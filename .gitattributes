@@ -1,0 +1,10 @@
+# v0.18 MED-18: shell scripts run under WSL bash directly from the /mnt/d mount.
+# core.autocrlf=true was smudging them to CRLF on Windows checkout, which makes
+# bash fail with "$'\r': command not found" / syntax errors. Pin LF.
+*.sh text eol=lf
+
+# v0.22 Pillar 2: model-tiers.json is deployed verbatim to ~/.claude/scripts and
+# Test-MemoryStack R9 SHA256-compares the repo copy against the deployed copy.
+# Pin LF so the committed bytes, the working-copy checkout, and the deployed copy
+# are byte-identical across machines (no autocrlf smudge -> no spurious R9 drift).
+claude-config/model-tiers.json text eol=lf

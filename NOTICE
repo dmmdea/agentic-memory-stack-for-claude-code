@@ -1,0 +1,12 @@
+agentic-memory-stack-for-claude-code
+Copyright 2026 dmmdea
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software INSTALLS or FETCHES third-party components at install time; it does
+not redistribute them. See THIRD-PARTY-NOTICES.md for the full list and licenses,
+including the EmbeddingGemma model, which is governed by the Gemma Terms of Use
+(https://ai.google.dev/gemma/terms) and is downloaded by the operator at install.
+
+Attribution: scripts/windows/dream-consolidate.ps1 is a port of
+grandamenium/dream-skill (MIT).

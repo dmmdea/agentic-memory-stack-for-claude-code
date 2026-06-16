@@ -1,0 +1,8 @@
+[Unit]
+Description=Weekly decay + dedup scan (v0.13)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/decay-scan.py
+ExecStartPost=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/semantic-dedup.py

@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly decay + dedup scan timer
+
+[Timer]
+OnCalendar=Sun 02:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

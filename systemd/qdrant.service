@@ -1,0 +1,14 @@
+[Unit]
+Description=Qdrant v1.18.2 vector store (v0.12 agentic-memory-stack)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/qdrant-server
+ExecStart=%h/qdrant-server/qdrant --config-path %h/qdrant-server/config/config.yaml
+Restart=on-failure
+RestartSec=3
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

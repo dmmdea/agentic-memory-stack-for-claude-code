@@ -1,0 +1,50 @@
+# Memory data — never commit
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+api-key
+.credentials.json
+auth.json
+*-ledger.jsonl
+audit-flags.jsonl
+
+# v1.0 Phase 7A: a raw snapshot of the developer's real ~/.claude/settings.json
+# (carries live secrets + personal paths). NOT consumed by the installer — it
+# patches the user's live settings.json programmatically. A scrubbed example
+# ships as claude-config/settings.example.json instead. NEVER commit the real one.
+claude-config/settings.json
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Repo-local tool cache (e.g. pinned Pester for Run-PesterTests.ps1) — never commit
+.tools/
+
+# Faithfulness-eval run outputs (ad-hoc; blessed baseline lives in the benchmarks folder)
+eval/faithfulness/results/
+
+# Backup files
+*.bak
+*.bak-*
+*.tar.gz
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

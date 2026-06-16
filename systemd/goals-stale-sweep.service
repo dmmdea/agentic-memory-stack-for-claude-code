@@ -1,0 +1,9 @@
+[Unit]
+Description=v0.17 Phase E: weekly stale-goal sweeper (report-only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/goals-stale-sweep.py
+StandardOutput=journal
+StandardError=journal

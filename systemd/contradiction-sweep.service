@@ -1,0 +1,15 @@
+[Unit]
+Description=v0.19 I.3: weekly offline contradiction sweep (canonical vs similar candidates; cheap local discovery)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# v0.27.3: the UNATTENDED weekly timer keeps the cheap local (offload-e4b) DISCOVERY pass — its
+# flags are advisory and resolved authoritatively by Codex via `--rejudge-stamped --judge codex`
+# (run on-demand with the Windows shim up). Without --judge local this would inherit the new
+# DEFAULT_JUDGE=codex and NO-OP every week (the shim is SessionStart-spawned, not up at Sun 05:00),
+# silently dropping the only automated drift pass (audit v0.27.3 HIGH). Codex is the AUTHORITATIVE
+# judge for interactive/manual use + the re-judge; this unit is the cheap unattended pre-pass.
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/contradiction-sweep.py --apply --limit 50 --judge local
+StandardOutput=journal
+StandardError=journal

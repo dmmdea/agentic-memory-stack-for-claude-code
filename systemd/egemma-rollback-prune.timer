@@ -1,0 +1,9 @@
+[Unit]
+Description=Fire EmbeddingGemma rollback prune once on 2026-06-21 (one-shot, self-disables after a successful prune)
+
+[Timer]
+OnCalendar=2026-06-21 14:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "default_tier": "frontier",
+  "_comment": "v0.23: coverage by actual capability/context-window, not a vague middle bucket. ALL 1M-context Claude flagships (Opus 4.6/4.7/4.8, Fable 5, Sonnet 4.6) share the full 'frontier' bundle — Sonnet's 1M window left no context-budget reason to trim it, so the old 'mid' tier was removed. Haiku 4.5 (200K) is 'small' (fewer items + a one-line tier legend). The offload harness (non-Claude Gemma) gets NO injection at all and is enforced hook-side (Test-OffloadNoBlockInvariant), not as a tier here. Matching is case-insensitive substring against match[], first tier in declaration order wins; unknown/legacy strings fail open to default_tier=frontier. Server mirror = TIER_BUNDLE_POLICY in mem0-server/app.py; test_tier_parity.py guards the two against drift. v1.0 Phase 3 / R2: memory_cap (K) capped at 2 frontier / 1 small (was 5/3) and the hook's block-level NOOP (Format-MemoryContextBlock emits no block when nothing clears) deliver abstention-first injection. relevance_threshold KEPT at 0.30 (both tiers; small was 0.33): the calibration found it gates the hybrid-search SEMANTIC score (off-domain <=0.12, relevant 0.25-0.57 on EmbeddingGemma's compressed scale), so 0.30 is already correctly placed and the research's raise to 0.5-0.6 would crater recall. eval/injection-gating/ + test_r2_injection_gating.py pin the values.",
+  "tiers": {
+    "frontier": { "match": ["opus", "fable", "sonnet"], "memory_cap": 2, "goal_cap": 5, "oq_cap": 3, "relevance_threshold": 0.30, "format": "full", "include_legend": false },
+    "small":    { "match": ["haiku"],                    "memory_cap": 1, "goal_cap": 3, "oq_cap": 2, "relevance_threshold": 0.30, "format": "flat", "include_legend": true }
+  }
+}

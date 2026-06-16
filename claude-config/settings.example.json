@@ -1,0 +1,25 @@
+{
+  "_comment": "EXAMPLE of the hook + env block install/2-windows-config.ps1 registers into your real ~/.claude/settings.json. NOT deployed verbatim — the installer patches your live file programmatically, merging these entries with any existing hooks. Shown here as a scrubbed reference for manual recovery. Replace <WIN_USER> with your Windows username and <DISTRO> with your WSL distro.",
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true"
+  },
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\stop-extract.ps1" } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\stop-extract.ps1" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "wsl.exe -d <DISTRO> -e bash -lc \"bash /mnt/c/Users/<WIN_USER>/.claude/scripts/storage-cap-check.sh\"" } ] },
+      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\mem0-hook-daemon-spawn.ps1", "async": true, "timeout": 10 } ] },
+      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\codex-shim-spawn.ps1", "async": true, "timeout": 10 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "C:\\Users\\<WIN_USER>\\.claude\\scripts\\mem0-hook-client.exe", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash|Edit|Write|MultiEdit", "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\pre-tool-check.ps1", "timeout": 3 } ] }
+    ]
+  }
+}

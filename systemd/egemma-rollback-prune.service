@@ -1,0 +1,12 @@
+[Unit]
+Description=v0.22 EmbeddingGemma rollback-window cleanup (one-shot, health-gated)
+# Deletes the OLD nomic `memories` Qdrant collection + snapshots (the v0.22 rollback
+# anchor) ONLY when the migration is confirmed durable: mem0 deep-health embedder ok
+# (dim 768) AND mem0 is STILL BOUND to mem0_egemma_768 (the binding-based rollback
+# guard, v0.22 H2) AND the new collection is green with >=1000 points. After a
+# rollback it SKIPs and logs a ROLLBACK DETECTED flag. Disable the timer as STEP 1
+# of any rollback (see ARCHITECTURE.md).
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/.mem0/egemma-rollback-prune.sh

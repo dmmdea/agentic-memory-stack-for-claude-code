@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly goals stale-sweep timer (Sun 04:00 - after stack-backup 03:30)
+
+[Timer]
+OnCalendar=Sun 04:00
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

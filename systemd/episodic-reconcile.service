@@ -1,0 +1,11 @@
+[Unit]
+Description=v0.27.4 R5: weekly episodic-ledger reconciliation (READ-ONLY drift detection — orphaned mem0 links / dangling episodes)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# READ-ONLY by construction (the SQLite ledger is opened mode=ro; no --apply). Reports drift to
+# ~/.mem0/episodic-reconciliation.jsonl (read by Test-MemoryStack). No Codex / no shim needed.
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/episodic-reconcile.py
+StandardOutput=journal
+StandardError=journal

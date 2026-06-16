@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly episodic-reconcile timer (Sun 05:30 - after contradiction-sweep 05:00; read-only + cheap)
+
+[Timer]
+OnCalendar=Sun 05:30
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

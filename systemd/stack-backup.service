@@ -1,0 +1,6 @@
+[Unit]
+Description=Weekly agentic memory stack snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash __REPO_ROOT_WSL__/scripts/wsl/stack-backup.sh
