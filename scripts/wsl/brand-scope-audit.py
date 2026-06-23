@@ -27,7 +27,7 @@ import sys
 import httpx
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "mem0_egemma_768"
+COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
 # Projects that are legitimately brand-neutral (cross-brand ecosystem facts).
 NEUTRAL_PROJECTS = {"", "ecosystem", "none"}
 
