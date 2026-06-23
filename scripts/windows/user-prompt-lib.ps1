@@ -525,8 +525,10 @@ function Format-MemoryContextBlock {
     }
 
     # v1.0 Phase 3 / R2 (abstention-first): the block renders ONLY when >=1 memory
-    # clears the relevance gate (the calibrated 0.50 threshold is applied
-    # server-side; the bundle returns nothing when the prompt is off the
+    # clears the relevance gate (the calibrated 0.30 semantic-cosine threshold is
+    # applied server-side — 0.30, NOT 0.50: on EmbeddingGemma's compressed scale 0.35
+    # craters recall to 0.47 and 0.50 drops 100%, so the raise was deliberately refused;
+    # the bundle returns nothing when the prompt is off the
     # project-knowledge manifold). Open goals / open frontier questions no longer
     # static-prepend on their own — that was the paper's #2 anti-pattern (static
     # 63.82% premature). $anyMemoryAdmitted gates the whole block at the end.

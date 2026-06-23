@@ -73,7 +73,10 @@ def get_recent_episodes(n=7):
         return []
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "memories"
+# The LIVE mem0 vector collection (config.py collection_name); matches contradiction-sweep.py /
+# episodic-reconcile.py / brand-scope-audit.py. The dead pre-EmbeddingGemma "memories" collection
+# was removed -> scroll 404'd -> the nightly dream's phase-4 index build failed every run.
+COLLECTION = "mem0_egemma_768"
 KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 OUT = Path.home() / ".mem0" / "MEMORY.md"
 MAX_LINES = 200

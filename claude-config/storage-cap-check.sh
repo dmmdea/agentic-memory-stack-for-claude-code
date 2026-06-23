@@ -36,6 +36,32 @@ PY
     fi
 }
 
+# Campaign (funnel) inference from cwd — mirrors infer_brand_from_cwd but returns the
+# matched rule's "campaign" (e.g. biohacker-collective). Empty = no funnel (store/shared).
+# Isolates funnel-specific canonical rules: a session surfaces shared facts (no campaign)
+# + ONLY its own funnel's rules, never another funnel's (2026-06-20 cross-funnel fix).
+infer_campaign_from_cwd() {
+    local cwd="$1"
+    local sdir cfg
+    sdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    cfg="$sdir/brands.json"
+    [ -f "$cfg" ] || { echo ""; return; }
+    python3 - "$cwd" "$cfg" <<'PY' 2>/dev/null
+import sys, json, re
+cwd = sys.argv[1].lower()
+try:
+    rules = json.load(open(sys.argv[2])).get("rules", [])
+except Exception:
+    rules = []
+out = ""
+for r in rules:
+    p = r.get("pattern")
+    if p and re.search(p, cwd, re.I):
+        out = r.get("campaign", ""); break
+print(out)
+PY
+}
+
 # v0.22 Pillar 1: initiative inference from cwd (mirrors the hook's
 # Get-SessionInitiative). Two initiatives can share one brand
 # (agentic-memory-stack and local-offload both = ai-ecosystem), so the
@@ -108,13 +134,30 @@ fi
 # v0.17 Phase 0.E: brand context auto-load
 SESSION_CWD="${CLAUDE_CWD:-$PWD}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
+# Funnel/campaign axis (2026-06-20): isolates funnel-specific canonical rules so a
+# biohacker session never sees recovery's rules and vice-versa.
+CAMPAIGN="$(infer_campaign_from_cwd "$SESSION_CWD")"
 # v0.22 Pillar 1: initiative axis for goal scoping (same cwd source as brand).
 INITIATIVE="$(infer_initiative_from_cwd "$SESSION_CWD")"
 KEY="$(cat "$HOME/.mem0/api-key" 2>/dev/null)"
 if [ -n "$BRAND" ] && [ -n "$KEY" ]; then
   echo "[agentic-memory-stack] brand context ($BRAND):"
-  # Top 5 canonical memories for this brand (highest trust)
-  canon=$(curl -fsS --max-time 4 -H "X-API-Key: $KEY" "http://127.0.0.1:18791/v1/memories?user_id=__WSL_USER__&limit=300" 2>/dev/null \
+  # Canonical memories for this brand (highest trust). v0.30 FIX (2026-06-19): fetch via
+  # the canonical SEARCH path, NOT the list endpoint. GET /v1/memories is a plain
+  # get_all(top_k) with NO tier filter, so canonical facts outside the top-N window were
+  # silently dropped (the hook surfaced 1 of 7). query_class=canonical + threshold=0 returns
+  # EVERY canonical record for the brand, query-independently (verified 2026-06-19).
+  canon_body=$(python3 -c "
+import sys, json
+print(json.dumps({
+    'query': sys.argv[1] + ' canonical ground-truth facts',
+    'query_class': 'canonical',
+    'threshold': 0,
+    'limit': 50,
+    'filters': {'tier': 'canonical', 'user_id': '__WSL_USER__', 'brand': sys.argv[1]},
+}))
+" "$BRAND" 2>/dev/null)
+  canon=$(curl -fsS --max-time 6 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" "http://127.0.0.1:18791/v1/memories/search" -d "$canon_body" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -122,9 +165,10 @@ try:
     recs = []
     for r in d.get('results', []):
         md = r.get('metadata') or {}
-        if md.get('tier') == 'canonical' and md.get('brand') == '$BRAND':
+        rc = md.get('campaign') or ''
+        if md.get('tier') == 'canonical' and md.get('brand') == '$BRAND' and (not rc or rc == '$CAMPAIGN'):
             recs.append(r)
-        if len(recs) >= 5:
+        if len(recs) >= 8:
             break
     for r in recs:
         text = (r.get('memory') or '')[:120]
@@ -132,7 +176,12 @@ try:
 except Exception:
     pass
 " 2>/dev/null)
-  [ -n "$canon" ] && echo "$canon"
+  # v0.28 Phase 2a: advisory frame — emitted iff ≥1 canonical fact exists.
+  # The frame is advisory ("verify before risky actions"), never an imperative.
+  if [ -n "$canon" ]; then
+    echo "Locked facts you can lean on this session — verify before risky actions:"
+    echo "$canon"
+  fi
   # Top 3 open goals for this brand, scoped to the session's initiative
   # (v0.22 Pillar 1): server returns this initiative + cross-cutting (NULL)
   # goals only, so another initiative's goals under the same brand don't bleed
@@ -181,5 +230,14 @@ if [ -f "$MEMORYMD" ]; then
   [ "$age_days" -gt 8 ] && warnings+="MEMORY.md stale (${age_days}d old; dream-consolidator may be failing). "
 fi
 
-[ -n "$warnings" ] && echo "[storage-cap] $warnings Run /memory-prune to address."
+# Brand-scope integrity (2026-06-20): the nightly brand-scope-audit writes this status.
+# Warn if any canonical fact ABOUT a brand is brand-untagged (invisible to that brand's
+# sessions — the bug that hid the Brand-A pre-filled-pens fact). Self-clears next clean run.
+BSSTATUS="$HOME/.mem0/brand-scope-status.json"
+if [ -f "$BSSTATUS" ]; then
+  nmis=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('n_misscoped',0))" "$BSSTATUS" 2>/dev/null || echo 0)
+  [ "${nmis:-0}" -gt 0 ] && warnings+="brand-scope: ${nmis} canonical fact(s) brand-untagged (invisible to brand sessions; see brand-scope-audit.py). "
+fi
+
+[ -n "$warnings" ] && echo "[storage-cap] $warnings Triage with: python scripts/wsl/audit-flags-triage.py --summary  (then --resolve --reason ...)."
 exit 0

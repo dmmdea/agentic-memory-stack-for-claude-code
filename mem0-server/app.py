@@ -274,11 +274,16 @@ from hook_contract import (
 # actor=claude. Server now enforces transitions; caller cannot self-elevate.)
 ADD_ALLOWED_TIERS = {"evidence", "temporal"}  # POST /v1/memories
 PROMOTE_ALLOWED_TIERS = {"evidence", "stable", "canonical", "insight", "temporal"}
-CANONICAL_REQUIRES_USER_DIRECT = True   # actor must be "user-direct" for canonical promotions
+CANONICAL_REQUIRES_USER_DIRECT = True   # actor must be "user-direct" OR in CANONICAL_AUTOPROMOTE_ALLOWED for canonical promotions
 INSIGHT_REQUIRES_C1 = True              # actor must be in INSIGHT_ALLOWED_ACTORS for insight writes
 # v0.14 C: exact allowlist replaces substring check ("c1" in actor) which was trivially bypassable
 # (e.g. actor="not-c1" passed the old check). Only these known consolidator identities may write insight tier.
 INSIGHT_ALLOWED_ACTORS = {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"}
+# Phase 2 autonomous promotion: the nightly dream consolidator may autonomously promote
+# to canonical under the STRICT bar (Codex-judged, cap<=3/night, canary unchanged).
+# The actor label is distinct from "user-direct" so ledger entries are auditable by source.
+# HMAC signing with the same canonical key is still required — the actor is a body label only.
+CANONICAL_AUTOPROMOTE_ALLOWED = {"dream-autopromote"}
 MAX_MEMORY_CHARS = int(os.environ.get("MEM0_MAX_MEMORY_CHARS", "4000"))  # storage cap (env-overridable)
 # v0.22: raised 1500 -> 4000. The old 1500 was a policy guess ("realistic for atomic facts",
 # audit 2026-06-08); its "prompt-budget honest" half is now MOOT — the v0.22 model-aware
@@ -287,6 +292,12 @@ MAX_MEMORY_CHARS = int(os.environ.get("MEM0_MAX_MEMORY_CHARS", "4000"))  # stora
 # checkpoint summaries (~1.5-2.5K chars) with a 413 every session. 4000 fits them with headroom
 # and stays well within EmbeddingGemma's 2048-token (~8K char) context. Atomic facts (<=25 words)
 # remain the preferred default for per-record retrieval precision; this cap is just a sane backstop.
+
+# v0.28 Phase 2a: promote-canary — reject imperative standing-order text from canonical tier.
+# Pure helper extracted into imperative_canary.py for testability without the full app stack.
+# Canary lexicon (v0.28): MUST | NEVER | ALWAYS | DO NOT | DON'T | SHALL | YOU MUST | RULE:
+from imperative_canary import is_imperative_canonical
+
 
 # v0.27.2 R5: NLI write-gate config (env). DEFAULT OFF — the write path is HOT (every L1a
 # Stop-hook extraction writes), so this never engages unless explicitly enabled. When on, a
@@ -738,6 +749,18 @@ def _search_core(b: SearchIn):
     hook_contract_version WARN-validation stays at the endpoint layer
     (each endpoint reports its own route name)."""
     capped_limit = min(b.limit, 500)
+    # v0.30 over-fetch: post-fetch filters (retired/_canonical_intent/admission) can drop
+    # records and leave a gap; over-fetch a buffer, filter, then trim to capped_limit (below).
+    _buf = int(os.environ.get("MEM0_SEARCH_OVERFETCH_BUFFER", "50"))
+    _buf = max(0, min(_buf, 500))                      # clamp env to [0,500] (Minor: no range validation)
+    if b.rerank:
+        _buf = min(_buf, 10)                            # Important: rerank is a CPU cross-encoder;
+                                                        # bound the candidate pool so latency stays sane
+    overfetch_limit = 0 if capped_limit == 0 else min(capped_limit + _buf, 500)  # Minor: don't fetch 50 for limit=0
+    if capped_limit > 0 and overfetch_limit == capped_limit:
+        # Important: at limit>=~450 the buffer collapses to 0 and the gap repair is inactive.
+        # Not a regression (old code gapped too at these limits), but make it observable.
+        log.warning("_search_core: over-fetch buffer collapsed at capped_limit=%d (gap repair inactive at this limit)", capped_limit)
     # v0.17 F.1.2: strip server-side opt-in flags before passing to mem.search / Qdrant.
     # These keys are our own post-filter directives; Qdrant doesn't know them and would 500.
     # v0.19 M4: allow_cross_brand is the explicit opt-in for brandless searches to
@@ -747,7 +770,7 @@ def _search_core(b: SearchIn):
     results = mem.search(
         query=b.query,
         filters=search_filters,
-        top_k=capped_limit,
+        top_k=overfetch_limit,
         threshold=b.threshold,
     )
     # v0.13: exclude retired records (retrievable=false) from search results unless caller explicitly opts in
@@ -890,6 +913,12 @@ def _search_core(b: SearchIn):
             query_class=_adm_qc,
             layer="server-search",
         )
+    # v0.30 over-fetch trim: now that retired/intent/admission filters have run on the
+    # larger pool, return only the caller's requested capped_limit (the K slots are now
+    # filled with non-filtered records, not gapped). Last mutation before logging so the
+    # logged returned_count/returned_top_ids reflect what the caller actually receives.
+    if isinstance(results, dict) and isinstance(results.get("results"), list):
+        results["results"] = results["results"][:capped_limit]
     # v0.17 Phase F.2.3: retrieval observability — log every search to ~/.mem0/retrieval-log.jsonl
     try:
         import hashlib as _hl
@@ -1028,6 +1057,14 @@ def update(
         actor=(actor or ""), reason=(reason or ""),
         x_user_direct_nonce=x_user_direct_nonce,
     )
+    # v0.28 Phase 2a: promote-canary on PUT — after HMAC enforcement, before the write.
+    # When the target record is canonical, reject imperative text (declarative facts only).
+    if current_tier == "canonical" and is_imperative_canonical(b.text.strip()):
+        raise HTTPException(
+            422,
+            "canonical is declarative facts only; rephrase as a fact, not a standing order. "
+            f"(detected imperative phrasing in: {b.text.strip()[:80]!r})",
+        )
     try:
         result = mem.update(memory_id=mid, data=b.text)
         # v0.17 F.2.5 / H1: PUT carry-over fix — mem.update() strips tier from Qdrant payload.
@@ -1107,9 +1144,10 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     if not actor:
         raise HTTPException(400, "actor is required (e.g., 'user-direct', 'c1-consolidator', 'claude-autonomous')")
     if b.tier == "canonical":
-        if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct":
+        if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct" and actor not in CANONICAL_AUTOPROMOTE_ALLOWED:
             raise HTTPException(403,
-                f"canonical promotion requires actor='user-direct' (you sent actor={actor!r}). "
+                f"canonical promotion requires actor='user-direct' or actor in {sorted(CANONICAL_AUTOPROMOTE_ALLOWED)} "
+                f"(you sent actor={actor!r}). "
                 "Autonomous Claude promotions can only set tier='insight' or 'stable'.")
         if not reason:
             raise HTTPException(400, "canonical promotion requires non-empty 'reason' (audit-trail policy)")
@@ -1137,6 +1175,34 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 f"insight tier requires actor in {sorted(INSIGHT_ALLOWED_ACTORS)} "
                 f"(you sent actor={actor!r}).")
 
+    # v0.29 Phase 2a: promote-canary — AFTER auth/HMAC enforcement, reject imperative text.
+    # Canonical tier is declarative facts only; standing-order phrasing is rejected with 422.
+    # FAIL-SAFE: if Qdrant retrieve RAISES, we cannot verify the text — reject with 503
+    # rather than silently skipping the canary (fail-open would be wrong for a write gate).
+    if b.tier == "canonical":
+        try:
+            _canon_records = mem.vector_store.client.retrieve(
+                collection_name=mem.vector_store.collection_name,
+                ids=[mid], with_payload=True, with_vectors=False,
+            )
+            _canon_text = ""
+            if _canon_records:
+                _pl = _canon_records[0].payload if hasattr(_canon_records[0], "payload") else _canon_records[0].get("payload", {})
+                _canon_text = (_pl.get("data") or _pl.get("memory") or "").strip()
+        except Exception as _e:
+            log.warning("imperative-canary: Qdrant retrieve failed for %s (%s); rejecting promotion", mid, _e)
+            raise HTTPException(
+                503,
+                "could not verify canonical text for the imperative-canary; "
+                "promotion rejected — retry when the store is reachable",
+            )
+        if is_imperative_canonical(_canon_text):
+            raise HTTPException(
+                422,
+                "canonical is declarative facts only; rephrase as a fact, not a standing order. "
+                f"(detected imperative phrasing in: {_canon_text[:80]!r})",
+            )
+
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
         mem.vector_store.client.set_payload(
@@ -1148,8 +1214,14 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         log.exception("tier-update failed")
         raise HTTPException(500, str(e))
     # Single ledger append AFTER successful payload update
-    # transport field: "cli-user-direct" for HMAC-validated canonical, "rest-api" otherwise
-    transport = "cli-user-direct" if (b.tier == "canonical" and x_user_direct_token) else "rest-api"
+    # transport field: "autonomous" when actor is from CANONICAL_AUTOPROMOTE_ALLOWED (dream-autopromote),
+    # "cli-user-direct" for HMAC-validated user-direct canonical, "rest-api" otherwise.
+    if b.tier == "canonical" and actor in CANONICAL_AUTOPROMOTE_ALLOWED:
+        transport = "autonomous"
+    elif b.tier == "canonical" and x_user_direct_token:
+        transport = "cli-user-direct"
+    else:
+        transport = "rest-api"
     try:
         _append_ledger({
             "ts": now, "event": "tier-change", "memory_id": mid,

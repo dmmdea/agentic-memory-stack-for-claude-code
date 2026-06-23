@@ -59,9 +59,11 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     return result
 
 @mcp.tool
-def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, threshold: float = 0.1, rerank: bool = False, query_class: str = "durable", brand: str | None = None, allow_cross_brand: bool = False) -> dict:
+def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, threshold: float = 0.1, rerank: bool | None = None, query_class: str = "durable", brand: str | None = None, allow_cross_brand: bool = False) -> dict:
     """Semantic search over mem0. Returns up to `limit` memories above `threshold`.
-    Set rerank=True for bge-reranker reordering (recommended for limit>=5).
+    Auto-reranks via the bge cross-encoder when limit>=5 (measured 2026-06-22 to IMPROVE
+    relevance — blind Codex A/B 7/11; adds ~2s on this CPU box, fine for a DELIBERATE search,
+    and NOT on the <500ms per-prompt bundle). Pass rerank=True/False to override the default.
     query_class: 'durable' (default) | 'operational' (recency-decayed) |
     'canonical' (REQUIRED to retrieve tier=canonical ground-truth records —
     the default class excludes them).
@@ -75,7 +77,8 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
         filters["brand"] = brand
     if allow_cross_brand:
         filters["allow_cross_brand"] = True
-    payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": rerank, "query_class": query_class}
+    eff_rerank = (limit >= 5) if rerank is None else rerank   # auto-on for deliberate (limit>=5) searches
+    payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": eff_rerank, "query_class": query_class}
     r = httpx.post(f"{MEM0_URL}/v1/memories/search", json=payload, headers=_headers(), timeout=30.0)
     r.raise_for_status()
     return r.json()
