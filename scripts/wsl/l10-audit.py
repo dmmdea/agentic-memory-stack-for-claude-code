@@ -28,7 +28,7 @@ import httpx
 
 MEM0_URL = "http://127.0.0.1:18791"
 QDRANT_URL = "http://127.0.0.1:6333"
-QDRANT_COLLECTION = "memories"
+QDRANT_COLLECTION = "mem0_egemma_768"  # live collection; the dead pre-EmbeddingGemma 'memories' was removed -> 404
 KEY_FILE = Path.home() / ".mem0" / "api-key"
 STATE_FILE = Path.home() / ".mem0" / "l10-state.json"
 FLAGS_FILE = Path.home() / ".mem0" / "audit-flags.jsonl"

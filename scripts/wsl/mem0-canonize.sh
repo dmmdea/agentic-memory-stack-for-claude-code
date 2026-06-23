@@ -3,6 +3,7 @@
 #
 # Usage (tier promotion — v0.19 Phase G: signs format-2, action="promote"):
 #   bash mem0-canonize.sh <memory_id> "<reason>"
+#   bash mem0-canonize.sh --actor dream-autopromote <memory_id> "<reason>"
 #
 # Usage (mutation actions — v0.17 Phase A, new --action flag):
 #   bash mem0-canonize.sh --action put            <memory_id> "<reason>" --text "<new text>"
@@ -51,6 +52,7 @@ MEM0="${MEM0_URL:-http://127.0.0.1:18791}"
 # ─── Argument parsing ────────────────────────────────────────────────────────
 
 ACTION=""        # empty → tier-promotion (v0.14 compat), or one of: put, delete, patch_metadata
+ACTOR=""         # Phase 2 autonomous: --actor flag for tier promotion body (default: user-direct)
 TEXT=""          # required for --action put
 METADATA_JSON="" # required for --action patch_metadata
 CASCADE=0        # v0.17 F.1.4: pass ?cascade=true to DELETE when set
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --action)
       ACTION="$2"
+      shift 2
+      ;;
+    --actor)
+      ACTOR="$2"
       shift 2
       ;;
     --text)
@@ -179,11 +185,14 @@ HMAC_HEADERS=(-H "X-User-Direct-Token: $TOKEN" -H "X-User-Direct-Ts: $TS" -H "X-
 
 if [[ -z "$ACTION" ]]; then
   # ── Tier promotion (v0.19 Phase G: format-2, action="promote") ──────────
+  # Phase 2: --actor flag selects the promotion actor label (default: user-direct).
+  PROMOTE_ACTOR="${ACTOR:-user-direct}"
   BODY="$(python3 -c "
 import json, sys
-reason = sys.argv[1]
-print(json.dumps({'tier': 'canonical', 'actor': 'user-direct', 'reason': reason}))
-" "$REASON")"
+actor = sys.argv[1]
+reason = sys.argv[2]
+print(json.dumps({'tier': 'canonical', 'actor': actor, 'reason': reason}))
+" "$PROMOTE_ACTOR" "$REASON")"
 
   echo "Promoting memory $MID to canonical (action=promote)..."
   echo "  ts=$TS"

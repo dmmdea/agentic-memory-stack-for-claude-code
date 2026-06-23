@@ -11,13 +11,15 @@ set -euo pipefail
 TS="${1:?ts arg required}"
 BACKUP_DIR="$HOME/.mem0/backups"
 MANIFEST="$BACKUP_DIR/manifest-$TS.json"
+# DR fix (2026-06-20): count the LIVE collection, not the frozen pre-egemma "memories".
+QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
 
 # ---------------------------------------------------------------------------
 # 1. Qdrant points count from live state at backup time
 # ---------------------------------------------------------------------------
 
 QDRANT_POINTS=0
-qdrant_raw=$(curl -fsS http://127.0.0.1:6333/collections/memories 2>/dev/null || true)
+qdrant_raw=$(curl -fsS "http://127.0.0.1:6333/collections/$QDRANT_COLLECTION" 2>/dev/null || true)
 if [ -n "$qdrant_raw" ]; then
     QDRANT_POINTS=$(echo "$qdrant_raw" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('points_count',0))" \

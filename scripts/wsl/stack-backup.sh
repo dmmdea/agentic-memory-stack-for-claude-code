@@ -15,6 +15,13 @@ BACKUP_DIR="$HOME/.mem0/backups"
 mkdir -p "$BACKUP_DIR"
 rc=0
 
+# DR fix (2026-06-20): the LIVE mem0 vector collection is mem0_egemma_768 (config.py).
+# It was "memories" before the EmbeddingGemma migration; the old collection still exists
+# frozen (~2165 pts) while the live store grew in mem0_egemma_768 (3028+). Snapshotting the
+# stale name silently backed up the WRONG vectors. Single source of truth here so it can't
+# drift again. Override via env if the collection is ever renamed.
+QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
+
 echo "stack-backup: starting TS=$TS BACKUP_DIR=$BACKUP_DIR"
 
 # ── 1. Local file backups (always run; Qdrant outage must not skip these) ─────
@@ -120,7 +127,7 @@ echo "stack-backup: local files done (rc=$rc so far)"
 # ── 2. Qdrant snapshot (isolated — failure here does NOT affect above) ─────────
 (
   set +e
-  SNAP=$(curl -sf -X POST http://127.0.0.1:6333/collections/memories/snapshots | jq -r '.result.name // empty')
+  SNAP=$(curl -sf -X POST "http://127.0.0.1:6333/collections/$QDRANT_COLLECTION/snapshots" | jq -r '.result.name // empty')
   if [ -z "$SNAP" ]; then
     echo "WARN: Qdrant snapshot request failed or returned empty name — skipping" >&2
     exit 0
@@ -134,7 +141,7 @@ echo "stack-backup: local files done (rc=$rc so far)"
       ;;
   esac
 
-  SNAP_SRC="$HOME/qdrant-server/snapshots/memories/$SNAP"
+  SNAP_SRC="$HOME/qdrant-server/snapshots/$QDRANT_COLLECTION/$SNAP"
   SNAP_DST="$BACKUP_DIR/qdrant-$TS.snapshot"
   if [ -f "$SNAP_SRC" ]; then
     cp "$SNAP_SRC" "$SNAP_DST.tmp" && mv "$SNAP_DST.tmp" "$SNAP_DST" \

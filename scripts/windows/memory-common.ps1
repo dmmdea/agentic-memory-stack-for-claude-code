@@ -45,6 +45,47 @@ function Test-Mem0CacheAclOwnerOnly {
     } catch { return $false }
 }
 
+function Test-IsShipLog {
+    # Pure keep/route classifier. $true => volatile ship-log (route to episodic).
+    # Over-KEEP is the HARD constraint: a value-bearing durable fact must never route.
+    # The distinguisher for LONG records is SHIP-SIGNAL (status verb + date/multi-clause),
+    # not length alone -- long crowding ship-logs carry that signal; long value facts do not.
+    # NOTE (invariant): a long record with ship-signal routes EVEN IF it carries a value
+    # marker. This is safe only because the pipeline extracts short atomic value facts
+    # SEPARATELY (the Codex inferability gate) before the full narrative reaches this
+    # classifier -- the atomic value is emitted as its own short fact (rule 1 KEEPs it);
+    # the narrative routes to the episode. Task 2 (write-path) preserves this: $evergreen
+    # atomics go to mem0, $shipLog narratives fold into the episode.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $t = $Text.Trim()
+    $statusVerb   = '\b(shipped|deployed|done|committed|completed|verified|fixed|started|added|updated|migrated|landed|merged|refactored|wired|removed|renamed)\b'
+    $dateAnchor   = '\b20\d{2}-\d{2}-\d{2}\b'
+    $atomicMarker = '\b(reserved|token|endpoint|credential|secret|password|version|port|path|hash|key|id|anchor|url)\b|https?://|:\d{2,5}\b|\w+\s*=\s*\S|\bset to\b|[A-Za-z]:\\|\.(ps1|py|js|ts|json|md|sh|exe|dll|yaml|yml|toml|cfg|conf)\b'
+    $multiClause  = (($t -split '\r?\n').Count -gt 1) -or (([regex]::Matches($t, ',')).Count -gt 3)
+    $shipSignal   = ($t -imatch $statusVerb) -and (($t -match $dateAnchor) -or $multiClause)
+    # 1) short value facts -> absolute KEEP (over-KEEP, the hard constraint)
+    if ($t.Length -lt 150 -and ($t -imatch $atomicMarker)) { return $false }
+    # 2) clear status events (status verb + date/multi-clause) -> route, any length
+    if ($shipSignal) { return $true }
+    # 3) long records with NO value marker -> crowders -> route
+    if ($t.Length -ge 150 -and -not ($t -imatch $atomicMarker)) { return $true }
+    # 4) default -> KEEP (long value statement without ship-signal; short non-marker non-event)
+    return $false
+}
+
+function Split-FactsByShipLog {
+    # Partition extracted facts: evergreen -> durable mem0; ship-logs -> episodic.
+    param([string[]]$Facts)
+    $evergreen = [System.Collections.Generic.List[string]]::new()
+    $shipLogs  = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in $Facts) {
+        if ([string]::IsNullOrWhiteSpace($f)) { continue }
+        if (Test-IsShipLog -Text $f) { $shipLogs.Add($f) } else { $evergreen.Add($f) }
+    }
+    return [pscustomobject]@{ Evergreen = @($evergreen); ShipLogs = @($shipLogs) }
+}
+
 function Get-Mem0Key {
     # v0.20 A.2: same local-cache mechanism as Get-Mem0ApiKeyCached in
     # user-prompt-lib.ps1 (fresh <1h cache authoritative; miss/stale -> UNC read
@@ -234,6 +275,7 @@ function Drain-Mem0DeadLetter {
     $still    = @()
     $drained  = 0
     $poisoned = 0
+    $dropped  = 0
 
     foreach ($line in $lines) {
         try {
@@ -292,6 +334,15 @@ function Drain-Mem0DeadLetter {
         $textVal   = if ($rec.PSObject.Properties.Name -contains 'text') { $rec.text } else { $rec.payload.text }
         $sourceVal = if ($rec.PSObject.Properties.Name -contains 'source') { $rec.source } else { $rec.payload.source }
 
+        # Phase-3 policy: ship-log entries must NEVER be replayed into durable mem0,
+        # even via the DLQ fallback. Drop silently (not quarantine — this is by policy,
+        # not because the record is malformed or undeliverable).
+        if (Test-IsShipLog -Text $textVal) {
+            Write-MemoryLog -Component 'l1a' -Message "DLQ: dropped ship-log entry per Phase-3 policy: $($textVal.Substring(0, [Math]::Min(80, $textVal.Length)))"
+            $dropped++
+            continue
+        }
+
         $r = $false
         try {
             $r = Add-Mem0Memory -Text $textVal -Source $sourceVal -Metadata $metaHt
@@ -320,7 +371,7 @@ function Drain-Mem0DeadLetter {
     } else {
         $still | Set-Content -LiteralPath $dlq -Encoding UTF8
     }
-    return @{ drained = $drained; remaining = $still.Count; quarantined = $poisoned }
+    return @{ drained = $drained; remaining = $still.Count; quarantined = $poisoned; dropped = $dropped }
 }
 
 function Invoke-CodexSubagent {

@@ -138,9 +138,14 @@ $turns
         exit 0
     }
 
+    # Phase 3: partition facts — evergreen atomic facts go to durable mem0; ship-log
+    # facts (Test-IsShipLog=true) fold into the episode summary, not mem0 records.
+    $split = Split-FactsByShipLog -Facts $facts
+
     $posted = 0
     $postedMemoryIds = [System.Collections.Generic.List[string]]::new()
-    foreach ($fact in $facts) {
+    # Only evergreen facts POST to mem0 and populate linked_memory_ids (durable-only).
+    foreach ($fact in $split.Evergreen) {
         if ([string]::IsNullOrWhiteSpace($fact)) { continue }
         $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata @{
             event = $EventName
@@ -152,12 +157,23 @@ $turns
             if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
         }
     }
-    Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($facts.Count), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
+    Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
     Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status 'ok' -FactsPosted $posted
     Mark-Throttle -Name 'l1a'
 
-    # v0.15: POST episode to /v1/episodes (best-effort; 404s until Phase B lands endpoint)
+    # Phase 3: if ship-logs exist but no episode is being posted they are dropped from
+    # durable storage. Do NOT force-create an episode and do NOT write ship-logs to mem0.
+
+    # v0.15: POST episode to /v1/episodes (live since v0.20 Phase B).
     if ($parsed.episode -and $parsed.episode.goal) {
+        # Phase 3: build episode summary (with ship-log fold) BEFORE the POST try-block so
+        # any bug in the ship-log fold surfaces via the outer handler rather than being
+        # swallowed as episode noise. $parsed.episode is non-null (guarded above).
+        $episodeSummary = $parsed.episode.summary
+        if ($split.ShipLogs.Count -gt 0) {
+            $episodeSummary += "`n`nSession ship-logs (routed from durable):`n - " + ($split.ShipLogs -join "`n - ")
+        }
+
         try {
             $apiKey = Get-Mem0Key
 
@@ -195,7 +211,7 @@ $turns
                 ended_at       = (Get-Date).ToUniversalTime().ToString('o')
                 transcript_path = $TranscriptPath
                 goal           = $parsed.episode.goal
-                summary        = $parsed.episode.summary
+                summary        = $episodeSummary
                 message_count  = 0
                 brand          = $brandInfo.brand
                 workspace      = $brandInfo.workspace
@@ -218,8 +234,10 @@ $turns
                 -TimeoutSec 5 | Out-Null
             Write-MemoryLog -Component 'l1a' -Message "  posted episode for session $sessionId (goal: $($parsed.episode.goal.Substring(0, [Math]::Min(80, $parsed.episode.goal.Length))))"
         } catch {
-            # Best-effort only — episodes endpoint 404s until Phase B ships
-            Write-MemoryLog -Component 'l1a' -Message "  episode post skipped/failed (expected until Phase B): $_"
+            # Best-effort: POST /v1/episodes is live (v0.20 Phase B). A failure here is
+            # non-fatal — the session's durable facts already landed in mem0; the episode
+            # (and its routed ship-logs) is the only loss.
+            Write-MemoryLog -Component 'l1a' -Message "  episode post failed (non-fatal; durable facts already in mem0): $_"
         }
     }
 

@@ -105,7 +105,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py"
+MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"

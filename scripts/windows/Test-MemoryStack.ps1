@@ -573,6 +573,32 @@ try {
     }
 } catch { Add-Check 'INVARIANTS' 'memory-block budget (R-budget)' 'WARN' "fail-open: $($_.Exception.Message)" }
 
+# I15 (v0.30 / R-surface): canonical surfacing — the SessionStart brand block
+# (storage-cap-check.sh) must fetch canonical via the SEARCH path (query_class=canonical),
+# NOT the list endpoint. GET /v1/memories is a plain get_all(top_k) with no tier filter, so
+# canonical facts outside the top-N window are silently dropped (the hook surfaced 1 of 7
+# ai-ecosystem canonical facts - found 2026-06-19). Structural: the deployed hook uses the
+# search path. Behavioral: that path returns the brand's canonical facts. Non-fatal / fail-open.
+try {
+    $scHook = Join-Path $env:USERPROFILE '.claude\scripts\storage-cap-check.sh'
+    $surfBrand = 'ai-ecosystem'
+    if (-not (Test-Path $scHook)) {
+        Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "deployed storage-cap-check.sh not found at $scHook"
+    } elseif (-not (Select-String -Path $scHook -Pattern 'query_class.*canonical' -Quiet)) {
+        Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' 'SessionStart hook fetches canonical via the LIST endpoint (lossy) - drops canonical facts outside the top-N window; repoint to query_class=canonical search'
+    } elseif ($key) {
+        $surfBody = @{ query='canonical ground-truth facts'; query_class='canonical'; threshold=0; limit=50; rerank=$false; filters=@{ tier='canonical'; user_id=$TmsWslUser; brand=$surfBrand } } | ConvertTo-Json
+        try {
+            $surf = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post -Body $surfBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 15
+            $surfCount = @($surf.results | Where-Object { $_.metadata.tier -eq 'canonical' }).Count
+            if ($surfCount -gt 0) { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'OK' "hook uses search path; $surfCount canonical fact(s) surfaceable for $surfBrand" }
+            else { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "search path wired but 0 canonical returned for $surfBrand (populate canonical or check brand/user_id)" }
+        } catch { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "search probe failed: $($_.Exception.Message.Substring(0,[Math]::Min(70,$_.Exception.Message.Length)))" }
+    } else {
+        Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' 'hook uses search path (structural OK); behavioral probe skipped (no API key)'
+    }
+} catch { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "fail-open: $($_.Exception.Message)" }
+
 
 # ==========================================================================
 # DIMENSION 3: RECOVERY
@@ -828,6 +854,31 @@ try {
     }
 } catch { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' $_.Exception.Message }
 
+# Phase 5 anti-drift: consolidation retrieval-drift alarm surface.
+# dream-consolidate.ps1 appends ONE JSONL record to ~/.mem0/consolidation-drift.jsonl ONLY when a
+# consolidation made a canary self-fact unretrievable (the before/after snapshot compare returned
+# exit 2). The file is ABSENT in the healthy steady state. WARN if an alarm fired within 14d
+# (investigate the canary / re-index the store); OK if absent or only historical (none since).
+try {
+    $cdLog = "$TmsHomeUnc\.mem0\consolidation-drift.jsonl"
+    if (Test-Path $cdLog) {
+        $cdRuns = @(Get-Content $cdLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ })
+        if ($cdRuns.Count -gt 0) {
+            $cdLast = $cdRuns[-1]
+            $cdAge  = (Get-Date) - [datetime]$cdLast.ts
+            if ($cdAge.TotalDays -le 14) {
+                Add-Check 'RECOVERY' 'consolidation drift' 'WARN' "drift alarm $($cdLast.ts) ($([int]$cdAge.TotalDays)d ago): $($cdLast.detail) - a canary fact became unretrievable after a consolidation; check eval/retrieval-drift + the dream log ($($cdRuns.Count) alarm(s) total)"
+            } else {
+                Add-Check 'RECOVERY' 'consolidation drift' 'OK' "last drift alarm $($cdLast.ts) >$([int]$cdAge.TotalDays)d ago, none since ($($cdRuns.Count) historical)"
+            }
+        } else {
+            Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'flag file present but no parseable alarm records'
+        }
+    } else {
+        Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'no drift alarms (no flag file yet)'
+    }
+} catch { Add-Check 'RECOVERY' 'consolidation drift' 'WARN' $_.Exception.Message }
+
 # R7: open_questions health (v0.17 Phase D)
 if ($key) {
     try {
@@ -866,6 +917,7 @@ try {
         'mem0-hook-client.cs',                                 # v0.20 A.6 compiled thin client SOURCE (exe is built FROM the deployed copy)
         'build-hook-client.ps1',                               # v0.20 Final: smoke-gated builder — deployed so a repo-less DR restore can rebuild the exe (SessionStart self-heal in mem0-hook-daemon-spawn.ps1)
         'dream-consolidate.ps1',                               # v0.20 Phase F (L4): installer deploys it + Task Scheduler runs it nightly — was the one deployed script R9 never checked
+        'autopromote-lib.ps1',                                 # Phase 2c: dot-sourced by dream-consolidate.ps1 for the autonomous-promotion decision logic (must deploy beside it)
         'codex-shim.ps1', 'codex-shim-spawn.ps1'               # v0.27.1 R5 keystone: Windows-resident Codex HTTP shim + its flag-gated SessionStart launcher
     )
     if (-not (Test-Path $repoHookDir)) {
@@ -935,6 +987,23 @@ try {
         elseif (-not (Test-Path $tiersRepo)) { $staleHooks += 'model-tiers.json(no-repo-copy)' }
         elseif ((Get-FileHash $tiersRepo -Algorithm SHA256).Hash -ne (Get-FileHash $tiersDep -Algorithm SHA256).Hash) { $staleHooks += 'model-tiers.json(drift - re-deploy claude-config\model-tiers.json)' }
 
+        # v0.30: storage-cap-check.sh (SessionStart brand/canonical block) repo source is
+        # claude-config\ (not scripts\windows\), so it can't ride the $hookNames loop. Track it
+        # here with the SAME sentinel-aware SHA parity (it carries the WSL-user sentinel).
+        # An untracked drift here is how the 1-of-7 canonical-surfacing defect hid (2026-06-19).
+        $scRepo = Join-Path (Split-Path -Parent (Split-Path -Parent $repoHookDir)) 'claude-config\storage-cap-check.sh'
+        $scDep  = Join-Path $deployedHookDir 'storage-cap-check.sh'
+        if     (-not (Test-Path $scDep))  { $staleHooks += 'storage-cap-check.sh(MISSING - SessionStart canonical/brand block absent; redeploy from claude-config)' }
+        elseif (-not (Test-Path $scRepo)) { $staleHooks += 'storage-cap-check.sh(no-repo-copy)' }
+        else {
+            $scText = [System.IO.File]::ReadAllText($scRepo)
+            if ($TmsWslUser) { $scText = $scText.Replace($snU, $TmsWslUser) }
+            if ($TmsWinUser) { $scText = $scText.Replace($snW, $TmsWinUser) }
+            if ($TmsDistro)  { $scText = $scText.Replace($snD, $TmsDistro) }
+            $scRepoHash = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($scText))).Replace('-','')
+            if ($scRepoHash -ne (Get-FileHash $scDep -Algorithm SHA256).Hash) { $staleHooks += 'storage-cap-check.sh(drift - re-deploy claude-config\storage-cap-check.sh with WSL-user substitution)' }
+        }
+
         if ($staleHooks.Count -eq 0) {
             Add-Check 'RECOVERY' 'deployed hooks freshness' 'OK' "$($hookNames.Count)/$($hookNames.Count) deployed scripts SHA256-match repo + model-tiers.json + client exe present and fresh"
         } else {
@@ -989,8 +1058,8 @@ try {
 $lastL1a = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\l1a.log"
 if ($lastL1a) { Add-Info 'L1a last activity' 'OK' $lastL1a } else { Add-Info 'L1a last activity' 'WARN' 'no l1a.log yet' }
 
-$lastC1 = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\c1.log"
-if ($lastC1) { Add-Info 'C1 last activity' 'OK' $lastC1 } else { Add-Info 'C1 last activity' 'WARN' 'no c1.log yet (fires nightly 3am)' }
+$lastDream = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\dream.log"
+if ($lastDream) { Add-Info 'Dream last activity' 'OK' $lastDream } else { Add-Info 'Dream last activity' 'WARN' 'no dream.log yet (fires nightly 3am)' }
 
 $dlq = "$env:USERPROFILE\.claude\state\mem0-post-failures.jsonl"
 if (Test-Path -LiteralPath $dlq) {

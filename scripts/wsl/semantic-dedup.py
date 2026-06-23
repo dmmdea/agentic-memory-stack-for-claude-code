@@ -36,7 +36,7 @@ from pathlib import Path
 import httpx
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "memories"
+COLLECTION = "mem0_egemma_768"  # live collection; the dead pre-EmbeddingGemma 'memories' was removed -> 404
 MEM0 = "http://127.0.0.1:18791"
 KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
@@ -111,16 +111,18 @@ def cosine(a, b):
     return dot / (na * nb + 1e-9)
 
 def main():
+    import sys
+    dry_run = "--dry-run" in sys.argv
     lock_fd = _acquire_dedup_lock()
     if lock_fd is None:
         print("semantic-dedup: another instance holds the lock; aborting", flush=True)
         return 0
     try:
-        return _run()
+        return _run(dry_run)
     finally:
         _release_dedup_lock(lock_fd)
 
-def _run():
+def _run(dry_run=False):
     deletions = 0
     # Preflight: confirm both backends are reachable
     try:
@@ -174,6 +176,9 @@ def _run():
                         "kept_text": (p_older.get("data") or "")[:120],
                     }
                     report.write(json.dumps(report_rec) + "\n")
+                    if dry_run:
+                        keep[rid] = False; deletions += 1   # would-delete; no API delete, no ledger
+                        continue
                     r = c.delete(f"{MEM0}/v1/memories/{rid}")
                     if r.status_code == 200:
                         keep[rid] = False
@@ -189,7 +194,8 @@ def _run():
         _append_ledger({"event": "dedup-scan-abort", "actor": "semantic-dedup", "reason": f"mid-run failure: {type(e).__name__}: {str(e)[:120]}", "partial_deletions": deletions})
         print(f"semantic-dedup: ABORT mid-run after deletions={deletions} ({e})", flush=True)
         return 1
-    print(f"semantic-dedup: deletions={deletions}, tier_thresholds={TIER_THRESHOLDS}, report={REPORT}")
+    label = "DRY-RUN would_delete" if dry_run else "deletions"
+    print(f"semantic-dedup: {label}={deletions}, tier_thresholds={TIER_THRESHOLDS}, report={REPORT}")
 
 if __name__ == "__main__":
     sys.exit(main())

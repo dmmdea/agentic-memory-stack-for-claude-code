@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "memories"
+COLLECTION = "mem0_egemma_768"  # live collection; the dead pre-EmbeddingGemma 'memories' was removed -> 404
 MEM0 = "http://127.0.0.1:18791"
 KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
