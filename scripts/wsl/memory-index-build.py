@@ -10,7 +10,7 @@ if the reader stops there). Full structured list follows.
 
 Verbose content stays in mem0; this is just a pointer index for SessionStart hydration."""
 from __future__ import annotations
-import datetime as dt, json, sys
+import datetime as dt, json, os, sys
 from collections import defaultdict
 from pathlib import Path
 import httpx
@@ -76,7 +76,7 @@ QDRANT = "http://127.0.0.1:6333"
 # The LIVE mem0 vector collection (config.py collection_name); matches contradiction-sweep.py /
 # episodic-reconcile.py / brand-scope-audit.py. The dead pre-EmbeddingGemma "memories" collection
 # was removed -> scroll 404'd -> the nightly dream's phase-4 index build failed every run.
-COLLECTION = "mem0_egemma_768"
+COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
 KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 OUT = Path.home() / ".mem0" / "MEMORY.md"
 MAX_LINES = 200

@@ -11,12 +11,12 @@ v0.13.1: preflight probe of Qdrant + mem0 health. Emits decay-scan-skip ledger e
 and exits 0 cleanly if either backend is unreachable. Mid-run httpx failures emit
 decay-scan-abort with partial counts."""
 from __future__ import annotations
-import datetime as dt, json, sys
+import datetime as dt, json, os, sys
 from pathlib import Path
 import httpx
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "mem0_egemma_768"  # live collection; the dead pre-EmbeddingGemma 'memories' was removed -> 404
+COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
 MEM0 = "http://127.0.0.1:18791"
 KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
