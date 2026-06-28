@@ -1,4 +1,8 @@
+#Requires -Version 7.0
 # Test-MemoryStack.ps1 - non-mutating memory-stack health verifier.
+# NOTE: pwsh-only (uses PS7 syntax incl. `&&`). Run manually under pwsh; it is NOT invoked by any
+# hook or scheduled task (those run powershell.exe 5.1). The #Requires gives a clean error if ever
+# run under 5.1 instead of a cryptic parse-death. The PS51Compat parse-guard auto-skips it.
 #
 # v0.17 Phase F.2.1: reorganized into THREE dimensions with subtotals:
 #   LIVENESS   — services up, ports listening, models loaded

@@ -84,6 +84,67 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     return r.json()
 
 @mcp.tool
+def memory_recall(query: str, brand: str | None = None, initiative: str | None = None, project: str | None = None, user_id: str = "__WSL_USER__") -> dict:
+    """PROACTIVELY pull the memory the task you are about to start depends on — the SAME
+    admission-gated, brand-scoped, ranked context the per-prompt UserPromptSubmit hook USED
+    to inject before that hook went dead in this runtime (VS Code extension / Agent SDK).
+    Call it at the START of any substantive task that could turn on a prior decision, brand or
+    project state, a port/path/config value, or an open goal — NOT on every trivial turn
+    (over-recall is the named anti-pattern; an EMPTY result is a valid "nothing relevant is
+    stored", never a failure).
+
+    Returns {ok, canonical, memories, goals, open_questions}:
+      - canonical: query-relevant tier=canonical GROUND TRUTH (locked facts — reserved ports,
+        locked decisions, brand directives). The default search class EXCLUDES these, so this
+        verb fetches them explicitly; trust them as ground truth.
+      - memories: the per-prompt bundle's top gated durable/evidence facts for `query` (K<=2,
+        threshold-gated — identical to what the dead hook would have injected).
+      - goals / open_questions: open goals + questions, optionally scoped to brand/initiative.
+
+    No side effects — the episode checkpoint is suppressed (checkpoint=False), so a recall never
+    pollutes the SessionStart resume banner. brand: pass it when working in a brand context
+    (e.g. 'brand-a', 'ai-ecosystem'). v1.0 Phase B: a branded recall now returns that brand's
+    facts PLUS the brand-NEUTRAL (general) facts that apply to every brand, excluding only OTHER
+    brands — so passing brand no longer starves recall; it ADDS brand-specific facts on top of the
+    neutral set. Brandless returns the brand-neutral set only. Either is safe (no cross-brand leak).
+    initiative/project scope the goals/questions to a repo leaf. For a DELIBERATE free-text search
+    instead of this curated bundle, use memory_search."""
+    H = _headers()
+    out: dict = {"ok": True}
+    # 1) the per-prompt bundle (durable memories + open goals + open questions), checkpoint
+    #    suppressed so a manual pull writes no episode. Reuses the EXACT _search_core gate path.
+    bpayload: dict = {"session_id": "mcp-memory-recall", "prompt": query, "checkpoint": False}
+    if brand:
+        bpayload["brand"] = brand
+    if initiative:
+        bpayload["initiative"] = initiative
+    if project:
+        bpayload["project"] = project
+    try:
+        rb = httpx.post(f"{MEM0_URL}/v1/context/bundle", json=bpayload, headers=H, timeout=30.0)
+        rb.raise_for_status()
+        b = rb.json()
+        out["memories"] = b.get("memories", [])
+        out["goals"] = b.get("goals", [])
+        out["open_questions"] = b.get("open_questions", [])
+    except Exception as e:
+        out["memories"], out["goals"], out["open_questions"] = [], [], []
+        out["bundle_error"] = str(e)
+    # 2) query-relevant canonical ground-truth — the default class excludes tier=canonical,
+    #    so a recall would otherwise miss the locked facts (ports/decisions) most worth pulling.
+    cfilters: dict = {"user_id": user_id}
+    if brand:
+        cfilters["brand"] = brand
+    try:
+        rc = httpx.post(f"{MEM0_URL}/v1/memories/search", json={"query": query, "filters": cfilters, "limit": 5, "threshold": 0.0, "rerank": False, "query_class": "canonical"}, headers=H, timeout=30.0)
+        rc.raise_for_status()
+        out["canonical"] = rc.json().get("results", [])
+    except Exception as e:
+        out["canonical"] = []
+        out["canonical_error"] = str(e)
+    return out
+
+@mcp.tool
 def memory_list(user_id: str = "__WSL_USER__", limit: int = 50) -> dict:
     """List recent memories for user_id. Hard-capped server-side at 500.
     Prefer memory_search for content discovery; this is for inventory."""

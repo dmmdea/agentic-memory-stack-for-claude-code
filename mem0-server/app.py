@@ -17,6 +17,7 @@ from mem0 import Memory
 from config import build_config
 from reranker import rerank as bge_rerank
 from admission_gate import apply_admission
+from redact import redact_secrets  # server-side secret scrub for stored prompt_text
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
 import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps injected below)
@@ -765,7 +766,15 @@ def _search_core(b: SearchIn):
     # These keys are our own post-filter directives; Qdrant doesn't know them and would 500.
     # v0.19 M4: allow_cross_brand is the explicit opt-in for brandless searches to
     # receive brand-scoped records (admission gate is fail-closed on brand otherwise).
-    _SERVER_FILTER_KEYS = {"include_retired", "include_canonical_intent", "allow_cross_brand"}
+    # v1.0 Phase B: `brand` is ALSO stripped from the Qdrant pre-filter and scoped ONLY by
+    # the admission gate below. The Qdrant `brand==X` pre-filter dropped brand-NEUTRAL
+    # (null-brand) candidates before the gate saw them, starving branded queries of the
+    # general facts that apply to every brand (A2 measured branded recall at 37.5% over a
+    # ~96%-neutral store). The admission gate is DESIGNED to admit null+matching and reject
+    # only a *different* brand (admission_gate.py), so moving brand entirely to the gate
+    # restores neutral facts to branded queries WITHOUT relaxing cross-brand isolation - the
+    # gate still rejects other brands (test_brand_isolation.py is the leak guard).
+    _SERVER_FILTER_KEYS = {"include_retired", "include_canonical_intent", "allow_cross_brand", "brand"}
     search_filters = {k: v for k, v in (b.filters or {}).items() if k not in _SERVER_FILTER_KEYS}
     results = mem.search(
         query=b.query,
@@ -1913,6 +1922,9 @@ def _checkpoint_core(b: EpisodeCheckpointIn) -> dict:
     and POST /v1/context/bundle (which performs the upsert as a server-side
     side effect so the hook needs one round-trip instead of two). Raises on
     failure; callers map exceptions to HTTP."""
+    # Security: scrub credential-shaped substrings from prompt_text before it is persisted in the
+    # episode checkpoint — the single chokepoint for BOTH /v1/episodes/checkpoint and the daemon's
+    # /v1/context/bundle, so no client can store a pasted key/token regardless of which path it took.
     with _episodic_connect() as conn:
         episode_id, action = _episodic_upsert_checkpoint(
             conn,
@@ -1921,7 +1933,7 @@ def _checkpoint_core(b: EpisodeCheckpointIn) -> dict:
             brand=b.brand,
             workspace=b.workspace,
             project=b.project,
-            prompt_text=b.prompt_text,
+            prompt_text=redact_secrets(b.prompt_text),
             commit=True,
         )
     return {"ok": True, "episode_id": episode_id, "action": action, "state": "in_progress"}
@@ -1973,6 +1985,13 @@ class ContextBundleIn(BaseModel):
     tier: Optional[str] = "frontier"
     transcript_path: Optional[str] = None
     hook_contract_version: Optional[str] = None
+    # v1.0 A1 (mandated-pull): the memory_recall MCP verb pulls the bundle on demand
+    # because the per-turn UserPromptSubmit hook is dead in the VS Code / Agent-SDK
+    # runtime. A manual pull MUST NOT upsert an episode or every recall would pollute
+    # the SessionStart resume banner with a synthetic session, so it passes
+    # checkpoint=False. The hook path omits it (default True) and keeps the original
+    # checkpoint-first contract unchanged.
+    checkpoint: bool = True
 
 
 @app.post("/v1/context/bundle")
@@ -2008,19 +2027,26 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
     # 2 memories / 5 goals / 3 OQ @ 0.30 (see TIER_BUNDLE_POLICY).
     _tp = resolve_tier_policy(b.tier)
 
-    # 1) episode checkpoint (side effect) — first, never skipped
-    try:
-        out["checkpoint"] = _checkpoint_core(EpisodeCheckpointIn(
-            session_id=b.session_id,
-            transcript_path=b.transcript_path,
-            prompt_text=(b.prompt or "")[:300],
-            brand=b.brand,
-            workspace=b.workspace,
-            project=b.project,
-        ))
-    except Exception:
-        log.exception("bundle: checkpoint failed (non-fatal)")
-        out["checkpoint"] = {"ok": False}
+    # 1) episode checkpoint (side effect) — first, never skipped on the hook path.
+    #    v1.0 A1: a manual memory_recall pull passes checkpoint=False to suppress the
+    #    upsert (no synthetic session in the resume banner); the gated search below
+    #    still runs, so a pull returns the identical memories/goals/open_questions the
+    #    hook would have injected — only the episode write is skipped.
+    if not b.checkpoint:
+        out["checkpoint"] = {"ok": True, "skipped": True}
+    else:
+        try:
+            out["checkpoint"] = _checkpoint_core(EpisodeCheckpointIn(
+                session_id=b.session_id,
+                transcript_path=b.transcript_path,
+                prompt_text=(b.prompt or "")[:300],
+                brand=b.brand,
+                workspace=b.workspace,
+                project=b.project,
+            ))
+        except Exception:
+            log.exception("bundle: checkpoint failed (non-fatal)")
+            out["checkpoint"] = {"ok": False}
 
     # 2) admission-gated proactive search (same parameters the hook used:
     #    user_id=DEFAULT_USER_ID, optional brand, limit = memory_cap (tier-scaled),

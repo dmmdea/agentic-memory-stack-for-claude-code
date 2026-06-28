@@ -1090,6 +1090,22 @@ def count_episodes(
 # v0.17 Phase D — Open Questions CRUD
 # ---------------------------------------------------------------------------
 
+def _ensure_session(conn: sqlite3.Connection, session_id: str | None) -> None:
+    """Insert a minimal sessions row so an open_questions FK reference
+    (first_seen_session_id / resolved_in_session_id -> sessions.session_id) never
+    raises IntegrityError when the referencing session was never checkpointed - e.g.
+    per-turn hooks are disabled in the VS Code / Agent-SDK runtime, so the live
+    session is never written to `sessions`. No-op for None/empty or an already-present
+    session; a later real checkpoint (create_session, ON CONFLICT) enriches the row.
+    """
+    if not session_id:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions (session_id, started_at) VALUES (?, ?)",
+        (session_id, _iso_now()),
+    )
+
+
 def create_open_question(
     conn: sqlite3.Connection,
     question_text: str,
@@ -1107,6 +1123,7 @@ def create_open_question(
     v0.22 Pillar 1: initiative stamps the cwd-derived repo/initiative. None ==
     cross-cutting (surfaces in every session).
     """
+    _ensure_session(conn, first_seen_session_id)
     cur = conn.execute(
         """INSERT INTO open_questions
            (question_text, brand, topic, first_seen_session_id, first_seen_episode_id, related_goal_id, priority, initiative)
@@ -1142,6 +1159,7 @@ def resolve_open_question(
 ) -> bool:
     """Flip status='resolved' + populate resolution fields + bump updated_at."""
     now = _iso_now()
+    _ensure_session(conn, resolved_in_session_id)
     cur = conn.execute(
         """UPDATE open_questions
            SET status = 'resolved', resolved_in_session_id = ?, resolved_at = ?,

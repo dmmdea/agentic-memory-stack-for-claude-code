@@ -48,3 +48,7 @@ eval/faithfulness/results/
 # OS
 .DS_Store
 Thumbs.db
+
+# faithfulness eval: resumable Codex answer cache (local runtime state, not tracked)
+eval/faithfulness/.codex-answer-cache.json
+eval/faithfulness/.codex-answer-cache.json.tmp

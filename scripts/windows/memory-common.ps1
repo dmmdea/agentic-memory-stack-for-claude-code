@@ -700,6 +700,29 @@ function Get-BrandFromTranscriptPath {
     }
 }
 
+function Redact-Secrets {
+    # Strip credential-shaped substrings from session text BEFORE it is sent to the extraction
+    # LLM (Codex, external) or POSTed to mem0 (a local queryable store) — pasted keys/tokens must
+    # not flow into either. Mirrors SkillOpt harvest.redact_secrets (one shared pattern set across
+    # the ecosystem's two session readers). Safe prose is untouched. Replacement strings are SINGLE-
+    # quoted so $1/$2 reach the .NET regex engine as backreferences, not PowerShell variables;
+    # -replace is case-insensitive by default, so no (?i) is needed.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $rules = @(
+        @('sk-[A-Za-z0-9_-]{10,}', '[REDACTED_OPENAI_KEY]'),
+        @('(Authorization:\s*Bearer\s+)[^\s"'']+', '$1[REDACTED]'),
+        @('(Authorization:\s*Basic\s+)[^\s"'']+', '$1[REDACTED]'),
+        @('\b(api[_-]?key|token|password|secret)\b(\s*[:=]\s*)[^\s"'']+', '$1$2[REDACTED]'),
+        # Only the [:=] assignment shape. A bare 'token <word>' / 'password <word>' rule over-
+        # redacts prose ("password reset email") and `\s+` would span the `\n\n` turn break and eat
+        # the next [role] tag in the joined transcript. Do not add it.
+        @('(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
+    )
+    foreach ($r in $rules) { $Text = $Text -replace $r[0], $r[1] }
+    return $Text
+}
+
 function Get-RecentTranscriptTurns {
     param(
         [Parameter(Mandatory)][string]$TranscriptPath,
@@ -752,7 +775,9 @@ function Get-RecentTranscriptTurns {
         } catch { }
     }
     if ($turns.Count -eq 0) { return $null }
-    $joined = $turns -join "`n`n"
+    # Redact secrets on the FULL joined text (before truncation) so credentials never reach the
+    # extractor LLM or mem0 — this is the single chokepoint every L1a/episodic consumer reads from.
+    $joined = Redact-Secrets ($turns -join "`n`n")
     if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
     return $joined
 }

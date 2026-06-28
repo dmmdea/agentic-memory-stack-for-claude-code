@@ -187,8 +187,12 @@ $turns
             }
             if (-not $sessionId) { $sessionId = [System.Guid]::NewGuid().ToString() }
 
-            # Infer brand/workspace/project from transcript path
-            $brandInfo = Get-BrandFromTranscriptPath -Path ($TranscriptPath ?? '')
+            # Infer brand/workspace/project from transcript path. NOTE: plain $TranscriptPath,
+            # NOT ($TranscriptPath ?? '') — the ?? null-coalescing operator is PS7-only and the
+            # Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
+            # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
+            # $TranscriptPath is a [string] param (defaults '', never $null), so ?? was redundant.
+            $brandInfo = Get-BrandFromTranscriptPath -Path $TranscriptPath
 
             # Best-effort started_at: use transcript file mtime as a proxy for session start
             $sessionStartedAt = (Get-Date).ToString('o')

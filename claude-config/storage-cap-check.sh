@@ -104,31 +104,39 @@ if [ -f "$FLAGS" ]; then
   [ "$delta" -gt 20 ] && warnings+="L10 audit-flags: ${delta} NEW since baseline (total ${fcount}). Review ~/.mem0/audit-flags.jsonl. "
 fi
 
-# v0.17 Phase 0.C: recent decisions surface (cross-restart persistence)
-# Read top 5 entries from ~/.mem0/recent-decisions.jsonl (most recent first).
-# Format: ts (YYYY-MM-DD HH:MM), answer (≤80 chars), question_preview (≤60 chars).
-DECISIONS="$HOME/.mem0/recent-decisions.jsonl"
-if [ -f "$DECISIONS" ] && [ -s "$DECISIONS" ]; then
-  decision_lines=$(tail -5 "$DECISIONS" 2>/dev/null | tac 2>/dev/null || tail -5 "$DECISIONS")
-  if [ -n "$decision_lines" ]; then
-    echo "[agentic-memory-stack] recent decisions (last 5):"
-    echo "$decision_lines" | while IFS= read -r dline; do
-      if [ -z "$dline" ]; then continue; fi
-      # Parse ts, answer, question_preview from JSON using python3 (stdlib only)
-      parsed=$(python3 -c "
-import json, sys
+# Recent-sessions surface (cross-restart). 2026-06-24: REPOINTED from recent-decisions.jsonl to
+# episodic.db. recent-decisions.jsonl was written by UserPromptSubmit 0.B (decision capture), a
+# PER-TURN hook that does NOT fire in the Claude Code VSCode-extension / Agent-SDK runtime — so it
+# froze on 2026-06-16 and this banner showed stale 06-16 decisions forever. Episodes ARE captured by
+# the SessionStart/PreCompact LIFECYCLE hooks (which DO fire), so they stay fresh. Show the last 5
+# episodes that have a real goal (skip empty placeholder rows).
+EPDB="$HOME/.mem0/episodic.db"
+if [ -f "$EPDB" ]; then
+  ep=$(python3 - "$EPDB" <<'PY' 2>/dev/null
+import sys, sqlite3
 try:
-    d = json.loads(sys.argv[1])
-    ts = d.get('ts','')[:16].replace('T',' ')
-    ans = d.get('answer','')[:80]
-    q   = d.get('question_preview','')[:60]
-    print(f'  - {ts}: {ans} (Q: {q})')
+    con = sqlite3.connect(sys.argv[1]); con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT e.goal_text AS goal, e.ended_at AS ended, s.brand AS brand "
+        "FROM episodes e LEFT JOIN sessions s ON e.session_id = s.session_id "
+        "WHERE e.goal_text IS NOT NULL AND TRIM(e.goal_text) <> '' "
+        "ORDER BY e.ended_at DESC LIMIT 5"
+    ).fetchall()
+    out = []
+    for r in rows:
+        ended = (r["ended"] or "")[:16].replace("T", " ")
+        goal = (r["goal"] or "")[:90]
+        brand = (r["brand"] or "")
+        tag = ("[" + brand + "] ") if brand else ""
+        out.append("  - " + ended + ": " + tag + goal)
+    if out:
+        print("[agentic-memory-stack] recent sessions (last 5):")
+        print("\n".join(out))
 except Exception:
     pass
-" "$dline" 2>/dev/null)
-      [ -n "$parsed" ] && echo "$parsed"
-    done
-  fi
+PY
+)
+  [ -n "$ep" ] && echo "$ep"
 fi
 
 # v0.17 Phase 0.E: brand context auto-load

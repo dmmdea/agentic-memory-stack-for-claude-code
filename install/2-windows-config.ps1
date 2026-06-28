@@ -127,7 +127,7 @@ Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser
 # WSL-side python — the mem0 write-gate + contradiction-sweep — reach Codex over
 # loopback HTTP) and its flag-gated SessionStart launcher codex-shim-spawn.ps1. Both
 # are R9 hash-tracked (Test-MemoryStack $hookNames), so they MUST be deployed here.
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1')
 foreach ($s in $winScripts) {
     $src = Join-Path $RepoRoot "scripts\windows\$s"
     $dst = Join-Path $ScriptsDir $s
@@ -241,7 +241,23 @@ $settings = if (Test-Path -LiteralPath $settingsPath) {
 # Add hooks property if missing - using a hashtable so PS can mutate it
 $hooks = if ($settings.PSObject.Properties['hooks']) { $settings.hooks } else { New-Object PSCustomObject }
 
-$psDispatcher = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\stop-extract.ps1'
+# 2026-06-25: prefer PowerShell 7 (pwsh) for ALL stack invocations (hooks + the nightly dream task).
+# Windows PowerShell 5.1 has quirks that silently broke the dream under Task Scheduler — empty
+# $LASTEXITCODE across the wsl.exe boundary, lost codex token counts, and the autopromote phase
+# dying mid-loop on a gate BLOCK (verified 2026-06-25: identical run completes end-to-end under
+# pwsh). pwsh 7 runs the same 5.1-clean scripts correctly. Resolve a concrete pwsh path; fall back
+# to powershell.exe ONLY if pwsh is genuinely absent. $psRunner = bare path (for -Execute);
+# $psQuoted = path quoted for embedding in a hook command STRING.
+$psRunner = 'powershell.exe'
+foreach ($cand in @(
+    (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source),
+    (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')
+)) { if ($cand -and (Test-Path $cand)) { $psRunner = $cand; break } }
+$psQuoted = if ($psRunner -match '\s') { '"' + $psRunner + '"' } else { $psRunner }
+Write-Host "    PowerShell runner (hooks + dream): $psRunner"
+
+$psDispatcher = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\stop-extract.ps1'
 # Use wsl.exe to invoke the bash script - Git Bash on Windows can't find /mnt/c paths
 # from this command form, so calling `bash C:/...` exits 127. The wsl.exe form works.
 # (Audit finding 2026-06-08: SessionStart hook silently failed before this fix.)
@@ -260,12 +276,17 @@ $bashCapCheck = 'wsl.exe -d ' + $Distro + ' -e bash -lc "bash /mnt/c/Users/' + $
 # the global `allowed`-style single-marker logic previously APPENDED a second
 # UserPromptSubmit hook on re-run.
 $psUserPrompt   = 'C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-client.exe'
-$psPreToolUse   = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\pre-tool-check.ps1'
-$psDaemonSpawn  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-daemon-spawn.ps1'
+$psPreToolUse   = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\pre-tool-check.ps1'
+$psDaemonSpawn  = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-daemon-spawn.ps1'
 # v0.27.1 R5: the Codex HTTP shim's SessionStart launcher. Flag-gated (no-op unless
 # ~/.claude/state/codex-shim.enabled exists), so registering it costs nothing until
 # the NLI write-gate is turned on.
-$psShimSpawn    = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\codex-shim-spawn.ps1'
+$psShimSpawn    = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\codex-shim-spawn.ps1'
+# 2026-06-24: SessionStart capture of the PRIOR session's transcript. The per-turn
+# Stop/UserPromptSubmit hooks do NOT fire in the Claude Code VSCode-extension / Agent-SDK
+# runtime (verified via fire-marker probe), so Stop-driven capture is dead there. This
+# lifecycle hook (which DOES fire) plus PreCompact carry capture instead. Async + detached.
+$psSessionCapture = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\sessionstart-capture.ps1'
 
 # Each event maps to an ARRAY of stack-owned entries (SessionStart has two).
 # Every entry carries its own dedupe markers; an existing hook matching ANY
@@ -278,7 +299,9 @@ $hookEntries = @{
         # v0.20 A.5: async daemon pre-warm (mirrors the live-box registration shape)
         @{ markers = @('mem0-hook-daemon-spawn.ps1');                      command = $psDaemonSpawn; async = $true; timeout = 10 },
         # v0.27.1 R5: async Codex-shim pre-warm (flag-gated; no-op until the write-gate is enabled)
-        @{ markers = @('codex-shim-spawn.ps1');                            command = $psShimSpawn; async = $true; timeout = 10 }
+        @{ markers = @('codex-shim-spawn.ps1');                            command = $psShimSpawn; async = $true; timeout = 10 },
+        # 2026-06-24: prior-session capture (per-turn hooks dead in VSCode-ext/SDK runtime; this carries capture)
+        @{ markers = @('sessionstart-capture.ps1');                        command = $psSessionCapture; async = $true; timeout = 15 }
     )
     # H12: Phase 0 hooks (v0.20 Final: exe registration + both-shape dedupe)
     'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 5 })
@@ -424,8 +447,8 @@ $taskName = 'ClaudeCode-DreamConsolidator-3am'
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
 $action = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\$env:USERNAME\.claude\scripts\dream-consolidate.ps1"
+    -Execute $psRunner `
+    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Users\$env:USERNAME\.claude\scripts\dream-consolidate.ps1"
 $trigger = New-ScheduledTaskTrigger -Daily -At 3:00am
 $settingsTask = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -444,6 +467,25 @@ Register-ScheduledTask `
     -Description 'Daily 3am dream-consolidate 4-phase consolidator (orient->gather->consolidate->prune). Uses Codex CLI via ChatGPT subscription.' `
     | Out-Null
 Write-Host "    Task Scheduler entry registered (next fire: 3:00 AM tomorrow, WakeToRun enabled)"
+
+# ----------------------------------------------------------------------
+# 5b. Register the nightly semantic-dedup task (4:30am, OFFSET from the 3am dream)
+# ----------------------------------------------------------------------
+# semantic-dedup is a WSL python script (tier-sensitive cosine over the LIVE mem0_egemma_768
+# collection). It runs offset from the dream so the dedup.lock mutual-exclusion never blocks the
+# dream's consolidation. Every delete is preserved in the tier-ledger for restore. (Before 2026-06
+# it had NO scheduled trigger AND queried the dead pre-egemma 'memories' collection -> 404 abort;
+# both fixed: the collection is now env-driven and this task runs it nightly.)
+Write-Host "==> [5b] Registering Task Scheduler entry: ClaudeCode-SemanticDedup-430am"
+$dedupTaskName = 'ClaudeCode-SemanticDedup-430am'
+Unregister-ScheduledTask -TaskName $dedupTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+$dedupCmd = "/home/$WslUser/apps/mem0-server/.venv/bin/python $RepoRootWsl/scripts/wsl/semantic-dedup.py >> /home/$WslUser/.mem0/dedup-cron.log 2>&1"
+$dedupAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wsl.exe" -Argument ('-d ' + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
+$dedupTrigger = New-ScheduledTaskTrigger -Daily -At 4:30am
+$dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+$dedupPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
+Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 
 Write-Host ""
 Write-Host "==> Windows config complete." -ForegroundColor Green

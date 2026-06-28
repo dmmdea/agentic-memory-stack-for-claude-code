@@ -691,7 +691,13 @@ foreach ($nom in $survivingNominees) {
         $canonizeExit = 1
     }
 
-    if ($canonizeExit -eq 0) {
+    # $LASTEXITCODE proved unreliable across the wsl.exe boundary under Task Scheduler (it came back
+    # empty 2026-06-21..23 despite the canonize running, so neither promoted++ nor failed++ ran: the
+    # phantom promoted=0/failed=0 with no error logged). Judge success by the canonize OUTPUT instead.
+    # mem0-canonize.sh prints a JSON body with tier set to canonical only on a real promotion; a
+    # curl/HTTP error (e.g. 403) prints no such body. The failure body is logged in the else branch.
+    $canonizeOk = (([string]$canonizeResult) -match 'tier.{1,8}canonical')
+    if ($canonizeOk) {
         $promotedCount++
         $promoteSummary += "- $shortText [reason: $reason]"
         Write-MemoryLog -Component 'dream' -Message "  autopromote: promoted id=$($nom.memory_id) confidence=$confidence transport=autonomous"
