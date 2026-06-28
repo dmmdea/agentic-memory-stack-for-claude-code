@@ -124,20 +124,25 @@ curl http://127.0.0.1:6333/collections/memories
 
 ---
 
-## Ollama + nomic-embed-text
+## EmbeddingGemma (embedder, on llama-swap `:11436`)
+
+> **v0.22:** Ollama + nomic-embed-text were **DECOMMISSIONED**. The embedder is now
+> EmbeddingGemma-300m (Q8_0 GGUF, 768d) served by llama-swap on `:11436`, via the asymmetric
+> query/document prefix shim `mem0-server/egemma_embedder.py`. Live Qdrant collection:
+> `mem0_egemma_768`.
 
 ```bash
-# Ollama itself
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Re-pull the model (Ollama caches by tag; `:latest` refreshes)
-ollama pull nomic-embed-text:latest
-
-# Verify embedding still works at expected dimension (768)
-curl http://127.0.0.1:11434/api/embed -d '{"model":"nomic-embed-text","input":"test"}' | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['embeddings'][0]))"
+# The model is served by llama-swap (config: ~/llama-swap/config.yaml, always_loaded group).
+# "Upgrading" the embedder means SWAPPING the GGUF / model - a deliberate re-embed, not a
+# patch (see the WARNING). Verify the live embedder + collection are healthy:
+curl -s http://127.0.0.1:18791/health/deep \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('collection:', d.get('collection'), '| qdrant:', d.get('checks',{}).get('qdrant'))"
 ```
 
-**WARNING:** if you swap to a different embedder model (or a different embedding dimension), **mem0's Qdrant collection becomes incompatible** (different dim, no vectors match). You'd need to delete and re-index the entire collection. Don't do this without a plan.
+**WARNING:** swapping the embedder model (or its embedding dimension) makes the
+`mem0_egemma_768` collection **incompatible** (different dim, no vectors match) — you'd need to
+delete and re-index the entire collection. Don't do this without the re-embed plan (see the
+EmbeddingGemma migration in CHANGELOG).
 
 ---
 

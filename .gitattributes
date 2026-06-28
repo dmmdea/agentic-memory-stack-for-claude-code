@@ -1,10 +1,24 @@
-# v0.18 MED-18: shell scripts run under WSL bash directly from the /mnt/d mount.
-# core.autocrlf=true was smudging them to CRLF on Windows checkout, which makes
-# bash fail with "$'\r': command not found" / syntax errors. Pin LF.
-*.sh text eol=lf
+# Normalize ALL text files to LF. core.autocrlf=true on Windows was smudging committed
+# files to CRLF on checkout — which breaks WSL bash scripts ("$'\r': command not found")
+# and causes spurious R9 drift (several scripts/configs are SHA256-compared repo-vs-deployed,
+# so the committed bytes, the working checkout, and the deployed copy must be byte-identical).
+* text=auto eol=lf
 
-# v0.22 Pillar 2: model-tiers.json is deployed verbatim to ~/.claude/scripts and
-# Test-MemoryStack R9 SHA256-compares the repo copy against the deployed copy.
-# Pin LF so the committed bytes, the working-copy checkout, and the deployed copy
-# are byte-identical across machines (no autocrlf smudge -> no spurious R9 drift).
+# Explicit pins for the WSL-executed + R9-deployed surface (belt-and-suspenders over the catch-all):
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ps1  text eol=lf
+*.json text eol=lf
+*.bats text eol=lf
 claude-config/model-tiers.json text eol=lf
+
+# Binary — never EOL-convert (also auto-detected by `text=auto`, pinned here for safety):
+*.gguf binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.gz   binary
+*.zip  binary
+*.db   binary
+*.xlsx binary
