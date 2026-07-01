@@ -1,6 +1,6 @@
 {
   "name": "agentic-memory-stack",
-  "version": "1.0.2",
+  "version": "1.10.0",
   "description": "Installer for a persistent, multi-tier, measurably-faithful memory backend for Claude Code on Windows + WSL2 (mem0 + Qdrant + EmbeddingGemma + Codex-driven extraction). Provides the install-agentic-memory-stack skill.",
   "author": { "name": "agentic-memory-stack" },
   "homepage": "https://github.com/dmmdea/agentic-memory-stack-for-claude-code",
