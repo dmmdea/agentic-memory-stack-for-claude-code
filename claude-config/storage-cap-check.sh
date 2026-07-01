@@ -214,6 +214,20 @@ except Exception:
   [ -n "$goals" ] && echo "$goals"
 fi
 
+# B1 (2026-06-28, Phase 1+2): durable/evidence ranked-bundle enrichment — the thin precis the
+# (now-dead) per-prompt UserPromptSubmit hook used to inject, which the canonical+goals lines do
+# NOT cover. Runs REGARDLESS of brand (gated only on the api key): a brandless session still has
+# brand-neutral facts AND must consume any fresh PreCompact marker so it can't linger. Reuses the
+# live /v1/context/bundle: Phase 2 — a FRESH PreCompact marker supplies a real CONVERSATION query
+# (tier=frontier, K<=2); otherwise a RECENCY pseudo-query (most-recent episode goal; precision-first
+# tier=small, K<=1) + distilled. Silent on abstention. Helper is fail-silent with its own HTTP
+# timeout + checkpoint=False (no synthetic episode in the resume banner).
+if [ -n "$KEY" ]; then
+  SDIR_B1="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  recall=$(python3 "$SDIR_B1/sessionstart_bundle.py" --brand "$BRAND" --initiative "$INITIATIVE" 2>/dev/null)
+  [ -n "$recall" ] && echo "$recall"
+fi
+
 # v0.13 SessionStart hydration: emit a one-line pointer to the stack repo's
 # session_summary.md if present. v1.0 Phase 7B: resolve the repo from the operator
 # receipt (~/.mem0/stack.env MEM0_REPO_ROOT_WSL) instead of a hardcoded dev path.
@@ -245,6 +259,33 @@ BSSTATUS="$HOME/.mem0/brand-scope-status.json"
 if [ -f "$BSSTATUS" ]; then
   nmis=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('n_misscoped',0))" "$BSSTATUS" 2>/dev/null || echo 0)
   [ "${nmis:-0}" -gt 0 ] && warnings+="brand-scope: ${nmis} canonical fact(s) brand-untagged (invisible to brand sessions; see brand-scope-audit.py). "
+fi
+
+# Contradiction-resolve trigger (2026-06-30): run the SAFE Codex resolver when the shim is UP
+# (session-time only — it is NOT up at the Sun 05:00 systemd timer). It CLEARS false advisory flags
+# + QUEUES genuine contradictions for human review (NEVER auto-hides — Codex over-promotes: a live
+# run hid 3/4 CONSISTENT facts). Weekly-throttled; detached so it never blocks SessionStart. The
+# weekly local sweep keeps minting advisory flags; this is what authoritatively resolves them.
+RESOLVE_MARKER="$HOME/.mem0/last-contradiction-rejudge"
+if [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
+  _do=1
+  if [ -f "$RESOLVE_MARKER" ]; then
+    _age=$(( ( $(date +%s) - $(stat -c %Y "$RESOLVE_MARKER" 2>/dev/null || echo 0) ) / 86400 ))
+    [ "$_age" -lt 7 ] && _do=0
+  fi
+  if [ "$_do" = 1 ] && curl -sf --max-time 4 http://127.0.0.1:18792/health >/dev/null 2>&1; then
+    touch "$RESOLVE_MARKER"
+    _PYB="$HOME/apps/mem0-server/.venv/bin/python"; [ -x "$_PYB" ] || _PYB=python3
+    nohup "$_PYB" "$MEM0_REPO_ROOT_WSL/scripts/wsl/contradiction-sweep.py" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
+  fi
+fi
+
+# Contradiction review queue: the safe resolver QUEUES genuine contradictions for human review
+# instead of auto-hiding — surface the outstanding count so the operator promotes the real ones.
+RQ="$HOME/.mem0/contradiction-promote-review.jsonl"
+if [ -s "$RQ" ]; then
+  nrev=$(grep -c . "$RQ" 2>/dev/null)
+  [ "${nrev:-0}" -gt 0 ] && warnings+="${nrev} contradiction(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl). "
 fi
 
 [ -n "$warnings" ] && echo "[storage-cap] $warnings Triage with: python scripts/wsl/audit-flags-triage.py --summary  (then --resolve --reason ...)."

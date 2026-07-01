@@ -42,7 +42,7 @@ Check "EmbeddingGemma :11436" { try { $b = @{model='embeddinggemma'; input='titl
 
 Write-Host ""
 Write-Host "Windows-side files + config:"
-Check "Runtime scripts present" { @('memory-common.ps1','l1a-extract.ps1','dream-consolidate.ps1','stop-extract.ps1','mem0-mcp-shim.py','storage-cap-check.sh','user-prompt-extract.ps1','user-prompt-lib.ps1','pre-tool-check.ps1','mem0-hook-daemon.ps1','mem0-hook-daemon-spawn.ps1','mem0-hook-client.cs','build-hook-client.ps1') | ForEach-Object { Test-Path "$env:USERPROFILE\.claude\scripts\$_" } | Where-Object { $_ -eq $false } | Measure-Object | ForEach-Object { $_.Count -eq 0 } } "Re-run 2-windows-config.ps1"
+Check "Runtime scripts present" { @('memory-common.ps1','l1a-extract.ps1','dream-consolidate.ps1','stop-extract.ps1','mem0-mcp-shim.py','storage-cap-check.sh','sessionstart_bundle.py','precompact_capture.py','user-prompt-extract.ps1','user-prompt-lib.ps1','pre-tool-check.ps1','mem0-hook-daemon.ps1','mem0-hook-daemon-spawn.ps1','mem0-hook-client.cs','build-hook-client.ps1') | ForEach-Object { Test-Path "$env:USERPROFILE\.claude\scripts\$_" } | Where-Object { $_ -eq $false } | Measure-Object | ForEach-Object { $_.Count -eq 0 } } "Re-run 2-windows-config.ps1"
 Check "Stop hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; ($s.hooks.Stop[0].hooks[0].command -match 'stop-extract.ps1') } "Re-run 2-windows-config.ps1"
 Check "PreCompact hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; ($s.hooks.PreCompact[0].hooks[0].command -match 'stop-extract.ps1') } "Re-run 2-windows-config.ps1"
 # v0.20 Final (adversarial-review HIGH): the A.5/A.6 accelerated chain is the

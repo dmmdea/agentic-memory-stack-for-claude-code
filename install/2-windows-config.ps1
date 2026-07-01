@@ -179,6 +179,31 @@ if (Test-Path -LiteralPath $capCheckSrc) {
     Write-Host "    WARN: $capCheckSrc not found" -ForegroundColor Yellow
 }
 
+# B1 (2026-06-28): SessionStart durable/evidence bundle enrichment helper, invoked by
+# storage-cap-check.sh as $SDIR_B1/sessionstart_bundle.py. MUST be deployed BESIDE that script
+# or the B1 enrichment silently no-ops. No sentinel substitution (the .py reads $HOME at runtime,
+# stdlib-only) so the deployed copy stays byte-identical to the repo copy.
+$ssBundleSrc = Join-Path $RepoRoot 'claude-config\sessionstart_bundle.py'
+$ssBundleDst = Join-Path $ScriptsDir 'sessionstart_bundle.py'
+if (Test-Path -LiteralPath $ssBundleSrc) {
+    Copy-Item -LiteralPath $ssBundleSrc -Destination $ssBundleDst -Force
+    Write-Host "    installed: sessionstart_bundle.py (from claude-config)"
+} else {
+    Write-Host "    WARN: $ssBundleSrc not found" -ForegroundColor Yellow
+}
+
+# B1 Phase 2 (2026-06-28): PreCompact conversation-query capture helper (WSL python). Tails the
+# transcript at PreCompact and stashes a redacted query marker the post-compact SessionStart helper
+# consumes. Deployed beside the others; stdlib-only, no sentinel substitution.
+$pcCaptureSrc = Join-Path $RepoRoot 'claude-config\precompact_capture.py'
+$pcCaptureDst = Join-Path $ScriptsDir 'precompact_capture.py'
+if (Test-Path -LiteralPath $pcCaptureSrc) {
+    Copy-Item -LiteralPath $pcCaptureSrc -Destination $pcCaptureDst -Force
+    Write-Host "    installed: precompact_capture.py (from claude-config)"
+} else {
+    Write-Host "    WARN: $pcCaptureSrc not found" -ForegroundColor Yellow
+}
+
 # v0.22 Pillar 2 (D4): model-tier policy read at runtime by the hook lib
 # (Resolve-ModelTier / Get-SessionTier) and the SessionStart spawn launcher.
 # Deployed beside the lib in ScriptsDir so $PSScriptRoot\model-tiers.json
@@ -262,6 +287,9 @@ $psDispatcher = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\
 # from this command form, so calling `bash C:/...` exits 127. The wsl.exe form works.
 # (Audit finding 2026-06-08: SessionStart hook silently failed before this fix.)
 $bashCapCheck = 'wsl.exe -d ' + $Distro + ' -e bash -lc "bash /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/storage-cap-check.sh"'
+# B1 Phase 2 (2026-06-28): PreCompact conversation-query capture — a WSL python hook that tails the
+# transcript and stashes a redacted query marker the post-compact SessionStart helper consumes.
+$bashPreCompactCapture = 'wsl.exe -d ' + $Distro + ' -e bash -lc "python3 /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/precompact_capture.py"'
 
 # H12: v0.17 Phase 0 hooks — UserPromptSubmit (checkpoint + decision-capture + proactive-search)
 # and PreToolUse (audit gate). Previously only registered in the operator's local settings.json;
@@ -293,7 +321,11 @@ $psSessionCapture = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Us
 # marker of ANY entry for that event is treated as ours and replaced.
 $hookEntries = @{
     'Stop'               = @(@{ markers = @('stop-extract.ps1');           command = $psDispatcher })
-    'PreCompact'         = @(@{ markers = @('stop-extract.ps1');           command = $psDispatcher })
+    'PreCompact'         = @(
+        @{ markers = @('stop-extract.ps1');                                command = $psDispatcher },
+        # B1 Phase 2: capture-only conversation query for the post-compact SessionStart top-up.
+        @{ markers = @('precompact_capture.py');                           command = $bashPreCompactCapture }
+    )
     'SessionStart'       = @(
         @{ markers = @('storage-cap-check.sh');                            command = $bashCapCheck },
         # v0.20 A.5: async daemon pre-warm (mirrors the live-box registration shape)
