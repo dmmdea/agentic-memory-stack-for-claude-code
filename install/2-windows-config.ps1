@@ -127,7 +127,11 @@ Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser
 # WSL-side python — the mem0 write-gate + contradiction-sweep — reach Codex over
 # loopback HTTP) and its flag-gated SessionStart launcher codex-shim-spawn.ps1. Both
 # are R9 hash-tracked (Test-MemoryStack $hookNames), so they MUST be deployed here.
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1')
+# Step 3: added dream-catchup.ps1 (debt-based missed-run catch-up, SessionStart-spawned) and
+# memory-index-refresh.ps1 (standalone MEMORY.md index refresh decoupled from the dream) — both
+# spawn detached from SessionStart. Not R9 hash-tracked (they are not hot-path clients), so this
+# stays a superset of $hookNames (InstallerParity holds).
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1')
 foreach ($s in $winScripts) {
     $src = Join-Path $RepoRoot "scripts\windows\$s"
     $dst = Join-Path $ScriptsDir $s

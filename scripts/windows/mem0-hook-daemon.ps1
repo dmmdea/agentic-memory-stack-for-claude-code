@@ -182,6 +182,17 @@ function Invoke-DaemonRawBundle {
     # in C# (the duplicate gate is deleted) — no silent drift.
     $resp.needs_0b   = [bool](Test-DecisionLikePrompt -Prompt ([string]$prompt))
 
+    # Step 1 (2026-06-30): real-time correction-capture. When the prompt looks like
+    # the operator correcting the agent, append it to the durable learn-rules queue
+    # (~/.mem0/learn-rules.jsonl). Rides this already-firing daemon path -> no new
+    # hook, no Windows parallel-hook-spawn race (anthropics/claude-code#37988).
+    # STRICTLY fail-open: never affects the bundle or needs_0b.
+    try {
+        if (Test-CorrectionLikePrompt -Prompt ([string]$prompt)) {
+            [void](Add-LearnRuleCapture -Prompt ([string]$prompt) -SessionId $sessionId -TranscriptPath ([string]$transcriptPath) -Brand ([string]$brand) -Initiative ([string]$initiative))
+        }
+    } catch {}
+
     # --- mirror §4: triviality gate (same constants as the inline path)
     $isTrivial = $true
     $promptForSearch = $null

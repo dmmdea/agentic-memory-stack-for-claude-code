@@ -190,6 +190,73 @@ function Test-DecisionLikePrompt {
     return $isDecisionLike
 }
 
+function Test-CorrectionLikePrompt {
+    <#
+    .SYNOPSIS
+    Step 1 (2026-06-30) real-time correction-capture predicate: does this prompt
+    look like the operator CORRECTING the agent — a signal worth capturing as a
+    durable learn-rule? Mirrors Test-DecisionLikePrompt. Tuned to require an
+    explicit correction/negation idiom so ordinary requests do NOT match (no bare
+    "stop"/"wait"/"no"; "no worries" and friends must not trip it).
+    #>
+    param([string]$Prompt)
+
+    if ([string]::IsNullOrWhiteSpace($Prompt)) { return $false }
+    $p = $Prompt.Trim()
+
+    $patterns = @(
+        "(?i)\b(that'?s|thats) (wrong|incorrect|not right|not correct|not what i (meant|asked|wanted|said))\b",
+        "(?i)^\s*(no|nope)\b[,.\s]+(that|thats|that'?s|you|it|dont|don'?t|wrong|not\b|revert|undo)",
+        "(?i)\byou (forgot|missed|should have|were supposed to|shouldn'?t have|weren'?t supposed to)\b",
+        "(?i)\b(revert|undo (that|it|this)|roll ?back)\b",
+        "(?i)\b(don'?t|do not) (do|make) (that|this)( again)?\b",
+        "(?i)\bwrong (file|one|place|approach|way|command|branch|dir|directory|path)\b",
+        "(?i)\bthat'?s not (what|how|right|correct)\b",
+        "(?i)\bactually[, ].{0,25}\b(not|wrong|instead|meant|should)\b"
+    )
+    foreach ($rx in $patterns) { if ($p -match $rx) { return $true } }
+    return $false
+}
+
+function Add-LearnRuleCapture {
+    <#
+    .SYNOPSIS
+    Step 1 (2026-06-30): append a detected operator-correction to the durable,
+    append-only learn-rules queue (~/.mem0/learn-rules.jsonl). Flywheel-shaped —
+    capture is decoupled from consolidation (a future promoter / the nightly dream
+    drains it). STRICTLY fail-open (never throws; the per-prompt hook must never
+    break). One compact JSON object per line. PS5.1-safe (no ternary / ?. / ??).
+    #>
+    param(
+        [string]$Prompt,
+        [string]$SessionId = '',
+        [string]$TranscriptPath = '',
+        [string]$Brand = '',
+        [string]$Initiative = '',
+        [string]$QueuePath = ($env:USERPROFILE + '\.mem0\learn-rules.jsonl')
+    )
+    try {
+        if ([string]::IsNullOrWhiteSpace($Prompt)) { return $false }
+        $dir = Split-Path -Parent $QueuePath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $text = $Prompt.Trim()
+        if ($text.Length -gt 2000) { $text = $text.Substring(0, 2000) }
+        $rec = [ordered]@{
+            ts         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            kind       = 'correction'
+            session_id = $SessionId
+            brand      = $Brand
+            initiative = $Initiative
+            transcript = $TranscriptPath
+            correction = $text
+            status     = 'pending'
+        }
+        $json = $rec | ConvertTo-Json -Compress -Depth 4
+        Add-Content -LiteralPath $QueuePath -Value $json -Encoding UTF8
+        return $true
+    } catch { return $false }
+}
+
 function Get-StackBrandRules {
     <#
     .SYNOPSIS

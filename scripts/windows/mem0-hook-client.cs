@@ -56,7 +56,7 @@ using System.Text.RegularExpressions;
 static class HookClient
 {
     const int ConnectTimeoutMs  = 100;   // same budget as the PS client
-    const int ResponseTimeoutMs = 2500;  // same budget as the PS client
+    const int ResponseTimeoutMs = 8000;  // raised 2500->8000 (2026-06-30): the COLD daemon bundle_raw is ~3.3s; the old 2.5s budget made the exe abandon the daemon and fall to the flaky inline path (intermittent GetResponse timeouts -> no injection). Outer hook timeout is 30s, so there is headroom. Warm bundles still return in ~200ms.
 
     static string ScriptDir;             // exe's own dir = deployed scripts dir
 
@@ -117,7 +117,7 @@ static class HookClient
 
         // SUCCESS: emit the daemon-rendered block (raw bytes + CRLF — the PS
         // client's [Console]::Out.WriteLine equivalent).
-        if (contextBytes != null && contextBytes.Length > 0) WriteStdout(contextBytes, true);
+        if (contextBytes != null && contextBytes.Length > 0) WriteAdditionalContext(contextBytes);
         Log("0.A+0.D served by daemon (exe): session=" + (sid ?? "?") + " " + (diag ?? "") + " exe_ms=" + sw.ElapsedMilliseconds);
 
         // Phase 0.B pre-gates: the decision verdict (needs_0b) is computed
@@ -349,10 +349,14 @@ static class HookClient
                 Stream si = p.StandardInput.BaseStream;
                 si.Write(stdin, 0, stdin.Length);
                 si.Close();
-                using (Stream o = Console.OpenStandardOutput())
+                using (MemoryStream ms = new MemoryStream())
                 {
-                    p.StandardOutput.BaseStream.CopyTo(o);
-                    o.Flush();
+                    // Buffer the child's stdout (the raw [MEMORY CONTEXT] block from
+                    // user-prompt-extract.ps1's [Console]::Out.WriteLine), then emit it
+                    // wrapped in the additionalContext envelope. Empty (0.B-only path,
+                    // MEM0_HOOK_DAEMON_SERVED=1) -> WriteAdditionalContext writes nothing.
+                    p.StandardOutput.BaseStream.CopyTo(ms);
+                    WriteAdditionalContext(ms.ToArray());
                 }
                 p.WaitForExit();
                 int code = p.ExitCode;
@@ -392,14 +396,56 @@ static class HookClient
 
     // -------------------------------------------------------------- output
 
-    static void WriteStdout(byte[] data, bool newline)
+    // WriteStdout removed 2026-06-30 (superseded by WriteAdditionalContext; its
+    // plain-stdout framing is silently dropped by the SDK/VSCode runtime).
+
+    // v-fix 2026-06-30: emit the memory block wrapped in the Claude Code
+    // UserPromptSubmit JSON envelope. The VSCode/Agent-SDK runtime injects ONLY
+    // hookSpecificOutput.additionalContext and silently DROPS plain stdout
+    // (verified: mr-hook uses this envelope and is injected every prompt; this
+    // client emitted raw stdout, which the runtime dropped). Fail-OPEN: null/
+    // empty -> write nothing, still exit 0 (a guard must never block the prompt).
+    static void WriteAdditionalContext(byte[] blockUtf8)
     {
-        // Raw bytes (the daemon's block is UTF-8) + CRLF, matching the PS
-        // client's [Console]::Out.WriteLine framing.
-        Stream o = Console.OpenStandardOutput();
-        o.Write(data, 0, data.Length);
-        if (newline) o.Write(new byte[] { 13, 10 }, 0, 2);
-        o.Flush();
+        if (blockUtf8 == null || blockUtf8.Length == 0) return;
+        try
+        {
+            string block = Encoding.UTF8.GetString(blockUtf8).TrimEnd('\r', '\n');
+            if (block.Length == 0) return;
+            string json = "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":"
+                        + JsonEscape(block) + "}}";
+            byte[] outBytes = Encoding.UTF8.GetBytes(json);
+            Stream o = Console.OpenStandardOutput();
+            o.Write(outBytes, 0, outBytes.Length);
+            o.Write(new byte[] { 13, 10 }, 0, 2);
+            o.Flush();
+        }
+        catch { }
+    }
+
+    static string JsonEscape(string s)
+    {
+        var sb = new StringBuilder(s.Length + 2);
+        sb.Append('"');
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
     }
 
     // --------------------------------------------------------------- misc

@@ -3,7 +3,7 @@
 # Fires nightly 3am via Windows Task Scheduler. Throttled to 24h.
 # Codex (gpt-5.5 medium) executes each phase; Fable designed the prompts.
 
-param([switch]$DryRun)
+param([switch]$DryRun, [switch]$Force)
 
 $ErrorActionPreference = 'Continue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -26,9 +26,11 @@ $DcHomeUnc = "\\wsl.localhost\$DcDistro\home\$DcWslUser"
 . (Join-Path $ScriptDir 'autopromote-lib.ps1')
 Initialize-MemoryEnv
 
-# 24h throttle (independent of L1a 10-min throttle)
+# 24h throttle (independent of L1a 10-min throttle). -Force bypasses ONLY this throttle
+# check (for a manual /dream-now); the Codex lock below still applies so a -Force run can
+# never collide with the nightly task or an in-flight L1a.
 $ThrottleName = 'dream'
-if (-not $DryRun -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 86400)) {
+if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 86400)) {
     Write-MemoryLog -Component 'dream' -Message 'skipping: 24h throttle not yet elapsed'
     exit 0
 }

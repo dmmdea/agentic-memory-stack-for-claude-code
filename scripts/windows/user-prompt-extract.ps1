@@ -512,6 +512,15 @@ if ($contextBlock) { [Console]::Out.WriteLine($contextBlock) }
 # --- Phase 0.B decision detection (wrapped so early exits don't block the tail) ---
 $questionPreview = $null
 
+# --- Step 1 (2026-06-30): real-time correction-capture (inline path). Runs
+#     INDEPENDENT of the decision-capture transcript guard below -- a correction
+#     is worth recording even without a readable transcript. Fail-open. ---
+try {
+    if (Test-CorrectionLikePrompt -Prompt $prompt) {
+        [void](Add-LearnRuleCapture -Prompt $prompt -SessionId $sessionId -TranscriptPath ([string]$transcriptPath))
+    }
+} catch { Write-Log "0.C correction-capture (inline) failed: $($_.Exception.Message)" }
+
 # Only attempt decision capture if we have a transcript and a short decision-like prompt
 # (v0.18 MED-20: predicate extracted to user-prompt-lib.ps1 Test-DecisionLikePrompt)
 if ($transcriptPath -and [System.IO.File]::Exists($transcriptPath)) {

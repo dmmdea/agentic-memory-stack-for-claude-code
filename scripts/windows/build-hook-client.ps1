@@ -116,7 +116,10 @@ if (-not $NoDeployCs) {
     $bhcCfg = $null
     try { if (Test-Path -LiteralPath $bhcCfgPath) { $bhcCfg = Import-PowerShellDataFile $bhcCfgPath } } catch { $bhcCfg = $null }
     $bhcUtf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    foreach ($hot in @('user-prompt-lib.ps1', 'mem0-hook-daemon.ps1')) {
+    # Step 3: dream-catchup.ps1 + memory-index-refresh.ps1 ride the same deploy so a
+    # build-hook-client.ps1 run ships them to ~/.claude/scripts (they carry no operator
+    # sentinels, so the substitution branch is skipped and they copy verbatim).
+    foreach ($hot in @('user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'user-prompt-extract.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1')) {
         $repoHot = Join-Path $PSScriptRoot $hot
         $depHot  = Join-Path $DeployDir $hot
         if ((Test-Path -LiteralPath $repoHot) -and
