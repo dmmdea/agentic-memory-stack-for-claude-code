@@ -40,7 +40,7 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full data-flow diagram and 
 
 ### v1.0 faithfulness (R1–R6)
 
-The stack went from "store + inject and hope" to "measurably faithful memory": a causal-intervention eval (R1), specificity-first extraction (R3), abstention-first gated injection (R2), write-gate + freshness + reconciliation governance (R5), attention-hygiene placement (R6), and a low-confidence raw-trace fallback (R4). Each is research-grounded and adversarially audited. See `docs/research/` and `CHANGELOG.md`.
+The stack went from "store + inject and hope" to "measurably faithful memory": a causal-intervention eval (R1), specificity-first extraction (R3), abstention-first gated injection (R2), write-gate + freshness + reconciliation governance (R5), attention-hygiene placement (R6), and a low-confidence raw-trace fallback (R4). Each is research-grounded and adversarially audited (full research notes and changelog live in the private development repo; releases carry the public notes).
 
 ## Files in this repo
 

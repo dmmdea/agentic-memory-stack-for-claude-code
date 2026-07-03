@@ -66,7 +66,7 @@ Check "curl in WSL" { wsl.exe -d $Distro -e which curl 2>&1 | Out-Null; $LASTEXI
 Check "llama-swap :11436 reachable in WSL" {
     wsl.exe -d $Distro -e bash -lc "curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null" 2>&1 | Out-Null
     $LASTEXITCODE -eq 0
-} "Start llama-swap (single local inference stack on :11436). See SKILL.md 'llama-swap.yaml' — it serves the EmbeddingGemma embedder + bge-reranker. Needs a llama.cpp build >= b6384 for the gemma-embedding arch."
+} "Start llama-swap (single local inference stack on :11436) serving the EmbeddingGemma embedder + bge-reranker. Full step-by-step guide: install/llama-swap-setup.md (build llama.cpp >= b6384, download the two GGUFs, config + systemd unit + verify)."
 Check "Node 22+ in WSL" {
     $v = wsl.exe -d $Distro -e bash -lc "node --version 2>/dev/null"
     if (-not $v) { return $false }
