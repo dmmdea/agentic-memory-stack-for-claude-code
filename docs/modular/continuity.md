@@ -206,7 +206,7 @@ a Python-side helper that catches `OperationalError: duplicate column name` so
    the numbered question and the user reply may push the assistant turn out of range.
    If this becomes a problem, increase the `Tail` value in the script.
 
-5. **mem0 write for decisions requires WSL warm:** If Ollama is not running,
+5. **mem0 write for decisions requires WSL warm:** If llama-swap (the embedder) is not running,
    the mem0 POST will fail. The `recent-decisions.jsonl` append still succeeds
    (it's a file write, not a service call). The SessionStart hydration still works
    from the JSONL file.

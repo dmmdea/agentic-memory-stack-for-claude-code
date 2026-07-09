@@ -45,6 +45,40 @@ class AdmissionDecision:
     reason: str
 
 
+# MEM-8 (2026-07-03): retrieval-starvation observability. The gate silently
+# eating results was invisible short of grepping admission-rejected.jsonl —
+# the exact failure mode behind branded-recall starvation (A2 measured 37.5%
+# recall before the v1.0 Phase B fix). In-memory counters per reason FAMILY
+# (the prefix before ':' — the suffix carries per-record ids/brands and would
+# explode cardinality), reset when the UTC day rolls; /health/deep surfaces
+# the snapshot as checks.admission_rejections_today. In-process only — a
+# restart zeroes it; admission-rejected.jsonl stays the durable audit record.
+admission_rejection_stats: dict = {"date": None, "total": 0, "reasons": {}}
+
+
+def _count_rejection(reason: str) -> None:
+    """Bump the per-family daily counter (lazy day-roll reset)."""
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    if admission_rejection_stats["date"] != today:
+        admission_rejection_stats["date"] = today
+        admission_rejection_stats["total"] = 0
+        admission_rejection_stats["reasons"] = {}
+    family = (reason or "unknown").split(":", 1)[0]
+    admission_rejection_stats["total"] += 1
+    admission_rejection_stats["reasons"][family] = (
+        admission_rejection_stats["reasons"].get(family, 0) + 1)
+
+
+def admission_rejections_today(top_n: int = 8) -> dict:
+    """Snapshot for /health/deep: {date, total, reasons} with the top_n reason
+    families by count. Zero-I/O; informational — never flips health ok."""
+    reasons = dict(sorted(
+        admission_rejection_stats["reasons"].items(), key=lambda kv: -kv[1])[:top_n])
+    return {"date": admission_rejection_stats["date"],
+            "total": admission_rejection_stats["total"],
+            "reasons": reasons}
+
+
 @dataclass
 class AdmissionPolicy:
     allowed_tiers: tuple[str, ...]
@@ -312,7 +346,8 @@ def log_rejected(memory_id: str, reason: str, layer: str, target_path: Optional[
         pass
 
 
-def apply_admission(results: Iterable[dict], scope: dict, query_class: str, layer: str = "server-search") -> list[dict]:
+def apply_admission(results: Iterable[dict], scope: dict, query_class: str, layer: str = "server-search",
+                    stats_out: Optional[dict] = None) -> list[dict]:
     """Apply default policy to a result list. Admitted results returned;
     rejected ones logged. Tier and recency checks apply regardless of scope.
     Brand (v0.19 M4, fail-closed): with scope['brand'] set, mismatched-brand
@@ -325,7 +360,12 @@ def apply_admission(results: Iterable[dict], scope: dict, query_class: str, laye
     'Operational' previously selected the 180d policy but silently skipped
     the recency rejection (raw-string compare in evaluate).
     v0.19 M11: log_rejected is guarded — an unwritable audit file logs a WARN
-    and the search continues; it must never turn a rejecting search into a 500."""
+    and the search continues; it must never turn a rejecting search into a 500.
+    MEM-8 (2026-07-03): every rejection bumps the in-memory daily counters
+    (_count_rejection, surfaced at /health/deep). `stats_out`, when passed,
+    receives per-CALL counts — today just rejected_brand_scoped (the
+    brandless fail-closed hides that starve a shim search invisibly; app.py
+    echoes it on the search response so the MCP shim can hint 'pass brand=')."""
     qc = (query_class or "durable").strip().lower() or "durable"
     policy = default_policy_for_class(qc)
     admitted = []
@@ -334,6 +374,9 @@ def apply_admission(results: Iterable[dict], scope: dict, query_class: str, laye
         if d.admit:
             admitted.append(r)
         else:
+            _count_rejection(d.reason)
+            if stats_out is not None and d.reason.startswith("brand_scope_required"):
+                stats_out["rejected_brand_scoped"] = stats_out.get("rejected_brand_scoped", 0) + 1
             try:
                 log_rejected(memory_id=r.get("id") or "unknown", reason=d.reason, layer=layer)
             except Exception:

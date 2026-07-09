@@ -459,7 +459,8 @@ if ($insights.Count -gt 0 -and -not $DryRun) {
                             actor = 'dream-consolidator'
                             reason = "cited as source_memory_id by insight"
                         } | ConvertTo-Json -Depth 4
-                        Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:18791/v1/memories/$sourceMid/metadata" -Headers @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'} -Body $patchBody -TimeoutSec 5 | Out-Null
+                        # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
+                        Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:18791/v1/memories/$sourceMid/metadata" -Headers @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'} -Body ([System.Text.Encoding]::UTF8.GetBytes($patchBody)) -TimeoutSec 5 | Out-Null
                     } catch {
                         # Best-effort - don't abort the cycle if a single PATCH fails
                         Write-MemoryLog -Component 'dream' -Message "  PATCH touched_by_dream failed for ${sourceMid}: $_"
@@ -498,10 +499,11 @@ try {
         # run_id) — without it the server 500s and this whole fetch was silently caught as
         # "non-fatal", leaving $canonicalNorm EMPTY so the canonical-dedup guard never ran.
         # Add the runtime user scope ($DcWslUser, line 17; no sentinels in this file).
+        # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
         $canonicalResp = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/search" `
             -Method Post `
             -Headers @{'X-API-Key' = $ckeyForFetch; 'Content-Type' = 'application/json'} `
-            -Body (@{ query = ''; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 1000 } | ConvertTo-Json -Depth 4 -Compress) `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = ''; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 1000 } | ConvertTo-Json -Depth 4 -Compress))) `
             -TimeoutSec 10
         if ($canonicalResp -and $canonicalResp.results) {
             $canonicalFacts = @($canonicalResp.results | ForEach-Object { $_.memory })
@@ -684,7 +686,12 @@ foreach ($nom in $survivingNominees) {
             $sqEsc = "'" + '"' + "'" + '"' + "'"
             $escapedReason = $nom.reason.Replace($sq, $sqEsc)
             $escapedMid    = $nom.memory_id.Replace($sq, $sqEsc)
-            $canonizeCmd   = "bash ${DcRepoWsl}/scripts/wsl/mem0-canonize.sh --actor dream-autopromote '${escapedMid}' '${escapedReason}'"
+            # v1.12 B1 (MEM-7): run the DEPLOYED canonize script (~/apps/mem0-scripts,
+            # synced by deploy.sh) - never the dev working tree, where an uncommitted
+            # edit becomes production behavior at 3am. (ASCII hyphen ON PURPOSE: this
+            # no-BOM file is read as ANSI by PS 5.1, and an em-dash's 0x94 byte is a
+            # smart-quote that desyncs the 5.1 tokenizer - PS51Compat caught exactly that.)
+            $canonizeCmd   = "bash /home/$DcWslUser/apps/mem0-scripts/mem0-canonize.sh --actor dream-autopromote '${escapedMid}' '${escapedReason}'"
             $canonizeResult = wsl.exe -d $DcDistro -e bash -c $canonizeCmd 2>&1
             $canonizeExit = $LASTEXITCODE
         }
@@ -743,7 +750,10 @@ if (-not $DryRun -and -not $DcRepoWsl) {
     Write-MemoryLog -Component 'dream' -Message '  skip index-build: no RepoRootWsl in receipt (run install to write ~/.claude/scripts/mem0-stack.config.psd1)'
     Mark-Throttle -Name $ThrottleName
 } elseif (-not $DryRun) {
-    $indexResult = wsl.exe -d $DcDistro -e bash -c "/home/$DcWslUser/apps/mem0-server/.venv/bin/python $DcRepoWsl/scripts/wsl/memory-index-build.py 2>&1"
+    # v1.12 B1 (MEM-7): invoke the DEPLOYED builder (~/apps/mem0-scripts, synced by
+    # deploy.sh) - never the dev working tree, where an uncommitted edit becomes
+    # production behavior at 3am (same change as memory-index-refresh.ps1).
+    $indexResult = wsl.exe -d $DcDistro -e bash -c "/home/$DcWslUser/apps/mem0-server/.venv/bin/python /home/$DcWslUser/apps/mem0-scripts/memory-index-build.py 2>&1"
     $indexExit = $LASTEXITCODE
     Write-MemoryLog -Component 'dream' -Message "  $indexResult"
     if ($indexExit -ne 0) {
@@ -765,7 +775,8 @@ Save-PhaseState -Phase 'prune' -Payload @{
 # SessionStart storage-cap hook surfaces as a warning when any record is mis-scoped.
 if (-not $DryRun -and $DcRepoWsl) {
     try {
-        $bsAudit = wsl.exe -d $DcDistro -e bash -c "/home/$DcWslUser/apps/mem0-server/.venv/bin/python $DcRepoWsl/scripts/wsl/brand-scope-audit.py 2>&1"
+        # v1.12 B1 (MEM-7): deployed runtime root, not the dev working tree.
+        $bsAudit = wsl.exe -d $DcDistro -e bash -c "/home/$DcWslUser/apps/mem0-server/.venv/bin/python /home/$DcWslUser/apps/mem0-scripts/brand-scope-audit.py 2>&1"
         Write-MemoryLog -Component 'dream' -Message "  brand-scope audit: $bsAudit"
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  brand-scope audit failed (non-fatal): $_"

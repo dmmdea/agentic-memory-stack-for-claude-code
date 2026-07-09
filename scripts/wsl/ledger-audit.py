@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -32,6 +33,30 @@ import httpx
 LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
 REPORT = Path.home() / ".mem0" / "ledger-audit-report.jsonl"
 BASELINE = Path.home() / ".mem0" / "ledger-audit-baseline.json"
+
+# MEM-16 (2026-07-03): the ledger is now the legacy tier-ledger.jsonl (frozen
+# historical archive) PLUS monthly segments tier-ledger-YYYY-MM.jsonl written
+# by app.py _append_ledger and the maintenance scripts (decay-scan /
+# goals-stale-sweep / semantic-dedup — all moved in the same change). The
+# strict YYYY-MM regex excludes tier-ledger-restore.jsonl (stack-restore.sh's
+# inspection copy) and any other non-segment sibling.
+_SEGMENT_RE = re.compile(r"^tier-ledger-\d{4}-\d{2}\.jsonl$")
+
+
+def ledger_files() -> list[Path]:
+    """Every ledger file to audit, in walk order: legacy archive first, then
+    monthly segments sorted by name (== chronological), so the monotonic
+    timestamp check spans the cutover naturally. Derives the segment dir from
+    LEDGER so tests that repoint LEDGER at tmp_path get segments from there."""
+    files: list[Path] = []
+    if LEDGER.exists():
+        files.append(LEDGER)
+    if LEDGER.parent.exists():
+        files.extend(sorted(
+            p for p in LEDGER.parent.glob("tier-ledger-*.jsonl")
+            if _SEGMENT_RE.match(p.name)
+        ))
+    return files
 
 # v0.18 MED-15: counts captured by --baseline and subtracted by --accept-baseline.
 # v0.19 M8: --baseline additionally records finding IDENTITIES (orphan_ids set +
@@ -145,7 +170,8 @@ def main() -> int:
                              "the existing baseline (only after triage — see docs/modular/tier-policy.md)")
     args = parser.parse_args()
 
-    if not LEDGER.exists():
+    files = ledger_files()
+    if not files:
         print("ledger-audit: no ledger to audit (not found)", flush=True)
         return 0
 
@@ -160,79 +186,86 @@ def main() -> int:
     deleted_memory_ids: set[str] = set()
     schema_versioned_entries = 0
 
-    # ---- Walk ledger ----
-    lines = LEDGER.read_text(encoding="utf-8").splitlines()
+    # ---- Walk ledger: legacy archive first, then monthly segments (MEM-16).
+    # last_ts carries ACROSS files — the walk order is chronological by design,
+    # so the monotonic check still covers the legacy->segment cutover boundary.
+    # Findings gain a "file" key (line numbers are per-file after segmentation).
     total_lines = 0
-    for line_no, line in enumerate(lines, 1):
-        line = line.strip()
-        if not line:
-            continue
-        total_lines += 1
+    for lf in files:
+        for line_no, line in enumerate(lf.read_text(encoding="utf-8").splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            total_lines += 1
 
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError as e:
-            parse_errors += 1
-            findings.append({"line": line_no, "type": "parse_error", "detail": str(e)})
-            continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as e:
+                parse_errors += 1
+                findings.append({"file": lf.name, "line": line_no, "type": "parse_error", "detail": str(e)})
+                continue
 
-        ts = entry.get("ts", "")
-        event = entry.get("event")
-        schema_ver = entry.get("schema_version")
-        counts[event or "unknown"] += 1
+            ts = entry.get("ts", "")
+            event = entry.get("event")
+            schema_ver = entry.get("schema_version")
+            counts[event or "unknown"] += 1
 
-        if schema_ver:
-            schema_versioned_entries += 1
-        else:
-            legacy_entries += 1
-            # Legacy entries: annotate but do NOT count as violations
-            findings.append({
-                "line": line_no,
-                "type": "legacy_schema",
-                "event": event,
-                "note": "pre-v0.17 entry; no schema_version field; won't recur post-F.4.4",
-            })
-
-        # 3. Monotonic timestamp check
-        if ts and last_ts and ts < last_ts:
-            monotonic_violations += 1
-            monotonic_pairs.append([last_ts, ts])  # v0.19 M8: identity key
-            findings.append({
-                "line": line_no,
-                "type": "non_monotonic",
-                "ts": ts,
-                "prev_ts": last_ts,
-            })
-        if ts:
-            last_ts = ts
-
-        # 4. Schema validation (v17+ entries only)
-        if schema_ver:
-            spec = SCHEMA.get(event)
-            if spec is None:
-                findings.append({
-                    "line": line_no,
-                    "type": "unknown_event",
-                    "event": event,
-                    "note": "not in SCHEMA — may be a new event type; add to SCHEMA if recurring",
-                })
-                schema_violations += 1
+            if schema_ver:
+                schema_versioned_entries += 1
             else:
-                for required in spec["required"]:
-                    if required not in entry or entry[required] is None:
-                        findings.append({
-                            "line": line_no,
-                            "type": "missing_field",
-                            "event": event,
-                            "field": required,
-                        })
-                        schema_violations += 1
+                legacy_entries += 1
+                # Legacy entries: annotate but do NOT count as violations
+                findings.append({
+                    "file": lf.name,
+                    "line": line_no,
+                    "type": "legacy_schema",
+                    "event": event,
+                    "note": "pre-v0.17 entry; no schema_version field; won't recur post-F.4.4",
+                })
 
-        # 5. Track deleted memory_ids
-        if event in ("delete", "decay-delete"):
-            mid = entry.get("memory_id")
-            if mid:
-                deleted_memory_ids.add(str(mid))
+            # 3. Monotonic timestamp check
+            if ts and last_ts and ts < last_ts:
+                monotonic_violations += 1
+                monotonic_pairs.append([last_ts, ts])  # v0.19 M8: identity key
+                findings.append({
+                    "file": lf.name,
+                    "line": line_no,
+                    "type": "non_monotonic",
+                    "ts": ts,
+                    "prev_ts": last_ts,
+                })
+            if ts:
+                last_ts = ts
+
+            # 4. Schema validation (v17+ entries only)
+            if schema_ver:
+                spec = SCHEMA.get(event)
+                if spec is None:
+                    findings.append({
+                        "file": lf.name,
+                        "line": line_no,
+                        "type": "unknown_event",
+                        "event": event,
+                        "note": "not in SCHEMA — may be a new event type; add to SCHEMA if recurring",
+                    })
+                    schema_violations += 1
+                else:
+                    for required in spec["required"]:
+                        if required not in entry or entry[required] is None:
+                            findings.append({
+                                "file": lf.name,
+                                "line": line_no,
+                                "type": "missing_field",
+                                "event": event,
+                                "field": required,
+                            })
+                            schema_violations += 1
+
+            # 5. Track deleted memory_ids
+            if event in ("delete", "decay-delete"):
+                mid = entry.get("memory_id")
+                if mid:
+                    deleted_memory_ids.add(str(mid))
 
     # ---- Optional: Qdrant orphan detection ----
     orphan_count = 0
@@ -278,18 +311,20 @@ def main() -> int:
                 })
             else:
                 # Collect all memory_ids referenced in the ledger
+                # (MEM-16: across the legacy archive + every monthly segment)
                 referenced: set[str] = set()
-                for line in LEDGER.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                        mid = e.get("memory_id")
-                        if mid:
-                            referenced.add(str(mid))
-                    except Exception:
-                        continue
+                for lf in files:
+                    for line in lf.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                            mid = e.get("memory_id")
+                            if mid:
+                                referenced.add(str(mid))
+                        except Exception:
+                            continue
 
                 # Orphan = referenced in ledger but neither in live Qdrant NOR in a delete event
                 orphans = referenced - live_memory_ids - deleted_memory_ids
@@ -445,6 +480,8 @@ def main() -> int:
     report_data = {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
         "ledger_path": str(LEDGER),
+        # MEM-16: every file audited (legacy archive + monthly segments)
+        "ledger_files": [str(p) for p in files],
         "total_lines": total_lines,
         "total_entries": sum(counts.values()),
         "event_counts": dict(counts.most_common()),
@@ -467,7 +504,7 @@ def main() -> int:
 
     # ---- Print summary ----
     print(
-        f"ledger-audit: {sum(counts.values())} entries "
+        f"ledger-audit: {sum(counts.values())} entries across {len(files)} file(s) "
         f"({schema_versioned_entries} v17+, {legacy_entries} legacy), "
         f"{parse_errors} parse errors, "
         f"{monotonic_violations} non-monotonic, "

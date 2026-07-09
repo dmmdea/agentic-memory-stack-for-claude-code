@@ -267,6 +267,21 @@ mkdir -p "$SYSTEMD_USER_DIR"
 
 # v0.22 M5: egemma-rollback-prune.{service,timer} are now version-controlled and
 # deployed here (previously hand-placed on the live box, outside R9/parity). They are
+# ----------------------------------------------------------------------
+# Maintenance-script runtime root (~/apps/mem0-scripts) — v1.12 B1 (MEM-7)
+# Timers exec DEPLOYED copies, never a dev working tree: an uncommitted repo
+# edit must not become production behavior at the next timer fire. deploy.sh
+# is the ongoing sync path; this block seeds a fresh install.
+# ----------------------------------------------------------------------
+SCRIPTS_DIR="$USER_HOME/apps/mem0-scripts"
+mkdir -p "$SCRIPTS_DIR"
+for f in "$REPO_ROOT"/scripts/wsl/*.py "$REPO_ROOT"/scripts/wsl/*.sh; do
+    [ -f "$f" ] || continue
+    tr -d "\r" < "$f" > "$SCRIPTS_DIR/$(basename "$f")"
+done
+chmod +x "$SCRIPTS_DIR"/*.sh
+echo "  maintenance scripts deployed to $SCRIPTS_DIR (timers exec these, not the repo)"
+
 # DEPLOYED but the timer is NOT auto-enabled — it is a one-shot tied to the v0.22
 # migration window (fires 2026-06-21) and a fresh install starts directly on the
 # mem0_egemma_768 collection with no old `memories` rollback anchor to prune.

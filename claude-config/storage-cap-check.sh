@@ -94,14 +94,45 @@ if [ -d "$QDRANT_DIR" ]; then
   [ "${size_mb:-0}" -gt 1024 ] && warnings+="Qdrant storage ${size_mb} MB (cap 1024). "
 fi
 
-# L10 audit flags — alert on DELTA above baseline (post-wipe v0.13 — see Task A.4)
+# L10 audit flags — MEM-11 (2026-07-03): the old banner printed raw line count
+# minus a baseline file that holds 0, i.e. EVERY flag ever written (328) — 4.6x
+# the real backlog and unfixable by triage (audit-flags.jsonl is append-only;
+# --resolve marks reviewed_keys in l10-state.json, it never shrinks the file).
+# Count what SLOWDRIP counts (l10-audit.py / audit-flags-triage.py --summary):
+# flags whose "<memory_id>:<flag_type>" dedup-key is NOT in
+# l10-state.json["reviewed_keys"] — so the banner (71 today) matches the number
+# the operator actually clears with the triage tool. Pure-local: two file
+# reads, no server call.
 FLAGS="$HOME/.mem0/audit-flags.jsonl"
-BASE="$HOME/.mem0/audit-flags.baseline"
+L10STATE="$HOME/.mem0/l10-state.json"
 if [ -f "$FLAGS" ]; then
-  fcount=$(wc -l < "$FLAGS" 2>/dev/null)
-  baseline=$(cat "$BASE" 2>/dev/null || echo 0)
-  delta=$(( fcount - baseline ))
-  [ "$delta" -gt 20 ] && warnings+="L10 audit-flags: ${delta} NEW since baseline (total ${fcount}). Review ~/.mem0/audit-flags.jsonl. "
+  l10counts=$(python3 - "$FLAGS" "$L10STATE" <<'PY' 2>/dev/null
+import json, sys
+flags_p, state_p = sys.argv[1], sys.argv[2]
+try:
+    reviewed = set(json.load(open(state_p, encoding="utf-8")).get("reviewed_keys", []))
+except Exception:
+    reviewed = set()   # no/unreadable state -> all flags unreviewed (conservative, same as SLOWDRIP)
+unrev = total = 0
+try:
+    for line in open(flags_p, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        total += 1
+        if f"{r.get('memory_id')}:{r.get('flag_type')}" not in reviewed:
+            unrev += 1
+except OSError:
+    pass
+print(f"{unrev} {total}")
+PY
+)
+  n_unrev="${l10counts%% *}"; n_total="${l10counts##* }"
+  [ "${n_unrev:-0}" -gt 20 ] && warnings+="L10 audit-flags: ${n_unrev} unreviewed (total ${n_total}). Review ~/.mem0/audit-flags.jsonl. "
 fi
 
 # Recent-sessions surface (cross-restart). 2026-06-24: REPOINTED from recent-decisions.jsonl to
@@ -148,7 +179,17 @@ CAMPAIGN="$(infer_campaign_from_cwd "$SESSION_CWD")"
 # v0.22 Pillar 1: initiative axis for goal scoping (same cwd source as brand).
 INITIATIVE="$(infer_initiative_from_cwd "$SESSION_CWD")"
 KEY="$(cat "$HOME/.mem0/api-key" 2>/dev/null)"
-if [ -n "$BRAND" ] && [ -n "$KEY" ]; then
+# v1.12 F3 (HK-4): cold-morning guard. This hook runs SYNCHRONOUSLY at SessionStart;
+# when the mem0 server isn't up yet (WSL just booted, services starting) every curl
+# below burns its full --max-time SERIALLY and the session start blocks 15-30s+.
+# Probe once for 1s; when cold, print the local-file blocks only (episodic recents,
+# storage warnings — no server needed) and skip every server-dependent section.
+MEM0_UP=1
+curl -sf --max-time 1 http://127.0.0.1:18791/health >/dev/null 2>&1 || MEM0_UP=0
+if [ "$MEM0_UP" = 0 ]; then
+  echo "[agentic-memory-stack] memory server still starting — brand facts/goals skipped this session (they return next session)"
+fi
+if [ "$MEM0_UP" = 1 ] && [ -n "$BRAND" ] && [ -n "$KEY" ]; then
   echo "[agentic-memory-stack] brand context ($BRAND):"
   # Canonical memories for this brand (highest trust). v0.30 FIX (2026-06-19): fetch via
   # the canonical SEARCH path, NOT the list endpoint. GET /v1/memories is a plain
@@ -165,7 +206,7 @@ print(json.dumps({
     'filters': {'tier': 'canonical', 'user_id': '__WSL_USER__', 'brand': sys.argv[1]},
 }))
 " "$BRAND" 2>/dev/null)
-  canon=$(curl -fsS --max-time 6 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" "http://127.0.0.1:18791/v1/memories/search" -d "$canon_body" 2>/dev/null \
+  canon=$(curl -fsS --max-time 3 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" "http://127.0.0.1:18791/v1/memories/search" -d "$canon_body" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -199,7 +240,7 @@ except Exception:
     INIT_ENC=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$INITIATIVE" 2>/dev/null)
     [ -n "$INIT_ENC" ] && INIT_Q="&initiative=$INIT_ENC"
   fi
-  goals=$(curl -fsS --max-time 3 -H "X-API-Key: $KEY" "http://127.0.0.1:18791/v1/goals?status=open&brand=$BRAND&limit=3${INIT_Q}" 2>/dev/null \
+  goals=$(curl -fsS --max-time 2 -H "X-API-Key: $KEY" "http://127.0.0.1:18791/v1/goals?status=open&brand=$BRAND&limit=3${INIT_Q}" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -222,7 +263,7 @@ fi
 # (tier=frontier, K<=2); otherwise a RECENCY pseudo-query (most-recent episode goal; precision-first
 # tier=small, K<=1) + distilled. Silent on abstention. Helper is fail-silent with its own HTTP
 # timeout + checkpoint=False (no synthetic episode in the resume banner).
-if [ -n "$KEY" ]; then
+if [ "${MEM0_UP:-0}" = 1 ] && [ -n "$KEY" ]; then
   SDIR_B1="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   recall=$(python3 "$SDIR_B1/sessionstart_bundle.py" --brand "$BRAND" --initiative "$INITIATIVE" 2>/dev/null)
   [ -n "$recall" ] && echo "$recall"
@@ -273,19 +314,27 @@ if [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
     _age=$(( ( $(date +%s) - $(stat -c %Y "$RESOLVE_MARKER" 2>/dev/null || echo 0) ) / 86400 ))
     [ "$_age" -lt 7 ] && _do=0
   fi
-  if [ "$_do" = 1 ] && curl -sf --max-time 4 http://127.0.0.1:18792/health >/dev/null 2>&1; then
+  # v1.12: gate on MEM0_UP (cold morning = no sweep) + exec the DEPLOYED copy
+  # (~/apps/mem0-scripts, B1/MEM-7), never the dev working tree. Placement stays at
+  # SessionStart deliberately: the Codex shim is only reliably up at session time,
+  # and the resolver is queue-only (never auto-hides) by design.
+  if [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ] && curl -sf --max-time 2 http://127.0.0.1:18792/health >/dev/null 2>&1; then
     touch "$RESOLVE_MARKER"
     _PYB="$HOME/apps/mem0-server/.venv/bin/python"; [ -x "$_PYB" ] || _PYB=python3
-    nohup "$_PYB" "$MEM0_REPO_ROOT_WSL/scripts/wsl/contradiction-sweep.py" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
+    _SWEEP="$HOME/apps/mem0-scripts/contradiction-sweep.py"
+    [ -f "$_SWEEP" ] || _SWEEP="$MEM0_REPO_ROOT_WSL/scripts/wsl/contradiction-sweep.py"
+    nohup "$_PYB" "$_SWEEP" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
   fi
 fi
 
 # Contradiction review queue: the safe resolver QUEUES genuine contradictions for human review
 # instead of auto-hiding — surface the outstanding count so the operator promotes the real ones.
+# MEM-13 (2026-07-03): own line, not the [storage-cap] warnings blob — the queue must be visible
+# even when nothing is over cap. /health/deep mirrors it as checks.pending_contradiction_reviews.
 RQ="$HOME/.mem0/contradiction-promote-review.jsonl"
 if [ -s "$RQ" ]; then
   nrev=$(grep -c . "$RQ" 2>/dev/null)
-  [ "${nrev:-0}" -gt 0 ] && warnings+="${nrev} contradiction(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl). "
+  [ "${nrev:-0}" -gt 0 ] && echo "${nrev} contradiction verdict(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl)"
 fi
 
 [ -n "$warnings" ] && echo "[storage-cap] $warnings Triage with: python scripts/wsl/audit-flags-triage.py --summary  (then --resolve --reason ...)."

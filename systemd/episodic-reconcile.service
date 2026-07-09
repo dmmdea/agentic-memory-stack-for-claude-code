@@ -6,6 +6,6 @@ After=network-online.target
 Type=oneshot
 # READ-ONLY by construction (the SQLite ledger is opened mode=ro; no --apply). Reports drift to
 # ~/.mem0/episodic-reconciliation.jsonl (read by Test-MemoryStack). No Codex / no shim needed.
-ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python __REPO_ROOT_WSL__/scripts/wsl/episodic-reconcile.py
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/episodic-reconcile.py
 StandardOutput=journal
 StandardError=journal

@@ -1,5 +1,7 @@
 # llama-swap Binding — 127.0.0.1 Closure (v0.18 Phase D)
 
+> **Historical record.** The paths below reference the config layout of the era (a `.zora`-managed config since retired). The **current** llama-swap setup — build, models, config location, systemd unit — is documented in [`install/llama-swap-setup.md`](../../install/llama-swap-setup.md). The loopback-bind requirement this doc established still holds and is verified by `Test-MemoryStack`.
+
 > **Status:** SHIPPED 2026-06-11. Closes the v0.17 `Test-MemoryStack` INVARIANTS WARN: llama-swap was listening on `0.0.0.0:11436` (wildcard), exposing bge-reranker-v2-m3 and every other model behind llama-swap to the LAN. The bind row is now GREEN (`127.0.0.1:11436`).
 
 ## What changed

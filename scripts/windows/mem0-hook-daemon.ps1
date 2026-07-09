@@ -80,6 +80,37 @@ function ConvertTo-DaemonB64 {
     return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
 }
 
+function Limit-RepeatedGoalsOq {
+    <#
+    v1.12 HK-5: the SAME open goals + questions re-rendered on EVERY substantive
+    prompt (1.8-6.2 KB measured per injection; ~100-300 KB repeated context per
+    long session) on top of the SessionStart banner that already carried them.
+    The daemon is resident, so it can remember what each session already saw:
+    when the goals+OQ set is UNCHANGED since the last injection for this session,
+    blank those sections (Format-MemoryContextBlock omits empty sections) —
+    memories stay per-prompt fresh. Re-inject immediately when the set changes
+    (new goal, resolved question) and every 12th substantive prompt as a
+    post-compaction/drift guard. Fail-open: any error = old behavior (re-inject).
+    #>
+    param($Bundle, [string]$SessionId)
+    if ($null -eq $Bundle -or [string]::IsNullOrWhiteSpace($SessionId)) { return $Bundle }
+    try {
+        $gSig = @($Bundle.goals | ForEach-Object { "$($_.id)|$($_.title)|$($_.status)" }) -join ';'
+        $qSig = @($Bundle.open_questions | ForEach-Object { "$($_.id)|$($_.question_text)|$($_.status)" }) -join ';'
+        $sig  = $gSig + '##' + $qSig
+        if ($null -eq $script:GoalsOqSeen) { $script:GoalsOqSeen = @{} }
+        $st = $script:GoalsOqSeen[$SessionId]
+        if ($null -ne $st -and $st.sig -eq $sig -and $st.n -lt 12) {
+            $st.n = $st.n + 1
+            $Bundle.goals = @()
+            $Bundle.open_questions = @()
+        } else {
+            $script:GoalsOqSeen[$SessionId] = @{ sig = $sig; n = 1 }
+        }
+    } catch { }
+    return $Bundle
+}
+
 function Invoke-DaemonRawBundle {
     <#
     .SYNOPSIS
@@ -247,6 +278,7 @@ function Invoke-DaemonRawBundle {
             }
             $bundleText = Invoke-Mem0Post -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
             $bundleR = ConvertFrom-HookJson $bundleText
+            $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId $sessionId   # v1.12 HK-5
             # v0.22 D: render per tier (resolved above from sidecar/transcript).
             # frontier/mid = full format; small = flat + legend. Fail-open frontier.
             $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier
@@ -353,6 +385,7 @@ function Invoke-DaemonRequest {
         }
         $bundleText = Invoke-Mem0Post -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
         $bundleR = ConvertFrom-HookJson $bundleText
+        $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId ([string]$Req.session_id)   # v1.12 HK-5
 
         # Identical rendering to the inline path: lib Format-MemoryContextBlock
         # incl. client-side admission Layers 1/2/3 + the same rejected-candidate

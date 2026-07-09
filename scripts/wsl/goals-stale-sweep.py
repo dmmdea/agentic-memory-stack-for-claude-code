@@ -22,7 +22,7 @@ from pathlib import Path
 
 DEFAULT_STALE_DAYS = 30
 EPISODIC_DB = Path.home() / ".mem0" / "episodic.db"
-LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
+LEDGER_DIR = Path.home() / ".mem0"
 SWEEP_LOG = Path.home() / ".mem0" / "goals-stale-sweep.jsonl"
 
 
@@ -30,12 +30,20 @@ def _iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def _ledger_path() -> Path:
+    # MEM-16 (2026-07-03): append to the CURRENT-MONTH segment
+    # (tier-ledger-YYYY-MM.jsonl), same naming as app.py _append_ledger — the
+    # legacy tier-ledger.jsonl is a frozen historical archive.
+    return LEDGER_DIR / f"tier-ledger-{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m')}.jsonl"
+
+
 def _ledger(rec: dict) -> None:
     rec.setdefault("ts", _iso_now())
     # v0.18 LOW-1: stamp schema_version on sweep-written ledger entries
     rec.setdefault("schema_version", "v18")
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    with LEDGER.open("a", encoding="utf-8") as f:
+    ledger = _ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
 

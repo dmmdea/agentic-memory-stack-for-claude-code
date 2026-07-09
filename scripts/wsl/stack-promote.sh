@@ -28,7 +28,10 @@ set -euo pipefail
 
 MEM0_DIR="$HOME/.mem0"
 MEM0_DB="$MEM0_DIR/episodic.db"
-LEDGER="$MEM0_DIR/tier-ledger.jsonl"
+# MEM-16 (2026-07-03): ledger writes go to the CURRENT-MONTH segment
+# (tier-ledger-YYYY-MM.jsonl, same naming as app.py _append_ledger); the legacy
+# tier-ledger.jsonl is a frozen historical archive.
+LEDGER="$MEM0_DIR/tier-ledger-$(date -u +%Y-%m).jsonl"
 MEM0_URL="http://127.0.0.1:18791"
 SNAPSHOT_TS=""
 
@@ -123,7 +126,9 @@ fi
 
 # --- 7. Ledger entry ---
 echo "[7/6] Writing production-restore ledger entry..."
-if [[ -f "$LEDGER" ]]; then
+# MEM-16: append unconditionally — a fresh month's segment won't exist yet and
+# the old "-f or skip" guard would silently drop the restore audit event.
+if [[ -d "$MEM0_DIR" ]]; then
     LEDGER_ENTRY=$(python3 -c "
 import json, datetime
 entry = {

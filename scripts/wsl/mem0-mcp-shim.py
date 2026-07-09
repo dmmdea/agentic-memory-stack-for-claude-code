@@ -14,6 +14,18 @@ if not KEY_FILE.exists():
     raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE}")
 MEM0_KEY = KEY_FILE.read_text(encoding="utf-8").strip()
 
+# MEM-19 (2026-07-03): stamp the hook contract version on the shim's POSTs so
+# /health/deep checks.hook_contract.missing stays 0 for MCP traffic (the shim
+# was the last field-less high-traffic caller). Values MUST stay inside
+# hook_contract.py's KNOWN_HOOK_CONTRACT_VERSIONS and are extended in the SAME
+# commit that bumps a wire contract (v0.19 M15 rule — no pre-whitelisting):
+#   '17.0' = the search wire contract (what pre-tool-check.ps1 sends on
+#            /v1/memories/search — the shim's search POSTs speak the same wire),
+#   '20.0' = the batched /v1/context/bundle contract (user-prompt-extract.ps1).
+# Parity-pinned against hook_contract.py by tests/test_mcp_shim_contract.py.
+SEARCH_HOOK_CONTRACT_VERSION = "17.0"
+BUNDLE_HOOK_CONTRACT_VERSION = "20.0"
+
 mcp = FastMCP("mem0")
 
 def _headers() -> dict:
@@ -50,7 +62,11 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
                 "consolidator. Dream will pick this up on its next nightly cycle if it crosses "
                 "the bar."
             )
-    payload = {"messages": text, "user_id": user_id, "infer": infer, "metadata": md}
+    # MEM-19: stamped on the add POST too. AddIn doesn't validate the field yet
+    # (pydantic ignores extras), so this is forward-stamping: the day the add
+    # contract is versioned server-side, the shim is already compliant.
+    payload = {"messages": text, "user_id": user_id, "infer": infer, "metadata": md,
+               "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
     r = httpx.post(f"{MEM0_URL}/v1/memories", json=payload, headers=_headers(), timeout=30.0)
     r.raise_for_status()
     result = r.json()
@@ -78,10 +94,23 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     if allow_cross_brand:
         filters["allow_cross_brand"] = True
     eff_rerank = (limit >= 5) if rerank is None else rerank   # auto-on for deliberate (limit>=5) searches
-    payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": eff_rerank, "query_class": query_class}
+    # MEM-19: version-stamp the search POST (was the last field-less caller
+    # inflating /health/deep hook_contract.missing).
+    payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": eff_rerank, "query_class": query_class,
+               "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
     r = httpx.post(f"{MEM0_URL}/v1/memories/search", json=payload, headers=_headers(), timeout=30.0)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    # MEM-8 (2026-07-03): a brandless search fail-closes on brand-scoped records
+    # (v0.19 M4) — correct isolation, but the caller only saw a thin/empty result
+    # and no reason (retrieval starvation, invisible). The server now counts the
+    # brand_scope_required hides per call (rejected_brand_scoped); surface a hint
+    # so the caller knows the fix is scoping, not absence of memory.
+    n_hidden = data.get("rejected_brand_scoped") or 0
+    if n_hidden:
+        data["hint"] = (f"{n_hidden} brand-scoped records were hidden — "
+                        "pass brand= or use memory_recall")
+    return data
 
 @mcp.tool
 def memory_recall(query: str, brand: str | None = None, initiative: str | None = None, project: str | None = None, user_id: str = "__WSL_USER__") -> dict:
@@ -113,7 +142,10 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
     out: dict = {"ok": True}
     # 1) the per-prompt bundle (durable memories + open goals + open questions), checkpoint
     #    suppressed so a manual pull writes no episode. Reuses the EXACT _search_core gate path.
-    bpayload: dict = {"session_id": "mcp-memory-recall", "prompt": query, "checkpoint": False}
+    #    MEM-19: stamped with the bundle contract version ('20.0' — the batched
+    #    /v1/context/bundle wire user-prompt-extract.ps1 speaks).
+    bpayload: dict = {"session_id": "mcp-memory-recall", "prompt": query, "checkpoint": False,
+                      "hook_contract_version": BUNDLE_HOOK_CONTRACT_VERSION}
     if brand:
         bpayload["brand"] = brand
     if initiative:
@@ -136,7 +168,8 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
     if brand:
         cfilters["brand"] = brand
     try:
-        rc = httpx.post(f"{MEM0_URL}/v1/memories/search", json={"query": query, "filters": cfilters, "limit": 5, "threshold": 0.0, "rerank": False, "query_class": "canonical"}, headers=H, timeout=30.0)
+        # MEM-19: the canonical pull is a plain search POST — same '17.0' stamp.
+        rc = httpx.post(f"{MEM0_URL}/v1/memories/search", json={"query": query, "filters": cfilters, "limit": 5, "threshold": 0.0, "rerank": False, "query_class": "canonical", "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}, headers=H, timeout=30.0)
         rc.raise_for_status()
         out["canonical"] = rc.json().get("results", [])
     except Exception as e:
@@ -181,7 +214,8 @@ def memory_promote(memory_id: str, tier: str = "stable", reason: str | None = No
 
     reason is recommended for audit clarity and REQUIRED for canonical (n/a here).
 
-    Writes a tier-ledger entry at ~/.mem0/tier-ledger.jsonl on success."""
+    Writes a tier-ledger entry (~/.mem0/tier-ledger-YYYY-MM.jsonl current-month
+    segment; MEM-16 monthly rotation) on success."""
     if tier == "canonical":
         raise ValueError(
             "canonical promotion requires user-direct CLI authentication. "

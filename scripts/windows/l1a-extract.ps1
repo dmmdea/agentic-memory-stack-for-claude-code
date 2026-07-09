@@ -66,7 +66,8 @@ Output this exact shape:
 Rules for facts (apply the INFERABILITY GATE first — it is the most important rule):
 - INFERABILITY GATE: before keeping a fact, ask "could a competent engineer who knows general software/tools but has NEVER worked on THIS project infer or guess this?" If YES, DROP it. Keep ONLY genuinely project-specific facts that cannot be known without having been here (our ports, paths, collection names, config values, decisions, IDs, flags, versions, locked-in choices). Generic best-practices and things the reader already knows are noise.
 - Prefer FEWER, higher-signal facts over filling a quota; max 5; output [] if nothing is genuinely project-specific.
-- Each fact self-contained and declarative, <= 30 words — but NEVER drop the distinguishing detail to hit the limit (a fact that loses the specific value/name/path/number is useless; specific-and-concrete beats short-and-vague).
+- Each fact self-contained and declarative, <= 30 words preferred, 60 words HARD MAXIMUM — but NEVER drop the distinguishing detail to hit the limit (a fact that loses the specific value/name/path/number is useless; specific-and-concrete beats short-and-vague).
+- ATOMIC facts only: ONE fact = ONE claim about ONE topic. NEVER emit a multi-topic dump (a session recap, a list of changes, several decisions welded into one string). If a candidate fact bundles multiple claims, SPLIT it into separate single-topic facts BEFORE output — each must stand alone when retrieved individually.
 - Keep proper nouns, dates, numbers, paths, IDs, flags, versions VERBATIM.
 - For a procedure or a conditional, phrase the fact as an actionable rule: "IF <situation> THEN <action>" (e.g. "IF rolling back the egemma migration THEN disable egemma-rollback-prune.timer FIRST").
 - Drop: pleasantries, hypotheticals, code blocks, one-off transient specifics (a single ad-hoc search query, a temp path) that will not recur, and anything already covered by a more durable fact.
@@ -145,16 +146,24 @@ $turns
     $posted = 0
     $postedMemoryIds = [System.Collections.Generic.List[string]]::new()
     # Only evergreen facts POST to mem0 and populate linked_memory_ids (durable-only).
-    foreach ($fact in $split.Evergreen) {
-        if ([string]::IsNullOrWhiteSpace($fact)) { continue }
-        $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata @{
-            event = $EventName
-            tier = 'evidence'
-            extracted_at = (Get-Date).ToString('o')
-        }
-        if ($memId) {
-            $posted++
-            if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
+    foreach ($rawFact in $split.Evergreen) {
+        if ([string]::IsNullOrWhiteSpace($rawFact)) { continue }
+        # MEM-10 (2026-07-03): belt-and-braces write-time guard. The prompt now
+        # demands atomic <=60-word facts, but if Codex still emits a multi-topic
+        # dump (>700 chars) it is split at sentence boundaries here — one record
+        # per chunk — instead of storing a single blob that trips the l10-audit
+        # OVERSIZE line (1200) and embeds many topics into one vector.
+        foreach ($fact in (Split-OversizeFact -Fact $rawFact)) {
+            if ([string]::IsNullOrWhiteSpace($fact)) { continue }
+            $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata @{
+                event = $EventName
+                tier = 'evidence'
+                extracted_at = (Get-Date).ToString('o')
+            }
+            if ($memId) {
+                $posted++
+                if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
+            }
         }
     }
     Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
@@ -230,9 +239,13 @@ $turns
                 hook_contract_version = '17.0'
             } | ConvertTo-Json -Depth 6 -Compress
 
+            # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 - an episode whose
+            # goal/summary carries non-ASCII (Spanish sessions, em-dashes) reached
+            # FastAPI as invalid UTF-8 -> 400 and the episode was silently lost
+            # (the catch below logs it as "non-fatal"). Send UTF-8 BYTES.
             Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/episodes" `
                 -Method Post `
-                -Body $episodePayload `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($episodePayload)) `
                 -ContentType 'application/json' `
                 -Headers @{'X-API-Key' = $apiKey} `
                 -TimeoutSec 5 | Out-Null

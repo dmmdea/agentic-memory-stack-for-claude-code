@@ -6,6 +6,33 @@ A persistent, multi-tier, **measurably faithful** memory backend for [Claude Cod
 >
 > **What it is NOT:** a Claude Code feature. It's external infrastructure you install once — WSL systemd services + Windows Claude Code hooks.
 
+## What you get
+
+- **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, per-prompt correction capture, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
+- **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deliberate pulls; a resume précis at session start.
+- **Trust, not just recall** — five tiers from auto-captured `evidence` up to HMAC-locked `canonical` ground truth; an admission gate hides superseded, contradicted, or wrong-workspace records at read time; time-sensitive tiers age out on a Weibull curve.
+- **A memory that polices itself** — weekly Codex-judged contradiction + supersession sweeps, an optional write-time NLI gate, and a *never-auto-hide* policy: every hide is human-confirmed via a review queue.
+- **Boring-by-design operations** — nightly/weekly hygiene (dedup, decay, audit, backups ×8 with integrity checks), an append-only audit ledger, loopback-only + API-key security, ~28 MCP tools.
+
+```mermaid
+flowchart LR
+    A["Claude Code sessions"] -->|"hooks: extract + capture"| B["mem0 server :18791<br/>tiers + admission gate"]
+    B --> C["Qdrant :6333<br/>768-d vectors"]
+    B -->|"embed / rerank"| D["llama-swap :11436<br/>EmbeddingGemma + bge"]
+    E["Codex CLI (gpt-5.5)"] -->|"extraction / consolidation / judgment"| B
+    B -->|"top K=1-2 at the 0.30 gate, or abstain"| A
+```
+
+## Documentation
+
+| You want to… | Read |
+|---|---|
+| Understand how it all works | **[ARCHITECTURE.md](./ARCHITECTURE.md)** — layers, tiers, data flow, invariants, design decisions |
+| Install it | this README (below) + [the installer skill](./skill/install-agentic-memory-stack/SKILL.md) + [llama-swap setup](./install/llama-swap-setup.md) |
+| Operate / debug it | [docs/operations.md](./docs/operations.md) — symptom → fix, schedules, the review queue |
+| Call its API / tools | [docs/api-contracts.md](./docs/api-contracts.md) — the REST + MCP contract |
+| Everything else | **[docs/README.md](./docs/README.md)** — the full documentation map |
+
 ## Install
 
 The installer is **self-contained, idempotent, and operator-agnostic** (it detects your WSL distro and derives every path from your own home/username). In Windows PowerShell, from the repo root:
@@ -53,9 +80,9 @@ The stack went from "store + inject and hope" to "measurably faithful memory": a
 | `systemd/` | systemd-user units (services + timers) |
 | `claude-config/` | CLAUDE.md tier-protocol snippet, model-tiers, storage-cap-check, `settings.example.json` |
 | `skill/install-agentic-memory-stack/` | The Claude Code installer skill (`SKILL.md` + `references/`) |
-| `eval/` | The R1 faithfulness eval harness + probe sets |
-| `docs/` | Architecture, runbooks, data-backup, research, modular deep-dives |
+| `eval/` | The faithfulness + retrieval eval harnesses and probe sets *(private repo only — excluded from the public mirror)* |
+| `docs/` | Operations, API contract, modular deep-dives — see [docs/README.md](./docs/README.md) for the map |
 
 ## License
 
-See [LICENSE](./LICENSE).
+Apache-2.0 — the `LICENSE` + `NOTICE` + `THIRD-PARTY-NOTICES.md` files ship with the public release.

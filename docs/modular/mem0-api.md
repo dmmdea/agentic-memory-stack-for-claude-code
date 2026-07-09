@@ -15,14 +15,16 @@ Missing or incorrect key → `401 {"detail": "missing or invalid X-API-Key"}`.
 Shallow liveness probe. Returns within ~50ms.
 
 ```
-Response 200: {"ok": true, "version": "2.0.4-v012", "store": "qdrant", "embedder": "nomic-embed-text"}
+Response 200: {"ok": true, "version": "2.0.4-v012", "stack": "<stack semver>", "store": "qdrant", "embedder": "embeddinggemma-300m"}
+# NOTE: "version" is deliberately PINNED to the historical "2.0.4-v012" (dashboards pattern-match it);
+# the release version of the stack is the separate "stack" key.
 ```
 
 Use for liveness checks (hooks, Test-MemoryStack). Do **not** use for "write path working" — use `/health/deep` for that.
 
 ### `GET /health/deep`
 
-Checks Qdrant collection status, Ollama embedder dimension, and mem0 collection point count. Slow (~1-3s). Use for diagnostics, not polling.
+Checks Qdrant collection status, EmbeddingGemma embedder dimension (via llama-swap), and mem0 collection point count. Slow (~1-3s). Use for diagnostics, not polling.
 
 ```
 Response 200: {"ok": true, "checks": {"qdrant": {"ok": true, "points": N, "status": "green"}, "embedder": {"ok": true, "dim": 768}}}
@@ -48,13 +50,13 @@ Request: {
   - `tier=insight` → `403` unless `metadata.source` contains `c1` or `consolidator`.
   - `tier=evidence` or `tier=temporal` → allowed.
   - No metadata.tier → defaults to no tier label (retrieved as untiered evidence).
-- **Size limit:** `MAX_MEMORY_CHARS = 1500`. Payload above this → `413`. Break into atomic facts.
+- **Size limit:** `MAX_MEMORY_CHARS = 4000` (env-overridable via `MEM0_MAX_MEMORY_CHARS`). Payload above this → `413`. Break into atomic facts.
 
 ```
 Response 200: {"results": [{"id": "<uuid>", "memory": "...", ...}]}
 Response 403: tier enforcement or insight-source missing
 Response 413: payload exceeds MAX_MEMORY_CHARS
-Response 500: Qdrant/Ollama unreachable
+Response 500: Qdrant/llama-swap unreachable
 ```
 
 ### `GET /v1/memories`

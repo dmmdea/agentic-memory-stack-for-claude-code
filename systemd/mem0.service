@@ -19,6 +19,16 @@ Environment=MEM0_DURABLE_FRESHNESS_ENABLED=1
 # install user (1-wsl-services.sh systemd sed) so a third-party box queries its
 # own tenant; app.py falls back to "default" if unset.
 Environment=MEM0_DEFAULT_USER_ID=__WSL_USER__
+# MEM-18 (2026-07-03): kill runtime phone-home. mem0 2.0.4 ships PostHog
+# telemetry ON by default — mem0/memory/telemetry.py reads MEM0_TELEMETRY and
+# treats anything outside ("true","1","yes") as off, so "False" disables it
+# (verified against the installed lib source, not the docs). HF_HUB_OFFLINE=1
+# is belt-and-braces: the reranker/embedder are HTTP clients to llama-swap (no
+# in-process HF load), so this only stops any transitive huggingface-hub
+# dependency from ever calling home from the server process — it can't break
+# inference because nothing in this process downloads weights.
+Environment=MEM0_TELEMETRY=False
+Environment=HF_HUB_OFFLINE=1
 # v0.19 Phase H key chain: private tmpfs runtime dir + best-effort DPAPI key
 # fetch before start. The '-' prefix keeps fresh/plaintext-mode boxes safe:
 # the fetch fails soft and canonical_key_provider falls through to plaintext.

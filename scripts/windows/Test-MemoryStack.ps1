@@ -130,12 +130,18 @@ try {
     } catch { Add-Check 'LIVENESS' 'Qdrant :6333' 'FAIL' $_.Exception.Message }
 }
 
+# v1.12 F1 (file-wide pattern): PS 5.1 Invoke-RestMethod encodes a STRING -Body as
+# Latin-1, so any non-ASCII byte (Spanish text, em-dashes) reaches FastAPI as invalid
+# UTF-8 -> 400. EVERY -Body in this file therefore sends
+# ([System.Text.Encoding]::UTF8.GetBytes($x)); GETs are untouched. Same fix as
+# pre-tool-check.ps1 (719 silent 400s, 06-10..07-03).
+
 # L4: EmbeddingGemma-300m embedder on llama-swap :11436 (v0.22 migration: replaced the
 # Ollama :11435 nomic-embed-text backend; Ollama fully decommissioned 2026-06-13).
 # Must return a 768-dim vector via the OpenAI-compatible /v1/embeddings endpoint.
 try {
     $embBody = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json
-    $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body $embBody -ContentType 'application/json' -TimeoutSec 20
+    $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($embBody)) -ContentType 'application/json' -TimeoutSec 20
     $dim = @($e.data[0].embedding).Count
     if ($dim -eq 768) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "embeddinggemma live, dim=$dim (CPU)" }
     else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "responded but dim=$dim (expected 768)" }
@@ -144,7 +150,7 @@ try {
 # L5: bge-reranker-v2-m3 on llama-swap :11436
 try {
     $rerankBody = @{model='bge-reranker-v2-m3'; query='ping'; documents=@('a','b','c'); top_n=3} | ConvertTo-Json
-    $r = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body $rerankBody -ContentType 'application/json' -TimeoutSec 20
+    $r = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($rerankBody)) -ContentType 'application/json' -TimeoutSec 20
     if ($r.results -and $r.results.Count -eq 3) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'OK' 'live + ordered 3 docs' }
     else                                         { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' 'responded but unexpected shape' }
 } catch { Add-Check 'LIVENESS' 'bge-reranker :11436' 'FAIL' $_.Exception.Message }
@@ -210,7 +216,7 @@ if ($key) {
             infer     = $false
             metadata  = @{tier='evidence'; source='test-memorystack-invariant-probe'}
         } | ConvertTo-Json
-        $addResp = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post -Body $addBody `
+        $addResp = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($addBody)) `
             -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 10
         $probeMid = $addResp.results[0].id
 
@@ -253,7 +259,7 @@ if ($key) {
                 $promoteOk = $false
                 try {
                     Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$probeMid/tier" -Method Patch `
-                        -Body $tierBody -ContentType 'application/json' `
+                        -Body ([System.Text.Encoding]::UTF8.GetBytes($tierBody)) -ContentType 'application/json' `
                         -Headers @{'X-API-Key'=$key; 'X-User-Direct-Token'=$token; 'X-User-Direct-Ts'=$ts; 'X-User-Direct-Nonce'=$promoteNonce} -TimeoutSec 10 | Out-Null
                     $promoteOk = $true
                 } catch {
@@ -266,7 +272,7 @@ if ($key) {
                     $putBody = @{text='tampered'} | ConvertTo-Json
                     try {
                         $putResp = Invoke-WebRequest -Uri "http://127.0.0.1:18791/v1/memories/$probeMid" -Method Put `
-                            -Body $putBody -ContentType 'application/json' `
+                            -Body ([System.Text.Encoding]::UTF8.GetBytes($putBody)) -ContentType 'application/json' `
                             -Headers @{'X-API-Key'=$key} -TimeoutSec 5 -ErrorAction Stop
                         Add-Check 'INVARIANTS' 'canonical immutability' 'FAIL' "ungated PUT returned $($putResp.StatusCode) (expected 403)"
                     } catch {
@@ -283,14 +289,14 @@ if ($key) {
                     try {
                         $admBody = @{query=$probeText; filters=@{user_id='test-inv-healthcheck'}; limit=10; threshold=0.1; rerank=$false} | ConvertTo-Json
                         $admDefault = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
-                            -Body $admBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
+                            -Body ([System.Text.Encoding]::UTF8.GetBytes($admBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
                         $defaultIds = @($admDefault.results | ForEach-Object { $_.id })
                         if ($defaultIds -contains $probeMid) {
                             Add-Check 'INVARIANTS' 'admission gate' 'FAIL' 'admission gate not filtering tier=canonical from default search'
                         } else {
                             $admCanonBody = @{query=$probeText; filters=@{user_id='test-inv-healthcheck'}; limit=10; threshold=0.1; rerank=$false; query_class='canonical'} | ConvertTo-Json
                             $admCanon = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
-                                -Body $admCanonBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
+                                -Body ([System.Text.Encoding]::UTF8.GetBytes($admCanonBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
                             $canonIds = @($admCanon.results | ForEach-Object { $_.id })
                             if ($canonIds -contains $probeMid) {
                                 Add-Check 'INVARIANTS' 'admission gate' 'OK' 'canonical probe absent from default search, present via query_class=canonical'
@@ -360,7 +366,7 @@ if ($key) {
         } | ConvertTo-Json
         try {
             $insResp = Invoke-WebRequest -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
-                -Body $insBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 -ErrorAction Stop
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($insBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 -ErrorAction Stop
             Add-Check 'INVARIANTS' 'insight allowlist' 'FAIL' "non-consolidator insight write returned $($insResp.StatusCode) (expected 403)"
         } catch {
             $sc = $_.Exception.Response.StatusCode.value__
@@ -375,7 +381,7 @@ if ($key) {
     try {
         $srBody = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$false} | ConvertTo-Json
         $sr = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
-            -Body $srBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($srBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
         $count = if ($sr.results) { @($sr.results).Count } else { 0 }
         $retiredInResults = @($sr.results | Where-Object { ($_.metadata.retrievable) -eq $false }).Count
         if ($retiredInResults -eq 0) { Add-Check 'INVARIANTS' 'search retrievable filter' 'OK'   "returned $count; 0 retired records leaked" }
@@ -388,7 +394,7 @@ if ($key) {
     try {
         $srBody = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$false} | ConvertTo-Json
         $sr = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
-            -Body $srBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($srBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
         $ciLeaked = @($sr.results | Where-Object { ($_.metadata).'_canonical_intent' -eq $true }).Count
         if ($ciLeaked -eq 0) { Add-Check 'INVARIANTS' '_canonical_intent exclusion' 'OK'   '0 _canonical_intent records in default search' }
         else                  { Add-Check 'INVARIANTS' '_canonical_intent exclusion' 'FAIL' "$ciLeaked _canonical_intent record(s) leaked into default search" }
@@ -406,13 +412,13 @@ if ($key) {
             if ($tier -ne 'canonical') {
                 $body = @{metadata=@{test_probe=$true}; actor='test-memorystack'; reason='healthcheck probe'} | ConvertTo-Json
                 $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$mid/metadata" -Method Patch `
-                    -Body $body -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
                 if ($r.ok) { Add-Check 'INVARIANTS' 'PATCH /metadata' 'OK' "merged $($r.merged_keys -join ',')" }
                 else        { Add-Check 'INVARIANTS' 'PATCH /metadata' 'WARN' 'response missing ok=true' }
                 # Cleanup
                 $cleanBody = @{metadata=@{test_probe=$false}; actor='test-memorystack'; reason='cleanup'} | ConvertTo-Json
                 Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$mid/metadata" -Method Patch `
-                    -Body $cleanBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($cleanBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null
             } else {
                 Add-Check 'INVARIANTS' 'PATCH /metadata' 'OK' 'skipped (first record is canonical; gate would need HMAC)'
             }
@@ -425,7 +431,7 @@ if ($key) {
     try {
         $body = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$true} | ConvertTo-Json
         $r = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
-            -Body $body -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 25
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 25
         $reranked = $r.reranked
         $count    = if ($r.results) { @($r.results).Count } else { 0 }
         if ($reranked -or $count -lt 3) { Add-Check 'INVARIANTS' 'search rerank=True' 'OK'   "count=$count reranked=$reranked" }
@@ -558,7 +564,7 @@ try {
                         'content-type'      = 'application/json'
                     }
                     $ct = Invoke-RestMethod -Uri 'https://api.anthropic.com/v1/messages/count_tokens' `
-                        -Method Post -Headers $ctHeaders -Body $ctBody -TimeoutSec 15
+                        -Method Post -Headers $ctHeaders -Body ([System.Text.Encoding]::UTF8.GetBytes($ctBody)) -TimeoutSec 15
                     $smallTokenTarget = 600   # small-tier block token target (worst-case fixture)
                     $itok = [int]$ct.input_tokens
                     if ($itok -le $smallTokenTarget) { $tokenNote = "; small=${itok}tok <= ${smallTokenTarget} (count_tokens)" }
@@ -593,7 +599,7 @@ try {
     } elseif ($key) {
         $surfBody = @{ query='canonical ground-truth facts'; query_class='canonical'; threshold=0; limit=50; rerank=$false; filters=@{ tier='canonical'; user_id=$TmsWslUser; brand=$surfBrand } } | ConvertTo-Json
         try {
-            $surf = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post -Body $surfBody -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 15
+            $surf = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($surfBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 15
             $surfCount = @($surf.results | Where-Object { $_.metadata.tier -eq 'canonical' }).Count
             if ($surfCount -gt 0) { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'OK' "hook uses search path; $surfCount canonical fact(s) surfaceable for $surfBrand" }
             else { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "search path wired but 0 canonical returned for $surfBrand (populate canonical or check brand/user_id)" }

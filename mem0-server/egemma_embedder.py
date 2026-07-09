@@ -27,14 +27,39 @@ config.py registers this class under the provider key "egemma" in mem0's
 EmbedderFactory, then sets embedder.provider = "egemma". Transport is the stock
 OpenAI-compatible path against llama-swap :11436/v1 (model "embeddinggemma").
 """
+import random
+import time
 import unicodedata
 from typing import Literal, Optional
 
 from mem0.embeddings.openai import OpenAIEmbedding
+from openai import RateLimitError
 
 # Verbatim from the EmbeddingGemma model card.
 _QUERY_PREFIX = "task: search result | query: "
 _DOC_PREFIX = "title: none | text: "
+
+# MEM-12 (2026-07-03): llama-swap returns 429 bursts under queue saturation
+# (25 RateLimitErrors/7d observed, incl. an 8-in-1s burst; every one killed a
+# bundle raw-trace fallback). ONE bounded retry after a short jittered sleep
+# absorbs the burst case. Anything still 429 after the retry re-raises so
+# callers keep their existing fail-soft handling — the retry only ADDS a second
+# attempt, it never swallows an error (never-500 invariant preserved: no new
+# failure mode, no silent loss). Other errors are NEVER retried (a 500 from a
+# ctx overflow must surface immediately, not get replayed).
+_RETRY_429_BASE_SLEEP_S = 0.25
+_RETRY_429_JITTER_S = 0.25   # uniform [0, 0.25) on top — de-syncs burst callers
+
+
+def _retry_once_on_429(call):
+    """Run ``call()``; on a single openai.RateLimitError (llama-swap 429) sleep
+    ~250ms + jitter and retry ONCE. The second 429 propagates unchanged; no
+    other exception type is ever retried."""
+    try:
+        return call()
+    except RateLimitError:
+        time.sleep(_RETRY_429_BASE_SLEEP_S + random.random() * _RETRY_429_JITTER_S)
+        return call()
 
 # v0.22 M4: EmbeddingGemma is served at --ctx-size 2048 (the MODEL's trained max —
 # must NOT be raised). A record that passes the 4000-CHAR storage gate (app.py
@@ -108,6 +133,11 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
     text is rewritten with the action-appropriate prefix before it goes out.
     """
 
+    # MEM-12: this class already does the one bounded 429 retry internally.
+    # episode_embeddings.py checks this marker so an injected shim instance is
+    # not ALSO wrapped by the episode-path retry (max attempts stays 2, never 4).
+    handles_429_retry = True
+
     def embed(
         self,
         text,
@@ -117,9 +147,12 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
         # the full text). Prevents a 2048-token overflow -> llama-server 500 ->
         # silent memory loss on token-dense records.
         prefixed = _prefix_for(memory_action) + _truncate_for_embedding(text)
-        return super().embed(prefixed, memory_action)
+        # MEM-12: one bounded retry on a llama-swap 429 burst; see module header.
+        parent = super()
+        return _retry_once_on_429(lambda: parent.embed(prefixed, memory_action))
 
     def embed_batch(self, texts, memory_action="add"):
         prefix = _prefix_for(memory_action)
         prefixed = [prefix + _truncate_for_embedding(t) for t in texts]
-        return super().embed_batch(prefixed, memory_action)
+        parent = super()
+        return _retry_once_on_429(lambda: parent.embed_batch(prefixed, memory_action))

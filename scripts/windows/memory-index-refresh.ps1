@@ -38,6 +38,25 @@ if (-not (Test-Throttle -Name 'index-refresh' -MinIntervalSeconds 21600)) {
     exit 0
 }
 
+# v1.12 F6 (HK-11, observed 3x in index-refresh.log): Test-Throttle..Mark-Throttle spans
+# the whole WSL build, so two session starts racing through that gap BOTH built. mkdir is
+# atomic — it is the mutex. The throttle still marks only on SUCCESS (the 2026-06-08
+# don't-burn-the-window-on-failure finding stays intact); stale locks (>30 min: builds
+# take <5) are reclaimed so a crashed holder can't wedge refreshes forever.
+$lockParent = Join-Path $env:USERPROFILE '.mem0\locks'
+$lockDir    = Join-Path $lockParent 'index-refresh.lock'
+[System.IO.Directory]::CreateDirectory($lockParent) | Out-Null
+try {
+    $null = New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop
+} catch {
+    try {
+        $age = (Get-Date) - (Get-Item $lockDir -ErrorAction Stop).CreationTime
+        if ($age.TotalMinutes -lt 30) { exit 0 }
+        Remove-Item $lockDir -Force -Recurse -ErrorAction Stop
+        $null = New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop
+    } catch { exit 0 }
+}
+
 try {
     # No RepoRootWsl in the receipt -> we cannot locate the index builder. Log + exit
     # (same guard the dream uses in phase 4).
@@ -47,9 +66,10 @@ try {
         exit 0
     }
 
-    # Invoke memory-index-build.py EXACTLY as dream-consolidate.ps1 phase 4 does:
-    # <venv python> $IrRepoWsl/scripts/wsl/memory-index-build.py, via wsl.exe -d <distro>.
-    $indexResult = wsl.exe -d $IrDistro -e bash -c "/home/$IrWslUser/apps/mem0-server/.venv/bin/python $IrRepoWsl/scripts/wsl/memory-index-build.py 2>&1"
+    # v1.12 B1 (MEM-7): invoke the DEPLOYED builder (~/apps/mem0-scripts, synced by
+    # deploy.sh) — never the dev working tree, where an uncommitted edit becomes
+    # production behavior at the next session start.
+    $indexResult = wsl.exe -d $IrDistro -e bash -c "/home/$IrWslUser/apps/mem0-server/.venv/bin/python /home/$IrWslUser/apps/mem0-scripts/memory-index-build.py 2>&1"
     $indexExit = $LASTEXITCODE
     Write-MemoryLog -Component 'index-refresh' -Message "  $indexResult"
     if ($indexExit -ne 0) {

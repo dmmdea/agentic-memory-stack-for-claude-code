@@ -210,10 +210,13 @@ function Invoke-PreToolCheck {
             hook_contract_version = $script:HookContractVersion   # v0.19 M15
         } | ConvertTo-Json -Depth 4 -Compress
 
+        # v1.12 F1 (719 silent failures 06-10..07-03): PS 5.1 Invoke-RestMethod encodes a
+        # STRING -Body as Latin-1, so any non-ASCII query byte (Spanish text, em-dashes in
+        # tool commands) reached FastAPI as invalid UTF-8 -> 400 Bad Request. Send BYTES.
         $resp = Invoke-RestMethod `
             -Uri "$($script:BaseUrl)/v1/memories/search" `
             -Method Post `
-            -Body $searchBody `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($searchBody)) `
             -ContentType 'application/json' `
             -Headers @{ 'X-API-Key' = $apiKey } `
             -TimeoutSec 2 `

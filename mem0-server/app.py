@@ -17,6 +17,8 @@ from mem0 import Memory
 from config import build_config
 from reranker import rerank as bge_rerank
 from admission_gate import apply_admission
+# MEM-8 (2026-07-03): daily rejection counters for /health/deep observability.
+from admission_gate import admission_rejections_today as _admission_rejections_today
 from redact import redact_secrets  # server-side secret scrub for stored prompt_text
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
@@ -144,6 +146,33 @@ try:
     log.info("%s collection %s", EPISODE_COLLECTION, "created" if _ep_created else "present")
 except Exception:
     log.exception("ensure_episode_collection failed (non-fatal; raw-fallback search will no-op)")
+
+# MEM-17 (2026-07-03): /health reported only "2.0.4-v012" (mem0 lib pin + the
+# ancient phase tag) — no way to tell WHICH stack release a runtime actually
+# runs (the v1.11.0 P0 shipped through exactly that blindness: module bytes on
+# disk, no version signal at the endpoint). Resolution order:
+#   1. MEM0_STACK_VERSION env (operator/unit override),
+#   2. ./VERSION beside app.py (deploy.sh copies the repo VERSION into the app
+#      dir on every deploy — the production path),
+#   3. ../VERSION (running straight from a repo checkout: mem0-server/../VERSION),
+#   4. "unknown" (never crash the server over a version cosmetics file).
+# Read ONCE at import — a health probe must not add per-request file I/O.
+def _resolve_stack_version(app_dir: Optional[Path] = None) -> str:
+    env_v = os.environ.get("MEM0_STACK_VERSION", "").strip()
+    if env_v:
+        return env_v
+    base = app_dir if app_dir is not None else Path(__file__).resolve().parent
+    for cand in (base / "VERSION", base.parent / "VERSION"):
+        try:
+            v = cand.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if v:
+            return v
+    return "unknown"
+
+
+STACK_VERSION = _resolve_stack_version()
 
 app = FastAPI(title="mem0 WSL", version="2.0.4-v012")
 
@@ -546,10 +575,25 @@ def _secure_open(path: Path, mode: str = "a", encoding: str = "utf-8"):
     return path.open(mode, encoding=encoding)
 
 
+def _ledger_segment_path(mem0_dir: Path, now: Optional[_dt.datetime] = None) -> Path:
+    """MEM-16 (2026-07-03): monthly ledger segment path — tier-ledger-YYYY-MM.jsonl.
+
+    The single legacy tier-ledger.jsonl grew unbounded (9.8MB) because every
+    writer appended to one file forever. New entries go to a per-month segment;
+    the legacy file is FROZEN as the historical archive (never rewritten, never
+    migrated — rewriting an append-only audit log would defeat its point).
+    Readers (scripts/wsl/ledger-audit.py, the test helpers) walk legacy + all
+    segments in chronological order. UTC month, matching the entry 'ts' stamps."""
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    return mem0_dir / f"tier-ledger-{now.strftime('%Y-%m')}.jsonl"
+
+
 def _append_ledger(record: dict) -> None:
-    """Append-only ledger writer for tier-change events. Single source of truth for promotion audit."""
+    """Append-only ledger writer for tier-change events. Single source of truth for promotion audit.
+    MEM-16: writes to the CURRENT MONTH segment (see _ledger_segment_path);
+    legacy ~/.mem0/tier-ledger.jsonl is a frozen historical archive."""
     import json as _json
-    ledger = Path.home() / ".mem0" / "tier-ledger.jsonl"
+    ledger = _ledger_segment_path(Path.home() / ".mem0")
     ledger.parent.mkdir(parents=True, exist_ok=True)
     if "ts" not in record:
         record["ts"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -560,7 +604,10 @@ def _append_ledger(record: dict) -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "version": "2.0.4-v012", "store": "qdrant", "embedder": "embeddinggemma-300m"}
+    # MEM-17: "version" stays the historical mem0-lib+phase tag (dashboards may
+    # pattern-match it); "stack" is the actual stack release (repo VERSION).
+    return {"ok": True, "version": "2.0.4-v012", "stack": STACK_VERSION,
+            "store": "qdrant", "embedder": "embeddinggemma-300m"}
 
 @app.get("/health/deep")
 def health_deep() -> dict:
@@ -569,6 +616,8 @@ def health_deep() -> dict:
     enough that callers should use /health for liveness; /health/deep is for diagnostics."""
     import httpx as _httpx
     out: dict[str, Any] = {"ok": True, "checks": {}}
+    # MEM-17: stack release on the diagnostics probe too (same startup read).
+    out["stack"] = STACK_VERSION
     # v0.22 H2: report the collection mem0 is ACTUALLY bound to at runtime (NOT a
     # hardcoded literal). The egemma-rollback-prune gate reads this to confirm the
     # stack is still on the new EmbeddingGemma collection before it deletes the old
@@ -607,6 +656,24 @@ def health_deep() -> dict:
     # field-less callers (documented-legitimate, logged INFO); unknown = real
     # drift candidates (logged WARN). Informational — never flips ok=False.
     out["checks"]["hook_contract"] = dict(_hook_contract_stats)
+    # MEM-8 (2026-07-03): retrieval-starvation observability — top admission
+    # rejection reason FAMILIES today (in-process daily counters from
+    # admission_gate; a gate silently eating results was invisible short of
+    # grepping admission-rejected.jsonl). Informational — never flips ok=False.
+    out["checks"]["admission_rejections_today"] = _admission_rejections_today()
+    # MEM-13 (2026-07-03): contradiction review-queue depth. The SAFE resolver
+    # QUEUES genuine contradictions for human review instead of auto-hiding
+    # (Codex over-promoted 3/4 CONSISTENT facts in a live run), so an unwatched
+    # queue silently accumulates verdicts nobody promotes. One tiny file read;
+    # informational — never flips ok=False. 0 when absent/empty/unreadable.
+    try:
+        _rq = Path.home() / ".mem0" / "contradiction-promote-review.jsonl"
+        out["checks"]["pending_contradiction_reviews"] = (
+            sum(1 for ln in _rq.read_text(encoding="utf-8").splitlines() if ln.strip())
+            if _rq.exists() else 0
+        )
+    except OSError:
+        out["checks"]["pending_contradiction_reviews"] = 0
     # v0.20 Phase D (M6): surface the keyless-degraded state (ExecStartPre=-
     # swallows a dpapi-fetch-key.sh failure; the server then 503s every
     # canonical/insight HMAC mutation while /health/deep stayed green — exactly
@@ -916,12 +983,18 @@ def _search_core(b: SearchIn):
         # it so the gate uses the (stable, canonical) allowlist instead of silently
         # stripping every canonical hit the caller explicitly filtered for.
         _adm_qc = "canonical" if (b.filters or {}).get("tier") == "canonical" else (b.query_class or "durable")
+        # MEM-8: per-call stats — how many results the brandless fail-closed
+        # gate hid (brand_scope_required). Echoed on the response below so the
+        # MCP shim can hint "pass brand=" instead of starving silently.
+        _adm_stats: dict = {}
         results["results"] = apply_admission(
             results["results"],
             scope=scope,
             query_class=_adm_qc,
             layer="server-search",
+            stats_out=_adm_stats,
         )
+        results["rejected_brand_scoped"] = int(_adm_stats.get("rejected_brand_scoped", 0))
     # v0.30 over-fetch trim: now that retired/intent/admission filters have run on the
     # larger pool, return only the caller's requested capped_limit (the K slots are now
     # filled with non-filtered records, not gapped). Last mutation before logging so the
@@ -2067,12 +2140,19 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
         sr = _search_core(SearchIn(
             query=(b.prompt or "")[:500],
             filters=filters,
-            limit=_tp["memory_cap"],            # v1.0 R2: tier-scaled K (frontier 2 / small 1)
+            limit=_tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped below
             threshold=_tp["relevance_threshold"],  # v1.0 R2: 0.30 both tiers (kept; calibration-confirmed)
             rerank=False,
             query_class="durable",
         ))
-        out["memories"] = sr.get("results", []) if isinstance(sr, dict) else []
+        _mems = sr.get("results", []) if isinstance(sr, dict) else []
+        # v1.12 HK-6: the hook client's admission list REJECTS tier=insight — observed
+        # in production as "0.D admission: 2 of 2 results rejected" (full bundle latency
+        # paid, zero memories injected, dead churn in admission-rejected.jsonl). Filter
+        # server-side so an insight hit can't burn a K-slot the client will throw away;
+        # the +2 over-fetch above lets an admissible memory take that slot instead.
+        out["memories"] = [m for m in _mems
+                           if ((m.get("metadata") or {}).get("tier")) != "insight"][:_tp["memory_cap"]]
     except Exception:
         log.exception("bundle: search failed (non-fatal)")
         out["memories"] = []

@@ -22,13 +22,22 @@ KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 EVIDENCE_AGE_DAYS = 90
 REPORT = Path.home() / ".mem0" / "decay-report.jsonl"
-LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
+LEDGER_DIR = Path.home() / ".mem0"
+
+def _ledger_path() -> Path:
+    # MEM-16 (2026-07-03): append to the CURRENT-MONTH segment
+    # (tier-ledger-YYYY-MM.jsonl), same naming as app.py _append_ledger — the
+    # legacy tier-ledger.jsonl is a frozen historical archive. ALL writers moved
+    # in the same change so ledger-audit.py's chronological walk (legacy first,
+    # then segments) stays monotonic across the cutover.
+    return LEDGER_DIR / f"tier-ledger-{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m')}.jsonl"
 
 def _ledger(rec):
     rec.setdefault("ts", dt.datetime.now(dt.timezone.utc).isoformat())
     rec.setdefault("schema_version", "v17")  # v0.17 F.4.4: every entry stamps schema version
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    with LEDGER.open("a", encoding="utf-8") as f:
+    ledger = _ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
 def scroll_all():

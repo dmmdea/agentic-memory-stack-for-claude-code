@@ -47,7 +47,7 @@ TIER_THRESHOLDS = {"canonical": 0.97, "stable": 0.95, "evidence": 0.94, "tempora
 # 0.92 threshold deleted 27 atomic facts on the v0.13 inaugural run, some of which may have
 # been such distinctions. Tighter 0.94 trades dedup compression for variation preservation.
 REPORT = Path.home() / ".mem0" / "dedup-report.jsonl"
-LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
+LEDGER_DIR = Path.home() / ".mem0"
 DEDUP_LOCK = Path.home() / ".mem0" / "dedup.lock"
 
 def _partition_key(payload):
@@ -60,11 +60,18 @@ def _partition_key(payload):
         payload.get("project") or payload.get("legacy_project"),
     )
 
+def _ledger_path() -> Path:
+    # MEM-16 (2026-07-03): append to the CURRENT-MONTH segment
+    # (tier-ledger-YYYY-MM.jsonl), same naming as app.py _append_ledger — the
+    # legacy tier-ledger.jsonl is a frozen historical archive.
+    return LEDGER_DIR / f"tier-ledger-{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m')}.jsonl"
+
 def _append_ledger(rec):
     rec.setdefault("ts", dt.datetime.now(dt.timezone.utc).isoformat())
     rec.setdefault("schema_version", "v17")  # v0.17 F.4.4: every entry stamps schema version
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    with LEDGER.open("a", encoding="utf-8") as f:
+    ledger = _ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
 def _acquire_dedup_lock() -> int | None:

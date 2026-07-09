@@ -3,4 +3,4 @@ Description=L10 post-hoc memory audit (v0.12 agentic-memory-stack)
 
 [Service]
 Type=oneshot
-ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python /mnt/c/Users/__WIN_USER__/.claude/scripts/l10-audit.py
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/l10-audit.py

@@ -388,7 +388,10 @@ function Get-PromotionGateVerdict {
     $candUser = $null; $wasReObserved = $false
     try {
         $b = @{ ids = @($MemoryId); with_payload = $true } | ConvertTo-Json -Compress
-        $cp = Invoke-RestMethod -Method Post -Uri "$qcol/points" -ContentType 'application/json' -Body $b -TimeoutSec 10
+        # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> invalid UTF-8
+        # at the server); send BYTES. IDs/filters here are ASCII today, but the same
+        # rule applies to every POST body — one Latin-1 byte kills the whole request.
+        $cp = Invoke-RestMethod -Method Post -Uri "$qcol/points" -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($b)) -TimeoutSec 10
         $pl = $cp.result[0].payload
         if ($pl) {
             $candUser = [string]$pl.user_id
@@ -412,7 +415,8 @@ function Get-PromotionGateVerdict {
         $filter = @{ must_not = @(@{ key = 'tier'; match = @{ value = 'canonical' } }, @{ has_id = @($MemoryId) }) }
         if ($candUser) { $filter['must'] = @(@{ key = 'user_id'; match = @{ value = $candUser } }) }
         $b = @{ query = $MemoryId; filter = $filter; limit = 10; with_payload = $false } | ConvertTo-Json -Depth 8 -Compress
-        $sib = Invoke-RestMethod -Method Post -Uri "$qcol/points/query" -ContentType 'application/json' -Body $b -TimeoutSec 10
+        # v1.12 F1: UTF-8 BYTES, not a Latin-1-encoded string (see site 1 above).
+        $sib = Invoke-RestMethod -Method Post -Uri "$qcol/points/query" -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($b)) -TimeoutSec 10
         $siblingScores = @($sib.result.points | ForEach-Object { [double]$_.score })
     } catch { }
     $corroboration = Get-CorroborationCount -SiblingScores $siblingScores -Threshold $SiblingThreshold -WasReObserved $wasReObserved
@@ -425,7 +429,8 @@ function Get-PromotionGateVerdict {
         $mustC = @(@{ key = 'tier'; match = @{ value = 'canonical' } })
         if ($candUser) { $mustC += @{ key = 'user_id'; match = @{ value = $candUser } } }
         $b = @{ query = $MemoryId; filter = @{ must = $mustC; must_not = @(@{ has_id = @($MemoryId) }) }; limit = $NearCanonicalK; with_payload = $true } | ConvertTo-Json -Depth 8 -Compress
-        $nc = Invoke-RestMethod -Method Post -Uri "$qcol/points/query" -ContentType 'application/json' -Body $b -TimeoutSec 10
+        # v1.12 F1: UTF-8 BYTES, not a Latin-1-encoded string (see site 1 above).
+        $nc = Invoke-RestMethod -Method Post -Uri "$qcol/points/query" -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($b)) -TimeoutSec 10
         $nearCanonTexts = @($nc.result.points | ForEach-Object {
             $p = $_.payload; $t = $null
             if ($p) { if ($p.data) { $t = [string]$p.data } elseif ($p.memory) { $t = [string]$p.memory } }

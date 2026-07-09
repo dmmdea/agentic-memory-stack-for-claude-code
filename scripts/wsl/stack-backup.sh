@@ -52,12 +52,22 @@ if [ -f "$HIST_SRC" ]; then
   fi
 fi
 
-# 1b. tier-ledger.jsonl
+# 1b. tier-ledger — MEM-16 (2026-07-03): the ledger is now legacy
+# tier-ledger.jsonl (frozen archive) + monthly segments tier-ledger-YYYY-MM.jsonl.
+# Concatenate legacy + segments (in ledger-audit.py's walk order: legacy first,
+# then segments sorted by name) into the SINGLE dated backup file, so the prune
+# and restore paths keep their one-file-per-snapshot contract unchanged. The
+# strict [0-9] glob excludes tier-ledger-restore.jsonl (stack-restore's copy).
 LEDGER_SRC="$HOME/.mem0/tier-ledger.jsonl"
 LEDGER_DST="$BACKUP_DIR/tier-ledger-$TS.jsonl"
-if [ -f "$LEDGER_SRC" ]; then
-  cp "$LEDGER_SRC" "$LEDGER_DST.tmp" && mv "$LEDGER_DST.tmp" "$LEDGER_DST" \
-    || { echo "WARN: tier-ledger.jsonl backup failed" >&2; rc=1; }
+ledger_parts=()
+[ -f "$LEDGER_SRC" ] && ledger_parts+=("$LEDGER_SRC")
+for seg in "$HOME/.mem0"/tier-ledger-[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl; do
+  [ -f "$seg" ] && ledger_parts+=("$seg")
+done
+if [ "${#ledger_parts[@]}" -gt 0 ]; then
+  cat "${ledger_parts[@]}" > "$LEDGER_DST.tmp" && mv "$LEDGER_DST.tmp" "$LEDGER_DST" \
+    || { echo "WARN: tier-ledger backup failed" >&2; rc=1; }
   test -s "$LEDGER_DST" || { echo "WARN: tier-ledger backup empty" >&2; rc=1; }
 fi
 

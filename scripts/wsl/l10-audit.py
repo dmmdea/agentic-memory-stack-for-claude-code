@@ -36,7 +36,14 @@ FLAGS_FILE = Path.home() / ".mem0" / "audit-flags.jsonl"
 PROMOTE_LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
 
 DURABILITY_DAYS_REPORT = 30  # memories older than this with no flags are reported, NOT promoted
-OVERSIZE_CHARS = 800
+# MEM-10 (2026-07-03): raised 800 -> 1200. 800 flagged what the server ACCEPTS
+# (app.py MAX_MEMORY_CHARS=4000 since v0.22) — every rich-but-legitimate fact
+# became audit noise, drowning the real multi-topic dumps. Enforcement moved to
+# WRITE time (l1a-extract.ps1: atomic <=60-word prompt rule + Split-OversizeFact
+# ~700-char sentence-split guard), so anything landing >1200 now is a genuine
+# dump from a path that bypassed the extractor — worth a flag. Still well under
+# the 4000 server cap.
+OVERSIZE_CHARS = 1200
 ONE_PAGE = 256
 
 # v0.17 F.2.7: slow-drip detection thresholds

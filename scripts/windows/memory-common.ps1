@@ -86,6 +86,48 @@ function Split-FactsByShipLog {
     return [pscustomobject]@{ Evergreen = @($evergreen); ShipLogs = @($shipLogs) }
 }
 
+function Split-OversizeFact {
+    # MEM-10 (2026-07-03): write-time oversize guard for the L1a extractor.
+    # The REAL fix is upstream — the extraction prompt now demands atomic
+    # single-topic facts (<=30 words preferred, 60 HARD max) — but Codex still
+    # occasionally emits a multi-topic dump. Anything over ~700 chars would sail
+    # through the server's 4000-char cap yet trip the l10-audit OVERSIZE line
+    # (1200) and retrieve poorly (one embedding for many topics). Split at
+    # sentence boundaries with greedy repacking; a single monster sentence is
+    # hard-wrapped so no emitted chunk can exceed MaxChars. PS 5.1-safe (the
+    # Stop hook chain runs under Windows PowerShell — no ?? / ?: here).
+    param(
+        [string]$Fact,
+        [int]$MaxChars = 700
+    )
+    if ([string]::IsNullOrWhiteSpace($Fact) -or $Fact.Length -le $MaxChars) {
+        return @($Fact)
+    }
+    $chunks = [System.Collections.Generic.List[string]]::new()
+    $cur = ''
+    foreach ($s in [regex]::Split($Fact.Trim(), '(?<=[.!?])\s+')) {
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        if ($cur -and (($cur.Length + 1 + $s.Length) -gt $MaxChars)) {
+            $chunks.Add($cur)
+            $cur = $s
+        } elseif ($cur) {
+            $cur = "$cur $s"
+        } else {
+            $cur = $s
+        }
+        # a single sentence longer than MaxChars: hard-wrap (never emit over-cap)
+        while ($cur.Length -gt $MaxChars) {
+            $chunks.Add($cur.Substring(0, $MaxChars))
+            $cur = $cur.Substring($MaxChars)
+        }
+    }
+    if ($cur) { $chunks.Add($cur) }
+    # Plain enumeration return (NOT the `,@()` single-object trick): callers
+    # consume via foreach / @(...) collection, and the comma-wrapper would make
+    # @(Split-OversizeFact ...) double-box the array into one element.
+    return @($chunks)
+}
+
 function Get-Mem0Key {
     # v0.20 A.2: same local-cache mechanism as Get-Mem0ApiKeyCached in
     # user-prompt-lib.ps1 (fresh <1h cache authoritative; miss/stale -> UNC read
@@ -217,10 +259,17 @@ function Add-Mem0Memory {
         metadata = $Metadata
     } | ConvertTo-Json -Depth 5 -Compress
     try {
+        # v1.12 F1 (719 silent failures 06-10..07-03): PS 5.1 Invoke-RestMethod encodes a
+        # STRING -Body as Latin-1, so any non-ASCII byte in a fact (Spanish text, em-dashes)
+        # reached FastAPI as invalid UTF-8 -> 400 -> the fact dead-lettered forever (the DLQ
+        # drain re-posts through THIS helper, so retries 400'd identically). Send BYTES.
+        # This is the centralized POST for L1a facts, C1 insights and the DLQ drain - one
+        # fix covers every caller. (ASCII hyphen on purpose: no-BOM + PS 5.1 reads this
+        # file as ANSI, and an em-dash's 0x94 byte is a smart quote to the tokenizer.)
         $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/memories" `
             -Method Post `
             -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} `
-            -Body $body `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
             -TimeoutSec 15
         # Return the new memory id (or $true if mem0 didn't return one) so callers can
         # record source-IDs (audit finding 2026-06-08: C1 insights had no lineage).
