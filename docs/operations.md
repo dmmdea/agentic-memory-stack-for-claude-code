@@ -50,7 +50,7 @@ systemctl --user list-timers --all | grep -E "decay|backup|goals|contradiction|r
 
 ## "The session banner says contradictions await review"
 
-This is the reconciliation system working as designed: a Codex verdict flagged records as stale/contradicting, and the **never-auto-hide** policy routes them to you instead of hiding them.
+This is the reconciliation system working as designed: a Codex verdict flagged records as stale/contradicting, and the queue-gated resolution policy routes them to you instead of hiding them. (The weekly canonical-anchored sweep is the one path that stamps directly — `--unstamp` reverses any stamp in one command.)
 
 ```bash
 # WSL — see the queue (one JSON line per candidate: memory_id, canonical_id, candidate text, justification)

@@ -7,6 +7,10 @@ Everything in this repo's documentation, organized by what you're trying to do (
 | Doc | What it explains |
 |---|---|
 | [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Start here.** The whole system: six layers, trust tiers, life of a memory, diagrams, safety invariants, design decisions |
+| [`modular/memory-model.md`](./modular/memory-model.md) | **The memory model in depth**: the three axes (types / tiers / query classes), each layer's purpose + lifecycle, decay math, the life of a memory |
+| [`modular/capture-pipeline.md`](./modular/capture-pipeline.md) | How conversations become memory: L1a + the inferability gate, ship-log split, corrections, the nightly dream + gated autopromotion |
+| [`modular/retrieval-pipeline.md`](./modular/retrieval-pipeline.md) | How memory reaches the agent: hybrid scoring + the calibration story, the four delivery channels, abstention, placement |
+| [`modular/reconciliation.md`](./modular/reconciliation.md) | How the store stays honest: the sweeps, the two judges, verdict semantics, never-auto-hide + the review queue |
 | [`modular/tier-policy.md`](./modular/tier-policy.md) | The trust-tier protocol and its server enforcement |
 | [`modular/model-aware-injection.md`](./modular/model-aware-injection.md) | Why injection differs per model tier (frontier vs small) |
 | [`modular/dream-skill.md`](./modular/dream-skill.md) | The nightly consolidation ("dream") design |

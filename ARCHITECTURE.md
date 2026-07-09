@@ -47,11 +47,11 @@ Think of a fact's life: **born → stored → trusted → recalled → kept hone
 
 | # | Layer | Job | Key code |
 |---|---|---|---|
-| 1 | [Capture (write path)](#1-capture--the-write-path) | Turn conversations into durable facts + episodes, automatically | `scripts/windows/l1a-extract.ps1`, `scripts/windows/dream-consolidate.ps1`, `mem0-server/episodic.py` |
+| 1 | [Capture (write path)](#1-capture--the-write-path) | Turn conversations into durable facts + episodes, automatically | `scripts/windows/l1a-extract.ps1`, `scripts/windows/dream-consolidate.ps1`, `mem0-server/episodic.py` — deep-dive: [`docs/modular/capture-pipeline.md`](./docs/modular/capture-pipeline.md) |
 | 2 | [Storage + hybrid search](#2-storage--hybrid-search) | Persist facts as vectors; find them by meaning + keywords + entities | `mem0-server/app.py`, `mem0-server/config.py`, `mem0-server/egemma_embedder.py` |
 | 3 | [Tiers + admission gate](#3-trust-tiers--the-admission-gate) | Rank by trust; hide superseded/contradicted/wrong-brand records at read time | `mem0-server/admission_gate.py`, `mem0-server/freshness.py` |
-| 4 | [Recall (read path)](#4-recall--the-read-path) | Put the right 1–2 memories into the agent's context — or abstain | `scripts/windows/user-prompt-extract.ps1`, `scripts/wsl/mem0-mcp-shim.py`, `claude-config/sessionstart_bundle.py` |
-| 5 | [Reconciliation + governance](#5-reconciliation--governance) | Detect and resolve stale/contradicting facts — safely, human-gated | `scripts/wsl/contradiction-sweep.py`, `mem0-server/nli_write_gate.py`, `mem0-server/codex_shim_client.py` |
+| 4 | [Recall (read path)](#4-recall--the-read-path) | Put the right 1–2 memories into the agent's context — or abstain | `scripts/windows/user-prompt-extract.ps1`, `scripts/wsl/mem0-mcp-shim.py`, `claude-config/sessionstart_bundle.py` — deep-dive: [`docs/modular/retrieval-pipeline.md`](./docs/modular/retrieval-pipeline.md) |
+| 5 | [Reconciliation + governance](#5-reconciliation--governance) | Detect and resolve stale/contradicting facts — safely, human-gated | `scripts/wsl/contradiction-sweep.py`, `mem0-server/nli_write_gate.py`, `mem0-server/codex_shim_client.py` — deep-dive: [`docs/modular/reconciliation.md`](./docs/modular/reconciliation.md) |
 | 6 | [Ops, security + tools](#6-ops-security--the-tool-surface) | Scheduled hygiene, crypto-gated canonical writes, backups, the MCP tool surface | `scripts/wsl/` maintenance jobs, `mem0-server/security_invariants.py`, `scripts/wsl/mem0-mcp-shim.py` |
 
 ### 1. Capture — the write path
@@ -92,7 +92,7 @@ sequenceDiagram
 
 ### 3. Trust tiers + the admission gate
 
-Every record carries a **tier** — the system's trust axis:
+Every record carries a **tier** — the system's trust axis (full treatment, incl. lifecycles + query classes + the memory-type axis: [`docs/modular/memory-model.md`](./docs/modular/memory-model.md)):
 
 | Tier | Meaning | Written by | Decays? |
 |---|---|---|---|
@@ -143,7 +143,7 @@ A self-writing store drifts unless something hunts stale and contradicting facts
 - **Canonical contradiction sweep** (weekly systemd timer): for each canonical fact, judge near-duplicate non-canonical candidates — *"does B contradict A?"*. All sweep judgment routes to **Codex** through the Windows HTTP shim (:18792); local models are never the judge (a measured 78% false-positive rate killed that design).
 - **Evidence-vs-evidence supersession sweep** (`--evidence-sweep`): anchors on recent facts, finds *older near-duplicate* neighbors, and asks the **supersession judge** a different question — *"would re-reading the older fact mislead about the CURRENT state?"* → `STALE` / `KEEP`, default KEEP. The distinction matters: a valid historical ship-log logically *supersedes* but must be **kept**; reusing the contradiction prompt over-flagged ~2/3 of pairs, and the dedicated judge measured precision 35% → 67% at 100% genuine recall.
 - **NLI write-gate** (async, opt-in): flags a *new* record that contradicts canonical truth at write time — fast cosine pre-filter, Codex judge only on high-similarity neighbors, fail-open on any uncertainty.
-- **Resolution policy — never auto-hide**: re-judging **auto-clears** false flags (safe), but a verdict that would *hide* a record routes to the **human review queue** (`~/.mem0/contradiction-promote-review.jsonl`; queue depth surfaced in the SessionStart banner). `--promote <id>` is the human-confirmed enforce; `--unstamp <id>` the one-command recovery. This policy exists because a live auto-enforce incident hid 3 consistent facts out of 4.
+- **Resolution policy — queue-gated hides**: re-judging **auto-clears** false flags (always safe, always automated); evidence-vs-evidence hides and pending-flag promotions route to the **human review queue** (`~/.mem0/contradiction-promote-review.jsonl`; depth surfaced in the SessionStart banner) — `--promote <id>` is the human-confirmed enforce, `--unstamp <id>` the one-command recovery. The **weekly canonical sweep is the exception**: its authoritative Codex YES verdicts stamp directly (recoverable via `--unstamp`; forensic `history` always sees hidden records). The queue exists because a live auto-enforce incident hid 3 consistent facts out of 4 — see `docs/modular/reconciliation.md` for the per-path matrix.
 
 ### 6. Ops, security + the tool surface
 
@@ -193,7 +193,7 @@ The axis human memory doesn't have: **trust** (tiers + the admission gate). It's
 
 ## Safety invariants (the contract)
 
-1. **Nothing is silently hidden.** Only an authoritative Codex verdict *plus* (for new hides) a human `--promote` makes a record unretrievable; the forensic `history` class can always see it.
+1. **Nothing is hidden below an authoritative verdict, and nothing is unrecoverable.** Only a Codex verdict can hide a record (evidence-vs-evidence and re-judge hides additionally require a human `--promote`; the weekly canonical sweep enforces directly); every hide is one-command reversible and the forensic `history` class always sees it.
 2. **Canonical is unforgeable.** HMAC + DPAPI + nonce replay protection; `add()` can never set it.
 3. **Local models never judge.** Embedding + reranking only; all contradiction/supersession/consolidation judgment is Codex.
 4. **Brand isolation is fail-closed**, at the server *and* the client render.
