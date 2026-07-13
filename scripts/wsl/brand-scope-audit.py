@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Brand-scope audit (2026-06-20) — catches the mis-scoping bug that hid Brand-A's
-"pre-filled pens" ground truth for two weeks.
+"""Brand-scope audit (2026-06-20) — catches the mis-scoping bug that hid a brand's
+ground-truth fact for two weeks.
 
 THE BUG: retrieval + the SessionStart brand-block are fail-closed on brand — a
 brand=X session sees ONLY brand=X canonical records, never null-brand ones. So a
 canonical fact ABOUT a brand that carries no `brand` tag is invisible to that
-brand's sessions. The pen fact (and 4 biohacker.collective rules) sat canonical but
+brand's sessions. One brand fact (and 4 same-brand rules) sat canonical but
 brand-untagged, so they never surfaced and the same corrections recurred ~50x.
 
 THE RULE (this audit): a canonical record whose `project` is a brand context (i.e.

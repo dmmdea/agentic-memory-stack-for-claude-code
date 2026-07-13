@@ -37,7 +37,7 @@ PY
 }
 
 # Campaign (funnel) inference from cwd — mirrors infer_brand_from_cwd but returns the
-# matched rule's "campaign" (e.g. biohacker-collective). Empty = no funnel (store/shared).
+# matched rule's "campaign" (e.g. campaign-a). Empty = no funnel (store/shared).
 # Isolates funnel-specific canonical rules: a session surfaces shared facts (no campaign)
 # + ONLY its own funnel's rules, never another funnel's (2026-06-20 cross-funnel fix).
 infer_campaign_from_cwd() {
@@ -174,7 +174,7 @@ fi
 SESSION_CWD="${CLAUDE_CWD:-$PWD}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
 # Funnel/campaign axis (2026-06-20): isolates funnel-specific canonical rules so a
-# biohacker session never sees recovery's rules and vice-versa.
+# a campaign-a session never sees campaign-b's rules and vice-versa.
 CAMPAIGN="$(infer_campaign_from_cwd "$SESSION_CWD")"
 # v0.22 Pillar 1: initiative axis for goal scoping (same cwd source as brand).
 INITIATIVE="$(infer_initiative_from_cwd "$SESSION_CWD")"
