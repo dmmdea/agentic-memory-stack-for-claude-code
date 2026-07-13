@@ -3,14 +3,14 @@
   "owner": { "name": "agentic-memory-stack" },
   "metadata": {
     "description": "Self-contained installer skill for the agentic memory stack (Claude Code, Windows + WSL2).",
-    "version": "1.12.1"
+    "version": "1.13.0"
   },
   "plugins": [
     {
       "name": "agentic-memory-stack",
       "source": "./",
       "description": "Installs the agentic memory stack: the install-agentic-memory-stack skill + the 4-phase operator-agnostic installer.",
-      "version": "1.12.1",
+      "version": "1.13.0",
       "skills": ["./skill/install-agentic-memory-stack/"]
     }
   ]

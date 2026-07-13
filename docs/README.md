@@ -29,6 +29,8 @@ Everything in this repo's documentation, organized by what you're trying to do (
 | Doc | When |
 |---|---|
 | [`operations.md`](./operations.md) | Something's broken or a banner fired: symptom → diagnosis → fix, service management, schedules, the review queue |
+| [`MIGRATION.md`](./MIGRATION.md) | **Moving to a new machine with your memory intact** — snapshot, fresh install, restore, re-key, verify, decommission |
+| [`DEVELOPMENT.md`](./DEVELOPMENT.md) | Changing the stack itself: repo tour, test suites, the single deploy path, release ritual, conventions |
 | [`data-backup.md`](./data-backup.md) | Backup & restore procedures |
 | [`modular/dpapi-canonical-key.md`](./modular/dpapi-canonical-key.md) | Canonical-key custody, recovery, rotation |
 | [`modular/admission-gate.md`](./modular/admission-gate.md) | Why a record isn't surfacing (hide reasons, query classes, forensics) |

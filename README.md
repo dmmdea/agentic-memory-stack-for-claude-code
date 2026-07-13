@@ -11,7 +11,7 @@ A persistent, multi-tier, **measurably faithful** memory backend for [Claude Cod
 - **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, per-prompt correction capture, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
 - **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deliberate pulls; a resume précis at session start.
 - **Trust, not just recall** — five tiers from auto-captured `evidence` up to HMAC-locked `canonical` ground truth; an admission gate hides superseded, contradicted, or wrong-workspace records at read time; time-sensitive tiers age out on a Weibull curve.
-- **A memory that polices itself** — weekly Codex-judged contradiction + supersession sweeps, an optional write-time NLI gate, and a *never-auto-hide* policy: every hide is human-confirmed via a review queue.
+- **A memory that polices itself** — weekly Codex-judged contradiction sweeps, an on-demand supersession sweep, an optional write-time NLI gate, and a queue-gated resolution policy: false flags auto-clear, evidence-vs-evidence hides are human-confirmed, and every hide is one-command reversible and forensically visible.
 - **Boring-by-design operations** — nightly/weekly hygiene (dedup, decay, audit, backups ×8 with integrity checks), an append-only audit ledger, loopback-only + API-key security, ~28 MCP tools.
 
 ```mermaid
@@ -30,6 +30,8 @@ flowchart LR
 | Understand how it all works | **[ARCHITECTURE.md](./ARCHITECTURE.md)** — layers, tiers, data flow, invariants, design decisions |
 | Install it | this README (below) + [the installer skill](./skill/install-agentic-memory-stack/SKILL.md) + [llama-swap setup](./install/llama-swap-setup.md) |
 | Operate / debug it | [docs/operations.md](./docs/operations.md) — symptom → fix, schedules, the review queue |
+| Move to a new machine | [docs/MIGRATION.md](./docs/MIGRATION.md) — keep your memory; code fresh, data restored, keys re-provisioned |
+| Change the stack itself | [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) — repo tour, tests, the deploy path, release ritual |
 | Call its API / tools | [docs/api-contracts.md](./docs/api-contracts.md) — the REST + MCP contract |
 | Everything else | **[docs/README.md](./docs/README.md)** — the full documentation map |
 

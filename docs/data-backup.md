@@ -52,7 +52,7 @@ For users who want full versioning of memory data. Heavier. The Qdrant collectio
 
 ### Option D — accept the loss
 
-If your daily L1a extraction is reliable and you'll re-accumulate everything in a few weeks on a new machine, the simplest answer is **do nothing**. The high-value facts are in `tier=canonical` and `tier=insight` and they'll regenerate from new sessions. The runbook v0.12 documents an `mem0-backfill.py` script for migrating from an older mem0 install.
+**Moving to a new machine? Use the full runbook: [`MIGRATION.md`](./MIGRATION.md)** — snapshot → fresh install → restore into production targets → fresh key → verify. The rest of this section is the older, minimal alternative: if your daily L1a extraction is reliable and you'd accept re-accumulating on a new machine, you *can* do nothing. The high-value facts are in `tier=canonical` and `tier=insight` and they'll regenerate from new sessions. The runbook v0.12 documents an `mem0-backfill.py` script for migrating from an older mem0 install.
 
 ## Restoring from a backup
 
