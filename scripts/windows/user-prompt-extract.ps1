@@ -111,7 +111,19 @@ function Invoke-Mem0Post {
     } finally { $resp.Close() }
 }
 
-$BaseUrl = 'http://127.0.0.1:18791'
+# Per-machine values resolve at RUNTIME (2026-07-14 audit) — see memory-common.ps1 for the why:
+# the deployed copies are committed to a repo shared with the other machine, so nothing
+# machine-specific may be baked in, and a User-scope env var is invisible to hook children of an
+# already-running host process (which is how this hook silently lost its API key on your-machine).
+$BaseUrl = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+$Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
+    $rcptDistro = $null
+    try {
+        $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+        if (Test-Path $rcpt) { $rcptDistro = (Import-PowerShellDataFile $rcpt).Distro }
+    } catch { $rcptDistro = $null }
+    if ($rcptDistro) { $rcptDistro } else { 'Ubuntu' }   # last resort; the installer always writes the receipt
+}
 
 # v0.18 MED-17: hook contract version stamped on the checkpoint/bundle POSTs
 # and saved fixtures. v0.20 A.3 bumped '17.0' -> '20.0' in the SAME commit that
@@ -245,7 +257,7 @@ $script:Jss.MaxJsonLength = 16MB
 
 # v0.20 A.2: API key via local cache (UNC read only on cache miss/stale).
 # Direct UNC fallback preserved for a missing/broken lib deploy.
-$ApiKeyPath = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\api-key'
+$ApiKeyPath = "\\wsl.localhost\$Mem0WslDistro\home\__WSL_USER__\.mem0\api-key"
 $apiKey = $null
 if (Test-FunctionAvailable 'Get-Mem0ApiKeyCached') {
     $apiKey = Get-Mem0ApiKeyCached
@@ -603,7 +615,7 @@ if ($questionPreview) {
     Write-Log "0.B decision detected: session=$sessionId answer='$($decision.answer)' q_preview='$($questionPreview.Substring(0,[Math]::Min(80,$questionPreview.Length)))...'"
 
     # Append to ~/.mem0/recent-decisions.jsonl (WSL path via UNC)
-    $decisionPath = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\recent-decisions.jsonl'
+    $decisionPath = "\\wsl.localhost\$Mem0WslDistro\home\__WSL_USER__\.mem0\recent-decisions.jsonl"
     try {
         $line = $script:Jss.Serialize($decision)
         [System.IO.File]::AppendAllText($decisionPath, $line + [System.Environment]::NewLine)

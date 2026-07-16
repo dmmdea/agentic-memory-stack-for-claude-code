@@ -431,7 +431,10 @@ $script:Jss.MaxJsonLength = 16MB
 [System.Net.ServicePointManager]::Expect100Continue = $false
 [System.Net.ServicePointManager]::UseNagleAlgorithm = $false
 
-$script:BaseUrl = 'http://127.0.0.1:18791'
+# MEM0_URL override (2026-07-14): the daemon is the pipe server behind mem0-hook-client.exe — it
+# produces the [MEMORY CONTEXT] block. When the brain lives on another node (your-machine -> your-machine), this
+# MUST follow MEM0_URL or the laptop's memory injection silently talks to a dead local port.
+$script:BaseUrl = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
 # Stamped on daemon-side bundle/checkpoint POSTs + fixture filenames. MUST
 # match $HookContractVersion in user-prompt-extract.ps1 (deployed together;
 # R9 hash-checks both).

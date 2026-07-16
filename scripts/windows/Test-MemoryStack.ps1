@@ -192,7 +192,28 @@ try {
 } catch { Add-Check 'INVARIANTS' 'Qdrant bind' 'FAIL' $_.Exception.Message }
 
 # I2: llama-swap bind — must NOT be 0.0.0.0 (v0.17 F.2.2)
+# 2026-07-14: llama-swap is not always a WSL service. On the your-machine workstation it runs
+# WINDOWS-NATIVE (llama-swap.exe under a SYSTEM scheduled task, config C:\llama-swap\
+# llama-swap.yaml), so the WSL-side `ss` probe below sees nothing and this check reported
+# "no listener on :11436 (llama-swap may be down)" while llama-swap was in fact serving the
+# embedder + reranker perfectly well — a permanently-wrong INVARIANT line on that host.
+# Probe the Windows side FIRST and fall through to the WSL probe only if nothing is listening
+# there, so the check is accurate on both deployment shapes.
 try {
+    $winLl = $null
+    try {
+        $winLl = Get-NetTCPConnection -State Listen -LocalPort 11436 -ErrorAction SilentlyContinue | Select-Object -First 1
+    } catch { $winLl = $null }
+    if ($winLl) {
+        # Windows-native llama-swap. LocalAddress '::' / '0.0.0.0' == every interface (LAN-exposed).
+        $la = [string]$winLl.LocalAddress
+        if ($la -eq '127.0.0.1' -or $la -eq '::1') {
+            Add-Check 'INVARIANTS' 'llama-swap bind' 'OK' "${la}:11436 (Windows-native)"
+        } else {
+            Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "LAN-exposed: Windows-native llama-swap listening on ${la}:11436 — no auth in front of it. Deliberate on a model-serving workstation (the launcher passes --listen 0.0.0.0:11436 so other hosts can use the models); to restrict, set --listen 127.0.0.1:11436 in C:\llama-swap\start-llama-swap.cmd and restart the 'llama-swap' scheduled task."
+        }
+    }
+    else {
     $llLine = wsl.exe -d $TmsDistro -e bash -c "ss -tlpn 2>/dev/null | grep 11436 | head -1"
     if      ($llLine -match '127\.0\.0\.1:11436') { Add-Check 'INVARIANTS' 'llama-swap bind' 'OK'   '127.0.0.1:11436' }
     elseif  ($llLine -match '0\.0\.0\.0:11436' -or $llLine -match '\*:11436') {
@@ -204,6 +225,7 @@ try {
     }
     elseif  ($llLine)                              { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "unexpected bind: $llLine" }
     else                                           { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' 'no listener on :11436 (llama-swap may be down)' }
+    }
 } catch { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' $_.Exception.Message }
 
 # I3: canonical immutability probe — POST evidence + assert PUT without HMAC = 403

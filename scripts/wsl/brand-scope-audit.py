@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Brand-scope audit (2026-06-20) — catches the mis-scoping bug that hid a brand's
+"""Brand-scope audit (2026-06-20) — catches the mis-scoping bug that hid Brand-A's
 ground-truth fact for two weeks.
 
 THE BUG: retrieval + the SessionStart brand-block are fail-closed on brand — a

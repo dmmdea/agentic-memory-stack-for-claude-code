@@ -51,7 +51,31 @@ try {
         exit 0
     }
 
-    $turns = Get-RecentTranscriptTurns -TranscriptPath $TranscriptPath -MaxTurns 24 -MaxChars 12000
+    # Cursor-aware windowing (2026-07-14): only extract turns appended SINCE the last successful
+    # extraction of THIS transcript, so overlapping recent-24-turn windows stop re-emitting the
+    # same facts every Stop. $advanceTo is captured NOW (before the slow codex call) so appends
+    # during extraction are picked up next run, not skipped. ANY uncertainty -> full recent window.
+    $advanceTo = 0L
+    try { $advanceTo = [long](Get-Item -LiteralPath $TranscriptPath).Length } catch { $advanceTo = 0L }
+    $cursor = Get-L1aCursor -TranscriptPath $TranscriptPath
+    $turns = $null
+    if ($cursor -gt 0 -and $advanceTo -gt 0 -and $advanceTo -eq $cursor) {
+        # transcript is byte-for-byte unchanged since the last successful extraction — nothing new.
+        # (The DLQ drain above already retried any previously-failed posts, so this is safe.)
+        # NOTE: -eq, NOT -le. A SHRINK ($advanceTo < $cursor: rotation/truncation/corruption) must
+        # NOT skip — a stale cursor above the file length would silently stop extraction forever.
+        # It falls through to the fallback (full window) below, which re-extracts and resets the cursor.
+        Write-MemoryLog -Component 'l1a' -Message '  no new transcript content since last extraction; skipping'
+        exit 0
+    }
+    if ($cursor -gt 0 -and $advanceTo -gt $cursor) {
+        try { $turns = Get-TranscriptTurnsSince -TranscriptPath $TranscriptPath -SinceBytes $cursor -MaxTurns 24 -MaxChars 12000 } catch { $turns = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($turns)) {
+        # first extraction of this transcript, a rotation/shrink, an empty since-window, or any
+        # error above: fall back to the unchanged last-24-turns behaviour (never lose extraction).
+        $turns = Get-RecentTranscriptTurns -TranscriptPath $TranscriptPath -MaxTurns 24 -MaxChars 12000
+    }
     if ([string]::IsNullOrWhiteSpace($turns)) {
         Write-MemoryLog -Component 'l1a' -Message '  empty turns, aborting'
         exit 0
@@ -136,6 +160,7 @@ $turns
         Write-MemoryLog -Component 'l1a' -Message '  no facts extracted (clean session)'
         Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status 'empty' -FactsPosted 0
         Mark-Throttle -Name 'l1a'  # mark even on empty - we successfully decided nothing was worth recording
+        Set-L1aCursor -TranscriptPath $TranscriptPath -Bytes $advanceTo   # this window was processed; don't re-scan it
         exit 0
     }
 
@@ -169,6 +194,7 @@ $turns
     Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
     Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status 'ok' -FactsPosted $posted
     Mark-Throttle -Name 'l1a'
+    Set-L1aCursor -TranscriptPath $TranscriptPath -Bytes $advanceTo   # this window was processed; next run only scans NEW turns
 
     # Phase 3: if ship-logs exist but no episode is being posted they are dropped from
     # durable storage. Do NOT force-create an episode and do NOT write ship-logs to mem0.

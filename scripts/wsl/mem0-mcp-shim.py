@@ -14,6 +14,86 @@ if not KEY_FILE.exists():
     raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE}")
 MEM0_KEY = KEY_FILE.read_text(encoding="utf-8").strip()
 
+import json as _json
+import uuid as _uuid
+import datetime as _dt
+
+AUTHORITY_URL = MEM0_URL                       # existing env (http://your-machine:18791 on the laptop)
+LOCAL_URL = "http://127.0.0.1:18791"           # dormant local replica, up only when offline
+OUTBOX = Path.home() / ".mem0" / "outbox.jsonl"
+_CONNECT_TIMEOUT = 1.5
+_READ_TIMEOUT = 30.0
+# Connect-level failures = fail over. A read timeout or HTTP status is NOT a connect failure.
+_FAILOVER_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+class OfflineError(Exception):
+    """The your-machine authority is connect-unreachable."""
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+def _timeout() -> "httpx.Timeout":
+    return httpx.Timeout(connect=_CONNECT_TIMEOUT, read=_READ_TIMEOUT, write=_READ_TIMEOUT, pool=_CONNECT_TIMEOUT)
+
+def _request(method: str, path: str, *, json: dict | None = None, params: dict | None = None):
+    """Reads: try authority (short connect), else fail over to the local replica.
+    Returns (payload, source). Raises OfflineError if BOTH are connect-unreachable.
+    Propagates httpx.HTTPStatusError (a real answer is never masked with a stale read)."""
+    last_exc = None
+    for url, source in ((AUTHORITY_URL, "authority"), (LOCAL_URL, "local-replica")):
+        try:
+            r = httpx.request(method, f"{url}{path}", json=json, params=params,
+                              headers=_headers(), timeout=_timeout())
+        except _FAILOVER_EXC as e:
+            last_exc = e
+            continue
+        r.raise_for_status()
+        return r.json(), source
+    raise OfflineError(f"authority and local replica both unreachable: {last_exc}")
+
+def _authority_only(method: str, path: str, *, json: dict | None = None) -> dict:
+    """Writes/mutations: authority only. Raise OfflineError on connect failure (caller queues)."""
+    try:
+        r = httpx.request(method, f"{AUTHORITY_URL}{path}", json=json,
+                          headers=_headers(), timeout=_timeout())
+    except _FAILOVER_EXC:
+        raise OfflineError()
+    r.raise_for_status()
+    return r.json()
+
+def _queue_op(op: str, args: dict) -> dict:
+    key = str(_uuid.uuid4())
+    rec = {"op": op, "args": args, "queued_ts": _now_iso(), "key": key}
+    OUTBOX.parent.mkdir(parents=True, exist_ok=True)
+    with OUTBOX.open("a", encoding="utf-8") as f:
+        f.write(_json.dumps(rec) + "\n")
+    return {"queued": True, "op": op, "event": "QUEUED_OFFLINE", "key": key}
+
+def _pending_adds(query: str) -> list[dict]:
+    """Outbox adds whose text matches `query` (case-insensitive substring),
+    shaped for merging into offline read results with a pending_sync marker."""
+    if not OUTBOX.exists():
+        return []
+    q = (query or "").lower()
+    out = []
+    for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = _json.loads(line)
+        except Exception:
+            continue
+        if rec.get("op") != "add":
+            continue
+        text = (rec.get("args") or {}).get("text", "")
+        if q in text.lower():
+            out.append({"memory": text, "pending_sync": True, "queued_ts": rec.get("queued_ts")})
+    return out
+
+def _pending_op_count() -> int:
+    """Number of queued (non-empty) outbox lines awaiting sync."""
+    if not OUTBOX.exists():
+        return 0
+    return sum(1 for line in OUTBOX.read_text(encoding="utf-8").splitlines() if line.strip())
+
 # MEM-19 (2026-07-03): stamp the hook contract version on the shim's POSTs so
 # /health/deep checks.hook_contract.missing stays 0 for MCP traffic (the shim
 # was the last field-less high-traffic caller). Values MUST stay inside
@@ -67,9 +147,10 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     # contract is versioned server-side, the shim is already compliant.
     payload = {"messages": text, "user_id": user_id, "infer": infer, "metadata": md,
                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
-    r = httpx.post(f"{MEM0_URL}/v1/memories", json=payload, headers=_headers(), timeout=30.0)
-    r.raise_for_status()
-    result = r.json()
+    try:
+        result = _authority_only("POST", "/v1/memories", json=payload)
+    except OfflineError:
+        return _queue_op("add", {"text": text, "user_id": user_id, "infer": infer, "metadata": md})
     if note:
         result["note"] = note
     return result
@@ -98,9 +179,13 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     # inflating /health/deep hook_contract.missing).
     payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": eff_rerank, "query_class": query_class,
                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
-    r = httpx.post(f"{MEM0_URL}/v1/memories/search", json=payload, headers=_headers(), timeout=30.0)
-    r.raise_for_status()
-    data = r.json()
+    data, source = _request("POST", "/v1/memories/search", json=payload)
+    if source == "local-replica":
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+        # Offline reads are stale by definition — surface queued-but-unsynced adds
+        # so a fact written minutes ago offline is still findable.
+        data.setdefault("results", []).extend(_pending_adds(query))
     # MEM-8 (2026-07-03): a brandless search fail-closes on brand-scoped records
     # (v0.19 M4) — correct isolation, but the caller only saw a thin/empty result
     # and no reason (retrieval starvation, invisible). The server now counts the
@@ -138,7 +223,6 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
     neutral set. Brandless returns the brand-neutral set only. Either is safe (no cross-brand leak).
     initiative/project scope the goals/questions to a repo leaf. For a DELIBERATE free-text search
     instead of this curated bundle, use memory_search."""
-    H = _headers()
     out: dict = {"ok": True}
     # 1) the per-prompt bundle (durable memories + open goals + open questions), checkpoint
     #    suppressed so a manual pull writes no episode. Reuses the EXACT _search_core gate path.
@@ -153,12 +237,21 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
     if project:
         bpayload["project"] = project
     try:
-        rb = httpx.post(f"{MEM0_URL}/v1/context/bundle", json=bpayload, headers=H, timeout=30.0)
-        rb.raise_for_status()
-        b = rb.json()
+        b, _bsource = _request("POST", "/v1/context/bundle", json=bpayload)
         out["memories"] = b.get("memories", [])
         out["goals"] = b.get("goals", [])
         out["open_questions"] = b.get("open_questions", [])
+        if _bsource == "local-replica":
+            # Stale replica answered (your-machine unreachable) — mark the bundle as replica-served
+            # (same key/value convention as memory_search) and merge queued-but-unsynced adds.
+            out["source"] = "local-replica"
+            out["memories"].extend(_pending_adds(query))
+            out["pending_ops"] = _pending_op_count()
+    except OfflineError:
+        out["memories"], out["goals"], out["open_questions"] = [], [], []
+        out["offline"] = True
+        out["memories"].extend(_pending_adds(query))
+        out["pending_ops"] = _pending_op_count()
     except Exception as e:
         out["memories"], out["goals"], out["open_questions"] = [], [], []
         out["bundle_error"] = str(e)
@@ -169,9 +262,11 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
         cfilters["brand"] = brand
     try:
         # MEM-19: the canonical pull is a plain search POST — same '17.0' stamp.
-        rc = httpx.post(f"{MEM0_URL}/v1/memories/search", json={"query": query, "filters": cfilters, "limit": 5, "threshold": 0.0, "rerank": False, "query_class": "canonical", "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}, headers=H, timeout=30.0)
-        rc.raise_for_status()
-        out["canonical"] = rc.json().get("results", [])
+        c, _csource = _request("POST", "/v1/memories/search", json={"query": query, "filters": cfilters, "limit": 5, "threshold": 0.0, "rerank": False, "query_class": "canonical", "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION})
+        out["canonical"] = c.get("results", [])
+    except OfflineError:
+        out["canonical"] = []
+        out["offline"] = True
     except Exception as e:
         out["canonical"] = []
         out["canonical_error"] = str(e)
@@ -183,23 +278,27 @@ def memory_list(user_id: str = "__WSL_USER__", limit: int = 50) -> dict:
     Prefer memory_search for content discovery; this is for inventory."""
     if limit > 500:
         limit = 500
-    r = httpx.get(f"{MEM0_URL}/v1/memories", params={"user_id": user_id, "limit": limit}, headers=_headers(), timeout=30.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/memories", params={"user_id": user_id, "limit": limit})
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 @mcp.tool
 def memory_delete(memory_id: str) -> dict:
     """Delete a memory by its ID."""
-    r = httpx.delete(f"{MEM0_URL}/v1/memories/{memory_id}", headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("DELETE", f"/v1/memories/{memory_id}")
+    except OfflineError:
+        return _queue_op("delete", {"memory_id": memory_id})
 
 @mcp.tool
 def memory_update(memory_id: str, text: str) -> dict:
     """Update a memory's text content."""
-    r = httpx.put(f"{MEM0_URL}/v1/memories/{memory_id}", json={"text": text}, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PUT", f"/v1/memories/{memory_id}", json={"text": text})
+    except OfflineError:
+        return _queue_op("update", {"memory_id": memory_id, "text": text})
 
 @mcp.tool
 def memory_promote(memory_id: str, tier: str = "stable", reason: str | None = None) -> dict:
@@ -222,9 +321,10 @@ def memory_promote(memory_id: str, tier: str = "stable", reason: str | None = No
             "Ask the operator to run: bash mem0-canonize.sh " + memory_id + " \"<reason>\""
         )
     payload = {"tier": tier, "actor": "claude-autonomous", "reason": reason}
-    r = httpx.patch(f"{MEM0_URL}/v1/memories/{memory_id}/tier", json=payload, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/memories/{memory_id}/tier", json=payload)
+    except OfflineError:
+        return _queue_op("promote", {"memory_id": memory_id, "tier": tier, "reason": reason})
 
 @mcp.tool
 def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = None) -> dict:
@@ -233,16 +333,19 @@ def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = N
     actor is always 'claude-autonomous' when called via MCP.
     reason is recommended for audit clarity."""
     payload = {"tier": tier, "actor": "claude-autonomous", "reason": reason}
-    r = httpx.patch(f"{MEM0_URL}/v1/memories/{memory_id}/tier", json=payload, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/memories/{memory_id}/tier", json=payload)
+    except OfflineError:
+        return _queue_op("demote", {"memory_id": memory_id, "tier": tier, "reason": reason})
 
 @mcp.tool
 def memory_health() -> dict:
     """Check mem0 server health."""
-    r = httpx.get(f"{MEM0_URL}/health", timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/health")
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +386,11 @@ def episodic_search(
         payload["until"] = until
     if brand:
         payload["brand"] = brand
-    r = httpx.post(f"{MEM0_URL}/v1/episodes/search", json=payload, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("POST", "/v1/episodes/search", json=payload)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -306,9 +411,11 @@ def episodic_recent(limit: int = 7, brand: str | None = None) -> list:
     params: dict = {"recent": limit}
     if brand:
         params["brand"] = brand
-    r = httpx.get(f"{MEM0_URL}/v1/episodes", params=params, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/episodes", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -323,9 +430,11 @@ def episodic_get(episode_id: int) -> dict:
 
     episode_id: integer id from episodic_search or episodic_recent results.
     """
-    r = httpx.get(f"{MEM0_URL}/v1/episodes/{episode_id}", headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", f"/v1/episodes/{episode_id}")
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +453,11 @@ def goals_list(status: str | None = None, brand: str | None = None, limit: int =
         params["status"] = status
     if brand:
         params["brand"] = brand
-    r = httpx.get(f"{MEM0_URL}/v1/goals", params=params, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/goals", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -356,9 +467,11 @@ def goals_tree(root_id: int | None = None) -> list[dict]:
     params: dict = {}
     if root_id is not None:
         params["root_id"] = root_id
-    r = httpx.get(f"{MEM0_URL}/v1/goals/tree", params=params, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/goals/tree", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -367,9 +480,11 @@ def goals_open(brand: str | None = None, limit: int = 10) -> list[dict]:
     params: dict = {"status": "open", "limit": limit}
     if brand:
         params["brand"] = brand
-    r = httpx.get(f"{MEM0_URL}/v1/goals", params=params, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/goals", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -378,18 +493,22 @@ def goals_blocked(brand: str | None = None, limit: int = 10) -> list[dict]:
     params: dict = {"status": "blocked", "limit": limit}
     if brand:
         params["brand"] = brand
-    r = httpx.get(f"{MEM0_URL}/v1/goals", params=params, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/goals", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
 def goal_details(goal_id: int) -> dict:
     """Full goal detail including linked_episode_count and parent reference.
     Use to investigate a specific goal."""
-    r = httpx.get(f"{MEM0_URL}/v1/goals/{goal_id}", headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", f"/v1/goals/{goal_id}")
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -404,9 +523,10 @@ def goal_create_manual(title: str, description: str | None = None, brand: str | 
         body["brand"] = brand
     if parent_goal_id is not None:
         body["parent_goal_id"] = parent_goal_id
-    r = httpx.post(f"{MEM0_URL}/v1/goals", json=body, headers=_headers(), timeout=10.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("POST", "/v1/goals", json=body)
+    except OfflineError:
+        return _queue_op("goal_create_manual", body)
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +544,10 @@ def goal_abandon(goal_id: int, reason: str, actor: str = "claude-autonomous") ->
     Use when scope changed, priority dropped, or goal was redundant with another.
     Requires a non-empty reason — this is a deliberate trash-can move; document why."""
     body = {"actor": actor, "reason": reason}
-    r = httpx.patch(f"{MEM0_URL}/v1/goals/{goal_id}/abandon", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/goals/{goal_id}/abandon", json=body)
+    except OfflineError:
+        return _queue_op("goal_abandon", {"goal_id": goal_id, "reason": reason, "actor": actor})
 
 
 @mcp.tool
@@ -437,9 +558,10 @@ def goal_complete(goal_id: int, reason: str, actor: str = "claude-autonomous") -
     session's surfaced context. Sets completed_at and stamps a goal-completed ledger entry.
     Requires a non-empty reason — document what shipped. (v0.22 Phase A, resolves OQ#636.)"""
     body = {"actor": actor, "reason": reason}
-    r = httpx.patch(f"{MEM0_URL}/v1/goals/{goal_id}/complete", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/goals/{goal_id}/complete", json=body)
+    except OfflineError:
+        return _queue_op("goal_complete", {"goal_id": goal_id, "reason": reason, "actor": actor})
 
 
 # ---------------------------------------------------------------------------
@@ -454,9 +576,11 @@ def memory_get_by_id(memory_id: str) -> dict:
     for exact reads. Avoids wrong-ID edits caused by search rediscovering similar records.
 
     Pattern: call memory_get_by_id first to confirm the correct record, THEN act on it."""
-    r = httpx.get(f"{MEM0_URL}/v1/memories/{memory_id}", headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", f"/v1/memories/{memory_id}")
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +593,11 @@ def goal_set_priority(goal_id: int, priority: int, reason: str | None = None,
     """Update a goal's priority (1=highest, 5=lowest). v0.17 F.3.2.
     Use when a goal's urgency changes relative to other open goals."""
     body = {"priority": priority, "actor": actor, "reason": reason}
-    r = httpx.patch(f"{MEM0_URL}/v1/goals/{goal_id}/priority", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/goals/{goal_id}/priority", json=body)
+    except OfflineError:
+        return _queue_op("goal_set_priority", {"goal_id": goal_id, "priority": priority,
+                                               "reason": reason, "actor": actor})
 
 
 @mcp.tool
@@ -482,9 +608,12 @@ def goal_link_episode(goal_id: int, episode_id: int, link_type: str = "advanced_
     Use when a session advanced a goal but auto-extraction from the Stop hook missed it.
     v0.17 F.3.2."""
     body = {"episode_id": episode_id, "link_type": link_type, "delta_text": delta_text, "actor": actor}
-    r = httpx.post(f"{MEM0_URL}/v1/goals/{goal_id}/link_episode", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("POST", f"/v1/goals/{goal_id}/link_episode", json=body)
+    except OfflineError:
+        return _queue_op("goal_link_episode", {"goal_id": goal_id, "episode_id": episode_id,
+                                               "link_type": link_type, "delta_text": delta_text,
+                                               "actor": actor})
 
 
 @mcp.tool
@@ -494,9 +623,12 @@ def goal_merge(source_goal_id: int, target_goal_id: int, reason: str,
     Use when two goals turn out to be the same thing (duplicate created by auto-extraction).
     Source stays in DB for audit but is excluded from default listings. v0.17 F.3.2."""
     body = {"target_goal_id": target_goal_id, "actor": actor, "reason": reason}
-    r = httpx.post(f"{MEM0_URL}/v1/goals/{source_goal_id}/merge", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("POST", f"/v1/goals/{source_goal_id}/merge", json=body)
+    except OfflineError:
+        return _queue_op("goal_merge", {"source_goal_id": source_goal_id,
+                                        "target_goal_id": target_goal_id,
+                                        "reason": reason, "actor": actor})
 
 
 # ---------------------------------------------------------------------------
@@ -513,9 +645,11 @@ def open_questions_open(brand: str | None = None, limit: int = 7) -> list[dict]:
     params: dict = {"status": "open", "limit": limit}
     if brand:
         params["brand"] = brand
-    r = httpx.get(f"{MEM0_URL}/v1/open_questions", params=params, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", "/v1/open_questions", params=params)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -528,9 +662,11 @@ def open_question_search(query: str, brand: str | None = None, status: str = "op
         body["brand"] = brand
     if status:
         body["status"] = status
-    r = httpx.post(f"{MEM0_URL}/v1/open_questions/search", json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("POST", "/v1/open_questions/search", json=body)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 @mcp.tool
@@ -544,18 +680,23 @@ def open_question_resolve(open_question_id: int, resolution_text: str,
         "resolution_text": resolution_text,
         "actor": actor,
     }
-    r = httpx.patch(f"{MEM0_URL}/v1/open_questions/{open_question_id}/resolve",
-                    json=body, headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return _authority_only("PATCH", f"/v1/open_questions/{open_question_id}/resolve", json=body)
+    except OfflineError:
+        return _queue_op("open_question_resolve", {"open_question_id": open_question_id,
+                                                   "resolution_text": resolution_text,
+                                                   "resolved_in_session_id": resolved_in_session_id,
+                                                   "actor": actor})
 
 
 @mcp.tool
 def open_question_details(open_question_id: int) -> dict:
     """Full detail on a frontier question including related goal title."""
-    r = httpx.get(f"{MEM0_URL}/v1/open_questions/{open_question_id}", headers=_headers(), timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+    data, source = _request("GET", f"/v1/open_questions/{open_question_id}")
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; your-machine unreachable"
+    return data
 
 
 if __name__ == "__main__":

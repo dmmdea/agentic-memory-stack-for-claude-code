@@ -2,8 +2,25 @@
 # Windows-native PowerShell. Talks to mem0 over loopback (WSL mirrored networking).
 # Auth uses claude.cmd (Windows OAuth, works because Windows-native invocation).
 
-$script:Mem0Url = 'http://127.0.0.1:18791'
-$script:Mem0KeyPath = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\api-key'
+# Per-machine values resolve at RUNTIME, never baked into the deployed text (2026-07-14 audit).
+# WHY: the deployed copies live in ~/.claude, which is a git repo SHARED with the other machine.
+# A distro substituted in at install time therefore gets committed by whichever box installed last
+# and breaks the other one. Runtime resolution keeps the deployed bytes machine-independent.
+#   MEM0_URL        - endpoint override when the brain lives on another node (your-machine -> your-machine).
+#   MEM0_WSL_DISTRO - distro holding ~/.mem0. Falls back to the per-machine install receipt,
+#                     because a User-scope env var is INVISIBLE to hook children of a host process
+#                     that started before the var was set -- that is exactly why the L1a extractor
+#                     silently failed on your-machine (it resolved 'Ubuntu' and never found the API key).
+$script:Mem0Url = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+$script:Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
+    $rcptDistro = $null
+    try {
+        $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+        if (Test-Path $rcpt) { $rcptDistro = (Import-PowerShellDataFile $rcpt).Distro }
+    } catch { $rcptDistro = $null }
+    if ($rcptDistro) { $rcptDistro } else { 'Ubuntu' }   # last resort only; the installer always writes the receipt
+}
+$script:Mem0KeyPath = "\\wsl.localhost\$($script:Mem0WslDistro)\home\__WSL_USER__\.mem0\api-key"
 $script:LogDir = Join-Path $env:USERPROFILE '.claude\logs'
 $script:StateDir = Join-Path $env:USERPROFILE '.claude\state'
 
@@ -344,7 +361,10 @@ function Drain-Mem0DeadLetter {
 
         # Quarantine deterministic failures immediately
         $isPoisonCode = $POISON_CODES -contains $statusCode
-        $isMaxAttempts = $attempts -ge $MAX_ATTEMPTS
+        # 2026-07-15 offline-first: a connection-level failure (status_code 0 = your-machine unreachable)
+        # must NOT count toward the quarantine cap, or a multi-day offline stretch of Stop hooks
+        # would quarantine perfectly good writes. Only server-response failures accrue attempts.
+        $isMaxAttempts = ($statusCode -ne 0) -and ($attempts -ge $MAX_ATTEMPTS)
 
         if ($isPoisonCode -or $isMaxAttempts) {
             $reason = if ($isPoisonCode) {
@@ -400,8 +420,9 @@ function Drain-Mem0DeadLetter {
         if ($r) {
             $drained++
         } else {
-            # Re-queue with incremented attempts; preserve all fields
-            $updatedAttempts = $attempts + 1
+            # Re-queue with incremented attempts; preserve all fields.
+            # Connection-level failures (status_code 0) do not accrue attempts — see gate above.
+            $updatedAttempts = if ($statusCode -eq 0) { $attempts } else { $attempts + 1 }
             $retryRec = @{
                 text        = $textVal
                 source      = $sourceVal
@@ -826,6 +847,110 @@ function Get-RecentTranscriptTurns {
     if ($turns.Count -eq 0) { return $null }
     # Redact secrets on the FULL joined text (before truncation) so credentials never reach the
     # extractor LLM or mem0 — this is the single chokepoint every L1a/episodic consumer reads from.
+    $joined = Redact-Secrets ($turns -join "`n`n")
+    if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
+    return $joined
+}
+
+# ---------------------------------------------------------------------------
+# L1a transcript cursor (2026-07-14): the extractor ran Get-RecentTranscriptTurns
+# (last 24 turns) on EVERY Stop, so consecutive extractions of a growing transcript
+# re-processed the OVERLAPPING window and re-emitted the same facts. The server-side
+# hash-idempotency guard now no-ops the resulting duplicate WRITES, so this is purely a
+# token-saving optimisation on the extractor side: only feed the turns appended SINCE the
+# last SUCCESSFUL extraction. The cursor is a byte offset into the append-only JSONL
+# transcript, stored per-transcript (keyed by the session-UUID filename) under state/.
+# It advances ONLY when an extraction completes (Mark-Throttle points), so a failed codex
+# call / POST re-processes the same window next time. ANY uncertainty (no cursor, shrink/
+# rotation, empty since-window, or an error) falls back to Get-RecentTranscriptTurns — the
+# unchanged behaviour — so this can never LOSE an extraction, only skip redundant ones.
+function Get-L1aCursorPath {
+    param([Parameter(Mandatory)][string]$TranscriptPath)
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'unknown' }
+    # sanitize to a safe filename component
+    $safe = ($name -replace '[^0-9A-Za-z_\-]', '_')
+    if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 80) }
+    return (Join-Path $script:StateDir ("l1a-cursor-$safe.txt"))
+}
+
+function Get-L1aCursor {
+    param([Parameter(Mandatory)][string]$TranscriptPath)
+    try {
+        $p = Get-L1aCursorPath -TranscriptPath $TranscriptPath
+        if (Test-Path $p) {
+            $v = (Get-Content -LiteralPath $p -Raw -ErrorAction Stop).Trim()
+            $n = 0L
+            if ([long]::TryParse($v, [ref]$n) -and $n -ge 0) { return $n }
+        }
+    } catch { }
+    return 0L
+}
+
+function Set-L1aCursor {
+    param(
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [Parameter(Mandatory)][long]$Bytes
+    )
+    try {
+        if (-not (Test-Path $script:StateDir)) { New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null }
+        $p = Get-L1aCursorPath -TranscriptPath $TranscriptPath
+        Set-Content -LiteralPath $p -Value ([string]$Bytes) -NoNewline -Encoding ASCII
+    } catch { }   # best-effort: a cursor-write failure just means the next run re-extracts (safe)
+}
+
+function Get-TranscriptTurnsSince {
+    # Like Get-RecentTranscriptTurns, but returns ONLY the turns appended after $SinceBytes.
+    # Returns $null when nothing new (or on any read/parse trouble) so the caller falls back.
+    param(
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [Parameter(Mandatory)][long]$SinceBytes,
+        [int]$MaxTurns = 24,
+        [int]$MaxChars = 12000
+    )
+    if (-not (Test-Path $TranscriptPath)) { return $null }
+    $tailBytes      = 524288    # same 512 KB bound as Get-RecentTranscriptTurns (pathological-line guard)
+    $maxRecordChars = 262144
+    $raw = $null
+    $droppedPartial = $false
+    try {
+        $fs = [System.IO.File]::Open($TranscriptPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $len = $fs.Length
+            if ($SinceBytes -ge $len) { return $null }   # nothing appended since the cursor
+            $start = $SinceBytes
+            if (($len - $start) -gt $tailBytes) { $start = $len - $tailBytes; $droppedPartial = $true }  # huge gap: bound + drop first partial
+            [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+            $count = [int]($len - $start)
+            $buf = New-Object byte[] $count
+            $read = $fs.Read($buf, 0, $count)
+            $raw = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+        } finally { $fs.Dispose() }
+    } catch { return $null }
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    $records = $raw -split "`n"
+    # Only when we re-bounded past the cursor is the first fragment a partial mid-line record.
+    # At a clean cursor boundary (a prior file length) the first record is whole — keep it.
+    if ($droppedPartial -and $records.Count -gt 1) { $records = $records[1..($records.Count - 1)] }
+    $turns = @()
+    foreach ($line in ($records | Select-Object -Last $MaxTurns)) {
+        $line = $line.TrimEnd("`r")
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line.Length -gt $maxRecordChars) { continue }
+        try {
+            $obj = $line | ConvertFrom-Json
+            $role = $obj.message.role
+            $content = $obj.message.content
+            if (-not $role -or -not $content) { continue }
+            $text = if ($content -is [string]) {
+                $content
+            } else {
+                ($content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n"
+            }
+            if ($text) { $turns += "[$role] $text" }
+        } catch { }
+    }
+    if ($turns.Count -eq 0) { return $null }
     $joined = Redact-Secrets ($turns -join "`n`n")
     if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
     return $joined

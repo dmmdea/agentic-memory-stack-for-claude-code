@@ -11,6 +11,34 @@
 # running the hook pipeline. The production hook dot-sources it from $PSScriptRoot;
 # deploy BOTH files to C:\Users\__WIN_USER__\.claude\scripts\ together.
 
+function Get-Mem0WslDistro {
+    <#
+    .SYNOPSIS
+    Resolve the WSL distro that holds ~/.mem0, at RUNTIME (2026-07-14 audit).
+
+    .DESCRIPTION
+    Order: $env:MEM0_WSL_DISTRO -> the per-machine install receipt (mem0-stack.config.psd1)
+    -> 'Ubuntu' as a last resort.
+
+    Two reasons this is resolved at runtime instead of substituted at install time:
+      1. The deployed copies of these scripts are committed to ~/.claude, a git repo SHARED with
+         the other machine. A distro baked in on one box would be pulled onto the other.
+      2. A User-scope env var is NOT inherited by hook children of a host process that started
+         before the var was set — which is exactly how the L1a extractor silently failed on your-machine
+         (it fell through to 'Ubuntu' and never found the API key at the Ubuntu-ML UNC path).
+    Never throws; the receipt read is best-effort.
+    #>
+    if ($env:MEM0_WSL_DISTRO) { return $env:MEM0_WSL_DISTRO }
+    try {
+        $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+        if (Test-Path $rcpt) {
+            $d = (Import-PowerShellDataFile $rcpt).Distro
+            if ($d) { return [string]$d }
+        }
+    } catch { }
+    return 'Ubuntu'
+}
+
 function Test-CacheAclOwnerOnly {
     <#
     .SYNOPSIS
@@ -52,7 +80,9 @@ function Get-Mem0ApiKeyCached {
     Never throws.
     #>
     param(
-        [string]$UncPath           = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\api-key',
+        # Distro resolves at RUNTIME (2026-07-14 audit) — the deployed copy is committed to a repo
+        # shared with the other machine, so no machine-specific distro may be baked in here.
+        [string]$UncPath           = ("\\wsl.localhost\$(Get-Mem0WslDistro)\home\__WSL_USER__\.mem0\api-key"),
         [string]$CachePath         = ($env:USERPROFILE + '\.mem0\api-key.cache'),
         [int]$MaxAgeMinutes        = 60,
         [int]$MaxStaleFallbackHours = 24
@@ -1446,18 +1476,41 @@ function Test-OffloadNoBlockInvariant {
                 return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "UserPromptSubmit command references mcp__ ('$c') - offload exposure" }
             }
         }
-        # Every UserPromptSubmit command must route to a known human-prompt client.
-        $allHuman = $true
+        # The stack's human-prompt client must BE registered (it is the block's only producer).
+        #
+        # 2026-07-14 audit — precision fix. This used to require that EVERY registered
+        # UserPromptSubmit command be the stack client, which is not what the invariant needs and
+        # made any legitimate co-registered hook (e.g. the meta-router's mr-hook.exe surfacer) a
+        # permanent WARN. UserPromptSubmit fires on human prompts ONLY — never for tool/MCP calls
+        # or subagents — and the loop above already FAILs on any mcp__ command here, so a
+        # co-registered NON-mcp hook cannot route the [MEMORY CONTEXT] block to the offload
+        # harness. What actually matters is: (a) no mcp__ on this path (checked above), and
+        # (b) the stack client is present. Absent = the block is not produced at all -> WARN.
+        $hasHumanClient = $false
+        $foreignCmds = @()
         foreach ($c in $upsCmds) {
             $isHuman = $false
             foreach ($m in $HumanClientMarkers) { if ($c -like "*$m*") { $isHuman = $true; break } }
-            if (-not $isHuman) { $allHuman = $false }
+            if ($isHuman) { $hasHumanClient = $true } else { $foreignCmds += $c }
         }
-        if (-not $allHuman) {
-            return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = "UserPromptSubmit command(s) not recognized as the stack human-prompt client: $($upsCmds -join '; ')" }
+        # Co-registered NON-stack hooks are tolerated (see above) but never go silent: the old rule
+        # at least NAMED them. Surface them in Detail so an unknown/unexpected UserPromptSubmit
+        # binary stays visible to the one check that looks at this path.
+        $script:UpsForeignNote = if ($foreignCmds.Count) { " | co-registered non-stack UserPromptSubmit hook(s), tolerated (no mcp__, cannot reach the offload harness): $($foreignCmds -join '; ')" } else { '' }
+        if (-not $hasHumanClient) {
+            return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = "no stack human-prompt client among the UserPromptSubmit command(s): $($upsCmds -join '; ')" }
         }
 
-        # --- INV-2: no PreToolUse hook matcher names mcp__ -----------------------
+        # --- INV-2: no PreToolUse hook matcher fires for the OFFLOAD harness ------
+        # 2026-07-14 audit — precision fix. This used to FAIL on ANY 'mcp__' substring in ANY
+        # PreToolUse matcher. That is over-broad: gating a hook on a specific unrelated MCP tool is
+        # legitimate and desirable (this box guards mcp__desktop-commander__write_file /
+        # __edit_block with the secret-scanner — a SECURITY feature the old rule would have
+        # condemned). The invariant that actually matters is narrower: no PreToolUse hook may fire
+        # for an mcp__local-offload__* call. Gating on other MCP tools cannot route the
+        # [MEMORY CONTEXT] block to the harness. NOTE: this branch was previously unreachable —
+        # INV-1's all-must-be-human rule returned WARN first — so the over-broad rule had never
+        # actually been evaluated against this config.
         $pre = $null
         try { $pre = $Hooks.PreToolUse } catch { $pre = $null }
         $matchers = @()
@@ -1467,9 +1520,18 @@ function Test-OffloadNoBlockInvariant {
             try { $m = [string]$entry.matcher } catch { $m = $null }
             if (-not [string]::IsNullOrWhiteSpace($m)) { $matchers += $m }
         }
+        # Test each matcher AS A REGEX against a real offload tool name, rather than substring-
+        # searching the matcher text for 'mcp__local-offload'. Review catch 2026-07-14: a substring
+        # test misses the matchers that matter most — 'mcp__.*', 'mcp__' and '.*' all FIRE on an
+        # offload call at runtime yet contain no such substring, so the hole the check exists to
+        # catch would sail through it. Claude Code treats the matcher as a regex, so evaluate it
+        # the same way it does.
+        $offloadProbe = 'mcp__local-offload__offload_summarize'
         foreach ($m in $matchers) {
-            if ($m -match 'mcp__') {
-                return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher names mcp__ ('$m') - an MCP call (incl. offload) would fire a hook" }
+            $firesOnOffload = $false
+            try { $firesOnOffload = ($offloadProbe -match $m) } catch { $firesOnOffload = $false }  # invalid regex = cannot fire
+            if ($firesOnOffload) {
+                return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher fires for the offload harness ('$m') - the harness could receive hook output" }
             }
         }
         # Find the stack's own pre-tool-check matcher and confirm it is exactly the
@@ -1486,7 +1548,11 @@ function Test-OffloadNoBlockInvariant {
         }
         $matcherNote = if ($stackMatcher) { "pre-tool-check matcher='$stackMatcher'" } else { 'pre-tool-check matcher not found (other PreToolUse matchers checked)' }
 
-        return [pscustomobject]@{ Ok = $true; Status = 'OK'; Detail = "offload-no-block holds: UserPromptSubmit=human-client-only ($($upsCmds.Count) cmd), no PreToolUse mcp__ matcher; $matcherNote" }
+        # 2026-07-14: the old detail claimed "no PreToolUse mcp__ matcher", which is now a false
+        # statement on any box that legitimately gates a hook on a non-offload MCP tool (this one
+        # runs the secret-scanner on mcp__desktop-commander writes). State what was actually proven.
+        $offloadNote = if ($matchers.Count) { "no PreToolUse matcher fires for mcp__local-offload ($($matchers.Count) matcher(s) regex-tested)" } else { 'no PreToolUse matchers registered' }
+        return [pscustomobject]@{ Ok = $true; Status = 'OK'; Detail = "offload-no-block holds: UserPromptSubmit carries the stack human-client and no mcp__ command ($($upsCmds.Count) cmd), $offloadNote; $matcherNote$($script:UpsForeignNote)" }
     } catch {
         return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = "invariant parse error (fail-open): $($_.Exception.Message)" }
     }

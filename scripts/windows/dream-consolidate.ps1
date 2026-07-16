@@ -159,7 +159,7 @@ function Get-OpenGoalsContext {
     try {
         $key = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
         if (-not $key) { return '' }
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?status=open&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
+        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/goals?status=open&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
         if (-not $r) { return '' }
         $lines = @()
         foreach ($g in $r) {
@@ -180,7 +180,7 @@ function Get-OpenQuestionsContext {
     try {
         $key = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
         if (-not $key) { return '' }
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/open_questions?status=open&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
+        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/open_questions?status=open&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
         if (-not $r) { return '' }
         $lines = @()
         foreach ($q in $r) {
@@ -201,7 +201,7 @@ function Get-BlockedGoalsContext {
     try {
         $key = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
         if (-not $key) { return '' }
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?status=blocked&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
+        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/goals?status=blocked&limit=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
         if (-not $r) { return '' }
         $lines = @()
         foreach ($g in $r) {
@@ -218,7 +218,7 @@ function Get-RecentEpisodes {
     try {
         $key = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
         if (-not $key) { return '' }
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/episodes?recent=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
+        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/episodes?recent=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
         if (-not $r) { return '' }
         $lines = @()
         foreach ($e in $r) {
@@ -460,7 +460,7 @@ if ($insights.Count -gt 0 -and -not $DryRun) {
                             reason = "cited as source_memory_id by insight"
                         } | ConvertTo-Json -Depth 4
                         # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
-                        Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:18791/v1/memories/$sourceMid/metadata" -Headers @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'} -Body ([System.Text.Encoding]::UTF8.GetBytes($patchBody)) -TimeoutSec 5 | Out-Null
+                        Invoke-RestMethod -Method Patch -Uri "$($script:Mem0Url)/v1/memories/$sourceMid/metadata" -Headers @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'} -Body ([System.Text.Encoding]::UTF8.GetBytes($patchBody)) -TimeoutSec 5 | Out-Null
                     } catch {
                         # Best-effort - don't abort the cycle if a single PATCH fails
                         Write-MemoryLog -Component 'dream' -Message "  PATCH touched_by_dream failed for ${sourceMid}: $_"
@@ -500,7 +500,7 @@ try {
         # "non-fatal", leaving $canonicalNorm EMPTY so the canonical-dedup guard never ran.
         # Add the runtime user scope ($DcWslUser, line 17; no sentinels in this file).
         # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
-        $canonicalResp = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/search" `
+        $canonicalResp = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/memories/search" `
             -Method Post `
             -Headers @{'X-API-Key' = $ckeyForFetch; 'Content-Type' = 'application/json'} `
             -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = ''; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 1000 } | ConvertTo-Json -Depth 4 -Compress))) `

@@ -5,6 +5,7 @@ Exposes same REST surface as official mem0 server (POST/GET/PUT/DELETE /v1/memor
 import os
 import hmac
 import json
+import hashlib
 import logging
 import datetime as _dt
 from pathlib import Path
@@ -566,6 +567,67 @@ def _coerce_to_text(messages: Any) -> str:
         return str(messages.get("content", messages))
     return str(messages)
 
+def _find_existing_by_hash(text: str, user_id: str, metadata: Optional[dict]) -> Optional[str]:
+    """Return the id of a stored point holding this exact text in the SAME scope, else None.
+
+    Backs the add() hash-idempotency guard (audit 2026-07-14). Exact, not fuzzy: mem0 stamps
+    hash=md5(data) on every infer=False write, so an equal hash means a byte-identical string —
+    unlike semantic-dedup.py's cosine threshold, this can never collapse two distinct facts.
+
+    Scope = (user_id, workspace, project). The scope match MUST be symmetric: a missing key on the
+    incoming write has to match ONLY points that also lack it (`is_empty`), never "any value".
+    Review catch 2026-07-14 (proven live): with an asymmetric filter, a brand-NEUTRAL write whose
+    metadata carried no workspace collapsed onto a BRANDED point and was never created — and since
+    brand-scoped search is fail-closed, the fact then existed only under a brand and was invisible
+    in exactly the sessions that needed it. A dedup guard that hides memories is worse than the
+    duplicates it removes, so err toward writing.
+
+    Buried points (contradicts_canonical / superseded_by) are EXCLUDED: those are deliberately
+    hidden from retrieval, and NOOPing a fresh write onto one would silently bury the new fact too.
+
+    Fail-OPEN: any Qdrant error returns None and the write proceeds.
+    """
+    try:
+        must: list = [{"key": "hash", "match": {"value": hashlib.md5(text.encode()).hexdigest()}}]
+        if user_id:
+            must.append({"key": "user_id", "match": {"value": user_id}})
+        for _k in ("workspace", "project"):
+            _v = (metadata or {}).get(_k)
+            if _v:
+                must.append({"key": _k, "match": {"value": _v}})
+            else:
+                # symmetric: no workspace on the incoming write => match only points that also
+                # have none. Without this the filter degenerates to (hash, user_id) and a
+                # brand-neutral write collapses onto a branded record.
+                must.append({"is_empty": {"key": _k}})
+        # Never dedup onto a record retrieval already hides — NOOPing onto it would bury the
+        # incoming fact too. Buried = contradicts_canonical set, superseded, or retrievable=false.
+        must.append({"is_empty": {"key": "contradicts_canonical"}})
+        must.append({"is_empty": {"key": "superseded_by"}})
+        hits = mem.vector_store.client.scroll(
+            collection_name=mem.vector_store.collection_name,
+            scroll_filter={
+                "must": must,
+                "must_not": [{"key": "retrievable", "match": {"value": False}}],
+            },
+            with_payload=True,
+            with_vectors=False,
+            limit=1,
+        )
+        points = hits[0] if hits else []
+        if not points:
+            return None
+        pay = points[0].payload or {}
+        # Tier must agree. A dream/C1 write of tier=insight must NOT be swallowed by an existing
+        # tier=evidence row (it would silently downgrade the insight and skip its ledger entry).
+        _incoming_tier = (metadata or {}).get("tier")
+        if _incoming_tier and pay.get("tier") and pay.get("tier") != _incoming_tier:
+            return None
+        return str(points[0].id)
+    except Exception:
+        log.warning("add(): hash-idempotency probe failed; allowing the write (fail-open)", exc_info=True)
+        return None
+
 def _secure_open(path: Path, mode: str = "a", encoding: str = "utf-8"):
     """v0.18 MED-10: open an append-log with chmod 600 enforced at creation.
     These logs carry query text, decision text, and replay nonces — owner-only perms."""
@@ -698,6 +760,14 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
             f"add: memory exceeds {MAX_MEMORY_CHARS}-char cap (got {len(text_for_check)}). "
             "Split into atomic facts (best for retrieval precision) or trim; raise MEM0_MAX_MEMORY_CHARS if a larger record is truly intended."
         )
+
+    # Empty-write guard (audit 2026-07-14): 163 live points held data="" (hash
+    # d41d8cd98f00b204e9800998ecf8427e — the md5 of the empty string), all written during the
+    # 2026-07-12 L1a bulk extraction. An empty memory is unretrievable noise that also trips
+    # L10's missing-provenance heuristic. Reject it at the door rather than storing it.
+    if not text_for_check.strip():
+        raise HTTPException(400, "add: refusing to store an empty memory (messages coerced to an empty string).")
+
     # Enforce: only evidence|temporal|insight* can be written via add.
     # - canonical NEVER via add — must use PATCH /v1/memories/{id}/tier with actor='user-direct'
     # - insight via add allowed ONLY when source contains 'c1-consolidator' (the nightly synthesizer)
@@ -741,6 +811,30 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
             log.warning("add() stripped caller-supplied retrieval-gating metadata keys %s "
                         "(only writable via PATCH /metadata by a trusted actor, or by the NLI gate)",
                         sorted(_stripped))
+
+    # Hash idempotency (audit 2026-07-14): 63,350 of 67,787 points (93.5%) were exact-hash
+    # duplicates. Cause: the L1a extractor re-extracts the WHOLE transcript on every
+    # Stop/PreCompact hook, and this endpoint had no uniqueness check — so every Stop re-inserted
+    # every fact of the session (worst single fact: 4,174 copies). mem0 stores hash=md5(data) on
+    # infer=False writes, so this match is EXACT, not a similarity heuristic. On a hit we return
+    # the existing id (idempotent for the caller) and write nothing.
+    #
+    # ORDERING IS LOAD-BEARING (review catch 2026-07-14): this MUST sit AFTER the tier gate and the
+    # forbidden-metadata strip above. Placed before them, a tier='canonical' add whose text already
+    # existed returned 200/NOOP instead of the 403 the gate owes the caller — a security guardrail
+    # whose enforcement depended on whether the text happened to be new. Every gate runs first;
+    # dedup is the last thing before the write.
+    #
+    # infer=True is deliberately NOT guarded: those facts are LLM-derived, so their stored hashes
+    # are not knowable before the write.
+    if b.infer is False:
+        _existing = _find_existing_by_hash(text_for_check, b.user_id, b.metadata)
+        if _existing:
+            log.info("add(): idempotent no-op — identical memory already stored as %s", _existing)
+            return {
+                "results": [{"id": _existing, "memory": text_for_check, "event": "NOOP_DUPLICATE"}],
+                "deduplicated": True,
+            }
 
     try:
         result = mem.add(

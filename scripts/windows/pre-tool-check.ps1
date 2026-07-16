@@ -46,9 +46,21 @@ $ErrorActionPreference = 'SilentlyContinue'
 # (rare) matching slow path and inside Write-Log.
 $script:LogDir   = $env:USERPROFILE + '\.claude\logs'
 $script:LogFile  = $script:LogDir + '\pre-tool-check.log'
-$script:BaseUrl  = 'http://127.0.0.1:18791'
-$script:WarnFile = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\pre-tool-warnings.jsonl'
-$script:ApiKeyUncPath = '\\wsl.localhost\__WSL_DISTRO__\home\__WSL_USER__\.mem0\api-key'
+# Per-machine values resolve at RUNTIME (2026-07-14 audit; see memory-common.ps1 for the rationale).
+# The zero-cmdlet rule above still holds: env reads, [System.IO.File] statics and [regex] are all
+# .NET — no Import-PowerShellDataFile / Join-Path here, so the fast path pays no module load.
+$script:BaseUrl  = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+$script:Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
+    $rcptPath = $env:USERPROFILE + '\.claude\scripts\mem0-stack.config.psd1'
+    $d = ''
+    if ([System.IO.File]::Exists($rcptPath)) {
+        $m = [regex]::Match([System.IO.File]::ReadAllText($rcptPath), "Distro\s*=\s*'([^']+)'")
+        if ($m.Success) { $d = $m.Groups[1].Value }
+    }
+    if ($d) { $d } else { 'Ubuntu' }   # last resort; the installer always writes the receipt
+}
+$script:WarnFile = '\\wsl.localhost\' + $script:Mem0WslDistro + '\home\__WSL_USER__\.mem0\pre-tool-warnings.jsonl'
+$script:ApiKeyUncPath = '\\wsl.localhost\' + $script:Mem0WslDistro + '\home\__WSL_USER__\.mem0\api-key'
 # Directory of THIS script (deployed: C:\Users\__WIN_USER__\.claude\scripts) — the lib
 # ships alongside both hooks.
 $script:ScriptDir = [System.IO.Path]::GetDirectoryName($PSCommandPath)
