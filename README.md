@@ -1,5 +1,7 @@
 # Agentic Memory Stack for Claude Code
 
+[![CI](https://github.com/dmmdea/agentic-memory-stack-for-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/dmmdea/agentic-memory-stack-for-claude-code/actions/workflows/ci.yml)
+
 A persistent, multi-tier, **measurably faithful** memory backend for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows + WSL2. It captures durable facts from your sessions, consolidates them into higher-order insights, surfaces the right one before each prompt, and governs against drift — with a causal-intervention eval proving the memory actually changes behavior.
 
 > **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), nightly consolidation (Task Scheduler), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a DPAPI-isolated canonical-key credential.

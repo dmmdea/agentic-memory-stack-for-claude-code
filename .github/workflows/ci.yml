@@ -1,0 +1,104 @@
+name: CI
+
+# Every job below is blocking and green on the tree it was added to.
+#
+# The three linters start at their *error* tier on purpose. The tree has
+# pre-existing findings at the lower tiers, and a repo-wide cleanup does not
+# belong in the commit that introduces CI. Each tier is a ratchet: a follow-up PR
+# cleans one level, then raises the gate here. Measured on 73ac638:
+#
+#   ruff              F401/F541/F841: 21 findings (all auto-fixable), then E rules: 38
+#   shellcheck        --severity=warning: 2 findings
+#   PSScriptAnalyzer  -Severity Warning: 322 findings
+#
+# Nothing is silenced: the deferred tiers are listed above so raising them is a
+# decision, not a discovery.
+
+# Branch flow: feature -> dev -> main. Both protected branches are gated: CI runs
+# on every PR into dev or main, and again on the merge result.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  import-closure:
+    name: Installer import closure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every mem0-server module is shipped by the installer
+        run: bash scripts/ci/check-import-closure.sh
+
+  tests:
+    name: Python tests (public suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check --quiet pytest
+      - name: Run the suites that need no live stack
+        run: |
+          python -m pytest -q \
+            scripts/wsl/test_ship_log_classifier.py \
+            scripts/wsl/test_ship_log_reclassify.py
+
+  ruff:
+    name: ruff (pyflakes tier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: python -m pip install --disable-pip-version-check --quiet ruff
+      # Pyflakes catches real bugs (undefined names, redefinitions). The three
+      # ignored rules are the cosmetic families the tree is currently dirty on.
+      - name: Lint
+        run: ruff check --select F --ignore F401,F541,F841 --output-format=github .
+
+  shellcheck:
+    name: shellcheck (error tier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck ships preinstalled on the GitHub-hosted ubuntu runners.
+      - name: Lint shell scripts
+        run: |
+          mapfile -t files < <(git ls-files '*.sh')
+          printf 'checking %d shell script(s)\n' "${#files[@]}"
+          shellcheck --severity=error "${files[@]}"
+
+  psscriptanalyzer:
+    name: PSScriptAnalyzer (error tier)
+    # PSScriptAnalyzer parses the AST — it never executes the scripts — so it runs
+    # on Linux via cross-platform pwsh (preinstalled on the ubuntu runners). Keeps
+    # the matrix on one OS and off the 2x-cost Windows runners.
+    # Note: the module requires pwsh >= 7.4.6.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Analyze PowerShell scripts
+        shell: pwsh
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          if ($findings) {
+            $findings | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+            throw "PSScriptAnalyzer reported $($findings.Count) error-severity finding(s)"
+          }
+          Write-Host 'PSScriptAnalyzer: no error-severity findings.'
