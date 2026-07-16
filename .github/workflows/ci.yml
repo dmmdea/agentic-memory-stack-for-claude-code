@@ -46,8 +46,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pytest
-        run: python -m pip install --disable-pip-version-check --quiet pytest
+      # httpx is imported at module scope by ship_log_reclassify, which the suites
+      # import. CLAUDE.md states the same requirement: "any Python 3.12+ with
+      # httpx + pytest works for the suite".
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check --quiet pytest httpx
       - name: Run the suites that need no live stack
         run: |
           python -m pytest -q \
