@@ -3,7 +3,11 @@
 Idempotent (replayed-key ledger); failures -> mutation-conflicts.jsonl (never dropped).
 Only runs when the authority is reachable; atomic rotation closes the concurrent-writer race."""
 from __future__ import annotations
-import argparse, json, os, sys, uuid
+import argparse
+import json
+import os
+import sys
+import uuid
 from pathlib import Path
 import httpx
 

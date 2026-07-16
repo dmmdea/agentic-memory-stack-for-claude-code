@@ -347,7 +347,7 @@ def run_apply(*, dry_run: bool) -> int:
 
         print(f"\n  Would process  : {len(to_process)}")
         print(f"  Would skip     : {already_done} (already retired / reclassified)")
-        print(f"  ZERO writes performed (dry-run).")
+        print("  ZERO writes performed (dry-run).")
 
         sample = to_process[:10]
         if sample:
@@ -506,7 +506,7 @@ def run_retire_only(*, dry_run: bool) -> int:
             snippet = c["text"].replace("\n", " ")[:90]
             print(f"  {c['id'][:8]:<10} {c['len']:>6}  {brand:<16}  {snippet!r}")
             if dry_run:
-                print(f"    → would PATCH retrievable=False (actor=backfill-apply-v013)")
+                print("    → would PATCH retrievable=False (actor=backfill-apply-v013)")
 
     if dry_run:
         print(f"\nDRY-RUN complete. {len(to_retire)} would be retired. No data modified.")
@@ -603,7 +603,7 @@ def run_report() -> int:
     full_predicate = len(candidates)
     conservative_count = len(conservative_set)
 
-    print(f"\n--- COUNTS ---")
+    print("\n--- COUNTS ---")
     print(f"  Total points scrolled  :  {total_points}")
     print(f"  Total tier=evidence    :  {total_evidence}")
     print(f"  Excluded (test debris) :  {len(excluded)}")
@@ -612,7 +612,7 @@ def run_report() -> int:
     print(f"\n  Operator decision D1: conservative ~{conservative_count} (>800 chars)"
           f" vs aggressive ~{full_predicate} (all is_ship_log)")
 
-    print(f"\n--- CANDIDATE TABLE (sorted by length desc) ---")
+    print("\n--- CANDIDATE TABLE (sorted by length desc) ---")
     print(f"  {'id[:8]':<10} {'len':>6}  {'>800?':<6}  {'brand':<16}  first 90 chars")
     print(f"  {'-'*8:<10} {'-'*6:>6}  {'-'*5:<6}  {'-'*16:<16}  {'-'*30}")
     for c in candidates:

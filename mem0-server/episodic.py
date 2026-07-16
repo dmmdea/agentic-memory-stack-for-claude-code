@@ -598,7 +598,7 @@ def finalize_episode(
         _within_duplicate_window = False
         if recent_complete and recent_complete["ended_at"]:
             try:
-                from datetime import datetime, timezone, timedelta as _td
+                from datetime import datetime
                 recent_dt = datetime.fromisoformat(
                     str(recent_complete["ended_at"]).replace("Z", "+00:00")
                 )

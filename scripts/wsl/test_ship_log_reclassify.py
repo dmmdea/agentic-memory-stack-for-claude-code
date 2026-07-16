@@ -14,7 +14,7 @@ import sys
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(__file__))
@@ -80,16 +80,13 @@ class TestApplyLive(unittest.TestCase):
 
         Returns (result_code, mock_client_instance).
         """
-        import tempfile, importlib
+        import tempfile
         import ship_log_reclassify as m
 
         # Write a temp report JSON
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump([candidate], f)
             tmp_path = Path(f.name)
-
-        # Patch _REPORT_JSON_PATH inside the module
-        qdrant_pt_payload = qdrant_payload or {}  # empty = not yet processed
 
         # Build a mock httpx.Client context manager
         mock_client = MagicMock()

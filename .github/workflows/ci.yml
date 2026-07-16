@@ -7,7 +7,8 @@ name: CI
 # belong in the commit that introduces CI. Each tier is a ratchet: a follow-up PR
 # cleans one level, then raises the gate here. Measured on 73ac638:
 #
-#   ruff              F401/F541/F841: 21 findings (all auto-fixable), then E rules: 38
+#   ruff              E701/E702 (29, need a formatter), E402 (9, several are
+#                     load-bearing sys.path patches), E722 (2, changes behavior)
 #   shellcheck        --severity=warning: 2 findings
 #   PSScriptAnalyzer  -Severity Warning: 322 findings
 #
@@ -67,10 +68,10 @@ jobs:
           python-version: '3.12'
       - name: Install ruff
         run: python -m pip install --disable-pip-version-check --quiet ruff
-      # Pyflakes catches real bugs (undefined names, redefinitions). The three
-      # ignored rules are the cosmetic families the tree is currently dirty on.
+      # Full pyflakes: real bugs (undefined names, redefinitions) plus dead code
+      # (unused imports and variables). Green since the dead code was removed.
       - name: Lint
-        run: ruff check --select F --ignore F401,F541,F841 --output-format=github .
+        run: ruff check --select F --output-format=github .
 
   shellcheck:
     name: shellcheck (error tier)

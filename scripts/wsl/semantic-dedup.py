@@ -30,7 +30,10 @@ emit dedup-scan-abort with partial counts. Acquires exclusive fcntl lock on
 its consolidation phase (prevents insights with source_memory_ids that dedup is
 about to delete)."""
 from __future__ import annotations
-import fcntl, json, os, sys
+import fcntl
+import json
+import os
+import sys
 import datetime as dt
 from pathlib import Path
 import httpx
