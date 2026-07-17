@@ -114,7 +114,7 @@ function Invoke-Mem0Post {
 # Per-machine values resolve at RUNTIME (2026-07-14 audit) — see memory-common.ps1 for the why:
 # the deployed copies are committed to a repo shared with the other machine, so nothing
 # machine-specific may be baked in, and a User-scope env var is invisible to hook children of an
-# already-running host process (which is how this hook silently lost its API key on your-machine).
+# already-running host process (which is how this hook silently lost its API key on one box).
 $BaseUrl = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
 $Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     $rcptDistro = $null
