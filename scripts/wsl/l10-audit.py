@@ -137,8 +137,6 @@ def main():
     _ = load_key()  # validates API key file exists; not actually needed for Qdrant scroll
     state = load_state()
     audited_keys: set[str] = set(state.get("audited_keys", []))
-    last_audit_ts = state.get("last_audit_ts", 0)
-    last_audit_dt = dt.datetime.fromtimestamp(last_audit_ts, tz=dt.timezone.utc) if last_audit_ts else None
     now = int(time.time())
     now_dt = dt.datetime.now(dt.timezone.utc)
 

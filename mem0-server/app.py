@@ -28,7 +28,6 @@ from episodic import (
     _connect as _episodic_connect,
     init_schema as _episodic_init_schema,
     create_session as _episodic_create_session,
-    add_episode as _episodic_add_episode,
     add_link as _episodic_add_link,
     search_fts as _episodic_search_fts,
     recent as _episodic_recent,
@@ -295,7 +294,6 @@ class EpisodeCheckpointIn(BaseModel):
 # v0.19 M15: '18.0' removed from the known set — only '17.0' is real; the set
 # is extended in the same commit that bumps $HookContractVersion in the hooks.
 from hook_contract import (
-    KNOWN_HOOK_CONTRACT_VERSIONS as _KNOWN_HOOK_CONTRACT_VERSIONS,
     hook_contract_stats as _hook_contract_stats,
     warn_hook_contract_version as _warn_hook_contract_version,
 )
@@ -981,7 +979,6 @@ def _search_core(b: SearchIn):
         # Only mark reranked=True if the reranker actually ran (presence of rerank_score)
         results["reranked"] = any("rerank_score" in r for r in reranked_items)
     # v0.17 F.4.1: query_class recency policy (applied AFTER rerank, BEFORE return)
-    import math as _math
     qclass = ((b.query_class or "durable") if hasattr(b, "query_class") else "durable").lower()
     if qclass == "operational":
         if isinstance(results, dict) and isinstance(results.get("results"), list):

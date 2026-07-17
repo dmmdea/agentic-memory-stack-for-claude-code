@@ -10,7 +10,9 @@ if the reader stops there). Full structured list follows.
 
 Verbose content stays in mem0; this is just a pointer index for SessionStart hydration."""
 from __future__ import annotations
-import datetime as dt, json, os, sys
+import datetime as dt
+import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 import httpx
@@ -135,18 +137,18 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out = [
-        f"# MEMORY.md - agentic-memory-stack lean index",
+        "# MEMORY.md - agentic-memory-stack lean index",
         f"Generated {now} by memory-index-build.py * Hard cap {MAX_LINES} lines * Lead {LEAD_N} = working-memory anchor.",
-        f"",
+        "",
         f"## Top {LEAD_N} (skim-only)",
     ]
     for e in lead:
         out.append(f"- `{e['id'][:8]}` [{e['tier']}] {e['snippet']}")
     out.extend([
-        f"",
-        f"## Full index (grouped by tier -> source)",
-        f"Plain evidence lives in mem0 (search by query). Full text via `memory_search` / `memory_list`.",
-        f"",
+        "",
+        "## Full index (grouped by tier -> source)",
+        "Plain evidence lives in mem0 (search by query). Full text via `memory_search` / `memory_list`.",
+        "",
     ])
     for tier in PRIORITY:
         if tier == "evidence": continue
