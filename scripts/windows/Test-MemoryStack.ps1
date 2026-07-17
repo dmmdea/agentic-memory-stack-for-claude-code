@@ -192,7 +192,7 @@ try {
 } catch { Add-Check 'INVARIANTS' 'Qdrant bind' 'FAIL' $_.Exception.Message }
 
 # I2: llama-swap bind — must NOT be 0.0.0.0 (v0.17 F.2.2)
-# 2026-07-14: llama-swap is not always a WSL service. On the your-machine workstation it runs
+# 2026-07-14: llama-swap is not always a WSL service. On some workstations it runs
 # WINDOWS-NATIVE (llama-swap.exe under a SYSTEM scheduled task, config C:\llama-swap\
 # llama-swap.yaml), so the WSL-side `ss` probe below sees nothing and this check reported
 # "no listener on :11436 (llama-swap may be down)" while llama-swap was in fact serving the

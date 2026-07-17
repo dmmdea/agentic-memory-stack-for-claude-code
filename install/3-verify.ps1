@@ -62,10 +62,44 @@ Check "SessionStart daemon-spawn registered" {
     @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command }) -like '*mem0-hook-daemon-spawn.ps1*'
 } "Re-run 2-windows-config.ps1"
 Check "mem0 MCP server registered" { $m = Get-Content "$env:USERPROFILE\.claude.json" -Raw | ConvertFrom-Json; $m.mcpServers.mem0 -ne $null } "Re-run 2-windows-config.ps1"
+# v1.16 (2026-07-17 remediation §6.2.3): generic deploy-layer skew detector. The shared/synced
+# settings.json can advance ahead of this box's machine-local deployed scripts (2026-07-17:
+# a config-repo untrack+pull deleted a box's whole deploy layer while settings.json kept
+# referencing it — the missing PreCompact script deadlocked live sessions). Every
+# ~/.claude/scripts/<file> referenced ANYWHERE in settings.json must exist on disk
+# (deliberately broader than hook commands — over-detection is the safe direction here).
+Check "No hook references a missing deployed script (skew guard)" {
+    $raw = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw
+    $refs = [regex]::Matches($raw, '(?i)[\\/]\.claude[\\/]+scripts[\\/]+([A-Za-z0-9_.-]+)') |
+        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $missing = @($refs | Where-Object { -not (Test-Path "$env:USERPROFILE\.claude\scripts\$_") })
+    if ($missing.Count -gt 0) { Write-Host "(missing: $($missing -join ', ')) " -NoNewline -ForegroundColor Yellow }
+    $missing.Count -eq 0
+} "Deploy layer is skewed vs settings.json - re-run 2-windows-config.ps1 (and check ~/.claude git history for an untrack/clean that removed deployed scripts)"
+# v1.16 one-brain role gate (§6.3): the receipt records this box's role. brain -> both
+# nightly tasks must be registered; replica -> both must be ABSENT (a replica running
+# consolidation/dedup mutates the one shared brain destructively).
+$stackRole = 'brain'
+$receiptFile = "$env:USERPROFILE\.claude\scripts\mem0-stack.config.psd1"
+if (Test-Path $receiptFile) {
+    try { $r = Import-PowerShellDataFile $receiptFile; if ($r.Role) { $stackRole = $r.Role } } catch {}
+}
+if ($stackRole -eq 'brain') {
 Check "Task Scheduler 3am dream-consolidate" {
     $t = Get-ScheduledTask -TaskName 'ClaudeCode-DreamConsolidator-3am' -ErrorAction SilentlyContinue
     $t -ne $null -and $t.Actions[0].Arguments -match 'dream-consolidate\.ps1'
 } "Re-run 2-windows-config.ps1"
+Check "Task Scheduler 4:30am semantic-dedup" {
+    $t = Get-ScheduledTask -TaskName 'ClaudeCode-SemanticDedup-430am' -ErrorAction SilentlyContinue
+    $t -ne $null -and $t.Actions[0].Arguments -match 'semantic-dedup\.py'
+} "Re-run 2-windows-config.ps1"
+} else {
+Check "Replica role: dream/dedup tasks absent (one-brain rule)" {
+    $dream = Get-ScheduledTask -TaskName 'ClaudeCode-DreamConsolidator-3am' -ErrorAction SilentlyContinue
+    $dedup = Get-ScheduledTask -TaskName 'ClaudeCode-SemanticDedup-430am' -ErrorAction SilentlyContinue
+    ($null -eq $dream) -and ($null -eq $dedup)
+} "A read-replica must not run nightly canonical mutations - re-run 2-windows-config.ps1 -Role replica (it unregisters them)"
+}
 Check "canonical-key exists (DPAPI blob or plaintext mode 600)" {
     # v0.20 Phase D (M9): post-Phase-H a DPAPI box has ONLY the .dpapi blob —
     # the old plaintext-only check false-failed there and its remediation

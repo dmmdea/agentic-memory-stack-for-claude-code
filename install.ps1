@@ -13,10 +13,21 @@ param(
     [string]$LogFile = '',
     # v1.0 Phase 7A: operator-agnostic install. The WSL distro is auto-detected
     # (default distro from `wsl -l -q`) but can be overridden for multi-distro boxes.
-    [string]$Distro = ''
+    [string]$Distro = '',
+    # v1.16 one-brain role gate: 'brain' (default) = this box is the memory write
+    # authority and runs the nightly dream/dedup scheduled tasks; 'replica' = a
+    # read-replica box where those canonical-mutation tasks must never run (and
+    # any previously-registered ones are removed).
+    [ValidateSet('brain','replica')][string]$Role = 'brain'
 )
 
 $ErrorActionPreference = 'Stop'
+# v1.16: the install phases are pwsh-only (2-windows-config.ps1 does not even PARSE under
+# Windows PowerShell 5.1 — BOM-less UTF-8 + em-dashes decode as ANSI and break quote
+# tracking, yielding five cryptic parse errors). Fail loud here instead, where 5.1 parses.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "This installer requires PowerShell 7+ (pwsh). You are on $($PSVersionTable.PSVersion). Run: pwsh -File install.ps1"
+}
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
 
@@ -49,6 +60,7 @@ try {
     Write-Host "WSL distro: $Distro"
     $wslUser = (wsl.exe -d $Distro -e whoami).Trim()
     Write-Host "WSL user: $wslUser"
+    Write-Host "Memory role: $Role (brain = runs nightly dream/dedup; replica = never)"
     Write-Host ""
 
     Write-Phase "[0/4] Prerequisites check"
@@ -66,7 +78,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "WSL services install failed." }
 
     Write-Phase "[2/4] Windows config (hooks, Task Scheduler, MCP registrations, CLAUDE.md patch)"
-    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro
+    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro -Role $Role
     if ($LASTEXITCODE -ne 0) { throw "Windows config failed." }
 
     Write-Phase "[3/4] Verify (end-to-end smoke test)"

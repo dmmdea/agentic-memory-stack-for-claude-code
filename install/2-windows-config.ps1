@@ -1,10 +1,24 @@
 # 2-windows-config.ps1 - register Claude Code hooks, MCP servers, Task Scheduler.
 # Idempotent: safe to re-run.
+# pwsh-only (v1.16 review finding): this file has never parsed under Windows PowerShell 5.1
+# (BOM-less UTF-8 + em-dashes in strings decode as ANSI and break quote tracking). NOTE:
+# #Requires cannot make that loud here — 5.1 fails at PARSE time, before #Requires is
+# evaluated — so the loud pre-flight guard lives in install.ps1 (which 5.1 does parse).
+# This #Requires still documents + enforces the contract for direct standalone invocation
+# from pwsh <7.
+#Requires -Version 7
 
 param(
     [Parameter(Mandatory)][string]$WslUser,
     # v1.0 Phase 7A: operator-agnostic. Resolved by the orchestrator; auto-detect if standalone.
-    [string]$Distro = ''
+    [string]$Distro = '',
+    # v1.16 (2026-07-17 deploy-layer-skew remediation §6.3): one-brain role gate. 'brain' (default) =
+    # this box is the memory write authority and runs the nightly dream-consolidate +
+    # semantic-dedup scheduled tasks. 'replica' = read-replica box (one-brain rule,
+    # docs/superpowers/specs/2026-07-15-offline-first-memory-design.md): consolidation and
+    # dedup are canonical-mutation operations and must NEVER run here — the installer
+    # skips registration AND removes any previously-registered tasks.
+    [ValidateSet('brain','replica')][string]$Role = 'brain'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,6 +107,7 @@ $receiptPath = Join-Path $ScriptsDir 'mem0-stack.config.psd1'
 $eWslUser = $WslUser.Replace("'", "''")
 $eWinUser = $WinUser.Replace("'", "''")
 $eDistro  = $Distro.Replace("'", "''")
+$eRole    = $Role.Replace("'", "''")
 $eRepoWin = $RepoRootWin.Replace("'", "''")
 $eRepoWsl = $RepoRootWsl.Replace("'", "''")
 $receipt = @"
@@ -100,6 +115,9 @@ $receipt = @"
     WslUser     = '$eWslUser'
     WinUser     = '$eWinUser'
     Distro      = '$eDistro'
+    # v1.16: one-brain role. 'brain' = write authority (dream/dedup tasks registered);
+    # 'replica' = read-replica (nightly canonical-mutation tasks forbidden here).
+    Role        = '$eRole'
     RepoRootWin = '$eRepoWin'
     RepoRootWsl = '$eRepoWsl'
     ApiKeyUnc   = '\\wsl.localhost\$eDistro\home\$eWslUser\.mem0\api-key'
@@ -110,7 +128,7 @@ $receipt = @"
 }
 "@
 Write-StackFile $receiptPath $receipt
-Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser Distro=$Distro)"
+Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser Distro=$Distro Role=$Role)"
 
 # H12: added user-prompt-extract.ps1 and pre-tool-check.ps1 for v0.17 Phase 0 hooks
 # v0.19 M13: added user-prompt-lib.ps1 — user-prompt-extract.ps1 dot-sources it;
@@ -293,13 +311,35 @@ $psQuoted = if ($psRunner -match '\s') { '"' + $psRunner + '"' } else { $psRunne
 Write-Host "    PowerShell runner (hooks + dream): $psRunner"
 
 $psDispatcher = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\stop-extract.ps1'
+# v1.16 (2026-07-17 remediation §6.1.5): emit DISTRO-AGNOSTIC hook commands (no `-d`)
+# when the AMS distro IS the box's WSL default — `wsl.exe` with no `-d` reaches it, and the
+# resulting settings.json stays portable across machines whose default distros differ (a
+# shared/synced settings.json with a hardcoded `-d <distro>` breaks every other box).
+# Only a NON-default AMS distro needs the explicit `-d` for correctness. The probe asks the
+# default distro its own name — the exact semantic "what does the no-`-d` form reach?".
+# Non-login bash (-c, not -lc): WSL_DISTRO_NAME is process env so no profile is needed, and a
+# profile that prints to stdout can't pollute the probe. Take the LAST non-empty line for the
+# same reason (v1.16 review finding 4).
+$defaultDistro = ''
+try { $defaultDistro = ((wsl.exe -e bash -c 'echo $WSL_DISTRO_NAME' 2>$null | Where-Object { "$_".Trim() } | Select-Object -Last 1) -as [string]).Trim() } catch {}
+$wslDistroArg = if ($defaultDistro -eq $Distro) { '' } else { '-d ' + $Distro + ' ' }
+if ($wslDistroArg) { Write-Host "    NOTE: $Distro is not the WSL default ($defaultDistro) - hook commands carry -d $Distro (settings.json becomes machine-specific)" -ForegroundColor Yellow }
+else { Write-Host "    hook commands emitted distro-agnostic (no -d; $Distro is the WSL default)" }
 # Use wsl.exe to invoke the bash script - Git Bash on Windows can't find /mnt/c paths
 # from this command form, so calling `bash C:/...` exits 127. The wsl.exe form works.
 # (Audit finding 2026-06-08: SessionStart hook silently failed before this fix.)
-$bashCapCheck = 'wsl.exe -d ' + $Distro + ' -e bash -lc "bash /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/storage-cap-check.sh"'
+$bashCapCheck = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "bash /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/storage-cap-check.sh"'
 # B1 Phase 2 (2026-06-28): PreCompact conversation-query capture — a WSL python hook that tails the
 # transcript and stashes a redacted query marker the post-compact SessionStart helper consumes.
-$bashPreCompactCapture = 'wsl.exe -d ' + $Distro + ' -e bash -lc "python3 /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/precompact_capture.py"'
+# v1.16 FAIL-OPEN (2026-07-17 remediation §6.2.1 — the root-cause fix for the compaction
+# deadlock class): Claude Code treats a PreCompact hook exit code 2 as a HARD BLOCK on compaction,
+# and python3 exits 2 when the capture script is missing (deploy-layer skew wiped it on the
+# brain box 2026-07-17 → every long session deadlocked at "Prompt is too long"). Capture is best-effort by
+# contract (same as h13-postcompact.js: "never blocks, always exit 0") — `|| true` makes bash
+# exit 0 no matter what python3 does, so a missing/erroring capture script can never again block
+# compaction. A failure of wsl.exe itself returns non-2 codes, which PreCompact treats as
+# non-blocking.
+$bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/precompact_capture.py || true"'
 
 # H12: v0.17 Phase 0 hooks — UserPromptSubmit (checkpoint + decision-capture + proactive-search)
 # and PreToolUse (audit gate). Previously only registered in the operator's local settings.json;
@@ -484,8 +524,23 @@ if (Test-Path -LiteralPath $claudeMd) {
 # ----------------------------------------------------------------------
 # 5. Register the 3am Task Scheduler entry for C1 consolidator
 # ----------------------------------------------------------------------
-Write-Host "==> [5] Registering Task Scheduler entry: ClaudeCode-DreamConsolidator-3am"
+# v1.16 one-brain role gate (2026-07-17 remediation §6.3): dream-consolidate and
+# semantic-dedup are canonical-mutation / write-authority operations. Registering them
+# unconditionally on every box let a read-replica run a destructive nightly dedup against
+# the one shared brain (no cross-machine lock exists — dedup.lock is per-machine). On a
+# 'replica' box: skip registration AND remove any tasks a pre-v1.16 install left behind.
 $taskName = 'ClaudeCode-DreamConsolidator-3am'
+$dedupTaskName = 'ClaudeCode-SemanticDedup-430am'
+if ($Role -ne 'brain') {
+    Write-Host "==> [5/5b] Role=replica: dream/dedup scheduled tasks NOT registered (one-brain rule)"
+    foreach ($t in @($taskName, $dedupTaskName)) {
+        if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $t -Confirm:$false
+            Write-Host "    removed stale task from replica: $t" -ForegroundColor Yellow
+        }
+    }
+} else {
+Write-Host "==> [5] Registering Task Scheduler entry: ClaudeCode-DreamConsolidator-3am"
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
 $action = New-ScheduledTaskAction `
@@ -519,7 +574,6 @@ Write-Host "    Task Scheduler entry registered (next fire: 3:00 AM tomorrow, Wa
 # it had NO scheduled trigger AND queried the dead pre-egemma 'memories' collection -> 404 abort;
 # both fixed: the collection is now env-driven and this task runs it nightly.)
 Write-Host "==> [5b] Registering Task Scheduler entry: ClaudeCode-SemanticDedup-430am"
-$dedupTaskName = 'ClaudeCode-SemanticDedup-430am'
 Unregister-ScheduledTask -TaskName $dedupTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 $dedupCmd = "/home/$WslUser/apps/mem0-server/.venv/bin/python $RepoRootWsl/scripts/wsl/semantic-dedup.py >> /home/$WslUser/.mem0/dedup-cron.log 2>&1"
 $dedupAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wsl.exe" -Argument ('-d ' + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
@@ -528,6 +582,7 @@ $dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfO
 $dedupPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
 Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
+} # end brain-role gate (v1.16 §6.3)
 
 Write-Host ""
 Write-Host "==> Windows config complete." -ForegroundColor Green

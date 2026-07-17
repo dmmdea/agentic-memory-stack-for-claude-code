@@ -18,7 +18,7 @@ import json as _json
 import uuid as _uuid
 import datetime as _dt
 
-AUTHORITY_URL = MEM0_URL                       # existing env (http://your-machine:18791 on the laptop)
+AUTHORITY_URL = MEM0_URL                       # existing env (the brain's URL on a replica box)
 LOCAL_URL = "http://127.0.0.1:18791"           # dormant local replica, up only when offline
 OUTBOX = Path.home() / ".mem0" / "outbox.jsonl"
 _CONNECT_TIMEOUT = 1.5
@@ -27,7 +27,7 @@ _READ_TIMEOUT = 30.0
 _FAILOVER_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 class OfflineError(Exception):
-    """The your-machine authority is connect-unreachable."""
+    """The memory authority is connect-unreachable."""
 
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -182,7 +182,7 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     data, source = _request("POST", "/v1/memories/search", json=payload)
     if source == "local-replica":
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
         # Offline reads are stale by definition — surface queued-but-unsynced adds
         # so a fact written minutes ago offline is still findable.
         data.setdefault("results", []).extend(_pending_adds(query))
@@ -242,7 +242,7 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
         out["goals"] = b.get("goals", [])
         out["open_questions"] = b.get("open_questions", [])
         if _bsource == "local-replica":
-            # Stale replica answered (your-machine unreachable) — mark the bundle as replica-served
+            # Stale replica answered (authority unreachable) — mark the bundle as replica-served
             # (same key/value convention as memory_search) and merge queued-but-unsynced adds.
             out["source"] = "local-replica"
             out["memories"].extend(_pending_adds(query))
@@ -281,7 +281,7 @@ def memory_list(user_id: str = "__WSL_USER__", limit: int = 50) -> dict:
     data, source = _request("GET", "/v1/memories", params={"user_id": user_id, "limit": limit})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 @mcp.tool
@@ -344,7 +344,7 @@ def memory_health() -> dict:
     data, source = _request("GET", "/health")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -389,7 +389,7 @@ def episodic_search(
     data, source = _request("POST", "/v1/episodes/search", json=payload)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -414,7 +414,7 @@ def episodic_recent(limit: int = 7, brand: str | None = None) -> list:
     data, source = _request("GET", "/v1/episodes", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -433,7 +433,7 @@ def episodic_get(episode_id: int) -> dict:
     data, source = _request("GET", f"/v1/episodes/{episode_id}")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -456,7 +456,7 @@ def goals_list(status: str | None = None, brand: str | None = None, limit: int =
     data, source = _request("GET", "/v1/goals", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -470,7 +470,7 @@ def goals_tree(root_id: int | None = None) -> list[dict]:
     data, source = _request("GET", "/v1/goals/tree", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -483,7 +483,7 @@ def goals_open(brand: str | None = None, limit: int = 10) -> list[dict]:
     data, source = _request("GET", "/v1/goals", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -496,7 +496,7 @@ def goals_blocked(brand: str | None = None, limit: int = 10) -> list[dict]:
     data, source = _request("GET", "/v1/goals", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -507,7 +507,7 @@ def goal_details(goal_id: int) -> dict:
     data, source = _request("GET", f"/v1/goals/{goal_id}")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -579,7 +579,7 @@ def memory_get_by_id(memory_id: str) -> dict:
     data, source = _request("GET", f"/v1/memories/{memory_id}")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -648,7 +648,7 @@ def open_questions_open(brand: str | None = None, limit: int = 7) -> list[dict]:
     data, source = _request("GET", "/v1/open_questions", params=params)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -665,7 +665,7 @@ def open_question_search(query: str, brand: str | None = None, status: str = "op
     data, source = _request("POST", "/v1/open_questions/search", json=body)
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
@@ -695,7 +695,7 @@ def open_question_details(open_question_id: int) -> dict:
     data, source = _request("GET", f"/v1/open_questions/{open_question_id}")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
-        data["stale_note"] = "served from local replica; your-machine unreachable"
+        data["stale_note"] = "served from local replica; authority unreachable"
     return data
 
 
