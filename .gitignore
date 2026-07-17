@@ -52,3 +52,8 @@ Thumbs.db
 # faithfulness eval: resumable Codex answer cache (local runtime state, not tracked)
 eval/faithfulness/.codex-answer-cache.json
 eval/faithfulness/.codex-answer-cache.json.tmp
+
+# operator brand routing: the real brands.json is the operator's private project map —
+# never tracked. The neutral template ships as claude-config/brands.example.json; the
+# installer falls back to it when no local brands.json exists.
+claude-config/brands.json
