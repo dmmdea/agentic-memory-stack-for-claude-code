@@ -226,12 +226,18 @@ if (Test-Path -LiteralPath $modelTiersSrc) {
 # customized brand map survives re-installs (the shipped default is neutral —
 # ai-ecosystem only; operators add their own projects). Read by the hook lib's
 # Get-StackBrandRules + storage-cap-check.sh.
+# Operator-neutral-at-rest: claude-config/brands.json is GITIGNORED (it is the
+# operator's private project map). A fresh clone therefore has only the tracked
+# template brands.example.json — deploy that when no local brands.json exists.
 $brandsSrc = Join-Path $RepoRoot 'claude-config\brands.json'
+if (-not (Test-Path -LiteralPath $brandsSrc)) {
+    $brandsSrc = Join-Path $RepoRoot 'claude-config\brands.example.json'
+}
 $brandsDst = Join-Path $ScriptsDir 'brands.json'
 if (-not (Test-Path -LiteralPath $brandsDst)) {
     if (Test-Path -LiteralPath $brandsSrc) {
         Copy-Item -LiteralPath $brandsSrc -Destination $brandsDst -Force
-        Write-Host "    installed: brands.json (neutral default — edit it to add your projects)"
+        Write-Host "    installed: brands.json (from $(Split-Path -Leaf $brandsSrc) — edit ~/.claude/scripts/brands.json or keep a local claude-config/brands.json to add your projects)"
     } else {
         Write-Host "    WARN: $brandsSrc not found" -ForegroundColor Yellow
     }
