@@ -97,6 +97,11 @@ curl -sf http://127.0.0.1:18791/health/deep | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert d.get('ok'), f'/health/deep not ok: {d}'
-print('    /health/deep OK — ' + ', '.join(k + ':' + str(v.get('ok', v)) for k, v in d.get('checks', {}).items()))
+# checks values are HETEROGENEOUS: sub-dicts with an 'ok' key AND bare scalars
+# (e.g. pending_contradiction_reviews: 0) — .get on an int crashed this print
+# (2026-07-17 cutover) and failed an otherwise-green deploy.
+print('    /health/deep OK — ' + ', '.join(
+    k + ':' + str(v.get('ok', v) if isinstance(v, dict) else v)
+    for k, v in d.get('checks', {}).items()))
 "
 echo "==> deploy complete. Full gate: cd $APP_DIR && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=http://127.0.0.1:18791 ./.venv/bin/pytest -q"
