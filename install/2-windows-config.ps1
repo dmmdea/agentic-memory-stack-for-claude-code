@@ -18,7 +18,12 @@ param(
     # docs/superpowers/specs/2026-07-15-offline-first-memory-design.md): consolidation and
     # dedup are canonical-mutation operations and must NEVER run here — the installer
     # skips registration AND removes any previously-registered tasks.
-    [ValidateSet('brain','replica')][string]$Role = 'brain'
+    [ValidateSet('brain','replica')][string]$Role = 'brain',
+    # Optional (2026-07-18): WSL path of a checkout carrying eval/ harnesses (the
+    # maintainer moat repo). The dream's retrieval-drift canary reads it from the
+    # receipt; empty -> falls back to RepoRootWsl (a missing eval/ degrades to the
+    # graceful skip, never a false alarm).
+    [string]$EvalRootWsl = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -110,6 +115,7 @@ $eDistro  = $Distro.Replace("'", "''")
 $eRole    = $Role.Replace("'", "''")
 $eRepoWin = $RepoRootWin.Replace("'", "''")
 $eRepoWsl = $RepoRootWsl.Replace("'", "''")
+$eEvalWsl = $EvalRootWsl.Replace("'", "''")
 $receipt = @"
 @{
     WslUser     = '$eWslUser'
@@ -120,6 +126,8 @@ $receipt = @"
     Role        = '$eRole'
     RepoRootWin = '$eRepoWin'
     RepoRootWsl = '$eRepoWsl'
+    # Optional: checkout carrying eval/ (drift canaries). Empty -> RepoRootWsl fallback.
+    EvalRootWsl = '$eEvalWsl'
     ApiKeyUnc   = '\\wsl.localhost\$eDistro\home\$eWslUser\.mem0\api-key'
     # 4C autonomous-canonical-promotion gate (E/T4): off | shadow | enforce.
     # Ships 'shadow' (compute + log, never blocks). Flip to 'enforce' only after the
