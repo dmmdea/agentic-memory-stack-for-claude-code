@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import uuid
-import sqlite3
 from pathlib import Path
 
 import httpx
@@ -27,13 +26,8 @@ from episodic import (
     init_schema,
     create_session,
     create_open_question,
-    get_open_question,
-    resolve_open_question,
-    update_open_question_status,
     list_open_questions,
     search_open_questions,
-    find_open_question_by_text_fuzzy,
-    VALID_OPEN_QUESTION_STATUSES,
 )
 
 # ---------------------------------------------------------------------------
@@ -276,7 +270,7 @@ def test_resolve_open_question():
 
 def test_search_open_questions_fts5(db):
     """FTS5 keyword search returns ranked results matching query terms."""
-    sid = _sess(db)
+    _sess(db)
 
     # Create a few distinct questions
     id1 = create_open_question(db, "Should canonical keys be stored in DPAPI vault?", brand="ai-ecosystem")

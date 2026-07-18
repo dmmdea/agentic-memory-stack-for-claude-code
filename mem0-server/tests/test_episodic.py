@@ -33,14 +33,10 @@ from episodic import (
     _sanitize_fts,
     init_schema,
     create_session,
-    end_session,
     add_episode,
     add_link,
     search_fts,
-    recent,
     get_episode,
-    count_episodes,
-    # v0.16 goals CRUD
     create_goal,
     get_goal,
     update_goal_status,
@@ -854,7 +850,7 @@ def test_episode_post_atomic_on_failure(tmp_path, monkeypatch):
                          ("Partial goal that should vanish", "ai-ecosystem"))
             # Simulate failure mid-transaction
             raise RuntimeError("simulated mid-write failure")
-            conn.commit()  # noqa: unreachable
+            # (the commit would happen here — unreachable after the simulated failure)
         except RuntimeError:
             conn.rollback()
 
@@ -1488,7 +1484,6 @@ def test_init_schema_dedupes_preexisting_in_progress_duplicates(tmp_path):
 
 def test_memory_get_by_id_returns_full_record():
     """F.3.1: POST evidence memory; GET /v1/memories/{id}; verify all expected fields present."""
-    import json as _json
     unique_text = f"F3.1 test memory exact-read {uuid.uuid4()}"
     add_r = httpx.post(
         f"{URL}/v1/memories",
@@ -1782,7 +1777,6 @@ def test_search_query_class_canonical_filters_tiers():
             headers=H, timeout=15,
         )
         assert default_r.status_code == 200, f"default search failed: {default_r.text}"
-        default_ids = {r["id"] for r in default_r.json().get("results", [])}
 
         # query_class='canonical' should return only stable (or canonical) tier records
         canon_r = httpx.post(

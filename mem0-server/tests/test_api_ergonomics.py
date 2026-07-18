@@ -2,7 +2,7 @@
 list endpoint hard-caps at 500. Run against a live mem0 server on :18791
 with a valid X-API-Key in $env:MEM0_KEY."""
 import getpass
-import os, json, httpx, pytest
+import os, httpx
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = os.environ["MEM0_KEY"]
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}

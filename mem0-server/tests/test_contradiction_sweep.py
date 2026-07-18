@@ -682,8 +682,20 @@ def test_fetch_point_text_5xx_raises():
         sweep.fetch_point_text(c, "p1")
 
 
-def _rejudge_env(monkeypatch, records, fetch_map, verdict_map):
+def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
     """Wire run_rejudge_stamped's collaborators with fakes; return the captured stamp calls + summaries."""
+    # Hermetic HOME: the dry_run=False preflight reads ~/.mem0/api-key from the
+    # REAL home, so on a box without the live stack (any CI runner) the run
+    # degrades before the fakes are reached. Fake the home + key, and point the
+    # single-runner lock inside it (the module-level constant was bound to the
+    # real home at import).
+    import tempfile
+    fake_home = Path(tempfile.mkdtemp(prefix="sweep-fake-home-"))
+    (fake_home / ".mem0").mkdir()
+    (fake_home / ".mem0" / "api-key").write_text("test-key\n")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(sweep, "REJUDGE_LOCK", fake_home / ".mem0" / ".rejudge-stamped.lock")
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
     monkeypatch.setattr(sweep, "scroll_stamped", lambda http: records)
 

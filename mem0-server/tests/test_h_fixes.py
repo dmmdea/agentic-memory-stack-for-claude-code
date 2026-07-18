@@ -22,11 +22,10 @@ import hmac as _hmac
 import os
 import sqlite3
 import threading
-import time
 import uuid
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -294,7 +293,7 @@ def test_h5_fetch_current_tier_fail_closed_when_tier_missing():
     """H5: fetch_current_tier returns 'canonical' (not None) when point exists but tier absent."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-    from security_invariants import fetch_current_tier, _NOT_FOUND
+    from security_invariants import fetch_current_tier
 
     # Build a mock Qdrant client that returns a point with no tier field in payload
     mock_record = MagicMock()
@@ -336,7 +335,7 @@ def test_h5_tier_missing_blocks_write_without_hmac():
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-    from security_invariants import assert_writable, _NOT_FOUND
+    from security_invariants import assert_writable
     from fastapi import HTTPException as FastAPIHTTPException
 
     # Mock client: point exists but tier is absent -> fetch_current_tier returns "canonical"

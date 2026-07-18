@@ -97,11 +97,16 @@ def test_dpapi_blob_without_plaintext_on_non_windows_logs_error(tmp_path, caplog
 
 
 def test_provider_path_not_traversal(tmp_path):
-    """Provider rejects path-traversal in dpapi_path / plaintext_path."""
+    """Provider rejects a key path outside user home / tmp / runtime dir."""
     from canonical_key_provider import CanonicalKeyProvider
+    # An unambiguous ABSOLUTE outside-home path. The old relative fixture
+    # ("../../etc/passwd") was cwd-dependent: with pytest's cwd inside home
+    # (every CI checkout under /home/runner) it resolved UNDER home, where the
+    # guard rightly allows it — the test failed only on such runners.
+    outside = Path("C:/Windows/System32/config") if os.name == "nt" else Path("/etc/passwd")
     with pytest.raises((ValueError, OSError)):
         CanonicalKeyProvider(
-            dpapi_path=Path("../../etc/passwd"),
+            dpapi_path=outside,
             plaintext_path=tmp_path / "canonical-key",
         )
 

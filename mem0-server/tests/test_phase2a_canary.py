@@ -17,7 +17,6 @@ The handler-level tests exercise the canary + fail-safe logic via monkeypatching
 """
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 

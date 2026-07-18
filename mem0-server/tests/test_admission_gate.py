@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
-import pytest
-from admission_gate import AdmissionPolicy, AdmissionDecision
+from admission_gate import AdmissionPolicy
 
 
 def _result(mid="m1", tier="evidence", brand=None, created_at=None, text="hello"):

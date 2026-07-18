@@ -1,6 +1,6 @@
 """Unit + live integration tests for reranker. Live test skips if llama-swap is down."""
 import httpx, pytest
-from reranker import should_rerank, rerank, RERANK_URL
+from reranker import should_rerank, rerank
 
 def test_should_rerank_skips_small():
     assert should_rerank([{"score": 0.5}, {"score": 0.4}]) is False  # N=2 < 3

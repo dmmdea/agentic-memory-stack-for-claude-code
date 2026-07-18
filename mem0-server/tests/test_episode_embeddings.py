@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from episode_embeddings import (  # noqa: E402
-    EPISODE_COLLECTION,
     MIN_SUMMARY_CHARS,
     ensure_episode_collection,
     embed_episode_summary,

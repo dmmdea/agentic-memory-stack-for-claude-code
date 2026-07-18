@@ -42,7 +42,6 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = os.environ.get("MEM0_KEY") or (Path.home() / ".mem0" / "api-key").read_text().strip()

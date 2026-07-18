@@ -68,7 +68,7 @@ def test_promote_canonical_user_direct_succeeds():
 
 def test_insight_bypass_substring_rejected():
     """v0.14 C: substring check replaced with exact-allowlist — fake-c1-bypass must be rejected."""
-    import uuid, httpx
+    import httpx
     r = httpx.post(f"{URL}/v1/memories", json={
         "messages": "evidence for insight test", "user_id": "test-insight-allow", "infer": False,
         "metadata": {"tier": "evidence", "source": "test-insight-allow"},
