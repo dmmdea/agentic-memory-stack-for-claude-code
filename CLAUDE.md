@@ -43,7 +43,41 @@ Windows + WSL2. Five components (4 runtime processes + 1 credential file):
 | `scripts/wsl/` | WSL-side maintenance jobs (sweeps, backups, canonize CLI) |
 | `systemd/` | User-level unit files the installer deploys |
 | `skill/` | The `install-agentic-memory-stack` Claude Code skill |
-| `ARCHITECTURE.md` | Full data-flow and layer map — read before changing server code |
+| `docs/` | All detailed documentation — see the map below |
+
+## Documentation map
+
+Detailed documentation lives in `docs/`. `AGENTS.md`/`CLAUDE.md` tell agents where to
+look and how to work; `docs/` explains how the application works.
+
+| Where | What it holds |
+|---|---|
+| [`docs/README.md`](docs/README.md) | The docs index — start here to find the doc for your task |
+| `docs/systems/` | How one system works today: responsibilities, interfaces, invariants |
+| `docs/flows/` | Behavior that moves end to end across several systems |
+| [`docs/architecture/`](docs/architecture/README.md) | Cross-system structure and durable technical constraints |
+| [`docs/architecture/decisions/`](docs/architecture/decisions/README.md) | ADRs — only `Accepted` ones are current guidance |
+| [`docs/glossary.md`](docs/glossary.md) | Canonical meaning of the domain terms used in docs and code |
+| `docs/templates/` | Starting points: [system](docs/templates/system.md), [flow](docs/templates/flow.md), [ADR](docs/templates/adr.md) |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Whole-system data-flow and layer map — read before changing server code |
+
+### Agent workflow
+
+1. Read `AGENTS.md`.
+2. Use `docs/README.md` to find relevant documentation.
+3. Read the system, flow, architecture, and glossary docs related to the area being changed.
+4. Inspect source files for implementation details.
+5. Make the code change.
+6. Update relevant docs if behavior, responsibilities, flows, invariants, assumptions, interfaces, or glossary-defined concepts changed.
+7. Ensure docs and code agree before finishing.
+
+### Rules
+
+- **Read the relevant docs before changing a system** — not after the change is written.
+- **Update affected docs in the same change**, never as a follow-up.
+- **Docs and code must agree** — if they disagree, fix one or flag the mismatch.
+- **Do not dump system detail into this file.** Deep behavior belongs in `docs/`; this
+  guide stays a router.
 
 ## Trust tiers (the core protocol)
 
