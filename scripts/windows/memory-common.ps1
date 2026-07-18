@@ -6,11 +6,11 @@
 # WHY: the deployed copies live in ~/.claude, which is a git repo SHARED with the other machine.
 # A distro substituted in at install time therefore gets committed by whichever box installed last
 # and breaks the other one. Runtime resolution keeps the deployed bytes machine-independent.
-#   MEM0_URL        - endpoint override when the brain lives on another node (your-machine -> your-machine).
+#   MEM0_URL        - endpoint override when the brain lives on another node (replica -> brain).
 #   MEM0_WSL_DISTRO - distro holding ~/.mem0. Falls back to the per-machine install receipt,
 #                     because a User-scope env var is INVISIBLE to hook children of a host process
 #                     that started before the var was set -- that is exactly why the L1a extractor
-#                     silently failed on your-machine (it resolved 'Ubuntu' and never found the API key).
+#                     silently failed on one box (it resolved 'Ubuntu' and never found the API key).
 $script:Mem0Url = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
 $script:Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     $rcptDistro = $null
@@ -361,7 +361,7 @@ function Drain-Mem0DeadLetter {
 
         # Quarantine deterministic failures immediately
         $isPoisonCode = $POISON_CODES -contains $statusCode
-        # 2026-07-15 offline-first: a connection-level failure (status_code 0 = your-machine unreachable)
+        # 2026-07-15 offline-first: a connection-level failure (status_code 0 = brain unreachable)
         # must NOT count toward the quarantine cap, or a multi-day offline stretch of Stop hooks
         # would quarantine perfectly good writes. Only server-response failures accrue attempts.
         $isMaxAttempts = ($statusCode -ne 0) -and ($attempts -ge $MAX_ATTEMPTS)

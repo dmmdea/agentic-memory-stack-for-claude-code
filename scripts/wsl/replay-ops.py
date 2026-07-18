@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Replay the offline operation-outbox to the your-machine authority. Adds first, then mutations.
+"""Replay the offline operation-outbox to the memory authority. Adds first, then mutations.
 Idempotent (replayed-key ledger); failures -> mutation-conflicts.jsonl (never dropped).
 Only runs when the authority is reachable; atomic rotation closes the concurrent-writer race."""
 from __future__ import annotations
-import argparse, json, os, sys, uuid
+import argparse
+import json
+import os
+import sys
+import uuid
 from pathlib import Path
 import httpx
 
-AUTHORITY = os.environ.get("MEM0_URL", "http://your-machine:18791")
+# Default = loopback (correct on the brain box). A replica MUST set MEM0_URL to the
+# brain's URL — travel-mode manages this; the old machine-name default resolved only
+# on the developer's tailnet.
+AUTHORITY = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = (Path.home() / ".mem0" / "api-key").read_text(encoding="utf-8").strip()
 _MUTATION_ORDER = 1  # adds sort before everything else
 _ADD_ORDER = 0
