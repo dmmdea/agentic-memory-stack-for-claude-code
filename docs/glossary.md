@@ -60,11 +60,11 @@ The retrieval-drift canary run in the Dream's prune phase — a zero-Codex befor
 
 ## Outbox
 
-The operation-outbox (`~/.mem0/outbox.jsonl`) that queues mutations made while the Brain authority is unreachable; entries are op-typed and uuid4-keyed for idempotent replay to the authority on reconnect. See [CHANGELOG.md](../CHANGELOG.md) (v1.15).
+The operation-outbox (`~/.mem0/outbox.jsonl`) that queues mutations made while the Brain authority is unreachable; entries are op-typed and uuid4-keyed for idempotent replay to the authority on reconnect. See [offline-travel.md](systems/offline-travel.md).
 
 ## Travel Mode
 
-A **legacy**, switch-based offline approach (`travel-mode.ps1 on`/`off`) that restored a read-only replica snapshot and queued writes to the Outbox. It was superseded in v1.15 by offline-first behavior that *emerges* from connectivity — reads fail over to a replica and writes queue automatically, with no explicit mode switch. See [CHANGELOG.md](../CHANGELOG.md) (v1.15).
+A **legacy**, switch-based offline approach (`travel-mode.ps1 on`/`off`) that restored a read-only replica snapshot and queued writes to the Outbox. It was superseded in v1.15 by offline-first behavior that *emerges* from connectivity — reads fail over to a replica and writes queue automatically, with no explicit mode switch. See [offline-travel.md](systems/offline-travel.md).
 
 ## Brand
 
