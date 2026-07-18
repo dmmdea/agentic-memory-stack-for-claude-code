@@ -59,6 +59,7 @@ for src in "$REPO_ROOT"/systemd/*.service "$REPO_ROOT"/systemd/*.timer; do
     resolved="$(sed -e "s|__WSL_USER__|$WSL_USER|g" \
                     -e "s|__WIN_USER__|$WIN_USER|g" \
                     -e "s|__WSL_DISTRO__|$DISTRO|g" \
+                    -e "s|__MEM0_BIND__|${MEM0_BIND:-127.0.0.1}|g" \
                     -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" "$src")"
     if [ -n "$DRY" ]; then
         if ! diff -q <(printf '%s\n' "$resolved") "$SYSTEMD_DIR/$unit" >/dev/null 2>&1; then
