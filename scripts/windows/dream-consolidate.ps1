@@ -20,6 +20,12 @@ $DcDistro  = if ($DcCfg -and $DcCfg.Distro)  { $DcCfg.Distro } else {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::Unicode; (wsl.exe -l -q | Where-Object { $_.Trim() } | Select-Object -First 1).Trim() } finally { [Console]::OutputEncoding = $prevEnc }
 }
 $DcRepoWsl = if ($DcCfg -and $DcCfg.RepoRootWsl) { $DcCfg.RepoRootWsl } else { '' }
+# EvalRootWsl (optional, 2026-07-18): where eval/ harnesses live. After the repo-model
+# inversion the PRODUCT repo no longer carries eval/ (it is maintainer/moat material), so
+# a box that has the moat checkout sets EvalRootWsl in the receipt; everyone else falls
+# back to the repo root, where a missing eval/ degrades to the existing graceful skip
+# (drift compare no-ops, never a false alarm).
+$DcEvalWsl = if ($DcCfg -and $DcCfg.EvalRootWsl) { $DcCfg.EvalRootWsl } elseif ($DcRepoWsl) { $DcRepoWsl } else { '' }
 $DcHomeUnc = "\\wsl.localhost\$DcDistro\home\$DcWslUser"
 
 . (Join-Path $ScriptDir 'memory-common.ps1')
@@ -68,10 +74,10 @@ function Save-PhaseState {
 # Mirrors the memory-index-build.py invocation (same venv python + -d $DcDistro bash -c).
 function Invoke-DriftSnapshot {
     param([string]$Phase, [string]$OutWsl)  # Phase = 'before' | 'after'
-    if ($DryRun -or [string]::IsNullOrWhiteSpace($DcRepoWsl)) { return $null }
+    if ($DryRun -or [string]::IsNullOrWhiteSpace($DcEvalWsl)) { return $null }
     try {
         $py     = "/home/$DcWslUser/apps/mem0-server/.venv/bin/python"
-        $script = "$DcRepoWsl/eval/retrieval-drift/retrieval_drift.py"
+        $script = "$DcEvalWsl/eval/retrieval-drift/retrieval_drift.py"
         # rm the prior file FIRST so a FAILED snapshot (mem0 down / bad key) cannot leave a STALE
         # file from an earlier night that compare would then treat as this cycle's truth (false
         # alarm). The CLI writes --out only on success (exit 0); require exit 0 before trusting it.
@@ -796,7 +802,7 @@ if ($driftBefore) {
         $driftAfter = Invoke-DriftSnapshot -Phase 'after' -OutWsl '/tmp/dream-drift-after.json'
         if ($driftAfter) {
             $py     = "/home/$DcWslUser/apps/mem0-server/.venv/bin/python"
-            $script = "$DcRepoWsl/eval/retrieval-drift/retrieval_drift.py"
+            $script = "$DcEvalWsl/eval/retrieval-drift/retrieval_drift.py"
             $cmp     = wsl.exe -d $DcDistro -e bash -c "$py $script compare '$driftBefore' '$driftAfter' 2>&1"
             $cmpExit = $LASTEXITCODE
             Write-MemoryLog -Component 'dream' -Message "  drift compare (exit=$cmpExit): $cmp"
