@@ -7,6 +7,20 @@ current guidance when reviewing, planning, or changing code.
 Architectural decisions are human-owned. Agents can help draft ADR text from accepted decisions
 and keep existing ADRs aligned with code, but they do not make the decisions.
 
+## Decisions on record
+
+| ADR | Status |
+|---|---|
+| [One-Brain Rule](one-brain-rule.md) | Accepted |
+| [Fail-Open Hook Contract](fail-open-hook-contract.md) | Accepted |
+| [EmbeddingGemma on llama-swap](embeddinggemma-on-llama-swap.md) | Accepted |
+| [Codex as Judge and Extractor](codex-as-judge-and-extractor.md) | Accepted |
+| [Tier Trust Model](tier-trust-model.md) | Accepted |
+| [Operator-Agnostic Sentinels](operator-agnostic-sentinels.md) | Accepted |
+| [Offline-First Emergent](offline-first-emergent.md) | Accepted |
+| [Switch-Based Travel Mode](switch-based-travel-mode.md) | Superseded → [Offline-First Emergent](offline-first-emergent.md) |
+| [Public Repo Primary](public-repo-primary.md) | Accepted |
+
 ## When to write one
 
 Use an ADR for decisions that shape the system beyond a single implementation detail — why a

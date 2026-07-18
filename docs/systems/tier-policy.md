@@ -43,7 +43,7 @@ These constants are quoted from the live source. Do not assume they changed with
 
 ## Ledger Format
 
-Every tier change (promotion or demotion) and every insight add appends one JSON line to `~/.mem0/tier-ledger.jsonl`:
+Every tier change (promotion or demotion) and every insight add appends one JSON line to the monthly ledger segment `~/.mem0/tier-ledger-YYYY-MM.jsonl`:
 
 ```jsonl
 {"ts": "2026-06-09T03:12:44+00:00", "event": "tier-change", "memory_id": "7f3a...", "tier": "canonical", "actor": "user-direct", "reason": "the operator said to lock this in"}
@@ -58,7 +58,7 @@ Every tier change (promotion or demotion) and every insight add appends one JSON
 
 The ledger is append-only. Never truncate it. It is the audit trail for all consequential memory operations.
 
-**Location:** `~/.mem0/tier-ledger.jsonl` (WSL home). The same path is accessible from Windows at `\\wsl.localhost\Ubuntu\home\youruser\.mem0\tier-ledger.jsonl`.
+**Location:** monthly segments `~/.mem0/tier-ledger-YYYY-MM.jsonl` (WSL home; the legacy single-file `~/.mem0/tier-ledger.jsonl` is a frozen historical archive). The same directory is accessible from Windows at `\\wsl.localhost\Ubuntu\home\youruser\.mem0\`.
 
 ## Rationale
 
@@ -318,7 +318,7 @@ memory_search(query="<phrase from the bad insight>", user_id="youruser")
 
 Option B — grep the tier-ledger:
 ```bash
-grep '"tier": "insight"' ~/.mem0/tier-ledger.jsonl | grep '"event": "add"'
+grep '"tier": "insight"' ~/.mem0/tier-ledger*.jsonl | grep '"event": "add"'
 ```
 
 Note the `memory_id`.
