@@ -1,8 +1,30 @@
 # Changelog
 
 This repo is the PRIMARY source for the agentic-memory-stack product; this file is the
-product's version authority as of v1.16.2 (the earlier private-side history is summarized
+product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
+
+## v1.17.0 (2026-07-18) — repo-local documentation system
+
+A durable, repo-local documentation system for humans and AI agents, reviewed alongside code.
+
+- **Taxonomy** under `docs/`: `systems/` (per-component deep-dives, renamed from `modular/`),
+  `flows/` (cross-system pipeline walkthroughs), `architecture/` (long-lived constraints +
+  `decisions/` ADRs), `glossary.md`, and `templates/`. `CLAUDE.md` gains a Documentation map
+  and the agent workflow; `AGENTS.md` stays a one-line import shim so the guidance can't drift.
+- **Six system docs** and **six flow docs** brought to a shared template with verified source
+  maps; a **26-term glossary**; **nine seeded ADRs** recording the load-bearing decisions
+  (one-brain rule, fail-open hooks, EmbeddingGemma on llama-swap, Codex as judge/extractor,
+  the tier trust model, operator-agnostic sentinels, the offline-first supersession of travel
+  mode, and public-repo-primary).
+- **Docs gate** (`scripts/ci/check-docs.py`, a new 7th CI job): every relative doc link
+  resolves to a real file, no operator-specific value leaks into docs, and every ADR carries
+  valid frontmatter (`status`/`date`; `superseded_by` iff `Superseded`).
+- The **docs-and-code-must-agree** rule is now explicit: every pull request that changes
+  behavior, interfaces, security, data, or operational procedures updates the affected
+  documentation in the same change.
+- The `.claude-plugin/*` manifests are realigned to the release version (they had drifted
+  to 1.15.0).
 
 ## v1.16.2 (2026-07-17) — operator-neutral test fixtures + suite repairs
 
