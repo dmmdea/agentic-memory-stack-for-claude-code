@@ -220,8 +220,8 @@ try {
         # On Linux, *:11436 is equivalent to 0.0.0.0:11436 (all interfaces)
         # v0.19 L9: remediation points at the systemd unit --listen flag — the actual
         # wildcard-bind source fixed in v0.18 Phase D. The yaml's llama-server cmd
-        # lines already carry --host 127.0.0.1 (docs/modular/llama-swap-binding.md).
-        Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "LAN-exposed ($($llLine.Trim().Substring(0,[Math]::Min(60,$llLine.Trim().Length)))) — fix --listen in ~/.config/systemd/user/llama-swap.service to '--listen 127.0.0.1:11436', then: systemctl --user daemon-reload && systemctl --user restart llama-swap (see docs/modular/llama-swap-binding.md)"
+        # lines already carry --host 127.0.0.1 (docs/systems/llama-swap-binding.md).
+        Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "LAN-exposed ($($llLine.Trim().Substring(0,[Math]::Min(60,$llLine.Trim().Length)))) — fix --listen in ~/.config/systemd/user/llama-swap.service to '--listen 127.0.0.1:11436', then: systemctl --user daemon-reload && systemctl --user restart llama-swap (see docs/systems/llama-swap-binding.md)"
     }
     elseif  ($llLine)                              { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "unexpected bind: $llLine" }
     else                                           { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' 'no listener on :11436 (llama-swap may be down)' }
@@ -371,7 +371,7 @@ try {
     } elseif ($ck.present) {
         Add-Check 'INVARIANTS' 'canonical key (server)' 'OK' "loaded source=$($ck.source)"
     } elseif ($ck.dpapi_blob) {
-        Add-Check 'INVARIANTS' 'canonical key (server)' 'FAIL' 'KEYLESS-DEGRADED: dpapi blob present but no key loaded - canonical/insight HMAC mutations 503; restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or see docs/modular/dpapi-canonical-key.md Recovery'
+        Add-Check 'INVARIANTS' 'canonical key (server)' 'FAIL' 'KEYLESS-DEGRADED: dpapi blob present but no key loaded - canonical/insight HMAC mutations 503; restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or see docs/systems/dpapi-canonical-key.md Recovery'
     } else {
         Add-Check 'INVARIANTS' 'canonical key (server)' 'OK' 'no key configured (no dpapi blob) - dev box; canonical promotions disabled by design'
     }

@@ -7,14 +7,14 @@ Everything in this repo's documentation, organized by what you're trying to do (
 | Doc | What it explains |
 |---|---|
 | [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Start here.** The whole system: six layers, trust tiers, life of a memory, diagrams, safety invariants, design decisions |
-| [`modular/memory-model.md`](./modular/memory-model.md) | **The memory model in depth**: the three axes (types / tiers / query classes), each layer's purpose + lifecycle, decay math, the life of a memory |
-| [`modular/capture-pipeline.md`](./modular/capture-pipeline.md) | How conversations become memory: L1a + the inferability gate, ship-log split, corrections, the nightly dream + gated autopromotion |
-| [`modular/retrieval-pipeline.md`](./modular/retrieval-pipeline.md) | How memory reaches the agent: hybrid scoring + the calibration story, the four delivery channels, abstention, placement |
-| [`modular/reconciliation.md`](./modular/reconciliation.md) | How the store stays honest: the sweeps, the two judges, verdict semantics, never-auto-hide + the review queue |
-| [`modular/tier-policy.md`](./modular/tier-policy.md) | The trust-tier protocol and its server enforcement |
-| [`modular/model-aware-injection.md`](./modular/model-aware-injection.md) | Why injection differs per model tier (frontier vs small) |
-| [`modular/dream-skill.md`](./modular/dream-skill.md) | The nightly consolidation ("dream") design |
-| [`modular/episodic.md`](./modular/episodic.md) · [`modular/goals.md`](./modular/goals.md) · [`modular/open-questions.md`](./modular/open-questions.md) | The episodic/goals/open-questions sidecar |
+| [`systems/memory-model.md`](./systems/memory-model.md) | **The memory model in depth**: the three axes (types / tiers / query classes), each layer's purpose + lifecycle, decay math, the life of a memory |
+| [`flows/memory-capture.md`](./flows/memory-capture.md) | How conversations become memory: L1a + the inferability gate, ship-log split, corrections, the nightly dream + gated autopromotion |
+| [`flows/memory-retrieval.md`](./flows/memory-retrieval.md) | How memory reaches the agent: hybrid scoring + the calibration story, the four delivery channels, abstention, placement |
+| [`systems/reconciliation.md`](./systems/reconciliation.md) | How the store stays honest: the sweeps, the two judges, verdict semantics, never-auto-hide + the review queue |
+| [`systems/tier-policy.md`](./systems/tier-policy.md) | The trust-tier protocol and its server enforcement |
+| [`systems/model-aware-injection.md`](./systems/model-aware-injection.md) | Why injection differs per model tier (frontier vs small) |
+| [`systems/dream-skill.md`](./systems/dream-skill.md) | The nightly consolidation ("dream") design |
+| [`systems/episodic.md`](./systems/episodic.md) · [`systems/goals.md`](./systems/goals.md) · [`systems/open-questions.md`](./systems/open-questions.md) | The episodic/goals/open-questions sidecar |
 
 ## Install & set up (tutorial / how-to)
 
@@ -32,18 +32,18 @@ Everything in this repo's documentation, organized by what you're trying to do (
 | [`MIGRATION.md`](./MIGRATION.md) | **Moving to a new machine with your memory intact** — snapshot, fresh install, restore, re-key, verify, decommission |
 | [`DEVELOPMENT.md`](./DEVELOPMENT.md) | Changing the stack itself: repo tour, test suites, the single deploy path, release ritual, conventions |
 | [`data-backup.md`](./data-backup.md) | Backup & restore procedures |
-| [`modular/dpapi-canonical-key.md`](./modular/dpapi-canonical-key.md) | Canonical-key custody, recovery, rotation |
-| [`modular/admission-gate.md`](./modular/admission-gate.md) | Why a record isn't surfacing (hide reasons, query classes, forensics) |
-| [`modular/l10-audit.md`](./modular/l10-audit.md) | Audit flags and how to triage them |
-| [`modular/continuity.md`](./modular/continuity.md) | Session-continuity behaviors (resume, checkpoints) |
+| [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md) | Canonical-key custody, recovery, rotation |
+| [`systems/admission-gate.md`](./systems/admission-gate.md) | Why a record isn't surfacing (hide reasons, query classes, forensics) |
+| [`systems/l10-audit.md`](./systems/l10-audit.md) | Audit flags and how to triage them |
+| [`systems/continuity.md`](./systems/continuity.md) | Session-continuity behaviors (resume, checkpoints) |
 
 ## Reference
 
 | Doc | What |
 |---|---|
 | [`api-contracts.md`](./api-contracts.md) | The REST API + MCP tool surface — the compatibility contract |
-| [`modular/mem0-api.md`](./modular/mem0-api.md) | mem0 server endpoints in detail |
-| [`modular/reranker.md`](./modular/reranker.md) · [`modular/codex-hooks.md`](./modular/codex-hooks.md) · [`modular/llama-swap-binding.md`](./modular/llama-swap-binding.md) | Component-level reference |
+| [`systems/mem0-api.md`](./systems/mem0-api.md) | mem0 server endpoints in detail |
+| [`systems/reranker.md`](./systems/reranker.md) · [`systems/codex-hooks.md`](./systems/codex-hooks.md) · [`systems/llama-swap-binding.md`](./systems/llama-swap-binding.md) | Component-level reference |
 
 ## Development history (private repo only)
 

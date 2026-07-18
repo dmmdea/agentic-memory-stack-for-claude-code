@@ -153,4 +153,4 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 - **`infer=true` for hook-extracted facts** → incorrect behavior: mem0's LLM extraction re-processes the already-extracted fact, possibly splitting or altering it. Always use `infer=false` from automated paths.
 - **Calling `/health` to verify write path** → misleading green. Use `/health/deep` or run a test round-trip.
 
-See `docs/modular/tier-policy.md` for the full tier rule table.
+See `docs/systems/tier-policy.md` for the full tier rule table.

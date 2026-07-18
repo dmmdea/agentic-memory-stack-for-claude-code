@@ -376,7 +376,7 @@ After 1 week (target: 2026-06-18), review `~/.mem0/pre-tool-warnings.jsonl`:
 |---|---|---|
 | 0.D | `scripts/windows/user-prompt-extract.ps1` | Every non-trivial user prompt now automatically searches mem0 + lists open goals, injecting results into Claude's context before Claude responds |
 | 0.E | `claude-config/storage-cap-check.sh` | Every new session auto-loads canonical facts + open goals for the inferred brand from cwd |
-| Docs | `docs/modular/continuity.md` | This document — design rationale, format, performance budgets, failure modes |
+| Docs | `docs/systems/continuity.md` | This document — design rationale, format, performance budgets, failure modes |
 
 **Self-assessment — would Claude's next user-prompt now have relevant canonical memories in front of it without Claude needing to call memory_search?**
 

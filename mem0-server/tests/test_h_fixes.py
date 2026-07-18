@@ -653,6 +653,6 @@ def test_v020_health_deep_exposes_canonical_key():
     assert ck["present"] is True, (
         "live server is KEYLESS — canonical/insight HMAC mutations are 503ing; "
         "restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or follow "
-        "docs/modular/dpapi-canonical-key.md Recovery"
+        "docs/systems/dpapi-canonical-key.md Recovery"
     )
     assert ck["source"] != "none"

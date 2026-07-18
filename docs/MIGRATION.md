@@ -42,7 +42,7 @@ Transport the backup directory to the new machine by any private means (LAN copy
 
 ## Phase 2 — credentials (fresh, never transported)
 
-1. **Canonical key** — generate + DPAPI-wrap on the new machine, exactly the "new box" provisioning in [`modular/dpapi-canonical-key.md`](./modular/dpapi-canonical-key.md): `generate-canonical-key.sh` → `dpapi-store-canonical-key.ps1` → verify the tmpfs key + a `mem0-canonize.sh` scratch cycle → remove the plaintext. Do **not** copy the old machine's blob or plaintext key; there is no data dependency on it.
+1. **Canonical key** — generate + DPAPI-wrap on the new machine, exactly the "new box" provisioning in [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md): `generate-canonical-key.sh` → `dpapi-store-canonical-key.ps1` → verify the tmpfs key + a `mem0-canonize.sh` scratch cycle → remove the plaintext. Do **not** copy the old machine's blob or plaintext key; there is no data dependency on it.
 2. **LLM auth** — `claude /login` and `codex login` (pick *Sign in with ChatGPT*).
 3. **Git hosting auth** — re-authenticate your git tooling on the new machine.
 

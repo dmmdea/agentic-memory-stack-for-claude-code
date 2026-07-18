@@ -130,8 +130,8 @@ high-judgment "which fact matters" decision where the judgment is — on the fro
 
 ## See also
 
-- `docs/modular/tier-policy.md` — the trust tiers themselves (who can write/promote each).
-- `docs/modular/admission-gate.md` — the server + client admission layers the block passes
+- `docs/systems/tier-policy.md` — the trust tiers themselves (who can write/promote each).
+- `docs/systems/admission-gate.md` — the server + client admission layers the block passes
   through before rendering.
 - `ARCHITECTURE.md` (P1 Tier Protocol) — the always-loaded CLAUDE.md tier-protocol prose
   that frontier sessions read; the small-tier legend is the per-session, in-block flat

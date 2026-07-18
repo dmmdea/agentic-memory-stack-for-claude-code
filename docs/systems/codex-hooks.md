@@ -77,7 +77,7 @@ Codex / gpt-5.5
 foreach insight: Add-Mem0Memory (tier=insight, source=c1-consolidator, source_memory_ids=[...])
 ```
 
-**Replacement in D.1:** `c1-consolidate.ps1` will be superseded by `dream-consolidate.ps1` (4-phase orient→gather→consolidate→prune). The Windows Task Scheduler entry (`ClaudeCode-DreamConsolidator-3am`) will be updated to point to the new script. `c1-consolidate.ps1` is kept under `legacy/` for one release as a rollback option. See `docs/modular/dream-skill.md` for the full design.
+**Replacement in D.1:** `c1-consolidate.ps1` will be superseded by `dream-consolidate.ps1` (4-phase orient→gather→consolidate→prune). The Windows Task Scheduler entry (`ClaudeCode-DreamConsolidator-3am`) will be updated to point to the new script. `c1-consolidate.ps1` is kept under `legacy/` for one release as a rollback option. See `docs/systems/dream-skill.md` for the full design.
 
 ## Failure Modes
 

@@ -13,7 +13,7 @@ consumer. Three sources, strict precedence:
 3. ~/.mem0/canonical-key — plaintext mode-600 file (dev/recovery fallback;
    removed from the production WSL box at v0.19 Phase H cutover).
 
-DPAPI threat model (per docs/modular/dpapi-canonical-key.md):
+DPAPI threat model (per docs/systems/dpapi-canonical-key.md):
 - Same-user processes on the same machine CAN decrypt — this is intentional;
   the v0.17 F.1.3 threat model documents single-user trust scope.
 - DIFFERENT users on same machine cannot decrypt (user-scope flag).

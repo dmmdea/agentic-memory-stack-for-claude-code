@@ -103,7 +103,7 @@ Rules for MEMORY.md generation:
 
 The dream consolidator acquires the shared Codex mutex (`Acquire-CodexLock -Owner 'dream'`) before the Phase 3 Codex call. L1a Stop-hook extractions are blocked while the dream consolidator holds the lock. The dream consolidator also checks `Release-CodexLock` in a `finally` block.
 
-See `docs/modular/codex-hooks.md` for the full mutex design.
+See `docs/systems/codex-hooks.md` for the full mutex design.
 
 ## Inputs and Outputs Summary
 

@@ -85,7 +85,7 @@ The stack went from "store + inject and hope" to "measurably faithful memory": a
 | `claude-config/` | CLAUDE.md tier-protocol snippet, model-tiers, storage-cap-check, `settings.example.json` |
 | `skill/install-agentic-memory-stack/` | The Claude Code installer skill (`SKILL.md` + `references/`) |
 | `eval/` | The faithfulness + retrieval eval harnesses and probe sets *(private repo only — excluded from the public mirror)* |
-| `docs/` | Operations, API contract, modular deep-dives — see [docs/README.md](./docs/README.md) for the map |
+| `docs/` | Operations, API contract, per-system and per-flow deep-dives — see [docs/README.md](./docs/README.md) for the map |
 
 ## License
 

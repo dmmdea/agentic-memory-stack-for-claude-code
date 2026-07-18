@@ -42,7 +42,7 @@ The curated "what do we know before I act" call: the same gated bundle (checkpoi
 
 ## Channel 3 — `memory_search` (deliberate search)
 
-Free-text semantic search with explicit `limit`/`threshold`/`query_class`/`brand` control and the reranker auto-on at `limit ≥ 5`. This is also where the forensic `history` class is used (see [`memory-model.md`](./memory-model.md)) — hidden records stay reachable on purpose.
+Free-text semantic search with explicit `limit`/`threshold`/`query_class`/`brand` control and the reranker auto-on at `limit ≥ 5`. This is also where the forensic `history` class is used (see [`memory-model.md`](../systems/memory-model.md)) — hidden records stay reachable on purpose.
 
 ## Channel 4 — the session-start précis
 
