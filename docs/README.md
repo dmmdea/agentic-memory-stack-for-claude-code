@@ -45,6 +45,7 @@ Then read the system and flow docs for the area you're changing.
 | [`flows/memory-retrieval.md`](./flows/memory-retrieval.md) | How memory reaches the agent: embedding, hybrid scoring + calibration, the four delivery channels, abstention |
 | [`flows/canonical-promotion.md`](./flows/canonical-promotion.md) | How evidence becomes canonical: the operator HMAC canonize and the dream autopromote → 4C gate (shadow by default), converging on one signing surface and the tier ledger |
 | [`flows/offline-outbox-replay.md`](./flows/offline-outbox-replay.md) | How an offline write survives: queue to the op-typed outbox, then an adds-first idempotent client replay to the authority on reconnect (no server replay endpoint; the replica never absorbs a write) |
+| [`flows/compaction-capture-restore.md`](./flows/compaction-capture-restore.md) | How a conversation survives compaction: a fail-open PreCompact hook writes a redacted query marker, the post-compact SessionStart consumes it and injects a conversation-relevant memory bundle (and the skew guard that prevents the exit-2 deadlock class) |
 
 ## Architecture & decisions
 
