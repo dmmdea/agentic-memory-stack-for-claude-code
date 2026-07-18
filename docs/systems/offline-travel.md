@@ -50,7 +50,7 @@ Offline resilience is delivered by two independent layers. Neither requires an o
 
 The mem0 MCP shim is the client every `memory_*` tool call flows through. It holds two URLs: `AUTHORITY_URL` (from `MEM0_URL`, default loopback `http://127.0.0.1:18791`) and a fixed `LOCAL_URL` (`http://127.0.0.1:18791`, the dormant local replica). Its behavior splits by operation kind:
 
-- **Reads** (`_request`) try the authority first with a short **1.5s connect timeout**; on a connect-level failure they fall over to the local replica and tag the result `source: "local-replica"` with a `stale_note`. If *both* are connect-unreachable the call raises `OfflineError` and the tool returns an empty-but-valid result marked `offline`. Crucially, a **read timeout or an HTTP error status is not a failover trigger** — the authority accepted the connection and is merely slow or erroring, and masking a real answer with a stale replica read would be wrong. That answer propagates instead.
+- **Reads** (`_request`) try the authority first with a short **1.5s connect timeout**; on a connect-level failure they fall over to the local replica and tag the result `source: "local-replica"` with a `stale_note`. If *both* are connect-unreachable the call raises `OfflineError`; `memory_recall` and the context bundle catch it and return an empty-but-valid result marked `offline`, while `memory_search` and the raw record reads let it propagate. Crucially, a **read timeout or an HTTP error status is not a failover trigger** — the authority accepted the connection and is merely slow or erroring, and masking a real answer with a stale replica read would be wrong. That answer propagates instead.
 - **Writes and mutations** (`_authority_only`) go to the authority *only*. On a connect-level failure they do **not** touch the replica — they call `_queue_op`, which appends the operation to the Outbox and returns `{event: "QUEUED_OFFLINE", op, key}`. This covers every mutating tool: `add`, `update`, `delete`, `promote`/`demote`, and the goal / open-question mutations.
 
 Offline reads additionally surface **queued-but-unsynced adds**: a search or recall merges any Outbox `add` whose text substring-matches the query, marked `pending_sync: true`, so a fact written minutes ago offline is still findable before it has replayed.
@@ -77,7 +77,7 @@ The watcher resolves the authority carefully: an explicit `-Authority` wins; oth
 
 ### Going offline (a read during an outage)
 
-Authority connect fails → the shim's 1.5s connect timeout trips → the read is reissued against the local replica → result returned tagged `local-replica` + `stale_note`, with any matching pending Outbox adds merged in. Independently, within ~2–6 minutes the watcher's third down-tick fires `go_offline` and ensures the replica services are up (restoring a fresh snapshot first if the last one is >24h old).
+Authority connect fails → the shim's 1.5s connect timeout trips → the read is reissued against the local replica → result returned tagged `local-replica` + `stale_note`, with any matching pending Outbox adds merged in. Independently, within ~4–6 minutes the watcher's third down-tick fires `go_offline` and ensures the replica services are up (restoring a fresh snapshot first if the last one is >24h old).
 
 ### Queueing a write while offline
 
@@ -159,7 +159,7 @@ All state is under `~/.mem0/` (WSL home) or `~/.claude/state/` (Windows), never 
 
 ## Error handling
 
-- **Both authority and replica unreachable** → reads raise `OfflineError`; tools return empty-but-valid results marked `offline` (with any pending Outbox adds merged), so a session degrades rather than crashes.
+- **Both authority and replica unreachable** → reads raise `OfflineError`. `memory_recall` and the context bundle catch it and return an empty-but-valid result marked `offline` (with any pending Outbox adds merged), so a session degrades rather than crashes; `memory_search` and raw record reads let `OfflineError` propagate — an edge that keeping the replica up (Layer 2) is designed to prevent.
 - **A torn Outbox line** (crash mid-append) → preserved verbatim in `mutation-conflicts.jsonl` under `reason: "unparseable"`; the surrounding good lines still replay.
 - **A deterministic replay failure** (unknown op, old-format record with no `op`) → conflict-logged once, never retried in a loop.
 - **A `4xx`/`5xx` on a replayed op** (e.g. deleting an already-gone memory) → conflict-logged with the status code; the batch continues.
