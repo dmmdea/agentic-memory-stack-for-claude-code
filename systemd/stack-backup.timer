@@ -1,8 +1,11 @@
 [Unit]
-Description=Weekly agentic memory stack snapshot timer
+Description=Daily agentic memory stack snapshot timer
 
 [Timer]
-OnCalendar=Sun 03:30
+# DAILY (2026-07-14, offline-first): the snapshot feeds the read-replica restore on
+# client boxes (restore-replica.ps1 pulls the latest snapshot), so a replica is at
+# most ~1 day stale when a box goes offline. Weekly left it up to 7 days behind.
+OnCalendar=*-*-* 03:30:00
 Persistent=true
 
 [Install]

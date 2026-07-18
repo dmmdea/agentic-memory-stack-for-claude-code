@@ -35,7 +35,11 @@ Environment=HF_HUB_OFFLINE=1
 RuntimeDirectory=mem0
 RuntimeDirectoryMode=0700
 ExecStartPre=-%h/apps/mem0-server/dpapi-fetch-key.sh
-ExecStart=%h/apps/mem0-server/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 18791
+# Bind address is operator config: loopback by default (safe single-box posture).
+# A multi-box deployment where replica clients reach this brain over the network
+# (e.g. a tailnet) sets MEM0_BIND=0.0.0.0 in ~/.mem0/stack.env — the deployers
+# (deploy.sh / 1-wsl-services.sh) resolve __MEM0_BIND__ from it at install time.
+ExecStart=%h/apps/mem0-server/.venv/bin/uvicorn app:app --host __MEM0_BIND__ --port 18791
 Restart=on-failure
 RestartSec=5
 MemoryMax=2G
