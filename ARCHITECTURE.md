@@ -289,4 +289,4 @@ Catches poisoned/oversize/credential-shaped writes within a working day, at zero
 
 ## History
 
-The repo evolved v0.12 → v1.x through research-grounded, adversarially-audited increments (each release audited to 0 critical/high findings before merge). The full trail — release notes, research fit-analyses, build plans, eval baselines — lives in the private development repo (`CHANGELOG.md`, `docs/research/`, `docs/superpowers/plans/`, `eval/`); the public mirror ships current-state docs only.
+The repo evolved v0.12 → v1.x through research-grounded, adversarially-audited increments (each release audited to 0 critical/high findings before merge). Release notes ship here in `CHANGELOG.md`, the product's version authority. The rest of the development trail — research fit-analyses, build plans, eval baselines — is not part of the shipped product and lives in a separate maintainer archive (`docs/research/`, `docs/superpowers/plans/`, `eval/`).
