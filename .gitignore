@@ -57,3 +57,6 @@ eval/faithfulness/.codex-answer-cache.json.tmp
 # never tracked. The neutral template ships as claude-config/brands.example.json; the
 # installer falls back to it when no local brands.json exists.
 claude-config/brands.json
+
+# operator-specific PII leak-guard patterns (see scripts/windows/tests/pii-patterns.local.txt.example)
+scripts/windows/tests/pii-patterns.local.txt
