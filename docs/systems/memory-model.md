@@ -69,7 +69,7 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 #### `canonical` — locked ground truth
 
 - **Purpose:** the facts everything else is judged against. The contradiction sweep uses canonical as its **anchor set**; the NLI write-gate flags new records that contradict it; agent guidance treats it as overriding.
-- **Written by:** *no plain write can ever create it.* Two doors only: the operator's HMAC-signed CLI (`mem0-canonize.sh` — DPAPI-held key, burned nonce, mandatory reason), or the dream's autopromotion (≤ 3/night, confidence-sorted, deduped, through the **enforced 4C contradiction/corroboration gate**). Every change lands in the tier ledger.
+- **Written by:** *no plain write can ever create it.* Two doors only: the operator's HMAC-signed CLI (`mem0-canonize.sh` — DPAPI-held key, burned nonce, mandatory reason), or the dream's autopromotion (≤ 3/night, confidence-sorted, deduped, through the **4C contradiction/corroboration gate** — which ships in shadow-calibration mode by default; enforce is opt-in). Every change lands in the tier ledger.
 - **Lifecycle:** no decay, no expiry. Only the `canonical` and `history` classes admit it — it does not ride ordinary durable searches and never appears in the per-prompt bundle; it arrives through the dedicated canonical-class channel of `memory_recall` (or an explicit `query_class="canonical"` search).
 - **Example:** `"All LLM judgment routes to the Codex layer; the local models only embed and rerank."`
 

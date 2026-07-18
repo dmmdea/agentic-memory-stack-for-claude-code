@@ -80,7 +80,7 @@ The server-side retrieval-admission policy applied to every `POST /v1/memories/s
 
 ## Promotion Gate
 
-The 4C contradiction/corroboration gate (enforce mode) that every autonomous Canonical promotion must clear: the Dream's confidence-sorted, ≤ 3/night, deduped nominees are blocked and left as Evidence if they fail it. See [memory-model.md](systems/memory-model.md).
+The 4C contradiction/corroboration gate that scores every autonomous Canonical promotion. It ships in shadow mode by default (computes and logs a verdict without changing the decision); in enforce mode, the Dream's confidence-sorted, ≤ 3/night, deduped nominees are blocked and left as Evidence if they fail it. See [memory-model.md](systems/memory-model.md).
 
 ## Query Class
 
