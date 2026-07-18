@@ -2,7 +2,7 @@
 
 A persistent, multi-tier, **measurably faithful** memory backend for Claude Code on Windows + WSL2. This document explains how the whole system works: the six functional layers, the trust-tier memory model, the life of a memory from conversation to retrieval, and the safety invariants that keep a *self-writing* store honest.
 
-> **How to read this doc.** Skim the [bird's-eye view](#birds-eye-view) and the [six layers](#the-six-functional-layers) for the mental model; use the [component code map](#component-code-map) and [ports table](#processes--ports) as reference while reading code. Per-component deep-dives live in [`docs/modular/`](./docs/modular/); day-2 operations in [`docs/operations.md`](./docs/operations.md); the API surface in [`docs/api-contracts.md`](./docs/api-contracts.md); the full doc map in [`docs/README.md`](./docs/README.md).
+> **How to read this doc.** Skim the [bird's-eye view](#birds-eye-view) and the [six layers](#the-six-functional-layers) for the mental model; use the [component code map](#component-code-map) and [ports table](#processes--ports) as reference while reading code. Per-component deep-dives live in `docs/modular/`; day-2 operations in [`docs/operations.md`](./docs/operations.md); the API surface in [`docs/api-contracts.md`](./docs/api-contracts.md); the full doc map in [`docs/README.md`](./docs/README.md).
 
 **Current shape** (see the `VERSION` file for the release): 4 long-running processes (mem0 FastAPI server, Qdrant, llama-swap, plus on-demand Codex CLI), ~10 Claude Code hooks, 2 Windows scheduled tasks, 6+ WSL systemd-user timers.
 
