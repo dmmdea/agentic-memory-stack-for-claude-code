@@ -34,6 +34,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker stage — *design doc; marked DESIGN in-file* |
 | [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md) | Canonical-key custody: DPAPI blob, runtime injection, recovery, rotation |
 | [`systems/llama-swap-binding.md`](./systems/llama-swap-binding.md) | The loopback-bind requirement for local inference — *historical record; the current setup guide is [`../install/llama-swap-setup.md`](../install/llama-swap-setup.md)* |
+| [`systems/installer-and-deploy.md`](./systems/installer-and-deploy.md) | How the stack is installed and updated: the 4 install phases, the receipt + sentinels, the brain/replica role gate, the gated deploy pipeline, and R9 parity |
 
 ## Flows — behavior across systems
 

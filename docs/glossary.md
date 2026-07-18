@@ -4,15 +4,15 @@ Domain terms used across this repository's documentation and code. See [STYLE.md
 
 ## Brain
 
-The **brain box**: the single machine that hosts the memory authority (Qdrant + the mem0 server on `:18791`) and is the sole write authority for the store. The role term is fixed by the [operator-neutral vocabulary](STYLE.md).
+The **brain box**: the single machine that hosts the memory authority (Qdrant + the mem0 server on `:18791`) and is the sole write authority for the store. The `brain`/`replica` role is chosen at install time by the installer's role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Replica
 
-A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. The role term is fixed by the [operator-neutral vocabulary](STYLE.md).
+A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. Installed with `-Role replica`, it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## One-Brain Rule
 
-The invariant that exactly one machine — the Brain — holds write authority while replicas stay read-only; mutations made while the authority is unreachable queue to the Outbox and replay on reconnect, so divergence is impossible by construction. Enforced at install by a `brain`/`replica` role gate. See [CHANGELOG.md](../CHANGELOG.md) (v1.15–v1.16).
+The invariant that exactly one machine — the Brain — holds write authority while replicas stay read-only; mutations made while the authority is unreachable queue to the Outbox and replay on reconnect, so divergence is impossible by construction. Enforced at install by a `brain`/`replica` role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Tier
 
@@ -40,15 +40,15 @@ The explicitly-perishable tier for facts with a shelf life. In the current admis
 
 ## Receipt
 
-The install-time file the installer writes recording the operator's deploy choices — the chosen repository path and the box's `brain`/`replica` role — which R9-tracked deployed scripts read to resolve operator-specific values at runtime. See [CHANGELOG.md](../CHANGELOG.md) (v1.16).
+The install-time file the installer writes recording the operator's deploy choices — the chosen repository path and the box's `brain`/`replica` role — which R9-tracked deployed scripts read to resolve operator-specific values at runtime. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Sentinel
 
-An operator-specific placeholder token (for example `__WSL_USER__`, `__WIN_USER__`, `__WSL_DISTRO__`, `__MEM0_BIND__`) embedded in the repository's scripts and systemd units so the public source ships free of real values; the installer and `deploy.sh` substitute the real values at deploy time. See [DEVELOPMENT.md](DEVELOPMENT.md).
+An operator-specific placeholder token (for example `__WSL_USER__`, `__WIN_USER__`, `__WSL_DISTRO__`, `__MEM0_BIND__`) embedded in the repository's scripts and systemd units so the public source ships free of real values; the installer and `deploy.sh` substitute the real values at deploy time. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## R9 Parity
 
-The `Test-MemoryStack.ps1` check (code **R9**) that SHA256-compares repository source against the deployed copy of every hot-path hook script and config — and checks the compiled hook client against an install-time `.sha256` sidecar — WARNing on any repo-vs-deployed drift. See [continuity.md](systems/continuity.md).
+The `Test-MemoryStack.ps1` check (code **R9**) that SHA256-compares repository source against the deployed copy of every hot-path hook script and config — and checks the compiled hook client against an install-time `.sha256` sidecar — WARNing on any repo-vs-deployed drift. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Dream
 
