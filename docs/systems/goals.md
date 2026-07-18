@@ -119,7 +119,7 @@ FTS5 query strings are sanitized via `_sanitize_fts`: non-word characters stripp
 | `GET` | `/v1/goals` | List goals with optional `?status=&brand=&parent_id=&limit=` filters. |
 | `GET` | `/v1/goals/tree` | Recursive CTE tree (flat list + depth). `?root_id=` optional. Must be registered BEFORE `/v1/goals/{id}` in FastAPI. |
 | `GET` | `/v1/goals/{id}` | Single goal detail including `linked_episode_count`. |
-| `PATCH` | `/v1/goals/{id}/status` | Update status. Body: `{status, actor (required), reason?, completed_at?}`. Appends a ledger entry to `~/.mem0/tier-ledger.jsonl` (HIGH-3 fix). |
+| `PATCH` | `/v1/goals/{id}/status` | Update status. Body: `{status, actor (required), reason?, completed_at?}`. Appends a ledger entry to the monthly segment `~/.mem0/tier-ledger-YYYY-MM.jsonl` (HIGH-3 fix). |
 
 ### MCP tools (in `scripts/wsl/mem0-mcp-shim.py`)
 
@@ -177,7 +177,7 @@ sqlite3 ~/.mem0/episodic.db \
 sqlite3 ~/.mem0/episodic.db "SELECT * FROM schema_meta;"
 ```
 
-**Audit trail:** every `PATCH /v1/goals/{id}/status` appends a line to `~/.mem0/tier-ledger.jsonl`:
+**Audit trail:** every `PATCH /v1/goals/{id}/status` appends a line to the monthly segment `~/.mem0/tier-ledger-YYYY-MM.jsonl`:
 ```json
 {"ts":"2026-06-10T...","event":"goal-status-change","goal_id":42,"new_status":"completed","actor":"user-direct","reason":"shipped"}
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-import-closure.sh — public mirror of the upstream import-closure publish gate.
+# check-import-closure.sh — the installer import-closure gate.
 #
 # Every module in mem0-server/*.py must be listed in MEM0_MODULES in
 # install/1-wsl-services.sh. When one is missing the installer never copies it and

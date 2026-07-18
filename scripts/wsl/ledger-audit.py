@@ -167,7 +167,7 @@ def main() -> int:
                             "report raw and adjusted numbers")
     parser.add_argument("--force", action="store_true",
                         help="with --baseline: allow re-recording even when a current count exceeds "
-                             "the existing baseline (only after triage — see docs/modular/tier-policy.md)")
+                             "the existing baseline (only after triage — see docs/systems/tier-policy.md)")
     args = parser.parse_args()
 
     files = ledger_files()
@@ -383,7 +383,7 @@ def main() -> int:
                     "baseline (re-baselining now would permanently normalize a regression): "
                     + ", ".join(f"{k} {old}->{new}" for k, (old, new) in grew.items())
                     + ". Triage the new findings first; re-run with --force only after "
-                    "root-causing (docs/modular/tier-policy.md).",
+                    "root-causing (docs/systems/tier-policy.md).",
                     flush=True,
                 )
                 return 1

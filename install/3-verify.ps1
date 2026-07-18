@@ -106,7 +106,7 @@ Check "canonical-key exists (DPAPI blob or plaintext mode 600)" {
     # (generate a fresh key) would have split-brained the key from the blob.
     $result = wsl.exe -d $Distro -e bash -lc "if [ -f ~/.mem0/canonical-key.dpapi ]; then echo dpapi; elif [ -f ~/.mem0/canonical-key ]; then stat -c '%a' ~/.mem0/canonical-key 2>/dev/null; else echo missing; fi"
     @('dpapi','600') -contains (($result -as [string]).Trim())
-} "No DPAPI blob: in WSL run bash scripts/wsl/generate-canonical-key.sh. DPAPI box (canonical-key.dpapi exists): systemctl --user restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or follow docs/modular/dpapi-canonical-key.md Recovery - do NOT generate a fresh key next to the blob"
+} "No DPAPI blob: in WSL run bash scripts/wsl/generate-canonical-key.sh. DPAPI box (canonical-key.dpapi exists): systemctl --user restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or follow docs/systems/dpapi-canonical-key.md Recovery - do NOT generate a fresh key next to the blob"
 Check "decay-scan.timer enabled" {
     $r = wsl.exe -d $Distro -e bash -lc "systemctl --user is-enabled decay-scan.timer 2>/dev/null || echo disabled"
     ($r -as [string]).Trim() -eq 'enabled'

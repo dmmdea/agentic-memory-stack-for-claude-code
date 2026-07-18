@@ -150,7 +150,7 @@ fi
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the
-# repo may live on a Windows drive (per docs/modular/dpapi-canonical-key.md).
+# repo may live on a Windows drive (per docs/systems/dpapi-canonical-key.md).
 tr -d "\r" < "$REPO_ROOT/scripts/wsl/dpapi-fetch-key.sh" > "$MEM0_DIR/dpapi-fetch-key.sh" && chmod +x "$MEM0_DIR/dpapi-fetch-key.sh"
 echo "  dpapi-fetch-key.sh deployed (Phase H key chain)"
 

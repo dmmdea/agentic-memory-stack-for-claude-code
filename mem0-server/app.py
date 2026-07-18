@@ -93,7 +93,7 @@ else:
         "canonical-key not found (checked runtime tmpfs + DPAPI + plaintext); canonical "
         "promotions will be REJECTED. If ~/.mem0/canonical-key.dpapi exists this is the "
         "keyless-degraded state: restart mem0 to re-run dpapi-fetch-key.sh (ExecStartPre) "
-        "or follow docs/modular/dpapi-canonical-key.md Recovery"
+        "or follow docs/systems/dpapi-canonical-key.md Recovery"
     )
 
 # v1.0 R7 (Phase 7A, recon defect B2): operator-agnostic default tenant.

@@ -54,7 +54,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body $bo
 Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 5 | Select-Object -ExpandProperty checks
 ```
 
-**Recovery** (server has no key / blob suspect): decrypt `canonical-key.dpapi` via `ProtectedData::Unprotect` → write `~/.mem0/canonical-key` → `chmod 600` → `systemctl --user restart mem0`. The blob is decryptable ONLY by the original Windows user while the DPAPI master-key chain survives — a Windows reinstall/profile loss destroys it, so back up the plaintext (or re-provision) before any such operation. Full backend detail: `docs/modular/dpapi-canonical-key.md`.
+**Recovery** (server has no key / blob suspect): decrypt `canonical-key.dpapi` via `ProtectedData::Unprotect` → write `~/.mem0/canonical-key` → `chmod 600` → `systemctl --user restart mem0`. The blob is decryptable ONLY by the original Windows user while the DPAPI master-key chain survives — a Windows reinstall/profile loss destroys it, so back up the plaintext (or re-provision) before any such operation. Full backend detail: `docs/systems/dpapi-canonical-key.md`.
 
 ## Forgetting + backup infrastructure
 

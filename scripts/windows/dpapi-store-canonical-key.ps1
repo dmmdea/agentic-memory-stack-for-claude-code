@@ -8,7 +8,7 @@
 # decrypts it via WSL interop at every service start and injects the key into
 # tmpfs ($XDG_RUNTIME_DIR/mem0/canonical-key). Re-run this script after any key
 # rotation so the blob always tracks the current key. Full runbook:
-# docs/modular/dpapi-canonical-key.md.
+# docs/systems/dpapi-canonical-key.md.
 
 [CmdletBinding()]
 param(
@@ -37,7 +37,7 @@ if ($RemovePlaintext -and $isWslPath) {
         $chainLive = ((Get-Content $runtimeKey -Raw).Trim() -eq (Get-Content $plainProbe -Raw).Trim())
     }
     if (-not $chainLive) {
-        Write-Host "REFUSING -RemovePlaintext: runtime tmpfs key at $runtimeKey is absent or does not match the plaintext. The WSL mem0-server needs the dpapi-fetch-key.sh ExecStartPre chain live (v0.19 Phase H) before the plaintext can go. Restart mem0.service, verify, and re-run - see docs/modular/dpapi-canonical-key.md." -ForegroundColor Red
+        Write-Host "REFUSING -RemovePlaintext: runtime tmpfs key at $runtimeKey is absent or does not match the plaintext. The WSL mem0-server needs the dpapi-fetch-key.sh ExecStartPre chain live (v0.19 Phase H) before the plaintext can go. Restart mem0.service, verify, and re-run - see docs/systems/dpapi-canonical-key.md." -ForegroundColor Red
         exit 1
     }
     Write-Host "Runtime tmpfs key matches plaintext - Phase H injection chain is live, removal is safe." -ForegroundColor Green
@@ -74,7 +74,7 @@ Write-Host "Verify OK: roundtrip yields original plaintext." -ForegroundColor Gr
 
 if ($RemovePlaintext) {
     Remove-Item $plaintext -Force
-    Write-Host "Removed plaintext $plaintext. The WSL server now reads the key via the dpapi-fetch-key.sh runtime injection (v0.19 Phase H); recovery = ProtectedData::Unprotect on the blob (docs/modular/dpapi-canonical-key.md)." -ForegroundColor Yellow
+    Write-Host "Removed plaintext $plaintext. The WSL server now reads the key via the dpapi-fetch-key.sh runtime injection (v0.19 Phase H); recovery = ProtectedData::Unprotect on the blob (docs/systems/dpapi-canonical-key.md)." -ForegroundColor Yellow
 } else {
     Write-Host "Plaintext retained at $plaintext. Re-run with -RemovePlaintext after verifying live mem0-server flows (runtime tmpfs key present + canonize cycle passing)." -ForegroundColor Yellow
 }

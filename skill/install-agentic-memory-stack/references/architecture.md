@@ -1,6 +1,6 @@
 # Agentic Memory Stack — architecture (v1.0)
 
-Read on demand from `SKILL.md`. The canonical, in-repo deep dive is `ARCHITECTURE.md` + `docs/modular/*`; this is the skill-side summary.
+Read on demand from `SKILL.md`. The canonical, in-repo deep dive is `ARCHITECTURE.md` + `docs/systems/*` + `docs/flows/*`; this is the skill-side summary.
 
 ## Live runtime processes
 
