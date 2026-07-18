@@ -235,7 +235,7 @@ Liveness (services, health, MCP registration, hooks SHA-match) + invariants (sea
 |---|---|---|
 | `claude --print` from hooks: "Not logged in" | Max OAuth single-session enforcement | BY DESIGN — the stack uses Codex |
 | Per-prompt injection silently dead under VS Code | stdout instead of the `hookSpecificOutput` envelope + a Windows concurrent-spawn race + a short daemon timeout | FIXED v1.11.0 (exec-form hook, envelope, 8 s timeout) |
-| Fresh installs crash-loop `mem0.service` | `redact.py` imported but not deployed by the installer | FIXED v1.11.1 (+ import-closure gate in the publish pipeline) |
+| Fresh installs crash-loop `mem0.service` | `redact.py` imported but not deployed by the installer | FIXED v1.11.1 (+ import-closure gate in CI) |
 | Hook POSTs fail with 400 on non-ASCII | UTF-8 bytes not declared on `-Body` | FIXED (encoding sweep) |
 | MCP tools time out at handshake | fastmcp ANSI banner on stdout | FIXED — `show_banner=False` |
 | A correct fact vanished from retrieval | early auto-enforce hid records on a single Codex YES | FIXED — never-auto-hide + review queue + `--unstamp` |

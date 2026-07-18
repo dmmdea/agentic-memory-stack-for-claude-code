@@ -59,7 +59,7 @@ This means every session that Codex extracts open questions from automatically p
 `PATCH /v1/open_questions/{id}/resolve` with `{resolved_in_session_id, resolution_text, actor}`:
 - Flips `status='resolved'`, sets `resolved_at` + `resolved_in_session_id` + `resolution_text`.
 - Only transitions from `status='open'` (already-resolved is a no-op returning 404).
-- Appends a `open-question-resolved` ledger entry to `tier-ledger.jsonl`.
+- Appends a `open-question-resolved` ledger entry to the monthly segment `tier-ledger-YYYY-MM.jsonl`.
 
 ### 4. Status transitions
 

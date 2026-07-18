@@ -9,7 +9,7 @@ This repo backs up the **code, configs, and installer** for the agentic memory s
 | `~/.mem0/history.db` (WSL SQLite) | mem0 fact history | 1-50 MB |
 | `~/.mem0/api-key` (WSL) | mem0 API key (regenerated on install) | <1 KB |
 | `~/.mem0/audit-flags.jsonl` (WSL) | L10 audit history | 1-10 MB |
-| `~/.mem0/tier-ledger.jsonl` (WSL) | Promotion/demotion history | <1 MB |
+| `~/.mem0/tier-ledger*.jsonl` (WSL) | Promotion/demotion history (monthly segments + frozen legacy file) | <1 MB |
 | `~/qdrant-server/storage/` (WSL) | Qdrant collection: vectors + payload | 100 MB - several GB |
 
 The largest store is Qdrant storage (vectors). The rest is small.

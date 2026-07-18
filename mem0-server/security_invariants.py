@@ -318,7 +318,7 @@ def validate_hmac_user_direct(
             "cannot validate user-direct token: server has no canonical key "
             "(runtime injection failed? check `journalctl --user -u mem0` for "
             "dpapi-fetch-key). If ~/.mem0/canonical-key.dpapi exists, restore the "
-            "key per docs/modular/dpapi-canonical-key.md Recovery and restart mem0; "
+            "key per docs/systems/dpapi-canonical-key.md Recovery and restart mem0; "
             "only run generate-canonical-key.sh on a box with no DPAPI blob.",
         )
 

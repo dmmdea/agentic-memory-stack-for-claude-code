@@ -65,7 +65,7 @@ cold-load; the 120s budget persists until the judge answers once.
 Every run (including dry-run) appends one JSONL summary line to
 ~/.mem0/contradiction-sweep.jsonl — read by Test-MemoryStack's RECOVERY
 "contradiction sweep" freshness row. Weekly systemd-user timer:
-contradiction-sweep.timer (see systemd/ + docs/modular/admission-gate.md).
+contradiction-sweep.timer (see systemd/ + docs/systems/admission-gate.md).
 """
 from __future__ import annotations
 

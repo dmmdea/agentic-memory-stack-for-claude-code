@@ -12,7 +12,7 @@ fi
 # (key split-brain: new HMAC key here, old key inside the blob the server fetches).
 if [ -f "$HOME/.mem0/canonical-key.dpapi" ] && [ "${1:-}" != "--force" ]; then
   echo "REFUSING: canonical-key.dpapi exists - generating a new key would diverge from the blob." >&2
-  echo "Recover the existing key instead: docs/modular/dpapi-canonical-key.md section Recovery" >&2
+  echo "Recover the existing key instead: docs/systems/dpapi-canonical-key.md section Recovery" >&2
   echo "(ProtectedData::Unprotect restore), or restart mem0 to re-run dpapi-fetch-key.sh." >&2
   echo "Use --force only for deliberate rotation (then re-run dpapi-store-canonical-key.ps1)." >&2
   exit 1

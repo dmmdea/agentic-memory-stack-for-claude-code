@@ -100,7 +100,7 @@ Liveness + version probe. No auth.
 {"ok": true, "memory_id": "abc...", "tier": "canonical", "actor": "claude", "ts": "2026-06-08T..."}
 ```
 
-**Side effect:** appends an entry to `~/.mem0/tier-ledger.jsonl`:
+**Side effect:** appends an entry to the monthly ledger segment `~/.mem0/tier-ledger-YYYY-MM.jsonl`:
 ```json
 {"ts":"...", "memory_id":"...", "tier":"canonical", "actor":"claude", "reason":"..."}
 ```
