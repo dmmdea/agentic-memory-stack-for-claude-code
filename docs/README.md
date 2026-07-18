@@ -43,6 +43,7 @@ Then read the system and flow docs for the area you're changing.
 |---|---|
 | [`flows/memory-capture.md`](./flows/memory-capture.md) | How conversations become memory: the four capture moments, the inferability gate, corrections, the nightly consolidation |
 | [`flows/memory-retrieval.md`](./flows/memory-retrieval.md) | How memory reaches the agent: embedding, hybrid scoring + calibration, the four delivery channels, abstention |
+| [`flows/canonical-promotion.md`](./flows/canonical-promotion.md) | How evidence becomes canonical: the operator HMAC canonize and the dream autopromote → 4C gate (shadow by default), converging on one signing surface and the tier ledger |
 
 ## Architecture & decisions
 
