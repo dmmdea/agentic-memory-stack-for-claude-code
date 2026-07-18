@@ -1,0 +1,8 @@
+# pii-patterns.local.txt — operator-private PII patterns for the parity tests.
+# Copy this file to pii-patterns.local.txt (gitignored) and list one regex per
+# line: your machine names, brand names, personal names, private IP prefixes.
+# Lines starting with '#' are comments. Each pattern is asserted NOT to appear
+# in any deployed windows script (InstallerParity) or default brand rule
+# (UserPromptExtract).
+(?i)your-machine-name
+your-private-brand
