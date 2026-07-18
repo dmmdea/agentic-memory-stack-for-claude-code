@@ -17,6 +17,13 @@ tradeoffs, and Architecture Decision Records.
 Do not use it for ordinary implementation notes, feature documentation, or detailed behavior that
 belongs in a system or flow document.
 
+## System-wide overview
+
+The repo-wide system overview lives at the root [`ARCHITECTURE.md`](../../ARCHITECTURE.md) — the
+bird's-eye view, the six functional layers, the trust-tier model, and the safety invariants. It
+stays at the root as the single system-wide entry point; this directory holds the cross-system
+constraints and Architecture Decision Records that sit beneath it.
+
 ## Decisions
 
 Architecture Decision Records live in [decisions/](decisions/README.md). Only ADRs with an
