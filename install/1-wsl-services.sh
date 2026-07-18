@@ -171,13 +171,21 @@ fi
 # developer path/handle (mirrors the Windows mem0-stack.config.psd1). LF, no BOM.
 mkdir -p "$USER_HOME/.mem0"
 REPO_ROOT_WSL="$REPO_ROOT"
+# MEM0_BIND: preserve an operator's existing bind choice across re-installs (a
+# multi-box brain binds 0.0.0.0; the shipped default is loopback). Sourced by the
+# unit-sentinel resolution below and by deploy.sh.
+if [ -z "${MEM0_BIND:-}" ] && [ -f "$USER_HOME/.mem0/stack.env" ]; then
+    MEM0_BIND="$(grep -E '^MEM0_BIND=' "$USER_HOME/.mem0/stack.env" | cut -d= -f2 || true)"
+fi
+MEM0_BIND="${MEM0_BIND:-127.0.0.1}"
 cat > "$USER_HOME/.mem0/stack.env" <<ENV
 MEM0_WSL_USER=$WSL_USER
 MEM0_WIN_USER=$WIN_USER
 MEM0_DISTRO=$DISTRO
 MEM0_REPO_ROOT_WSL=$REPO_ROOT_WSL
+MEM0_BIND=$MEM0_BIND
 ENV
-echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO"
+echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO bind=$MEM0_BIND"
 
 # Generate canonical-key if not present (v0.14 B: HMAC auth for tier=canonical promotions).
 # Fix-pass guard: a DPAPI-backed box has NO plaintext canonical-key — only the
@@ -296,6 +304,7 @@ for unit in mem0.service qdrant.service l10-audit.service l10-audit.timer decay-
         -e "s|__WSL_USER__|$WSL_USER|g" \
         -e "s|__WIN_USER__|$WIN_USER|g" \
         -e "s|__WSL_DISTRO__|$DISTRO|g" \
+        -e "s|__MEM0_BIND__|${MEM0_BIND:-127.0.0.1}|g" \
         -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" \
         "$SRC" > "$DST"
     echo "  installed: $unit"

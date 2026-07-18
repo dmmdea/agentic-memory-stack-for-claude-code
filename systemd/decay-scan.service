@@ -1,8 +1,16 @@
 [Unit]
-Description=Weekly decay + dedup scan (v0.13)
+Description=Weekly decay scan (v0.13)  [dedup ExecStartPost DISABLED 2026-07-14]
 After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/decay-scan.py
-ExecStartPost=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/semantic-dedup.py
+# DISABLED 2026-07-14 (memory-stack audit). This line ran semantic-dedup.py with NO --dry-run =
+# an unattended LIVE delete. Two reasons it must not run as-is:
+#   1. O(n^2) pure-Python cosine over ~67.8k x 768-dim vectors = 4-62 h CPU per weekly fire.
+#   2. Its 0.94 evidence-tier cosine threshold culls NEAR-duplicates, not just exact ones; the
+#      v0.13 run at 0.92 destroyed 27 genuine atomic facts (see semantic-dedup.py comments).
+# The real problem it was masking is EXACT-hash duplication (93.5% of the store) caused by the
+# L1a extractor re-inserting whole transcripts; fix that at the source + use exact-hash dedup.
+# Re-enable ONLY with an explicit --dry-run, or delete this line once exact-hash dedup lands.
+# ExecStartPost=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/semantic-dedup.py
