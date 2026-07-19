@@ -61,7 +61,22 @@ Check "SessionStart daemon-spawn registered" {
     $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json
     @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command }) -like '*mem0-hook-daemon-spawn.ps1*'
 } "Re-run 2-windows-config.ps1"
-Check "mem0 MCP server registered" { $m = Get-Content "$env:USERPROFILE\.claude.json" -Raw | ConvertFrom-Json; $m.mcpServers.mem0 -ne $null } "Re-run 2-windows-config.ps1"
+# The entry must exist AND its args must be well-formed. A registration whose shim path is
+# shattered across array elements (e.g. a username-neutralization edit that splits
+# "/mnt/c/Users/<user>/.claude/scripts/mem0-mcp-shim.py" into three JSON array elements) makes
+# WSL run python against the /mnt/c/Users/ DIRECTORY, so the MCP server never starts and recall
+# silently dies. The old check only tested existence and passed on that shattered form.
+# Shape check is operator-agnostic (multi-tenant): the username segment is `.+`, no literal user.
+Check "mem0 MCP server registered + args well-formed" {
+    # -AsHashtable tolerates the case-variant duplicate project keys a stock ~/.claude.json can
+    # carry (a Claude Code quirk) — plain ConvertFrom-Json throws on those. pwsh-only installer.
+    $m = Get-Content "$env:USERPROFILE\.claude.json" -Raw | ConvertFrom-Json -AsHashtable
+    $mem0 = $m.mcpServers.mem0
+    if ($null -eq $mem0) { return $false }
+    # Exactly one args element is the FULL shim path; the shattered form has none that match.
+    $shim = @($mem0.args | Where-Object { "$_" -match '^/mnt/.+/\.claude/scripts/mem0-mcp-shim\.py$' })
+    ($shim.Count -eq 1) -and ($mem0.command -eq 'wsl.exe')
+} "Re-run 2-windows-config.ps1 (it rewrites a correct single-path mem0 entry) — the ~/.claude.json mem0 args are missing or malformed (shim path split across array elements)"
 # v1.16 (2026-07-17 remediation §6.2.3): generic deploy-layer skew detector. The shared/synced
 # settings.json can advance ahead of this box's machine-local deployed scripts (2026-07-17:
 # a config-repo untrack+pull deleted a box's whole deploy layer while settings.json kept
