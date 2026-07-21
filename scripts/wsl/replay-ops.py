@@ -4,17 +4,34 @@ Idempotent (replayed-key ledger); failures -> mutation-conflicts.jsonl (never dr
 Only runs when the authority is reachable; atomic rotation closes the concurrent-writer race."""
 from __future__ import annotations
 import argparse
+import fcntl
 import json
 import os
 import sys
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 import httpx
 
 # Default = loopback (correct on the brain box). A replica MUST set MEM0_URL to the
 # brain's URL — travel-mode manages this; the old machine-name default resolved only
 # on the developer's tailnet.
-AUTHORITY = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
+def _default_authority() -> str:
+    """MEM0_URL env > ~/.mem0/authority-url (per-host file) > loopback — same precedence the shim
+    uses, so a standalone run on a replica targets the brain instead of silently probing loopback."""
+    env = (os.environ.get("MEM0_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        for line in (Path.home() / ".mem0" / "authority-url").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:18791"
+
+AUTHORITY = _default_authority()
 KEY = (Path.home() / ".mem0" / "api-key").read_text(encoding="utf-8").strip()
 _MUTATION_ORDER = 1  # adds sort before everything else
 _ADD_ORDER = 0
@@ -63,10 +80,39 @@ def dispatch(op: str, args: dict) -> httpx.Response:
     r.raise_for_status()
     return r
 
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]", ""}
+
+
+def _is_local_url(url: str) -> bool:
+    """True for loopback/unspecified/malformed. Mirrors offline-watcher.ps1's Test-IsLocalUrl —
+    a malformed URL counts as local so it fails CLOSED (refuse to replay) rather than open."""
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return True
+    return (host or "") in _LOCAL_HOSTS
+
+
+def _role() -> str:
+    """This box's One-Brain role, written by the installer beside the authority file."""
+    try:
+        return (Path.home() / ".mem0" / "role").read_text(encoding="utf-8").strip().lower() or "brain"
+    except OSError:
+        return "brain"   # unmarked boxes are single-machine installs, where loopback IS the authority
+
+
 def replay(outbox: Path, authority: str, key: str) -> dict:
     global AUTHORITY
     AUTHORITY = authority  # dispatch must target the same authority the probe checked
     stats = {"replayed": 0, "conflicts": 0, "kept": 0}
+    # ONE-BRAIN GUARD. On a replica, loopback is the DISPOSABLE travel store — replaying into it
+    # would write the queued mutations to a store that is torn down on reconnect AND ledger their
+    # keys as done, so the real authority never receives them and nothing reports a loss.
+    # offline-watcher.ps1 guards its own authority choice for this reason; this guards every
+    # caller, including the shim's unattended startup drain. Refuse, keep the outbox intact.
+    if _role() == "replica" and _is_local_url(authority):
+        stats["refused"] = "replica authority is loopback — refusing to replay into the disposable local store (One-Brain Rule)"
+        return stats
     replaying = outbox.with_suffix(".replaying.jsonl")
     tmp = outbox.with_suffix(".rotating.jsonl")
     live_pending = outbox.exists() and outbox.read_text(encoding="utf-8").strip()
@@ -143,6 +189,25 @@ if __name__ == "__main__":
     ap.add_argument("--outbox", default=str(Path.home() / ".mem0" / "outbox.jsonl"))
     ap.add_argument("--authority", default=AUTHORITY)
     a = ap.parse_args()
-    s = replay(Path(a.outbox), a.authority, KEY)
+    # SINGLE-DRAINER LOCK. The idempotency ledger makes replay safe SEQUENTIALLY, not
+    # concurrently: two drainers both read done_keys before either appends to it, so both
+    # dispatch the same records, and the loser's `replaying.write_text(kept)` overwrites the
+    # winner's kept set. Concurrency is now routine — the shim drains at every session start,
+    # so parallel sessions plus the watcher's go_online can easily overlap. A non-blocking
+    # flock means the second drainer exits immediately instead of queueing; whatever it would
+    # have replayed is still in the outbox for the holder's pass or the next start.
+    lock_path = Path(a.outbox).parent / "replay-ops.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, "w", encoding="utf-8")
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(json.dumps({"replayed": 0, "conflicts": 0, "kept": 0, "skipped": "another drain holds the lock"}))
+        sys.exit(0)
+    try:
+        s = replay(Path(a.outbox), a.authority, KEY)
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
     print(json.dumps(s))
     sys.exit(0)

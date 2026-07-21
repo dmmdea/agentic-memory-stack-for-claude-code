@@ -93,3 +93,56 @@ def test_offline_search_merges_pending_adds(shim, monkeypatch, tmp_path):
     monkeypatch.setattr(shim.httpx, "request", fake_request)
     data = shim.memory_search(query="reranker")
     assert any(r.get("pending_sync") for r in data["results"])
+
+
+# --- 2026-07-21: authority resolution ---------------------------------------------------------
+# The bug this covers: the shim resolved its authority from MEM0_URL, but the MCP entry launches
+# it as `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly — no login
+# shell, no WSLENV pass-through — so the env var never arrived. The replica fell back to loopback,
+# found no local server, and returned QUEUED_OFFLINE on every write.
+
+def _load_shim(tmp_path, monkeypatch, env_url, file_url):
+    """Import a fresh shim with HOME pointed at tmp_path, and MEM0_URL / the authority file set
+    (or absent) as specified. Returns the module, or skips if fastmcp is unavailable."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mem0 = tmp_path / ".mem0"
+    mem0.mkdir(exist_ok=True)
+    (mem0 / "api-key").write_text("test-key", encoding="utf-8")
+    if env_url is None:
+        monkeypatch.delenv("MEM0_URL", raising=False)
+    else:
+        monkeypatch.setenv("MEM0_URL", env_url)
+    if file_url is not None:
+        (mem0 / "authority-url").write_text(file_url, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("shim_auth_ut", SHIM_PATH)
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    except Exception as e:
+        pytest.skip(f"shim import needs fastmcp: {e}")
+    return mod
+
+
+def test_authority_file_is_used_when_env_is_absent(tmp_path, monkeypatch):
+    """The core fix: with no MEM0_URL in the environment — exactly how the shim is launched —
+    the authority still resolves to the brain instead of loopback."""
+    mod = _load_shim(tmp_path, monkeypatch, env_url=None, file_url="http://brain-host:18791\n")
+    assert mod.AUTHORITY_URL == "http://brain-host:18791"
+
+
+def test_env_overrides_the_authority_file(tmp_path, monkeypatch):
+    """MEM0_URL stays an ad-hoc override for one-off runs."""
+    mod = _load_shim(tmp_path, monkeypatch, env_url="http://override:18791",
+                     file_url="http://brain-host:18791\n")
+    assert mod.AUTHORITY_URL == "http://override:18791"
+
+
+def test_falls_back_to_loopback_with_neither(tmp_path, monkeypatch):
+    """A single-machine install has no authority file and needs no configuration."""
+    mod = _load_shim(tmp_path, monkeypatch, env_url=None, file_url=None)
+    assert mod.AUTHORITY_URL == "http://127.0.0.1:18791"
+
+
+def test_authority_file_ignores_comments_blanks_and_trailing_slash(tmp_path, monkeypatch):
+    mod = _load_shim(tmp_path, monkeypatch, env_url=None,
+                     file_url="# written by the installer\n\nhttp://brain-host:18791/\n")
+    assert mod.AUTHORITY_URL == "http://brain-host:18791"

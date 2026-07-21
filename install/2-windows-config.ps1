@@ -23,7 +23,26 @@ param(
     # maintainer moat repo). The dream's retrieval-drift canary reads it from the
     # receipt; empty -> falls back to RepoRootWsl (a missing eval/ degrades to the
     # graceful skip, never a false alarm).
-    [string]$EvalRootWsl = ''
+    [string]$EvalRootWsl = '',
+    # 2026-07-20: the memory AUTHORITY address this box talks to. Written to the per-host file
+    # ~/.mem0/authority-url (inside WSL), which the MCP shim and replay-ops read.
+    #
+    # WHY A FILE AND NOT AN ENV VAR: the mem0 MCP entry launches the shim as
+    # `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly — no login shell
+    # (profile never sourced) and no WSLENV pass-through. A MEM0_URL set on the Windows side is
+    # therefore invisible to the shim, so a replica silently fell back to loopback, found no local
+    # server, and returned OfflineError/QUEUED_OFFLINE on every operation while writes piled up in
+    # the outbox unnoticed. Reading the authority from disk removes that whole class of failure.
+    #
+    # A -Role replica MUST have its brain's address: -AuthorityUrl http://<brain-host>:18791
+    # (installing a replica against a loopback authority is refused — it would lose queued writes).
+    # Prefer a stable hostname over a DHCP LAN IP, which churns.
+    #
+    # Empty is the default ON PURPOSE, and is NOT the same as loopback: omitting the flag INHERITS
+    # the authority already on the box (~/.mem0/authority-url, else the previous receipt) so a
+    # plain re-run cannot silently revert a replica to loopback. Only a first install with no
+    # prior state falls back to loopback. Passing a value explicitly always wins.
+    [string]$AuthorityUrl = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -116,6 +135,40 @@ $eRole    = $Role.Replace("'", "''")
 $eRepoWin = $RepoRootWin.Replace("'", "''")
 $eRepoWsl = $RepoRootWsl.Replace("'", "''")
 $eEvalWsl = $EvalRootWsl.Replace("'", "''")
+# --- authority resolution: INHERIT, never silently revert -----------------------------------
+# A plain re-run (`2-windows-config.ps1 -WslUser x -Role replica`, no -AuthorityUrl) must not
+# clobber a replica's authority back to loopback — that silently re-introduces the exact bug this
+# whole mechanism exists to fix, and the operator gets no error, just writes queueing forever.
+# Precedence: explicit -AuthorityUrl > the live ~/.mem0/authority-url > the previous receipt >
+# loopback. Only a NEW install with no prior state lands on the loopback default.
+$AuthorityUrl = $AuthorityUrl.Trim().TrimEnd('/')
+if (-not $AuthorityUrl) {
+    $prior = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null |
+              Where-Object { "$_".Trim() -and -not "$_".Trim().StartsWith('#') } | Select-Object -First 1)
+    if ("$prior".Trim()) {
+        $AuthorityUrl = "$prior".Trim().TrimEnd('/')
+        Write-Host "    memory authority inherited from ~/.mem0/authority-url: $AuthorityUrl"
+    } elseif ((Test-Path $receiptPath) -and ($p = (Import-PowerShellDataFile $receiptPath).AuthorityUrl)) {
+        $AuthorityUrl = "$p".Trim().TrimEnd('/')
+        Write-Host "    memory authority inherited from the previous receipt: $AuthorityUrl"
+    } else {
+        $AuthorityUrl = 'http://127.0.0.1:18791'
+    }
+}
+# Strict whitelist. This value is interpolated into a bash command below, so anything outside
+# scheme://host[:port][/path] — quotes, semicolons, backticks, $ — is rejected outright rather
+# than escaped-and-hoped. Reject BEFORE use, not after.
+if ($AuthorityUrl -notmatch '^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/-]*)?$') {
+    throw "-AuthorityUrl '$AuthorityUrl' is not a plain http(s) URL (scheme://host[:port][/path]). Refusing: this value is passed to a shell."
+}
+# One-Brain guard. A replica pointed at its own loopback would, on the next outbox drain, replay
+# queued writes INTO its disposable local store and ledger them as done — they are then lost on
+# teardown. offline-watcher.ps1 guards its own authority choice for exactly this reason; this is
+# the install-time half of the same rule. Fail loudly instead of installing a data-losing box.
+if ($Role -eq 'replica' -and $AuthorityUrl -match '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)') {
+    throw "-Role replica with a loopback authority ('$AuthorityUrl') violates the One-Brain Rule: queued writes would replay into this box's disposable store and be lost. Pass -AuthorityUrl http://<brain-host>:18791"
+}
+$eAuthorityUrl = $AuthorityUrl.Replace("'", "''")
 $receipt = @"
 @{
     WslUser     = '$eWslUser'
@@ -129,6 +182,10 @@ $receipt = @"
     # Optional: checkout carrying eval/ (drift canaries). Empty -> RepoRootWsl fallback.
     EvalRootWsl = '$eEvalWsl'
     ApiKeyUnc   = '\\wsl.localhost\$eDistro\home\$eWslUser\.mem0\api-key'
+    # 2026-07-20: memory authority this box talks to (mirrored into ~/.mem0/authority-url,
+    # which is what the shim actually reads). Loopback on the brain; the brain's address
+    # on a replica. Recorded here so verify/diagnostics can report it without guessing.
+    AuthorityUrl = '$eAuthorityUrl'
     # 4C autonomous-canonical-promotion gate (E/T4): off | shadow | enforce.
     # Ships 'shadow' (compute + log, never blocks). Flip to 'enforce' only after the
     # contradiction judge is calibrated (eval/promotion-gate/CALIBRATION.md). Reversible.
@@ -137,6 +194,33 @@ $receipt = @"
 "@
 Write-StackFile $receiptPath $receipt
 Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser Distro=$Distro Role=$Role)"
+
+# --- per-host memory authority (2026-07-20) ------------------------------------------------
+# The shim + replay-ops read ~/.mem0/authority-url INSIDE WSL (env MEM0_URL still wins if set).
+# Written unconditionally so every box states its authority explicitly instead of relying on a
+# default — on the brain that is loopback, on a replica it is the brain's address. Idempotent.
+# Fail-soft: a bad write must not abort an otherwise-good install (verify reports it instead).
+try {
+    # $AuthorityUrl passed the strict scheme://host[:port][/path] whitelist at resolution time
+    # (quotes/semicolons/backticks/$ are rejected there, not escaped here), so single-quoting
+    # it for bash cannot be broken out of. Belt-and-braces: escape any quote anyway.
+    $bAuthorityUrl = $AuthorityUrl.Replace("'", "'\''")
+    $authCmd = "mkdir -p ~/.mem0 && printf '%s\n' '$bAuthorityUrl' > ~/.mem0/authority-url && chmod 600 ~/.mem0/authority-url"
+    wsl.exe -d $Distro -e bash -lc $authCmd 2>&1 | Out-Null
+    # The role is written beside it so WSL-side code can enforce the One-Brain Rule without
+    # reaching back into the Windows receipt (replay-ops.py refuses to drain a replica's
+    # outbox into a loopback authority — see its _refuse_local_authority guard).
+    $bRole = $Role.Replace("'", "'\''")
+    wsl.exe -d $Distro -e bash -lc "printf '%s\n' '$bRole' > ~/.mem0/role && chmod 600 ~/.mem0/role" 2>&1 | Out-Null
+    $authBack = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1)
+    if ("$authBack".Trim() -eq $AuthorityUrl) {
+        Write-Host "    memory authority: $AuthorityUrl (~/.mem0/authority-url)"
+    } else {
+        Write-Host "    WARN: authority-url readback mismatch (wrote '$AuthorityUrl', read '$authBack')" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "    WARN: could not write ~/.mem0/authority-url: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 
 # H12: added user-prompt-extract.ps1 and pre-tool-check.ps1 for v0.17 Phase 0 hooks
 # v0.19 M13: added user-prompt-lib.ps1 — user-prompt-extract.ps1 dot-sources it;
@@ -179,7 +263,9 @@ foreach ($s in $winScripts) {
 # not found) yet still registered a SessionStart hook pointing at the missing
 # deployed file. It is now deployed from claude-config\ in the dedicated block
 # below so the SessionStart cap-check stays wired (matching the live box).
-$wslScripts = @('mem0-mcp-shim.py', 'l10-audit.py')
+# replay-ops.py rides along (2026-07-20): the shim drains the outbox at startup by spawning its
+# SIBLING replay-ops.py, so the drainer must live in the same deployed directory as the shim.
+$wslScripts = @('mem0-mcp-shim.py', 'l10-audit.py', 'replay-ops.py')
 foreach ($s in $wslScripts) {
     $src = Join-Path $RepoRoot "scripts\wsl\$s"
     $dst = Join-Path $ScriptsDir $s
@@ -474,7 +560,14 @@ Backup-File $mcpConfigPath
 # those. On PS7 parse with -AsHashtable (case-sensitive, preserves all keys); on
 # 5.1 (no -AsHashtable) use the object path. Either way, never abort the whole
 # install on an MCP-registration hiccup — warn and continue.
-$mem0Args = @('-d', $Distro, '-e', "/home/$WslUser/apps/mem0-server/.venv/bin/python", '/mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/mem0-mcp-shim.py')
+# 2026-07-20 ROOT CAUSE of the "shattered mem0 args" bug (repaired by hand twice before, and
+# silently re-broken by every install run): PowerShell's `,` binds TIGHTER than `+`, so an
+# unparenthesized concat inside an array literal is parsed as array concatenation, not string
+# concatenation — @('-e', $py, '/mnt/c/Users/' + $env:USERNAME + '/...shim.py') yielded FIVE
+# elements with the shim path split across three of them. wsl.exe then ran python against
+# '/mnt/c/Users/' and the MCP server never started. Use one interpolated string (same idiom as
+# the python path beside it) so there is no `+` to mis-bind.
+$mem0Args = @('-d', $Distro, '-e', "/home/$WslUser/apps/mem0-server/.venv/bin/python", "/mnt/c/Users/$env:USERNAME/.claude/scripts/mem0-mcp-shim.py")
 $useHashtable = $PSVersionTable.PSVersion.Major -ge 6
 try {
     if ($useHashtable) {

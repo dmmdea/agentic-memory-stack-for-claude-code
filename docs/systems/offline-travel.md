@@ -35,7 +35,7 @@ The older `travel-mode.ps1 on`/`off` switch that an operator flipped by hand is 
 ## Key concepts
 
 - **Brain** / **Replica** — the brain box holds sole write authority over the store; a replica box serves it read-only. Defined in [`../glossary.md`](../glossary.md).
-- **Authority** — the brain's mem0 URL as seen by this box: loopback on the brain box itself, or the brain's remote URL on a replica box. It is whatever `MEM0_URL` resolves to; the shim reads it as `AUTHORITY_URL`.
+- **Authority** — the brain's mem0 URL as seen by this box: loopback on the brain box itself, or the brain's remote URL on a replica box. Resolved as `MEM0_URL` env → `~/.mem0/authority-url` (the durable per-host file the installer writes) → loopback; the shim reads the result as `AUTHORITY_URL`.
 - **Local replica** — a dormant local mem0 + Qdrant on loopback (`127.0.0.1:18791`), started only during an outage, restored read-only from the newest snapshot set.
 - **Outbox** — the operation queue (`~/.mem0/outbox.jsonl`); each line is an op-typed, `uuid4`-keyed record of a mutation made while offline. Defined in [`../glossary.md`](../glossary.md).
 - **Replayed-key ledger** — `~/.mem0/outbox.replayed.jsonl`; the record of which Outbox keys already applied to the authority, which is what makes replay idempotent.
@@ -48,7 +48,7 @@ Offline resilience is delivered by two independent layers. Neither requires an o
 
 ### Layer 1 — the shim's per-call failover (no flag)
 
-The mem0 MCP shim is the client every `memory_*` tool call flows through. It holds two URLs: `AUTHORITY_URL` (from `MEM0_URL`, default loopback `http://127.0.0.1:18791`) and a fixed `LOCAL_URL` (`http://127.0.0.1:18791`, the dormant local replica). Its behavior splits by operation kind:
+The mem0 MCP shim is the client every `memory_*` tool call flows through. It holds two URLs: `AUTHORITY_URL` (resolved `MEM0_URL` env → `~/.mem0/authority-url` file → loopback `http://127.0.0.1:18791`) and a fixed `LOCAL_URL` (`http://127.0.0.1:18791`, the dormant local replica). The authority comes from a **file** rather than the environment because the shim is launched via `wsl.exe … -e <python> <shim>`, which execs directly with no login shell and no `WSLENV` pass-through — an environment variable set on the Windows side never reaches it. At startup the shim also fires a fire-and-forget Outbox drain (see [`../flows/offline-outbox-replay.md`](../flows/offline-outbox-replay.md)). Its behavior splits by operation kind:
 
 - **Reads** (`_request`) try the authority first with a short **1.5s connect timeout**; on a connect-level failure they fall over to the local replica and tag the result `source: "local-replica"` with a `stale_note`. If *both* are connect-unreachable the call raises `OfflineError`; `memory_recall` and the context bundle catch it and return an empty-but-valid result marked `offline`, while `memory_search` and the raw record reads let it propagate. Crucially, a **read timeout or an HTTP error status is not a failover trigger** — the authority accepted the connection and is merely slow or erroring, and masking a real answer with a stale replica read would be wrong. That answer propagates instead.
 - **Writes and mutations** (`_authority_only`) go to the authority *only*. On a connect-level failure they do **not** touch the replica — they call `_queue_op`, which appends the operation to the Outbox and returns `{event: "QUEUED_OFFLINE", op, key}`. This covers every mutating tool: `add`, `update`, `delete`, `promote`/`demote`, and the goal / open-question mutations.

@@ -4,12 +4,36 @@ Stdio transport (what Claude Code expects for stdio-type MCP entries).
 """
 from __future__ import annotations
 import os
+import subprocess
+import sys
 from pathlib import Path
 import httpx
 from fastmcp import FastMCP
 
-MEM0_URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY_FILE = Path.home() / ".mem0" / "api-key"
+# Per-host authority address, same machine-local file pattern as the API key above.
+# WHY A FILE: this shim is launched as `wsl.exe -d <distro> -e <python> <shim>`, which execs the
+# binary directly — no login shell (no profile sourced) and no WSLENV pass-through. Any MEM0_URL
+# set on the Windows side is therefore NOT visible here, so a replica box silently fell back to
+# loopback, found no local server, and every op returned OfflineError/QUEUED_OFFLINE. Reading the
+# authority from disk decouples it from the launch command and from env pass-through entirely.
+AUTHORITY_FILE = Path.home() / ".mem0" / "authority-url"
+
+def _resolve_authority() -> str:
+    """MEM0_URL env (ad-hoc override) > ~/.mem0/authority-url (durable, per-host) > loopback."""
+    env = (os.environ.get("MEM0_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        for line in AUTHORITY_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:18791"
+
+MEM0_URL = _resolve_authority()
 if not KEY_FILE.exists():
     raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE}")
 MEM0_KEY = KEY_FILE.read_text(encoding="utf-8").strip()
@@ -18,7 +42,7 @@ import json as _json
 import uuid as _uuid
 import datetime as _dt
 
-AUTHORITY_URL = MEM0_URL                       # existing env (the brain's URL on a replica box)
+AUTHORITY_URL = MEM0_URL                       # resolved above: env > authority-url file > loopback
 LOCAL_URL = "http://127.0.0.1:18791"           # dormant local replica, up only when offline
 OUTBOX = Path.home() / ".mem0" / "outbox.jsonl"
 _CONNECT_TIMEOUT = 1.5
@@ -699,7 +723,37 @@ def open_question_details(open_question_id: int) -> dict:
     return data
 
 
+def _drain_outbox_async() -> None:
+    """Fire-and-forget outbox drain at startup. Fail-open and stdio-safe.
+
+    WHY: a QUEUED_OFFLINE write used to sit in the outbox indefinitely — the only drain trigger
+    was the offline-watcher's offline->online transition, which never fires when the authority was
+    reachable the whole time and only this shim was pointed at the wrong address. Session start is
+    the natural unconditional retry point. Delegates to replay-ops.py (adds-first, idempotent via
+    its key ledger) rather than reimplementing replay here.
+
+    STDIO SAFETY: the child's stdout/stderr go to a log file, NEVER to our stdout — that is the
+    MCP JSON-RPC channel and any stray byte on it breaks the protocol.
+    """
+    try:
+        if not OUTBOX.exists() or OUTBOX.stat().st_size == 0:
+            return
+        drainer = Path(__file__).resolve().parent / "replay-ops.py"
+        if not drainer.exists():
+            return
+        log = Path.home() / ".mem0" / "outbox-drain.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            subprocess.Popen(
+                [sys.executable, str(drainer), "--authority", AUTHORITY_URL],
+                stdin=subprocess.DEVNULL, stdout=fh, stderr=fh, start_new_session=True,
+            )
+    except Exception:
+        pass  # a drain attempt must never delay or break the MCP server
+
+
 if __name__ == "__main__":
+    _drain_outbox_async()
     # show_banner=False is CRITICAL — fastmcp 3.x prints an ANSI banner to STDOUT by default,
     # which corrupts the MCP JSON-RPC stdio protocol and causes client timeouts.
     mcp.run(show_banner=False)

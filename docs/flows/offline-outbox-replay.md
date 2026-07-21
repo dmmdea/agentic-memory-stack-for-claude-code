@@ -11,7 +11,7 @@ Two triggers bracket the flow:
 | Half | Trigger |
 |---|---|
 | **Queue** | any *mutating* `memory_*` MCP tool call while the authority is **connect-unreachable** (a TCP connect refusal/timeout — not a slow-but-answered request) |
-| **Replay** | reconnection — the `mem0-offline-watcher`'s `go_online` transition runs the replay driver; it can also be invoked by hand to drain a stranded queue |
+| **Replay** | three triggers: **shim startup** (every new session, unconditional — fire-and-forget), the `mem0-offline-watcher`'s `go_online` transition, or a manual run to drain a stranded queue |
 
 ## Participants
 
@@ -24,9 +24,19 @@ Two triggers bracket the flow:
 
 ## Step-by-step flow
 
-### `MEM0_URL`, and the authority/replica split
+### Authority resolution, and the authority/replica split
 
-Both the shim and the driver resolve the authority from `MEM0_URL`, defaulting to loopback `http://127.0.0.1:18791` — correct on the **brain box**, where the authority *is* local. A **replica box** must set `MEM0_URL` to the brain's URL, so its writes target the real authority, not itself. The shim additionally holds a fixed `LOCAL_URL` (`http://127.0.0.1:18791`) for the *dormant local replica* that read failover uses; writes never go there.
+Both the shim and the driver resolve the authority the same way, in this precedence:
+
+1. **`MEM0_URL`** environment variable — an ad-hoc override.
+2. **`~/.mem0/authority-url`** — the durable, per-host file, written by the installer's `-AuthorityUrl`. This is the normal source.
+3. **`http://127.0.0.1:18791`** — loopback fallback.
+
+The file is the source of truth because the MCP entry launches the shim as `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly: **no login shell and no `WSLENV` pass-through**, so a `MEM0_URL` set on the Windows side is invisible inside the shim. Resolving from disk — the same machine-local pattern already used for `~/.mem0/api-key` — makes the authority independent of the launch command, so regenerating the MCP entry cannot silently revert it.
+
+The default is correct on the **brain box**, where the authority *is* local. A **replica box** must carry the brain's address in that file, so its writes target the real authority rather than itself. The shim additionally holds a fixed `LOCAL_URL` (`http://127.0.0.1:18791`) for the *dormant local replica* that read failover uses; writes never go there.
+
+> Failure this prevents (observed 2026-07-20): a replica whose authority resolved to loopback found no local server, so **both** hops were dead — every operation returned `OfflineError`/`QUEUED_OFFLINE` and writes accumulated in the Outbox unnoticed.
 
 ### Queueing a write offline
 
@@ -99,8 +109,10 @@ Every mutation made offline eventually lands on the authority exactly once, in a
 The replica rules — the offline-side One-Brain Rule:
 
 1. **The replica never absorbs a write.** Writes go to the authority or to the Outbox — never to `LOCAL_URL`. The local replica is restored read-only and torn down on reconnect, so divergence is impossible *by construction*, not by policy. This is the same invariant [`../systems/installer-and-deploy.md`](../systems/installer-and-deploy.md) enforces at install through the `brain`/`replica` role gate.
-2. **A replica box must point `MEM0_URL` at the brain.** The default loopback is only correct on the brain box; a replica that kept the default would queue and replay into its own disposable store — a One-Brain violation the watcher's authority guard also exists to prevent.
-3. **Replay is idempotent and adds-first.** Re-running a partial replay double-applies nothing (the key ledger), and dependent mutations never precede the add they reference.
+2. **A replica box must carry the brain's address in `~/.mem0/authority-url`.** The loopback default is only correct on the brain box. A replica that kept the default has no local server to reach at all, so every write queues instead of landing — and if a local replica *were* running, it would queue and replay into its own disposable store, a One-Brain violation the watcher's authority guard also exists to prevent.
+3. **Replay is idempotent and adds-first.** Re-running a partial replay double-applies nothing (the key ledger), and dependent mutations never precede the add they reference. The key ledger makes replay idempotent **sequentially**; concurrency is excluded separately, by a non-blocking `flock` on `~/.mem0/replay-ops.lock` — two drainers would otherwise both read the ledger before either appended to it, dispatch the same records, and have the loser's rewrite clobber the winner's kept set. A second drainer exits immediately; whatever it would have replayed stays in the Outbox for the holder's pass or the next start.
+
+4. **A replica never replays into itself.** If this box's role is `replica` and the resolved authority is loopback, `replay-ops.py` refuses the drain and leaves the Outbox intact. Otherwise the queued mutations would land in the disposable local store, be ledgered as delivered, and vanish on teardown — a silent One-Brain violation with no error anywhere. A malformed authority URL counts as local, so the guard fails closed.
 4. **Replay only runs against a reachable, healthy authority**, so the Outbox is never half-drained or stranded.
 5. **A conflicted or unparseable record is preserved, never dropped** — it goes to the conflict log.
 6. **The Outbox writer and the replay `dispatch` map are one contract** — change `_queue_op`'s entry shape or add a mutating tool without adding its op to `dispatch`, and offline mutations land in the conflict log.
