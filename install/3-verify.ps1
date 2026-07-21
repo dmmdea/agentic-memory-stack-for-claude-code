@@ -48,7 +48,18 @@ function Check {
 
 Write-Host ""
 Write-Host "WSL services reachable from Windows (mirrored networking):"
-Check "Qdrant :6333" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false } } "wsl: systemctl --user status qdrant.service"
+# Role-aware for the same reason as the mem0 check below: on a REPLICA the local Qdrant is the
+# DISPOSABLE travel store, and both of its states are correct — up while offline
+# (offline-watcher.ps1 starts it on go_offline), down while online (go_online stops it, and
+# `travel-mode.ps1 off` stops AND disables it). Demanding it on a replica fails verify for doing
+# exactly what the design says. On a brain it is the live store and must be up.
+if ($stackRole -eq 'brain') {
+    Check "Qdrant :6333 (brain, live store)" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false } } "wsl: systemctl --user status qdrant.service"
+} else {
+    $qdrantUp = try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false }
+    $state = if ($qdrantUp) { 'up (travel/offline store active)' } else { 'down (online - torn down by design)' }
+    Write-Host "  Qdrant :6333 (replica, disposable travel store) ... $state" -ForegroundColor DarkGray
+}
 # Role-aware (2026-07-20): on a REPLICA the local mem0 is deliberately dormant — it is the
 # offline read-replica, started only when the authority is unreachable — so demanding loopback
 # health there is wrong by design and made verify unpassable on a replica box. The check that
