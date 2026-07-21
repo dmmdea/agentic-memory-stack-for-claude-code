@@ -121,3 +121,64 @@ def test_conflict_is_logged_not_dropped(ro, tmp_path, monkeypatch):
     stats = ro.replay(ob, "http://authority.invalid", "test-key")
     assert stats["conflicts"] == 1
     assert (tmp_path / "mutation-conflicts.jsonl").exists()
+
+
+# --- 2026-07-21: authority resolution + the One-Brain refusal guard --------------------------
+# These cover the paths added when the replica was found to be silently losing every write.
+
+@pytest.mark.parametrize("url,expected_local", [
+    ("http://127.0.0.1:18791", True),
+    ("http://localhost:18791", True),
+    ("http://0.0.0.0:18791", True),
+    ("http://[::1]:18791", True),
+    ("", True),                      # empty
+    ("not a url", True),             # malformed -> fails CLOSED (treated as local, refuse)
+    ("http://brain-host:18791", False),
+    ("https://brain.example.net", False),
+])
+def test_is_local_url_fails_closed(ro, url, expected_local):
+    assert ro._is_local_url(url) is expected_local
+
+
+def test_replica_refuses_to_replay_into_its_own_loopback(ro, tmp_path, monkeypatch):
+    """One-Brain Rule: replaying a replica's outbox into loopback would write the queued
+    mutations to its DISPOSABLE local store and ledger them as delivered — they then vanish on
+    teardown with nothing reporting a loss. The outbox must survive untouched."""
+    ob = tmp_path / "outbox.jsonl"
+    rec = {"op": "add", "args": {"text": "x", "user_id": "u"}, "key": "k-1"}
+    ob.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    monkeypatch.setattr(ro, "_role", lambda: "replica")
+    called = []
+    monkeypatch.setattr(ro, "dispatch", lambda op, args: called.append(op))
+    monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
+
+    stats = ro.replay(ob, "http://127.0.0.1:18791", "test-key")
+
+    assert "refused" in stats and stats["replayed"] == 0
+    assert called == []                                   # nothing was dispatched
+    assert json.loads(ob.read_text().strip()) == rec      # outbox preserved byte-identical
+
+
+def test_brain_may_replay_into_loopback(ro, tmp_path, monkeypatch):
+    """The guard is role-scoped: on the brain, loopback IS the authority, so refusing there
+    would break the single-machine install."""
+    ob = tmp_path / "outbox.jsonl"
+    ob.write_text(json.dumps({"op": "add", "args": {"text": "x"}, "key": "k-2"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(ro, "_role", lambda: "brain")
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {}
+    monkeypatch.setattr(ro, "dispatch", lambda op, args: R())
+    monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
+
+    stats = ro.replay(ob, "http://127.0.0.1:18791", "test-key")
+
+    assert "refused" not in stats and stats["replayed"] == 1
+
+
+def test_unmarked_box_defaults_to_brain(ro, tmp_path, monkeypatch):
+    """A box with no ~/.mem0/role is a single-machine install, where loopback is correct."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".mem0").mkdir()
+    assert ro._role() == "brain"
