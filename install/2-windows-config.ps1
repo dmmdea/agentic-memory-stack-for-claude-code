@@ -519,7 +519,14 @@ Backup-File $mcpConfigPath
 # those. On PS7 parse with -AsHashtable (case-sensitive, preserves all keys); on
 # 5.1 (no -AsHashtable) use the object path. Either way, never abort the whole
 # install on an MCP-registration hiccup — warn and continue.
-$mem0Args = @('-d', $Distro, '-e', "/home/$WslUser/apps/mem0-server/.venv/bin/python", '/mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/mem0-mcp-shim.py')
+# 2026-07-20 ROOT CAUSE of the "shattered mem0 args" bug (repaired by hand twice before, and
+# silently re-broken by every install run): PowerShell's `,` binds TIGHTER than `+`, so an
+# unparenthesized concat inside an array literal is parsed as array concatenation, not string
+# concatenation — @('-e', $py, '/mnt/c/Users/' + $env:USERNAME + '/...shim.py') yielded FIVE
+# elements with the shim path split across three of them. wsl.exe then ran python against
+# '/mnt/c/Users/' and the MCP server never started. Use one interpolated string (same idiom as
+# the python path beside it) so there is no `+` to mis-bind.
+$mem0Args = @('-d', $Distro, '-e', "/home/$WslUser/apps/mem0-server/.venv/bin/python", "/mnt/c/Users/$env:USERNAME/.claude/scripts/mem0-mcp-shim.py")
 $useHashtable = $PSVersionTable.PSVersion.Major -ge 6
 try {
     if ($useHashtable) {
