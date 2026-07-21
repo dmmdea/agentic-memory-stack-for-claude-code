@@ -23,7 +23,21 @@ param(
     # maintainer moat repo). The dream's retrieval-drift canary reads it from the
     # receipt; empty -> falls back to RepoRootWsl (a missing eval/ degrades to the
     # graceful skip, never a false alarm).
-    [string]$EvalRootWsl = ''
+    [string]$EvalRootWsl = '',
+    # 2026-07-20: the memory AUTHORITY address this box talks to. Written to the per-host file
+    # ~/.mem0/authority-url (inside WSL), which the MCP shim and replay-ops read.
+    #
+    # WHY A FILE AND NOT AN ENV VAR: the mem0 MCP entry launches the shim as
+    # `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly — no login shell
+    # (profile never sourced) and no WSLENV pass-through. A MEM0_URL set on the Windows side is
+    # therefore invisible to the shim, so a replica silently fell back to loopback, found no local
+    # server, and returned OfflineError/QUEUED_OFFLINE on every operation while writes piled up in
+    # the outbox unnoticed. Reading the authority from disk removes that whole class of failure.
+    #
+    # Default is loopback, correct for -Role brain (the authority talks to itself). A
+    # -Role replica MUST pass its brain's address: -AuthorityUrl http://<brain-host>:18791
+    # Prefer a stable hostname over a DHCP LAN IP, which churns.
+    [string]$AuthorityUrl = 'http://127.0.0.1:18791'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -116,6 +130,8 @@ $eRole    = $Role.Replace("'", "''")
 $eRepoWin = $RepoRootWin.Replace("'", "''")
 $eRepoWsl = $RepoRootWsl.Replace("'", "''")
 $eEvalWsl = $EvalRootWsl.Replace("'", "''")
+$AuthorityUrl = $AuthorityUrl.Trim().TrimEnd('/')
+$eAuthorityUrl = $AuthorityUrl.Replace("'", "''")
 $receipt = @"
 @{
     WslUser     = '$eWslUser'
@@ -129,6 +145,10 @@ $receipt = @"
     # Optional: checkout carrying eval/ (drift canaries). Empty -> RepoRootWsl fallback.
     EvalRootWsl = '$eEvalWsl'
     ApiKeyUnc   = '\\wsl.localhost\$eDistro\home\$eWslUser\.mem0\api-key'
+    # 2026-07-20: memory authority this box talks to (mirrored into ~/.mem0/authority-url,
+    # which is what the shim actually reads). Loopback on the brain; the brain's address
+    # on a replica. Recorded here so verify/diagnostics can report it without guessing.
+    AuthorityUrl = '$eAuthorityUrl'
     # 4C autonomous-canonical-promotion gate (E/T4): off | shadow | enforce.
     # Ships 'shadow' (compute + log, never blocks). Flip to 'enforce' only after the
     # contradiction judge is calibrated (eval/promotion-gate/CALIBRATION.md). Reversible.
@@ -137,6 +157,29 @@ $receipt = @"
 "@
 Write-StackFile $receiptPath $receipt
 Write-Host "    receipt written: $receiptPath (WslUser=$WslUser WinUser=$WinUser Distro=$Distro Role=$Role)"
+
+# --- per-host memory authority (2026-07-20) ------------------------------------------------
+# The shim + replay-ops read ~/.mem0/authority-url INSIDE WSL (env MEM0_URL still wins if set).
+# Written unconditionally so every box states its authority explicitly instead of relying on a
+# default — on the brain that is loopback, on a replica it is the brain's address. Idempotent.
+# Fail-soft: a bad write must not abort an otherwise-good install (verify reports it instead).
+if ($AuthorityUrl -notmatch '^https?://') {
+    Write-Host "    WARN: -AuthorityUrl '$AuthorityUrl' is not an http(s) URL; skipping authority-url write" -ForegroundColor Yellow
+} else {
+    try {
+        # Single-quoted inside bash so nothing in the URL is expanded; the value is validated above.
+        $authCmd = "mkdir -p ~/.mem0 && printf '%s\n' '$AuthorityUrl' > ~/.mem0/authority-url && chmod 600 ~/.mem0/authority-url"
+        wsl.exe -d $Distro -e bash -lc $authCmd 2>&1 | Out-Null
+        $authBack = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1)
+        if ("$authBack".Trim() -eq $AuthorityUrl) {
+            Write-Host "    memory authority: $AuthorityUrl (~/.mem0/authority-url)"
+        } else {
+            Write-Host "    WARN: authority-url readback mismatch (wrote '$AuthorityUrl', read '$authBack')" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "    WARN: could not write ~/.mem0/authority-url: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 # H12: added user-prompt-extract.ps1 and pre-tool-check.ps1 for v0.17 Phase 0 hooks
 # v0.19 M13: added user-prompt-lib.ps1 — user-prompt-extract.ps1 dot-sources it;
@@ -179,7 +222,9 @@ foreach ($s in $winScripts) {
 # not found) yet still registered a SessionStart hook pointing at the missing
 # deployed file. It is now deployed from claude-config\ in the dedicated block
 # below so the SessionStart cap-check stays wired (matching the live box).
-$wslScripts = @('mem0-mcp-shim.py', 'l10-audit.py')
+# replay-ops.py rides along (2026-07-20): the shim drains the outbox at startup by spawning its
+# SIBLING replay-ops.py, so the drainer must live in the same deployed directory as the shim.
+$wslScripts = @('mem0-mcp-shim.py', 'l10-audit.py', 'replay-ops.py')
 foreach ($s in $wslScripts) {
     $src = Join-Path $RepoRoot "scripts\wsl\$s"
     $dst = Join-Path $ScriptsDir $s

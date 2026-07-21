@@ -14,7 +14,22 @@ import httpx
 # Default = loopback (correct on the brain box). A replica MUST set MEM0_URL to the
 # brain's URL — travel-mode manages this; the old machine-name default resolved only
 # on the developer's tailnet.
-AUTHORITY = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
+def _default_authority() -> str:
+    """MEM0_URL env > ~/.mem0/authority-url (per-host file) > loopback — same precedence the shim
+    uses, so a standalone run on a replica targets the brain instead of silently probing loopback."""
+    env = (os.environ.get("MEM0_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        for line in (Path.home() / ".mem0" / "authority-url").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:18791"
+
+AUTHORITY = _default_authority()
 KEY = (Path.home() / ".mem0" / "api-key").read_text(encoding="utf-8").strip()
 _MUTATION_ORDER = 1  # adds sort before everything else
 _ADD_ORDER = 0

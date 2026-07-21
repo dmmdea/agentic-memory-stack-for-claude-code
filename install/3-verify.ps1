@@ -18,6 +18,21 @@ if (-not $Distro) {
 $fails = @()
 $warns = @()
 
+# Role + memory authority, resolved BEFORE the liveness checks because both are role-dependent
+# (2026-07-20). The receipt records the role; the authority this box actually talks to lives in
+# ~/.mem0/authority-url inside WSL — the same file the MCP shim and replay-ops read.
+$stackRole = 'brain'
+$receiptFile = "$env:USERPROFILE\.claude\scripts\mem0-stack.config.psd1"
+if (Test-Path $receiptFile) {
+    try { $r = Import-PowerShellDataFile $receiptFile; if ($r.Role) { $stackRole = $r.Role } } catch {}
+}
+$authorityUrl = 'http://127.0.0.1:18791'
+try {
+    $af = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null |
+           Where-Object { "$_".Trim() -and -not "$_".Trim().StartsWith('#') } | Select-Object -First 1)
+    if ("$af".Trim()) { $authorityUrl = "$af".Trim().TrimEnd('/') }
+} catch {}
+
 function Check {
     param([string]$Name, [scriptblock]$Test, [string]$FixHint)
     Write-Host -NoNewline "  $Name ... "
@@ -34,7 +49,23 @@ function Check {
 Write-Host ""
 Write-Host "WSL services reachable from Windows (mirrored networking):"
 Check "Qdrant :6333" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false } } "wsl: systemctl --user status qdrant.service"
-Check "mem0 :18791" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health' -TimeoutSec 3).ok } catch { $false } } "wsl: systemctl --user status mem0.service"
+# Role-aware (2026-07-20): on a REPLICA the local mem0 is deliberately dormant — it is the
+# offline read-replica, started only when the authority is unreachable — so demanding loopback
+# health there is wrong by design and made verify unpassable on a replica box. The check that
+# matters on every box is the authority reachability one below.
+if ($stackRole -eq 'brain') {
+    Check "mem0 :18791 (brain, local authority)" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health' -TimeoutSec 3).ok } catch { $false } } "wsl: systemctl --user status mem0.service"
+}
+# The address the MCP shim will actually use. A replica pointed at loopback (the pre-2026-07-20
+# failure) silently queued every write to the outbox instead of reaching the brain.
+Check "memory authority reachable ($stackRole -> $authorityUrl)" {
+    try { (Invoke-RestMethod -Uri "$authorityUrl/health" -TimeoutSec 5).ok } catch { $false }
+} "Set this box's authority: re-run 2-windows-config.ps1 -AuthorityUrl http://<brain-host>:18791 (writes ~/.mem0/authority-url). On the brain, loopback is correct - check: systemctl --user status mem0.service"
+Check "authority-url file present (per-host, survives reinstall)" {
+    $v = $null
+    try { $v = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1) } catch {}
+    [bool]("$v".Trim() -match '^https?://')
+} "Re-run 2-windows-config.ps1 (it writes ~/.mem0/authority-url) - without it the shim falls back to loopback, which on a replica means every write queues to the outbox"
 # v0.22 EmbeddingGemma migration: mem0's embedder is EmbeddingGemma-300m on llama-swap
 # :11436 (single-stack llama.cpp). Ollama fully decommissioned 2026-06-13 — no longer
 # a stack dependency. This verifies the embedder returns a 768-dim vector.
@@ -91,14 +122,9 @@ Check "No hook references a missing deployed script (skew guard)" {
     if ($missing.Count -gt 0) { Write-Host "(missing: $($missing -join ', ')) " -NoNewline -ForegroundColor Yellow }
     $missing.Count -eq 0
 } "Deploy layer is skewed vs settings.json - re-run 2-windows-config.ps1 (and check ~/.claude git history for an untrack/clean that removed deployed scripts)"
-# v1.16 one-brain role gate (§6.3): the receipt records this box's role. brain -> both
-# nightly tasks must be registered; replica -> both must be ABSENT (a replica running
-# consolidation/dedup mutates the one shared brain destructively).
-$stackRole = 'brain'
-$receiptFile = "$env:USERPROFILE\.claude\scripts\mem0-stack.config.psd1"
-if (Test-Path $receiptFile) {
-    try { $r = Import-PowerShellDataFile $receiptFile; if ($r.Role) { $stackRole = $r.Role } } catch {}
-}
+# v1.16 one-brain role gate (§6.3): brain -> both nightly tasks must be registered;
+# replica -> both must be ABSENT (a replica running consolidation/dedup mutates the one
+# shared brain destructively). $stackRole was resolved from the receipt at the top of this file.
 if ($stackRole -eq 'brain') {
 Check "Task Scheduler 3am dream-consolidate" {
     $t = Get-ScheduledTask -TaskName 'ClaudeCode-DreamConsolidator-3am' -ErrorAction SilentlyContinue
