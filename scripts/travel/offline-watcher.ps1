@@ -46,15 +46,31 @@ $ErrorActionPreference = 'Continue'
 # go_online would replay the outbox INTO the disposable local store (one-brain violation).
 # The true authority is never a loopback/unspecified host on the machine this watcher runs
 # on (it is a companion to travel-mode.ps1, which refuses on/off on the authority itself).
-if (-not $Authority) {
-    if ($env:MEM0_URL -and -not (Test-IsLocalUrl $env:MEM0_URL)) { $Authority = $env:MEM0_URL }
-    else { $Authority = 'http://your-machine:18791' }
-}
 $Distro    = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     # wsl.exe emits UTF-16LE by default -> NUL-interleaved capture; WSL_UTF8=1 fixes the
     # encoding at the source, NUL-strip is belt-and-braces for older wsl.exe builds.
     $env:WSL_UTF8 = '1'
     ((wsl.exe -l -q) -replace "`0", '' | Where-Object { $_.Trim() } | Select-Object -First 1).Trim() }
+if (-not $Authority) {
+    if ($env:MEM0_URL -and -not (Test-IsLocalUrl $env:MEM0_URL)) { $Authority = $env:MEM0_URL }
+    else {
+        # 2026-07-20: fall back to the per-host authority file, NOT straight to the placeholder.
+        # This tick is a scheduled-task process, so $env:MEM0_URL is whatever the user-scope
+        # variable happened to be — and travel-mode.ps1 rewrites that variable as part of its
+        # normal operation. Without this, a cleared or clobbered variable drops the watcher onto
+        # the placeholder host below, which resolves to nothing: every probe fails, the box
+        # decides it is offline, and it wedges itself into travel mode while the brain is up.
+        # The file is the same source the shim and replay-ops read.
+        $fromFile = $null
+        try {
+            $fromFile = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null |
+                         Where-Object { "$_".Trim() -and -not "$_".Trim().StartsWith('#') } | Select-Object -First 1)
+        } catch {}
+        $fromFile = "$fromFile".Trim().TrimEnd('/')
+        if ($fromFile -and -not (Test-IsLocalUrl $fromFile)) { $Authority = $fromFile }
+        else { $Authority = 'http://your-machine:18791' }
+    }
+}
 $StateFile = Join-Path $env:USERPROFILE '.claude\state\offline-mode.json'
 function Wsl([string]$c) { wsl.exe -d $Distro -e bash -lc $c }
 

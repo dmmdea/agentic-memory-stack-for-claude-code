@@ -82,7 +82,20 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 | `RepoRootWin`, `RepoRootWsl` | the operator-chosen repository path, both views |
 | `EvalRootWsl` | optional checkout carrying the `eval/` harnesses; empty by default (the orchestrator does not pass it), and the Dream's drift canary falls back to `RepoRootWsl` when it is empty |
 | `ApiKeyUnc` | UNC path to the WSL-side API key |
+| `AuthorityUrl` | the memory authority this box talks to, mirrored into `~/.mem0/authority-url` (which is what the shim actually reads) |
 | `PromotionGateMode` | ships `shadow` |
+
+**The memory authority (`-AuthorityUrl`).** Phase 2 also writes `~/.mem0/authority-url` **inside WSL** — the per-host file the MCP shim, `replay-ops.py`, and the SessionStart bundle resolve their authority from (`MEM0_URL` env → this file → loopback) — plus `~/.mem0/role`, so WSL-side code can enforce the One-Brain Rule without reading back into the Windows receipt.
+
+It is a *file* and not an environment variable for a concrete reason: the mem0 MCP entry launches the shim as `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly — no login shell, no `WSLENV` pass-through — so a `MEM0_URL` set on the Windows side never reaches the shim process. Before this, a replica silently fell back to loopback, found no local server, and returned `QUEUED_OFFLINE` on every write while the Outbox filled up unnoticed.
+
+Three rules keep that failure from coming back by another door:
+
+| Rule | Behaviour |
+|---|---|
+| **Omitting the flag inherits** | `-AuthorityUrl` defaults to *empty*, not loopback. With no value the installer takes the address already on the box (`~/.mem0/authority-url`, else the previous receipt); only a first install with no prior state falls back to loopback. A plain re-run therefore cannot silently revert a replica — the regression this whole mechanism exists to prevent. |
+| **A replica may not point at itself** | Installing `-Role replica` against a loopback authority is **refused**. Its Outbox would replay into the box's own disposable store and be ledgered as delivered, so the writes are lost on teardown with nothing reporting it. `3-verify.ps1` asserts the same thing, because a live local mem0 answers `/health` and would otherwise pass every reachability check. |
+| **The value is whitelisted, not escaped** | It reaches a shell, so anything outside `scheme://host[:port][/path]` is rejected at resolution time rather than quoted and hoped for. |
 
 R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-consolidate.ps1`) read this at runtime instead of hardcoding any developer path or handle.
 
