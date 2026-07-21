@@ -31,7 +31,7 @@ impossible **by construction**, not by policy.
 ## Consequences
 
 - The store cannot silently fork; there is always exactly one truth to reconcile against.
-- A replica box must point `MEM0_URL` at the brain, or its writes would queue and replay into its own
+- A replica box must carry the brain's address in `~/.mem0/authority-url` (installer `-AuthorityUrl`), or its writes would queue and replay into its own
   disposable store — a One-Brain violation the offline-watcher's authority guard also prevents.
 - The offline-watcher must never run on the brain box (its reconnect transition stops the live
   services); its installer refuses registration there.

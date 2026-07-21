@@ -82,7 +82,12 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 | `RepoRootWin`, `RepoRootWsl` | the operator-chosen repository path, both views |
 | `EvalRootWsl` | optional checkout carrying the `eval/` harnesses; empty by default (the orchestrator does not pass it), and the Dream's drift canary falls back to `RepoRootWsl` when it is empty |
 | `ApiKeyUnc` | UNC path to the WSL-side API key |
+| `AuthorityUrl` | the memory authority this box talks to, mirrored into `~/.mem0/authority-url` (which is what the shim actually reads) |
 | `PromotionGateMode` | ships `shadow` |
+
+**The memory authority (`-AuthorityUrl`).** Phase 2 also writes `~/.mem0/authority-url` **inside WSL** — the per-host file the MCP shim and `replay-ops.py` resolve their authority from (`MEM0_URL` env → this file → loopback). It defaults to `http://127.0.0.1:18791`, which is correct on a `brain` box because the authority is local; a `replica` must be installed with `-AuthorityUrl http://<brain-host>:18791`.
+
+It is a *file* and not an environment variable for a concrete reason: the mem0 MCP entry launches the shim as `wsl.exe -d <distro> -e <python> <shim>`, which execs the binary directly — no login shell, no `WSLENV` pass-through — so a `MEM0_URL` set on the Windows side never reaches the shim process. Before this, a replica silently fell back to loopback, found no local server, and returned `QUEUED_OFFLINE` on every write while the Outbox filled up unnoticed. Resolving from disk also means re-running the installer *reproduces* the correct authority instead of reverting it.
 
 R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-consolidate.ps1`) read this at runtime instead of hardcoding any developer path or handle.
 
