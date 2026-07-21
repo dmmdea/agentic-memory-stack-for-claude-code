@@ -156,12 +156,19 @@ $turns
     }
 
     $facts = @($parsed.facts)
+    # 2026-07-21: a zero-fact result used to `exit 0` RIGHT HERE, before the episode POST
+    # below. That coupled the episodic record to durable fact extraction: a session that
+    # produced no evergreen facts left no episode at all, even when the extractor had
+    # returned a perfectly good episode with a goal and summary. Episodes are the record
+    # that a session HAPPENED and what it was about; facts are what was worth keeping from
+    # it. They are different questions, and the second answering "none" must not erase the
+    # first. This is also self-reinforcing: goal staleness is measured from episode_links,
+    # so missing episodes make goals look abandoned.
+    # Flow now falls through to the episode POST, which keeps its own guard
+    # (`$parsed.episode.goal`) — so this still never FORCE-creates an episode, per the
+    # Phase 3 rule below; it just stops discarding a real one.
     if ($facts.Count -eq 0) {
-        Write-MemoryLog -Component 'l1a' -Message '  no facts extracted (clean session)'
-        Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status 'empty' -FactsPosted 0
-        Mark-Throttle -Name 'l1a'  # mark even on empty - we successfully decided nothing was worth recording
-        Set-L1aCursor -TranscriptPath $TranscriptPath -Bytes $advanceTo   # this window was processed; don't re-scan it
-        exit 0
+        Write-MemoryLog -Component 'l1a' -Message '  no facts extracted (clean session) - continuing to episode POST'
     }
 
     # Phase 3: partition facts — evergreen atomic facts go to durable mem0; ship-log
@@ -191,8 +198,13 @@ $turns
             }
         }
     }
-    Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
-    Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status 'ok' -FactsPosted $posted
+    if ($facts.Count -gt 0) {
+        Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
+    }
+    # One usage record per run: 'empty' keeps the zero-fact case distinguishable in the ledger,
+    # which is what the old early-exit reported before the episode POST was reached.
+    $usageStatus = if ($facts.Count -eq 0) { 'empty' } else { 'ok' }
+    Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status $usageStatus -FactsPosted $posted
     Mark-Throttle -Name 'l1a'
     Set-L1aCursor -TranscriptPath $TranscriptPath -Bytes $advanceTo   # this window was processed; next run only scans NEW turns
 
