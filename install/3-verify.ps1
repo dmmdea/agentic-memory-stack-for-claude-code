@@ -76,7 +76,15 @@ Check "authority-url file present (per-host, survives reinstall)" {
     $v = $null
     try { $v = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1) } catch {}
     [bool]("$v".Trim() -match '^https?://')
-} "Re-run 2-windows-config.ps1 (it writes ~/.mem0/authority-url) - without it the shim falls back to loopback, which on a replica means every write queues to the outbox"
+} "Re-run 2-windows-config.ps1 (it inherits or writes ~/.mem0/authority-url) - without it the shim falls back to loopback, which on a replica means every write queues to the outbox"
+# A replica whose authority is loopback passes every check above — a live local mem0 answers
+# /health — while being in a One-Brain-violating state: its outbox would drain into the
+# disposable local store. Reachability alone cannot catch that; the address itself must be wrong.
+if ($stackRole -eq 'replica') {
+    Check "replica authority is NOT loopback (One-Brain Rule)" {
+        $authorityUrl -notmatch '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)'
+    } "This replica points at itself ($authorityUrl). Queued writes would replay into its disposable local store and be lost. Re-run 2-windows-config.ps1 -Role replica -AuthorityUrl http://<brain-host>:18791"
+}
 # v0.22 EmbeddingGemma migration: mem0's embedder is EmbeddingGemma-300m on llama-swap
 # :11436 (single-stack llama.cpp). Ollama fully decommissioned 2026-06-13 — no longer
 # a stack dependency. This verifies the embedder returns a 768-dim vector.

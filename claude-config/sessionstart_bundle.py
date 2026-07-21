@@ -190,7 +190,21 @@ def main(argv=None) -> int:
         if not query:
             return 0  # no signal -> inject nothing
 
-        url = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
+        # Same precedence as the MCP shim and replay-ops: MEM0_URL env > ~/.mem0/authority-url
+        # (per-host file) > loopback. Env-only resolution left this silently injecting NOTHING on
+        # a replica — the whole function is wrapped in `except: pass`, so a connection refusal to
+        # a dead loopback looks identical to "no memories matched".
+        url = os.environ.get("MEM0_URL", "").strip()
+        if not url:
+            try:
+                for line in open(os.path.join(home, ".mem0", "authority-url"), encoding="utf-8"):
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        url = line
+                        break
+            except OSError:
+                pass
+        url = (url or "http://127.0.0.1:18791").rstrip("/")
         memories = fetch_bundle(url, key, query, brand, initiative, tier=tier)
         block = format_block(select_facts(memories, k=k))
         if block:
