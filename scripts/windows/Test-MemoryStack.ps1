@@ -139,21 +139,52 @@ try {
 # L4: EmbeddingGemma-300m embedder on llama-swap :11436 (v0.22 migration: replaced the
 # Ollama :11435 nomic-embed-text backend; Ollama fully decommissioned 2026-06-13).
 # Must return a 768-dim vector via the OpenAI-compatible /v1/embeddings endpoint.
+# 2026-07-22: these two probes hit CPU-only llama.cpp upstreams (--n-gpu-layers 0), which are
+# slow for two legitimate reasons: a lazy first load after any llama-swap restart (measured
+# ~7.4s) and box-wide CPU contention (embeddings latency has been observed spiking from a
+# ~15-40ms baseline to 12s). The old 20s client timeout aborted such runs and reported FAIL,
+# i.e. the health check manufactured its own failure. llama-swap's own healthCheckTimeout is
+# 300s, so 20s was also stricter than the server it is checking. Raised to 90s.
+#
+# A timeout is now reported as WARN, not FAIL: "slow/cold" and "broken" are different states
+# and only the second should read as a stack fault. A real HTTP error still FAILs, and now
+# carries the RESPONSE BODY — llama-swap puts the actual cause there (e.g. an Application
+# Control policy blocking the upstream binary), which a bare status code hides.
+$probeTimeoutSec = 90
+function Get-ProbeFailure {
+    param($ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    $isTimeout = ($msg -match 'timed out|timeout|canceled|cancelled') -or
+                 ($ErrorRecord.Exception -is [System.Threading.Tasks.TaskCanceledException])
+    $detail = $null
+    try { $detail = $ErrorRecord.ErrorDetails.Message } catch {}
+    if ($detail) { $msg = "$msg | response: $detail" }
+    return [pscustomobject]@{ IsTimeout = $isTimeout; Message = $msg }
+}
+
 try {
     $embBody = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json
-    $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($embBody)) -ContentType 'application/json' -TimeoutSec 20
+    $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($embBody)) -ContentType 'application/json' -TimeoutSec $probeTimeoutSec
     $dim = @($e.data[0].embedding).Count
     if ($dim -eq 768) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "embeddinggemma live, dim=$dim (CPU)" }
     else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "responded but dim=$dim (expected 768)" }
-} catch { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $_.Exception.Message }
+} catch {
+    $f = Get-ProbeFailure $_
+    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "no response in ${probeTimeoutSec}s (CPU model cold or contended, not necessarily down)" }
+    else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $f.Message }
+}
 
 # L5: bge-reranker-v2-m3 on llama-swap :11436
 try {
     $rerankBody = @{model='bge-reranker-v2-m3'; query='ping'; documents=@('a','b','c'); top_n=3} | ConvertTo-Json
-    $r = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($rerankBody)) -ContentType 'application/json' -TimeoutSec 20
+    $r = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($rerankBody)) -ContentType 'application/json' -TimeoutSec $probeTimeoutSec
     if ($r.results -and $r.results.Count -eq 3) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'OK' 'live + ordered 3 docs' }
     else                                         { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' 'responded but unexpected shape' }
-} catch { Add-Check 'LIVENESS' 'bge-reranker :11436' 'FAIL' $_.Exception.Message }
+} catch {
+    $f = Get-ProbeFailure $_
+    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "no response in ${probeTimeoutSec}s (CPU model cold or contended, not necessarily down)" }
+    else              { Add-Check 'LIVENESS' 'bge-reranker :11436' 'FAIL' $f.Message }
+}
 
 # L6: mem0 list pagination (> default cap of 20 returned when limit=100)
 if ($key) {
