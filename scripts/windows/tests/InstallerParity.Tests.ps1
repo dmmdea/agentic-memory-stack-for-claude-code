@@ -118,8 +118,12 @@ Describe 'installer/verifier ship the A.5/A.6 chain (v0.20 Final)' {
         }, $true) | Select-Object -First 1
         $sessionBlock = $assign.Right.Extent.Text
         $sessionBlock | Should -Match "mem0-hook-daemon-spawn\.ps1"
+        # 2026-07-22: hook commands are built by New-HookCommand with FORWARD-slash paths —
+        # hook command strings execute through Git Bash, where an unquoted backslash is an
+        # escape character and silently destroys the command (root cause of the second
+        # episodic-capture outage). Assert the builder call, not a path spelling.
         $src = Get-Content $installerPath -Raw
-        $src | Should -Match ([regex]::Escape('\.claude\scripts\mem0-hook-daemon-spawn.ps1'))
+        $src | Should -Match ([regex]::Escape("New-HookCommand 'mem0-hook-daemon-spawn.ps1'"))
     }
 
     It 'installer registers the SessionStart codex-shim-spawn launcher (v0.27.1 R5)' {
@@ -131,8 +135,9 @@ Describe 'installer/verifier ship the A.5/A.6 chain (v0.20 Final)' {
         }, $true) | Select-Object -First 1
         $sessionBlock = $assign.Right.Extent.Text
         $sessionBlock | Should -Match "codex-shim-spawn\.ps1" -Because 'if the launcher registration is dropped, deploy + R9 still pass but the shim never warms — silently disabling the Codex write-gate path'
+        # Same forward-slash rationale as the daemon-spawn assertion above.
         $src = Get-Content $installerPath -Raw
-        $src | Should -Match ([regex]::Escape('\.claude\scripts\codex-shim-spawn.ps1'))
+        $src | Should -Match ([regex]::Escape("New-HookCommand 'codex-shim-spawn.ps1'"))
     }
 
     It 'shim scripts carry NO dmmdea token (R9 byte-identical deploy)' {

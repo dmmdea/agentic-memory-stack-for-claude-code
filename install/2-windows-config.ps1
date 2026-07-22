@@ -417,9 +417,34 @@ foreach ($cand in @(
     if (Test-Path $cand) { $psRunner = $cand; break }
 }
 $psQuoted = if ($psRunner -match '\s') { '"' + $psRunner + '"' } else { $psRunner }
-Write-Host "    PowerShell runner (hooks + dream): $psRunner"
+Write-Host "    PowerShell runner (dream task): $psRunner"
 
-$psDispatcher = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\stop-extract.ps1'
+# HOOK COMMANDS ARE EXECUTED THROUGH GIT BASH — THEY MUST BE BASH-SAFE (2026-07-22).
+# Claude Code on this platform runs hook command STRINGS through Git Bash, where an unquoted
+# backslash is an escape character. A command like
+#     C:\Users\<user>\...\pwsh.exe -File C:\Users\<user>\.claude\scripts\stop-extract.ps1
+# is stripped to `C:Users<user>...pwsh.exe` (exit 127, command not found) — the hook dies
+# instantly and silently on EVERY event. This was the second, independent killer of the
+# episodic-capture outage: after the version-pinned launcher was fixed, the backslashed
+# command form still failed in the bash layer. The pre-2026-07-13 form worked precisely
+# because it was `powershell.exe` (bare, PATH-resolved — nothing to strip) with a
+# forward-slash -File path.
+#
+# Rules for anything placed in a hook "command" string:
+#   - launcher: bare `powershell.exe` (PATH-resolved; System32, version-independent). The
+#     dispatcher scripts are 5.1-clean by contract (PS51Compat gate) and each spawns its
+#     real worker under pwsh 7 itself, so 5.1 quirks never touch the work.
+#   - script path: FORWARD slashes, DOUBLE-quoted (double quotes are quoting in both bash
+#     and cmd, and protect usernames containing spaces).
+# $psQuoted/$psRunner remain for the SCHEDULED TASK actions below — Task Scheduler does not
+# go through bash, and the dream genuinely needs pwsh 7 (documented 5.1 breakage).
+$hookScriptsFwd = 'C:/Users/' + $env:USERNAME + '/.claude/scripts'
+function New-HookCommand {
+    param([string]$ScriptName)
+    return 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $hookScriptsFwd + '/' + $ScriptName + '"'
+}
+
+$psDispatcher = New-HookCommand 'stop-extract.ps1'
 # v1.16 (2026-07-17 remediation §6.1.5): emit DISTRO-AGNOSTIC hook commands (no `-d`)
 # when the AMS distro IS the box's WSL default — `wsl.exe` with no `-d` reaches it, and the
 # resulting settings.json stays portable across machines whose default distros differ (a
@@ -463,17 +488,17 @@ $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt
 # the global `allowed`-style single-marker logic previously APPENDED a second
 # UserPromptSubmit hook on re-run.
 $psUserPrompt   = 'C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-client.exe'
-$psPreToolUse   = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\pre-tool-check.ps1'
-$psDaemonSpawn  = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-daemon-spawn.ps1'
+$psPreToolUse   = New-HookCommand 'pre-tool-check.ps1'
+$psDaemonSpawn  = New-HookCommand 'mem0-hook-daemon-spawn.ps1'
 # v0.27.1 R5: the Codex HTTP shim's SessionStart launcher. Flag-gated (no-op unless
 # ~/.claude/state/codex-shim.enabled exists), so registering it costs nothing until
 # the NLI write-gate is turned on.
-$psShimSpawn    = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\codex-shim-spawn.ps1'
+$psShimSpawn    = New-HookCommand 'codex-shim-spawn.ps1'
 # 2026-06-24: SessionStart capture of the PRIOR session's transcript. The per-turn
 # Stop/UserPromptSubmit hooks do NOT fire in the Claude Code VSCode-extension / Agent-SDK
 # runtime (verified via fire-marker probe), so Stop-driven capture is dead there. This
 # lifecycle hook (which DOES fire) plus PreCompact carry capture instead. Async + detached.
-$psSessionCapture = $psQuoted + ' -NoProfile -ExecutionPolicy Bypass -File C:\Users\' + $env:USERNAME + '\.claude\scripts\sessionstart-capture.ps1'
+$psSessionCapture = New-HookCommand 'sessionstart-capture.ps1'
 
 # Each event maps to an ARRAY of stack-owned entries (SessionStart has two).
 # Every entry carries its own dedupe markers; an existing hook matching ANY
