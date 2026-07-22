@@ -241,7 +241,7 @@ try {
 # memory-index-refresh.ps1 (standalone MEMORY.md index refresh decoupled from the dream) — both
 # spawn detached from SessionStart. Not R9 hash-tracked (they are not hot-path clients), so this
 # stays a superset of $hookNames (InstallerParity holds).
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
 foreach ($s in $winScripts) {
     $src = Join-Path $RepoRoot "scripts\windows\$s"
     $dst = Join-Path $ScriptsDir $s
@@ -395,12 +395,27 @@ $hooks = if ($settings.PSObject.Properties['hooks']) { $settings.hooks } else { 
 # pwsh). pwsh 7 runs the same 5.1-clean scripts correctly. Resolve a concrete pwsh path; fall back
 # to powershell.exe ONLY if pwsh is genuinely absent. $psRunner = bare path (for -Execute);
 # $psQuoted = path quoted for embedding in a hook command STRING.
-$psRunner = 'powershell.exe'
+#
+# NEVER BAKE A VERSION-STAMPED PATH (2026-07-21). `Get-Command pwsh.exe` on a Store-installed
+# PowerShell resolves to C:\Program Files\WindowsApps\Microsoft.PowerShell_<VERSION>_x64__...\pwsh.exe.
+# Windows replaces that directory wholesale on every PowerShell update, so the path this installer
+# recorded silently ceases to exist. It was resolved first here, which is how the 2026-07-13 install
+# pinned SIX hooks to ...PowerShell_7.6.3.0..., and when 7.6.4.0 replaced it every one of them
+# stopped executing with no error anywhere — a hook whose executable is missing simply never runs.
+# That killed episodic capture for 8 days (Stop), plus PreToolUse and three SessionStart spawns.
+# Version-independent locations are therefore tried FIRST, and a versioned WindowsApps path is
+# rejected outright rather than recorded.
+$psRunner = 'powershell.exe'   # System32 — always present, never moves between versions
 foreach ($cand in @(
-    (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source),
-    (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')
-)) { if ($cand -and (Test-Path $cand)) { $psRunner = $cand; break } }
+    (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),              # MSI install: stable across updates
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'),     # App Execution Alias: unversioned name
+    (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+)) {
+    if (-not $cand) { continue }
+    # Reject the version-stamped Store path even though it exists TODAY — it is a time bomb.
+    if ($cand -match 'WindowsApps\\Microsoft\.PowerShell_[0-9][0-9.]*_') { continue }
+    if (Test-Path $cand) { $psRunner = $cand; break }
+}
 $psQuoted = if ($psRunner -match '\s') { '"' + $psRunner + '"' } else { $psRunner }
 Write-Host "    PowerShell runner (hooks + dream): $psRunner"
 
@@ -644,15 +659,19 @@ if ($Role -ne 'brain') {
 Write-Host "==> [5] Registering Task Scheduler entry: ClaudeCode-DreamConsolidator-3am"
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
+# Launched through run-hidden.vbs so the 3am firing never draws a console on the desktop
+# (see that file for why -WindowStyle Hidden and S4U are both the wrong tool here).
+$hiddenVbs = "C:\Users\$env:USERNAME\.claude\scripts\run-hidden.vbs"
 $action = New-ScheduledTaskAction `
-    -Execute $psRunner `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Users\$env:USERNAME\.claude\scripts\dream-consolidate.ps1"
+    -Execute 'wscript.exe' `
+    -Argument "//nologo `"$hiddenVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\dream-consolidate.ps1`""
 $trigger = New-ScheduledTaskTrigger -Daily -At 3:00am
 $settingsTask = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -WakeToRun `
+    -Hidden `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 
@@ -677,9 +696,11 @@ Write-Host "    Task Scheduler entry registered (next fire: 3:00 AM tomorrow, Wa
 Write-Host "==> [5b] Registering Task Scheduler entry: ClaudeCode-SemanticDedup-430am"
 Unregister-ScheduledTask -TaskName $dedupTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 $dedupCmd = "/home/$WslUser/apps/mem0-server/.venv/bin/python $RepoRootWsl/scripts/wsl/semantic-dedup.py >> /home/$WslUser/.mem0/dedup-cron.log 2>&1"
-$dedupAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wsl.exe" -Argument ('-d ' + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
+# Windowless via run-hidden.vbs: a bare wsl.exe action opens a console on the desktop.
+$dedupAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
+    -Argument ("//nologo `"$hiddenVbs`" `"$env:SystemRoot\System32\wsl.exe`" -d " + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
 $dedupTrigger = New-ScheduledTaskTrigger -Daily -At 4:30am
-$dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+$dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
 $dedupPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
 Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
