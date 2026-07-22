@@ -187,17 +187,24 @@ Check "Codex headless call works" {
 
 Write-Host ""
 Write-Host "mem0 end-to-end (add -> search):"
-Check "mem0 add+search round-trip" {
+# Role-aware (2026-07-22): targets $authorityUrl, NOT loopback. Same defect class as the
+# liveness checks fixed on 2026-07-21, one site further down the file: on a replica,
+# loopback is the DISPOSABLE travel store — down while online by design — so a hardcoded
+# 127.0.0.1 made this check's outcome depend on whether leftover local services happened
+# to be running (a false green yesterday, a false red today, on the same healthy box).
+# The end-to-end that matters on every box is the round-trip against the AUTHORITY the
+# MCP shim actually writes to.
+Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
     try {
         $key = wsl.exe -d $Distro -e bash -c "cat /home/$WslUser/.mem0/api-key"
         $key = ($key -as [string]).Trim()
         $body = @{ messages = 'smoke-test memory: agentic memory stack verify timestamp ' + (Get-Date -Format o); user_id = 'verify-test'; infer = $false; metadata = @{ source = 'install-verify'; tier = 'evidence' } } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $body -TimeoutSec 15 | Out-Null
+        Invoke-RestMethod -Uri "$authorityUrl/v1/memories" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $body -TimeoutSec 15 | Out-Null
         $searchBody = @{ query = 'smoke-test memory'; filters = @{ user_id = 'verify-test' }; top_k = 1; threshold = 0.1 } | ConvertTo-Json -Compress
-        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $searchBody -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri "$authorityUrl/v1/memories/search" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $searchBody -TimeoutSec 15
         $r.results.Count -ge 1
     } catch { $false }
-} "Check mem0 server logs: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'"
+} "Round-trip against $authorityUrl failed. On the brain: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'. On a replica: is the brain reachable (tailscale status), and does ~/.mem0/authority-url point at it?"
 
 Write-Host ""
 if ($fails.Count -eq 0) {
