@@ -32,12 +32,19 @@ $DcHomeUnc = "\\wsl.localhost\$DcDistro\home\$DcWslUser"
 . (Join-Path $ScriptDir 'autopromote-lib.ps1')
 Initialize-MemoryEnv
 
-# 24h throttle (independent of L1a 10-min throttle). -Force bypasses ONLY this throttle
+# Nightly throttle (independent of L1a 10-min throttle). -Force bypasses ONLY this throttle
 # check (for a manual /dream-now); the Codex lock below still applies so a -Force run can
 # never collide with the nightly task or an in-flight L1a.
+#
+# 23h, NOT 24h (2026-07-24). The stamp is written at cycle COMPLETION, ~45-60s after the
+# fixed 03:00 trigger fires — so with a strict 86400s window the next night's 03:00 start
+# is always a few dozen seconds short of eligible, and the dream silently ran every OTHER
+# night (observed: full cycle 07-23 03:00, "skipping: 24h throttle not yet elapsed"
+# 07-24 03:00:02, an off-by-43-seconds miss). 82800s keeps the throttle's real job —
+# never two cycles in one night — without fighting the schedule that invokes it.
 $ThrottleName = 'dream'
-if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 86400)) {
-    Write-MemoryLog -Component 'dream' -Message 'skipping: 24h throttle not yet elapsed'
+if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 82800)) {
+    Write-MemoryLog -Component 'dream' -Message 'skipping: nightly throttle (23h) not yet elapsed'
     exit 0
 }
 
