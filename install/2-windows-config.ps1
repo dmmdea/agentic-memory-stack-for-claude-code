@@ -134,7 +134,23 @@ $eDistro  = $Distro.Replace("'", "''")
 $eRole    = $Role.Replace("'", "''")
 $eRepoWin = $RepoRootWin.Replace("'", "''")
 $eRepoWsl = $RepoRootWsl.Replace("'", "''")
+# ($eEvalWsl is escaped AFTER the inherit block below, so the receipt carries the resolved value.)
+# --- EvalRootWsl: INHERIT, never silently revert (2026-07-24) -------------------------------
+# Same rule as AuthorityUrl below, caught the same way: a plain re-run without -EvalRootWsl
+# reset the receipt to '' — which silently turns the dream's retrieval-drift canary back into
+# its graceful skip on a box that HAD it configured. Omitting the flag now inherits the prior
+# receipt's value; only an explicit -EvalRootWsl (or a first install) changes it.
+if (-not $EvalRootWsl -and (Test-Path $receiptPath)) {
+    try {
+        $prevEval = (Import-PowerShellDataFile $receiptPath).EvalRootWsl
+        if ($prevEval) {
+            $EvalRootWsl = $prevEval
+            Write-Host "    EvalRootWsl inherited from the previous receipt: $EvalRootWsl"
+        }
+    } catch {}
+}
 $eEvalWsl = $EvalRootWsl.Replace("'", "''")
+
 # --- authority resolution: INHERIT, never silently revert -----------------------------------
 # A plain re-run (`2-windows-config.ps1 -WslUser x -Role replica`, no -AuthorityUrl) must not
 # clobber a replica's authority back to loopback — that silently re-introduces the exact bug this
