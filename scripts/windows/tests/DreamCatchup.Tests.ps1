@@ -56,7 +56,10 @@ exit 0
         Set-Content -Path (Join-Path $scripts 'dream-consolidate.ps1') -Value $stub -Encoding UTF8
 
         if (-not $NoDreamMarker) {
-            $now = [int][double]::Parse((Get-Date -UFormat %s))
+            # Same epoch basis the code under test uses (Get-UnixEpoch). `Get-Date -UFormat %s`
+            # would place this fixture stamp UTC-offset hours away when Pester runs under 5.1,
+            # making DreamAgeHours mean something different per shell edition.
+            $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
             $ts  = $now - [int]($DreamAgeHours * 3600)
             Set-Content -Path (Join-Path $state 'last-dream') -Value $ts -Encoding UTF8 -NoNewline
         }
