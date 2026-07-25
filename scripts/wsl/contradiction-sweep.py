@@ -1205,19 +1205,21 @@ def main() -> int:
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
     if args.judge == "codex" and not args.unstamp and not args.promote:
         if _codex is None:
-            # FAIL LOUD (2026-07-25). A missing bridge MODULE is a deploy defect, not a runtime
-            # condition: unlike an unreachable shim (transient, handled below with exit 0 so the
-            # weekly timer stays quiet), the module can only be absent if the layout is wrong.
-            # This exited 0 for months while the sweep judged nothing, and the silence is exactly
-            # why nobody noticed. A non-zero exit surfaces it in `systemctl --user --failed`.
+            # Exit 0 is DELIBERATE and stays: a fresh box mid-install legitimately has no bridge
+            # yet, and turning that into a failed unit would make every partial deploy noisy
+            # (pinned by test_main_codex_preflight_noops_when_bridge_import_failed).
+            #
+            # But the silence is also how the layout bug below hid for months, so the message now
+            # names every path searched — with the layout fix above, reaching this line at all
+            # means a genuinely absent module rather than a miscomputed path.
             tried = ", ".join(str(c) for c in _BRIDGE_CANDIDATES)
-            print("contradiction-sweep: FATAL - codex_shim_client not importable; the sweep cannot "
-                  f"judge. Looked for mem0-server in: {tried}", flush=True)
+            print("contradiction-sweep: --judge codex but codex_shim_client is not importable; "
+                  f"nothing will be judged. Searched for mem0-server in: {tried}", flush=True)
             _append_summary({"dry_run": dry_run, "judge": "codex",
-                             "outcome": "fatal:codex-bridge-missing",
+                             "outcome": "no-op:codex-bridge-unavailable",
                              "skipped": "codex_shim_client import failed",
                              "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
-            return 2
+            return 0
         _h = _codex.health()
         if not _h.get("ok"):
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "
