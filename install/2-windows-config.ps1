@@ -460,6 +460,25 @@ function New-HookCommand {
     return 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $hookScriptsFwd + '/' + $ScriptName + '"'
 }
 
+function New-HookExeCommand {
+    # A hook that invokes an EXE directly still goes through the Git Bash layer, so it needs
+    # the same forward-slash + double-quoted treatment as New-HookCommand above. It does NOT
+    # get the powershell.exe prefix — the exe is the program.
+    #
+    # WHY THIS EXISTS (2026-07-24): the 2026-07-22 bash-safe pass converted the five .ps1 hook
+    # commands and MISSED this one, because it is the only hook whose command is a bare exe
+    # path. It stayed on the raw backslash form and was destroyed by bash on every prompt:
+    #   /usr/bin/bash: line 1: C:Usersdmmde.claudescriptsmem0-hook-client.exe: command not found
+    # exit 127, silently, ~1000 times. Memory injection (Phase 0.A/0.D) reached no prompt.
+    #
+    # It hid so long because the SIBLING hook on the same event kept working and made the event
+    # look healthy: hooks registered with an `args` array are exec'd directly by Claude Code
+    # with no shell, so backslashes there are harmless. Only a hook with NO `args` is passed to
+    # bash as a command string. Never register a bare Windows path as a hook command.
+    param([string]$ExeName)
+    return '"' + $hookScriptsFwd + '/' + $ExeName + '"'
+}
+
 $psDispatcher = New-HookCommand 'stop-extract.ps1'
 # v1.16 (2026-07-17 remediation §6.1.5): emit DISTRO-AGNOSTIC hook commands (no `-d`)
 # when the AMS distro IS the box's WSL default — `wsl.exe` with no `-d` reaches it, and the
@@ -503,7 +522,7 @@ $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt
 # so a re-run over a live exe-registered box replaces rather than appends —
 # the global `allowed`-style single-marker logic previously APPENDED a second
 # UserPromptSubmit hook on re-run.
-$psUserPrompt   = 'C:\Users\' + $env:USERNAME + '\.claude\scripts\mem0-hook-client.exe'
+$psUserPrompt   = New-HookExeCommand 'mem0-hook-client.exe'
 $psPreToolUse   = New-HookCommand 'pre-tool-check.ps1'
 $psDaemonSpawn  = New-HookCommand 'mem0-hook-daemon-spawn.ps1'
 # v0.27.1 R5: the Codex HTTP shim's SessionStart launcher. Flag-gated (no-op unless

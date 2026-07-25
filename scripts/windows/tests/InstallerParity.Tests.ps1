@@ -88,8 +88,11 @@ Describe 'installer/verifier ship the A.5/A.6 chain (v0.20 Final)' {
     }
 
     It 'installer registers UserPromptSubmit at the compiled exe' {
+        # 2026-07-24: assert the BUILDER call, not a backslash path spelling. Hook command
+        # strings run through Git Bash, which eats unquoted backslashes — the old literal form
+        # this used to assert is precisely the shape that died exit 127 on every prompt.
         $src = Get-Content $installerPath -Raw
-        $src | Should -Match ([regex]::Escape('\.claude\scripts\mem0-hook-client.exe'))
+        $src | Should -Match ([regex]::Escape("New-HookExeCommand 'mem0-hook-client.exe'"))
         # the legacy wrapper must no longer be the registered command shape
         $src | Should -Not -Match ([regex]::Escape('-File C:\Users\') + ".*user-prompt-extract\.ps1")
     }
