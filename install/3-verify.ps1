@@ -127,6 +127,31 @@ Check "mem0 MCP server registered + args well-formed" {
     $shim = @($mem0.args | Where-Object { "$_" -match '^/mnt/.+/\.claude/scripts/mem0-mcp-shim\.py$' })
     ($shim.Count -eq 1) -and ($mem0.command -eq 'wsl.exe')
 } "Re-run 2-windows-config.ps1 (it rewrites a correct single-path mem0 entry) — the ~/.claude.json mem0 args are missing or malformed (shim path split across array elements)"
+# 2026-07-24: bash-safety guard for hook COMMAND strings. Claude Code passes a hook command
+# with no `args` array to Git Bash, where an unquoted backslash is an escape character — so a
+# raw Windows path is silently shredded into `C:Usersdmmde...` and the hook dies exit 127 on
+# every single event, with nothing surfaced anywhere. That killed episodic capture for 9 days
+# (stop-extract.ps1) and memory injection for longer (mem0-hook-client.exe, ~1000 failures).
+# A hook WITH an `args` array is exec'd directly and is exempt — that asymmetry is exactly why
+# this hid so long: the sibling hook on the same event kept working and the event looked fine.
+Check "Hook commands are bash-safe (no unquoted backslash paths)" {
+    $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json -AsHashtable
+    $bad = @()
+    foreach ($evt in $s.hooks.Keys) {
+        foreach ($entry in @($s.hooks[$evt])) {
+            foreach ($h in @($entry.hooks)) {
+                $cmd = [string]$h.command
+                if (-not $cmd -or $cmd -notmatch '\\') { continue }
+                if ($h.ContainsKey('args')) { continue }   # direct exec, never sees a shell
+                # Every backslash must sit inside a double-quoted run, else bash eats it.
+                $unquoted = ($cmd -replace '"[^"]*"', '')
+                if ($unquoted -match '\\') { $bad += "$evt -> $cmd" }
+            }
+        }
+    }
+    if ($bad.Count -gt 0) { Write-Host "(offenders: $($bad -join ' | ')) " -NoNewline -ForegroundColor Yellow }
+    $bad.Count -eq 0
+} "A hook command carries an unquoted Windows path; Git Bash strips the backslashes and the hook dies exit 127 silently. Re-run 2-windows-config.ps1 (New-HookCommand / New-HookExeCommand emit quoted forward-slash paths)."
 # v1.16 (2026-07-17 remediation §6.2.3): generic deploy-layer skew detector. The shared/synced
 # settings.json can advance ahead of this box's machine-local deployed scripts (2026-07-17:
 # a config-repo untrack+pull deleted a box's whole deploy layer while settings.json kept
