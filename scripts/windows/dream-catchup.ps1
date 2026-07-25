@@ -44,7 +44,11 @@ try {
     if (Test-Path $dreamMarker) {
         try { $lastDream = [int](Get-Content $dreamMarker -Raw).Trim() } catch { $lastDream = $null }
     }
-    $now = [int][double]::Parse((Get-Date -UFormat %s))
+    # Get-UnixEpoch (memory-common.ps1, dot-sourced above), NOT `Get-Date -UFormat %s`: this
+    # script runs under 5.1 from the SessionStart hook while the dream's scheduled task runs
+    # under pwsh 7, and the two editions disagree on %s by the UTC offset — which is what made
+    # this very line report "last dream 36.4h ago" for a true 41.4h gap.
+    $now = Get-UnixEpoch
     # No marker at all -> the dream has never recorded a run: treat as maximally stale (force).
     $ageHours = if ($null -ne $lastDream) { ($now - $lastDream) / 3600.0 } else { [double]::PositiveInfinity }
 

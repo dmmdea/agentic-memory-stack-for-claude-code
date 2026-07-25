@@ -631,6 +631,22 @@ function Write-MemoryLog {
     Add-Content -Path $logFile -Value "[$ts] $Message" -Encoding UTF8
 }
 
+function Get-UnixEpoch {
+    # Shell-version-independent Unix epoch seconds. USE THIS, never `Get-Date -UFormat %s`.
+    #
+    # WHY (2026-07-24): on Windows PowerShell 5.1, `Get-Date -UFormat %s` returns a value
+    # offset by the machine's UTC offset — measured on a UTC-5 box, 18000s BEHIND the true
+    # epoch — while pwsh 7 returns it correctly. This stack writes and reads the same
+    # ~/.claude/state/last-* stamps from BOTH shells: scheduled tasks run under pwsh 7, and
+    # Claude Code hooks run under 5.1. A stamp written by one and read by the other therefore
+    # yielded an elapsed time wrong by exactly the UTC offset, in whichever direction:
+    #   - 5.1 writes, pwsh 7 reads  -> elapsed OVERSTATED  -> a throttle opens ~5h early
+    #   - pwsh 7 writes, 5.1 reads  -> elapsed UNDERSTATED -> catch-up fires ~5h late
+    # Observed: dream-catchup logged "last dream 36.4h ago" when the true gap was 41.4h.
+    # [DateTimeOffset]::UtcNow is identical on both editions and is timezone-independent.
+    return [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
 function Test-Throttle {
     # Check whether enough time has elapsed since last successful run.
     # Pure check - does NOT write the state file (audit finding 2026-06-08: the old
@@ -642,7 +658,7 @@ function Test-Throttle {
         [Parameter(Mandatory)][int]$MinIntervalSeconds
     )
     $stateFile = Join-Path $script:StateDir "last-$Name"
-    $now = [int][double]::Parse((Get-Date -UFormat %s))
+    $now = Get-UnixEpoch
     if (Test-Path $stateFile) {
         try {
             $last = [int](Get-Content $stateFile -Raw).Trim()
@@ -656,7 +672,7 @@ function Mark-Throttle {
     # Stamp the success time so the throttle window opens for the next call.
     param([Parameter(Mandatory)][string]$Name)
     $stateFile = Join-Path $script:StateDir "last-$Name"
-    $now = [int][double]::Parse((Get-Date -UFormat %s))
+    $now = Get-UnixEpoch
     Set-Content -Path $stateFile -Value $now -Encoding UTF8 -NoNewline
 }
 
