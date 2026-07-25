@@ -82,7 +82,19 @@ import httpx
 # via the Windows HTTP shim — the model-routing rule (all LLM judgment uses Codex, never a local
 # model; the v0.21.1 offload-e4b judge was the audited misrouting). The bridge lives in
 # mem0-server/ (sibling of scripts/). Local-judge mode still runs if the bridge is absent.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mem0-server"))
+# LAYOUT-AWARE (2026-07-25): parents[2] alone is correct ONLY in the repo layout
+# (scripts/wsl/x.py -> repo root). Deployed, this file lives at ~/apps/mem0-scripts/x.py, where
+# parents[2] is $HOME and the computed path is ~/mem0-server — which does not exist. The bridge
+# import therefore always failed in production and the weekly sweep exited as a no-op every run,
+# having never judged anything. Try both layouts; first hit wins.
+_BRIDGE_CANDIDATES = [
+    Path(__file__).resolve().parents[2] / "mem0-server",   # repo:     scripts/wsl/ -> <repo>/mem0-server
+    Path.home() / "apps" / "mem0-server",                  # deployed: ~/apps/mem0-scripts/ -> ~/apps/mem0-server
+]
+for _cand in _BRIDGE_CANDIDATES:
+    if _cand.is_dir():
+        sys.path.insert(0, str(_cand))
+        break
 try:
     import codex_shim_client as _codex
 except Exception:  # noqa: BLE001
@@ -1193,11 +1205,19 @@ def main() -> int:
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
     if args.judge == "codex" and not args.unstamp and not args.promote:
         if _codex is None:
-            print("contradiction-sweep: --judge codex but codex_shim_client import failed", flush=True)
+            # FAIL LOUD (2026-07-25). A missing bridge MODULE is a deploy defect, not a runtime
+            # condition: unlike an unreachable shim (transient, handled below with exit 0 so the
+            # weekly timer stays quiet), the module can only be absent if the layout is wrong.
+            # This exited 0 for months while the sweep judged nothing, and the silence is exactly
+            # why nobody noticed. A non-zero exit surfaces it in `systemctl --user --failed`.
+            tried = ", ".join(str(c) for c in _BRIDGE_CANDIDATES)
+            print("contradiction-sweep: FATAL - codex_shim_client not importable; the sweep cannot "
+                  f"judge. Looked for mem0-server in: {tried}", flush=True)
             _append_summary({"dry_run": dry_run, "judge": "codex",
-                             "outcome": "no-op:codex-bridge-unavailable",
-                             "skipped": "codex_shim_client import failed"})
-            return 0
+                             "outcome": "fatal:codex-bridge-missing",
+                             "skipped": "codex_shim_client import failed",
+                             "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
+            return 2
         _h = _codex.health()
         if not _h.get("ok"):
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "

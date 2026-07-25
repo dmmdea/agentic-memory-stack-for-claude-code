@@ -224,10 +224,23 @@ Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
         $key = wsl.exe -d $Distro -e bash -c "cat /home/$WslUser/.mem0/api-key"
         $key = ($key -as [string]).Trim()
         $body = @{ messages = 'smoke-test memory: agentic memory stack verify timestamp ' + (Get-Date -Format o); user_id = 'verify-test'; infer = $false; metadata = @{ source = 'install-verify'; tier = 'evidence' } } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri "$authorityUrl/v1/memories" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $body -TimeoutSec 15 | Out-Null
+        # 2026-07-25: generous timeout + bounded retry on the SEARCH side. Both legs go through
+        # the CPU-only embedder on :11436, which can take many seconds during a model swap or
+        # under concurrent load, and an add that succeeded is not necessarily searchable in the
+        # same instant. With a single 15s attempt this check failed on a completely healthy box
+        # and made 3-verify exit 1 — and a verifier that cries wolf stops being read.
+        # A genuine HTTP error on the ADD still throws and FAILs loudly; only slowness is absorbed.
+        Invoke-RestMethod -Uri "$authorityUrl/v1/memories" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $body -TimeoutSec 60 | Out-Null
         $searchBody = @{ query = 'smoke-test memory'; filters = @{ user_id = 'verify-test' }; top_k = 1; threshold = 0.1 } | ConvertTo-Json -Compress
-        $r = Invoke-RestMethod -Uri "$authorityUrl/v1/memories/search" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $searchBody -TimeoutSec 15
-        $r.results.Count -ge 1
+        $found = $false
+        foreach ($attempt in 1..3) {
+            try {
+                $r = Invoke-RestMethod -Uri "$authorityUrl/v1/memories/search" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $searchBody -TimeoutSec 60
+                if ($r.results.Count -ge 1) { $found = $true; break }
+            } catch { }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 3 }
+        }
+        $found
     } catch { $false }
 } "Round-trip against $authorityUrl failed. On the brain: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'. On a replica: is the brain reachable (tailscale status), and does ~/.mem0/authority-url point at it?"
 
