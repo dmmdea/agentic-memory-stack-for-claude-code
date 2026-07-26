@@ -40,6 +40,8 @@ pwsh -NoProfile -File .\scripts\windows\Run-PesterTests.ps1
 
 Conventions the suites encode: pure logic is factored into unit-testable helpers (decision matrices, parsers, prompt builders) pinned by tests; injection-defense prompt *structure* is pinned by tests (delimiter blocks, closing-tag neutralization); "the installer covers the server's import closure" is itself a test (`test_config_import_closure.py`) — and a CI gate.
 
+**A suite never touches the operator's live state.** Much of this code resolves its paths from `$env:USERPROFILE` (`~\.claude\state`, `~\.mem0`), usually as a *parameter default* that a caller may omit — so a test that exercises the real entry point inherits the real directory. Any suite covering such a path sandboxes `$env:USERPROFILE` to a `TestDrive` root in `BeforeEach` and restores it in `AfterEach`. Two rules make the sandbox self-enforcing, because a leaking suite is otherwise indistinguishable from a passing one: assert against the sandbox path the code actually writes to (an assertion aimed at a directory the code never touches passes unconditionally and proves nothing), and include at least one *positive control* — a write the code is supposed to make, asserted present inside the sandbox — so removing the sandbox turns the suite red instead of silently redirecting the write to the real state directory.
+
 ## Deploying a change to the live runtime
 
 **One path** (v1.12, MEM-7 — born from a P0 where a hand-copied module never reached the installer):
