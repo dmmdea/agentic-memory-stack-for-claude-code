@@ -50,8 +50,18 @@ _READ_TIMEOUT = 30.0
 # Connect-level failures = fail over. A read timeout or HTTP status is NOT a connect failure.
 _FAILOVER_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
+# 2026-07-26: the ONE HTTP status that is not a real answer. app.py returns 503 +
+# Retry-After when the upstream embedder is rate-limited (llama-swap 429 outliving
+# the embedder's bounded retry) — the server explicitly saying "ask again later".
+# Before this, that arrived as a flat 500, which this shim correctly treats as a
+# real answer, so a queued-offline write was instead DROPPED; a memory add was lost
+# that way. Treating 503 like a connect failure routes reads to the replica and
+# writes to the outbox. Every OTHER status stays a real answer and is never masked
+# with a stale read — the invariant this rule exists to protect.
+_RETRYABLE_STATUS = {503}
+
 class OfflineError(Exception):
-    """The memory authority is connect-unreachable."""
+    """The memory authority is unusable: connect-unreachable, or answering 503."""
 
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -61,7 +71,8 @@ def _timeout() -> "httpx.Timeout":
 
 def _request(method: str, path: str, *, json: dict | None = None, params: dict | None = None):
     """Reads: try authority (short connect), else fail over to the local replica.
-    Returns (payload, source). Raises OfflineError if BOTH are connect-unreachable.
+    Returns (payload, source). Raises OfflineError if BOTH are unusable (connect-
+    unreachable, or answering a _RETRYABLE_STATUS).
     Propagates httpx.HTTPStatusError (a real answer is never masked with a stale read)."""
     last_exc = None
     for url, source in ((AUTHORITY_URL, "authority"), (LOCAL_URL, "local-replica")):
@@ -71,17 +82,27 @@ def _request(method: str, path: str, *, json: dict | None = None, params: dict |
         except _FAILOVER_EXC as e:
             last_exc = e
             continue
+        if r.status_code in _RETRYABLE_STATUS:
+            # Not a real answer — the server told us to ask again. Fall through to
+            # the replica rather than raising it at the caller as a hard failure.
+            last_exc = httpx.HTTPStatusError(
+                f"{source} returned {r.status_code}", request=r.request, response=r)
+            continue
         r.raise_for_status()
         return r.json(), source
     raise OfflineError(f"authority and local replica both unreachable: {last_exc}")
 
 def _authority_only(method: str, path: str, *, json: dict | None = None) -> dict:
-    """Writes/mutations: authority only. Raise OfflineError on connect failure (caller queues)."""
+    """Writes/mutations: authority only. Raise OfflineError on connect failure, or on a
+    _RETRYABLE_STATUS answer, so the caller queues to the outbox instead of losing the
+    write (a 503 means the authority cannot serve right now, not that the op is bad)."""
     try:
         r = httpx.request(method, f"{AUTHORITY_URL}{path}", json=json,
                           headers=_headers(), timeout=_timeout())
     except _FAILOVER_EXC:
         raise OfflineError()
+    if r.status_code in _RETRYABLE_STATUS:
+        raise OfflineError(f"authority answered {r.status_code} (retryable); queueing")
     r.raise_for_status()
     return r.json()
 
