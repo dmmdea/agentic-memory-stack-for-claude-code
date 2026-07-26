@@ -4,6 +4,68 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.18.0 (2026-07-25) — the silent-failure week
+
+Twenty PRs repairing a family of defects that shared one trait: **something stopped working and
+nothing said so.** Every one was found by hand or by audit, never by an alarm, because each failed
+into a shape indistinguishable from "nothing to do".
+
+### Outages fixed
+
+- **Memory injection was dead on every prompt** (~1000 recorded failures). Claude Code passes a
+  hook command with no `args` array to Git Bash, where an unquoted backslash is an escape
+  character, so the client's absolute path was shredded and the hook exited 127 — silently. Hooks
+  registered *with* an `args` array are exec'd directly and kept working, so the event looked
+  healthy throughout.
+- **Episodic capture was dead for 9 days**, from two independent causes at once: the hook launcher
+  was pinned to a version-stamped WindowsApps PowerShell path that Windows deletes on update, and
+  the command strings carried the backslash bug above. Fixing either alone left it dead.
+- **The weekly contradiction sweep had never judged anything** in the deployed layout — its
+  `sys.path` resolved correctly in the repo but to a non-existent directory once deployed, so the
+  Codex bridge import failed and the run exited 0 every week.
+- **A replica silently queued every write to the Outbox.** The MCP shim read its authority from an
+  environment variable, but `wsl.exe -e` execs directly (no login shell, no `WSLENV`
+  pass-through), so the value never arrived and the shim fell back to a dead loopback.
+- **The offsite backup was deleting archives.** `robocopy /MIR` mirrors, so every source-side
+  retention prune destroyed the offsite copy too; 688 MB existed only offsite and was hours from
+  being purged.
+
+### Systemic fixes
+
+- Authority resolution is a per-host file (`~/.mem0/authority-url`), read identically by the shim,
+  `replay-ops`, the SessionStart bundle and the offline watcher. The Outbox drains at shim
+  startup, and a replica refuses to replay into its own disposable store (One-Brain Rule).
+- Throttle arithmetic uses a shell-independent epoch helper: PowerShell 5.1's
+  `Get-Date -UFormat %s` is offset by the machine's UTC offset while pwsh 7 is correct, and both
+  editions write the same state files.
+- The nightly dream throttle is 23h, not 24h — the stamp is written at cycle completion, so a
+  strict 24h window against a fixed 03:00 trigger made the dream run every *other* night.
+- Installer values **inherit** rather than silently revert: omitting `-AuthorityUrl` or
+  `-EvalRootWsl` on a re-run keeps what the box already had.
+- Scheduled tasks run windowless through a `wscript` shim and register `Hidden`.
+- Verifiers stopped crying wolf — role-aware checks (a replica's local store is *designed* to be
+  down while online), a retry-hardened round-trip, and probe timeouts that report a slow CPU model
+  as WARN rather than FAIL.
+
+### Guards, so these classes cannot recur silently
+
+- `3-verify` fails when any hook command carries an unquoted backslash path — the check that would
+  have caught both hook outages on day one.
+- `RegressionGuards.Tests.ps1` pins the throttle constant *and* its behaviour, the epoch helper,
+  receipt inheritance, and the bash-safe hook builders. Mutation-tested: reverting each fix turns
+  it red.
+- The missing-bridge failure is receipt-gated — quiet on a fresh or partial deploy, loud on a box
+  that completed an install.
+- `check-docs.py` enumerates via `git ls-files`, so local scratch files no longer trip the gate
+  while CI behaviour is unchanged.
+
+### Restored from the carve
+
+`_debris_patterns.py` + `conftest.py` (89 live-stack tests could not even be collected) and
+`Run-PesterTests.ps1` (documented but never published; two defects fixed in the port — unquoted
+`Start-Process -ArgumentList` elements broke on any path containing a space, and a locale-specific
+module path).
+
 ## v1.17.0 (2026-07-18) — repo-local documentation system
 
 A durable, repo-local documentation system for humans and AI agents, reviewed alongside code.
