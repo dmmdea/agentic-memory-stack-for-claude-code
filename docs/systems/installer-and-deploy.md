@@ -80,7 +80,7 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 | `WslUser`, `WinUser`, `Distro` | the three identity dimensions |
 | `Role` | `brain` or `replica` (the One-Brain Rule role) |
 | `RepoRootWin`, `RepoRootWsl` | the operator-chosen repository path, both views |
-| `EvalRootWsl` | optional checkout carrying the `eval/` harnesses; empty by default (the orchestrator does not pass it), and the Dream's drift canary falls back to `RepoRootWsl` when it is empty |
+| `EvalRootWsl` | optional checkout carrying the `eval/` harnesses. Omitting `-EvalRootWsl` on a re-run **inherits** the prior receipt's value rather than blanking it (same rule as `AuthorityUrl`) — a plain re-run used to reset it to empty and silently disable the Dream's drift canary. Only an explicit flag, or a first install with no prior receipt, changes it; when genuinely empty the canary falls back to `RepoRootWsl` |
 | `ApiKeyUnc` | UNC path to the WSL-side API key |
 | `AuthorityUrl` | the memory authority this box talks to, mirrored into `~/.mem0/authority-url` (which is what the shim actually reads) |
 | `PromotionGateMode` | ships `shadow` |

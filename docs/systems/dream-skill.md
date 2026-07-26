@@ -16,7 +16,7 @@ The 4-phase consolidation pattern (orient → gather → consolidate → prune) 
 
 ## Scope
 
-The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insight synthesis, autonomous canonical promotion, `MEMORY.md` rebuild, and the retrieval-drift canary — plus the trigger, the 24h throttle, the shared Codex mutex, and the missed-run catch-up.
+The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insight synthesis, autonomous canonical promotion, `MEMORY.md` rebuild, and the retrieval-drift canary — plus the trigger, the nightly (23h) throttle, the shared Codex mutex, and the missed-run catch-up.
 
 ## Non-scope
 
@@ -28,16 +28,16 @@ The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insi
 ## Key concepts
 
 - **The five phases** — orient, gather, consolidate, autopromote (3.5), prune, plus a zero-Codex drift canary (5).
-- **24h throttle** — one consolidation per day, independent of the L1a 10-min throttle.
+- **Nightly throttle (23h)** — one consolidation per day, independent of the L1a 10-min throttle.
 - **Shared Codex mutex** — the dream and L1a contend for one Codex lock so they never invoke Codex concurrently.
 - **4C promotion gate** — the contradiction + source-weighted-corroboration gate that decides whether an autopromotion nominee reaches canonical.
 - **Retrieval-drift canary** — a before/after snapshot of whether a fixed canary set stays retrievable across a consolidation, run only when an eval checkout is present (`EvalRootWsl`).
 
 ## How the system works
 
-The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the 24h throttle and exits immediately if the last successful run was < 24h ago. It then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every Codex call goes through the ChatGPT-subscription Codex CLI, never Claude — see [`codex-hooks.md`](./codex-hooks.md) for why.
+The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the nightly throttle and exits immediately if the last successful run was < 23h ago. It then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every Codex call goes through the ChatGPT-subscription Codex CLI, never Claude — see [`codex-hooks.md`](./codex-hooks.md) for why.
 
-If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a pending learn-rule, a queued promotion, or a last run > 48h ago) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own 24h throttle + Codex lock prevent a double-run.
+If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a pending learn-rule, a queued promotion, or a last run > 48h ago) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own nightly throttle + Codex lock prevent a double-run.
 
 ## Important flows
 
@@ -51,7 +51,9 @@ Load current context before deciding what to gather. Reads:
 
 Output: a "context snapshot" struct passed to Phase 2 — what the consolidator already knows, what tiers are crowded, whether there's enough new evidence to justify consolidation.
 
-**Skip condition:** the 24h throttle is enforced at the top level — if `dream-last-run` is < 24h ago (`86400s`), the script exits before Phase 1.
+**Skip condition:** the nightly throttle is enforced at the top level — if `dream-last-run` is < 23h ago (`82800s`), the script exits before Phase 1.
+
+**Why 23h and not 24h.** The throttle stamp is written at cycle *completion*, ~45-60s after the fixed 03:00 trigger fires. Against a strict `86400s` window the next night's 03:00 start was therefore always short by those few dozen seconds, so the dream silently ran every OTHER night. `82800s` keeps the real guarantee — never two cycles in one night — without the schedule racing its own stamp. Related: throttle stamps are Unix epoch seconds written through a shell-independent helper (`Get-UnixEpoch`); PowerShell 5.1's `Get-Date -UFormat %s` is offset by the machine's UTC offset and must never be used for them.
 
 ### Phase 2 — Gather
 

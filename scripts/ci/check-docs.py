@@ -7,13 +7,42 @@ stripped out before the line is scanned, so it cannot mask an adjacent violation
 (3) every top-level ADR in docs/architecture/decisions/ (subdirectories are not
 scanned) has valid frontmatter (status/date; superseded_by iff Superseded).
 Exit 1 on any violation."""
-import re, sys
+import re, subprocess, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DOC_FILES = [p for p in (ROOT / "docs").rglob("*.md")] + [
-    ROOT / n for n in ("AGENTS.md", "ARCHITECTURE.md", "README.md", "CLAUDE.md") if (ROOT / n).exists()
-]
+
+
+def _tracked_markdown():
+    """Markdown files git actually tracks, or None if git is unavailable.
+
+    2026-07-25: this gate used to rglob the working tree, so a local scratch note under docs/
+    -- something that will never be committed -- made it exit 1 and blocked unrelated work. CI
+    runs on a clean checkout where tracked == present, so restricting to tracked files leaves CI
+    behaviour identical while making the local run mean what it claims: "what is in the repo".
+    Falls back to the filesystem walk if git is not usable (e.g. an exported tarball).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*.md"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout
+    except Exception:
+        return None
+    return [ROOT / p for p in out.split("\0") if p]
+
+
+_tracked = _tracked_markdown()
+if _tracked is None:
+    DOC_FILES = [p for p in (ROOT / "docs").rglob("*.md")] + [
+        ROOT / n for n in ("AGENTS.md", "ARCHITECTURE.md", "README.md", "CLAUDE.md") if (ROOT / n).exists()
+    ]
+else:
+    _top = {"AGENTS.md", "ARCHITECTURE.md", "README.md", "CLAUDE.md"}
+    DOC_FILES = [
+        p for p in _tracked
+        if (p.is_relative_to(ROOT / "docs") or p.name in _top and p.parent == ROOT) and p.exists()
+    ]
 LINK = re.compile(r"\[[^\]]*\]\(([^)#\s]+)(?:#[^)\s]*)?\)")
 PII = re.compile(r"(?i)\b(aorus|qube|dmmdea|dmmde|daniel|readypep|eclipton|dojolife|danmar|peptidos|pepclick|intranet-pds)\b"
                  r"|10\.0\.0\.\d+|D:\\Dev\\dmmdea|D:\\repos|/mnt/d/(Dev|repos)")
