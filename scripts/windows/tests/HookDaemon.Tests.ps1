@@ -9,6 +9,12 @@
 # unchanged. Real named pipes are exercised via an in-process fake daemon
 # (runspace thread serving one scripted response).
 #
+# Isolation: the raw-pipeline Describe runs under a sandboxed USERPROFILE, because
+# the daemon's -StateDir/-FixtureDir defaults resolve under ~\.claude\state and the
+# op=bundle_raw dispatch does not pass them. Everything the suite writes — rate-limit
+# tokens, hook fixtures — and the stale-token sweep it triggers must stay inside
+# TestDrive, never the operator's live state.
+#
 # Run: pwsh -NoProfile -Command "Invoke-Pester C:\path\to\agentic-memory-stack-for-claude-code\scripts\windows\tests\ -Output Detailed"
 
 BeforeAll {
@@ -335,11 +341,31 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         $script:BaseUrl = 'http://127.0.0.1:1'
         $script:HookContractVersion = '20.0'
         $script:StaleExitRequested = $false   # v0.22 L2: reset the self-exit flag per test
-        $script:stateDir = Join-Path $TestDrive ("state-{0}" -f ([guid]::NewGuid().ToString('N')))
+        # Sandbox USERPROFILE — the pattern DreamCatchup/InstallerParity/CodexShim use.
+        # Invoke-DaemonRequest dispatches op=bundle_raw to Invoke-DaemonRawBundle WITHOUT
+        # -StateDir/-FixtureDir, so both fall to their defaults, which resolve under
+        # $env:USERPROFILE\.claude\state — the OPERATOR'S LIVE STATE. Unsandboxed, the
+        # bundle_raw tests below wrote a real rate-limit token, appended synthetic stdin to
+        # the live hook-fixture drift corpus, and ran Invoke-RateLimitStateSweep against the
+        # live directory, deleting real sessions' tokens older than an hour. The fixed $sid
+        # also made the suite order-dependent on leftover live state: a token still inside
+        # the cooldown sent the full-bundle test down the checkpoint-only path and failed it.
+        # Rooting the sandbox here makes those defaults land on $script:stateDir, so the
+        # "no side effects" assertion below checks the path the code actually writes to.
+        $script:sandboxHome = Join-Path $TestDrive ("home-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $script:stateDir = Join-Path $script:sandboxHome '.claude\state'
         $script:fixDir = Join-Path $script:stateDir 'hook-fixtures'
         New-Item -ItemType Directory -Path $script:stateDir -Force | Out-Null
+        $script:savedUserProfile = $env:USERPROFILE
+        $env:USERPROFILE = $script:sandboxHome
         $script:sid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000'
         $script:rawSubstantive = '{"hook_event_name":"UserPromptSubmit","prompt":"what is the state of the admission gate","transcript_path":"C:\\x\\agentic-memory-stack\\' + $script:sid + '.jsonl"}'
+    }
+
+    AfterEach {
+        # USERPROFILE is process-global; restore it even when a test throws so the rest of
+        # the run (and anything Pester spawns) sees the real profile again.
+        if ($null -ne $script:savedUserProfile) { $env:USERPROFILE = $script:savedUserProfile }
     }
 
     It 'substantive prompt: bundle POST + render, rate-limit token consumed, 0.B fields returned' {
@@ -460,6 +486,12 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         Should -Invoke Invoke-Mem0Post -Times 1 -Exactly -ParameterFilter { $Uri -like '*context/bundle' }
         # v0.22 L2: a matching hash must NOT request self-exit (daemon keeps serving)
         $script:StaleExitRequested | Should -BeFalse
+        # Positive control for the sandbox, and the guard that keeps it in place. This is the
+        # one test that reaches the full write path through the DEFAULT -StateDir; the token
+        # appearing HERE proves the default resolved into the sandbox instead of the real
+        # ~\.claude\state. Drop the USERPROFILE sandbox from BeforeEach and this goes red
+        # rather than silently writing to the operator's live state again.
+        Test-Path (Join-Path $script:stateDir "user-prompt-rate-limit-$($script:sid)") | Should -BeTrue
     }
 }
 
