@@ -82,11 +82,38 @@ import httpx
 # via the Windows HTTP shim — the model-routing rule (all LLM judgment uses Codex, never a local
 # model; the v0.21.1 offload-e4b judge was the audited misrouting). The bridge lives in
 # mem0-server/ (sibling of scripts/). Local-judge mode still runs if the bridge is absent.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mem0-server"))
+# LAYOUT-AWARE (2026-07-25): parents[2] alone is correct ONLY in the repo layout
+# (scripts/wsl/x.py -> repo root). Deployed, this file lives at ~/apps/mem0-scripts/x.py, where
+# parents[2] is $HOME and the computed path is ~/mem0-server — which does not exist. The bridge
+# import therefore always failed in production and the weekly sweep exited as a no-op every run,
+# having never judged anything. Try both layouts; first hit wins.
+_BRIDGE_CANDIDATES = [
+    Path(__file__).resolve().parents[2] / "mem0-server",   # repo:     scripts/wsl/ -> <repo>/mem0-server
+    Path.home() / "apps" / "mem0-server",                  # deployed: ~/apps/mem0-scripts/ -> ~/apps/mem0-server
+]
+for _cand in _BRIDGE_CANDIDATES:
+    if _cand.is_dir():
+        sys.path.insert(0, str(_cand))
+        break
 try:
     import codex_shim_client as _codex
 except Exception:  # noqa: BLE001
     _codex = None
+
+
+def _install_is_provisioned() -> bool:
+    """True when this box has completed an install, so a missing bridge is a DEFECT.
+
+    Uses the WSL-side install receipt markers the installer writes at the end of its receipt
+    step (~/.mem0/role and ~/.mem0/authority-url). Their ABSENCE is the honest signal for a
+    fresh or half-finished box, which must stay quiet; their presence means the deploy claimed
+    to be complete, so anything missing after that is worth failing loudly for.
+
+    A module-level function on purpose: it is the seam the tests monkeypatch to exercise both
+    sides without touching the operator's real ~/.mem0.
+    """
+    mem0_dir = Path.home() / ".mem0"
+    return (mem0_dir / "role").exists() or (mem0_dir / "authority-url").exists()
 
 QDRANT = "http://127.0.0.1:6333"
 # v0.27.3 FIX: was the stale pre-egemma "memories" collection (pruned post-migration) — candidate
@@ -1193,10 +1220,28 @@ def main() -> int:
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
     if args.judge == "codex" and not args.unstamp and not args.promote:
         if _codex is None:
-            print("contradiction-sweep: --judge codex but codex_shim_client import failed", flush=True)
+            # Receipt-gated: the two cases look identical here but mean opposite things.
+            #   - No install receipt -> a fresh box or a half-finished deploy legitimately has no
+            #     bridge yet. Stay quiet (exit 0), or every partial install becomes a failed unit.
+            #   - Receipt present -> the box completed an install, so an unimportable bridge is a
+            #     DEPLOY DEFECT. Fail loudly: silence is exactly how the layout bug above survived
+            #     for months, judging nothing every week with nobody the wiser.
+            tried = ", ".join(str(c) for c in _BRIDGE_CANDIDATES)
+            if _install_is_provisioned():
+                print("contradiction-sweep: FATAL - this box has an install receipt but "
+                      "codex_shim_client is not importable, so nothing can be judged. "
+                      f"Searched for mem0-server in: {tried}", flush=True)
+                _append_summary({"dry_run": dry_run, "judge": "codex",
+                                 "outcome": "fatal:codex-bridge-missing-on-provisioned-box",
+                                 "skipped": "codex_shim_client import failed",
+                                 "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
+                return 2
+            print("contradiction-sweep: --judge codex but codex_shim_client is not importable; "
+                  f"nothing will be judged. Searched for mem0-server in: {tried}", flush=True)
             _append_summary({"dry_run": dry_run, "judge": "codex",
                              "outcome": "no-op:codex-bridge-unavailable",
-                             "skipped": "codex_shim_client import failed"})
+                             "skipped": "codex_shim_client import failed",
+                             "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
             return 0
         _h = _codex.health()
         if not _h.get("ok"):

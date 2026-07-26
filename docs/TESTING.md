@@ -16,12 +16,16 @@ CI runs the subset that needs **no live stack** — see the explicit list in
 Python 3.12+ with `pytest httpx fastapi fastmcp`; Windows with Pester 5.
 
 ```bash
-python -m pip install pytest httpx fastapi fastmcp
-python -m pytest -q mem0-server/tests/test_admission_gate.py  # etc. — see ci.yml for the full list
+# `python` does not exist on a stock Ubuntu/WSL box — use python3, or the stack venv
+# (~/apps/mem0-server/.venv/bin/python) which already has the dependencies.
+python3 -m pip install pytest httpx fastapi fastmcp
+python3 -m pytest -q mem0-server/tests/test_admission_gate.py  # etc. — see ci.yml for the full list
 ```
 
 ```powershell
-Invoke-Pester scripts/windows/tests -Output Detailed
+# Use the repo runner, NOT a bare Invoke-Pester: it pins Pester 5.x (the system 3.4.0 shadows it
+# and breaks `Should -Be`) and imports from a repo-local, non-synced module cache.
+pwsh -NoProfile -File .\scripts\windows\Run-PesterTests.ps1
 ```
 
 ## Live-stack suites
@@ -31,7 +35,15 @@ The remaining files in `mem0-server/tests/` exercise a **running deployment**
 for some suites the Codex CLI). Run them on a box with the stack installed:
 
 ```bash
-python -m pytest -q mem0-server/tests   # collects everything, live suites included
+python3 -m pytest -q mem0-server/tests   # every mem0-server suite, live ones included
+```
+
+`mem0-server/tests/` is **not** the whole repo. Two more pytest trees exist and are not
+collected by the command above — run them explicitly:
+
+```bash
+python3 -m pytest -q claude-config/tests    # hook-side: bundle, precompact, storage-cap
+python3 -m pytest -q scripts/wsl            # ship-log classifier / reclassifier
 ```
 
 `test_egemma_embedder.py` additionally needs the `mem0` package installed

@@ -797,15 +797,44 @@ def test_weekly_unit_judges_with_codex_not_local():
 
 
 def test_main_codex_preflight_noops_when_bridge_import_failed(monkeypatch):
-    """codex_shim_client missing entirely (fresh box, partial deploy): same
-    graceful SKIP — exit 0, no-op outcome, nothing judged."""
+    """codex_shim_client missing entirely on an UNPROVISIONED box (fresh box, partial
+    deploy): graceful SKIP — exit 0, no-op outcome, nothing judged. Turning this into a
+    failed unit would make every half-finished install noisy."""
     monkeypatch.setattr(sweep, "_codex", None)
+    monkeypatch.setattr(sweep, "_install_is_provisioned", lambda: False)
     monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--apply", "--judge", "codex"])
     summaries = []
     monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
     rc = sweep.main()
     assert rc == 0
     assert summaries[-1]["outcome"] == "no-op:codex-bridge-unavailable"
+
+
+def test_main_codex_preflight_fails_loud_when_bridge_missing_on_provisioned_box(monkeypatch):
+    """Same missing bridge, but the box carries an install receipt: that is a DEPLOY DEFECT,
+    not a half-finished install, so it must fail loudly (non-zero -> visible failed unit).
+
+    This is the other half of the 2026-07-25 decision. The quiet exit-0 path is what let the
+    deployed-layout sys.path bug judge nothing every week for months without a single signal."""
+    monkeypatch.setattr(sweep, "_codex", None)
+    monkeypatch.setattr(sweep, "_install_is_provisioned", lambda: True)
+    monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--apply", "--judge", "codex"])
+    summaries = []
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    rc = sweep.main()
+    assert rc == 2
+    assert summaries[-1]["outcome"] == "fatal:codex-bridge-missing-on-provisioned-box"
+    assert summaries[-1]["searched"]
+
+
+def test_install_is_provisioned_reads_receipt_markers(tmp_path, monkeypatch):
+    """The gate itself: absent markers -> unprovisioned; either marker -> provisioned.
+    Exercised against a temp HOME so the operator's real ~/.mem0 is never touched."""
+    monkeypatch.setattr(sweep.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".mem0").mkdir()
+    assert sweep._install_is_provisioned() is False
+    (tmp_path / ".mem0" / "role").write_text("brain\n", encoding="utf-8")
+    assert sweep._install_is_provisioned() is True
 
 
 def test_main_codex_preflight_never_falls_back_to_local(monkeypatch):
