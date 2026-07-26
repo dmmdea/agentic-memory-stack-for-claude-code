@@ -100,6 +100,21 @@ try:
 except Exception:  # noqa: BLE001
     _codex = None
 
+
+def _install_is_provisioned() -> bool:
+    """True when this box has completed an install, so a missing bridge is a DEFECT.
+
+    Uses the WSL-side install receipt markers the installer writes at the end of its receipt
+    step (~/.mem0/role and ~/.mem0/authority-url). Their ABSENCE is the honest signal for a
+    fresh or half-finished box, which must stay quiet; their presence means the deploy claimed
+    to be complete, so anything missing after that is worth failing loudly for.
+
+    A module-level function on purpose: it is the seam the tests monkeypatch to exercise both
+    sides without touching the operator's real ~/.mem0.
+    """
+    mem0_dir = Path.home() / ".mem0"
+    return (mem0_dir / "role").exists() or (mem0_dir / "authority-url").exists()
+
 QDRANT = "http://127.0.0.1:6333"
 # v0.27.3 FIX: was the stale pre-egemma "memories" collection (pruned post-migration) — candidate
 # DISCOVERY (scroll_canonicals + query_similar) ran on dead vectors while stamps wrote to the live
@@ -1205,14 +1220,22 @@ def main() -> int:
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
     if args.judge == "codex" and not args.unstamp and not args.promote:
         if _codex is None:
-            # Exit 0 is DELIBERATE and stays: a fresh box mid-install legitimately has no bridge
-            # yet, and turning that into a failed unit would make every partial deploy noisy
-            # (pinned by test_main_codex_preflight_noops_when_bridge_import_failed).
-            #
-            # But the silence is also how the layout bug below hid for months, so the message now
-            # names every path searched — with the layout fix above, reaching this line at all
-            # means a genuinely absent module rather than a miscomputed path.
+            # Receipt-gated: the two cases look identical here but mean opposite things.
+            #   - No install receipt -> a fresh box or a half-finished deploy legitimately has no
+            #     bridge yet. Stay quiet (exit 0), or every partial install becomes a failed unit.
+            #   - Receipt present -> the box completed an install, so an unimportable bridge is a
+            #     DEPLOY DEFECT. Fail loudly: silence is exactly how the layout bug above survived
+            #     for months, judging nothing every week with nobody the wiser.
             tried = ", ".join(str(c) for c in _BRIDGE_CANDIDATES)
+            if _install_is_provisioned():
+                print("contradiction-sweep: FATAL - this box has an install receipt but "
+                      "codex_shim_client is not importable, so nothing can be judged. "
+                      f"Searched for mem0-server in: {tried}", flush=True)
+                _append_summary({"dry_run": dry_run, "judge": "codex",
+                                 "outcome": "fatal:codex-bridge-missing-on-provisioned-box",
+                                 "skipped": "codex_shim_client import failed",
+                                 "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
+                return 2
             print("contradiction-sweep: --judge codex but codex_shim_client is not importable; "
                   f"nothing will be judged. Searched for mem0-server in: {tried}", flush=True)
             _append_summary({"dry_run": dry_run, "judge": "codex",
