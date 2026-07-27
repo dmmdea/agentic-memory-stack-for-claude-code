@@ -180,6 +180,47 @@ def auth(x_api_key: Optional[str] = Header(None)):
     if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
         raise HTTPException(401, "missing or invalid X-API-Key")
 
+
+# --- upstream rate-limit -> retryable status (2026-07-26) --------------------
+# llama-swap answers 429 under queue saturation. egemma_embedder absorbs a bounded
+# burst (3 attempts, backoff), but one that outlives the retry used to fall into
+# the generic `except Exception -> HTTPException(500)` at the bottom of every
+# endpoint and surface as a flat 500.
+#
+# That is not cosmetic. The MCP shim's offline failover fires on CONNECT-level
+# failures ONLY and never on an HTTP status, precisely so a real answer is never
+# masked by a stale replica read. A 500 is therefore taken as a real answer: the
+# write is NOT queued to the outbox, it is dropped. A memory add was lost exactly
+# this way. 503 + Retry-After says the opposite — "not an answer, ask again" —
+# which the shim can act on without weakening the never-mask-a-real-answer rule.
+#
+# Deliberately narrow: ONLY an upstream rate-limit maps to 503. Every other
+# exception keeps its 500, because a ctx-overflow or a coding error must stay
+# loud and must never be replayed.
+_RETRY_AFTER_SECONDS = "1"
+
+
+def _is_upstream_rate_limit(e: BaseException) -> bool:
+    """Duck-typed 429 detection, matching episode_embeddings._is_rate_limit:
+    openai.RateLimitError carries status_code == 429 and is named RateLimitError;
+    either signal qualifies. An httpx.HTTPStatusError wrapping a 429 response
+    (the reranker transport) qualifies too. NOTHING else does."""
+    if getattr(e, "status_code", None) == 429 or type(e).__name__ == "RateLimitError":
+        return True
+    resp = getattr(e, "response", None)
+    return getattr(resp, "status_code", None) == 429
+
+
+def _upstream_error(e: Exception) -> HTTPException:
+    """The HTTPException to raise for an otherwise-unhandled endpoint exception."""
+    if _is_upstream_rate_limit(e):
+        return HTTPException(
+            503,
+            f"upstream embedder rate-limited (llama-swap 429), retry shortly: {e}",
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+    return HTTPException(500, str(e))
+
 class AddIn(BaseModel):
     messages: Any   # str | list[dict] | dict
     user_id: str
@@ -881,7 +922,7 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
         raise
     except Exception as e:
         log.exception("add failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 @app.get("/v1/memories")
 def list_all(user_id: str = Query(...), limit: int = Query(100), x_api_key: Optional[str] = Header(None)):
@@ -897,7 +938,7 @@ def list_all(user_id: str = Query(...), limit: int = Query(100), x_api_key: Opti
         return mem.get_all(filters={"user_id": user_id}, top_k=limit)
     except Exception as e:
         log.exception("list failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 def _search_core(b: SearchIn):
     """v0.20 A.3: search internals shared by POST /v1/memories/search and
@@ -1164,7 +1205,7 @@ def search(b: SearchIn, x_api_key: Optional[str] = Header(None)):
         return _search_core(b)
     except Exception as e:
         log.exception("search failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 @app.get("/v1/memories/{mid}")
 def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
@@ -1203,7 +1244,7 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
         raise
     except Exception as e:
         log.exception("get_by_id failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.put("/v1/memories/{mid}")
@@ -1294,7 +1335,7 @@ def update(
         raise
     except Exception as e:
         log.exception("update failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 @app.patch("/v1/memories/{mid}/tier")
 def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
@@ -1385,7 +1426,7 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         )
     except Exception as e:
         log.exception("tier-update failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
     # Single ledger append AFTER successful payload update
     # transport field: "autonomous" when actor is from CANONICAL_AUTOPROMOTE_ALLOWED (dream-autopromote),
     # "cli-user-direct" for HMAC-validated user-direct canonical, "rest-api" otherwise.
@@ -1524,7 +1565,7 @@ def update_metadata(
         )
     except Exception as e:
         log.exception("metadata update failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
     try:
         _append_ledger({
             "event": "metadata-merge",
@@ -1560,7 +1601,7 @@ def create_goal_endpoint(b: GoalIn, x_api_key: Optional[str] = Header(None)):
         return {"ok": True, "goal_id": gid}
     except Exception as e:
         log.exception("goal create failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/goals/tree")
@@ -1573,7 +1614,7 @@ def goals_tree_endpoint(root_id: Optional[int] = None, x_api_key: Optional[str] 
             return _episodic_get_goal_tree(conn, root_goal_id=root_id)
     except Exception as e:
         log.exception("goals tree failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/goals")
@@ -1597,7 +1638,7 @@ def list_goals_endpoint(
             return _episodic_list_goals(conn, status=status, brand=brand, parent_goal_id=parent_id, limit=limit, initiative=initiative)
     except Exception as e:
         log.exception("goals list failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/goals/{goal_id}")
@@ -1614,7 +1655,7 @@ def get_goal_endpoint(goal_id: int, x_api_key: Optional[str] = Header(None)):
         raise
     except Exception as e:
         log.exception("goal get failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.patch("/v1/goals/{goal_id}/status")
@@ -1647,7 +1688,7 @@ def patch_goal_status_endpoint(goal_id: int, b: GoalStatusIn, x_api_key: Optiona
         raise
     except Exception as e:
         log.exception("goal status patch failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -1687,7 +1728,7 @@ def abandon_goal_endpoint(goal_id: int, b: GoalAbandonIn, x_api_key: Optional[st
         raise
     except Exception as e:
         log.exception("goal abandon failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -1734,7 +1775,7 @@ def complete_goal_endpoint(goal_id: int, b: GoalCompleteIn, x_api_key: Optional[
         raise
     except Exception as e:
         log.exception("goal complete failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -1792,7 +1833,7 @@ def patch_goal_priority_endpoint(goal_id: int, b: GoalPriorityIn, x_api_key: Opt
         raise
     except Exception as e:
         log.exception("goal priority patch failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.post("/v1/goals/{goal_id}/link_episode")
@@ -1819,7 +1860,7 @@ def link_goal_to_episode_endpoint(goal_id: int, b: GoalLinkEpisodeIn, x_api_key:
         raise
     except Exception as e:
         log.exception("goal link episode failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.post("/v1/goals/{source_goal_id}/merge")
@@ -1903,7 +1944,7 @@ def merge_goals_endpoint(
         raise
     except Exception as e:
         log.exception("goal merge failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -1958,7 +1999,7 @@ def create_open_question_endpoint(b: OpenQuestionIn, x_api_key: Optional[str] = 
         return {"ok": True, "open_question_id": oqid}
     except Exception as e:
         log.exception("open_question create failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/open_questions")
@@ -1978,7 +2019,7 @@ def list_open_questions_endpoint(
             return _episodic_list_open_questions(conn, status=status, brand=brand, limit=limit, initiative=initiative)
     except Exception as e:
         log.exception("open_questions list failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.post("/v1/open_questions/search")
@@ -1990,7 +2031,7 @@ def search_open_questions_endpoint(b: OpenQuestionSearchIn, x_api_key: Optional[
             return _episodic_search_open_questions(conn, query=b.query, brand=b.brand, status=b.status, limit=b.limit)
     except Exception as e:
         log.exception("open_questions search failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/open_questions/{oq_id}")
@@ -2007,7 +2048,7 @@ def get_open_question_endpoint(oq_id: int, x_api_key: Optional[str] = Header(Non
         raise
     except Exception as e:
         log.exception("open_question get failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.patch("/v1/open_questions/{oq_id}/resolve")
@@ -2040,7 +2081,7 @@ def resolve_open_question_endpoint(oq_id: int, b: OpenQuestionResolveIn, x_api_k
         raise
     except Exception as e:
         log.exception("open_question resolve failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.patch("/v1/open_questions/{oq_id}/status")
@@ -2071,7 +2112,7 @@ def patch_open_question_status_endpoint(oq_id: int, b: OpenQuestionStatusIn, x_a
         raise HTTPException(400, str(ve))
     except Exception as e:
         log.exception("open_question status patch failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -2119,7 +2160,7 @@ def episode_checkpoint(b: EpisodeCheckpointIn, x_api_key: Optional[str] = Header
         return _checkpoint_core(b)
     except Exception as e:
         log.exception("episode checkpoint failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -2425,7 +2466,7 @@ def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
         return {"ok": True, "session_id": b.session_id, "episode_id": episode_id}
     except Exception as e:
         log.exception("episode create failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.post("/v1/episodes/search")
@@ -2439,7 +2480,7 @@ def search_episodes(b: EpisodeSearchIn, x_api_key: Optional[str] = Header(None))
         return {"results": results, "count": len(results)}
     except Exception as e:
         log.exception("episode search failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/episodes/count")
@@ -2455,7 +2496,7 @@ def episodes_count(
             return _episodic_count(conn, since, brand)
     except Exception as e:
         log.exception("episode count failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/episodes")
@@ -2471,7 +2512,7 @@ def list_episodes(
             return _episodic_recent(conn, recent, brand)
     except Exception as e:
         log.exception("episode list failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.get("/v1/episodes/{episode_id}")
@@ -2488,7 +2529,7 @@ def get_episode_endpoint(episode_id: int, x_api_key: Optional[str] = Header(None
         raise
     except Exception as e:
         log.exception("episode get failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
 
 
 @app.delete("/v1/memories/{mid}")
@@ -2611,7 +2652,7 @@ def delete(
         result = mem.delete(memory_id=mid)
     except Exception as e:
         log.exception("delete failed")
-        raise HTTPException(500, str(e))
+        raise _upstream_error(e)
     try:
         _append_ledger({
             "event": "delete",

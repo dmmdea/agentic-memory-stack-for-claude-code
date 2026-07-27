@@ -41,25 +41,37 @@ _DOC_PREFIX = "title: none | text: "
 
 # MEM-12 (2026-07-03): llama-swap returns 429 bursts under queue saturation
 # (25 RateLimitErrors/7d observed, incl. an 8-in-1s burst; every one killed a
-# bundle raw-trace fallback). ONE bounded retry after a short jittered sleep
-# absorbs the burst case. Anything still 429 after the retry re-raises so
-# callers keep their existing fail-soft handling — the retry only ADDS a second
-# attempt, it never swallows an error (never-500 invariant preserved: no new
-# failure mode, no silent loss). Other errors are NEVER retried (a 500 from a
+# bundle raw-trace fallback). A bounded retry after a short jittered sleep
+# absorbs the burst case. Anything still 429 after the last attempt re-raises so
+# callers keep their existing fail-soft handling — the retry only ADDS attempts,
+# it never swallows an error. Other errors are NEVER retried (a 500 from a
 # ctx overflow must surface immediately, not get replayed).
+#
+# 2026-07-26: widened from a single retry to three total attempts with
+# exponential backoff. One retry absorbed a two-deep burst but not the 8-in-1s
+# one on record, and a burst that outlived it reached app.py's generic handler
+# as a flat HTTP 500 — which the MCP shim treats as a real answer rather than a
+# retryable condition, so the write was dropped instead of queued. app.py now
+# also maps a surviving 429 to 503 (see _upstream_error there); widening the
+# retry is the half that stops most bursts from getting that far.
+_RETRY_429_ATTEMPTS = 3      # total attempts = 2 retries
 _RETRY_429_BASE_SLEEP_S = 0.25
 _RETRY_429_JITTER_S = 0.25   # uniform [0, 0.25) on top — de-syncs burst callers
 
 
-def _retry_once_on_429(call):
-    """Run ``call()``; on a single openai.RateLimitError (llama-swap 429) sleep
-    ~250ms + jitter and retry ONCE. The second 429 propagates unchanged; no
-    other exception type is ever retried."""
-    try:
-        return call()
-    except RateLimitError:
-        time.sleep(_RETRY_429_BASE_SLEEP_S + random.random() * _RETRY_429_JITTER_S)
-        return call()
+def _retry_on_429(call):
+    """Run ``call()``; on openai.RateLimitError (llama-swap 429) sleep with
+    exponential backoff + jitter and retry, up to ``_RETRY_429_ATTEMPTS`` total
+    attempts. The final 429 propagates unchanged; no other exception type is
+    ever retried."""
+    for attempt in range(_RETRY_429_ATTEMPTS):
+        try:
+            return call()
+        except RateLimitError:
+            if attempt == _RETRY_429_ATTEMPTS - 1:
+                raise
+            time.sleep(_RETRY_429_BASE_SLEEP_S * (2 ** attempt)
+                       + random.random() * _RETRY_429_JITTER_S)
 
 # v0.22 M4: EmbeddingGemma is served at --ctx-size 2048 (the MODEL's trained max —
 # must NOT be raised). A record that passes the 4000-CHAR storage gate (app.py
@@ -133,9 +145,10 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
     text is rewritten with the action-appropriate prefix before it goes out.
     """
 
-    # MEM-12: this class already does the one bounded 429 retry internally.
+    # MEM-12: this class already does the bounded 429 retry internally.
     # episode_embeddings.py checks this marker so an injected shim instance is
-    # not ALSO wrapped by the episode-path retry (max attempts stays 2, never 4).
+    # not ALSO wrapped by the episode-path retry (attempts stay _RETRY_429_ATTEMPTS,
+    # never a multiple of it).
     handles_429_retry = True
 
     def embed(
@@ -149,10 +162,10 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
         prefixed = _prefix_for(memory_action) + _truncate_for_embedding(text)
         # MEM-12: one bounded retry on a llama-swap 429 burst; see module header.
         parent = super()
-        return _retry_once_on_429(lambda: parent.embed(prefixed, memory_action))
+        return _retry_on_429(lambda: parent.embed(prefixed, memory_action))
 
     def embed_batch(self, texts, memory_action="add"):
         prefix = _prefix_for(memory_action)
         prefixed = [prefix + _truncate_for_embedding(t) for t in texts]
         parent = super()
-        return _retry_once_on_429(lambda: parent.embed_batch(prefixed, memory_action))
+        return _retry_on_429(lambda: parent.embed_batch(prefixed, memory_action))

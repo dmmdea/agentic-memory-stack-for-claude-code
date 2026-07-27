@@ -1,11 +1,29 @@
 # mem0-server/tests/test_shim_offline.py
 from __future__ import annotations
 import importlib.util
+import re
 from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIM_PATH = REPO_ROOT / "scripts" / "wsl" / "mem0-mcp-shim.py"
+APP_PATH = REPO_ROOT / "mem0-server" / "app.py"
+
+
+def test_no_endpoint_raises_a_bare_500_for_an_unclassified_exception():
+    """The shim's 503 handling below is only worth anything if the server actually
+    SENDS 503 rather than a flat 500. Every endpoint's generic handler must route
+    through app._upstream_error; one missed site is one endpoint that still drops
+    writes during a 429 burst.
+
+    Source-level on purpose: `import app` builds the live Memory client, so it cannot
+    run on a headless CI runner — but this guard must. The behavioural counterpart
+    lives in test_upstream_rate_limit_status.py (local-only)."""
+    src = APP_PATH.read_text(encoding="utf-8")
+    stragglers = re.findall(r"raise HTTPException\(\s*500\s*,\s*str\(e\)\s*\)", src)
+    assert not stragglers, (
+        f"{len(stragglers)} endpoint(s) still raise a bare 500 for an unclassified "
+        "exception; route them through _upstream_error(e)")
 
 @pytest.fixture()
 def shim(monkeypatch, tmp_path):
@@ -43,6 +61,63 @@ def test_request_does_not_fail_over_on_http_status(shim, monkeypatch):
     monkeypatch.setattr(shim.httpx, "request", fake_request)
     with pytest.raises(httpx.HTTPStatusError):
         shim._request("POST", "/v1/memories/search", json={"query": "q"})
+
+def test_request_fails_over_to_local_on_503(shim, monkeypatch):
+    """503 is the server saying "not an answer, ask again" (app.py._upstream_error,
+    raised when llama-swap 429s outlive the embedder's bounded retry). Unlike every
+    other status it must NOT be handed to the caller as a real answer."""
+    import httpx
+    calls = []
+    def fake_request(method, url, **kw):
+        calls.append(url)
+        req = httpx.Request(method, url)
+        if url.startswith(shim.AUTHORITY_URL):
+            return httpx.Response(503, json={"detail": "upstream embedder rate-limited"},
+                                  headers={"Retry-After": "1"}, request=req)
+        return httpx.Response(200, json={"results": [{"memory": "x"}]}, request=req)
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    payload, source = shim._request("POST", "/v1/memories/search", json={"query": "q"})
+    assert source == "local-replica"
+    assert any(u.startswith(shim.LOCAL_URL) for u in calls)
+
+
+def test_request_both_503_raises_offline_error(shim, monkeypatch):
+    """Authority AND replica rate-limited => offline, not a masked 503."""
+    import httpx
+    def fake_request(method, url, **kw):
+        req = httpx.Request(method, url)
+        return httpx.Response(503, json={"detail": "rate-limited"}, request=req)
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    with pytest.raises(shim.OfflineError):
+        shim._request("POST", "/v1/memories/search", json={"query": "q"})
+
+
+def test_authority_only_503_raises_offline_error_so_the_write_queues(shim, monkeypatch):
+    """The data-loss fix. A write meeting a 503 must raise OfflineError, because every
+    mutation tool catches exactly that to queue into the outbox. Before this, the 503's
+    predecessor (a flat 500) escaped as HTTPStatusError past those handlers and the
+    write was DROPPED — a memory add was lost that way."""
+    import httpx
+    def fake_request(method, url, **kw):
+        req = httpx.Request(method, url)
+        return httpx.Response(503, json={"detail": "upstream embedder rate-limited"},
+                              headers={"Retry-After": "1"}, request=req)
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    with pytest.raises(shim.OfflineError):
+        shim._authority_only("POST", "/v1/memories", json={"messages": "m", "user_id": "u"})
+
+
+def test_authority_only_500_still_propagates_and_never_queues(shim, monkeypatch):
+    """Scope guard: ONLY 503 became retryable. A 500 is still a real answer — queueing
+    it would replay a genuinely bad op forever."""
+    import httpx
+    def fake_request(method, url, **kw):
+        req = httpx.Request(method, url)
+        return httpx.Response(500, json={"detail": "boom"}, request=req)
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    with pytest.raises(httpx.HTTPStatusError):
+        shim._authority_only("POST", "/v1/memories", json={"messages": "m", "user_id": "u"})
+
 
 def test_read_timeout_propagates_and_never_fails_over(shim, monkeypatch):
     # A ReadTimeout means the authority ACCEPTED the connection and is merely slow —

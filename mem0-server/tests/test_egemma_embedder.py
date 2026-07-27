@@ -20,6 +20,7 @@ from egemma_embedder import (
     _QUERY_PREFIX,
     _DOC_PREFIX,
     _EMBED_TOKEN_BUDGET,
+    _RETRY_429_ATTEMPTS,
     _RETRY_429_BASE_SLEEP_S,
     _RETRY_429_JITTER_S,
     _prefix_for,
@@ -116,10 +117,13 @@ def test_embed_batch_search_prefixes_all_queries(monkeypatch):
     assert captured["texts"] == [_QUERY_PREFIX + "q1", _QUERY_PREFIX + "q2"]
 
 
-# ---- MEM-12 (2026-07-03): ONE bounded retry on a llama-swap 429 burst ----
-# 25 RateLimitErrors/7d (incl. 8-in-1s) each killed a bundle raw-trace fallback;
-# a single ~250ms+jitter retry absorbs the burst. The contract pinned here:
-# exactly ONE retry, ONLY on RateLimitError, second 429 re-raises unchanged.
+# ---- MEM-12 (2026-07-03): bounded retry on a llama-swap 429 burst ----
+# 25 RateLimitErrors/7d (incl. 8-in-1s) each killed a bundle raw-trace fallback.
+# Widened 2026-07-26 from one retry to _RETRY_429_ATTEMPTS total attempts with
+# exponential backoff: one retry could not absorb the 8-in-1s burst on record, and
+# a survivor reached app.py as a flat 500 that the MCP shim reads as a real answer,
+# dropping the write. The contract pinned here: at most _RETRY_429_ATTEMPTS
+# attempts, ONLY on RateLimitError, the final 429 re-raises unchanged.
 
 def _rate_limit_error():
     import openai
@@ -149,9 +153,11 @@ def test_embed_429_then_success_retries_once(monkeypatch):
     assert _RETRY_429_BASE_SLEEP_S <= slept[0] < _RETRY_429_BASE_SLEEP_S + _RETRY_429_JITTER_S
 
 
-def test_embed_429_twice_reraises_no_third_attempt(monkeypatch):
-    """Never-500 invariant intact: the retry never swallows — a sustained 429
-    surfaces to the caller's existing fail-soft handling after attempt #2."""
+def test_embed_sustained_429_reraises_after_bounded_attempts(monkeypatch):
+    """The retry never swallows — a sustained 429 surfaces to the caller's existing
+    fail-soft handling (and, above it, to app.py's 503 mapping) once the bounded
+    attempts are spent. Bounded means bounded: no unbounded hammering of a
+    saturated queue."""
     import openai
     emb = _make_embedder()
     calls = {"n": 0}
@@ -164,7 +170,28 @@ def test_embed_429_twice_reraises_no_third_attempt(monkeypatch):
     monkeypatch.setattr("egemma_embedder.time.sleep", lambda s: None)
     with pytest.raises(openai.RateLimitError):
         emb.embed("still saturated", memory_action="search")
-    assert calls["n"] == 2, "bounded: never more than one retry"
+    assert calls["n"] == _RETRY_429_ATTEMPTS, "bounded at _RETRY_429_ATTEMPTS"
+
+
+def test_embed_429_backoff_is_exponential_with_jitter(monkeypatch):
+    """Each retry waits longer than the last. A flat delay re-collides with the
+    same saturated queue; doubling plus jitter de-syncs concurrent callers."""
+    emb = _make_embedder()
+    slept = []
+
+    def always_429(self, text, memory_action=None):
+        raise _rate_limit_error()
+
+    monkeypatch.setattr("mem0.embeddings.openai.OpenAIEmbedding.embed", always_429)
+    monkeypatch.setattr("egemma_embedder.time.sleep", lambda s: slept.append(s))
+    with pytest.raises(Exception):
+        emb.embed("saturated", memory_action="add")
+
+    assert len(slept) == _RETRY_429_ATTEMPTS - 1, "one sleep per retry, none after the last"
+    for i, s in enumerate(slept):
+        base = _RETRY_429_BASE_SLEEP_S * (2 ** i)
+        assert base <= s < base + _RETRY_429_JITTER_S, f"attempt {i} backoff out of band"
+    assert slept == sorted(slept), "backoff must not shrink"
 
 
 def test_embed_non_429_error_is_never_retried(monkeypatch):
@@ -201,7 +228,7 @@ def test_embed_batch_429_then_success_retries_once(monkeypatch):
 
 def test_shim_advertises_self_retry_marker():
     """episode_embeddings._embed_with_429_retry keys off this marker so the
-    composed episode path never multiplies attempts beyond 2."""
+    composed episode path never multiplies the embedder's own attempt budget."""
     assert EmbeddingGemmaEmbedder.handles_429_retry is True
 
 
