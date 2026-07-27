@@ -52,8 +52,12 @@ def _tool_fn(tool):
 
 
 class _FakeResp:
-    def __init__(self, payload=None):
+    # status_code is part of the httpx.Response surface the shim reads: since
+    # 2026-07-26 it checks for a retryable 503 before trusting the body. A stand-in
+    # missing a field the real object always carries is a defect in the stand-in.
+    def __init__(self, payload=None, status_code=200):
         self._payload = payload if payload is not None else {"ok": True, "results": []}
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None

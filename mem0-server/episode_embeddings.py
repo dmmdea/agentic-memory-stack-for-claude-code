@@ -53,7 +53,8 @@ def _is_rate_limit(exc: Exception) -> bool:
 def _embed_with_429_retry(embedder, text: str, memory_action: str):
     """embedder.embed with the single bounded 429 retry. Skipped entirely when
     the embedder self-retries (EmbeddingGemmaEmbedder.handles_429_retry — the
-    production shim) so composed layers never multiply attempts beyond 2."""
+    production shim, which as of 2026-07-26 makes 3 attempts with backoff) so
+    composed layers never multiply attempts."""
     if getattr(embedder, "handles_429_retry", False):
         return embedder.embed(text, memory_action=memory_action)
     try:

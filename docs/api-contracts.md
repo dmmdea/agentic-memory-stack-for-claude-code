@@ -10,7 +10,9 @@ Base URL: `http://127.0.0.1:18791` (loopback only, accessible from Windows via W
 
 Auth: every endpoint except `/health` requires the `X-API-Key` header. Key is at `~/.mem0/api-key` (WSL, mode 0600). Comparison uses `hmac.compare_digest` (constant-time).
 
-All endpoints return JSON. On error, HTTP 401 (auth), 400 (validation), or 500 (server). Error body is `{"detail": "..."}`.
+All endpoints return JSON. On error, HTTP 401 (auth), 400 (validation), 503 (upstream rate-limited — **retryable**, carries `Retry-After`), or 500 (server). Error body is `{"detail": "..."}`.
+
+**503 is the one status a client must not treat as a real answer.** It means the embedder upstream (llama-swap) answered 429 and outlived the embedder's bounded retry — the server can serve this request later, it just cannot now. A client that treats it as a failed operation drops the work: the MCP shim's failover fires on connect-level errors only, so before 503 existed this arrived as 500, was read as a real answer, and the write was discarded instead of queued. The shim now routes 503 the way it routes a connect failure (reads → local replica, writes → outbox). Every other status remains a real answer and must never be masked with a stale read.
 
 ### `GET /health`
 
