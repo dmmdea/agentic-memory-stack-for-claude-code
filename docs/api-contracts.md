@@ -118,7 +118,7 @@ Liveness + version probe. No auth.
 Stdio JSON-RPC, spawned by Claude Code / Codex CLI as a child process. The shim wraps the REST API; tool names map to functions in the shim file.
 
 ### `memory_health()` → dict
-Returns `GET /health`.
+Returns `GET /health/deep` — the probe that actually exercises the store and the embedder, not the static `/health`. A health tool that cannot observe a broken write path does not merely fail to help, it certifies the outage: shallow `/health` reported `ok=True` throughout a live embedder rate-limit burst that had `POST /v1/memories` returning 500. Liveness callers on a hot path (the prompt-time storage-cap check, the installer's port probe) stay on shallow `/health` deliberately.
 
 ### `memory_add(text, user_id="youruser", infer=False, metadata=None)` → dict
 Wraps `POST /v1/memories`. Use `metadata={"source":"...", "tier":"evidence"}` minimum.

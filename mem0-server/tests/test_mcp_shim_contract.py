@@ -77,6 +77,28 @@ def test_shim_versions_are_known_to_the_server(shim):
     assert shim.BUNDLE_HOOK_CONTRACT_VERSION == "20.0"
 
 
+def test_memory_health_probes_the_deep_endpoint_that_actually_embeds(shim, monkeypatch):
+    """A health tool that cannot see a broken write path is worse than none: it
+    actively certifies the outage. Shallow /health returns a STATIC dict — no
+    Qdrant call, no embed — so it answered ok=True through a live 429 burst that
+    had memory_add returning 500. Only /health/deep embeds (asserting the 768-dim
+    vector) and touches the store, so that is what this tool must probe."""
+    seen = []
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        seen.append((method, url))
+        return _FakeResp({"ok": True, "checks": {"embedder": {"ok": True, "dim": 768}}})
+
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    _tool_fn(shim.memory_health)()
+    assert len(seen) == 1
+    method, url = seen[0]
+    assert method == "GET"
+    assert url.endswith("/health/deep"), (
+        f"memory_health probed {url!r}; the shallow /health never embeds and would "
+        "report ok=True while the write path is broken")
+
+
 def test_memory_search_posts_search_contract_version(shim, monkeypatch):
     posts = []
 

@@ -385,8 +385,19 @@ def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = N
 
 @mcp.tool
 def memory_health() -> dict:
-    """Check mem0 server health."""
-    data, source = _request("GET", "/health")
+    """Check mem0 server health: store, embedder, and canonical-key end to end."""
+    # 2026-07-26: was GET /health, which returns a STATIC dict — it never touches
+    # Qdrant or the embedder, so it answered ok=True while the write path was
+    # broken. A live 429 burst on the embedder had memory_add returning 500 for an
+    # extended period and this tool reported healthy throughout, which is exactly
+    # why the outage stayed invisible. /health/deep actually embeds (asserts the
+    # 768-dim vector comes back), checks Qdrant, and reports the canonical key.
+    #
+    # This is a diagnostic tool an agent calls deliberately, not a liveness probe,
+    # so /health/deep's extra cost is the right trade. The genuinely hot/liveness
+    # callers stay on shallow /health on purpose: storage-cap-check.sh (prompt hot
+    # path, 1s timeout, fail-open) and install/1-wsl-services.sh (port-up check).
+    data, source = _request("GET", "/health/deep")
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
