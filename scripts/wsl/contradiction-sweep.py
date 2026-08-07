@@ -1301,26 +1301,36 @@ def main() -> int:
         _append_summary({"dry_run": dry_run, "outcome": "degraded:qdrant-unreachable",
                          "skipped": f"qdrant unreachable: {str(e)[:120]}"})
         return 1
-    try:
-        models_r = httpx.get(f"{LLAMA_SWAP}/v1/models", timeout=5.0)
-        models_r.raise_for_status()
-        models_json = models_r.json()
-    except (httpx.HTTPError, OSError, ValueError) as e:
-        print(f"contradiction-sweep: FAIL preflight - llama-swap unreachable: {e}", flush=True)
-        _append_summary({"dry_run": dry_run, "outcome": "degraded:llama-swap-unreachable",
-                         "skipped": f"llama-swap unreachable: {str(e)[:120]}"})
-        return 1
-    # v0.20 M16: a typo'd/retired --model used to 4xx on every pair -> N silent
-    # skips, exit 0, fresh JSONL ts. Verify the judge actually exists up front.
-    if not model_available(models_json, args.model):
-        served = [m.get("id") for m in (models_json.get("data") or [])
-                  if isinstance(m, dict)][:20]
-        print(f"contradiction-sweep: FAIL preflight - model {args.model!r} not served "
-              f"by llama-swap (available: {served})", flush=True)
-        _append_summary({"dry_run": dry_run, "model": args.model,
-                         "outcome": f"degraded:model-not-available:{args.model}",
-                         "skipped": f"model {args.model} not in llama-swap /v1/models"})
-        return 1
+    # AMS-07 (W4): the llama-swap preflight is for the LOCAL judge only.
+    # --model names a llama-swap model, and llama-swap rosters are per-machine
+    # (the shipped default was named on a different box's roster), so demanding
+    # it when Codex is the judge made the sweep no-op for a reason that has
+    # nothing to do with the work it was about to do. That is how AMS-07's
+    # second dead dependency hid BEHIND the first: with the shim finally
+    # spawning, the very next run still failed preflight on an unused model.
+    # The Codex path needs the shim (checked by the judge dispatch), not
+    # llama-swap.
+    if args.judge == "local":
+        try:
+            models_r = httpx.get(f"{LLAMA_SWAP}/v1/models", timeout=5.0)
+            models_r.raise_for_status()
+            models_json = models_r.json()
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            print(f"contradiction-sweep: FAIL preflight - llama-swap unreachable: {e}", flush=True)
+            _append_summary({"dry_run": dry_run, "outcome": "degraded:llama-swap-unreachable",
+                             "skipped": f"llama-swap unreachable: {str(e)[:120]}"})
+            return 1
+        # v0.20 M16: a typo'd/retired --model used to 4xx on every pair -> N silent
+        # skips, exit 0, fresh JSONL ts. Verify the judge actually exists up front.
+        if not model_available(models_json, args.model):
+            served = [m.get("id") for m in (models_json.get("data") or [])
+                      if isinstance(m, dict)][:20]
+            print(f"contradiction-sweep: FAIL preflight - model {args.model!r} not served "
+                  f"by llama-swap (available: {served})", flush=True)
+            _append_summary({"dry_run": dry_run, "model": args.model,
+                             "outcome": f"degraded:model-not-available:{args.model}",
+                             "skipped": f"model {args.model} not in llama-swap /v1/models"})
+            return 1
     api_key = None
     if not dry_run:
         try:
