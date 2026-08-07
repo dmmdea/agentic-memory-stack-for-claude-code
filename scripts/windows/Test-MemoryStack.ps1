@@ -1088,7 +1088,24 @@ try {
                 if (-not $ids) { $ids = '(ids not recorded - pre-fix-pass run)' }
                 Add-Check 'RECOVERY' 'contradiction sweep' 'WARN' "last APPLY run $($lastApply.ts) (judge=$(if ($applyJudge) { $applyJudge } else { 'codex' })) stamped yes=$($lastApply.yes_count) ENFORCED record(s): $ids - review; clear false positives: contradiction-sweep.py --unstamp <id> (admission-gate.md sweep runbook)"
             }
-            elseif ($lastOutcome -and $lastOutcome -ne 'ok') { Add-Check 'RECOVERY' 'contradiction sweep' 'WARN' "last run $($last.ts) outcome=$lastOutcome - sweep did no protective work (journalctl --user -u contradiction-sweep; admission-gate.md runbook)" }
+            elseif ($lastOutcome -and $lastOutcome -ne 'ok') {
+                # AMS-07 (W4): a SINGLE non-ok run is a skipped week (the documented,
+                # accepted trade). A STREAK means the judgment leg is dead — 7 in a row
+                # went unnoticed for a month because this row only ever looked at the
+                # last run. The streak escalates to FAIL only now that the sweep unit
+                # spawns the shim on demand, so a red row is actionable rather than
+                # permanent (review F16).
+                $streak = 0
+                for ($i = $normalRuns.Count - 1; $i -ge 0; $i--) {
+                    $o = if ($normalRuns[$i].PSObject.Properties['outcome']) { [string]$normalRuns[$i].outcome } else { 'ok' }
+                    if ($o -ne 'ok') { $streak++ } else { break }
+                }
+                if ($streak -ge 3) {
+                    Add-Check 'RECOVERY' 'contradiction sweep' 'FAIL' "$streak CONSECUTIVE non-ok runs (latest $($last.ts) outcome=$lastOutcome) - the judgment leg is DEAD, not merely skipping a week. Check the Codex shim on :18792 (ExecStartPre spawns it; ~/.claude/state/codex-shim.disabled would suppress that) then: journalctl --user -u contradiction-sweep"
+                } else {
+                    Add-Check 'RECOVERY' 'contradiction sweep' 'WARN' "last run $($last.ts) outcome=$lastOutcome ($streak consecutive) - sweep did no protective work; a single skipped week is the accepted trade (journalctl --user -u contradiction-sweep; admission-gate.md runbook)"
+                }
+            }
             elseif ($age.TotalDays -gt 14) { Add-Check 'RECOVERY' 'contradiction sweep' 'WARN' "last run $($last.ts) >14d ago - timer may not be firing" }
             else { Add-Check 'RECOVERY' 'contradiction sweep' 'OK' "last $($last.ts) outcome=$(if ($lastOutcome) { $lastOutcome } else { 'n/a (pre-v0.20 entry)' }) pairs=$($last.pairs_checked) yes=$($last.yes_count) stamped=$($last.stamped_count)$procDetail; last apply yes=$(if ($lastApply) { $lastApply.yes_count } else { 'n/a' })" }
         }

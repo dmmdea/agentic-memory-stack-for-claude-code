@@ -15,8 +15,21 @@ Type=oneshot
 # local YES polluting the store with spurious advisory stamps. It NEVER falls
 # back to local (that would re-introduce the audited misrouting). The
 # session-time SessionStart rejudge (storage-cap-check.sh, fires when the shim
-# IS up, weekly-throttled) remains the authoritative resolution path, so
-# contradiction coverage continues on any week the operator opens a session.
+# IS up, weekly-throttled) resolves EXISTING stamps — but it runs
+# --rejudge-stamped, so it never DISCOVERS new contradictions. This unit is the
+# only discovery pass in the stack; a skipped week here is a week with no
+# discovery at all.
+#
+# AMS-07 (W4): 7/7 historical runs were no-ops because the Codex shim was never
+# up at 05:00 — its spawn was gated on a flag nothing creates, and even after
+# that decoupling a session-spawned shim self-shuts after 240 idle minutes, so
+# Sunday 05:00 would still find it down. ExecStartPre spawns the shim ON DEMAND
+# (fail-soft '-': if the spawn cannot run, the sweep still preflights and
+# no-ops exactly as before — never a hard failure, never a local-judge
+# fallback). Spawning a Windows process from WSL is sound here because the shim
+# is reached over HTTP, not stdio: only its stdout would be mangled, and
+# nothing reads it.
+ExecStartPre=-/usr/bin/env powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\__WIN_USER__\\.claude\\scripts\\codex-shim-spawn.ps1
 ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --apply --limit 50 --judge codex
 StandardOutput=journal
 StandardError=journal

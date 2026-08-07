@@ -1,14 +1,32 @@
 # codex-shim-spawn.ps1 — v0.27.1 R5: best-effort SessionStart launcher for the Codex HTTP shim.
 #
-# Registered as an async SessionStart hook so the shim is warm during a session
-# IF — and only if — a consumer needs it. The shim is only used when the NLI
-# write-gate is enabled (or a Codex contradiction re-judge is running), so spawning
-# it every session by default would be pure waste. Gate the spawn on a marker file:
+# Registered as an async SessionStart hook so the shim is warm during a session.
 #
-#   ~/.claude/state/codex-shim.enabled    (created by the write-gate increment)
+# AMS-07 (W4, audit P1): this spawn used to require
+# ~/.claude/state/codex-shim.enabled — a flag whose ONLY documented creator was
+# the manual "turn the NLI write-gate on" step, which was never performed.
+# NOTHING in either repo creates it. So the shim never spawned, and BOTH of its
+# consumers died silently with it:
+#   * the session-time contradiction RE-JUDGE (storage-cap-check.sh probes
+#     :18792 and skips when it is down), and
+#   * the weekly DISCOVERY sweep (7/7 receipts read no-op:codex-shim-unreachable).
+# Coupling a general judgment service to an unrelated feature flag is what made
+# a P1 capability dead-on-arrival for its whole life.
 #
-# Absent  -> no-op (default; the shim never spawns, zero overhead).
-# Present -> spawn the shim if it is not already listening.
+# The gate is now OPT-OUT. Both consumers are always registered, so the shim is
+# always wanted; the flag file below exists for anyone who deliberately wants
+# the old zero-listener posture:
+#
+#   ~/.claude/state/codex-shim.disabled   (present -> never spawn)
+#
+# POSTURE NOTE (deliberate, recorded in the program ledger): the shim now
+# listens on loopback :18792 for up to its idle life (~4h) after each session
+# start, where before it never listened at all. It is loopback-only, its /judge
+# verb requires the mem0 API key under a constant-time compare, /health returns
+# nothing sensitive, and a named singleton mutex means parallel sessions cannot
+# accumulate processes. The exposure it adds is that a local process able to
+# read ~/.mem0/api-key can spend the Codex subscription — unchanged in kind
+# from every other stack component that holds that key.
 #
 # Self-contained on purpose (no lib dot-source for the launch path): a broken lib
 # deploy must not break SessionStart, and the shim's named mutex makes a duplicate
@@ -20,8 +38,8 @@ $ErrorActionPreference = 'SilentlyContinue'
 try { [void][Console]::In.ReadToEnd() } catch {}
 
 $dir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
-$flag = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'state', 'codex-shim.enabled')
-if (-not [System.IO.File]::Exists($flag)) { exit 0 }
+$optOut = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'state', 'codex-shim.disabled')
+if ([System.IO.File]::Exists($optOut)) { exit 0 }
 
 # Resolve the port (env override, else the reserved default 18792).
 $port = 18792
