@@ -31,7 +31,11 @@ EmbeddingGemma-300m (llama-swap, CPU, 768-d) is **asymmetric**: queries and docu
 
 ### Hybrid scoring — and the trap every maintainer must know
 
-mem0's search runs three legs: dense cosine (semantic), BM25 (keyword), entity boosts. The subtlety that has caused real miscalibration:
+mem0's search runs three legs: dense cosine (semantic), BM25 (keyword), entity boosts.
+
+The BM25 leg is not free-standing: mem0 encodes sparse vectors with **fastembed**, an optional dependency that is now explicitly installed — and post-condition-checked — by the installer. When the encoder is missing at runtime, mem0 **fail-softs to dense-only search silently** (one one-shot log warning, no error), so exact-identifier lookups keep returning answers — confidently wrong ones. That fallback is now loud: `/health/deep` runs a **GATING `sparse_leg` check** — a deterministic canary that derives a token from the *oldest* BM25-bearing point and requires that point back in the top keyword results — so a dead lexical leg fails the health gate (and the deploy gate) instead of staying green. Check shape: [`../systems/mem0-api.md`](../systems/mem0-api.md).
+
+The subtlety that has caused real miscalibration:
 
 > **The relevance gate applies to the raw SEMANTIC cosine; the score the API returns is the COMBINED (semantic+bm25+entity)/max value — a different, higher scale.**
 
@@ -109,12 +113,14 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 | Cross-brand leak | fail-closed brand policy at server *and* client |
 | Slow retrieval blocks typing | fail-open hook, 8 s daemon budget, rerank off the hot path |
 | Search silently degrades after a change | the multi-hop/temporal eval guard + retrieval-drift canary (private eval harness) re-baseline retrieval deterministically, for free |
+| BM25 encoder (fastembed) vanishes → silent dense-only fallback | the GATING `sparse_leg` check on `/health/deep` (deterministic oldest-point canary) fails the health and deploy gates |
 
 ## External dependencies
 
 - **llama-swap on `:11436`** — EmbeddingGemma-300m (embeddings) and bge-reranker-v2-m3 (deliberate-path rerank).
 - **mem0 server on `:18791`** — the bundle / recall / search endpoints and all gating.
 - **Qdrant** — the dense / keyword / entity candidate store the search legs query.
+- **fastembed** (in the server venv) — the BM25 sparse encoder; explicit in the installer with a loadability post-condition, and watched by the GATING `sparse_leg` health check (mem0 silently degrades to dense-only without it).
 
 ## Invariants and assumptions
 

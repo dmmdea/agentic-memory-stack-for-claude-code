@@ -83,6 +83,20 @@ def test_unknown_keys_are_blind_preserved():
     assert out == {"some_future_key": 1, "junk": "y"}
 
 
+def test_owned_and_marker_sets_are_exactly_the_contract():
+    # Pin the LITERAL sets. A test that iterates over the imported set is
+    # vacuous against a key being removed from it (the loop simply shrinks) —
+    # the same mutation-blindness class the W1 ledger records three times.
+    assert MEM0_OWNED_KEYS == {
+        "data", "hash", "text_lemmatized", "created_at", "updated_at",
+        "user_id", "agent_id", "run_id", "actor_id", "role",
+    }
+    assert NLI_CHECK_MARKERS == {
+        "nli_gate_checked_at", "contradiction_checked_at",
+        "contradicts_canonical_pending",
+    }
+
+
 def test_dropped_is_union_and_disjoint_sanity():
     assert DROPPED_KEYS == MEM0_OWNED_KEYS | NLI_CHECK_MARKERS
     assert "contradicts_canonical" not in DROPPED_KEYS
