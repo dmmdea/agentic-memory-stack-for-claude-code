@@ -237,7 +237,7 @@ Describe 'live HttpListener (integration)' {
     }
 }
 
-Describe 'codex-shim-spawn.ps1 flag-gate' {
+Describe 'codex-shim-spawn.ps1 opt-out gate (AMS-07)' {
     BeforeAll {
         $script:winDir2 = Split-Path -Parent $PSScriptRoot
         $script:ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -255,8 +255,16 @@ Describe 'codex-shim-spawn.ps1 flag-gate' {
                 Where-Object { $_.CommandLine -and $_.CommandLine -match 'codex-shim\.ps1' })
         }
     }
-    It 'marker ABSENT => exit 0 and nothing is launched on the port' {
+    It 'OPT-OUT marker present => exit 0 and nothing is launched on the port' {
+        # AMS-07 (W4) inverted this contract. It used to require an opt-IN
+        # marker (codex-shim.enabled) that NOTHING in either repo created, so
+        # the shim never spawned and both of its consumers — the weekly
+        # contradiction discovery sweep and the session-time re-judge — were
+        # dead for the capability's entire life. The gate is now opt-OUT, and
+        # this test pins the remaining escape hatch.
         $sb = New-SpawnSandbox
+        New-Item -ItemType Directory -Path (Join-Path $sb '.claude\state') -Force | Out-Null
+        Set-Content -Path (Join-Path $sb '.claude\state\codex-shim.disabled') -Value '1'
         # Free ephemeral port for the spawn to (not) use.
         $tl = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
         $tl.Start(); $p = $tl.LocalEndpoint.Port; $tl.Stop()
@@ -268,18 +276,53 @@ Describe 'codex-shim-spawn.ps1 flag-gate' {
             # this the script blocks forever waiting for stdin EOF.
             '' | & $script:ps51 -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb '.claude\scripts\codex-shim-spawn.ps1') *> $null
             $LASTEXITCODE | Should -Be 0
-            Start-Sleep -Milliseconds 600
+            Start-Sleep -Milliseconds 1500
             $listening = [bool](Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue)
-            $listening | Should -BeFalse -Because 'with no codex-shim.enabled marker the launcher must be a no-op'
+            $listening | Should -BeFalse -Because 'codex-shim.disabled is the deliberate opt-out and must still suppress the spawn'
         } finally {
             $env:USERPROFILE = $saved
             if ($savedPort) { $env:MEM0_CODEX_SHIM_PORT = $savedPort } else { Remove-Item Env:\MEM0_CODEX_SHIM_PORT -ErrorAction SilentlyContinue }
         }
     }
-    It 'marker PRESENT but port already listening => does NOT double-spawn' {
+
+    It 'NO marker (the default) => the shim IS launched' {
+        # The positive half of the inverted contract: on a default box the
+        # launcher must actually raise the shim, or AMS-07 is only fixed on
+        # paper.
+        #
+        # Observe the LAUNCHER's contract with a stub shim. Neither a bound port
+        # nor a live process is observable here: codex-shim.ps1 holds a
+        # MACHINE-GLOBAL singleton mutex, so on any box where the real shim is
+        # already up the sandbox instance exits immediately without binding —
+        # correct product behaviour that would make either assertion pass on a
+        # clean CI runner and fail on a working machine. Launching the shim is
+        # this script's whole job; binding is the shim's, covered elsewhere.
+        $sb = New-SpawnSandbox
+        $stub = Join-Path $sb '.claude\scripts\codex-shim.ps1'
+        $marker = Join-Path $sb 'spawned.marker'
+        Set-Content -Path $stub -Value "Set-Content -Path '$marker' -Value 'launched'" -Encoding UTF8
+        $tl = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $tl.Start(); $p = $tl.LocalEndpoint.Port; $tl.Stop()
+        $saved = $env:USERPROFILE; $savedPort = $env:MEM0_CODEX_SHIM_PORT
+        try {
+            $env:USERPROFILE = $sb; $env:MEM0_CODEX_SHIM_PORT = "$p"
+            '' | & $script:ps51 -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb '.claude\scripts\codex-shim-spawn.ps1') *> $null
+            $LASTEXITCODE | Should -Be 0
+            $launched = $false
+            foreach ($i in 1..40) {
+                if (Test-Path $marker) { $launched = $true; break }
+                Start-Sleep -Milliseconds 250
+            }
+            $launched | Should -BeTrue -Because 'with the opt-in flag removed, a default box must raise the shim its consumers need'
+        } finally {
+            $env:USERPROFILE = $saved
+            if ($savedPort) { $env:MEM0_CODEX_SHIM_PORT = $savedPort } else { Remove-Item Env:\MEM0_CODEX_SHIM_PORT -ErrorAction SilentlyContinue }
+        }
+    }
+    It 'port already listening => does NOT double-spawn' {
         $sb = New-SpawnSandbox
         New-Item -ItemType Directory -Path (Join-Path $sb '.claude\state') -Force | Out-Null
-        Set-Content -Path (Join-Path $sb '.claude\state\codex-shim.enabled') -Value '1'
+        # (no marker needed now: the gate is opt-out)
         # Occupy the port ourselves so the launcher's probe sees it as already-running.
         $tl = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
         $tl.Start(); $p = $tl.LocalEndpoint.Port
