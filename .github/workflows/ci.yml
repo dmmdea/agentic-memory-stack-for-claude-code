@@ -63,6 +63,7 @@ jobs:
         run: |
           python -m pytest -q \
             mem0-server/tests/test_admission_gate.py \
+            mem0-server/tests/test_ams01_history_window.py \
             mem0-server/tests/test_autopromote_actor.py \
             mem0-server/tests/test_canonical_key_provider.py \
             mem0-server/tests/test_codex_shim_client.py \
