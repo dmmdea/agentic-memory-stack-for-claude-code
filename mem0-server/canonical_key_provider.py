@@ -11,7 +11,8 @@ consumer. Three sources, strict precedence:
    XDG_RUNTIME_DIR is unset and no explicit path given (e.g. plain Windows).
 2. ~/.mem0/canonical-key.dpapi — DPAPI blob, decryptable on Windows only.
 3. ~/.mem0/canonical-key — plaintext mode-600 file (dev/recovery fallback;
-   removed from the production WSL box at v0.19 Phase H cutover).
+   removed on boxes where the per-box v0.19 Phase H cutover has been run;
+    the operative source elsewhere - /health/deep reports which).
 
 DPAPI threat model (per docs/systems/dpapi-canonical-key.md):
 - Same-user processes on the same machine CAN decrypt — this is intentional;
