@@ -309,3 +309,60 @@ Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10
         }
     }
 }
+
+Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
+    BeforeAll {
+        $script:winDir   = Split-Path -Parent $PSScriptRoot
+        $script:repoRoot = Split-Path -Parent (Split-Path -Parent $script:winDir)
+        function script:Get-CodeLines {
+            param([string]$Path)
+            ((Get-Content $Path -Raw) -split "`r?`n" |
+                Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        }
+        $script:dreamCode = script:Get-CodeLines (Join-Path $script:winDir 'dream-consolidate.ps1')
+        $script:tmsCode   = script:Get-CodeLines (Join-Path $script:winDir 'Test-MemoryStack.ps1')
+        $script:bannerRaw = Get-Content (Join-Path $script:repoRoot 'claude-config\storage-cap-check.sh') -Raw
+        $script:bannerCode = ($script:bannerRaw -split "`r?`n" |
+            Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    }
+
+    It 'AMS-06: the dedup-mutex skip does NOT mark the throttle' {
+        # The wake-collision burned TWO nights per occurrence because this branch
+        # stamped last-dream on a skip; dream-catchup then read "fresh". Extract
+        # the mutex block from executable code and assert the mark is gone.
+        $m = [regex]::Match($script:dreamCode, '(?s)\$dedupLock\s*=.*?\$driftBefore\s*=')
+        $m.Success | Should -BeTrue -Because 'the mutex block must exist between the dedup.lock check and the drift BEFORE snapshot'
+        $m.Value | Should -Not -Match 'Mark-Throttle' -Because 'a skipped consolidation must leave the throttle open so the next 03:00 recovers same-day'
+    }
+
+    It 'AMS-06: a DryRun cannot stamp the live throttle or the consolidation receipt' {
+        # The zero-signal branch marked the throttle unconditionally — a dry run
+        # reaching it burned that night's real 03:00 (F4). And prune.json is the
+        # consolidation-completed receipt: a dry-run write spoofs the probe (F5).
+        $script:dreamCode | Should -Match 'if \(-not \$DryRun\) \{ Mark-Throttle -Name \$ThrottleName \}' -Because 'the zero-signal mark must be DryRun-guarded'
+        $m = [regex]::Match($script:dreamCode, "(?s)if \(-not \`$DryRun\) \{\s*Save-PhaseState -Phase 'prune'")
+        $m.Success | Should -BeTrue -Because 'the prune receipt must only be written by a REAL run'
+    }
+
+    It 'AMS-08: the guard death and drift alarms are typed records with a compat probe' {
+        $script:dreamCode.Contains("Test-DriftStateSupport") | Should -BeTrue -Because 'the ps1 must probe the deployed python for --state support (either repo may deploy first)'
+        $script:dreamCode.Contains("-match '--state'") | Should -BeTrue -Because 'the probe must grep the help text, not assume'
+        $script:dreamCode.Contains("Add-DriftRecord -Kind 'guard-dead'") | Should -BeTrue -Because 'two consecutive snapshot failures must append a guard-dead record (the 07-21 fail-open signature)'
+        $script:dreamCode.Contains("Add-DriftRecord -Kind 'drift'") | Should -BeTrue -Because 'the classic alarm must carry its kind so readers can filter'
+        $script:dreamCode.Contains("Write-DriftHeartbeat -Event 'snapshot-failure'") | Should -BeTrue -Because 'a failed snapshot must beat the heartbeat, not skip silently'
+    }
+
+    It 'W3 verifier rows exist and the drift row filters kinds' {
+        $script:tmsCode | Should -Match "Add-Check 'LIVENESS' 'dream cycle'" -Because 'AMS-06 needs the artifact-based cycle row (L9)'
+        $script:tmsCode | Should -Match "Add-Check 'RECOVERY' 'drift guard liveness'" -Because 'AMS-08 needs the guard-liveness row (R11)'
+        $script:tmsCode | Should -Match "Add-Check 'LIVENESS' 'capability manifest'" -Because 'the liveness contract needs its verdict row (L10)'
+        $script:tmsCode.Contains("-not `$_.kind -or `$_.kind -eq 'drift'") | Should -BeTrue -Because 'legacy kind-absent records must read as drift (F14) and guard-dead must not be mislabeled a drift alarm'
+        $script:tmsCode.Contains("`$TmsRole -eq 'replica'") | Should -BeTrue -Because 'brain-only rows must be role-gated (F3) or a replica FAILs forever'
+    }
+
+    It 'the SessionStart banner emits the heartbeat digest from files, never /health/deep' {
+        $script:bannerCode.Contains('[heartbeat]') | Should -BeTrue -Because 'the digest line is the load-bearing mouth (morning-summary has no other reader)'
+        $script:bannerCode.Contains('retrieval-drift-state.json') | Should -BeTrue -Because 'drift alarm/guard-dead must reach the banner'
+        $script:bannerCode | Should -Not -Match 'health/deep' -Because 'the banner must never call the expensive endpoint inline (the 1s cold-morning guard exists for a reason)'
+    }
+}

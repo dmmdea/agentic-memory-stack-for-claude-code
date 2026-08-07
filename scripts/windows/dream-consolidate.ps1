@@ -79,6 +79,73 @@ function Save-PhaseState {
 # throws and NO-OPs under -DryRun or when the receipt lacks RepoRootWsl. The Python reads
 # the search key from ~/.mem0/api-key itself (read_api_key_fallback), so no key wiring here.
 # Mirrors the memory-index-build.py invocation (same venv python + -d $DcDistro bash -c).
+# W3 AMS-08/F1: does the deployed drift guard support persistent state? Probe its
+# help text ONCE per run. The moat python and this public script ship separately,
+# so either side may deploy first — an older python fed unknown flags would
+# argparse-exit 2 on EVERY snapshot, manufacturing a nightly guard-dead alarm
+# (the exact fail-open class this wave closes). Degrade to legacy invocation +
+# a compat-fallback marker instead.
+$script:DriftStateWsl  = "/home/$DcWslUser/.mem0/retrieval-drift-state.json"
+$script:DriftStateUnc  = Join-Path $DcHomeUnc '.mem0\retrieval-drift-state.json'
+$script:DriftStateSupported = $null
+function Test-DriftStateSupport {
+    if ($null -ne $script:DriftStateSupported) { return $script:DriftStateSupported }
+    $script:DriftStateSupported = $false
+    if (-not [string]::IsNullOrWhiteSpace($DcEvalWsl)) {
+        try {
+            $py = "/home/$DcWslUser/apps/mem0-server/.venv/bin/python"
+            $s  = "$DcEvalWsl/eval/retrieval-drift/retrieval_drift.py"
+            $help = wsl.exe -d $DcDistro -e bash -c "$py $s snapshot -h 2>&1; $py $s compare -h 2>&1"
+            if (($help -join ' ') -match '--state') { $script:DriftStateSupported = $true }
+        } catch { $script:DriftStateSupported = $false }
+    }
+    return $script:DriftStateSupported
+}
+
+# Append a typed record to consolidation-drift.jsonl. kind='drift' is the
+# classic alarm; kind='guard-dead' means the GUARD ITSELF stopped comparing
+# (>=2 consecutive snapshot failures — the 07-21/07-23 fail-open signature).
+# Readers treat kind-absent legacy records as kind='drift' (review F14).
+function Add-DriftRecord {
+    param([string]$Kind, [string]$Detail)
+    $driftFlag = Join-Path $DcHomeUnc '.mem0\consolidation-drift.jsonl'
+    $rec = [ordered]@{
+        ts             = (Get-Date).ToString('o')
+        schema_version = 'drift-v1'
+        kind           = $Kind
+        detail         = $Detail
+    } | ConvertTo-Json -Compress -Depth 5
+    $dir = Split-Path -Parent $driftFlag
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::AppendAllText($driftFlag, $rec + "`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-DriftHeartbeat {
+    param([string]$Event)  # snapshot-failure | compat-fallback
+    try {
+        if (Test-DriftStateSupport) {
+            $py = "/home/$DcWslUser/apps/mem0-server/.venv/bin/python"
+            $s  = "$DcEvalWsl/eval/retrieval-drift/retrieval_drift.py"
+            wsl.exe -d $DcDistro -e bash -c "$py $s heartbeat --state '$($script:DriftStateWsl)' --event $Event 2>&1" | Out-Null
+            if ($Event -eq 'snapshot-failure' -and (Test-Path $script:DriftStateUnc)) {
+                $st = Get-Content $script:DriftStateUnc -Raw | ConvertFrom-Json
+                if ([int]$st.consecutive_snapshot_failures -ge 2) {
+                    Add-DriftRecord -Kind 'guard-dead' -Detail "drift guard has not compared for $($st.consecutive_snapshot_failures) consecutive attempts (snapshot failures) -- the canary is not protecting consolidations"
+                    Write-MemoryLog -Component 'dream' -Message '  !! DRIFT GUARD DEAD -- >=2 consecutive snapshot failures; flagged to consolidation-drift.jsonl'
+                }
+            }
+        } elseif (-not (Test-Path $script:DriftStateUnc)) {
+            # Legacy python deployed: minimal marker so the liveness row can WARN
+            # (compat-fallback) rather than staying blind; NEVER guard-dead (F1).
+            $marker = @{ compat_fallback = $true; ts = (Get-Date).ToString('o') } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText($script:DriftStateUnc, $marker + "`n", (New-Object System.Text.UTF8Encoding($false)))
+            Write-MemoryLog -Component 'dream' -Message '  drift guard running in compat-fallback (deployed retrieval_drift.py predates --state)'
+        }
+    } catch {
+        Write-MemoryLog -Component 'dream' -Message "  drift heartbeat ($Event) failed (non-fatal): $_"
+    }
+}
+
 function Invoke-DriftSnapshot {
     param([string]$Phase, [string]$OutWsl)  # Phase = 'before' | 'after'
     if ($DryRun -or [string]::IsNullOrWhiteSpace($DcEvalWsl)) { return $null }
@@ -93,11 +160,14 @@ function Invoke-DriftSnapshot {
         Write-MemoryLog -Component 'dream' -Message "  drift $Phase snapshot (exit=$snapExit): $out"
         if ($snapExit -ne 0) {
             Write-MemoryLog -Component 'dream' -Message "  drift $Phase snapshot FAILED (exit=$snapExit) -- skipping drift compare this cycle (no false alarm)"
+            # W3: the skip is no longer silent — the guard's own death now counts.
+            Write-DriftHeartbeat -Event 'snapshot-failure'
             return $null
         }
         return $OutWsl
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  drift $Phase snapshot FAILED (non-fatal): $_"
+        Write-DriftHeartbeat -Event 'snapshot-failure'
         return $null
     }
 }
@@ -362,7 +432,11 @@ Write-MemoryLog -Component 'dream' -Message "  gathered $($signals.Count) signal
 
 if ($signals.Count -eq 0) {
     Write-MemoryLog -Component 'dream' -Message '  no signals; nothing to consolidate'
-    Mark-Throttle -Name $ThrottleName
+    # AMS-06/F4 (W3): a legitimate full-cycle no-op marks the throttle — but only
+    # a REAL run. A -DryRun reaching here used to stamp the LIVE throttle and
+    # silently burn that night's 03:00 (same defect class as the prune.json
+    # DryRun spoof fixed below).
+    if (-not $DryRun) { Mark-Throttle -Name $ThrottleName }
     return
 }
 
@@ -372,8 +446,14 @@ $dedupLock = "$DcHomeUnc\.mem0\dedup.lock"
 if (Test-Path $dedupLock) {
     $age = (Get-Date) - (Get-Item $dedupLock).LastWriteTime
     if ($age.TotalMinutes -lt 30) {
-        Write-MemoryLog -Component 'dream' -Message "  semantic-dedup mutex held (lock $([int]$age.TotalMinutes)min old), skipping consolidate phase"
-        Mark-Throttle -Name $ThrottleName
+        # AMS-06 (W3, audit P1): this branch marked the throttle on a skip, so a
+        # wake-collision (both missed tasks collapsing to the wake instant) cost
+        # TWO nights: the skipped one, then the next 03:00 throttle-blocked by the
+        # skip's own stamp — while dream-catchup read the fresh stamp and reported
+        # "fresh". 5 of 12 audit-window nights lost; recurred 07-31 and 08-03.
+        # Mirror the malformed-JSON branch: skip WITHOUT marking, so the next
+        # 03:00 (or the next catch-up window) recovers same-day.
+        Write-MemoryLog -Component 'dream' -Message "  semantic-dedup mutex held (lock $([int]$age.TotalMinutes)min old), skipping consolidate phase; throttle NOT marked"
         return
     }
 }
@@ -775,11 +855,20 @@ if (-not $DryRun -and -not $DcRepoWsl) {
     }
     Mark-Throttle -Name $ThrottleName
 }
-Save-PhaseState -Phase 'prune' -Payload @{
-    posted_insights = $posted
-    index_rebuilt = ($indexExit -eq 0)
-    index_exit_code = $indexExit
-    timestamp = (Get-Date).ToString('o')
+# W3/F5: prune.json is the "consolidation actually completed" receipt the new
+# dream-cycle probe reads. Two honesty fixes: (a) a -DryRun must not refresh it
+# (a dry run could spoof the receipt); (b) the no-RepoRootWsl branch used to
+# reach here with indexExit=0 and write index_rebuilt=true though no index ran.
+if (-not $DryRun) {
+    Save-PhaseState -Phase 'prune' -Payload @{
+        posted_insights = $posted
+        index_rebuilt = (($indexExit -eq 0) -and [bool]$DcRepoWsl)
+        index_exit_code = $(if ($DcRepoWsl) { $indexExit } else { $null })
+        skipped_reason = $(if (-not $DcRepoWsl) { 'no RepoRootWsl in receipt' } else { $null })
+        timestamp = (Get-Date).ToString('o')
+    }
+} else {
+    Write-MemoryLog -Component 'dream' -Message '  prune receipt not written (DryRun) -- prune.json is the consolidation-completed receipt'
 }
 
 # Brand-scope integrity audit (2026-06-20) — nightly check that no canonical fact ABOUT a
@@ -810,26 +899,71 @@ if ($driftBefore) {
         if ($driftAfter) {
             $py     = "/home/$DcWslUser/apps/mem0-server/.venv/bin/python"
             $script = "$DcEvalWsl/eval/retrieval-drift/retrieval_drift.py"
-            $cmp     = wsl.exe -d $DcDistro -e bash -c "$py $script compare '$driftBefore' '$driftAfter' 2>&1"
+            # W3 AMS-08: pass persistent state when the deployed python supports
+            # it — enables the cross-run legs (absolute floor + high-water mark)
+            # the same-night compare is structurally blind to. Legacy python =
+            # legacy invocation, byte-identical to pre-W3 behavior (F1).
+            $stateArg = if (Test-DriftStateSupport) { " --state '$($script:DriftStateWsl)'" } else { '' }
+            $cmp     = wsl.exe -d $DcDistro -e bash -c "$py $script compare '$driftBefore' '$driftAfter'$stateArg 2>&1"
             $cmpExit = $LASTEXITCODE
             Write-MemoryLog -Component 'dream' -Message "  drift compare (exit=$cmpExit): $cmp"
             if ($cmpExit -eq 2) {
-                $driftFlag = Join-Path $DcHomeUnc '.mem0\consolidation-drift.jsonl'
-                $driftRec  = [ordered]@{
-                    ts             = (Get-Date).ToString('o')
-                    schema_version = 'drift-v1'
-                    detail         = ($cmp -join ' ')
-                } | ConvertTo-Json -Compress -Depth 5
-                $driftDir = Split-Path -Parent $driftFlag
-                if (-not (Test-Path $driftDir)) { New-Item -ItemType Directory -Path $driftDir -Force | Out-Null }
-                # No-BOM UTF-8 append (codebase JSONL convention — Add-Content -Encoding UTF8 prepends
-                # a BOM that breaks line-by-line parsing; see Write-PromotionGateLog).
-                [System.IO.File]::AppendAllText($driftFlag, $driftRec + "`n", (New-Object System.Text.UTF8Encoding($false)))
-                Write-MemoryLog -Component 'dream' -Message '  !! RETRIEVAL DRIFT ALARM — a canary fact became unretrievable after consolidation; flagged to consolidation-drift.jsonl'
+                Add-DriftRecord -Kind 'drift' -Detail ($cmp -join ' ')
+                Write-MemoryLog -Component 'dream' -Message '  !! RETRIEVAL DRIFT ALARM -- a canary became unretrievable (within-run) or the cross-run floor/high-water legs tripped; flagged to consolidation-drift.jsonl'
             }
         }
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  drift compare FAILED (non-fatal): $_"
+    }
+}
+
+# ── W3 AMS-05: nightly HEARTBEAT section in the morning summary ──────────────
+# The dream is the one surface that runs nightly with services warm, so it can
+# afford a real /health/deep read. The SessionStart banner points here; sections
+# use ASCII '--' in headers on purpose (this file is also written by PS 5.1
+# catch-up runs, whose Add-Content mangled em-dashes into mojibake — see the
+# pre-W3 section headers).
+if (-not $DryRun) {
+    try {
+        # Rotation first (review F10): the file was append-forever with zero
+        # readers; now that it has readers, bound it. Keep the newest 20
+        # sections; archive the rest.
+        if ((Test-Path $morningSummaryPath) -and ((Get-Item $morningSummaryPath).Length -gt 131072)) {
+            $msRaw = Get-Content $morningSummaryPath -Raw
+            $msParts = [regex]::Split($msRaw, "(?m)^(?=## )")
+            if ($msParts.Count -gt 21) {
+                $archivePath = Join-Path $DreamStateDir 'morning-summary.archive.md'
+                $old = $msParts[0..($msParts.Count - 21)] -join ''
+                $new = $msParts[($msParts.Count - 20)..($msParts.Count - 1)] -join ''
+                [System.IO.File]::AppendAllText($archivePath, $old, (New-Object System.Text.UTF8Encoding($false)))
+                [System.IO.File]::WriteAllText($morningSummaryPath, $new, (New-Object System.Text.UTF8Encoding($false)))
+                Write-MemoryLog -Component 'dream' -Message "  morning-summary rotated ($($msParts.Count - 21) old section(s) archived)"
+            }
+        }
+        $hbLines = @()
+        try {
+            $hbHd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30
+            $hbLines += "- /health/deep ok: $($hbHd.ok)"
+            if ($hbHd.checks.capabilities) {
+                $cap = $hbHd.checks.capabilities
+                $deadReq = @($cap.dead_required)
+                $unk = @($cap.unknown)
+                if ($deadReq.Count -gt 0) { $hbLines += "- DEAD required capabilities: $($deadReq -join ', ')" }
+                $hbLines += "- capabilities: $($deadReq.Count) dead-required, $($unk.Count) unknown"
+            }
+            if ($hbHd.checks.retrieval_drift) {
+                $rd = $hbHd.checks.retrieval_drift
+                if ($rd.alarm) { $hbLines += "- DRIFT ALARM standing (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm))" }
+                if ([int]$rd.consecutive_snapshot_failures -ge 2) { $hbLines += '- DRIFT GUARD DEAD (>=2 consecutive snapshot failures)' }
+            }
+        } catch {
+            $hbLines += "- /health/deep unreachable from the dream: $($_.Exception.Message)"
+        }
+        if ($hbLines.Count -eq 0) { $hbLines = @('- healthy; no standing alarms visible to the dream') }
+        $hbSection = "`n## Heartbeat -- $((Get-Date).ToString('yyyy-MM-dd HH:mm'))`n" + ($hbLines -join "`n") + "`n"
+        [System.IO.File]::AppendAllText($morningSummaryPath, $hbSection, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-MemoryLog -Component 'dream' -Message "  heartbeat section failed (non-fatal): $_"
     }
 }
 
