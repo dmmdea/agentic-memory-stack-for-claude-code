@@ -29,7 +29,7 @@ server returns 403). The load-bearing rules:
 
 ## Consequences
 
-- Ground truth is unforgeable: canonical cannot be created or mutated without the DPAPI-held key, so a
+- Ground truth is unforgeable: canonical cannot be created or mutated without the HMAC signing key, so a
   compromised or prompt-injected agent cannot elevate its own guesses.
 - Every tier change is auditable — each PATCH and insight add appends to the append-only tier ledger.
 - Canonical promotion is deliberately a human (or tightly-gated nightly) act, not an in-session one.

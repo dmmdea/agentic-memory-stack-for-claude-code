@@ -809,21 +809,55 @@ function Get-BrandFromTranscriptPath {
 function Redact-Secrets {
     # Strip credential-shaped substrings from session text BEFORE it is sent to the extraction
     # LLM (Codex, external) or POSTed to mem0 (a local queryable store) — pasted keys/tokens must
-    # not flow into either. Mirrors SkillOpt harvest.redact_secrets (one shared pattern set across
-    # the ecosystem's two session readers). Safe prose is untouched. Replacement strings are SINGLE-
-    # quoted so $1/$2 reach the .NET regex engine as backreferences, not PowerShell variables;
-    # -replace is case-insensitive by default, so no (?i) is needed.
+    # not flow into either. Safe prose is untouched.
+    #
+    # ONE canonical pattern set, FOUR copies: this one, mem0-server/redact.py,
+    # claude-config/precompact_capture.py, and the SkillOpt reader on the offline replica host.
+    # The pattern STRINGS below are byte-identical to the Python copies (only the backreference
+    # syntax differs — $1 here, \1 there). The three in-repo copies are pinned to each other by
+    # tests/fixtures/redaction-cases.jsonl, which all three suites iterate; the full rationale for
+    # each shape lives in mem0-server/redact.py's docstring. Highlights that are load-bearing here:
+    #
+    #   * `(?<![A-Za-z0-9])`, NOT `\b`, is the left boundary. Unanchored `sk-…` corrupted 12 live
+    #     stored points ('task-notification' -> 'ta[REDACTED_OPENAI_KEY]'); `\b` also refuses to
+    #     fire on a genuine `MY_sk-…` and — the bigger defect — cannot match `API_KEY` inside
+    #     `MEM0_API_KEY=` at all, because `_` is a word character. The lookbehind admits a keyword
+    #     that follows `_`/`-`, which covers `MEM0_API_KEY=` / `CRON_SECRET=` / `GITHUB_TOKEN=`;
+    #     the `[A-Za-z0-9]*[_-]?` prefix tolerance covers the separator-less form the lookbehind
+    #     still rejects (`apiToken=`, `vercelSecret:`). The fixture pins the two separately.
+    #   * `[ \t]*[:=][ \t]*`, NEVER `\s*[:=]\s*`. (The comment that used to sit here claimed the
+    #     `\n\n` turn-break hazard had been avoided — it had not: `\s*` DID span it, so
+    #     'API token:\n\n[assistant] Sure' redacted the next role tag.)
+    #   * The value class never spans a newline, is bounded, and consumes escapes, so an unbalanced
+    #     quote cannot swallow the rest of the transcript window and `"abc\"def12345"` cannot leak
+    #     its tail. An unquoted value must be >= 16 chars or contain a digit, so
+    #     'password: never store passwords in mem0' survives.
+    #   * NO bare-hex and NO bare-`Bearer` rule — they eat live git SHAs, Cloudflare zone ids, and
+    #     a stored fact about Bearer tokens.
+    #   * Every pattern carries an explicit case flag. `-replace` is case-insensitive by default and
+    #     Python's `re` is not; that difference was the ONLY observed drift between the copies
+    #     (`SK-UPPER` redacted here, kept there). Spelling `(?i)` / `(?-i:…)` into the pattern makes
+    #     the strings identical across runtimes AND the behaviour identical. Do not remove them.
+    #
+    # Replacement strings are SINGLE-quoted so $1 reaches the .NET regex engine as a backreference,
+    # not a PowerShell variable. Patterns are kept one-per-line and never concatenated: inside
+    # `@(...)`, `,` binds tighter than `+`, so an unparenthesized concat shatters the pair.
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return $Text }
     $rules = @(
-        @('sk-[A-Za-z0-9_-]{10,}', '[REDACTED_OPENAI_KEY]'),
-        @('(Authorization:\s*Bearer\s+)[^\s"'']+', '$1[REDACTED]'),
-        @('(Authorization:\s*Basic\s+)[^\s"'']+', '$1[REDACTED]'),
-        @('\b(api[_-]?key|token|password|secret)\b(\s*[:=]\s*)[^\s"'']+', '$1$2[REDACTED]'),
-        # Only the [:=] assignment shape. A bare 'token <word>' / 'password <word>' rule over-
-        # redacts prose ("password reset email") and `\s+` would span the `\n\n` turn break and eat
-        # the next [role] tag in the joined transcript. Do not add it.
-        @('(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
+        @('(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}', '[REDACTED_OPENAI_KEY]'),
+        @('(?i)(Authorization[ \t]*:[ \t]*Bearer[ \t]+)[^\s"'']+', '$1[REDACTED]'),
+        @('(?i)(Authorization[ \t]*:[ \t]*Basic[ \t]+)[^\s"'']+', '$1[REDACTED]'),
+        @('(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)(?:(?:["''](?:\\.|[^\\\r\n]){4,200}["'']|["''](?:\\.|[^"''\\\r\n]){4,200})|(?=[^\s"''\r\n]{4})(?:[^\s"''\r\n]{16,200}|[^\s"''\r\n]{0,200}[0-9][^\s"''\r\n]{0,200}))', '$1[REDACTED]'),
+        @('(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)["''\x60]?[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*', '$1[REDACTED]'),
+        @('(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36})', '[REDACTED_GITHUB_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})', '[REDACTED_GITHUB_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,})', '[REDACTED_SLACK_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})', '[REDACTED_NVIDIA_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16})', '[REDACTED_AWS_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)', '[REDACTED_JWT]'),
+        @('(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@', '$1:[REDACTED]@'),
+        @('(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
     )
     foreach ($r in $rules) { $Text = $Text -replace $r[0], $r[1] }
     return $Text

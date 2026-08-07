@@ -5,6 +5,10 @@
 # Always exits 0. Emits a single banner line if anything's over cap (else silent).
 
 set +e
+# W4: unconditional liveness stamp for the sessionstart-banner capability row. It sits
+# ABOVE the MEM0_UP cold gate on purpose — on a cold morning every server-dependent
+# section below is skipped, and the hook still ran. Fail-open (|| true).
+mkdir -p "$HOME/.mem0" 2>/dev/null && date +%s > "$HOME/.mem0/last-sessionstart-banner" 2>/dev/null || true
 warnings=""
 
 # v0.17 Phase 0.E brand inference; v1.0 Phase 7B: operator-agnostic — rules from

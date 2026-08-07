@@ -163,7 +163,7 @@ A self-writing store drifts unless something hunts stale and contradicting facts
 **Security posture**:
 
 - Loopback-only services; `X-API-Key` on every mem0 call (constant-time compare).
-- **Canonical is cryptographically locked**: promotion/edit/delete requires an HMAC-SHA256 format-2 token (timestamp + burned nonce + reason) signed with a key that rests **only** as a Windows-DPAPI blob and is injected into RAM-backed tmpfs at service start (see [`docs/systems/dpapi-canonical-key.md`](./docs/systems/dpapi-canonical-key.md)). No plain `add` can ever create canonical.
+- **Canonical is cryptographically locked**: promotion/edit/delete requires an HMAC-SHA256 format-2 token (timestamp + burned nonce + reason) signed with a key designed to rest as a Windows-DPAPI blob injected into RAM-backed tmpfs at service start. That cutover is a **per-box operator act**; until it is performed the key rests as a mode-600 plaintext file, which `/health/deep` reports as `canonical_key.source` (see [`docs/systems/dpapi-canonical-key.md`](./docs/systems/dpapi-canonical-key.md)). Either way no plain `add` can ever create canonical — the HMAC gate is unaffected by where the key rests.
 - Server-side `add()` strips caller-forged gating metadata (`contradicts_canonical`, `superseded_by`, `retrievable`, …).
 - Judge prompts treat memory text as **untrusted data** inside delimiter blocks with closing-tag neutralization (prompt-injection defense, pinned by tests).
 - Secrets are redacted at every chokepoint: session readers, extraction prompts, and the server checkpoint path.
@@ -194,7 +194,7 @@ The axis human memory doesn't have: **trust** (tiers + the admission gate). It's
 ## Safety invariants (the contract)
 
 1. **Nothing is hidden below an authoritative verdict, and nothing is unrecoverable.** Only a Codex verdict can hide a record (evidence-vs-evidence and re-judge hides additionally require a human `--promote`; the weekly canonical sweep enforces directly); every hide is one-command reversible and the forensic `history` class always sees it.
-2. **Canonical is unforgeable.** HMAC + DPAPI + nonce replay protection; `add()` can never set it.
+2. **Canonical is unforgeable.** HMAC + nonce replay protection (+ DPAPI key-at-rest where the per-box cutover has been performed); `add()` can never set it.
 3. **Local models never judge.** Embedding + reranking only; all contradiction/supersession/consolidation judgment is Codex.
 4. **Brand isolation is fail-closed**, at the server *and* the client render.
 5. **Abstention over noise.** No memory clears the gate → no injection at all.

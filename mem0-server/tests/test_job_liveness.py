@@ -17,9 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from job_liveness import (  # noqa: E402
     age_hours,
+    count_lines,
     count_recent_sections,
     get_role,
     job_liveness_health,
+    normalize_host,
     parse_epoch_content,
     read_stack_env,
 )
@@ -32,10 +34,23 @@ from drift_state import (  # noqa: E402
 # UTF-8 em-dash bytes (E2 80 94) decoded through cp1252 -> the classic
 # three-glyph mojibake the pre-W3 PS 5.1 writer left in section headers.
 MOJI_DASH = chr(0x00E2) + chr(0x20AC) + chr(0x201D)
+# U+FEFF, the BOM Windows PowerShell 5.1 prefixes to `Set-Content -Encoding UTF8`
+# output. Spelled with chr() for the same reason as MOJI_DASH above: this source
+# file stays pure ASCII while the fixture reproduces the real byte sequence.
+BOM = chr(0xFEFF)
 
 JL_KEYS = {"role", "last_dream_age_h", "prune_age_h", "gather_age_h",
            "backup_manifest_age_h", "dedup_report_age_h",
-           "morning_summary_age_h", "morning_summary_sections_48h"}
+           "morning_summary_age_h", "morning_summary_sections_48h",
+           # W4 session-scoped receipts (additive -- the cross-track contract
+           # grows by ADDING keys; renaming one breaks capabilities.py and the
+           # PowerShell readers together).
+           "l1a_attempt_age_h", "l1a_success_age_h",
+           "sessionstart_banner_age_h",
+           "mcp_shim_receipt_age_h", "mcp_shim_host_match",
+           "mcp_shim_stack_version",
+           "brand_scope_age_h", "brand_scope_misscoped",
+           "outbox_depth", "outbox_replayed_age_h", "outbox_drain_log_age_h"}
 DS_KEYS = {"state_present", "last_compare_ts", "age_hours",
            "before_retrievable", "n_total", "hwm", "hwm_seeded",
            "consecutive_below_hwm", "consecutive_snapshot_failures",
@@ -144,9 +159,28 @@ def test_collector_full_fixture_all_fields(tmp_path):
                   encoding="utf-8")
     os.utime(ms, (now_s - 9 * 3600, now_s - 9 * 3600))
 
+    # --- W4 session-scoped receipts, so the no-error pin below stays honest ---
+    (state / "last-l1a-attempt").write_text(str(now_s - 900), encoding="utf-8")
+    (state / "last-l1a").write_text(str(now_s - 2 * 3600), encoding="utf-8")
+    (mem0_dir / "last-sessionstart-banner").write_text(str(now_s - 3600),
+                                                       encoding="utf-8")
+    (mem0_dir / "mcp-shim-receipt.json").write_text(json.dumps(
+        {"ts": now_s - 1800, "host": "Box-A.local", "stack_version": "1.18.0",
+         "authority": "http://127.0.0.1:18791"}), encoding="utf-8")
+    (mem0_dir / "brand-scope-status.json").write_text(json.dumps(
+        {"ts": "2026-08-07T03:00:00+00:00", "n_canonical": 40,
+         "n_misscoped": 0, "misscoped": []}), encoding="utf-8")
+    (mem0_dir / "outbox.jsonl").write_text('{"op":"add"}\n\n{"op":"add"}\n',
+                                           encoding="utf-8")
+    for name, age_h in (("outbox.replayed.jsonl", 5), ("outbox-drain.log", 4)):
+        f = mem0_dir / name
+        f.write_text("x\n", encoding="utf-8")
+        os.utime(f, (now_s - age_h * 3600, now_s - age_h * 3600))
+
     out = job_liveness_health(mem0_dir=mem0_dir, win_home=win_home,
                               now_s=now_s, environ={},
-                              stack_env={"MEM0_ROLE": "brain"})
+                              stack_env={"MEM0_ROLE": "brain"},
+                              hostname="box-a")
     assert out["role"] == "brain"
     assert out["backup_manifest_age_h"] == 12.0   # newest manifest, not oldest
     assert out["dedup_report_age_h"] == 6.0
@@ -155,6 +189,17 @@ def test_collector_full_fixture_all_fields(tmp_path):
     assert out["gather_age_h"] == 10.0
     assert out["morning_summary_age_h"] == 9.0
     assert out["morning_summary_sections_48h"] == 1
+    assert out["l1a_attempt_age_h"] == 0.25
+    assert out["l1a_success_age_h"] == 2.0
+    assert out["sessionstart_banner_age_h"] == 1.0
+    assert out["mcp_shim_receipt_age_h"] == 0.5
+    assert out["mcp_shim_host_match"] is True     # 'Box-A.local' ~ 'box-a'
+    assert out["mcp_shim_stack_version"] == "1.18.0"
+    assert out["brand_scope_misscoped"] == 0
+    assert out["brand_scope_age_h"] is not None
+    assert out["outbox_depth"] == 2               # blank lines are not entries
+    assert out["outbox_replayed_age_h"] == 5.0
+    assert out["outbox_drain_log_age_h"] == 4.0
     assert set(out) == JL_KEYS  # everything present -> no error key
 
 
@@ -180,6 +225,89 @@ def test_get_role_falls_back_to_role_receipt(tmp_path):
     # env still wins over the receipt
     assert get_role(environ={"MEM0_ROLE": "brain"}, stack_env={},
                     role_file=rf) == "brain"
+
+
+# ----------------------------------------------------------------------
+# W4: session-scoped receipts
+# ----------------------------------------------------------------------
+
+def test_epoch_stamps_survive_the_powershell_51_bom():
+    """Review F13. The Claude Code hooks run under Windows PowerShell 5.1, whose
+    `Set-Content -Encoding UTF8` writes a BOM. read_text(encoding='utf-8') keeps
+    it as U+FEFF and str.strip() does NOT remove it -- so without explicit
+    stripping the very stamps the two-signal rule depends on would parse as None
+    and read as 'no signal' forever."""
+    assert parse_epoch_content(BOM + "1723000000") == 1723000000.0
+    assert parse_epoch_content(BOM + "1723000000\r\n") == 1723000000.0
+    assert parse_epoch_content(" " + BOM + " 1723000000 ") == 1723000000.0
+
+
+def test_l1a_two_signal_stamps_are_read_from_content(tmp_path):
+    now_s = 1_700_000_000
+    state = tmp_path / "winhome" / ".claude" / "state"
+    state.mkdir(parents=True)
+    # BOM-prefixed, exactly as PS 5.1 writes them.
+    (state / "last-l1a-attempt").write_text(BOM + str(now_s - 600),
+                                            encoding="utf-8")
+    (state / "last-l1a").write_text(BOM + str(now_s - 7200),
+                                    encoding="utf-8")
+    # Skew the mtimes: the age must come from the CONTENT, like last-dream.
+    for f in (state / "last-l1a-attempt", state / "last-l1a"):
+        os.utime(f, (now_s - 999_999, now_s - 999_999))
+    out = job_liveness_health(mem0_dir=tmp_path / "mem0",
+                              win_home=tmp_path / "winhome", now_s=now_s,
+                              environ={}, stack_env={})
+    assert out["l1a_attempt_age_h"] == 0.17
+    assert out["l1a_success_age_h"] == 2.0
+
+
+def test_shim_receipt_host_mismatch_is_reported(tmp_path):
+    now_s = 1_700_000_000
+    mem0_dir = tmp_path / "mem0"
+    mem0_dir.mkdir(parents=True)
+    (mem0_dir / "mcp-shim-receipt.json").write_text(json.dumps(
+        {"ts": now_s - 3600, "host": "OTHER-BOX", "stack_version": "1.0.0"}),
+        encoding="utf-8")
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=tmp_path / "nowin",
+                              now_s=now_s, environ={}, stack_env={},
+                              hostname="this-box")
+    # The age is still reported (diagnostics), but the host flag is what the
+    # verdict keys on -- ~/.mem0 travels in stack backups.
+    assert out["mcp_shim_receipt_age_h"] == 1.0
+    assert out["mcp_shim_host_match"] is False
+    assert out["mcp_shim_stack_version"] == "1.0.0"
+
+
+def test_malformed_receipts_are_notes_not_exceptions(tmp_path):
+    now_s = 1_700_000_000
+    mem0_dir = tmp_path / "mem0"
+    mem0_dir.mkdir(parents=True)
+    (mem0_dir / "mcp-shim-receipt.json").write_text("{not json",
+                                                    encoding="utf-8")
+    (mem0_dir / "brand-scope-status.json").write_text("[1, 2, 3]",
+                                                      encoding="utf-8")
+    (mem0_dir / "last-sessionstart-banner").write_text("not-an-epoch",
+                                                       encoding="utf-8")
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=tmp_path / "nowin",
+                              now_s=now_s, environ={}, stack_env={})
+    assert out["mcp_shim_receipt_age_h"] is None
+    assert out["brand_scope_misscoped"] is None
+    assert out["sessionstart_banner_age_h"] is None
+    assert "error" in out           # named, not raised
+
+
+def test_normalize_host_strips_domain_and_case():
+    assert normalize_host("BOX-A.tail1234.ts.net") == "box-a"
+    assert normalize_host(" Box-A ") == "box-a"
+    assert normalize_host("") is None
+    assert normalize_host(None) is None
+
+
+def test_count_lines_ignores_blanks_and_absent(tmp_path):
+    p = tmp_path / "outbox.jsonl"
+    assert count_lines(p) is None            # absent != empty
+    p.write_text('{"a":1}\n\n   \n{"b":2}\n', encoding="utf-8")
+    assert count_lines(p) == 2
 
 
 def test_read_stack_env(tmp_path):
