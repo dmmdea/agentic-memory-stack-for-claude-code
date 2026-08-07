@@ -303,7 +303,8 @@ Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10
     }
 
     It 'the new headless suites actually gate CI (silent-not-gating is the W1 failure class)' {
-        foreach ($t in 'test_payload_carryover.py', 'test_sparse_health.py', 'test_mojibake_check.py') {
+        foreach ($t in 'test_payload_carryover.py', 'test_sparse_health.py', 'test_mojibake_check.py',
+                       'test_capabilities.py', 'test_job_liveness.py') {
             $script:ciText | Should -Match ([regex]::Escape("mem0-server/tests/$t")) -Because "a headless test file absent from ci.yml's explicit list never runs — $t must gate"
             Test-Path (Join-Path $script:repoRoot "mem0-server\tests\$t") | Should -BeTrue -Because "$t must exist where ci.yml points"
         }
