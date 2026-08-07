@@ -189,7 +189,7 @@ Every phase is best-effort and fail-open: the 4C gate is wrapped so it can never
 
 ## Security and privacy notes
 
-Autonomous canonical promotion does **not** bypass the canonical write gate: it still signs the same format-2 HMAC token via `mem0-canonize.sh` (actor `dream-autopromote`), so an attacker who could only run the consolidator still cannot forge canonical without the DPAPI-held key. The imperative-canary independently blocks standing-order text from the canonical tier. Logs carry counts, ids, and reasons — not raw memory text where avoidable.
+Autonomous canonical promotion does **not** bypass the canonical write gate: it still signs the same format-2 HMAC token via `mem0-canonize.sh` (actor `dream-autopromote`), so an attacker who could only run the consolidator still cannot forge canonical without the HMAC signing key. The imperative-canary independently blocks standing-order text from the canonical tier. Logs carry counts, ids, and reasons — not raw memory text where avoidable.
 
 ## Observability and debugging
 

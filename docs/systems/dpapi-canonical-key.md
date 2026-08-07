@@ -1,13 +1,39 @@
 # Canonical-key backend: DPAPI blob + runtime tmpfs injection (v0.19 Phase H)
 
-Status: **ACTIVE** — plaintext `~/.mem0/canonical-key` was removed from the
-production WSL box on 2026-06-12 after the verified cutover below. This doc
-supersedes the v0.18 runbook section (rescinded in the v0.18 fix-pass because
-the WSL server could not read the DPAPI blob — see `docs/v018-resume.md`).
+Status: **BUILT — CUTOVER IS PER-BOX, AND IS NOT AUTOMATIC.**
+
+The chain below (provider resolution order, `dpapi-fetch-key.sh`, the
+`ExecStartPre` unit line, the store/rotate tooling) ships and deploys on every
+install. What does **not** ship is the blob itself: it is created by an
+operator running `dpapi-store-canonical-key.ps1` once per box, because the blob
+is encrypted to *that* Windows user's DPAPI master key and cannot be copied
+between machines or profiles.
+
+Until that step is performed on a given box, the provider serves the plaintext
+`~/.mem0/canonical-key` (mode 600) — a **documented, accepted posture**, not a
+malfunction — and `ExecStartPre` fails soft with `DPAPI blob not found` in the
+journal on every start.
+
+> **AMS-13 (audit 2026-08-07):** this document previously asserted the cutover
+> as globally complete ("ACTIVE … removed from the production WSL box"). That
+> was true of the box the stack ran on in June, which is now the offline
+> replica; the brain has run on plaintext since the 2026-07-13 migration, and
+> the docs said otherwise for three weeks. A capability is not "active" because
+> it is built — the cutover is a per-box operator act with its own runbook
+> (below) and its own verification.
+
+Verify the posture of the box you are on:
+
+```
+curl -s localhost:18791/health/deep | python3 -c "import json,sys; print(json.load(sys.stdin)['checks']['canonical_key'])"
+# {'ok': True, 'present': True, 'source': 'runtime',   'dpapi_blob': True}   <- cutover done
+# {'ok': True, 'present': True, 'source': 'plaintext', 'dpapi_blob': False}  <- plaintext posture
+```
 
 ## Architecture
 
-At rest, the ONLY canonical-key artifact on disk is the DPAPI blob:
+Where the cutover **has** been performed, the only canonical-key artifact at
+rest is the DPAPI blob:
 
 ```
 ~/.mem0/canonical-key.dpapi    mode 600, ~262 bytes
@@ -32,7 +58,8 @@ Provider precedence (`mem0-server/canonical_key_provider.py`):
 
 1. `$XDG_RUNTIME_DIR/mem0/canonical-key` — runtime-injected tmpfs key
 2. `~/.mem0/canonical-key.dpapi` — decrypted directly (Windows hosts only)
-3. `~/.mem0/canonical-key` — plaintext (dev/recovery fallback; absent in prod)
+3. `~/.mem0/canonical-key` — plaintext, mode 600 (dev/recovery fallback, and
+   the operative source on any box where the per-box cutover has not been run)
 4. `None` → canonical/insight mutations 503 with a loud journal error naming
    the runtime path and `journalctl --user -u mem0` as the first diagnostic.
 

@@ -9,7 +9,10 @@ Pure logic is unit-tested here; the stdin/marker-write I/O is exercised by the l
   python -m pytest claude-config/tests/test_precompact_capture.py -v
 """
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 _HERE = Path(__file__).resolve().parent
 _MOD = _HERE.parent / "precompact_capture.py"
@@ -89,3 +92,46 @@ def test_build_query_redacts_and_caps():
 
 def test_build_query_empty_on_no_turns():
     assert pc.build_query("garbage\n{bad", max_turns=6, max_chars=400) == ""
+
+
+# --- the shared cross-runtime redaction fixture -------------------------------------------
+# The same tests/fixtures/redaction-cases.jsonl that mem0-server/tests/test_redact.py and
+# scripts/windows/tests/MemoryCommon.Tests.ps1 iterate. This copy of the pattern set is one of
+# FOUR (the fourth, SkillOpt, lives on the offline replica host and is not covered here) and
+# they had already drifted once with no test to catch it. Substring assertions only; `|+|` is a
+# split marker stripped at load time so realistic credential prefixes never sit contiguously on
+# disk and a secret scanner cannot flag the fixture. Conventions are documented in full in
+# mem0-server/tests/test_redact.py.
+_JOIN = "|+|"
+_FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "redaction-cases.jsonl"
+
+
+def _unsplit(s):
+    return s.replace(_JOIN, "")
+
+
+_CASES = [
+    json.loads(ln) for ln in _FIXTURE.read_text(encoding="ascii").splitlines() if ln.strip()
+]
+
+
+@pytest.mark.parametrize("case", _CASES, ids=[c["name"] for c in _CASES])
+def test_redaction_fixture_case(case):
+    out = pc.redact(_unsplit(case["text"]))
+    for needle in case["must_redact"]:
+        assert _unsplit(needle) not in out, "%s: leaked %r -> %r" % (case["name"], needle, out)
+    for needle in case["must_keep"]:
+        assert _unsplit(needle) in out, "%s: lost %r -> %r" % (case["name"], needle, out)
+
+
+def test_marker_query_is_redacted_end_to_end():
+    """The pattern set must apply through build_query, not just through redact()."""
+    # Split so no SOURCE line carries a `KEY=<16 alnum>` shape: secret scanners
+    # (gitleaks generic-api-key, GitHub push protection) match it regardless of
+    # context, and a redaction suite is the one place such literals must live.
+    # The runtime string is byte-identical to the un-split form.
+    secret = "abcd1234" + "efgh5678"
+    rec = json.dumps({"message": {"role": "user", "content": "export MEM0_API_KEY=" + secret}})
+    q = pc.build_query(rec, max_turns=6, max_chars=800)
+    assert secret not in q
+    assert "MEM0_API_KEY=[REDACTED]" in q

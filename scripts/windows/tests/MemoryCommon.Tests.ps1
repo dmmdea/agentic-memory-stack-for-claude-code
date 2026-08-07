@@ -43,6 +43,63 @@ Describe 'Get-RecentTranscriptTurns pathological-transcript guard (v0.23)' {
     }
 }
 
+BeforeDiscovery {
+    # The shared cross-runtime redaction fixture. ONE file, THREE suites: this one,
+    # mem0-server/tests/test_redact.py, and claude-config/tests/test_precompact_capture.py.
+    # That is the structural fix for AMS-12 — four copies of the pattern set were born
+    # identical in a single commit with NO binding test, and had already drifted on case
+    # sensitivity before anyone noticed. Cases MUST be loaded in BeforeDiscovery: `-ForEach`
+    # is evaluated at discovery time, not at run time.
+    #
+    # Fixture conventions that matter on this side specifically:
+    #   * the field is `text`, NOT `input` — `$input` is an automatic variable and `-ForEach`
+    #     binding to it would silently produce nothing.
+    #   * the file is ASCII-only — PS 5.1 `Get-Content` defaults to ANSI, so a non-ASCII byte
+    #     would decode differently here than in the Python suites and break parity for a
+    #     reason that has nothing to do with the rules.
+    #   * assertions are literal substrings (`.Contains`, not `-Match`/`-BeLike`) — the markers
+    #     contain `[` and `]`, which both of those would read as regex/wildcard syntax.
+    #   * `|+|` is a split marker stripped at load time so realistic credential prefixes never
+    #     sit contiguously on disk (an unsplit fixture is flagged by gitleaks and unpushable).
+    $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+    $fixturePath = Join-Path $repoRoot 'tests\fixtures\redaction-cases.jsonl'
+    $redactionCases = @(
+        foreach ($line in (Get-Content -LiteralPath $fixturePath)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $o = ConvertFrom-Json $line
+            # Hashtable, not the PSCustomObject: hashtable keys are what -ForEach binds as
+            # variables. @() around the arrays guards PowerShell's single-element unwrap.
+            @{
+                name        = $o.name
+                text        = $o.text
+                must_redact = @($o.must_redact)
+                must_keep   = @($o.must_keep)
+            }
+        }
+    )
+}
+
+Describe 'Redact-Secrets shared cross-runtime fixture (AMS-12)' {
+    It 'fixture case <name>' -ForEach $redactionCases {
+        $out = Redact-Secrets ($text.Replace('|+|', ''))
+        foreach ($n in $must_redact) {
+            $needle = $n.Replace('|+|', '')
+            $out.Contains($needle) | Should -BeFalse -Because "case '$name' must redact '$needle' but got: $out"
+        }
+        foreach ($n in $must_keep) {
+            $needle = $n.Replace('|+|', '')
+            $out.Contains($needle) | Should -BeTrue -Because "case '$name' must keep '$needle' but got: $out"
+        }
+    }
+
+    # A fixture that failed to load would make every -ForEach test vacuously ABSENT rather than
+    # failing, so the count is asserted too. It is carried through -ForEach because discovery-time
+    # variables are not guaranteed to be in scope during the run phase.
+    It 'loaded a populated fixture (<caseCount> cases)' -ForEach @(@{ caseCount = @($redactionCases).Count }) {
+        $caseCount | Should -BeGreaterOrEqual 20
+    }
+}
+
 Describe 'Get-RecentTranscriptTurns secret redaction (security)' {
     # Credentials pasted into a session must never reach the extraction LLM (Codex) or mem0.
     # Redaction runs inside Get-RecentTranscriptTurns (the single chokepoint), so every

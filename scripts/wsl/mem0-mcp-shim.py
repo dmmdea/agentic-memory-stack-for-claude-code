@@ -784,7 +784,51 @@ def _drain_outbox_async() -> None:
         pass  # a drain attempt must never delay or break the MCP server
 
 
+# W4 (review F13): the shim's own release stamp. This is a PINNED LITERAL, not a
+# lookup, and that is the point: the deployed copies live in ~/apps/mem0-scripts and
+# the Windows %USERPROFILE%\.claude\scripts, neither of which has a VERSION file, and
+# resolving the SERVER's VERSION would always agree with the server and detect nothing.
+# The launch path (the Windows copy) is refreshed only by install/2-windows-config.ps1,
+# never by deploy.sh — that gap is how two shipped fixes stayed dead for 12 days
+# (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
+# STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
+# BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
+SHIM_STACK_VERSION = "1.18.0"
+
+
+def _write_start_receipt() -> None:
+    """Host-keyed start receipt for the mcp-shim capability row. Fail-open.
+
+    The shim is spawned per session over stdio, so "this file was written recently"
+    is a genuine per-session liveness signal — the only one this component has.
+
+    HOST-KEYED because ~/.mem0 travels in the stack backups: a receipt restored from
+    another box must not read as local liveness, so the reader (job_liveness.py)
+    compares hostnames and treats a foreign receipt as absent. The manifest row is
+    scoped to 'brain' for the same family of reasons: a replica's shim writes to the
+    REPLICA's ~/.mem0, whose server may not even be running to read it.
+
+    STDIO SAFETY: writes to a FILE and nothing else. stdout is the MCP JSON-RPC
+    channel — a single stray byte there breaks the protocol (the same reason
+    mcp.run is called with show_banner=False below), so this function must never
+    print, and any failure is swallowed rather than reported."""
+    try:
+        import socket
+        rcpt = Path.home() / ".mem0" / "mcp-shim-receipt.json"
+        rcpt.parent.mkdir(parents=True, exist_ok=True)
+        rcpt.write_text(_json.dumps({
+            "ts": int(_dt.datetime.now(_dt.timezone.utc).timestamp()),
+            "host": socket.gethostname(),
+            "stack_version": SHIM_STACK_VERSION,
+            "authority": AUTHORITY_URL,
+            "pid": os.getpid(),
+        }), encoding="utf-8")
+    except Exception:
+        pass  # a liveness receipt must never delay or break the MCP server
+
+
 if __name__ == "__main__":
+    _write_start_receipt()
     _drain_outbox_async()
     # show_banner=False is CRITICAL — fastmcp 3.x prints an ANSI banner to STDOUT by default,
     # which corrupts the MCP JSON-RPC stdio protocol and causes client timeouts.
