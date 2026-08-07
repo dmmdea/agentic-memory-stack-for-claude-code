@@ -1,5 +1,8 @@
 #Requires -Version 7.0
-# Test-MemoryStack.ps1 - non-mutating memory-stack health verifier.
+# Test-MemoryStack.ps1 - memory-stack health verifier. Mostly read-only; the
+# INVARIANTS dimension writes SELF-CLEANING probe records (canonical-immutability
+# and PUT-survival canaries) under user_id 'test-inv-healthcheck' and deletes
+# them before exit. (The old "non-mutating" claim was false since v0.19 — W2.)
 # NOTE: pwsh-only (uses PS7 syntax incl. `&&`). Run manually under pwsh; it is NOT invoked by any
 # hook or scheduled task (those run powershell.exe 5.1). The #Requires gives a clean error if ever
 # run under 5.1 instead of a cryptic parse-death. The PS51Compat parse-guard auto-skips it.
@@ -114,6 +117,9 @@ try {
         if (-not $hd.checks.embedder.ok) { $errs += "embedder:$($hd.checks.embedder.error)" }
         # v0.20 Phase D (M6): keyless-degraded server flips /health/deep ok=false
         if ($hd.checks.canonical_key -and -not $hd.checks.canonical_key.ok) { $errs += 'canonical_key: not loaded (dpapi-fetch-key ExecStartPre failed - restart mem0)' }
+        # AMS-09 (W2): a dead BM25 sparse leg also flips ok=false — name it here
+        # so the L2 FAIL row is never an empty error list.
+        if ($hd.checks.sparse_leg -and -not $hd.checks.sparse_leg.ok) { $errs += "sparse_leg: $(if ($hd.checks.sparse_leg.error) { $hd.checks.sparse_leg.error } else { 'BM25 leg dead (fastembed/slot/canary)' })" }
         Add-Check 'LIVENESS' 'mem0 /health/deep' 'FAIL' ($errs -join '; ')
     }
 } catch { Add-Check 'LIVENESS' 'mem0 /health/deep' 'FAIL' $_.Exception.Message }
@@ -207,6 +213,33 @@ try {
         else                      { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' "${lines} lines but $([int]$age.TotalDays)d old (dream-consolidator may be failing)" }
     } else { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' 'not yet generated' }
 } catch { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' $_.Exception.Message }
+
+# L8 (W2, AMS-09): BM25 sparse-leg liveness. The lexical leg died silently for
+# 33 days behind mem0's fastembed fail-soft while every health surface stayed
+# green. /health/deep now runs a GATING sparse_leg check (encoder importable +
+# collection slot + deterministic oldest-point retrieval canary); this row
+# surfaces it and additionally WARNs when sparse coverage < 95% (a
+# half-backfilled corpus is degraded, not dead — the server does not gate on
+# coverage).
+try {
+    $slHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $sl = $slHd.checks.sparse_leg
+    if (-not $sl) {
+        Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' '/health/deep has no sparse_leg check — server predates W2 (redeploy mem0-server)'
+    } elseif (-not $sl.ok) {
+        $why = @()
+        if (-not $sl.fastembed) { $why += 'fastembed not importable (venv missing the dep - re-run install/1-wsl-services.sh)' }
+        if (-not $sl.bm25_slot) { $why += 'collection has no bm25 sparse slot' }
+        if ($sl.canary -and $sl.canary.ran -and -not $sl.canary.hit) { $why += "canary token '$($sl.canary.token)' did not retrieve its point (encoder/tokenizer drift?)" }
+        if ($sl.error) { $why += [string]$sl.error }
+        if (-not $why) { $why = @('sparse_leg ok=false') }
+        Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' ($why -join '; ')
+    } elseif ($sl.coverage -lt 0.95) {
+        Add-Check 'LIVENESS' 'bm25 sparse leg' 'WARN' "leg alive (canary '$($sl.canary.token)' hit) but coverage $($sl.with_bm25)/$($sl.points) = $([Math]::Round(100*$sl.coverage,1))% < 95% - run the bm25 backfill"
+    } else {
+        Add-Check 'LIVENESS' 'bm25 sparse leg' 'OK' "canary '$($sl.canary.token)' hit; coverage $($sl.with_bm25)/$($sl.points) = $([Math]::Round(100*$sl.coverage,1))%"
+    }
+} catch { Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' $_.Exception.Message }
 
 
 # ==========================================================================
@@ -386,6 +419,69 @@ if ($key) {
             Add-Check 'INVARIANTS' 'canonical immutability' 'WARN' 'add returned no id — probe skipped'
         }
     } catch { Add-Check 'INVARIANTS' 'canonical immutability' 'WARN' $_.Exception.Message }
+}
+
+# I13 (W2, AMS-01 P0): PUT payload-survival canary. Every PUT used to destroy
+# ALL custom payload metadata (mem0 rebuilds the payload; only tier was
+# restored) — brand isolation broke on every updated record and tombstones
+# became resurrectable. This probe proves THE LIVE SERVER preserves custom
+# keys through a real PUT: POST rich-metadata evidence -> PUT new text ->
+# read the Qdrant payload -> assert brand/source/project/tier survive AND
+# data/text_lemmatized were recomputed for the NEW text (review F13) ->
+# DELETE. Self-cleaning on every path, even assertion failure — the pre-fix
+# live pytest suite leaked 2 damaged records; this probe must never leak.
+if ($key) {
+    $psMid = $null
+    try {
+        $psText1 = "put-survival-probe-$(Get-Random) alpha"
+        $psText2 = "put-survival-probe-$(Get-Random) survived-zzqx"
+        $psAddBody = @{
+            messages  = $psText1
+            user_id   = 'test-inv-healthcheck'
+            infer     = $false
+            metadata  = @{tier='evidence'; source='test-memorystack-put-survival'; brand='probe-brand'; project='probe-project'}
+        } | ConvertTo-Json
+        $psAdd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($psAddBody)) -ContentType 'application/json' `
+            -Headers @{'X-API-Key'=$key} -TimeoutSec 10
+        $psMid = $psAdd.results[0].id
+        if ($psMid) {
+            $psPutBody = @{text=$psText2} | ConvertTo-Json
+            Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$psMid" -Method Put `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($psPutBody)) -ContentType 'application/json' `
+                -Headers @{'X-API-Key'=$key} -TimeoutSec 15 | Out-Null
+            # Read the raw Qdrant payload (the API's GET shape does not expose
+            # every payload key; the payload IS the thing AMS-01 destroyed).
+            $psColl = if ($hd -and $hd.collection) { $hd.collection } else { 'mem0_egemma_768' }
+            $psQBody = @{ids=@($psMid); with_payload=$true} | ConvertTo-Json
+            $psPts = Invoke-RestMethod -Uri "http://127.0.0.1:6333/collections/$psColl/points" -Method Post `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($psQBody)) -ContentType 'application/json' -TimeoutSec 10
+            $psPl = $psPts.result[0].payload
+            $lost = @()
+            if ($psPl.source -ne 'test-memorystack-put-survival') { $lost += 'source' }
+            if ($psPl.brand -ne 'probe-brand')                    { $lost += 'brand' }
+            if ($psPl.project -ne 'probe-project')                { $lost += 'project' }
+            if ($psPl.tier -ne 'evidence')                        { $lost += 'tier' }
+            $stale = @()
+            if ($psPl.data -ne $psText2)                                { $stale += 'data' }
+            if (-not ([string]$psPl.text_lemmatized).Contains('zzqx'))  { $stale += 'text_lemmatized' }
+            if (-not $psPl.created_at)                                  { $stale += 'created_at(absent)' }
+            if ($lost.Count -eq 0 -and $stale.Count -eq 0) {
+                Add-Check 'INVARIANTS' 'PUT payload survival' 'OK' 'brand/source/project/tier survived a live PUT; data+text_lemmatized recomputed'
+            } elseif ($lost.Count -gt 0) {
+                Add-Check 'INVARIANTS' 'PUT payload survival' 'FAIL' "AMS-01 REGRESSION - PUT destroyed: $($lost -join ', ')"
+            } else {
+                Add-Check 'INVARIANTS' 'PUT payload survival' 'FAIL' "PUT did not recompute: $($stale -join ', ')"
+            }
+        } else {
+            Add-Check 'INVARIANTS' 'PUT payload survival' 'WARN' 'add returned no id - probe skipped'
+        }
+    } catch { Add-Check 'INVARIANTS' 'PUT payload survival' 'WARN' $_.Exception.Message }
+    finally {
+        if ($psMid) {
+            try { Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$psMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
+        }
+    }
 }
 
 # I12 (v0.20 Phase D M6): keyless-degraded server must FAIL INVARIANTS, not WARN.
@@ -1120,6 +1216,25 @@ try {
         }
     }
 } catch { Add-Check 'RECOVERY' 'deployed hooks freshness' 'WARN' $_.Exception.Message }
+
+# R10 (W2, AMS-10): CP437 mojibake corpus tripwire. A PS 5.1 capture boundary
+# stored OEM-decoded UTF-8 in memory text for two months (corpus was repaired
+# in W2; the boundary is fixed). /health/deep computes the count server-side
+# (informational there — it never flips ok); THIS row is where hits>0 becomes
+# a WARN a human sees, with sample ids to chase.
+try {
+    $mjHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $mj = $mjHd.checks.mojibake
+    if (-not $mj) {
+        Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' '/health/deep has no mojibake check — server predates W2 (redeploy mem0-server)'
+    } elseif ($mj.error) {
+        Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' "scan failed: $($mj.error)"
+    } elseif ($mj.hits -gt 0) {
+        Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' "$($mj.hits) corrupted point(s) of $($mj.scanned) scanned — sample: $(@($mj.sample_ids) -join ', ') — run scripts/wsl/cp437-repair.py"
+    } else {
+        Add-Check 'RECOVERY' 'cp437 mojibake' 'OK' "0 hits across $($mj.scanned) scanned points ($($mj.elapsed_ms)ms)"
+    }
+} catch { Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' $_.Exception.Message }
 
 
 # ==========================================================================
