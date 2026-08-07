@@ -361,6 +361,49 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         $script:tmsCode.Contains("`$TmsRole -eq 'replica'") | Should -BeTrue -Because 'brain-only rows must be role-gated (F3) or a replica FAILs forever'
     }
 
+    It 'AMS-07: the Codex shim spawn is NOT gated on the flag nothing creates' {
+        # The shim's spawn required ~/.claude/state/codex-shim.enabled — a flag
+        # whose only documented creator was a manual "enable the NLI write-gate"
+        # step never performed, and which nothing in either repo creates. That
+        # one check kept a P1 judgment capability dead for its entire life.
+        # (Found by the W4 mutation ledger: re-gating it turned NOTHING red.)
+        $spawn = script:Get-CodeLines (Join-Path $script:winDir 'codex-shim-spawn.ps1')
+        $spawn | Should -Not -Match 'codex-shim\.enabled' -Because 'an opt-IN flag nothing creates is why the judgment leg never once ran'
+        $spawn.Contains('codex-shim.disabled') | Should -BeTrue -Because 'the gate must be opt-OUT: both consumers are always registered'
+    }
+
+    It 'AMS-07: the weekly sweep spawns the shim on demand' {
+        # A session-spawned shim self-shuts after ~240 idle minutes, so the Sunday
+        # 05:00 timer would still find it down and log its eighth consecutive
+        # no-op. Without this ExecStartPre the R6c streak escalation below would
+        # be a permanently-red guard (plan review F16).
+        $unit = Get-Content (Join-Path $script:repoRoot 'systemd\contradiction-sweep.service') -Raw
+        $unitCode = ($unit -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        $unitCode | Should -Match 'ExecStartPre=-.*codex-shim-spawn\.ps1' -Because 'the sweep must raise its own judge, fail-soft, or it can never be up when it runs'
+        $unitCode | Should -Match 'judge codex' -Because 'the sweep must never fall back to a local judge (78% false positives measured)'
+    }
+
+    It 'AMS-07: a streak of no-op sweeps FAILs, a single skipped week WARNs' {
+        # 7 consecutive no-ops went unnoticed for a month because the row only
+        # ever read the LAST run. A skipped week is the documented accepted
+        # trade; a streak means the leg is dead.
+        $script:tmsCode | Should -Match "Add-Check 'RECOVERY' 'contradiction sweep' 'FAIL'" -Because 'a dead judgment leg must FAIL, not WARN forever'
+        $script:tmsCode | Should -Match '\$streak\s*-ge\s*3' -Because 'the escalation must key on a consecutive-run streak'
+    }
+
+    It 'AMS-11: the one-brain guard keys on local receipts, never a hostname parameter' {
+        # The guard compared $env:COMPUTERNAME against -AuthorityHost, whose
+        # default was the literal 'your-machine' — so it never fired anywhere.
+        # Deriving that host from the authority URL is EQUALLY vacuous on the
+        # brain (loopback authority -> host 127.0.0.1 != COMPUTERNAME).
+        $trav = script:Get-CodeLines (Join-Path $script:repoRoot 'scripts\travel\travel-mode.ps1')
+        $trav | Should -Not -Match '\$AuthorityHost' -Because 'a hostname parameter default is what made this guard vacuous for its whole life'
+        $trav.Contains("-eq 'brain'") | Should -BeTrue -Because 'the role receipt is authoritative on the box being protected'
+        $trav.Contains('Test-IsLocalAuthorityUrl') | Should -BeTrue -Because 'a box whose authority is itself IS the authority'
+        $trav | Should -Match 'Assert-NotTheAuthority ''on''' -Because "the 'on' verb must invoke the guard"
+        $trav | Should -Match 'Assert-NotTheAuthority ''off''' -Because "the 'off' verb stops the live services and must invoke it too"
+    }
+
     It 'the SessionStart banner emits the heartbeat digest from files, never /health/deep' {
         $script:bannerCode.Contains('[heartbeat]') | Should -BeTrue -Because 'the digest line is the load-bearing mouth (morning-summary has no other reader)'
         $script:bannerCode.Contains('retrieval-drift-state.json') | Should -BeTrue -Because 'drift alarm/guard-dead must reach the banner'
