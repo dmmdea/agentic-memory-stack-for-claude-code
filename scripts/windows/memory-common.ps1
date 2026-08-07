@@ -470,8 +470,24 @@ function Invoke-CodexSubagent {
     # (PS 5.1-safe — Start-Process -Timeout is PS7-only) and on timeout kill the WHOLE
     # tree (powershell -> codex.cmd -> node) with `taskkill /T /F` so nothing orphans
     # (mirrors the Python harness's process-tree kill).
+    # AMS-10 (2026-08-07): force UTF-8 across the whole child boundary. PS 5.1 decodes
+    # native stdout with the OEM console codepage (CP437) while codex emits UTF-8, so
+    # '–'/'→'/'é' became 'ΓÇô'/'ΓåÆ'/'├⌐' in stored memories; the input leg (OEM
+    # StandardInput writer + PS 5.1's ASCII $OutputEncoding) turned non-ASCII prompt
+    # chars into '?'. Child setters: OutputEncoding = how PS decodes codex's stdout,
+    # $OutputEncoding = how PS encodes the piped prompt into codex's stdin,
+    # InputEncoding = how the child decodes the parent's UTF-8 prompt bytes. Each
+    # setter is try/catch-wrapped (F16: [Console] setters throw terminating .NET
+    # exceptions under exotic host states) so a failure degrades to the status quo
+    # instead of killing the invocation. Parent side: StandardOutput/ErrorEncoding
+    # decode the child's UTF-8, and the prompt is written as raw UTF-8 bytes via
+    # BaseStream (ProcessStartInfo.StandardInputEncoding does not exist on .NET
+    # Framework / PS 5.1).
     $childScript = @'
 $ErrorActionPreference = 'Continue'
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+try { $OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $inp = [Console]::In.ReadToEnd()
 $o = $inp | & $env:MEM0_CODEX_CMD exec --skip-git-repo-check -c $env:MEM0_CODEX_EFFORT_ARG - 2>&1
 [Console]::Out.Write([string]::Join([char]10, @($o | ForEach-Object { [string]$_ })))
@@ -487,12 +503,16 @@ exit $LASTEXITCODE
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
     $psi.EnvironmentVariables['MEM0_CODEX_CMD'] = $script:CodexCmd
     $psi.EnvironmentVariables['MEM0_CODEX_EFFORT_ARG'] = $effortArg
 
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
-        $p.StandardInput.Write($Prompt)
+        $promptBytes = [System.Text.Encoding]::UTF8.GetBytes($Prompt)
+        $p.StandardInput.BaseStream.Write($promptBytes, 0, $promptBytes.Length)
+        $p.StandardInput.BaseStream.Flush()
         $p.StandardInput.Close()
         # Read async BEFORE WaitForExit so a large reply can't deadlock the pipe.
         $outTask = $p.StandardOutput.ReadToEndAsync()

@@ -242,3 +242,70 @@ Describe 'Deploy parity covers the LIVE LAUNCH PATH (audit 2026-08-07: AMS-02/03
         $code | Should -Match '"\$baselineNote -- ' -Because 'the caveat must come first so truncation cannot eat it'
     }
 }
+
+Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10)' {
+    # Each fix in this wave ships with its own liveness surface. These pins assert
+    # the WIRING of those surfaces in code (comment-stripped), because every one of
+    # them protects against a silent-removal failure mode the audit already found
+    # once. Behavior is proven elsewhere (headless pytest, the live canaries, and
+    # the mutation ledger for this wave); these guards make sure the wiring cannot
+    # quietly disappear in a refactor.
+    BeforeAll {
+        $script:winDir   = Split-Path -Parent $PSScriptRoot
+        $script:repoRoot = Split-Path -Parent (Split-Path -Parent $script:winDir)
+        function script:Get-CodeLines {
+            param([string]$Path)
+            # strip comment lines (# leading) so prose can never satisfy a pin —
+            # the W1 mutation ledger proved whole-file greps vacuous three times.
+            ((Get-Content $Path -Raw) -split "`r?`n" |
+                Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        }
+        $script:appCode  = script:Get-CodeLines (Join-Path $script:repoRoot 'mem0-server\app.py')
+        $script:instCode = script:Get-CodeLines (Join-Path $script:repoRoot 'install\1-wsl-services.sh')
+        $script:tmsCode  = script:Get-CodeLines (Join-Path $script:winDir 'Test-MemoryStack.ps1')
+        $script:ciText   = Get-Content (Join-Path $script:repoRoot '.github\workflows\ci.yml') -Raw
+    }
+
+    It 'AMS-01: the PUT handler passes the carry-over INTO mem.update' {
+        # The defect was precisely that this call site sent no metadata and only
+        # tier was restored afterward. If the metadata= argument disappears, the
+        # wipe is back with every test below it still green (the headless suite
+        # pins the helper, not this call site — this pin owns the wiring).
+        $script:appCode | Should -Match 'compute_carryover\(_pre_payload\)' -Because 'the pre-read payload must feed the carry-over'
+        $script:appCode | Should -Match 'metadata=\(_carryover or None\)'   -Because 'preservation must be atomic in the upsert, not post-hoc'
+        $script:appCode | Should -Match 'raise HTTPException\(\s*503'       -Because 'a failed pre-read must refuse the PUT (fail-closed) — proceeding blind IS the wipe'
+    }
+
+    It 'AMS-09: fastembed is installed by BOTH installer branches and proven loadable' {
+        # The leg died because a venv rebuild took the refresh branch, which never
+        # installed fastembed. Every pip line that installs the server deps must
+        # carry it, and the post-condition must LOAD the encoder, not pip-list it.
+        $pipLines = @($script:instCode -split "`n" | Where-Object { $_ -match 'pip.? install' -and ($_ -match 'mem0ai' -or $_ -match 'starlette') })
+        $pipLines.Count | Should -BeGreaterOrEqual 2 -Because 'fresh and refresh pip lines must both exist (an empty lookup would make this pin vacuous)'
+        $bare = @($pipLines | Where-Object { $_ -notmatch 'fastembed' })
+        $bare | Should -BeNullOrEmpty -Because "every server pip line must install fastembed; missing from: $($bare -join ' || ')"
+        $script:instCode | Should -Match 'SparseTextEmbedding\(model_name="Qdrant/bm25"\)' -Because 'the post-condition must instantiate the encoder (pip-listed but unloadable = the same dead leg)'
+    }
+
+    It 'AMS-09: /health/deep sparse_leg check exists and GATES ok' {
+        $script:appCode | Should -Match 'out\["checks"\]\["sparse_leg"\]' -Because 'the leg must report on /health/deep'
+        # the gating flip must be the sparse_leg result, adjacent to its assignment
+        $script:appCode | Should -Match '(?s)out\["checks"\]\["sparse_leg"\]\s*=\s*_sl\s*.{0,120}if not _sl\.get\("ok"\).{0,40}out\["ok"\]\s*=\s*False' -Because 'a dead lexical leg must flip ok=false so the deploy gate blocks (informational-only was how it stayed dead 33 days)'
+    }
+
+    It 'W2 verifier rows exist for all three findings' {
+        $script:tmsCode | Should -Match "Add-Check 'LIVENESS' 'bm25 sparse leg'"        -Because 'AMS-09 needs a human-visible row (L8)'
+        $script:tmsCode | Should -Match "Add-Check 'INVARIANTS' 'PUT payload survival'" -Because 'AMS-01 needs the live PUT canary row (I13)'
+        $script:tmsCode | Should -Match "Add-Check 'RECOVERY' 'cp437 mojibake'"         -Because 'AMS-10 needs the corpus tripwire row (R10)'
+        # the PUT canary must clean up even when assertions fail — the pre-fix live
+        # pytest suite leaked 2 damaged records into the production store.
+        $script:tmsCode | Should -Match '(?s)finally\s*\{\s*if \(\$psMid\)' -Because 'the PUT-survival probe must delete its record on every path'
+    }
+
+    It 'the new headless suites actually gate CI (silent-not-gating is the W1 failure class)' {
+        foreach ($t in 'test_payload_carryover.py', 'test_sparse_health.py', 'test_mojibake_check.py') {
+            $script:ciText | Should -Match ([regex]::Escape("mem0-server/tests/$t")) -Because "a headless test file absent from ci.yml's explicit list never runs — $t must gate"
+            Test-Path (Join-Path $script:repoRoot "mem0-server\tests\$t") | Should -BeTrue -Because "$t must exist where ci.yml points"
+        }
+    }
+}

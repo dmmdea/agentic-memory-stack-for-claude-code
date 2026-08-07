@@ -7,6 +7,7 @@ import hmac
 import json
 import hashlib
 import logging
+import threading
 import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
@@ -24,6 +25,9 @@ from redact import redact_secrets  # server-side secret scrub for stored prompt_
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
 import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps injected below)
+from payload_carryover import compute_carryover  # AMS-01: PUT payload carry-over (P0)
+from sparse_health import sparse_leg_health      # AMS-09: BM25 leg liveness (gating)
+from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
 from episodic import (
     _connect as _episodic_connect,
     init_schema as _episodic_init_schema,
@@ -402,6 +406,44 @@ _ADD_FORBIDDEN_META = {"retrievable", "expires_at", "created_at", "tier_actor",
                        "superseded_by", "contradicts_canonical", "contradiction_checked_at",
                        "nli_gate_checked_at", "contradicts_canonical_pending"}
 
+# AMS-01/F4 (2026-08-07): per-record write lock. uvicorn runs single-worker and
+# these sync-def handlers execute in the threadpool, so two requests CAN
+# interleave a read-modify-write on the same record. Concretely: a canonical
+# promotion landing between PUT's payload pre-read and its upsert used to be
+# silently demoted by the upsert's stale tier (ledger and store then disagree),
+# and the async NLI stamp could land inside the PUT window and be erased.
+# One lock per memory id serializes PUT, PATCH /tier, PATCH /metadata and the
+# NLI stamp for that id only. Registry grows one small Lock per distinct id
+# written this process lifetime — bounded in practice by the corpus.
+_MID_LOCKS: dict = {}
+_MID_LOCKS_GUARD = threading.Lock()
+
+def _mid_write_lock(mid):
+    key = str(mid)
+    with _MID_LOCKS_GUARD:
+        lk = _MID_LOCKS.get(key)
+        if lk is None:
+            lk = _MID_LOCKS[key] = threading.Lock()
+        return lk
+
+# AMS-01 (2026-08-07): in-process daily carry-over counters (MEM-8 pattern,
+# zero I/O). Invocation proof on /health/deep that the repaired PUT path is
+# the one serving traffic: puts = PUTs served today; keys_restored = keys the
+# post-verify had to re-stamp (should stay ~0 — the pre-merge makes restore a
+# fallback); keys_lost = keys still absent after retries (MUST stay 0 —
+# nonzero is an active AMS-01 recurrence). Survival itself is proven by the
+# verifier's PUT canary and the live pytest, not by this counter.
+_put_carryover_today = {"date": None, "puts": 0, "keys_restored": 0, "keys_lost": 0}
+
+def _put_carryover_bump(puts=0, restored=0, lost=0):
+    today = _dt.date.today().isoformat()
+    if _put_carryover_today["date"] != today:
+        _put_carryover_today.update(
+            {"date": today, "puts": 0, "keys_restored": 0, "keys_lost": 0})
+    _put_carryover_today["puts"] += puts
+    _put_carryover_today["keys_restored"] += restored
+    _put_carryover_today["keys_lost"] += lost
+
 # v0.29 R4 — raw-trace fallback (opt-in, default OFF). When the condensed
 # (semantic) memory search admits nothing in context_bundle, optionally surface
 # ONE compact snippet from the most SEMANTICALLY-relevant past EPISODE (NEMORI
@@ -488,11 +530,14 @@ def _nli_gate_stamp(records, user_id, brand):
     BackgroundTask) so add() never blocks on Codex. Fail-soft throughout (logs, never raises)."""
     def _stamp(mid, cid):
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        mem.vector_store.client.set_payload(
-            collection_name=mem.vector_store.collection_name,
-            payload={"contradicts_canonical": cid, "nli_gate_checked_at": now_iso, "updated_at": now_iso},
-            points=[mid],
-        )
+        # AMS-01/F4: serialize against a concurrent PUT — the async stamp used
+        # to land inside the PUT window and be erased by the upsert.
+        with _mid_write_lock(mid):
+            mem.vector_store.client.set_payload(
+                collection_name=mem.vector_store.collection_name,
+                payload={"contradicts_canonical": cid, "nli_gate_checked_at": now_iso, "updated_at": now_iso},
+                points=[mid],
+            )
         _append_ledger({"event": "nli-write-gate-flag", "memory_id": str(mid),
                         "contradicts_canonical": str(cid), "actor": "nli-write-gate"})
         log.warning("NLI write-gate flagged %s as contradicting canonical %s "
@@ -785,6 +830,37 @@ def health_deep() -> dict:
     out["checks"]["canonical_key"] = _canonical_key_health(_APP_KEY_PROVIDER)
     if not out["checks"]["canonical_key"]["ok"]:
         out["ok"] = False
+    # AMS-09 (2026-08-07): BM25 sparse-leg liveness — GATING. The lexical leg
+    # died silently for 33 days behind mem0's fastembed ImportError fail-soft
+    # while this endpoint stayed green (the exact 'shallow health green-lighting
+    # a broken path' class it exists to prevent). A dead leg now fails the
+    # deploy gate — a blocked deploy on a rebuilt venv is the CORRECT outcome;
+    # the venv rebuild that killed the leg is precisely the event this catches.
+    # sparse_leg_health never raises (module contract) — belt here anyway.
+    try:
+        _sl = sparse_leg_health(
+            mem.vector_store.client, mem.vector_store.collection_name,
+            lambda q: mem.vector_store._encode_bm25(q),
+        )
+    except Exception as e:
+        _sl = {"ok": False, "error": str(e)[:120]}
+    out["checks"]["sparse_leg"] = _sl
+    if not _sl.get("ok"):
+        out["ok"] = False
+    # AMS-10 (2026-08-07): CP437 mojibake corpus tripwire — informational,
+    # never flips ok (Test-MemoryStack WARNs on hits>0). Qdrant has no regex
+    # filter, so this is a client-side scroll — measured ~0.2s on the live
+    # corpus; the page cap bounds growth and `scanned` stays honest about it.
+    def _mj_scroll(offset, limit):
+        return mem.vector_store.client.scroll(
+            mem.vector_store.collection_name,
+            with_payload=["data", "text_lemmatized"], with_vectors=False,
+            limit=limit, offset=offset,
+        )
+    out["checks"]["mojibake"] = mojibake_health(_mj_scroll)
+    # AMS-01 (2026-08-07): carry-over counters — informational invocation proof.
+    _put_carryover_bump()  # roll the date on idle days so 'date' stays current
+    out["checks"]["put_carryover_today"] = dict(_put_carryover_today)
     return out
 
 @app.post("/v1/memories")
@@ -1250,6 +1326,7 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
 @app.put("/v1/memories/{mid}")
 def update(
     mid: str, b: UpdateIn,
+    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(None),
     x_user_direct_token: Optional[str] = Header(None, alias="X-User-Direct-Token"),
     x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
@@ -1258,7 +1335,10 @@ def update(
     reason: Optional[str] = Query(None),
 ):
     """Update memory text. v0.17 Phase A: canonical/insight tier gate applied BEFORE update.
-    v0.17 Phase F.1: X-User-Direct-Nonce header accepted for replay protection."""
+    v0.17 Phase F.1: X-User-Direct-Nonce header accepted for replay protection.
+    AMS-01 (P0, 2026-08-07): the full existing payload is carried over INTO the
+    update (mem0 rebuilds the payload from scratch — every custom key used to be
+    destroyed on every PUT; only tier was restored). See payload_carryover."""
     auth(x_api_key)
     if len(b.text) > MAX_MEMORY_CHARS:
         raise HTTPException(413, f"update: text exceeds {MAX_MEMORY_CHARS}-char cap (got {len(b.text)})")
@@ -1279,63 +1359,160 @@ def update(
             "canonical is declarative facts only; rephrase as a fact, not a standing order. "
             f"(detected imperative phrasing in: {b.text.strip()[:80]!r})",
         )
-    try:
-        result = mem.update(memory_id=mid, data=b.text)
-        # v0.17 F.2.5 / H1: PUT carry-over fix — mem.update() strips tier from Qdrant payload.
-        # Restore so subsequent PUT/DELETE/PATCH-metadata calls are still gated by Phase A.
-        # H1 fix: retry with bounded exponential backoff (3 attempts: 100ms, 300ms, 900ms).
-        # If all retries fail for canonical/insight, raise 500 instead of silently succeeding.
-        if current_tier:
-            import time as _time
-            _tier_restored = False
-            _backoff_delays = [0.1, 0.3, 0.9]  # seconds
-            for _attempt, _delay in enumerate(_backoff_delays):
-                try:
-                    mem.vector_store.client.set_payload(
-                        collection_name=mem.vector_store.collection_name,
-                        payload={"tier": current_tier},
-                        points=[mid],
-                    )
-                    _tier_restored = True
-                    break
-                except Exception:
-                    if _attempt < len(_backoff_delays) - 1:
-                        log.warning(
-                            "H1: tier restore attempt %d/%d failed for mid=%s tier=%s; retrying in %.1fs",
-                            _attempt + 1, len(_backoff_delays), mid, current_tier, _backoff_delays[_attempt + 1],
-                        )
-                        _time.sleep(_delay)
-                    else:
-                        log.exception(
-                            "H1: all %d tier restore attempts exhausted for mid=%s tier=%s",
-                            len(_backoff_delays), mid, current_tier,
-                        )
-            if not _tier_restored and current_tier in {"canonical", "insight"}:
-                raise HTTPException(
-                    500,
-                    f"F.2.5/H1: tier restore failed after {len(_backoff_delays)} attempts for "
-                    f"memory_id={mid!r} (tier={current_tier!r}). The record may be in an inconsistent "
-                    "state — manual verification required. The update itself succeeded in mem0 "
-                    "but tier field was not restored in Qdrant.",
-                )
-        # Ledger entry on success — user-direct PUTs to canonical/insight are audit-covered
+    # AMS-01/F4: serialize the whole read-modify-write against PATCH /tier,
+    # PATCH /metadata and the async NLI stamp for this record. The tier gate
+    # above stays OUTSIDE the lock on purpose (gate-before-update semantics;
+    # residual value-level race on the imperative canary requires a concurrent
+    # user-direct HMAC promotion inside a microsecond window — accepted and
+    # documented, the payload itself can no longer be lost).
+    with _mid_write_lock(mid):
+        # AMS-01/F5: FAIL-CLOSED pre-read. Proceeding without the existing
+        # payload IS the wipe — a Qdrant error refuses the PUT (503). A
+        # missing record proceeds: mem0's own update raises its not-found.
         try:
-            _append_ledger({
-                "event": "memory-update",
-                "memory_id": mid,
-                "prior_tier": current_tier,
-                "actor": actor or "rest-api",
-                "reason": reason or "PUT /v1/memories/{mid}",
-                "transport": "cli-user-direct" if x_user_direct_token else "rest-api",
-            })
-        except Exception:
-            log.exception("ledger append failed for memory-update")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("update failed")
-        raise _upstream_error(e)
+            _pre_pts = mem.vector_store.client.retrieve(
+                collection_name=mem.vector_store.collection_name,
+                ids=[mid], with_payload=True,
+            )
+        except Exception as e:
+            # A client-side 4xx (e.g. malformed id) is a PERMANENT fault —
+            # returning 503 would make the MCP shim queue the op to its outbox
+            # and retry a never-satisfiable PUT at every drain. Only genuine
+            # availability faults may be 503 (the shim's documented
+            # queue-on-503 contract).
+            _status = getattr(e, "status_code", None)
+            if isinstance(_status, int) and 400 <= _status < 500:
+                raise HTTPException(
+                    400, f"AMS-01: pre-update read rejected by the store "
+                         f"(bad memory id?): {str(e)[:120]}",
+                )
+            raise HTTPException(
+                503,
+                "AMS-01: pre-update payload read failed; refusing to PUT — a "
+                f"blind update would destroy custom metadata: {str(e)[:120]}",
+            )
+        _pre_payload = dict(_pre_pts[0].payload or {}) if _pre_pts else {}
+        _carryover = compute_carryover(_pre_payload)
+        try:
+            # Pre-merge: mem0 deepcopies metadata= into the rebuilt payload and
+            # then overwrites its own keys (data/hash/text_lemmatized/created_at/
+            # updated_at), so preservation is ATOMIC in the upsert — no restore
+            # window, and carry-over can never poison the recomputed values.
+            result = mem.update(memory_id=mid, data=b.text,
+                                metadata=(_carryover or None))
+            _put_carryover_bump(puts=1)
+            # v0.17 F.2.5 / H1, generalized by AMS-01: post-verify the carry-over
+            # LANDED. With the pre-merge this is a tripwire for mem0-contract
+            # drift (the single external assumption: _update_memory deepcopies
+            # metadata= into the new payload). PRESENCE-triggered, not
+            # value-compared — race-benign for concurrent value changes.
+            _expected = dict(_carryover)
+            if current_tier and "tier" not in _expected:
+                _expected["tier"] = current_tier
+            _missing = {}
+            if _expected:
+                import time as _time
+                _backoff_delays = [0.1, 0.3, 0.9]  # seconds
+                _restored_total = 0
+                for _attempt in range(len(_backoff_delays) + 1):
+                    if _attempt:
+                        _time.sleep(_backoff_delays[_attempt - 1])
+                    try:
+                        _post = mem.vector_store.client.retrieve(
+                            collection_name=mem.vector_store.collection_name,
+                            ids=[mid], with_payload=True,
+                        )
+                        _post_payload = dict(_post[0].payload or {}) if _post else {}
+                        _missing = {k: v for k, v in _expected.items()
+                                    if k not in _post_payload}
+                        if not _missing:
+                            break
+                        mem.vector_store.client.set_payload(
+                            collection_name=mem.vector_store.collection_name,
+                            payload=_missing, points=[mid],
+                        )
+                        _restored_total += len(_missing)
+                        # Immediate re-verify so a successful restore on the
+                        # last attempt is not misreported as lost.
+                        _post = mem.vector_store.client.retrieve(
+                            collection_name=mem.vector_store.collection_name,
+                            ids=[mid], with_payload=True,
+                        )
+                        _post_payload = dict(_post[0].payload or {}) if _post else {}
+                        _missing = {k: v for k, v in _expected.items()
+                                    if k not in _post_payload}
+                        if not _missing:
+                            break
+                    except Exception:
+                        log.exception(
+                            "AMS-01: carry-over post-verify attempt %d failed for mid=%s",
+                            _attempt + 1, mid,
+                        )
+                else:
+                    # for/else: the loop exhausted without a clean break. When
+                    # _missing is non-empty the restore-failure path below owns
+                    # the outcome (500 for gated tiers). When it is EMPTY here,
+                    # every post-verify attempt raised: no 500 fires, which is
+                    # defensible (the pre-merge already carried the payload
+                    # atomically) — but say so, loudly, in the log.
+                    if not _missing:
+                        log.error(
+                            "AMS-01: post-verify NEVER COMPLETED for mid=%s — the PUT "
+                            "returned 200 on the strength of the atomic pre-merge alone",
+                            mid,
+                        )
+                if _restored_total:
+                    _put_carryover_bump(restored=_restored_total)
+                    log.warning(
+                        "AMS-01: post-verify had to restore %d carry-over key(s) for mid=%s "
+                        "— the pre-merge should make this ~impossible; suspect mem0-contract drift",
+                        _restored_total, mid,
+                    )
+                if _missing:
+                    _put_carryover_bump(lost=len(_missing))
+                    _tier_now = str(_expected.get("tier") or "")
+                    if _tier_now in {"canonical", "insight"}:
+                        raise HTTPException(
+                            500,
+                            f"F.2.5/H1/AMS-01: carry-over restore failed after retries for "
+                            f"memory_id={mid!r} (tier={_tier_now!r}); missing keys: "
+                            f"{sorted(_missing)}. The record may be in an inconsistent state "
+                            "— manual verification required. The update itself succeeded in "
+                            "mem0 but the payload carry-over was not restored in Qdrant.",
+                        )
+                    log.error(
+                        "AMS-01: carry-over keys still missing after retries for mid=%s: %s",
+                        mid, sorted(_missing),
+                    )
+            # Ledger entry on success — user-direct PUTs to canonical/insight are audit-covered
+            try:
+                _append_ledger({
+                    "event": "memory-update",
+                    "memory_id": mid,
+                    "prior_tier": current_tier,
+                    "actor": actor or "rest-api",
+                    "reason": reason or "PUT /v1/memories/{mid}",
+                    "transport": "cli-user-direct" if x_user_direct_token else "rest-api",
+                })
+            except Exception:
+                log.exception("ledger append failed for memory-update")
+            # F3 (2026-08-07): a PUT changes the text, so it re-enters the NLI
+            # write-gate exactly like an add. compute_carryover deliberately
+            # dropped the checked-markers; this re-queues judgment of the NEW
+            # text. Async (after the response), fail-soft — same contract as add.
+            if NLI_GATE_ENABLED:
+                background_tasks.add_task(
+                    _nli_gate_stamp,
+                    [{"id": mid, "memory": b.text}],
+                    _pre_payload.get("user_id"),
+                    _carryover.get("brand"),
+                )
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception("update failed")
+            raise _upstream_error(e)
 
 @app.patch("/v1/memories/{mid}/tier")
 def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
@@ -1419,11 +1596,15 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
 
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
-        mem.vector_store.client.set_payload(
-            collection_name=mem.vector_store.collection_name,
-            payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
-            points=[mid],
-        )
+        # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
+        # without this, a promotion landing inside the PUT window was silently
+        # demoted by the PUT's stale-tier upsert (store and ledger disagreed).
+        with _mid_write_lock(mid):
+            mem.vector_store.client.set_payload(
+                collection_name=mem.vector_store.collection_name,
+                payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
+                points=[mid],
+            )
     except Exception as e:
         log.exception("tier-update failed")
         raise _upstream_error(e)
@@ -1502,7 +1683,9 @@ def update_metadata(
     # key allowlist rather than reopen this endpoint.
     FORBIDDEN_KEYS = {"retrievable", "expires_at", "created_at", "tier_actor",
                       "superseded_by", "contradicts_canonical", "contradiction_checked_at",
-                      "contradicts_canonical_pending"}  # v0.29.4: only the sweep actor writes it
+                      "contradicts_canonical_pending",  # v0.29.4: only the sweep actor writes it
+                      "nli_gate_checked_at"}  # W2: symmetric with the other check-markers —
+                                              # the gate's server-side stamp is its only writer
     forbidden_hit = FORBIDDEN_KEYS & set(b.metadata.keys())
     if forbidden_hit:
         # v0.20 Final (adversarial-review MED, mixed-key bypass): every forbidden
@@ -1558,11 +1741,13 @@ def update_metadata(
     merged = dict(b.metadata)
     merged["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
-        mem.vector_store.client.set_payload(
-            collection_name=mem.vector_store.collection_name,
-            payload=merged,
-            points=[mid],
-        )
+        # AMS-01/F4: serialize against a concurrent PUT's read-modify-write.
+        with _mid_write_lock(mid):
+            mem.vector_store.client.set_payload(
+                collection_name=mem.vector_store.collection_name,
+                payload=merged,
+                points=[mid],
+            )
     except Exception as e:
         log.exception("metadata update failed")
         raise _upstream_error(e)
