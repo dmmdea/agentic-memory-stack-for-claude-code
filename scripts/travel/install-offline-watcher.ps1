@@ -1,9 +1,34 @@
 #Requires -PSEdition Core
-param([string]$AuthorityHost = 'your-machine')   # machine that OWNS the live brain — same convention as travel-mode.ps1
 # HARD GUARD — never register the watcher on the authority machine: its go_online transition
 # stops mem0/qdrant, which ARE the production brain there (mirrors travel-mode.ps1's refusal).
-if ($env:COMPUTERNAME -ieq $AuthorityHost) {
-    throw "REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority — the watcher's go_online stops the LIVE mem0/qdrant. The watcher is for the laptop. (Override only by editing -AuthorityHost, deliberately.)"
+# AMS-11 (W4): keyed on LOCAL receipts, not a hostname parameter. The old
+# -AuthorityHost default was the operator-neutral literal 'your-machine', so
+# this guard never fired on any real machine; deriving the host from the
+# authority URL is equally vacuous on the brain (its authority is loopback).
+$_role = ''
+$_auth = ''
+try {
+    $_cfg = Join-Path $env:USERPROFILE '.claude\scripts\mem0-stack.config.psd1'
+    if (Test-Path $_cfg) {
+        $_c = Import-PowerShellDataFile $_cfg
+        $_auth = [string]$_c.AuthorityUrl
+        $_distro = [string]$_c.Distro
+    }
+} catch {}
+if (-not $_distro) { $_distro = $env:MEM0_WSL_DISTRO }
+if ($_distro) {
+    try { $_role = ("$(wsl.exe -d $_distro -e bash -lc 'cat ~/.mem0/role 2>/dev/null' | Select-Object -First 1)".Trim().ToLowerInvariant()) } catch {}
+    if (-not $_auth) { try { $_auth = ("$(wsl.exe -d $_distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' | Select-Object -First 1)".Trim()) } catch {} }
+}
+$_authIsLocal = $false
+if ($_auth) {
+    try { $_h = ([System.Uri]$_auth).Host; $_authIsLocal = ($_h -in @('127.0.0.1','localhost','::1','[::1]')) -or ($_h -ieq $env:COMPUTERNAME) } catch {}
+}
+if ($_role -eq 'brain' -or $_authIsLocal) {
+    throw "REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority (role='$_role', authority='$_auth') — the watcher's go_online stops the LIVE mem0/qdrant. The watcher is for a replica box."
+}
+if (-not $_role -and -not $_auth) {
+    throw "REFUSED: cannot determine this box's role (no ~/.mem0/role, no authority URL) — refusing fail-closed rather than risk registering the watcher on the authority."
 }
 $watcher = Join-Path $PSScriptRoot 'offline-watcher.ps1'
 # WINDOWLESS (2026-07-21). This task repeats every 2 MINUTES. Registered as a bare

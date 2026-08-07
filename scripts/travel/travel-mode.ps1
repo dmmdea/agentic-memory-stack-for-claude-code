@@ -18,8 +18,12 @@
   The one-brain rule holds because the shim never writes to the replica — new memories go to
   the outbox and are applied by the authority on reconnect.
 
-  HARD GUARD: refuses to run 'on' on the authority machine itself ($AuthorityHost) — restoring
-  a snapshot there would overwrite the live brain with day-old data.
+  HARD GUARD: refuses to run 'on'/'off' on the authority machine — restoring a snapshot there
+  would overwrite the live brain with day-old data, and 'off' would stop the live services.
+  The guard reads LOCAL receipts (~/.mem0/role and the authority URL), never a hostname
+  parameter: the previous parameter defaulted to an operator-neutral placeholder, so it never
+  fired anywhere, and deriving the hostname from the authority URL is equally vacuous on the
+  brain (its authority is loopback). Fail-closed: an undeterminable role refuses too.
 
 .EXAMPLE
   travel-mode.ps1 status
@@ -35,13 +39,17 @@ param(
     # pCloud copy with a loud warning. P: is pCloud's VIRTUAL drive: it STREAMS files from the
     # cloud, so restoring from it fails in the one scenario travel mode exists for (found
     # 2026-07-14 — the first end-to-end test only passed because the laptop still had internet).
+    # AMS-11 (W4): the placeholder defaults below are LAST-RESORT only. Unset
+    # params are resolved at RUNTIME from receipts that already exist on every
+    # installed box (see Resolve-TravelDefaults). The operator-neutral
+    # 'your-machine' literals made travel mode resolve to directories that
+    # exist nowhere, so the replica restore has never once worked.
     [string]$BackupDir = '',
-    [string]$LocalBackupDir = 'D:\memory-backups\your-machine',
-    [string]$CloudBackupDir = 'P:\memory-backups\your-machine',
+    [string]$LocalBackupDir = '',
+    [string]$CloudBackupDir = '',
 
-    [string]$Authority = 'http://your-machine:18791',      # Tailscale MagicDNS — resolves home and away
+    [string]$Authority = '',                               # Tailscale MagicDNS — resolves home and away
     [string]$Replica   = 'http://127.0.0.1:18791',
-    [string]$AuthorityHost = 'your-machine',               # machine that OWNS the live brain — on/off refuse to run there
     [switch]$Force,
     # Pre-flight: resolve + seed the snapshot source and print what WOULD happen, touching no
     # services. Use before a trip to answer "will travel mode work if I lose internet right now?"
@@ -50,7 +58,102 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Distro = $env:MEM0_WSL_DISTRO; if (-not $Distro) { $Distro = 'Ubuntu' }   # laptop=Ubuntu, your-machine=Ubuntu-ML
+$Distro = $env:MEM0_WSL_DISTRO
+if (-not $Distro) {
+    # AMS-11 (W4): the installer receipt knows the distro; the old hardcoded
+    # 'Ubuntu' was wrong on any box using a different distro name.
+    try {
+        $cfgP = Join-Path $env:USERPROFILE '.claude\scripts\mem0-stack.config.psd1'
+        if (Test-Path $cfgP) { $Distro = (Import-PowerShellDataFile $cfgP).Distro }
+    } catch {}
+}
+if (-not $Distro) { $Distro = 'Ubuntu' }
+
+# ── AMS-11 (W4): runtime resolution + the ONE-BRAIN GUARD ────────────────────
+# The guard that stops a replica-restore from destroying the live brain must
+# key on facts that are AUTHORITATIVE ON THIS BOX. It previously compared
+# $env:COMPUTERNAME against an -AuthorityHost parameter whose default was the
+# operator-neutral literal 'your-machine' — so it never fired anywhere.
+#
+# Deriving that hostname from the authority URL (the obvious fix) is ALSO
+# vacuous: on the brain the authority URL is loopback, so the derived host is
+# '127.0.0.1', which never equals the machine name — the guard would look
+# alive and still never fire on the one machine it exists to protect.
+#
+# Two independent local facts decide it instead:
+#   1. ~/.mem0/role == 'brain'      (written by the installer; W3 made the
+#                                    server read the same receipt)
+#   2. the authority URL is LOCAL   (a box whose authority is itself IS the
+#                                    authority — the offline-watcher already
+#                                    treats a local URL as "not a replica")
+function Test-IsLocalAuthorityUrl([string]$url) {
+    if (-not $url) { return $false }
+    try { $h = ([System.Uri]$url).Host } catch { return $false }
+    return ($h -in @('127.0.0.1', 'localhost', '::1', '[::1]')) -or ($h -ieq $env:COMPUTERNAME)
+}
+
+function Get-Mem0RoleLocal {
+    # ~/.mem0/role inside WSL; empty when the receipt is absent (older install).
+    try {
+        $r = Wsl "cat ~/.mem0/role 2>/dev/null"
+        return ("$($r | Select-Object -First 1)".Trim().ToLowerInvariant())
+    } catch { return '' }
+}
+
+function Get-AuthorityUrlLocal {
+    # Receipt first (Windows side), then the per-host file the MCP shim reads.
+    try {
+        $cfgP = Join-Path $env:USERPROFILE '.claude\scripts\mem0-stack.config.psd1'
+        if (Test-Path $cfgP) {
+            $u = (Import-PowerShellDataFile $cfgP).AuthorityUrl
+            if ($u) { return [string]$u }
+        }
+    } catch {}
+    try {
+        $u = Wsl "cat ~/.mem0/authority-url 2>/dev/null"
+        return ("$($u | Select-Object -First 1)".Trim())
+    } catch { return '' }
+}
+
+function Assert-NotTheAuthority([string]$verb) {
+    $role = Get-Mem0RoleLocal
+    $auth = Get-AuthorityUrlLocal
+    $isLocalAuth = Test-IsLocalAuthorityUrl $auth
+    if ($role -eq 'brain' -or $isLocalAuth) {
+        $why = if ($role -eq 'brain') { "~/.mem0/role says 'brain'" } else { "the authority URL ($auth) is this machine" }
+        throw ("REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority — $why. " +
+               "'$verb' would " + $(if ($verb -eq 'on') { 'overwrite the live brain with a day-old snapshot' } else { 'stop and disable the LIVE mem0/qdrant' }) + '. ' +
+               'Travel mode is for a replica box. (If this box was genuinely demoted to a replica, fix ~/.mem0/role and the authority URL first.)')
+    }
+    if (-not $role -and -not $auth) {
+        throw "REFUSED: cannot determine this box's role (no ~/.mem0/role and no authority URL). Refusing '$verb' fail-closed rather than risk running on the authority."
+    }
+}
+
+function Resolve-TravelDefaults {
+    # Backup dirs are named after the AUTHORITY host by convention
+    # (P:\memory-backups\<host> is the live layout). Derive it, normalised, and
+    # refuse IP literals — 'D:\memory-backups\127.0.0.1' is not a real path.
+    $auth = Get-AuthorityUrlLocal
+    if (-not $script:Authority) { $script:Authority = $auth }
+    $host_ = ''
+    if ($script:Authority) {
+        try { $host_ = ([System.Uri]$script:Authority).Host } catch { $host_ = '' }
+    }
+    $host_ = ($host_ -split '\.')[0].ToLowerInvariant()   # strip domain, normalise
+    if ($host_ -match '^\d+$' -or $host_ -in @('127', 'localhost', '')) { $host_ = '' }
+    if (-not $script:LocalBackupDir) {
+        $script:LocalBackupDir = if ($host_) { "D:\memory-backups\$host_" } else { '' }
+    }
+    if (-not $script:CloudBackupDir) {
+        $script:CloudBackupDir = if ($host_) { "P:\memory-backups\$host_" } else { '' }
+    }
+    if (-not $script:LocalBackupDir -or -not $script:CloudBackupDir) {
+        throw ("REFUSED: cannot derive the backup directories — the authority URL " +
+               "('$($script:Authority)') yields no usable host name. Pass -LocalBackupDir and " +
+               '-CloudBackupDir explicitly, or fix ~/.mem0/authority-url to name the authority by host.')
+    }
+}
 
 # A snapshot SET is only usable if all four artifacts share a timestamp — P: regularly holds
 # orphans (a manifest whose qdrant snapshot never finished uploading). Everything below reasons
@@ -109,10 +212,9 @@ switch ($Mode) {
 
   'on' {
       # HARD GUARD — never on the authority machine: the restore would stop the live mem0 and
-      # overwrite the real brain (67k+ memories) with a day-old snapshot.
-      if ($env:COMPUTERNAME -ieq $AuthorityHost) {
-          throw "REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority. Travel mode is for the laptop. (Override only by editing -AuthorityHost, deliberately.)"
-      }
+      # overwrite the real brain with a day-old snapshot. Keyed on local receipts (AMS-11/W4).
+      Assert-NotTheAuthority 'on'
+      Resolve-TravelDefaults
       Write-Host "==> Travel mode ON"
 
       # 0. Seed/refresh the LOCAL cache from pCloud while we still have internet. Gated on the
@@ -213,9 +315,8 @@ EOF"
   'off' {
       # HARD GUARD — 'off' stops+disables mem0/qdrant in WSL. On the authority machine those ARE
       # the live brain, so this must refuse there just as 'on' does (they share the same Wsl calls).
-      if ($env:COMPUTERNAME -ieq $AuthorityHost) {
-          throw "REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority — 'off' would stop and disable the LIVE mem0/qdrant. Travel mode is for the laptop."
-      }
+      Assert-NotTheAuthority 'off'
+      Resolve-TravelDefaults
       Write-Host "==> Travel mode OFF"
 
       if (-not (Test-Endpoint $Authority)) {
