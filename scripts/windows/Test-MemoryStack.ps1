@@ -108,7 +108,10 @@ try {
 
 # L2: mem0 deep health (Qdrant + embedder probe)
 try {
-    $hd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 6
+    # W2: /health/deep now runs the sparse-leg canary (filtered scroll + a
+    # keyword probe, first call may load the bm25 model) and the mojibake
+    # scroll — 6s flapped on cold starts; 30 matches L8/R10.
+    $hd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30
     if ($hd.ok) {
         Add-Check 'LIVENESS' 'mem0 /health/deep' 'OK' "qdrant_points=$($hd.checks.qdrant.points) embed_dim=$($hd.checks.embedder.dim)"
     } else {
@@ -1222,6 +1225,10 @@ try {
 # in W2; the boundary is fixed). /health/deep computes the count server-side
 # (informational there — it never flips ok); THIS row is where hits>0 becomes
 # a WARN a human sees, with sample ids to chase.
+# KNOWN-ACCEPTED nag: a memory that QUOTES a mojibake example (e.g. session
+# learnings about this very repair) will WARN here permanently — eyeball the
+# sample ids before assuming fresh corruption; the repair script's flag gate
+# (--include-flagged) is the sanctioned way to leave quotes intact.
 try {
     $mjHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
     $mj = $mjHd.checks.mojibake

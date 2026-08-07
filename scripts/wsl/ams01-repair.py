@@ -93,6 +93,16 @@ REPORT_PATH = Path(os.environ.get("MEM0_AMS01_REPORT", str(Path.home() / ".mem0"
 RECEIPTS_PATH = Path(os.environ.get("MEM0_AMS01_RECEIPTS", str(Path.home() / ".mem0" / "ams01-repair-receipts.jsonl")))
 TMP_COLLECTION = os.environ.get("MEM0_AMS01_TMP_COLLECTION", "ams01-restore-tmp")
 
+# Identity guard (diff-review finding 5): the temp collection is DROPPED by
+# this script. A mis-set env var pointing it at the live collection would make
+# the script delete production as its first act. Refuse to start unless the
+# temp name is distinct AND carries the script's own prefix.
+if TMP_COLLECTION == COLLECTION or not TMP_COLLECTION.startswith("ams01-"):
+    print(f"FATAL: MEM0_AMS01_TMP_COLLECTION={TMP_COLLECTION!r} is unsafe — it "
+          f"must differ from the live collection ({COLLECTION!r}) and start "
+          "with 'ams01-' (this collection gets DROPPED).", file=sys.stderr)
+    sys.exit(2)
+
 SCRIPT_NAME = "ams01-repair"
 _SCROLL_PAGE = 256
 
@@ -508,10 +518,22 @@ def _mark_one(qc, cand: dict, stats: dict) -> None:
         stats["noop"] += 1
         print(f"  NOOP {pid[:8]} (already marked)")
         return
+    # Diff-review finding 6: the register may be stale — a record that
+    # regained its provenance keys since --report must NOT be stamped with a
+    # false factual claim. Re-verify the LIVE key-set still matches a damage
+    # fingerprint before writing anything.
+    live_keys = frozenset(live_payload.keys())
+    if damage_variant(live_keys, bool(cand.get("first_update_ts"))) is None:
+        stats["healed"] = stats.get("healed", 0) + 1
+        print(f"  HEALED {pid[:8]} (live key-set no longer matches a damage "
+              "fingerprint; not marking)")
+        return
     # Factual marker only -- no invented brand/source values (review F1/F2).
+    # provenance_lost_at: 'unknown' is an honest value; None would be a typed
+    # lie (finding 6, minor leg).
     marker = {
         "provenance_lost": "ams01-put-wipe",
-        "provenance_lost_at": cand.get("first_update_ts"),
+        "provenance_lost_at": cand.get("first_update_ts") or "unknown",
     }
     qc.set_payload(collection_name=COLLECTION, payload=marker, points=[pid], wait=True)
     write_receipt(pid, "mark-provenance-lost", {}, marker)
@@ -529,6 +551,9 @@ def _delete_one(qc, cand: dict, stats: dict, operator_ack: str) -> None:
         return
     qc.delete(collection_name=COLLECTION,
               points_selector=models.PointIdsList(points=[pid]), wait=True)
+    # Receipt captures identity fields only, not the full payload/vector —
+    # deliberate: deletion is operator-acked test debris, and the pre-repair
+    # snapshots retain the complete point should it ever matter.
     write_receipt(
         pid, "surface-delete",
         {"exists": True, "data": live_payload.get("data"),

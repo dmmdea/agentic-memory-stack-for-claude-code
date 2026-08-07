@@ -14,13 +14,25 @@ Split for headless testability (house pattern: canonical_key_health):
 - ``sparse_leg_health(...)`` — thin I/O wrapper; NEVER raises (a probe bug
   must not take down /health/deep for its other consumers — review F11).
 
-Canary determinism (review F6): probing "some recent point" would go green
-after a tokenizer/hash change that strands the legacy corpus — the exact
-drift the canary exists to catch. So the canary always targets the OLDEST
-bm25-bearing point (created_at min over a filtered scroll) and derives its
-token deterministically (longest token, lexicographic tiebreak) from that
-point's ``text_lemmatized``. The point id must appear anywhere in the top-5
-keyword results; a ``None`` from keyword_search means the encoder is dead.
+Canary determinism (review F6, hardened by the diff review): probing "some
+recent point" would go green after a tokenizer/hash change that strands the
+legacy corpus — the exact drift the canary exists to catch. So the canary
+always targets the OLDEST bm25-bearing point (created_at min over a filtered
+scroll) and derives its token deterministically (longest token, lexicographic
+tiebreak) from that point's ``text_lemmatized``. The retrieval probe queries
+``using='bm25'`` WITH a ``HasIdCondition`` filter on that exact point
+(limit 1): the point returns iff its STORED sparse vector overlaps the
+CURRENT encoder's token index — precisely the drift signal, and immune to
+top-k displacement as the corpus grows (a top-5 membership check could go
+red on a perfectly healthy leg once five newer points outscore the fixed
+probe point). An encoder that cannot encode the query (returns ``None``)
+means the leg is dead.
+
+Empty-collection carve-out (diff review finding 2): a brand-new box with
+ZERO points has nothing that can be dead — gating there would block every
+deploy on a fresh install until the first memory lands. ``points == 0`` is
+green with a note; a POPULATED corpus with zero bm25-bearing points still
+gates (that is a dead leg's signature, not a fresh box's).
 """
 
 import importlib.util
@@ -37,11 +49,21 @@ def pick_canary_token(text_lemmatized):
 def evaluate_sparse_leg(fastembed_present, bm25_slot, points, with_bm25,
                         canary, error=None):
     """Pure verdict. GATING failures: fastembed missing, slot missing,
-    canary did not hit (including 'no bm25-bearing point to probe').
-    Coverage is reported but does NOT gate here — Test-MemoryStack WARNs
-    below 0.95; a half-backfilled corpus with a live encoder is degraded,
-    not dead."""
+    canary did not hit (including 'no bm25-bearing point to probe' on a
+    populated corpus). Coverage is reported but does NOT gate here —
+    Test-MemoryStack WARNs below 0.95; a half-backfilled corpus with a live
+    encoder is degraded, not dead."""
     coverage = (float(with_bm25) / float(points)) if points else 0.0
+    if points == 0 and fastembed_present and bm25_slot:
+        # Fresh install: nothing exists to probe, nothing can be dead.
+        return {
+            "ok": True,
+            "fastembed": bool(fastembed_present),
+            "bm25_slot": bool(bm25_slot),
+            "points": 0, "with_bm25": 0, "coverage": 0.0,
+            "canary": canary,
+            "note": "empty collection — canary skipped",
+        }
     ok = bool(fastembed_present and bm25_slot
               and canary and canary.get("ran") and canary.get("hit"))
     out = {
@@ -58,10 +80,10 @@ def evaluate_sparse_leg(fastembed_present, bm25_slot, points, with_bm25,
     return out
 
 
-def sparse_leg_health(client, collection_name, keyword_search_fn):
-    """I/O wrapper. ``keyword_search_fn(query, top_k)`` is mem0's
-    ``vector_store.keyword_search`` (returns a result list, or ``None`` when
-    the encoder is unavailable). Never raises."""
+def sparse_leg_health(client, collection_name, encode_query_fn):
+    """I/O wrapper. ``encode_query_fn(text)`` mirrors mem0's query-side
+    encoder (``vector_store._encode_bm25`` — returns a sparse query object,
+    or ``None`` when the encoder is unavailable). Never raises."""
     canary = {"ran": False, "hit": False, "token": None}
     try:
         from qdrant_client import models as _qm
@@ -78,10 +100,17 @@ def sparse_leg_health(client, collection_name, keyword_search_fn):
             collection_name, count_filter=bm25_filter, exact=True
         ).count
 
+        if points == 0:
+            return evaluate_sparse_leg(
+                fastembed_present, bm25_slot, 0, 0, canary,
+            )
+
         # Oldest bm25-bearing point: filtered scroll, min created_at (no
         # payload index on created_at exists, so order_by is unavailable —
-        # a full filtered walk at page 1000 measured ~0.2s on the live corpus).
-        oldest = None  # (created_at, id, text_lemmatized)
+        # a full filtered walk at page 1000 measured ~0.2s on the live corpus.
+        # String-min on ISO timestamps is deterministic, which is what the
+        # canary needs; true age ordering is not load-bearing).
+        oldest = None  # (sort_key, id, text_lemmatized)
         offset = None
         while True:
             pts, offset = client.scroll(
@@ -100,17 +129,27 @@ def sparse_leg_health(client, collection_name, keyword_search_fn):
         if oldest is None:
             return evaluate_sparse_leg(
                 fastembed_present, bm25_slot, points, with_bm25, canary,
-                error="no bm25-bearing point to canary",
+                error="no bm25-bearing point to canary (populated corpus, zero sparse vectors)",
             )
 
         token = pick_canary_token(oldest[2])
         canary["token"] = token
         if token:
-            canary["ran"] = True
-            hits = keyword_search_fn(token, 5)
-            ids = {str(getattr(h, "id", None) or (h.get("id") if isinstance(h, dict) else None))
-                   for h in (hits or [])}
-            canary["hit"] = oldest[1] in ids
+            sq = encode_query_fn(token)
+            if sq is not None:
+                canary["ran"] = True
+                # Displacement-proof probe (diff review finding 3): filter to
+                # the probe point's own id — it returns iff its STORED sparse
+                # vector overlaps the CURRENT encoder's tokens. Top-k
+                # membership would degrade as the corpus grows; this cannot.
+                hits = client.query_points(
+                    collection_name, query=sq, using="bm25",
+                    query_filter=_qm.Filter(
+                        must=[_qm.HasIdCondition(has_id=[oldest[1]])]),
+                    limit=1,
+                )
+                ids = {str(h.id) for h in (getattr(hits, "points", None) or [])}
+                canary["hit"] = oldest[1] in ids
         return evaluate_sparse_leg(
             fastembed_present, bm25_slot, points, with_bm25, canary,
         )

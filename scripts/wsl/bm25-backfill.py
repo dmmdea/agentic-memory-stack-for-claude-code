@@ -21,7 +21,10 @@ vectors were produced by an incompatible encoder -- the report then recommends
 including the legacy set in scope via --rewrite-legacy.
 
 --apply --dry-run / --apply --live: scroll all points, skip those that already
-carry a bm25 vector (idempotent; --rewrite-legacy includes them), take the text
+carry a bm25 vector (idempotent; --rewrite-legacy includes them — NOTE: the
+overwritten legacy sparse vector is NOT captured in receipts; it is fully
+recomputable from the stored text and was encoder-incompatible anyway, which
+is the only reason --rewrite-legacy would run), take the text
 exactly as mem0's insert() does (text_lemmatized, falling back to data), skip
 empty text, encode with fastembed, and write via update_vectors in batches --
 payload and dense vector UNTOUCHED.

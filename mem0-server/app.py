@@ -840,7 +840,7 @@ def health_deep() -> dict:
     try:
         _sl = sparse_leg_health(
             mem.vector_store.client, mem.vector_store.collection_name,
-            lambda q, k: mem.vector_store.keyword_search(q, top_k=k),
+            lambda q: mem.vector_store._encode_bm25(q),
         )
     except Exception as e:
         _sl = {"ok": False, "error": str(e)[:120]}
@@ -1375,6 +1375,17 @@ def update(
                 ids=[mid], with_payload=True,
             )
         except Exception as e:
+            # A client-side 4xx (e.g. malformed id) is a PERMANENT fault —
+            # returning 503 would make the MCP shim queue the op to its outbox
+            # and retry a never-satisfiable PUT at every drain. Only genuine
+            # availability faults may be 503 (the shim's documented
+            # queue-on-503 contract).
+            _status = getattr(e, "status_code", None)
+            if isinstance(_status, int) and 400 <= _status < 500:
+                raise HTTPException(
+                    400, f"AMS-01: pre-update read rejected by the store "
+                         f"(bad memory id?): {str(e)[:120]}",
+                )
             raise HTTPException(
                 503,
                 "AMS-01: pre-update payload read failed; refusing to PUT — a "
@@ -1436,6 +1447,19 @@ def update(
                         log.exception(
                             "AMS-01: carry-over post-verify attempt %d failed for mid=%s",
                             _attempt + 1, mid,
+                        )
+                else:
+                    # for/else: the loop exhausted without a clean break. When
+                    # _missing is non-empty the restore-failure path below owns
+                    # the outcome (500 for gated tiers). When it is EMPTY here,
+                    # every post-verify attempt raised: no 500 fires, which is
+                    # defensible (the pre-merge already carried the payload
+                    # atomically) — but say so, loudly, in the log.
+                    if not _missing:
+                        log.error(
+                            "AMS-01: post-verify NEVER COMPLETED for mid=%s — the PUT "
+                            "returned 200 on the strength of the atomic pre-merge alone",
+                            mid,
                         )
                 if _restored_total:
                     _put_carryover_bump(restored=_restored_total)
@@ -1659,7 +1683,9 @@ def update_metadata(
     # key allowlist rather than reopen this endpoint.
     FORBIDDEN_KEYS = {"retrievable", "expires_at", "created_at", "tier_actor",
                       "superseded_by", "contradicts_canonical", "contradiction_checked_at",
-                      "contradicts_canonical_pending"}  # v0.29.4: only the sweep actor writes it
+                      "contradicts_canonical_pending",  # v0.29.4: only the sweep actor writes it
+                      "nli_gate_checked_at"}  # W2: symmetric with the other check-markers —
+                                              # the gate's server-side stamp is its only writer
     forbidden_hit = FORBIDDEN_KEYS & set(b.metadata.keys())
     if forbidden_hit:
         # v0.20 Final (adversarial-review MED, mixed-key bypass): every forbidden

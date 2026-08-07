@@ -14,7 +14,10 @@ cryptography>=48.0.1,<49
 uvicorn>=0.27.0
 httpx>=0.27.0
 pydantic>=2.6.0
-qdrant-client>=1.9.0
+# qdrant-client floor raised 1.9 -> 1.13 (W2): sparse_health.py uses
+# HasVectorCondition (client >=1.13); an older client would surface as a
+# confusing gating sparse_leg FAIL instead of a dep error.
+qdrant-client>=1.13.0
 mem0ai>=2.0.4
 anyio>=4.3.0
 # AMS-09 (2026-08-07): BM25 sparse-leg encoder. mem0ai keeps fastembed under its

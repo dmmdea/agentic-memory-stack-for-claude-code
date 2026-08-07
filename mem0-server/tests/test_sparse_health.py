@@ -39,11 +39,28 @@ def test_canary_miss_gates():
     assert out["ok"] is False
 
 
-def test_no_canary_point_gates():
-    # Empty bm25 population: nothing to probe IS a dead leg, not an unknown.
+def test_no_canary_point_on_populated_corpus_gates():
+    # POPULATED corpus with zero bm25 vectors: nothing to probe IS a dead leg.
     out = evaluate_sparse_leg(True, True, 100, 0, CANARY_NOT_RUN,
                               error="no bm25-bearing point to canary")
     assert out["ok"] is False and "error" in out
+
+
+def test_empty_collection_is_green_with_note():
+    # Diff-review finding 2: a brand-new box (0 points) has nothing that can
+    # be dead — gating there would block every deploy on a fresh install.
+    out = evaluate_sparse_leg(True, True, 0, 0, CANARY_NOT_RUN)
+    assert out["ok"] is True and "note" in out
+
+
+def test_empty_collection_with_missing_dep_still_gates():
+    # The carve-out is for the missing CORPUS, never for a missing DEP: an
+    # empty box without fastembed installed must still fail (the installer
+    # post-condition contract).
+    out = evaluate_sparse_leg(False, True, 0, 0, CANARY_NOT_RUN)
+    assert out["ok"] is False
+    out = evaluate_sparse_leg(True, False, 0, 0, CANARY_NOT_RUN)
+    assert out["ok"] is False
 
 
 def test_low_coverage_reports_but_does_not_gate_here():
@@ -55,7 +72,7 @@ def test_low_coverage_reports_but_does_not_gate_here():
 
 def test_zero_points_coverage_zero_no_crash():
     out = evaluate_sparse_leg(True, True, 0, 0, CANARY_NOT_RUN)
-    assert out["coverage"] == 0.0 and out["ok"] is False
+    assert out["coverage"] == 0.0  # ok=True via the empty-collection carve-out
 
 
 def test_canary_token_rule_is_deterministic():

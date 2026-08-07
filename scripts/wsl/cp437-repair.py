@@ -487,7 +487,11 @@ def _flag_gate(cand: dict, include_flagged: set[str], stats: dict) -> bool:
 
 def apply_sqlite_phase(db_path: Path, candidates: list[dict], *, live: bool,
                        include_flagged: set[str], stats: dict) -> None:
-    con = sqlite3.connect(str(db_path)) if live else None
+    # timeout=30: the live server writes history.db on every add/PUT, so
+    # "database is locked" mid-repair is a realistic transient, not a bug
+    # (diff-review finding 4). Per-record try/except below matches the Qdrant
+    # phases' contract: one bad row counts an error and the run continues.
+    con = sqlite3.connect(str(db_path), timeout=30) if live else None
     try:
         for cand in candidates:
             if _flag_gate(cand, include_flagged, stats):
@@ -497,12 +501,17 @@ def apply_sqlite_phase(db_path: Path, candidates: list[dict], *, live: bool,
             if not live:
                 print(f"  WOULD-REPAIR {cand['id']} fields={cols}")
                 continue
-            # Plain column UPDATE only: the FTS5 AFTER UPDATE triggers keep the
-            # shadow tables in sync -- never write to *_fts directly.
-            sets = ", ".join(f"{c} = ?" for c in cols)
-            params = [cand["changes"][c]["after"] for c in cols] + [cand["pk_value"]]
-            con.execute(f"UPDATE {cand['table']} SET {sets} WHERE {cand['pk']} = ?", params)
-            con.commit()
+            try:
+                # Plain column UPDATE only: the FTS5 AFTER UPDATE triggers keep
+                # the shadow tables in sync -- never write to *_fts directly.
+                sets = ", ".join(f"{c} = ?" for c in cols)
+                params = [cand["changes"][c]["after"] for c in cols] + [cand["pk_value"]]
+                con.execute(f"UPDATE {cand['table']} SET {sets} WHERE {cand['pk']} = ?", params)
+                con.commit()
+            except sqlite3.Error as e:
+                stats["errors"] += 1
+                print(f"  ERROR {cand['id']}: {e}", file=sys.stderr)
+                continue
             write_receipt(
                 cand["id"], "cp437-repair",
                 {c: cand["changes"][c]["before"] for c in cols},
@@ -526,6 +535,19 @@ def apply_memory_phase(candidates: list[dict], dense_name: str, *, live: bool,
             if _flag_gate(cand, include_flagged, stats):
                 continue
             payload = dict(cand["point"].get("payload") or {})
+            if live:
+                # Diff-review finding 1: the scan may be minutes old and this
+                # phase upserts a FULL point — writing scan-time state would
+                # silently revert any concurrent server write (NLI stamp,
+                # PATCH, PUT). Re-read the LIVE payload and repair that; if
+                # the live text no longer matches the detector, it is a no-op.
+                fresh = qc.retrieve(collection_name=COLLECTION,
+                                    ids=[cand["point"]["id"]], with_payload=True)
+                if not fresh:
+                    stats["noop"] += 1
+                    print(f"  GONE {cand['id']} (deleted since scan; skipped)")
+                    continue
+                payload = dict(fresh[0].payload or {})
             old_data = payload.get("data") if isinstance(payload.get("data"), str) else ""
             old_lemma = payload.get("text_lemmatized")
             new_payload = dict(payload)
@@ -571,6 +593,19 @@ def apply_memory_phase(candidates: list[dict], dense_name: str, *, live: bool,
                     indices=[int(i) for i in emb.indices],
                     values=[float(v) for v in emb.values],
                 )
+                # Last-instant freshness check (diff-review finding 1): the
+                # embed calls above take seconds; if the live point changed
+                # underneath them, writing our computed state would be a lost
+                # update. Cheap re-read, no embed — skip on any divergence
+                # (idempotent: the next run picks the record up again).
+                recheck = qc.retrieve(collection_name=COLLECTION,
+                                      ids=[cand["point"]["id"]], with_payload=True)
+                live_now = dict(recheck[0].payload or {}) if recheck else None
+                if live_now is None or live_now.get("data") != old_data:
+                    stats["raced"] = stats.get("raced", 0) + 1
+                    print(f"  RACED {cand['id']} (live point changed during embed; "
+                          "skipped — re-run to pick it up)")
+                    continue
                 # Single upsert carrying BOTH named vectors and the FULL merged
                 # payload (review F8). An unnamed dense vector is addressed by
                 # the default name '' in the named-vector form.
@@ -604,6 +639,20 @@ def apply_episodes_phase(candidates: list[dict], *, live: bool,
                 continue
             pt = cand["point"]
             payload = dict(pt.get("payload") or {})
+            if live:
+                # Diff-review finding 1 (same as the memory phase): never
+                # upsert scan-time state over a live point. Re-read fresh;
+                # a since-repaired/changed point becomes a no-op.
+                fresh = qc.retrieve(collection_name=EPISODES_COLLECTION,
+                                    ids=[pt["id"]], with_payload=True,
+                                    with_vectors=True)
+                if not fresh:
+                    stats["noop"] += 1
+                    print(f"  GONE {cand['id']} (deleted since scan; skipped)")
+                    continue
+                payload = dict(fresh[0].payload or {})
+                pt = {"id": pt["id"], "payload": payload,
+                      "vector": fresh[0].vector}
             new_payload = dict(payload)
             before: dict[str, Any] = {}
             after: dict[str, Any] = {}
@@ -639,6 +688,16 @@ def apply_episodes_phase(candidates: list[dict], *, live: bool,
                     stats["errors"] += 1
                     print(f"  ERROR {cand['id']}: no existing vector and summary below "
                           "re-embed floor; skipping", file=sys.stderr)
+                    continue
+                # Last-instant freshness check (finding 1): skip on divergence
+                # during the embed; the next run picks the record up again.
+                recheck = qc.retrieve(collection_name=EPISODES_COLLECTION,
+                                      ids=[pt["id"]], with_payload=True)
+                live_now = dict(recheck[0].payload or {}) if recheck else None
+                if live_now is None or any(live_now.get(f) != payload.get(f)
+                                           for f in ("goal", "summary")):
+                    stats["raced"] = stats.get("raced", 0) + 1
+                    print(f"  RACED {cand['id']} (live episode changed during embed; skipped)")
                     continue
                 # Episodes collection uses a single unnamed dense vector (see
                 # episode_embeddings.ensure_episode_collection), so the plain

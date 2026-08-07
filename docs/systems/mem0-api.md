@@ -157,9 +157,10 @@ Update a memory's text content. The **full existing payload is carried over** at
 ```json
 Request: {"text": "new content"}
 Response 200: mem0 update result
+Response 400: pre-update read rejected by the store (malformed memory id — permanent fault, never queued)
 Response 413: text exceeds MAX_MEMORY_CHARS
-Response 500: Qdrant unreachable
-Response 503: pre-update payload read failed (refused fail-closed rather than wiping custom metadata)
+Response 500: carry-over restore exhausted for a canonical/insight record (inconsistent state — manual verification)
+Response 503: pre-update payload read failed (refused fail-closed rather than wiping custom metadata; MCP shim queues 503s to the outbox and replays)
 ```
 
 ### `PATCH /v1/memories/{id}/tier`
