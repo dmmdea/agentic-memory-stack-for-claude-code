@@ -76,14 +76,23 @@ def read_stack_env(path=None):
     return env
 
 
-def get_role(environ=None, stack_env=None):
-    """Box role ('brain'|'replica'|...) from env MEM0_ROLE, else stack.env.
-    None when neither source declares one (fail-soft — the capability
-    evaluator treats an unknown role as 'no required rows can be dead')."""
+def get_role(environ=None, stack_env=None, role_file=None):
+    """Box role ('brain'|'replica'|...) from env MEM0_ROLE, else stack.env,
+    else the ~/.mem0/role receipt install/2-windows-config.ps1 writes (diff-
+    review fix 3: the Windows installer is the role AUTHORITY; ignoring its
+    receipt let a stale stack.env default a replica to brain and convict its
+    by-design-absent brain jobs as dead_required). None when no source
+    declares one (fail-soft — unknown role convicts nothing)."""
     environ = os.environ if environ is None else environ
     role = environ.get("MEM0_ROLE") or (
         stack_env if stack_env is not None else read_stack_env()
     ).get("MEM0_ROLE")
+    if not (isinstance(role, str) and role.strip()):
+        p = Path(role_file) if role_file is not None else (Path.home() / ".mem0" / "role")
+        try:
+            role = p.read_text(encoding="utf-8")
+        except OSError:
+            role = None
     if isinstance(role, str) and role.strip():
         return role.strip().lower()
     return None
@@ -175,7 +184,10 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
     mem0_dir = Path(mem0_dir) if mem0_dir is not None else Path.home() / ".mem0"
     senv = stack_env if stack_env is not None else read_stack_env()
     out = {
-        "role": get_role(environ=environ, stack_env=senv),
+        # role receipt travels with the injected sidecar dir (fix 3 + test
+        # isolation: the live ~/.mem0/role must not leak into a tmp fixture).
+        "role": get_role(environ=environ, stack_env=senv,
+                         role_file=mem0_dir / "role"),
         "last_dream_age_h": None,
         "prune_age_h": None,
         "gather_age_h": None,

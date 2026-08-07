@@ -261,6 +261,10 @@ try {
 try {
     if ($TmsRole -eq 'replica') {
         Add-Check 'LIVENESS' 'dream cycle' 'OK' 'replica role: dream not scheduled here by design (one-brain rule)'
+    } elseif (-not $TmsRole) {
+        # Diff-review fix 2 (bound F3): an unknown role cannot convict — a
+        # receipt-less box may be a replica that never schedules the dream.
+        Add-Check 'LIVENESS' 'dream cycle' 'WARN' 'role unknown (no Role in mem0-stack.config.psd1) - cannot judge dream liveness; re-run install/2-windows-config.ps1 to write the receipt'
     } else {
         $ldPath = Join-Path $env:USERPROFILE '.claude\state\last-dream'
         $dreamDir = Join-Path $env:USERPROFILE '.claude\state\dream'
@@ -277,7 +281,8 @@ try {
                 try {
                     $g = Get-Content $gatherP -Raw | ConvertFrom-Json
                     $gAgeH = ((Get-Date) - (Get-Item $gatherP).LastWriteTime).TotalHours
-                    if ($gAgeH -lt 30 -and @($g.signals).Count -eq 0) { $quietNight = $true }
+                    # dry_run receipts cannot vouch for a quiet night (fix 5).
+                    if ($gAgeH -lt 30 -and @($g.signals).Count -eq 0 -and -not $g.dry_run) { $quietNight = $true }
                 } catch {}
             }
             if ($ldAgeH -lt 30) {
@@ -305,7 +310,14 @@ try {
                     try {
                         $lcEpoch = [long]((Get-Content $lcPath -Raw).Trim())
                         $lcAgeMin = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $lcEpoch) / 60.0
-                        if ($lcAgeMin -gt 30) { $failedRecovery = $true }
+                        # Diff-review fix 1: the catchup stamp records a DECISION
+                        # (every 6h-throttled pass, including "fresh, skip"), so
+                        # ">30min old" is true ~always and convicted every long
+                        # sleep as "genuinely stuck". Failed-recovery evidence
+                        # needs a RECENT decision (<=6h) that MUST have invoked
+                        # (catchup force-invokes at >72h regardless of debt) with
+                        # the stamp still stale afterward.
+                        if ($lcAgeMin -gt 30 -and $lcAgeMin -le 360 -and $ldAgeH -gt 72) { $failedRecovery = $true }
                     } catch {}
                 }
                 if ($debt -or $failedRecovery) {
@@ -1150,6 +1162,8 @@ try {
 try {
     if ($TmsRole -eq 'replica') {
         Add-Check 'RECOVERY' 'drift guard liveness' 'OK' 'replica role: dream/drift guard not scheduled here by design'
+    } elseif (-not $TmsRole) {
+        Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'role unknown (no Role in mem0-stack.config.psd1) - cannot judge guard liveness'
     } elseif (-not ($TmsCfg -and $TmsCfg.EvalRootWsl)) {
         Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'no EvalRootWsl in the receipt - drift guard not configured on this box (expected on non-maintainer installs)'
     } else {
@@ -1176,6 +1190,10 @@ try {
                 }
                 if ($failOpen) {
                     Add-Check 'RECOVERY' 'drift guard liveness' 'FAIL' 'a consolidation completed AFTER the last drift compare - the guard fail-open-skipped (the 07-21 signature); check EvalRootWsl + dream.log drift lines'
+                } elseif (-not $rd.last_compare_ts -or [int]$rd.consecutive_snapshot_failures -ge 1) {
+                    # Diff-review fix 6: a heartbeat-only state (one failure,
+                    # zero compares ever) is not "guard alive".
+                    Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' "guard has not completed a compare yet (snapshot failures: $([int]$rd.consecutive_snapshot_failures)) - watch the next dream night"
                 } elseif ($rd.alarm) {
                     Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' "guard alive; STANDING ALARM (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm), below-hwm streak=$($rd.consecutive_below_hwm)) - run eval/retrieval-drift validate to separate fact-gone from fact-unrankable"
                 } else {

@@ -210,6 +210,14 @@ MEM0_BIND="${MEM0_BIND:-127.0.0.1}"
 if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/stack.env" ]; then
     MEM0_ROLE="$(grep -E '^MEM0_ROLE=' "$USER_HOME/.mem0/stack.env" | cut -d= -f2 || true)"
 fi
+# Diff-review fix 3: install/2-windows-config.ps1 already writes the
+# AUTHORITATIVE role to ~/.mem0/role — a fresh replica install (installer 1
+# before installer 2) or a re-deploy must inherit it, not default to brain
+# (a wrong brain default makes every brain-only capability read dead-required
+# on a replica: false alarms on the exact surfaces W3 adds).
+if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/role" ]; then
+    MEM0_ROLE="$(tr -d '[:space:]' < "$USER_HOME/.mem0/role" || true)"
+fi
 MEM0_ROLE="${MEM0_ROLE:-brain}"
 cat > "$USER_HOME/.mem0/stack.env" <<ENV
 MEM0_WSL_USER=$WSL_USER

@@ -427,7 +427,11 @@ $gatherTokens = Parse-CodexTokenUsage -RawOutput $gatherRaw
 $gatherText = Get-CodexResponseText -RawOutput $gatherRaw
 $gatherParsed = Extract-JsonFromText -Text $gatherText -ExpectedKey 'signals'
 $signals = if ($gatherParsed) { @($gatherParsed.signals) } else { @() }
-Save-PhaseState -Phase 'gather' -Payload @{ signals = $signals; codex_ms = $gatherDurationMs; tokens = $gatherTokens }
+# dry_run travels in the receipt (diff-review fix 5): gather.json is L9's
+# quiet-night disambiguator, and -DryRun bypasses the throttle — without the
+# flag a daytime dry run could stamp a fresh 0-signal receipt and mask a live
+# mutex-skip pattern that same night.
+Save-PhaseState -Phase 'gather' -Payload @{ signals = $signals; codex_ms = $gatherDurationMs; tokens = $gatherTokens; dry_run = [bool]$DryRun }
 Write-MemoryLog -Component 'dream' -Message "  gathered $($signals.Count) signals (codex ${gatherDurationMs}ms, $gatherTokens tokens)"
 
 if ($signals.Count -eq 0) {

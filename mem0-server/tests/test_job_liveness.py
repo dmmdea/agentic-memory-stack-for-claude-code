@@ -158,11 +158,28 @@ def test_collector_full_fixture_all_fields(tmp_path):
     assert set(out) == JL_KEYS  # everything present -> no error key
 
 
-def test_get_role_env_beats_stack_env_and_normalizes():
+def test_get_role_env_beats_stack_env_and_normalizes(tmp_path):
+    # role_file injected as absent so the LIVE box's ~/.mem0/role receipt
+    # cannot leak into a headless assertion (the fallback exists on purpose —
+    # diff-review fix 3 — and gets its own pin below).
+    absent = tmp_path / "role"
     assert get_role(environ={"MEM0_ROLE": " Brain "},
-                    stack_env={"MEM0_ROLE": "replica"}) == "brain"
-    assert get_role(environ={}, stack_env={"MEM0_ROLE": "replica"}) == "replica"
-    assert get_role(environ={}, stack_env={}) is None
+                    stack_env={"MEM0_ROLE": "replica"}, role_file=absent) == "brain"
+    assert get_role(environ={}, stack_env={"MEM0_ROLE": "replica"},
+                    role_file=absent) == "replica"
+    assert get_role(environ={}, stack_env={}, role_file=absent) is None
+
+
+def test_get_role_falls_back_to_role_receipt(tmp_path):
+    # Diff-review fix 3: install/2-windows-config.ps1 writes the authoritative
+    # role to ~/.mem0/role; env and stack.env silence must inherit it — a brain
+    # default on a replica convicts its by-design-absent jobs as dead_required.
+    rf = tmp_path / "role"
+    rf.write_text(" Replica \n", encoding="utf-8")
+    assert get_role(environ={}, stack_env={}, role_file=rf) == "replica"
+    # env still wins over the receipt
+    assert get_role(environ={"MEM0_ROLE": "brain"}, stack_env={},
+                    role_file=rf) == "brain"
 
 
 def test_read_stack_env(tmp_path):
