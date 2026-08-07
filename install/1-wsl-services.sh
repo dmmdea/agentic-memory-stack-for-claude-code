@@ -105,7 +105,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py"
+MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"
@@ -202,14 +202,32 @@ if [ -z "${MEM0_BIND:-}" ] && [ -f "$USER_HOME/.mem0/stack.env" ]; then
     MEM0_BIND="$(grep -E '^MEM0_BIND=' "$USER_HOME/.mem0/stack.env" | cut -d= -f2 || true)"
 fi
 MEM0_BIND="${MEM0_BIND:-127.0.0.1}"
+# MEM0_ROLE: inherit-never-revert (same rule as MEM0_BIND) — a re-run must keep the
+# operator's existing role, never silently flip a replica back to brain. Default is
+# brain; a replica install must set this to mirror install/2-windows-config.ps1 -Role
+# until the two installers share a single role source. Read by job_liveness_health()
+# (W3) so /health/deep and the capability manifest can role-gate the brain-only rows.
+if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/stack.env" ]; then
+    MEM0_ROLE="$(grep -E '^MEM0_ROLE=' "$USER_HOME/.mem0/stack.env" | cut -d= -f2 || true)"
+fi
+# Diff-review fix 3: install/2-windows-config.ps1 already writes the
+# AUTHORITATIVE role to ~/.mem0/role — a fresh replica install (installer 1
+# before installer 2) or a re-deploy must inherit it, not default to brain
+# (a wrong brain default makes every brain-only capability read dead-required
+# on a replica: false alarms on the exact surfaces W3 adds).
+if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/role" ]; then
+    MEM0_ROLE="$(tr -d '[:space:]' < "$USER_HOME/.mem0/role" || true)"
+fi
+MEM0_ROLE="${MEM0_ROLE:-brain}"
 cat > "$USER_HOME/.mem0/stack.env" <<ENV
 MEM0_WSL_USER=$WSL_USER
 MEM0_WIN_USER=$WIN_USER
 MEM0_DISTRO=$DISTRO
 MEM0_REPO_ROOT_WSL=$REPO_ROOT_WSL
 MEM0_BIND=$MEM0_BIND
+MEM0_ROLE=$MEM0_ROLE
 ENV
-echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO bind=$MEM0_BIND"
+echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO bind=$MEM0_BIND role=$MEM0_ROLE"
 
 # Generate canonical-key if not present (v0.14 B: HMAC auth for tier=canonical promotions).
 # Fix-pass guard: a DPAPI-backed box has NO plaintext canonical-key — only the

@@ -286,11 +286,13 @@ if [ -n "${MEM0_REPO_ROOT_WSL:-}" ] && [ -f "$SS" ]; then
   [ -n "$next" ] && echo "[agentic-memory-stack] last session next-up: $next"
 fi
 
-# MEMORY.md staleness - dream-consolidator should rebuild it nightly
+# MEMORY.md staleness. W3/F19: MEMORY.md is rebuilt by memory-index-refresh.ps1
+# on its own 6h SessionStart throttle, DECOUPLED from the dream — the old
+# "dream-consolidator may be failing" hint misdiagnosed this for months.
 MEMORYMD="$HOME/.mem0/MEMORY.md"
 if [ -f "$MEMORYMD" ]; then
   age_days=$(( ( $(date +%s) - $(stat -c %Y "$MEMORYMD") ) / 86400 ))
-  [ "$age_days" -gt 8 ] && warnings+="MEMORY.md stale (${age_days}d old; dream-consolidator may be failing). "
+  [ "$age_days" -gt 8 ] && warnings+="MEMORY.md stale (${age_days}d old; memory-index-refresh.ps1 is not firing at SessionStart). "
 fi
 
 # Brand-scope integrity (2026-06-20): the nightly brand-scope-audit writes this status.
@@ -336,6 +338,55 @@ if [ -s "$RQ" ]; then
   nrev=$(grep -c . "$RQ" 2>/dev/null)
   [ "${nrev:-0}" -gt 0 ] && echo "${nrev} contradiction verdict(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl)"
 fi
+
+# W3 AMS-05 heartbeat digest — one own-line (MEM-13 convention), silent when all
+# clear. CHEAP FILE READS ONLY (the 1s cold-morning guard exists because serial
+# curls once blocked sessions 15-30s; /health/deep is never called inline here).
+# Windows-side files are reached via this script's own /mnt/c deployment path
+# (review F10 — never $HOME for Windows artifacts: the two-homes bug class).
+# No ack-stamp by design (review F11): overnight autonomous sessions would
+# false-ack; the section count is a 48h window (idempotent, race-free) and
+# alarm items key on live state so they re-show until actually cleared.
+_hb=""
+_WINPROFILE=""
+case "${BASH_SOURCE[0]:-}" in
+  /mnt/c/Users/*) _WINPROFILE="$(echo "${BASH_SOURCE[0]}" | sed -E 's#^(/mnt/c/Users/[^/]+)/.*#\1#')" ;;
+esac
+if [ -n "$_WINPROFILE" ]; then
+  _MS="$_WINPROFILE/.claude/state/dream/morning-summary.md"
+  if [ -f "$_MS" ]; then
+    # Tail-read (bounded — the file rotates at ~128KB but be defensive) and count
+    # sections whose header date parses within 48h. Headers may carry mojibake
+    # dashes from pre-W3 PS 5.1 runs — match on the leading '## ' + date shape only.
+    _cutoff=$(( $(date +%s) - 172800 ))
+    _nsec=$(tail -c 65536 "$_MS" 2>/dev/null | grep -E '^## ' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' | while read -r _d; do
+      _e=$(date -d "$_d" +%s 2>/dev/null) || continue
+      [ "$_e" -ge "$_cutoff" ] && echo x
+    done | wc -l)
+    [ "${_nsec:-0}" -gt 0 ] && _hb+="${_nsec} morning-summary section(s) in last 48h (review: ~/.claude/state/dream/morning-summary.md). "
+  fi
+fi
+_RDS="$HOME/.mem0/retrieval-drift-state.json"
+if [ -f "$_RDS" ]; then
+  _rd=$(python3 -c "
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+bits=[]
+if d.get('alarm'): bits.append('DRIFT ALARM standing (%s/%s retrievable, hwm %s)' % (d.get('before_retrievable'), d.get('n_total'), d.get('hwm')))
+if int(d.get('consecutive_snapshot_failures') or 0) >= 2: bits.append('DRIFT GUARD DEAD (>=2 snapshot failures)')
+if d.get('compat_fallback') and not d.get('last_compare_ts'): bits.append('drift guard in compat-fallback (update moat checkout)')
+print('; '.join(bits))" "$_RDS" 2>/dev/null)
+  [ -n "$_rd" ] && _hb+="$_rd. "
+fi
+_CSW="$HOME/.mem0/contradiction-sweep.jsonl"
+if [ -s "$_CSW" ]; then
+  # grep -c prints the count even on zero matches (exit 1) — no ||-fallback, it
+  # would append a second line and break the -ge integer test (diff-review fix 4).
+  _noop=$(tail -n 3 "$_CSW" 2>/dev/null | grep -c '"outcome": *"no-op' 2>/dev/null)
+  [ "${_noop:-0}" -ge 3 ] && _hb+="contradiction sweep: 3+ consecutive no-op runs (judgment leg dead — see AMS-07). "
+fi
+[ -n "$_hb" ] && echo "[heartbeat] $_hb"
 
 [ -n "$warnings" ] && echo "[storage-cap] $warnings Triage with: python scripts/wsl/audit-flags-triage.py --summary  (then --resolve --reason ...)."
 exit 0

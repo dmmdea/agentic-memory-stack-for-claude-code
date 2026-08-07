@@ -46,12 +46,12 @@ If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream
 Load current context before deciding what to gather. Reads:
 1. `~/.mem0/MEMORY.md` — the lean index from the previous dream run (if it exists)
 2. The current tier distribution: count of evidence / insight / canonical / stable / temporal in mem0
-3. Time since last dream run (`~/.claude/state/dream-last-run`)
+3. Time since last dream run (`~/.claude/state/last-dream`)
 4. Any open audit flags in `~/.mem0/audit-flags.jsonl` since baseline
 
 Output: a "context snapshot" struct passed to Phase 2 — what the consolidator already knows, what tiers are crowded, whether there's enough new evidence to justify consolidation.
 
-**Skip condition:** the nightly throttle is enforced at the top level — if `dream-last-run` is < 23h ago (`82800s`), the script exits before Phase 1.
+**Skip condition:** the nightly throttle is enforced at the top level — if `last-dream` is < 23h ago (`82800s`), the script exits before Phase 1.
 
 **Why 23h and not 24h.** The throttle stamp is written at cycle *completion*, ~45-60s after the fixed 03:00 trigger fires. Against a strict `86400s` window the next night's 03:00 start was therefore always short by those few dozen seconds, so the dream silently ran every OTHER night. `82800s` keeps the real guarantee — never two cycles in one night — without the schedule racing its own stamp. Related: throttle stamps are Unix epoch seconds written through a shell-independent helper (`Get-UnixEpoch`); PowerShell 5.1's `Get-Date -UFormat %s` is offset by the machine's UTC offset and must never be used for them.
 
@@ -151,7 +151,7 @@ The canary harness lives in the eval checkout: `<EvalRootWsl>/eval/retrieval-dri
 | File | Role |
 |---|---|
 | `~/.mem0/MEMORY.md` | The lean ≤200-line index, rebuilt every run (Phase 4). |
-| `~/.claude/state/dream-last-run` | Unix timestamp of the last successful run; the 24h throttle store. |
+| `~/.claude/state/last-dream` | Unix timestamp of the last successful run; the 24h throttle store. |
 | `~/.mem0/audit-flags.jsonl` | Open audit flags read in Phase 1. |
 | morning summary | Human-readable log of the night's autopromotions and gate verdicts. |
 | `/tmp/dream-drift-before.json` / after | The retrieval-drift snapshots compared in Phase 5. |

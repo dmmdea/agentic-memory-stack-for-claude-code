@@ -46,6 +46,9 @@ $TmsUid = try { ([string](wsl.exe -d $TmsDistro -e id -u)).Trim() } catch { '100
 if (-not ($TmsUid -match '^\d+$')) { $TmsUid = '1000' }
 $TmsDistroUnc = "\\wsl.localhost\$TmsDistro"
 $TmsHomeUnc   = "$TmsDistroUnc\home\$TmsWslUser"
+# W3/F3: the box role gates the brain-only rows (dream cycle, drift guard) — a
+# replica never runs the dream, and a permanent FAIL there is alarm fatigue.
+$TmsRole = if ($TmsCfg -and $TmsCfg.Role) { [string]$TmsCfg.Role } else { '' }
 
 # --------------------------------------------------------------------------
 # Check registry: each dimension accumulates into its own list
@@ -213,7 +216,11 @@ try {
         $age   = (Get-Date) - (Get-Item $memPath).LastWriteTime
         $lines = (Get-Content $memPath | Measure-Object -Line).Lines
         if ($age.TotalDays -lt 8) { Add-Check 'LIVENESS' 'MEMORY.md' 'OK'   "${lines} lines, $([int]$age.TotalHours)h old" }
-        else                      { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' "${lines} lines but $([int]$age.TotalDays)d old (dream-consolidator may be failing)" }
+        # W3/F19: MEMORY.md is rebuilt by memory-index-refresh.ps1 on its own 6h
+        # throttle, DECOUPLED from the dream — the old "dream-consolidator may be
+        # failing" hint misdiagnosed this row for months. The dream has its own
+        # row now (L9).
+        else                      { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' "${lines} lines but $([int]$age.TotalDays)d old (memory-index-refresh.ps1 is not running at SessionStart - it is decoupled from the dream)" }
     } else { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' 'not yet generated' }
 } catch { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' $_.Exception.Message }
 
@@ -243,6 +250,105 @@ try {
         Add-Check 'LIVENESS' 'bm25 sparse leg' 'OK' "canary '$($sl.canary.token)' hit; coverage $($sl.with_bm25)/$($sl.points) = $([Math]::Round(100*$sl.coverage,1))%"
     }
 } catch { Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' $_.Exception.Message }
+
+# L9 (W3, AMS-06): dream-cycle liveness from ARTIFACTS, never task history —
+# tonight's installer re-run wiped LastTaskResult to "never ran" hours after a
+# successful cycle, so Get-ScheduledTaskInfo is structurally untrustworthy.
+# Sources: last-dream stamp (cycle reached a legitimate terminal state),
+# prune.json (consolidation actually completed phase 4), gather.json (quiet-
+# night disambiguator — review F5). FAIL needs corroboration (review F6): the
+# nightly is fragile by design (sleep/travel) and dream-catchup self-heals.
+try {
+    if ($TmsRole -eq 'replica') {
+        Add-Check 'LIVENESS' 'dream cycle' 'OK' 'replica role: dream not scheduled here by design (one-brain rule)'
+    } elseif (-not $TmsRole) {
+        # Diff-review fix 2 (bound F3): an unknown role cannot convict — a
+        # receipt-less box may be a replica that never schedules the dream.
+        Add-Check 'LIVENESS' 'dream cycle' 'WARN' 'role unknown (no Role in mem0-stack.config.psd1) - cannot judge dream liveness; re-run install/2-windows-config.ps1 to write the receipt'
+    } else {
+        $ldPath = Join-Path $env:USERPROFILE '.claude\state\last-dream'
+        $dreamDir = Join-Path $env:USERPROFILE '.claude\state\dream'
+        if (-not (Test-Path $ldPath)) {
+            Add-Check 'LIVENESS' 'dream cycle' 'WARN' 'no last-dream stamp - the dream has never completed on this box'
+        } else {
+            $ldEpoch = [long]((Get-Content $ldPath -Raw).Trim())
+            $ldAgeH  = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $ldEpoch) / 3600.0
+            $pruneP  = Join-Path $dreamDir 'prune.json'
+            $gatherP = Join-Path $dreamDir 'gather.json'
+            $pruneAgeH = if (Test-Path $pruneP) { ((Get-Date) - (Get-Item $pruneP).LastWriteTime).TotalHours } else { $null }
+            $quietNight = $false
+            if (Test-Path $gatherP) {
+                try {
+                    $g = Get-Content $gatherP -Raw | ConvertFrom-Json
+                    $gAgeH = ((Get-Date) - (Get-Item $gatherP).LastWriteTime).TotalHours
+                    # dry_run receipts cannot vouch for a quiet night (fix 5).
+                    if ($gAgeH -lt 30 -and @($g.signals).Count -eq 0 -and -not $g.dry_run) { $quietNight = $true }
+                } catch {}
+            }
+            if ($ldAgeH -lt 30) {
+                if ($null -ne $pruneAgeH -and $pruneAgeH -lt 30) {
+                    Add-Check 'LIVENESS' 'dream cycle' 'OK' "cycle + consolidation completed $([int]$ldAgeH)h ago (prune receipt fresh)"
+                } elseif ($quietNight) {
+                    Add-Check 'LIVENESS' 'dream cycle' 'OK' "cycle ran $([int]$ldAgeH)h ago; nothing to consolidate (quiet night - gather.json 0 signals)"
+                } elseif ($null -ne $pruneAgeH -and $pruneAgeH -gt 72) {
+                    Add-Check 'LIVENESS' 'dream cycle' 'FAIL' "cycles are running (stamp $([int]$ldAgeH)h) but NOT consolidating (prune receipt $([int]($pruneAgeH/24))d old, nights not quiet) - the AMS-06 signature; check dream.log for mutex/malformed-JSON skips"
+                } else {
+                    $pruneDesc = if ($null -ne $pruneAgeH) { "$([int]$pruneAgeH)h old" } else { 'absent' }
+                    Add-Check 'LIVENESS' 'dream cycle' 'WARN' "cycle ran $([int]$ldAgeH)h ago but the consolidation receipt is $pruneDesc - one skipped night is tolerable; investigate if it repeats"
+                }
+            } elseif ($ldAgeH -le 48) {
+                Add-Check 'LIVENESS' 'dream cycle' 'WARN' "last cycle $([int]$ldAgeH)h ago (box likely slept) - dream-catchup should self-heal at the next session; re-check in 30m"
+            } else {
+                $debt = $false
+                foreach ($f in 'learn-rules.jsonl', 'promote-queue.jsonl') {
+                    $fp = Join-Path $env:USERPROFILE ".claude\state\$f"
+                    if ((Test-Path $fp) -and ((Get-Item $fp).Length -gt 0)) { $debt = $true }
+                }
+                $failedRecovery = $false
+                $lcPath = Join-Path $env:USERPROFILE '.claude\state\last-dream-catchup'
+                if (Test-Path $lcPath) {
+                    try {
+                        $lcEpoch = [long]((Get-Content $lcPath -Raw).Trim())
+                        $lcAgeMin = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $lcEpoch) / 60.0
+                        # Diff-review fix 1: the catchup stamp records a DECISION
+                        # (every 6h-throttled pass, including "fresh, skip"), so
+                        # ">30min old" is true ~always and convicted every long
+                        # sleep as "genuinely stuck". Failed-recovery evidence
+                        # needs a RECENT decision (<=6h) that MUST have invoked
+                        # (catchup force-invokes at >72h regardless of debt) with
+                        # the stamp still stale afterward.
+                        if ($lcAgeMin -gt 30 -and $lcAgeMin -le 360 -and $ldAgeH -gt 72) { $failedRecovery = $true }
+                    } catch {}
+                }
+                if ($debt -or $failedRecovery) {
+                    Add-Check 'LIVENESS' 'dream cycle' 'FAIL' "last cycle $([int]($ldAgeH/24))d ago WITH $(if ($debt) { 'standing debt (learn/promote queues non-empty)' } else { 'a catchup that ran >30m ago and did not recover' }) - consolidation is genuinely stuck"
+                } else {
+                    Add-Check 'LIVENESS' 'dream cycle' 'WARN' "last cycle $([int]($ldAgeH/24))d ago, no debt evidence - long sleep/travel is normal for this box; catchup will fire on the next session"
+                }
+            }
+        }
+    }
+} catch { Add-Check 'LIVENESS' 'dream cycle' 'WARN' $_.Exception.Message }
+
+# L10 (W3, AMS-05/§3): the capability manifest verdicts, computed server-side
+# (capabilities.py evaluate() over /health/deep's own checks). Dead REQUIRED
+# capabilities for this box's role FAIL; unknowns are WARN-class visibility
+# (they are W4's revive-or-bury worklist, not silent gaps).
+try {
+    $capHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $cap = $capHd.checks.capabilities
+    if (-not $cap) {
+        Add-Check 'LIVENESS' 'capability manifest' 'WARN' '/health/deep has no capabilities check - server predates W3 (redeploy mem0-server)'
+    } else {
+        $deadReq = @($cap.dead_required)
+        $unk = @($cap.unknown)
+        if ($deadReq.Count -gt 0) {
+            Add-Check 'LIVENESS' 'capability manifest' 'FAIL' "DEAD required capability(ies): $($deadReq -join ', ') - see docs/capability-manifest.md for each probe + remedy"
+        } else {
+            Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities (role=$($cap.role)); $($unk.Count) unknown (probe:none rows - the W4 worklist)"
+        }
+    }
+} catch { Add-Check 'LIVENESS' 'capability manifest' 'WARN' $_.Exception.Message }
 
 
 # ==========================================================================
@@ -1017,29 +1123,86 @@ try {
 } catch { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' $_.Exception.Message }
 
 # Phase 5 anti-drift: consolidation retrieval-drift alarm surface.
-# dream-consolidate.ps1 appends ONE JSONL record to ~/.mem0/consolidation-drift.jsonl ONLY when a
-# consolidation made a canary self-fact unretrievable (the before/after snapshot compare returned
-# exit 2). The file is ABSENT in the healthy steady state. WARN if an alarm fired within 14d
-# (investigate the canary / re-index the store); OK if absent or only historical (none since).
+# dream-consolidate.ps1 appends typed JSONL records to ~/.mem0/consolidation-drift.jsonl:
+# kind='drift' (a canary became unretrievable / cross-run floor or HWM tripped) and
+# kind='guard-dead' (W3: the guard itself stopped comparing). Records without a kind
+# are legacy drift alarms (review F14). The file is ABSENT in the healthy steady state.
 try {
     $cdLog = "$TmsHomeUnc\.mem0\consolidation-drift.jsonl"
     if (Test-Path $cdLog) {
-        $cdRuns = @(Get-Content $cdLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ })
+        $cdAll = @(Get-Content $cdLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ })
+        $cdRuns = @($cdAll | Where-Object { -not $_.kind -or $_.kind -eq 'drift' })
+        $cdDead = @($cdAll | Where-Object { $_.kind -eq 'guard-dead' })
+        if ($cdDead.Count -gt 0) {
+            $gdLast = $cdDead[-1]
+            $gdAge  = (Get-Date) - [datetime]$gdLast.ts
+            if ($gdAge.TotalDays -le 14) {
+                Add-Check 'RECOVERY' 'consolidation drift' 'FAIL' "GUARD DEAD $($gdLast.ts) ($([int]$gdAge.TotalDays)d ago): $($gdLast.detail) - consolidations are running UNGUARDED; fix the drift snapshot path (EvalRootWsl receipt / moat checkout)"
+            }
+        }
         if ($cdRuns.Count -gt 0) {
             $cdLast = $cdRuns[-1]
             $cdAge  = (Get-Date) - [datetime]$cdLast.ts
             if ($cdAge.TotalDays -le 14) {
-                Add-Check 'RECOVERY' 'consolidation drift' 'WARN' "drift alarm $($cdLast.ts) ($([int]$cdAge.TotalDays)d ago): $($cdLast.detail) - a canary fact became unretrievable after a consolidation; check eval/retrieval-drift + the dream log ($($cdRuns.Count) alarm(s) total)"
+                Add-Check 'RECOVERY' 'consolidation drift' 'WARN' "drift alarm $($cdLast.ts) ($([int]$cdAge.TotalDays)d ago): $($cdLast.detail) - a canary fact became unretrievable; check eval/retrieval-drift + the dream log ($($cdRuns.Count) alarm(s) total)"
             } else {
                 Add-Check 'RECOVERY' 'consolidation drift' 'OK' "last drift alarm $($cdLast.ts) >$([int]$cdAge.TotalDays)d ago, none since ($($cdRuns.Count) historical)"
             }
-        } else {
+        } elseif ($cdDead.Count -eq 0) {
             Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'flag file present but no parseable alarm records'
         }
     } else {
         Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'no drift alarms (no flag file yet)'
     }
 } catch { Add-Check 'RECOVERY' 'consolidation drift' 'WARN' $_.Exception.Message }
+
+# R11 (W3, AMS-08): drift GUARD liveness — the 07-21/07-23 outage proved the guard
+# can die silently (fail-open skip) while consolidations proceed. Reads the state
+# sidecar the guard now maintains. Role-gated (F3): a replica runs no dream.
+try {
+    if ($TmsRole -eq 'replica') {
+        Add-Check 'RECOVERY' 'drift guard liveness' 'OK' 'replica role: dream/drift guard not scheduled here by design'
+    } elseif (-not $TmsRole) {
+        Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'role unknown (no Role in mem0-stack.config.psd1) - cannot judge guard liveness'
+    } elseif (-not ($TmsCfg -and $TmsCfg.EvalRootWsl)) {
+        Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'no EvalRootWsl in the receipt - drift guard not configured on this box (expected on non-maintainer installs)'
+    } else {
+        $rdState = "$TmsHomeUnc\.mem0\retrieval-drift-state.json"
+        if (-not (Test-Path $rdState)) {
+            Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'no state sidecar yet (deployed retrieval_drift.py predates --state, or first post-W3 night pending)'
+        } else {
+            $rd = Get-Content $rdState -Raw | ConvertFrom-Json
+            if ($rd.compat_fallback -and -not $rd.last_compare_ts) {
+                Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'compat-fallback: deployed retrieval_drift.py predates --state - cross-run legs (floor/HWM) inactive; update the moat checkout'
+            } elseif ([int]$rd.consecutive_snapshot_failures -ge 2) {
+                Add-Check 'RECOVERY' 'drift guard liveness' 'FAIL' "guard DEAD: $($rd.consecutive_snapshot_failures) consecutive snapshot failures - consolidations unguarded"
+            } else {
+                # Fail-open signature: a consolidation COMPLETED (prune.json) after
+                # the last compare. Quiet nights legitimately skip the compare, so
+                # anchor on the consolidation receipt, not the dream stamp.
+                $prunePath = Join-Path $env:USERPROFILE '.claude\state\dream\prune.json'
+                $failOpen = $false
+                if ((Test-Path $prunePath) -and $rd.last_compare_ts) {
+                    try {
+                        $pruneTs = [datetime]((Get-Content $prunePath -Raw | ConvertFrom-Json).timestamp)
+                        if (($pruneTs - [datetime]$rd.last_compare_ts).TotalHours -gt 2) { $failOpen = $true }
+                    } catch {}
+                }
+                if ($failOpen) {
+                    Add-Check 'RECOVERY' 'drift guard liveness' 'FAIL' 'a consolidation completed AFTER the last drift compare - the guard fail-open-skipped (the 07-21 signature); check EvalRootWsl + dream.log drift lines'
+                } elseif (-not $rd.last_compare_ts -or [int]$rd.consecutive_snapshot_failures -ge 1) {
+                    # Diff-review fix 6: a heartbeat-only state (one failure,
+                    # zero compares ever) is not "guard alive".
+                    Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' "guard has not completed a compare yet (snapshot failures: $([int]$rd.consecutive_snapshot_failures)) - watch the next dream night"
+                } elseif ($rd.alarm) {
+                    Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' "guard alive; STANDING ALARM (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm), below-hwm streak=$($rd.consecutive_below_hwm)) - run eval/retrieval-drift validate to separate fact-gone from fact-unrankable"
+                } else {
+                    Add-Check 'RECOVERY' 'drift guard liveness' 'OK' "guard alive; last compare $($rd.last_compare_ts) (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm))"
+                }
+            }
+        }
+    }
+} catch { Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' $_.Exception.Message }
 
 # R7: open_questions health (v0.17 Phase D)
 if ($key) {
