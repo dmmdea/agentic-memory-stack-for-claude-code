@@ -273,11 +273,19 @@ def list_snapshots() -> list[dict]:
 def choose_snapshot(snapshots: list[dict], add_ts: dt.datetime | None,
                     first_update_ts: dt.datetime | None) -> dict | None:
     """Latest snapshot whose timestamp falls inside [ADD ts, first UPDATE ts).
-    The latest eligible snapshot carries the most complete pre-wipe payload."""
+    The latest eligible snapshot carries the most complete pre-wipe payload.
+
+    Only 'snapshot-dir' entries are recovery-eligible (live-verified
+    2026-08-07): Qdrant's snapshot-recover API refuses any file path outside
+    its own snapshots directory (403 Forbidden), so the backup-dir copies —
+    which are byte-copies of snapshot-dir files anyway — are inventory-only.
+    Choosing one produced a hard recovery error on the first live run."""
     if add_ts is None or first_update_ts is None:
         return None
     chosen = None
     for snap in snapshots:
+        if snap.get("origin") != "snapshot-dir":
+            continue
         ts = parse_ts(snap["ts"])
         if ts is None:
             continue

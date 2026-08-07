@@ -57,6 +57,29 @@ def test_update_window_uses_event_time_not_record_birth_time(tmp_path, monkeypat
     assert rec["first_update_ts"] > rec["add_ts"]  # a real, non-empty window
 
 
+def test_choose_snapshot_only_recovery_eligible_origins(monkeypatch):
+    # Live-verified 2026-08-07: Qdrant's snapshot-recover API 403s on any file
+    # outside its own snapshots directory, so backup-dir copies are
+    # inventory-only. Choosing one turned a RESTORE into a hard error.
+    mod = _load_module(monkeypatch)
+    add = mod.parse_ts("2026-07-01T00:00:00+00:00")
+    upd = mod.parse_ts("2026-07-10T00:00:00+00:00")
+    snaps = [
+        {"origin": "snapshot-dir", "ts": "2026-07-02T00:00:00+00:00", "path": "a"},
+        {"origin": "backup-dir",   "ts": "2026-07-09T00:00:00+00:00", "path": "b"},
+    ]
+    chosen = mod.choose_snapshot(snaps, add, upd)
+    assert chosen is not None and chosen["path"] == "a", (
+        "the later backup-dir snapshot must NOT win — it cannot be recovered from"
+    )
+    # backup-dir alone in window -> no recovery possible, not an error-later
+    only_backup = [{"origin": "backup-dir", "ts": "2026-07-05T00:00:00+00:00", "path": "b"}]
+    assert mod.choose_snapshot(only_backup, add, upd) is None
+    # latest eligible snapshot-dir entry wins
+    snaps.append({"origin": "snapshot-dir", "ts": "2026-07-08T00:00:00+00:00", "path": "c"})
+    assert mod.choose_snapshot(snaps, add, upd)["path"] == "c"
+
+
 def test_multiple_updates_take_the_earliest_event(tmp_path, monkeypatch):
     mod = _load_module(monkeypatch)
     db = tmp_path / "history.db"
