@@ -77,14 +77,17 @@ jobs:
             mem0-server/tests/test_l10_audit.py \
             mem0-server/tests/test_ledger_audit.py \
             mem0-server/tests/test_mcp_shim_contract.py \
+            mem0-server/tests/test_mojibake_check.py \
             mem0-server/tests/test_nli_write_gate.py \
             mem0-server/tests/test_open_questions.py \
+            mem0-server/tests/test_payload_carryover.py \
             mem0-server/tests/test_phase2a_canary.py \
             mem0-server/tests/test_r2_injection_gating.py \
             mem0-server/tests/test_redact.py \
             mem0-server/tests/test_replay_ops.py \
             mem0-server/tests/test_reranker.py \
             mem0-server/tests/test_shim_offline.py \
+            mem0-server/tests/test_sparse_health.py \
             mem0-server/tests/test_systemd_parity.py \
             mem0-server/tests/test_tier_parity.py \
             claude-config/tests \

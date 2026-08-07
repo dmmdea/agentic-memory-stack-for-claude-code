@@ -105,7 +105,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py"
+MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"
@@ -123,7 +123,13 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # cryptography>=48.0.1,<49 (GHSA-537c-gmf6-5ccf; capped <49 so a fresh install
     # reproduces the as-tested 48.x major — bump the cap via UPGRADE.md for 49.x).
     # Both deps come in transitively otherwise.
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
+    # AMS-09 (2026-08-07): fastembed is the BM25 sparse-leg encoder. mem0ai puts
+    # it under the `extras` extra (NOT `nlp`, which is spacy-only), so it was
+    # never installed and every fresh install shipped a silently dead lexical
+    # leg (mem0 fail-softs to dense-only with one log warning). Floor-only, no
+    # cap (house rule); the /health/deep sparse_leg canary — not a version pin
+    # — is the defense against a future breaking fastembed release.
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -136,17 +142,35 @@ else
     # The pip step is fail-soft (a transient offline blip must not abort a code
     # refresh of an already-patched venv), but the post-condition assertion below
     # HARD-FAILS so the installer can never report success with a vulnerable venv.
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=48.0.1,<49' || \
+    # AMS-09 (2026-08-07): fastembed added to the refresh branch too — the branch
+    # a live box actually takes on re-run. Adding it only to the fresh-install
+    # line would never heal an existing venv (that is exactly how the leg died:
+    # a venv rebuild dropped it and nothing re-installed it).
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=48.0.1,<49' fastembed || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
-    "$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: security floors not satisfied (need starlette>=1.3.1, cryptography>=48.0.1) — re-run with network access to remediate."; exit 1; }
+fi
+
+# Post-conditions for BOTH branches (fresh install and refresh): the installer
+# must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=48.0.1, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
 import sys
 from importlib.metadata import version
 from packaging.version import Version as V
 ok = V(version("starlette")) >= V("1.3.1") and V(version("cryptography")) >= V("48.0.1")
+# AMS-09: the BM25 leg must be LOADABLE, not merely pip-listed. Instantiating
+# the encoder also warms the model cache so the first /health/deep canary and
+# the deploy gate do not eat the cold-download latency. An offline re-run with
+# fastembed absent must FAIL here — a green installer over a dead lexical leg
+# is the exact silent divergence that caused AMS-09.
+try:
+    from fastembed import SparseTextEmbedding
+    SparseTextEmbedding(model_name="Qdrant/bm25")
+except Exception as e:
+    print(f"  fastembed BM25 encoder not loadable: {e}", file=sys.stderr)
+    ok = False
 sys.exit(0 if ok else 1)
 PYEOF
-    echo "  security floors satisfied (starlette>=1.3.1, cryptography>=48.0.1,<49)"
-fi
+echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=48.0.1,<49, fastembed BM25 encoder loadable)"
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the

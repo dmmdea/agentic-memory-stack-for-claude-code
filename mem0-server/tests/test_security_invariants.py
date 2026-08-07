@@ -354,15 +354,19 @@ def test_evidence_put_no_token_accepted():
     """v0.17 Phase A invariant: non-canonical/non-insight tier PUT requires no extra gate.
     Regression: ensure the gate did not over-block lower tiers."""
     mid = _post_evidence(f"evidence-put-{uuid.uuid4()}")
-    r = httpx.put(
-        f"{URL}/v1/memories/{mid}",
-        json={"text": "updated evidence text"},
-        headers=H, timeout=10,
-    )
-    assert r.status_code == 200, \
-        f"evidence PUT should succeed without HMAC; got {r.status_code}: {r.text}"
-    # Cleanup: plain DELETE works for evidence (no HMAC needed)
-    httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+    try:
+        r = httpx.put(
+            f"{URL}/v1/memories/{mid}",
+            json={"text": "updated evidence text"},
+            headers=H, timeout=10,
+        )
+        assert r.status_code == 200, \
+            f"evidence PUT should succeed without HMAC; got {r.status_code}: {r.text}"
+    finally:
+        # Cleanup: plain DELETE works for evidence (no HMAC needed). In finally
+        # (AMS-01 hardening): this test PUTs the record, and the pre-fix suite
+        # leaked PUT-damaged records into the live store when an assertion fired.
+        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
 
 
 # ---------- (regression: valid HMAC PUT succeeds + ledger records it) ----------
@@ -372,21 +376,25 @@ def test_canonical_put_with_valid_hmac_succeeds_and_ledger_records():
     """v0.17 Phase A: HMAC PUT on canonical succeeds; ledger gets memory-update entry.
     This is the positive control — ensures gates are not so strict they block valid ops."""
     mid = _post_evidence(f"canonical-put-valid-{uuid.uuid4()}")
-    _promote_to_canonical(mid)
-    ledger_before = _ledger_count()
-    token, ts, nonce = _sign_hmac(mid, "put", "valid PUT test")
-    r = httpx.put(
-        f"{URL}/v1/memories/{mid}",
-        params={"actor": "user-direct", "reason": "valid PUT test"},
-        json={"text": "validly updated canonical text"},
-        headers={**H, "X-User-Direct-Token": token, "X-User-Direct-Ts": ts,
-                 "X-User-Direct-Nonce": nonce},
-        timeout=10,
-    )
-    assert r.status_code == 200, f"valid HMAC PUT should succeed; got {r.status_code}: {r.text}"
-    assert _ledger_count() > ledger_before, \
-        "ledger must record a valid memory-update (positive control for ledger assertions)"
-    _force_delete(mid)
+    try:
+        _promote_to_canonical(mid)
+        ledger_before = _ledger_count()
+        token, ts, nonce = _sign_hmac(mid, "put", "valid PUT test")
+        r = httpx.put(
+            f"{URL}/v1/memories/{mid}",
+            params={"actor": "user-direct", "reason": "valid PUT test"},
+            json={"text": "validly updated canonical text"},
+            headers={**H, "X-User-Direct-Token": token, "X-User-Direct-Ts": ts,
+                     "X-User-Direct-Nonce": nonce},
+            timeout=10,
+        )
+        assert r.status_code == 200, f"valid HMAC PUT should succeed; got {r.status_code}: {r.text}"
+        assert _ledger_count() > ledger_before, \
+            "ledger must record a valid memory-update (positive control for ledger assertions)"
+    finally:
+        # AMS-01 hardening: this test PUTs the record, so a failed assertion
+        # used to leak a PUT-damaged record into the live store. Delete always.
+        _force_delete(mid)
 
 
 # ---------- (regression: POST tier=canonical still blocked) ----------
@@ -483,8 +491,11 @@ def test_put_canonical_then_put_again_still_requires_hmac():
     """v0.17 F.2.5: after valid HMAC PUT, the second PUT without HMAC must still be 403
     (mem0 update() strips tier from Qdrant payload; F.2.5 restores it via set_payload)."""
     mid = _post_evidence(f"f25-{uuid.uuid4()}")
-    _promote_to_canonical(mid)
     try:
+        # AMS-01 hardening: promote runs INSIDE the try so even a failed setup
+        # or assertion deletes the record — the pre-fix suite leaked PUT-damaged
+        # records into the live store.
+        _promote_to_canonical(mid)
         # First PUT: valid HMAC succeeds (v0.18 MED-7: nonce required — format
         # ts|nonce|action|mid|reason). reason in the signed payload must match
         # the reason query param exactly.
@@ -511,6 +522,96 @@ def test_put_canonical_then_put_again_still_requires_hmac():
         )
     finally:
         _force_delete(mid)
+
+
+# ---------- AMS-01 (P0, 2026-08-07): PUT payload carry-over survival ----------
+
+def test_ams01_put_preserves_custom_payload_metadata():
+    """AMS-01 regression (P0, 2026-08-07): mem0's _update_memory rebuilds the
+    Qdrant payload from scratch on every update, so a PUT used to destroy every
+    custom payload key (source, brand, project, retrievable, provenance stamps —
+    only tier was restored by F.2.5). The fix pre-reads the payload (fail-closed
+    503 on read error) and passes the carry-over via mem.update(metadata=...) so
+    preservation is atomic inside the upsert.
+
+    Assert: source/brand/project survive a plain-API-key PUT on an evidence
+    record with their exact values, tier stays evidence, the text actually
+    changed, updated_at is present — and any NLI check-markers stamped on the
+    OLD text did not carry over unchanged (a text change voids prior judgments;
+    a fresh record is normally unstamped, so that leg is conditional)."""
+    from payload_carryover import NLI_CHECK_MARKERS
+
+    user_id = "test-inv-ams01"
+    original_text = f"ams01-put-survival-{uuid.uuid4()}"
+    r = httpx.post(
+        f"{URL}/v1/memories",
+        json={
+            "messages": original_text, "user_id": user_id, "infer": False,
+            "metadata": {
+                "source": "test-ams01-put-survival",
+                "brand": "test-probe-brand",
+                "project": "test-probe",
+                "tier": "evidence",
+                "user_id": user_id,
+            },
+        },
+        headers=H, timeout=10,
+    )
+    r.raise_for_status()
+    mid = r.json()["results"][0]["id"]
+    try:
+        pre = httpx.get(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        pre.raise_for_status()
+        pre_meta = pre.json().get("metadata") or {}
+        # POST forbids seeding check-markers (_ADD_FORBIDDEN_META), so these
+        # only exist here if the async NLI gate stamped the record already.
+        pre_markers = {k: pre_meta[k] for k in NLI_CHECK_MARKERS if k in pre_meta}
+
+        new_text = f"ams01-put-survival-updated-{uuid.uuid4()}"
+        r_put = httpx.put(
+            f"{URL}/v1/memories/{mid}",
+            json={"text": new_text},
+            headers=H, timeout=10,
+        )
+        assert r_put.status_code == 200, \
+            f"AMS-01 setup: plain-key PUT on evidence must succeed; got {r_put.status_code}: {r_put.text}"
+
+        post = httpx.get(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        post.raise_for_status()
+        body = post.json()
+        post_meta = body.get("metadata") or {}
+
+        assert body.get("memory") == new_text, (
+            f"PUT must change the text; got {body.get('memory')!r}"
+        )
+        assert post_meta.get("source") == "test-ams01-put-survival", (
+            f"AMS-01 regression: 'source' destroyed by PUT (metadata after: {post_meta})"
+        )
+        assert post_meta.get("brand") == "test-probe-brand", (
+            f"AMS-01 regression: 'brand' destroyed by PUT — brand isolation broken "
+            f"(metadata after: {post_meta})"
+        )
+        assert post_meta.get("project") == "test-probe", (
+            f"AMS-01 regression: 'project' destroyed by PUT (metadata after: {post_meta})"
+        )
+        assert body.get("tier") == "evidence", (
+            f"tier must survive the PUT as 'evidence'; got {body.get('tier')!r}"
+        )
+        assert body.get("updated_at"), (
+            f"updated_at must be present after PUT; got {body.get('updated_at')!r}"
+        )
+        # F3: check-markers assert "this exact text was judged" — they must not
+        # survive a text change unchanged (compute_carryover drops them; the PUT
+        # handler re-queues NLI judgment of the NEW text asynchronously).
+        for k, v in pre_markers.items():
+            assert post_meta.get(k) != v, (
+                f"NLI check-marker {k!r} carried over unchanged across a text "
+                "change — a stale judgment would let re-judging be evaded forever"
+            )
+    finally:
+        # Evidence tier: plain-key DELETE. MUST run even when assertions fail —
+        # the pre-fix suite leaked PUT-damaged records into the live store.
+        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
 
 
 # ---------- v0.17 Phase F.1.1: nonce replay protection ----------

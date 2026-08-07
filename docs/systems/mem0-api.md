@@ -80,6 +80,12 @@ Response 200: {"ok": true, "checks": {"qdrant": {"ok": true, "points": N, "statu
 Response 200 (degraded): {"ok": false, "checks": {"qdrant": {"ok": false, "error": "..."}}}
 ```
 
+Three checks added by the 2026-08 audit:
+
+- **`sparse_leg` — GATING** (flips `ok` to `false`): BM25 lexical-leg liveness. mem0 fail-softs to dense-only search silently when the fastembed sparse encoder is missing (the installer now declares fastembed explicitly, with a loadability post-condition); this check makes that fallback loud with a **deterministic canary** — it derives a token from the *oldest* BM25-bearing point (longest token, lexicographic tiebreak, from its lemmatized text) and requires that point back in the top-5 keyword results, so a tokenizer/hash change that strands the legacy corpus also fails. Shape: `{"ok": bool, "fastembed": bool, "bm25_slot": bool, "points": N, "with_bm25": N, "coverage": 0.0-1.0, "canary": {"ran": bool, "hit": bool, "token": "..."}, "error"?: "..."}`. `coverage` (`with_bm25 / points`) is reported but does not gate — a half-backfilled corpus with a live encoder is degraded, not dead (`Test-MemoryStack` WARNs below 0.95).
+- **`mojibake` — informational** (never flips `ok`): CP437 mojibake corpus tripwire — scans point text payloads for the glyph-pair signature of UTF-8 bytes decoded through the OEM console codepage. Shape: `{"ok": true, "scanned": N, "hits": N, "sample_ids": [...], "elapsed_ms": N}`. The scroll is page-capped so the walk stays bounded as the corpus grows; `scanned` stays honest about a capped scan. `Test-MemoryStack` WARNs on `hits > 0`.
+- **`put_carryover_today` — informational** (never flips `ok`): daily counters proving the PUT payload carry-over (below) is active. Shape: `{"date": "YYYY-MM-DD", "puts": N, "keys_restored": N, "keys_lost": N}` — `keys_restored`/`keys_lost` count post-verify repair activity and should stay 0; nonzero values indicate mem0-contract drift.
+
 ### `POST /v1/memories`
 
 Add one or more memories.
@@ -146,13 +152,15 @@ Response 200: {"results": [{"id": "...", "memory": "...", "score": 0.83, "metada
 
 ### `PUT /v1/memories/{id}`
 
-Update a memory's text content (does not change tier — the tier is restored on the Qdrant payload after the write). Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`); canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order.
+Update a memory's text content. The **full existing payload is carried over** atomically into the rewrite (tier, source, brand, project, provenance stamps — every custom key): mem0 rebuilds the Qdrant payload from scratch on update, so before this carry-over a PUT silently destroyed all custom metadata (only tier was restored). The pre-update payload read is **fail-closed**: if it errors, the PUT is refused with `503` rather than performing a blind update that would wipe metadata. Because a PUT changes the text, the record **re-enters the NLI write-gate**: the carry-over deliberately drops the NLI check-markers (a judgment of the old text must not vouch for the new one) and re-judgment of the new text is queued asynchronously, exactly like an add. Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`); canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order.
 
 ```json
 Request: {"text": "new content"}
 Response 200: mem0 update result
+Response 400: pre-update read rejected by the store (malformed memory id — permanent fault, never queued)
 Response 413: text exceeds MAX_MEMORY_CHARS
-Response 500: Qdrant unreachable
+Response 500: carry-over restore exhausted for a canonical/insight record (inconsistent state — manual verification)
+Response 503: pre-update payload read failed (refused fail-closed rather than wiping custom metadata; MCP shim queues 503s to the outbox and replays)
 ```
 
 ### `PATCH /v1/memories/{id}/tier`
@@ -229,7 +237,7 @@ Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hoo
 | `413` | payload exceeds `MAX_MEMORY_CHARS` |
 | `422` | imperative text rejected from the canonical tier (imperative-canary) |
 | `500` | Qdrant / llama-swap / mem0 backend error |
-| `503` | canonical-canary could not verify the stored text (store unreachable) |
+| `503` | canonical-canary could not verify the stored text (store unreachable); PUT pre-update payload read failed (fail-closed carry-over) |
 
 ## Security and privacy notes
 
