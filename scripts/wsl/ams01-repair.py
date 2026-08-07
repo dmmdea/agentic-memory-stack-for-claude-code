@@ -179,23 +179,34 @@ def _now_iso() -> str:
 
 def load_history_index(db_path: Path) -> dict[str, dict]:
     """One pass over history.db -> {memory_id: {add_ts, first_update_ts,
-    update_rows}}. Opened read-only; this script never writes history."""
+    update_rows}}. Opened read-only; this script never writes history.
+
+    COLUMN SEMANTICS (live-verified 2026-08-07, and the cause of a shipped
+    defect): mem0's add_history stamps the RECORD's creation time into the
+    history row's created_at column on EVERY event — an UPDATE row's
+    created_at equals the ADD row's. The event's own timestamp lives in
+    updated_at. Reading created_at for UPDATE rows makes the restore window
+    [ADD, first UPDATE) empty for every record, silently degrading every
+    RESTORE to MARK."""
     index: dict[str, dict] = {}
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        for memory_id, event, created_at in con.execute(
-            "SELECT memory_id, event, created_at FROM history"
+        for memory_id, event, created_at, updated_at in con.execute(
+            "SELECT memory_id, event, created_at, updated_at FROM history"
         ):
             rec = index.setdefault(str(memory_id), {
                 "add_ts": None, "first_update_ts": None, "update_rows": 0,
             })
             ev = (event or "").upper()
-            ts = parse_ts(created_at)
             if ev == "ADD":
+                ts = parse_ts(created_at)
                 if ts is not None and (rec["add_ts"] is None or ts < rec["add_ts"]):
                     rec["add_ts"] = ts
             elif ev == "UPDATE":
                 rec["update_rows"] += 1
+                # updated_at = when THIS update happened; created_at would be
+                # the record's birth time (see docstring).
+                ts = parse_ts(updated_at) or parse_ts(created_at)
                 if ts is not None and (rec["first_update_ts"] is None or ts < rec["first_update_ts"]):
                     rec["first_update_ts"] = ts
     finally:
