@@ -224,6 +224,65 @@ Describe 'Invoke-CodexSubagent -TimeoutSeconds enforcement (v0.27 R5)' {
         $script:CodexCmd = $fake
         { Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30 } | Should -Throw -ExpectedMessage '*exited 3*'
     }
+
+    # AMS-10 (2026-08-07) regression pair: codex emits UTF-8 but PS 5.1's child
+    # powershell decoded native stdout with the OEM codepage (CP437), storing
+    # mojibake; the input leg turned non-ASCII prompt chars into '?'. Both fakes
+    # move RAW bytes (never text) across the boundary, and every expected char is
+    # assembled from [char]0xNNNN codepoints — a literal non-ASCII char in THIS
+    # file would itself cross an encoding boundary and defeat the test.
+
+    It 'returns codex UTF-8 output with non-ASCII codepoints intact (output leg)' {
+        # – → é ñ ≥ assembled from codepoints, never literals.
+        $chars = -join @([char]0x2013, [char]0x2192, [char]0x00E9, [char]0x00F1, [char]0x2265)
+        $payload = 'UTF8_SENTINEL:' + $chars + ':END'
+        $bin = Join-Path $TestDrive 'utf8-payload.bin'
+        [System.IO.File]::WriteAllBytes($bin, [System.Text.Encoding]::UTF8.GetBytes($payload))
+        # The fake dumps the payload's raw UTF-8 bytes to stdout via the byte
+        # stream (bypassing any console text encoder), exactly like codex does.
+        $fake = Join-Path $TestDrive 'codex-utf8.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @(
+            '@echo off',
+            'powershell -NoProfile -NonInteractive -Command "$b=[System.IO.File]::ReadAllBytes(''%~dp0utf8-payload.bin'');$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length);$s.Flush()"'
+        )
+        $script:CodexCmd = $fake
+        # Simulate the PRODUCTION parent: the L1a/dream hooks run under headless
+        # Windows PowerShell whose Console.OutputEncoding is the OEM codepage
+        # (CP437). Without this, a UTF-8-console test harness (pwsh) masks the
+        # bug — CP437 is byte-bijective, so the child's mojibake re-encodes to
+        # the original bytes and the harness's UTF-8 parent decode restores the
+        # string. The fixed code sets psi.StandardOutputEncoding explicitly, so
+        # it must stay green no matter what the caller's console encoding is.
+        $savedEnc = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(437)
+            $out = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 60
+        } finally {
+            [Console]::OutputEncoding = $savedEnc
+        }
+        $out.Contains($chars) | Should -BeTrue -Because 'UTF-8 codex output must survive the child-powershell boundary without OEM mojibake'
+    }
+
+    It 'delivers a non-ASCII prompt to codex stdin intact, not as ? (input leg)' {
+        $eAcute = [string][char]0x00E9   # e-acute from codepoint, never a literal
+        $prompt = 'acc' + $eAcute + 'nt survives'
+        $cap = Join-Path $TestDrive 'stdin-capture.bin'
+        # The fake copies its RAW stdin bytes to a file, then prints a sentinel so
+        # the happy path (exit 0, non-empty output) is preserved.
+        $fake = Join-Path $TestDrive 'codex-echo-stdin.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @(
+            '@echo off',
+            'powershell -NoProfile -NonInteractive -Command "$i=[Console]::OpenStandardInput();$m=New-Object System.IO.MemoryStream;$i.CopyTo($m);[System.IO.File]::WriteAllBytes(''%~dp0stdin-capture.bin'',$m.ToArray())"',
+            'echo CODEX_STDIN_CAPTURED'
+        )
+        $script:CodexCmd = $fake
+        $out = Invoke-CodexSubagent -Prompt $prompt -TimeoutSeconds 60
+        $out | Should -Match 'CODEX_STDIN_CAPTURED'
+        Test-Path $cap | Should -BeTrue
+        $received = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($cap))
+        $received.Contains('acc' + $eAcute + 'nt') | Should -BeTrue -Because 'the e-acute must reach codex stdin as UTF-8, not be flattened to ?'
+        $received.Contains('acc?nt') | Should -BeFalse
+    }
 }
 
 Describe 'Split-OversizeFact write-time oversize guard (MEM-10, 2026-07-03)' {
