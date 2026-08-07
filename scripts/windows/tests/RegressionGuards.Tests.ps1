@@ -133,3 +133,59 @@ Describe 'Hook commands are bash-safe (2026-07-22 / 2026-07-24)' {
         $src.Contains($badShape) | Should -BeFalse -Because 'that concatenation is the shape Git Bash shreds'
     }
 }
+
+Describe 'Deploy parity covers the LIVE LAUNCH PATH (audit 2026-08-07: AMS-02/03/04)' {
+    # The MCP registration launches the WINDOWS copy of the shim; deploy.sh only ever
+    # writes the WSL copy. R9 printed "deployed scripts SHA256-match repo" for 12 days
+    # while that shim was stale and two shipped fixes (503-queueing, deep memory_health)
+    # were dead in production on BOTH boxes. These guards close the hole in the guard.
+    BeforeAll {
+        # tests -> windows -> scripts -> repo root (three levels; an off-by-one here makes
+        # every assertion below fail on a missing file instead of on the thing under test)
+        $script:winDir       = Split-Path -Parent $PSScriptRoot
+        $script:repoRoot     = Split-Path -Parent (Split-Path -Parent $script:winDir)
+        $script:tmsText      = Get-Content (Join-Path $script:winDir 'Test-MemoryStack.ps1') -Raw
+        $script:installerTxt = Get-Content (Join-Path $script:repoRoot 'install\2-windows-config.ps1') -Raw
+        $script:deployText   = Get-Content (Join-Path $script:repoRoot 'scripts\wsl\deploy.sh') -Raw
+    }
+
+    It 'R9 hashes every file the installer deploys to the launch path' {
+        # Parsed from the installer's OWN list, so this guard cannot drift from the deployer:
+        # add a file to $wslScripts and forget R9, and this goes red.
+        $m = [regex]::Match($script:installerTxt, '\$wslScripts\s*=\s*@\(([^)]*)\)')
+        $m.Success | Should -BeTrue -Because 'the installer must declare $wslScripts'
+        $deployed = @([regex]::Matches($m.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        $deployed.Count | Should -BeGreaterThan 0
+
+        $missing = @($deployed | Where-Object { $script:tmsText -notmatch [regex]::Escape("'$_'") })
+        $missing | Should -BeNullOrEmpty -Because (
+            "R9 must hash every file the installer deploys to the launch path; missing: $($missing -join ', ')")
+    }
+
+    It 'deploy.sh verifies the launch-path copies and names the fix command' {
+        $script:deployText | Should -Match 'launch-path' -Because 'deploy.sh brands itself THE single deploy path; it must not report success over a half-shipped fix wave'
+        $script:deployText | Should -Match '2-windows-config\.ps1' -Because 'a failure must name the exact command that fixes it'
+    }
+
+    It 'R9 names the baseline its parity verdict was computed against' {
+        # A green "deployed matches repo" is meaningless if the repo side is a checkout
+        # 8 PRs behind origin/main -- which is what the audit found.
+        #
+        # ASSERT ON CODE, NOT PROSE. The first version of this guard grepped the whole file
+        # for 'origin/main' and 'BASELINE' and was VACUOUS: -Match is case-insensitive, so
+        # the word "baseline" in this fix's own explanatory COMMENT satisfied it, and
+        # 'origin/main' appears in that comment too. Mutating the real logic left it green.
+        # Stripping comment lines first is what makes the assertion bite.
+        $code = ($script:tmsText -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+
+        $code | Should -Match "rev-list\s+--count\s+'HEAD\.\.origin/main'" -Because 'the baseline must be measured against origin/main, not asserted in prose'
+        $code | Should -Match 'BASELINE STALE' -Because 'a stale baseline must be named in the row an operator reads'
+        # and the note must actually reach the verdict: computed-but-unused is the same defect
+        $code | Should -Match '\$parityStatus\s*=.*\$baselineNote' -Because 'a stale baseline must downgrade the row, not just be computed'
+        $code | Should -Match 'Add-Check .RECOVERY. .deployed hooks freshness. \$parityStatus \$parityMsg' -Because 'the OK branch must publish the computed status and message'
+        # The note must LEAD the message: the summary table truncates long details with an
+        # ellipsis, and the first live run proved a tail-appended warning is invisible.
+        $code | Should -Match '\$parityMsg\s*=\s*if\s*\(\$baselineNote\)' -Because 'the message must branch on the baseline'
+        $code | Should -Match '"\$baselineNote -- ' -Because 'the caveat must come first so truncation cannot eat it'
+    }
+}

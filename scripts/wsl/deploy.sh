@@ -52,6 +52,54 @@ mkdir -p "$SCRIPTS_DIR"
 rsync -rc $DRY -v --include='*.py' --include='*.sh' --exclude='*' \
     "$REPO_ROOT/scripts/wsl/" "$SCRIPTS_DIR/" | grep -v '^$' | sed 's/^/    scripts: /'
 
+# --- 2b. launch-path parity (audit 2026-08-07: AMS-02/AMS-03) ---
+# This script brands itself THE single deploy path, but step 2 writes only the WSL
+# copies. The MCP tool surface Claude Code actually launches is the WINDOWS copy under
+# the operator's .claude/scripts, refreshed exclusively by install/2-windows-config.ps1.
+# Deploying the WSL side and printing "deploy complete" is how two shipped fixes
+# (503 write-queueing, deep memory_health) stayed dead in production for 12 days while
+# the parity check agreed everything matched.
+#
+# This block deliberately does NOT deploy the Windows-side files -- that is the
+# installer's job, on the Windows side. It REFUSES to report success while they are
+# stale, and names the exact command that fixes it. Fail-loud by design: a deploy that
+# only half-lands must not look identical to one that landed.
+LAUNCH_SCRIPTS="mem0-mcp-shim.py l10-audit.py replay-ops.py"
+launch_stale=""
+win_home="$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')"
+launch_dir=""
+[ -n "$win_home" ] && launch_dir="$(wslpath "$win_home" 2>/dev/null)/.claude/scripts"
+
+if [ -z "$launch_dir" ] || [ ! -d "$launch_dir" ]; then
+    echo "    launch-path: SKIPPED (Windows launch dir not resolvable from here)"
+elif [ -n "$DRY" ]; then
+    echo "    launch-path: checked below (dry run still verifies)"
+fi
+
+if [ -n "$launch_dir" ] && [ -d "$launch_dir" ]; then
+    for f in $LAUNCH_SCRIPTS; do
+        src="$REPO_ROOT/scripts/wsl/$f"
+        dst="$launch_dir/$f"
+        [ -f "$src" ] || continue
+        if [ ! -f "$dst" ]; then
+            launch_stale="$launch_stale $f(MISSING)"
+        elif ! diff -q <(sed -e "s|__WSL_USER__|$WSL_USER|g" \
+                             -e "s|__WIN_USER__|$WIN_USER|g" \
+                             -e "s|__WSL_DISTRO__|$DISTRO|g" "$src") "$dst" >/dev/null 2>&1; then
+            launch_stale="$launch_stale $f(STALE)"
+        fi
+    done
+
+    if [ -n "$launch_stale" ]; then
+        echo "==> DEPLOY INCOMPLETE - launch-path copies are stale:$launch_stale" >&2
+        echo "    The MCP tool surface launches the WINDOWS copies, not the WSL ones this" >&2
+        echo "    script just wrote. Fix from Windows PowerShell, then restart the session:" >&2
+        echo "      pwsh -NoProfile -File install/2-windows-config.ps1" >&2
+        exit 3
+    fi
+    echo "    launch-path parity OK ($LAUNCH_SCRIPTS)"
+fi
+
 # --- 3. systemd units (same sentinel resolution as the installer) ---
 for src in "$REPO_ROOT"/systemd/*.service "$REPO_ROOT"/systemd/*.timer; do
     [ -f "$src" ] || continue
