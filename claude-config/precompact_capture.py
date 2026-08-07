@@ -25,15 +25,37 @@ DEFAULT_MAX_TURNS = 6
 DEFAULT_MAX_CHARS = 800
 _TAIL_BYTES = 262144  # read only the last 256 KB — bounds the pathological giant-line transcript case
 
-# Canonical credential-shape set (same patterns as the server/L1a/skillopt readers). Only the [:=]
-# assignment shape is a secret; a bare 'token <word>' rule over-redacts ordinary prose.
-_SECRET_PATTERNS = (
-    (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "[REDACTED_OPENAI_KEY]"),
-    (re.compile(r"(?i)(Authorization:\s*Bearer\s+)[^\s\"']+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(Authorization:\s*Basic\s+)[^\s\"']+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b(\s*[:=]\s*)[^\s\"']+"), r"\1\2[REDACTED]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
-     "[REDACTED_PRIVATE_KEY]"),
+# Canonical credential-shape set. FOUR copies exist: this one, mem0-server/redact.py, the L1a
+# reader (scripts/windows/memory-common.ps1 Redact-Secrets), and the SkillOpt reader on the offline
+# replica host. The pattern STRINGS below are byte-identical to the other copies (only the
+# backreference syntax differs -- \1 here, $1 in PowerShell); the three in-repo copies are pinned to
+# each other by tests/fixtures/redaction-cases.jsonl, which all three suites iterate.
+# Rationale for each shape (left boundary vs \b, prefix tolerance, [ \t] vs \s, the bounded
+# newline-free value class, no bare-hex / no bare-Bearer) lives in mem0-server/redact.py's docstring.
+_SECRET_PATTERNS = tuple(
+    (re.compile(p), r)
+    for p, r in (
+        (r"(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}", "[REDACTED_OPENAI_KEY]"),
+        (r"(?i)(Authorization[ \t]*:[ \t]*Bearer[ \t]+)[^\s\"']+", r"\1[REDACTED]"),
+        (r"(?i)(Authorization[ \t]*:[ \t]*Basic[ \t]+)[^\s\"']+", r"\1[REDACTED]"),
+        (r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)"
+         r"[ \t]*[:=][ \t]*)"
+         r"(?:[\"'](?:\\.|[^\"'\\\r\n]){4,200}[\"']?"
+         r"|(?=[^\s\"'\r\n]{4})(?:[^\s\"'\r\n]{16,200}|[^\s\"'\r\n]{0,200}[0-9][^\s\"'\r\n]{0,200}))",
+         r"\1[REDACTED]"),
+        (r"(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)"
+         r"[ \t]*[:=][ \t]*)[\"'\x60]?[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*", r"\1[REDACTED]"),
+        (r"(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36})", "[REDACTED_GITHUB_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})", "[REDACTED_GITHUB_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,})", "[REDACTED_SLACK_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})", "[REDACTED_NVIDIA_KEY]"),
+        (r"(?-i:(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16})", "[REDACTED_AWS_KEY]"),
+        (r"(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)",
+         "[REDACTED_JWT]"),
+        (r"(?i)([a-z][a-z0-9+.-]*://[^\s:@/]{1,64}):[^\s:@/]{1,256}@", r"\1:[REDACTED]@"),
+        (r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+         "[REDACTED_PRIVATE_KEY]"),
+    )
 )
 
 

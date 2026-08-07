@@ -31,7 +31,27 @@ There is no single trigger — capture happens at four distinct moments, each hu
 
 **Chain:** the hook dispatcher (`stop-extract.ps1`) reads the hook JSON from stdin, snapshots the transcript (PreCompact mutates it), and spawns `l1a-extract.ps1` **detached** — session close is never blocked. The extractor throttles to **one successful extraction per 10 min** (marked only on success, so a transient failure doesn't burn the window), drains the dead-letter queue, health-checks mem0, then reads the last **24 turns / 12 000 chars** of the transcript (last 512 KB only; any single record > 256 KB skipped — a pathological-giant-line guard).
 
-**Redaction before the LLM.** `Redact-Secrets` strips credential shapes (keys, tokens, bearer headers, PEM blocks) *before* the text reaches Codex — and `redact.py` applies the same class of scrubbing server-side at the checkpoint chokepoint. Secrets are excluded at every entrance, not filtered after the fact.
+**Redaction before the LLM.** `Redact-Secrets` strips credential shapes *before* the text reaches Codex; `redact.py` applies the identical set server-side at the checkpoint chokepoint; `precompact_capture.py` applies it again before the resume marker hits disk. Secrets are excluded at every entrance, not filtered after the fact.
+
+**One pattern set, four copies — not three.** Three live in this repo (`memory-common.ps1 Redact-Secrets`, `mem0-server/redact.py`, `claude-config/precompact_capture.py`); the fourth is the SkillOpt reader, which lives on the offline replica host, is outside this repo's test reach, and adopts the set on that machine's next return. Earlier revisions of this page and of `redact.py`'s own docstring said *three runtimes* — the count was wrong, and the uncounted copy is precisely the one that can drift unobserved.
+
+**Families covered.** Each pattern is anchored on the left with `(?<![A-Za-z0-9])` (not `\b`, because `_` is a word character) and carries an explicit case flag:
+
+| Family | Shape |
+|---|---|
+| OpenAI-style key | `sk-` + 10 or more key characters |
+| Authorization header | `Authorization: Bearer <token>` / `Authorization: Basic <token>` |
+| Prefix-tolerant assignment | `<vendor>_<api_key\|token\|password\|passwd\|secret>` + `:`/`=` + a quoted or bare value |
+| Labelled value line | a `Value:` / `Key:` line (optionally bulleted or back-ticked) whose value is a 32+ character unbroken alphanumeric run |
+| Provider families | `gh[pousr]_` + 36, `github_pat_` + 60 or more, `xox[baprs]-`, `nvapi-` + 60 or more, `AKIA`/`ASIA` + 16 uppercase, a double-`eyJ` JWT |
+| URL user-info | `scheme://user:pass@host` |
+| PEM block | `-----BEGIN … PRIVATE KEY-----` through its `END` |
+
+The prefix tolerance is the load-bearing part: a `\b`-anchored keyword **cannot** match `API_KEY` inside `MEM0_API_KEY=` at all, so every `FOO_API_KEY=`, `CRON_SECRET=` and `GITHUB_TOKEN=` in the corpus used to be invisible. The separator is matched with `[ \t]*`, never `\s*`, because `\s*` spans the `\n\n` turn break in a joined transcript and ate the following `[role]` tag. Value classes never cross a newline, are length-bounded, and consume backslash escapes, so one unbalanced quote cannot swallow the rest of a transcript window and a value like `"abc\"def12345"` cannot leak its tail.
+
+**Deliberately not covered**, because each would corrupt live stored content: a bare-hex rule (live git SHAs and 32-hex zone ids), a bare `Bearer <word>` rule (a stored fact whose text reads "THREE Vercel Bearer API tokens embedded plaintext"), and a bare `token <word>` / `password <word>` rule ("the password reset email"). Three limits are accepted and pinned as such in the fixture rather than left implicit: a JSON-style quoted key (`"secret": "…"`) is not matched; a plain English word after a keyword is kept (`password: never store passwords in mem0` — an unquoted value counts as a credential only at 16+ characters or with a digit in it); and a single-line quoted value longer than 200 characters has its first 200 redacted and its tail left behind, the 200 being a deliberate blast-radius cap.
+
+**Fixture-enforced parity.** The four copies were born identical in a single commit with **no binding test**, and had already drifted (PowerShell's `-replace` is case-insensitive by default and Python's `re` is not, so `SK-UPPER` was redacted in one runtime and kept in the other) before anyone noticed. The structural fix is one shared fixture, [`../../tests/fixtures/redaction-cases.jsonl`](../../tests/fixtures/redaction-cases.jsonl), iterated by all three in-repo suites — pytest parametrize on the two Python copies, Pester `It -ForEach` (cases loaded in `BeforeDiscovery`) on the PowerShell copy. Its conventions each exist for a reason: the field is `text` and never `input` (`$input` is a PowerShell automatic variable that `-ForEach` binding would silently shadow); the file is ASCII-only (PS 5.1 `Get-Content` defaults to ANSI); assertions are literal substrings and never exact-output equality (so `$1`-vs-`\1` and marker rewording cannot turn the fixture into a tripwire); and a `|+|` split marker is stripped at load time so realistic credential prefixes never sit contiguously on disk — an unsplit fixture is flagged by secret scanners and therefore unpushable.
 
 **The inferability gate** is the extraction prompt's rule #1 and the reason the store stays high-signal. Verbatim core: *"before keeping a fact, ask: could a competent engineer who knows general software/tools but has NEVER worked on THIS project infer or guess this? If YES, DROP it."* Only genuinely project-specific facts survive — ports, paths, collection names, config values, decisions, IDs, flags, versions, locked-in choices. Generic best practices are noise by definition.
 
@@ -105,13 +125,13 @@ When the pipeline succeeds: only genuinely project-specific facts reach mem0 as 
 
 1. **Skeptical by default** — inferability gate, atomicity, ship-log split: the store's value is precision, not volume.
 2. **Never block the operator** — every capture is detached/throttled/fail-open; hooks always exit 0.
-3. **Secrets never enter** — redaction at both reader and server chokepoints.
+3. **Secrets never enter** — the same pattern set runs at the reader, the PreCompact sidecar, and the server chokepoint, and one shared fixture keeps the three copies from drifting apart.
 4. **Autonomy is structurally bounded** — the dream can act alone, but only through confidence sort + cap 3 + dedup + 4C gate + HMAC + ledger.
 5. **Everything self-heals** — DLQ retries, dream catch-up, decoupled indexing, poison quarantine.
 
 ## Security and privacy notes
 
-Secrets are excluded at every entrance, not filtered after the fact: `Redact-Secrets` scrubs credential shapes before the transcript reaches Codex, and `redact.py` re-scrubs server-side at the checkpoint chokepoint (see the L1a step above). Autonomous canonical promotion does **not** bypass the canonical write gate — it signs the same HMAC token via `mem0-canonize.sh --actor dream-autopromote`, so an attacker who could only run the consolidator still cannot forge canonical without the DPAPI-held key. All capture state lives under `~/.mem0/` (WSL) and `~/.claude/state/` (Windows); nothing here opens a LAN listener, and the shipped scripts carry no real host or operator value.
+Secrets are excluded at every entrance, not filtered after the fact: `Redact-Secrets` scrubs credential shapes before the transcript reaches Codex, `precompact_capture.py` scrubs the resume query before the marker is written, and `redact.py` re-scrubs server-side at the checkpoint chokepoint — one pattern set, held identical by a shared fixture (see the L1a step above for the families covered, the shapes deliberately left alone, and the two accepted misses). Autonomous canonical promotion does **not** bypass the canonical write gate — it signs the same HMAC token via `mem0-canonize.sh --actor dream-autopromote`, so an attacker who could only run the consolidator still cannot forge canonical without the DPAPI-held key. All capture state lives under `~/.mem0/` (WSL) and `~/.claude/state/` (Windows); nothing here opens a LAN listener, and the shipped scripts carry no real host or operator value.
 
 ## Observability and debugging
 
@@ -128,6 +148,7 @@ Secrets are excluded at every entrance, not filtered after the fact: `Redact-Sec
 - [`../../scripts/windows/tests/DreamAutopromote.Tests.ps1`](../../scripts/windows/tests/DreamAutopromote.Tests.ps1), [`../../scripts/windows/tests/DreamGateVerdict.Tests.ps1`](../../scripts/windows/tests/DreamGateVerdict.Tests.ps1), [`../../scripts/windows/tests/DreamCatchup.Tests.ps1`](../../scripts/windows/tests/DreamCatchup.Tests.ps1) — the nomination pipeline, the 4C gate verdict, and the catch-up debt logic.
 - [`../../claude-config/tests/test_precompact_capture.py`](../../claude-config/tests/test_precompact_capture.py) — the PreCompact query capture.
 - [`../../mem0-server/tests/test_redact.py`](../../mem0-server/tests/test_redact.py) — server-side redaction.
+- [`../../tests/fixtures/redaction-cases.jsonl`](../../tests/fixtures/redaction-cases.jsonl) — the shared redaction fixture all three in-repo suites iterate (`test_redact.py`, `test_precompact_capture.py`, `MemoryCommon.Tests.ps1`). Adding a rule to one copy without the others turns its case red in the other two.
 
 ## Source map
 
