@@ -29,7 +29,19 @@ Type=oneshot
 # fallback). Spawning a Windows process from WSL is sound here because the shim
 # is reached over HTTP, not stdio: only its stdout would be mangled, and
 # nothing reads it.
-ExecStartPre=-/usr/bin/env powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\__WIN_USER__\\.claude\\scripts\\codex-shim-spawn.ps1
+# ABSOLUTE interpreter path, not `env powershell.exe`: the systemd --user
+# manager's PATH carries no /mnt/c entries, so the env form exits 127 —
+# invisibly, because of the leading '-'. Verified from a transient user unit:
+# env form -> "No such file or directory"; absolute path -> runs. Same reason
+# scripts/wsl/dpapi-fetch-key.sh hardcodes this path.
+ExecStartPre=-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\__WIN_USER__\\.claude\\scripts\\codex-shim-spawn.ps1
+# The spawn returns as soon as the process starts; the shim then needs a moment
+# to bind. contradiction-sweep.py preflights with a SINGLE 3s health attempt and
+# no retry, so without this wait ExecStart loses the race and no-ops anyway —
+# the failure mode this whole ExecStartPre exists to end. Bounded, fail-soft:
+# always exits 0, so a shim that never comes up degrades to the documented
+# skipped week rather than failing the unit.
+ExecStartPre=-/bin/sh -c 'for i in $(seq 1 30); do curl -sf -m 2 http://127.0.0.1:18792/health >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
 ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --apply --limit 50 --judge codex
 StandardOutput=journal
 StandardError=journal

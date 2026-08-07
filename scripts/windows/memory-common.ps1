@@ -848,7 +848,7 @@ function Redact-Secrets {
         @('(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}', '[REDACTED_OPENAI_KEY]'),
         @('(?i)(Authorization[ \t]*:[ \t]*Bearer[ \t]+)[^\s"'']+', '$1[REDACTED]'),
         @('(?i)(Authorization[ \t]*:[ \t]*Basic[ \t]+)[^\s"'']+', '$1[REDACTED]'),
-        @('(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)(?:["''](?:\\.|[^"''\\\r\n]){4,200}["'']?|(?=[^\s"''\r\n]{4})(?:[^\s"''\r\n]{16,200}|[^\s"''\r\n]{0,200}[0-9][^\s"''\r\n]{0,200}))', '$1[REDACTED]'),
+        @('(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)(?:(?:["''](?:\\.|[^\\\r\n]){4,200}["'']|["''](?:\\.|[^"''\\\r\n]){4,200})|(?=[^\s"''\r\n]{4})(?:[^\s"''\r\n]{16,200}|[^\s"''\r\n]{0,200}[0-9][^\s"''\r\n]{0,200}))', '$1[REDACTED]'),
         @('(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)["''\x60]?[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*', '$1[REDACTED]'),
         @('(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36})', '[REDACTED_GITHUB_TOKEN]'),
         @('(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})', '[REDACTED_GITHUB_TOKEN]'),
@@ -856,7 +856,7 @@ function Redact-Secrets {
         @('(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})', '[REDACTED_NVIDIA_KEY]'),
         @('(?-i:(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16})', '[REDACTED_AWS_KEY]'),
         @('(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)', '[REDACTED_JWT]'),
-        @('(?i)([a-z][a-z0-9+.-]*://[^\s:@/]{1,64}):[^\s:@/]{1,256}@', '$1:[REDACTED]@'),
+        @('(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@', '$1:[REDACTED]@'),
         @('(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
     )
     foreach ($r in $rules) { $Text = $Text -replace $r[0], $r[1] }

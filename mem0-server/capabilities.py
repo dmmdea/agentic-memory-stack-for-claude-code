@@ -298,7 +298,15 @@ def _canonical_key_state(check):
     if not check.get("ok"):
         return "dead"          # keyless-degraded: blob exists, nothing served it
     if check.get("present"):
-        return "alive"
+        # AMS-13 (W4, review F22-1): a key that rests as PLAINTEXT is a working
+        # capability in a weaker posture — never 'alive'. Reporting 'alive' here
+        # is the drift AMS-13 exists to end: the docs claimed the DPAPI cutover
+        # was complete for three weeks while this row agreed with them. The
+        # cutover is a per-box operator act; until it is performed on THIS box,
+        # the honest verdict is 'degraded' and /health/deep names the source.
+        if check.get("source") == "dpapi" or check.get("dpapi_blob"):
+            return "alive"
+        return "degraded"
     # ok without a key = no key configured at all: promotions are disabled by
     # design there, but the capability is not operative either.
     return "degraded"

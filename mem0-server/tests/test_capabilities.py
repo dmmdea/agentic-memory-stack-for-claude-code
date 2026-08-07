@@ -38,7 +38,12 @@ GREEN_CHECKS = {
     "embedder": {"ok": True, "dim": 768},
     "sparse_leg": {"ok": True, "points": 100, "with_bm25": 100, "coverage": 1.0,
                    "canary": {"ran": True, "hit": True, "token": "qdrant"}},
-    "canonical_key": {"ok": True, "present": True, "provider": "dpapi"},
+    # Real /health/deep shape (canonical_key_health): ok/present/source/dpapi_blob.
+    # The fixture previously carried a "provider" key that production never
+    # emits — a fixture that does not mirror the real shape cannot catch a
+    # verdict that reads the real keys.
+    "canonical_key": {"ok": True, "present": True, "source": "runtime",
+                      "dpapi_blob": True},
     "put_carryover_today": {"date": "2026-08-07", "puts": 3,
                             "keys_restored": 0, "keys_lost": 0},
     "mojibake": {"ok": True, "scanned": 100, "hits": 0, "sample_ids": [],
@@ -100,7 +105,7 @@ def _ev(checks, role="brain", **kw):
     return evaluate(checks, role, **kw)
 
 
-def test_all_green_truth_table():
+def test_GREEN_CHECKS_truth_table():
     out = _ev(GREEN_CHECKS)
     assert out["role"] == "brain"
     for cid in PROBE_BACKED + W4_REVIVED:
@@ -447,6 +452,33 @@ def test_admission_gate_row_dead_when_probe_fails():
     assert "admission-gate" in out["dead_required"]        # required 'both'
     assert out["states"]["brand-isolation"] == "dead"      # the leaking dimension
     assert out["states"]["tier-policy"] == "alive"         # that leg still holds
+
+
+def test_canonical_key_plaintext_is_degraded_never_alive():
+    """AMS-13 / review F22-1: a working key resting as PLAINTEXT is a weaker
+    posture, not a healthy one. This row reporting 'alive' on plaintext is
+    exactly the drift AMS-13 exists to end — the docs claimed the DPAPI cutover
+    was complete while this agreed with them."""
+    checks = dict(GREEN_CHECKS)
+    checks["canonical_key"] = {"ok": True, "present": True,
+                               "source": "plaintext", "dpapi_blob": False}
+    out = evaluate(checks, "brain")
+    assert out["states"]["canonical-key"] == "degraded"
+    # degraded is not dead: promotions still work, so it must not convict.
+    assert "canonical-key" not in out["dead_required"]
+
+
+def test_canonical_key_alive_only_on_a_real_dpapi_posture():
+    for src, blob, expected in (
+        ("runtime", True, "alive"),      # tmpfs key injected from the blob
+        ("dpapi", False, "alive"),       # served directly from the blob
+        ("plaintext", False, "degraded"),
+        ("plaintext", True, "alive"),    # blob exists and served the key
+    ):
+        checks = dict(GREEN_CHECKS)
+        checks["canonical_key"] = {"ok": True, "present": True,
+                                   "source": src, "dpapi_blob": blob}
+        assert evaluate(checks, "brain")["states"]["canonical-key"] == expected, (src, blob)
 
 
 def test_tier_policy_dead_when_canonical_admitted_in_durable():

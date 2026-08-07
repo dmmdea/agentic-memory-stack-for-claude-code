@@ -71,7 +71,7 @@ _SECRET_PATTERNS = tuple(
         # Prefix-tolerant `<vendor>_<keyword> = <value>` assignment, quoted or bare.
         (r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)"
          r"[ \t]*[:=][ \t]*)"
-         r"(?:[\"'](?:\\.|[^\"'\\\r\n]){4,200}[\"']?"
+         r"(?:[\"'](?:\\.|[^\\\r\n]){4,200}[\"']|[\"'](?:\\.|[^\"'\\\r\n]){4,200}"
          r"|(?=[^\s\"'\r\n]{4})(?:[^\s\"'\r\n]{16,200}|[^\s\"'\r\n]{0,200}[0-9][^\s\"'\r\n]{0,200}))",
          r"\1[REDACTED]"),
         # A labelled value line: `Value: <32+ alnum>` / `- Key: `<hex>``. This is the corpus shape
@@ -88,7 +88,7 @@ _SECRET_PATTERNS = tuple(
         (r"(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)",
          "[REDACTED_JWT]"),
         # scheme://user:pass@host
-        (r"(?i)([a-z][a-z0-9+.-]*://[^\s:@/]{1,64}):[^\s:@/]{1,256}@", r"\1:[REDACTED]@"),
+        (r"(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@", r"\1:[REDACTED]@"),
         # PEM private key block.
         (r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
          "[REDACTED_PRIVATE_KEY]"),

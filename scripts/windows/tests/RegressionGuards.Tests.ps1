@@ -379,7 +379,13 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         # be a permanently-red guard (plan review F16).
         $unit = Get-Content (Join-Path $script:repoRoot 'systemd\contradiction-sweep.service') -Raw
         $unitCode = ($unit -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
-        $unitCode | Should -Match 'ExecStartPre=-.*codex-shim-spawn\.ps1' -Because 'the sweep must raise its own judge, fail-soft, or it can never be up when it runs'
+        # ABSOLUTE interpreter path: `env powershell.exe` exits 127 from a
+        # systemd --user unit (no /mnt/c on its PATH) and the '-' prefix hides
+        # it. The first version of this pin matched `ExecStartPre=-.*spawn.ps1`,
+        # which the DEAD form satisfied — that is why mutation M6 passed against
+        # a mechanism that could never run.
+        $unitCode | Should -Match 'ExecStartPre=-/mnt/c/.*powershell\.exe.*codex-shim-spawn\.ps1' -Because 'the env form cannot resolve from a systemd user unit; only an absolute interpreter path runs'
+        $unitCode | Should -Match 'ExecStartPre=-/bin/sh -c .*18792/health' -Because 'the preflight is a single 3s attempt with no retry, so the spawn needs a bounded readiness wait or ExecStart loses the race'
         $unitCode | Should -Match 'judge codex' -Because 'the sweep must never fall back to a local judge (78% false positives measured)'
     }
 

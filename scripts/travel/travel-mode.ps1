@@ -208,7 +208,17 @@ function Show-Status {
 
 switch ($Mode) {
 
-  'status' { Show-Status; break }
+  'status' {
+      # 'status' is the DIAGNOSTIC verb: it must work on every box, including
+      # the authority (where the guard refuses the mutating verbs) and a box
+      # whose backup dirs cannot be derived. So resolve only the authority URL
+      # here — never Resolve-TravelDefaults, which throws when the host is an
+      # IP literal. Without this the row printed 'authority: -> UNREACHABLE'
+      # everywhere once the placeholder default was removed.
+      if (-not $Authority) { $Authority = Get-AuthorityUrlLocal }
+      Show-Status
+      break
+  }
 
   'on' {
       # HARD GUARD — never on the authority machine: the restore would stop the live mem0 and

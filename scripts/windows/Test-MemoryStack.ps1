@@ -1393,6 +1393,23 @@ try {
             if ($scRepoHash -ne (Get-FileHash $scDep -Algorithm SHA256).Hash) { $staleHooks += 'storage-cap-check.sh(drift - re-deploy claude-config\storage-cap-check.sh with WSL-user substitution)' }
         }
 
+        # W4 (AMS-12 review FB-7): the PreCompact capture is the THIRD deployed
+        # copy of the redaction rule set, and R9 never hashed it -- so a stale
+        # deployed copy would keep the OLD rules (which corrupted live text via
+        # the unbounded sk- match) while the repo said the fix had shipped.
+        # Exactly the AMS-02 class, on a file that scrubs credentials. Its repo
+        # source is claude-config\ like storage-cap-check.sh, so it needs the
+        # same explicit tracking; it carries no sentinels, so a plain hash.
+        foreach ($ccName in 'precompact_capture.py', 'sessionstart_bundle.py') {
+            $ccRepo = Join-Path (Split-Path -Parent (Split-Path -Parent $repoHookDir)) "claude-config\$ccName"
+            $ccDep  = Join-Path $deployedHookDir $ccName
+            if     (-not (Test-Path $ccRepo)) { continue }
+            elseif (-not (Test-Path $ccDep))  { $staleHooks += "$ccName(MISSING - redeploy from claude-config)" }
+            elseif ((Get-FileHash $ccRepo -Algorithm SHA256).Hash -ne (Get-FileHash $ccDep -Algorithm SHA256).Hash) {
+                $staleHooks += "$ccName(drift - re-deploy claude-config\$ccName)"
+            }
+        }
+
         # AUDIT 2026-08-07 (AMS-04): a git checkout is a production input. This check
         # hashes the deployed files against a LOCAL checkout -- and the audit found that
         # checkout 8 PRs behind origin/main, so "deployed matches repo" was true while the
