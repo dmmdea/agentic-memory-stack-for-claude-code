@@ -214,7 +214,7 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 - `memory_promote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier
 - `memory_demote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier (same endpoint, different direction)
 - `memory_delete(memory_id)` — DELETE /v1/memories/{id}
-- `memory_health()` — GET /health
+- `memory_health()` — GET /health/deep (switched 2026-07-26: shallow /health green-lit broken write paths)
 
 ## Dependencies
 
@@ -250,7 +250,7 @@ Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hoo
 ## Security and privacy notes
 
 - **Auth:** single `X-API-Key` (mode-600 file), constant-time compared; loopback bind is the network boundary.
-- **Canonical writes:** gated by an HMAC user-direct token (format-2, replay-protected via a burned nonce in `~/.mem0/canonical-replay.jsonl`); the signing key is DPAPI-held (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)).
+- **Canonical writes:** gated by an HMAC user-direct token (format-2, replay-protected via a burned nonce in `~/.mem0/canonical-replay.jsonl`); the signing key rests as a DPAPI blob where the per-box cutover has been run, else mode-600 plaintext — /health/deep reports which (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)).
 - **Metadata forgery:** retrieval-gating keys are stripped on `add` and forbidden on the generic metadata PATCH so an API-key holder cannot silently bury records.
 - **Secret redaction:** stored prompt text is scrubbed server-side (`redact.py`).
 

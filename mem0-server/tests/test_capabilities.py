@@ -473,7 +473,14 @@ def test_canonical_key_alive_only_on_a_real_dpapi_posture():
         ("runtime", True, "alive"),      # tmpfs key injected from the blob
         ("dpapi", False, "alive"),       # served directly from the blob
         ("plaintext", False, "degraded"),
-        ("plaintext", True, "alive"),    # blob exists and served the key
+        # A blob on disk while the server SERVES plaintext is the cutover-ran-
+        # then-broke state (ExecStartPre fails soft). It is a stronger degraded
+        # signal than plain plaintext, never alive. This row previously asserted
+        # 'alive' with the comment "blob exists and served the key" — which
+        # source=plaintext contradicts; a green suite would never have
+        # self-corrected it.
+        ("plaintext", True, "degraded"),
+        ("none", True, "degraded"),      # latent, but never alive on a blob alone
     ):
         checks = dict(GREEN_CHECKS)
         checks["canonical_key"] = {"ok": True, "present": True,

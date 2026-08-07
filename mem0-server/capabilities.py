@@ -304,7 +304,14 @@ def _canonical_key_state(check):
         # was complete for three weeks while this row agreed with them. The
         # cutover is a per-box operator act; until it is performed on THIS box,
         # the honest verdict is 'degraded' and /health/deep names the source.
-        if check.get("source") == "dpapi" or check.get("dpapi_blob"):
+        # Only the SERVING source can say alive. `dpapi_blob` merely means a
+        # blob exists on disk — and {source: plaintext, dpapi_blob: true} is
+        # the single most important state for AMS-13 to catch: the operator DID
+        # run the cutover, but dpapi-fetch-key.sh's ExecStartPre failed (the '-'
+        # prefix swallows it, which is exactly how this brain ran for weeks) and
+        # the provider quietly fell back to plaintext. Treating the blob's mere
+        # existence as health would relocate the drift, not end it.
+        if check.get("source") in ("runtime", "dpapi"):
             return "alive"
         return "degraded"
     # ok without a key = no key configured at all: promotions are disabled by
