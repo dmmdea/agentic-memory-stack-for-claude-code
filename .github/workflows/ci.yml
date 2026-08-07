@@ -66,6 +66,7 @@ jobs:
             mem0-server/tests/test_ams01_history_window.py \
             mem0-server/tests/test_autopromote_actor.py \
             mem0-server/tests/test_canonical_key_provider.py \
+            mem0-server/tests/test_capabilities.py \
             mem0-server/tests/test_codex_shim_client.py \
             mem0-server/tests/test_config_import_closure.py \
             mem0-server/tests/test_contradiction_resolve.py \
@@ -75,6 +76,7 @@ jobs:
             mem0-server/tests/test_episodic_reconcile.py \
             mem0-server/tests/test_failure_injection.py \
             mem0-server/tests/test_freshness.py \
+            mem0-server/tests/test_job_liveness.py \
             mem0-server/tests/test_l10_audit.py \
             mem0-server/tests/test_ledger_audit.py \
             mem0-server/tests/test_mcp_shim_contract.py \

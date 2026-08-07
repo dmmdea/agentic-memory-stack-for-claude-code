@@ -28,6 +28,9 @@ import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps inje
 from payload_carryover import compute_carryover  # AMS-01: PUT payload carry-over (P0)
 from sparse_health import sparse_leg_health      # AMS-09: BM25 leg liveness (gating)
 from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
+from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
+from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
+from capabilities import evaluate as evaluate_capabilities  # W3: capability manifest (informational)
 from episodic import (
     _connect as _episodic_connect,
     init_schema as _episodic_init_schema,
@@ -861,6 +864,25 @@ def health_deep() -> dict:
     # AMS-01 (2026-08-07): carry-over counters — informational invocation proof.
     _put_carryover_bump()  # roll the date on idle days so 'date' stays current
     out["checks"]["put_carryover_today"] = dict(_put_carryover_today)
+    # W3 (2026-08-07): the alarm mouths — nightly-job receipt ages, the
+    # retrieval-drift guard's state file, and the capability manifest folded
+    # over everything above. ALL informational: the gating checks already
+    # flipped ok adjacent to their assignment; nothing here double-gates.
+    # Each module is never-raise by contract — belted anyway (house F11: a
+    # probe bug must not take down /health/deep for its other consumers).
+    try:
+        out["checks"]["job_liveness"] = job_liveness_health()
+    except Exception as e:
+        out["checks"]["job_liveness"] = {"role": None, "error": str(e)[:120]}
+    try:
+        out["checks"]["retrieval_drift"] = drift_state_health()
+    except Exception as e:
+        out["checks"]["retrieval_drift"] = {"state_present": None, "error": str(e)[:120]}
+    try:
+        _cap_role = (out["checks"].get("job_liveness") or {}).get("role")
+        out["checks"]["capabilities"] = evaluate_capabilities(out["checks"], _cap_role)
+    except Exception as e:
+        out["checks"]["capabilities"] = {"error": str(e)[:120]}
     return out
 
 @app.post("/v1/memories")
