@@ -981,7 +981,16 @@ try {
         'build-hook-client.ps1',                               # v0.20 Final: smoke-gated builder — deployed so a repo-less DR restore can rebuild the exe (SessionStart self-heal in mem0-hook-daemon-spawn.ps1)
         'dream-consolidate.ps1',                               # v0.20 Phase F (L4): installer deploys it + Task Scheduler runs it nightly — was the one deployed script R9 never checked
         'autopromote-lib.ps1',                                 # Phase 2c: dot-sourced by dream-consolidate.ps1 for the autonomous-promotion decision logic (must deploy beside it)
-        'codex-shim.ps1', 'codex-shim-spawn.ps1'               # v0.27.1 R5 keystone: Windows-resident Codex HTTP shim + its flag-gated SessionStart launcher
+        'codex-shim.ps1', 'codex-shim-spawn.ps1',              # v0.27.1 R5 keystone: Windows-resident Codex HTTP shim + its flag-gated SessionStart launcher
+        # AUDIT 2026-08-07 (AMS-02/AMS-03): THE LAUNCH-PATH TRIO. The MCP registration
+        # launches the WINDOWS copy of the shim from this directory; deploy.sh only ever
+        # writes the WSL copy under ~/apps/mem0-scripts. Because these three were absent
+        # from this list, R9 reported "deployed scripts SHA256-match repo" for 12 days
+        # while the live shim sat at a pre-fix revision and TWO shipped fixes -- 503
+        # write-queueing and the deep memory_health probe -- were dead in production on
+        # both boxes. Deployed by install/2-windows-config.ps1's $wslScripts loop; the
+        # RegressionGuards suite parses that list so this one cannot drift from it.
+        'mem0-mcp-shim.py', 'l10-audit.py', 'replay-ops.py'
     )
     if (-not (Test-Path $repoHookDir)) {
         Add-Check 'RECOVERY' 'deployed hooks freshness' 'WARN' "repo dir not found: $repoHookDir"
@@ -1002,8 +1011,17 @@ try {
         # R9 file on a fresh box.
         $snU = '__WSL' + '_USER__'; $snW = '__WIN' + '_USER__'; $snD = '__WSL' + '_DISTRO__'
         $staleHooks = @()
+        # AUDIT 2026-08-07 (AMS-03): the launch-path trio lives in scripts\wsl\, not
+        # scripts\windows\, but is DEPLOYED into this same Windows scripts dir by the
+        # installer's $wslScripts loop. Resolving every name against $repoHookDir alone
+        # would report them 'no-repo-copy' -- loud, but the wrong diagnosis, and it would
+        # never catch actual drift in the file the MCP launches. Route each name to the
+        # directory that actually holds its source.
+        $repoWslDir = Join-Path (Split-Path -Parent $repoHookDir) 'wsl'
+        $wslSourced = @('mem0-mcp-shim.py', 'l10-audit.py', 'replay-ops.py')
         foreach ($hn in $hookNames) {
-            $repoFile = Join-Path $repoHookDir $hn
+            $srcDir   = if ($wslSourced -contains $hn) { $repoWslDir } else { $repoHookDir }
+            $repoFile = Join-Path $srcDir $hn
             $depFile  = Join-Path $deployedHookDir $hn
             if     (-not (Test-Path $depFile))  { $staleHooks += "$hn(MISSING)" }
             elseif (-not (Test-Path $repoFile)) { $staleHooks += "$hn(no-repo-copy)" }
@@ -1067,8 +1085,36 @@ try {
             if ($scRepoHash -ne (Get-FileHash $scDep -Algorithm SHA256).Hash) { $staleHooks += 'storage-cap-check.sh(drift - re-deploy claude-config\storage-cap-check.sh with WSL-user substitution)' }
         }
 
+        # AUDIT 2026-08-07 (AMS-04): a git checkout is a production input. This check
+        # hashes the deployed files against a LOCAL checkout -- and the audit found that
+        # checkout 8 PRs behind origin/main, so "deployed matches repo" was true while the
+        # deployed bytes were stale. A parity verdict without its baseline is not a verdict;
+        # name the baseline, and downgrade a clean row to WARN when the baseline is behind.
+        $baselineNote = ''
+        try {
+            $behind = (& git -C $TmsRepoWin rev-list --count 'HEAD..origin/main' 2>$null | Select-Object -First 1)
+            # Do NOT gate on $LASTEXITCODE: after a native command with 2>$null inside a
+            # pipeline it comes back EMPTY rather than 0, so an exit-code precondition
+            # silently suppressed this note on its first live run (git had succeeded and
+            # reported 12 commits behind). The digit test is the robust check -- a failed
+            # git produces no digits, which is the same signal without the trap.
+            if ("$behind" -match '^\d+$' -and [int]$behind -gt 0) {
+                $baselineNote = " [BASELINE STALE: comparison checkout is $behind commit(s) behind origin/main - git fetch + checkout main before trusting this row]"
+            }
+        } catch { $baselineNote = ' [BASELINE UNKNOWN: git comparison unavailable]' }
+
         if ($staleHooks.Count -eq 0) {
-            Add-Check 'RECOVERY' 'deployed hooks freshness' 'OK' "$($hookNames.Count)/$($hookNames.Count) deployed scripts SHA256-match repo + model-tiers.json + client exe present and fresh"
+            $parityStatus = if ($baselineNote) { 'WARN' } else { 'OK' }
+            # LEAD with the caveat. The summary table truncates long details with an
+            # ellipsis, so a warning appended to the tail is computed, stored, and never
+            # read -- the same produced-but-undelivered failure this wave exists to end.
+            # A parity verdict whose baseline is stale must say so in the first words.
+            $parityMsg = if ($baselineNote) {
+                "$baselineNote -- $($hookNames.Count)/$($hookNames.Count) deployed scripts SHA256-match that baseline"
+            } else {
+                "$($hookNames.Count)/$($hookNames.Count) deployed scripts SHA256-match repo + model-tiers.json + client exe present and fresh"
+            }
+            Add-Check 'RECOVERY' 'deployed hooks freshness' $parityStatus $parityMsg
         } else {
             Add-Check 'RECOVERY' 'deployed hooks freshness' 'WARN' (($staleHooks -join ', ') + " - redeploy: Copy-Item (Join-Path '$TmsRepoWin' 'scripts\windows\<name>') ~\.claude\scripts\")
         }

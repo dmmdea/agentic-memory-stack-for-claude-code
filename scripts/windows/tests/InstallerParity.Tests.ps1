@@ -61,11 +61,28 @@ Describe 'installer/verifier ship the A.5/A.6 chain (v0.20 Final)' {
         { Get-ParsedAst -Path $verifierPath }  | Should -Not -Throw
     }
 
-    It 'installer $winScripts deploys every file Test-MemoryStack R9 hash-tracks' {
+    It 'the installer deploys every file Test-MemoryStack R9 hash-tracks' {
+        # The invariant is "R9-tracked => deployed by the installer", NOT "=> listed in
+        # $winScripts". The installer has TWO deploy lists into the same scripts dir:
+        # $winScripts (sources from scripts\windows\) and $wslScripts (sources from
+        # scripts\wsl\ -- the mem0 MCP shim and its siblings, which the MCP actually
+        # launches). Audit 2026-08-07 (AMS-03) added the $wslScripts trio to R9 because
+        # its absence let R9 report "all deployed scripts match" while the live shim was
+        # 12 days stale; checking only $winScripts here would have forced that fix back
+        # out and re-opened the hole. Union both lists.
         $win = Get-AstArrayStrings -Path $installerPath -VarName 'winScripts'
+        $wsl = Get-AstArrayStrings -Path $installerPath -VarName 'wslScripts'
+        $deployed = @($win) + @($wsl)
         $r9  = Get-AstArrayStrings -Path $tmsPath       -VarName 'hookNames'
-        $missing = @($r9 | Where-Object { $win -notcontains $_ })
+        $missing = @($r9 | Where-Object { $deployed -notcontains $_ })
         $missing | Should -BeNullOrEmpty -Because "every R9-tracked deployed file the installer skips makes a clean install self-report DEGRADED: $($missing -join ', ')"
+    }
+
+    It 'both installer deploy lists are actually discoverable (the union above is not vacuous)' {
+        # If a rename made either lookup return empty, the union test above would pass
+        # trivially for the wrong reason. Pin that both lists exist and are non-empty.
+        @(Get-AstArrayStrings -Path $installerPath -VarName 'winScripts') | Should -Not -BeNullOrEmpty
+        @(Get-AstArrayStrings -Path $installerPath -VarName 'wslScripts') | Should -Not -BeNullOrEmpty
     }
 
     It 'installer deploys the daemon, spawn launcher, client source, and smoke-gated builder' {
