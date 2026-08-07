@@ -6,10 +6,24 @@ Endpoint: POST /v1/rerank   (llama-server `--reranking` flag exposes this).
 Failure policy (lens A4): any error from the reranker (timeout, 5xx,
 connection refused) returns the input order unchanged + logs a WARN. Search
 never errors because reranking failed. To surface silent degradation, we
-track consecutive failures and log on the 1st + every 10th."""
+track consecutive failures and log on the 1st + every 10th.
+
+W4 / review F11 — PASSIVE liveness, never an active probe. The capability
+manifest needs a reranker verdict, but an ACTIVE rerank probe must NOT live in
+/health/deep: this is a CPU cross-encoder (Test-MemoryStack budgets it 90s and
+still WARNs on cold-model timeouts), and scripts/wsl/deploy.sh gates on
+/health/deep immediately after a restart — an active probe there would hang
+deploys on a cold or contended model. So ``rerank_stats`` below is bumped from
+REAL rerank calls on the search path (in-process, zero I/O, mirroring
+hook_contract.py's ``hook_contract_stats``) and capabilities.py reads it. The
+active 3-doc probe stays where it can afford to be slow: TMS check L5.
+
+Zero signal (no rerank traffic since this process started) maps to 'unknown',
+never 'alive' (F9) — the counters are in-process and a restart zeroes them."""
 from __future__ import annotations
 import logging
 import threading
+import time
 from typing import Sequence
 
 import httpx
@@ -26,8 +40,20 @@ RERANK_SKIP_IF_TOP_SCORE = 0.92
 # (was 380 chars for bge-reranker-base which had 512-token ctx)
 RERANK_DOC_MAX_CHARS = 6000  # v2-m3 ctx=8192; 6000 chars is safe room for query + special tokens
 
-# Failure surfacing (lens A4)
-_consecutive_failures = 0
+# Failure surfacing (lens A4) + W4 passive liveness counters (F11).
+# ONE source of truth for the consecutive-failure count: the log-throttling
+# ladder below and /health/deep's checks.reranker read the same number, so a
+# manifest verdict can never disagree with what the WARN lines said.
+# Fixed key names (cross-track contract — capabilities.py reads these):
+#   last_rerank_ok_ts            epoch seconds of the last SUCCESSFUL rerank
+#   consecutive_rerank_failures  reset to 0 on every success
+rerank_stats: dict = {
+    "last_rerank_ok_ts": None,
+    "consecutive_rerank_failures": 0,
+    "ok_total": 0,
+    "fail_total": 0,
+    "last_error": None,
+}
 _failure_lock = threading.Lock()
 
 
@@ -40,9 +66,18 @@ def should_rerank(results: Sequence[dict]) -> bool:
     return True
 
 
+def rerank_health() -> dict:
+    """Snapshot of the passive counters for /health/deep (zero I/O, never
+    raises). Informational — it never flips the endpoint's ok."""
+    with _failure_lock:
+        return dict(rerank_stats)
+
+
 def rerank(query: str, results: list[dict], text_key: str = "memory") -> list[dict]:
-    """Reorder `results` by bge-reranker scores. Idempotent; original list is not mutated."""
-    global _consecutive_failures
+    """Reorder `results` by bge-reranker scores. Idempotent; original list is not mutated.
+
+    A skipped rerank (should_rerank False) is NOT an attempt and bumps nothing:
+    the counters must mean 'the transport was exercised', not 'search ran'."""
     if not should_rerank(results):
         return list(results)
     docs = [str(r.get(text_key, "") or "")[:RERANK_DOC_MAX_CHARS] for r in results]
@@ -70,12 +105,16 @@ def rerank(query: str, results: list[dict], text_key: str = "memory") -> list[di
             if id(r) not in seen:
                 out.append(r)
         with _failure_lock:
-            _consecutive_failures = 0  # reset on success
+            rerank_stats["consecutive_rerank_failures"] = 0   # reset on success
+            rerank_stats["last_rerank_ok_ts"] = time.time()
+            rerank_stats["ok_total"] += 1
         return out
     except (httpx.HTTPError, ValueError, KeyError) as e:
         with _failure_lock:
-            _consecutive_failures += 1
-            local_n = _consecutive_failures
+            rerank_stats["consecutive_rerank_failures"] += 1
+            rerank_stats["fail_total"] += 1
+            rerank_stats["last_error"] = f"{e.__class__.__name__}: {e}"[:160]
+            local_n = rerank_stats["consecutive_rerank_failures"]
         # Surface silent-degradation: WARN on first failure + every 10th thereafter
         if local_n == 1 or local_n % 10 == 0:
             log.warning("reranker unavailable (consecutive=%d), returning dense-only order: %s",

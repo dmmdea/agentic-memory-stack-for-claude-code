@@ -22,6 +22,16 @@ Initialize-MemoryEnv
 if ($env:L1A_REENTRANT -eq '1') { exit 0 }
 $env:L1A_REENTRANT = '1'
 
+# W4 F12: UNCONDITIONAL attempt stamp - written here, before the throttle and every
+# other early return below. WHY: last-l1a stamps only on a SUCCESSFUL extraction, so
+# "sessions happened and had nothing durable to extract" was indistinguishable from
+# "the extractor is dead" and the capability manifest would convict a healthy box.
+# With both stamps the server can require attempt-fresh AND success-stale-for-days
+# before it accuses anything (capabilities.py _l1a_state). Best-effort by design:
+# a stamp failure must never cost an extraction. ($script:StateDir already exists —
+# Initialize-MemoryEnv above creates it.)
+try { Set-Content -Path (Join-Path $script:StateDir 'last-l1a-attempt') -Value (Get-UnixEpoch) -Encoding UTF8 -NoNewline } catch { }
+
 try {
     # Throttle: 10 minutes between SUCCESSFUL extractions (not mere fires - audit
     # 2026-06-08: prior code marked the throttle before doing anything, so a

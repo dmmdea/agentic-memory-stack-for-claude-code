@@ -18,6 +18,10 @@ from mem0 import Memory
 
 from config import build_config
 from reranker import rerank as bge_rerank
+# W4 (F11): PASSIVE rerank counters. There is deliberately NO active rerank
+# probe on /health/deep — deploy.sh gates on this endpoint right after a
+# restart and the reranker is a CPU cross-encoder (TMS budgets it 90s).
+from reranker import rerank_health as _rerank_health
 from admission_gate import apply_admission
 # MEM-8 (2026-07-03): daily rejection counters for /health/deep observability.
 from admission_gate import admission_rejections_today as _admission_rejections_today
@@ -31,6 +35,10 @@ from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
 from capabilities import evaluate as evaluate_capabilities  # W3: capability manifest (informational)
+# W4: in-process admission self-probe. Calls AdmissionPolicy.evaluate() DIRECTLY —
+# never apply_admission, which would bump the MEM-8 daily counters this endpoint
+# reports and append to ~/.mem0/admission-rejected.jsonl on every health read.
+from capabilities import admission_selfprobe as _admission_selfprobe
 from episodic import (
     _connect as _episodic_connect,
     init_schema as _episodic_init_schema,
@@ -878,9 +886,24 @@ def health_deep() -> dict:
         out["checks"]["retrieval_drift"] = drift_state_health()
     except Exception as e:
         out["checks"]["retrieval_drift"] = {"state_present": None, "error": str(e)[:120]}
+    # W4 (F11): the reranker's PASSIVE counters — what real search traffic has
+    # already proven about the CPU cross-encoder. Zero I/O; an active probe here
+    # would hang deploy.sh's post-restart health gate on a cold model.
+    try:
+        out["checks"]["reranker"] = _rerank_health()
+    except Exception as e:
+        out["checks"]["reranker"] = {"error": str(e)[:120]}
+    # W4: admission/tier/brand read-half self-probe. Pure — three synthetic
+    # records through AdmissionPolicy.evaluate(); no counters, no audit log,
+    # no disk (apply_admission would do all three on every health read).
+    try:
+        out["checks"]["admission_probe"] = _admission_selfprobe()
+    except Exception as e:
+        out["checks"]["admission_probe"] = {"ok": False, "error": str(e)[:120]}
     try:
         _cap_role = (out["checks"].get("job_liveness") or {}).get("role")
-        out["checks"]["capabilities"] = evaluate_capabilities(out["checks"], _cap_role)
+        out["checks"]["capabilities"] = evaluate_capabilities(
+            out["checks"], _cap_role, stack_version=STACK_VERSION)
     except Exception as e:
         out["checks"]["capabilities"] = {"error": str(e)[:120]}
     return out

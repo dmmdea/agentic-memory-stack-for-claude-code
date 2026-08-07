@@ -110,10 +110,18 @@ try {
 } catch { Add-Check 'LIVENESS' 'mem0 :18791' 'FAIL' $_.Exception.Message }
 
 # L2: mem0 deep health (Qdrant + embedder probe)
+# W4: $hdTried records that L2 ALREADY attempted the call. Four downstream rows
+# reuse $hd, and their `if ($hd -and $hd.checks)` guard could not tell "L2 has
+# not run yet" from "L2 tried and failed" — so a single slow/hung /health/deep
+# was re-probed four more times, each with its own timeout (worst case grew to
+# ~120s once W4 raised I12 to 30s). A downstream row must now report the
+# outage, never re-run into it.
+$hdTried = $false
 try {
     # W2: /health/deep now runs the sparse-leg canary (filtered scroll + a
     # keyword probe, first call may load the bm25 model) and the mojibake
     # scroll — 6s flapped on cold starts; 30 matches L8/R10.
+    $hdTried = $true
     $hd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30
     if ($hd.ok) {
         Add-Check 'LIVENESS' 'mem0 /health/deep' 'OK' "qdrant_points=$($hd.checks.qdrant.points) embed_dim=$($hd.checks.embedder.dim)"
@@ -186,12 +194,25 @@ try {
     else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $f.Message }
 }
 
-# L5: bge-reranker-v2-m3 on llama-swap :11436
+# L5: bge-reranker-v2-m3 on llama-swap :11436.
+# W4 (review F11): THIS is the reranker capability's active exerciser, and it stays
+# here on purpose. /health/deep must NOT run an active rerank probe — deploy.sh gates
+# on that endpoint immediately after a restart, and this is a CPU cross-encoder that
+# routinely needs the full 90s budget below on a cold or contended box; an active
+# probe there would hang deploys. The server therefore exposes only PASSIVE counters
+# (checks.reranker, bumped by real search traffic) and the `reranker` manifest row
+# reads those. This row is where 90s is affordable, so it is where the real call lives.
+# The passive counters are echoed below when L2 already fetched /health/deep — read
+# from the EXISTING $hd only, never a fresh call (see the amplification note at L2).
 try {
     $rerankBody = @{model='bge-reranker-v2-m3'; query='ping'; documents=@('a','b','c'); top_n=3} | ConvertTo-Json
     $r = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/rerank' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($rerankBody)) -ContentType 'application/json' -TimeoutSec $probeTimeoutSec
-    if ($r.results -and $r.results.Count -eq 3) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'OK' 'live + ordered 3 docs' }
-    else                                         { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' 'responded but unexpected shape' }
+    $rrStats = ''
+    if ($hd -and $hd.checks -and $hd.checks.reranker) {
+        $rrStats = " (server passive: ok_total=$($hd.checks.reranker.ok_total) consecutive_failures=$($hd.checks.reranker.consecutive_rerank_failures))"
+    }
+    if ($r.results -and $r.results.Count -eq 3) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'OK' "live + ordered 3 docs$rrStats" }
+    else                                         { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "responded but unexpected shape$rrStats" }
 } catch {
     $f = Get-ProbeFailure $_
     if ($f.IsTimeout) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "no response in ${probeTimeoutSec}s (CPU model cold or contended, not necessarily down)" }
@@ -232,7 +253,7 @@ try {
 # half-backfilled corpus is degraded, not dead — the server does not gate on
 # coverage).
 try {
-    $slHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $slHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
     $sl = $slHd.checks.sparse_leg
     if (-not $sl) {
         Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' '/health/deep has no sparse_leg check — server predates W2 (redeploy mem0-server)'
@@ -335,9 +356,11 @@ try {
 # capabilities for this box's role FAIL; unknowns are WARN-class visibility
 # (they are W4's revive-or-bury worklist, not silent gaps).
 try {
-    $capHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $capHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
     $cap = $capHd.checks.capabilities
-    if (-not $cap) {
+    if (-not $capHd) {
+        Add-Check 'LIVENESS' 'capability manifest' 'WARN' 'deep health unavailable (see the mem0 /health/deep row) - capability verdicts not read'
+    } elseif (-not $cap) {
         Add-Check 'LIVENESS' 'capability manifest' 'WARN' '/health/deep has no capabilities check - server predates W3 (redeploy mem0-server)'
     } else {
         $deadReq = @($cap.dead_required)
@@ -345,7 +368,9 @@ try {
         if ($deadReq.Count -gt 0) {
             Add-Check 'LIVENESS' 'capability manifest' 'FAIL' "DEAD required capability(ies): $($deadReq -join ', ') - see docs/capability-manifest.md for each probe + remedy"
         } else {
-            Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities (role=$($cap.role)); $($unk.Count) unknown (probe:none rows - the W4 worklist)"
+            # W4: every row now has a probe. An 'unknown' here is an honest
+            # zero-signal state (idle box, no traffic yet), NOT a missing probe.
+            Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities (role=$($cap.role)); $($unk.Count) unknown (zero-signal on this box - see docs/capability-manifest.md for each row's exerciser)"
         }
     }
 } catch { Add-Check 'LIVENESS' 'capability manifest' 'WARN' $_.Exception.Message }
@@ -600,7 +625,11 @@ if ($key) {
 # dpapi_blob}; key provisioned (blob on disk) but not loaded = hard FAIL (flips
 # exit code 1). A dev box with no blob at all stays OK (promotions disabled by design).
 try {
-    $ckHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 6 }
+    # W4: 6 -> 30. The 6s budget was never raised when L2 went to 30 for the W2
+    # sparse-leg canary + mojibake scroll, so on a slow/cold box this row timed out,
+    # FAILed INVARIANTS and flipped the whole run's exit code to 1 while the server
+    # was merely busy. 30 matches L2/L8/L10 and the endpoint's real worst case.
+    $ckHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
     $ck = $ckHd.checks.canonical_key
     if ($null -eq $ck) {
         Add-Check 'INVARIANTS' 'canonical key (server)' 'WARN' '/health/deep has no canonical_key check - pre-v0.20 server deployed? redeploy app.py + restart mem0'
@@ -1410,7 +1439,7 @@ try {
 # sample ids before assuming fresh corruption; the repair script's flag gate
 # (--include-flagged) is the sanctioned way to leave quotes intact.
 try {
-    $mjHd = if ($hd -and $hd.checks) { $hd } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $mjHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
     $mj = $mjHd.checks.mojibake
     if (-not $mj) {
         Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' '/health/deep has no mojibake check — server predates W2 (redeploy mem0-server)'
