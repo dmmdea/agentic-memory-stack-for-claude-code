@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Weekly snapshot of the agentic memory stack. Idempotent - keeps last 8 weeks.
+# Daily snapshot of the agentic memory stack (timer OnCalendar 03:30 daily since 2026-07-14). Idempotent - keeps last 8 snapshots (~an 8-day restore window).
 #
 # v0.14 C hardening:
 #   - Qdrant block moved AFTER local-file backups (Qdrant outage can't kill local backups)

@@ -18,7 +18,7 @@ The runbook for moving an **existing, populated** stack to a new Windows + WSL2 
 ## Phase 0 — on the OLD machine: take the snapshot
 
 ```bash
-# WSL — force a fresh weekly-style backup right now
+# WSL — force a fresh backup snapshot right now (the stack-backup timer also takes one daily at 03:30)
 bash ~/apps/mem0-scripts/stack-backup.sh
 ls -t ~/.mem0/backups | head    # note the newest timestamp (YYYYmmdd-HHMMSS)
 ```
