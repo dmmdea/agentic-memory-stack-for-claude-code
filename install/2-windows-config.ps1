@@ -755,7 +755,13 @@ Write-Host "    Task Scheduler entry registered (next fire: 3:00 AM tomorrow, Wa
 # both fixed: the collection is now env-driven and this task runs it nightly.)
 Write-Host "==> [5b] Registering Task Scheduler entry: ClaudeCode-SemanticDedup-430am"
 Unregister-ScheduledTask -TaskName $dedupTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-$dedupCmd = "/home/$WslUser/apps/mem0-server/.venv/bin/python $RepoRootWsl/scripts/wsl/semantic-dedup.py >> /home/$WslUser/.mem0/dedup-cron.log 2>&1"
+# W6 PR-A (audit silent-jobs finding + W6 roast F3): the action MUST execute
+# the DEPLOYED copy, never $RepoRootWsl — building it from the repo root made
+# a DESTRUCTIVE nightly job run whatever a dev worktree happened to have
+# checked out (checkout-as-deployment, the program's class-4 disease; the
+# live task was verified pointing at an unmanaged worktree). deploy.sh owns
+# refreshing ~/apps/mem0-scripts; this task now rides that single path.
+$dedupCmd = "/home/$WslUser/apps/mem0-server/.venv/bin/python /home/$WslUser/apps/mem0-scripts/semantic-dedup.py >> /home/$WslUser/.mem0/dedup-cron.log 2>&1"
 # Windowless via run-hidden.vbs: a bare wsl.exe action opens a console on the desktop.
 $dedupAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
     -Argument ("//nologo `"$hiddenVbs`" `"$env:SystemRoot\System32\wsl.exe`" -d " + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
