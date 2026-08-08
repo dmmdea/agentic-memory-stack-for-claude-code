@@ -644,8 +644,10 @@ def _reset_daily_counters():
 
 def test_stats_out_counts_brand_scope_hides(tmp_path, monkeypatch):
     """A brandless search over branded records: stats_out reports exactly how
-    many were hidden by the fail-closed gate (and ONLY that family — a tier
-    rejection must not inflate the brand-hide count the shim hints on)."""
+    many were hidden by the fail-closed gate, and a tier rejection lands in
+    its OWN family key — never inflating the brand-hide count the shim hints
+    on. (Pin deliberately updated in W5 T1.4/T2.1: stats_out went per-family,
+    increment-only — the old exact pin was {'rejected_brand_scoped': 2}.)"""
     from pathlib import Path
     from admission_gate import apply_admission
     monkeypatch.setattr(Path, "home", lambda: tmp_path)  # keep audit out of real ~/.mem0
@@ -659,7 +661,56 @@ def test_stats_out_counts_brand_scope_hides(tmp_path, monkeypatch):
     ]
     admitted = apply_admission(results, scope={}, query_class="durable", stats_out=stats)
     assert [r["id"] for r in admitted] == ["m3"]
-    assert stats == {"rejected_brand_scoped": 2}
+    assert stats == {"rejected_brand_scoped": 2, "rejected_tier_disallowed": 1}
+
+
+def test_stats_out_counts_every_family(tmp_path, monkeypatch):
+    """W5 review R6: one forced rejection per family — every mapped key must
+    increment. A typo'd prefix in _STATS_FAMILIES would be a counter that
+    never fires (the W1 vacuous-guard class); this test makes that red."""
+    import datetime as dt
+    from pathlib import Path
+    from admission_gate import apply_admission
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("MEM0_RELEVANCE_FLOOR_OPERATIONAL", "0.5")
+    monkeypatch.setenv("MEM0_BRAND_COHERENCE_THRESHOLD", "0.5")
+    _reset_daily_counters()
+    stats: dict = {}
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=400)).isoformat()
+
+    sup = _result(mid="f-sup")
+    sup["metadata"]["superseded_by"] = "m-newer"
+    con = _result(mid="f-con")
+    con["metadata"]["contradicts_canonical"] = "m-canon"
+    weak_brand = _result(mid="f-coh", brand="ai-ecosystem")
+    weak_brand["score"] = 0.10                      # below coherence floor
+    weak_rel = _result(mid="f-rel")
+    weak_rel["rerank_score"] = 0.10                 # below relevance floor
+
+    # operational scope with a brand: exercises recency + both floors too
+    apply_admission([
+        _result(mid="f-tier", tier="temporal"),          # rejected_tier_disallowed
+        sup,                                             # rejected_superseded
+        con,                                             # rejected_contradicted
+        _result(mid="f-mis", brand="brand-x"),           # rejected_brand_mismatch
+        weak_brand,                                      # rejected_brand_coherence
+        _result(mid="f-old", created_at=old),            # rejected_recency
+        weak_rel,                                        # rejected_relevance_floor
+    ], scope={"brand": "ai-ecosystem"}, query_class="operational", stats_out=stats)
+    # brandless scope: exercises the fail-closed hide
+    apply_admission([_result(mid="f-scope", brand="brand-y")],
+                    scope={}, query_class="durable", stats_out=stats)
+
+    assert stats == {
+        "rejected_tier_disallowed": 1,
+        "rejected_superseded": 1,
+        "rejected_contradicted": 1,
+        "rejected_brand_mismatch": 1,
+        "rejected_brand_coherence": 1,
+        "rejected_recency": 1,
+        "rejected_relevance_floor": 1,
+        "rejected_brand_scoped": 1,
+    }
 
 
 def test_stats_out_absent_keeps_legacy_signature(tmp_path, monkeypatch):

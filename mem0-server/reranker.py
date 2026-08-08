@@ -57,13 +57,20 @@ rerank_stats: dict = {
 _failure_lock = threading.Lock()
 
 
-def should_rerank(results: Sequence[dict]) -> bool:
+def skip_reason(results: Sequence[dict]) -> str | None:
+    """W5 T1.2: pure skip-reason — None (rerank), 'small_n', or 'confident'.
+    The two reasons were collapsed inside should_rerank for a year; the
+    rerank_status stamp needs them apart."""
     if len(results) < RERANK_MIN_N:
-        return False
+        return "small_n"
     top = (results[0] or {}).get("score")
     if isinstance(top, (int, float)) and top >= RERANK_SKIP_IF_TOP_SCORE:
-        return False
-    return True
+        return "confident"
+    return None
+
+
+def should_rerank(results: Sequence[dict]) -> bool:
+    return skip_reason(results) is None
 
 
 def rerank_health() -> dict:
@@ -73,12 +80,25 @@ def rerank_health() -> dict:
         return dict(rerank_stats)
 
 
-def rerank(query: str, results: list[dict], text_key: str = "memory") -> list[dict]:
+def rerank(query: str, results: list[dict], text_key: str = "memory", *,
+           force: bool = False, status_out: dict | None = None) -> list[dict]:
     """Reorder `results` by bge-reranker scores. Idempotent; original list is not mutated.
 
     A skipped rerank (should_rerank False) is NOT an attempt and bumps nothing:
-    the counters must mean 'the transport was exercised', not 'search ran'."""
-    if not should_rerank(results):
+    the counters must mean 'the transport was exercised', not 'search ran'.
+
+    W5 T1.2/T5.3 (out-param, house stats_out pattern — the list-return
+    signature is pinned): ``status_out['status']`` is set to one of
+    ran | skipped_small_n | skipped_confident | failed_fallback_dense.
+    ``force=True`` bypasses BOTH skip heuristics — the union leg passes it
+    when lexical_only candidates are present, because a silent skip would
+    delete every lexical rescue via the fail-closed drop (exactly the
+    confidently-wrong-dense shape AMS-56 exists to fix; a 2-doc CPU rerank
+    is cheap)."""
+    reason = skip_reason(results)
+    if reason is not None and not force:
+        if status_out is not None:
+            status_out["status"] = f"skipped_{reason}"
         return list(results)
     docs = [str(r.get(text_key, "") or "")[:RERANK_DOC_MAX_CHARS] for r in results]
     try:
@@ -108,6 +128,8 @@ def rerank(query: str, results: list[dict], text_key: str = "memory") -> list[di
             rerank_stats["consecutive_rerank_failures"] = 0   # reset on success
             rerank_stats["last_rerank_ok_ts"] = time.time()
             rerank_stats["ok_total"] += 1
+        if status_out is not None:
+            status_out["status"] = "ran"
         return out
     except (httpx.HTTPError, ValueError, KeyError) as e:
         with _failure_lock:
@@ -119,4 +141,6 @@ def rerank(query: str, results: list[dict], text_key: str = "memory") -> list[di
         if local_n == 1 or local_n % 10 == 0:
             log.warning("reranker unavailable (consecutive=%d), returning dense-only order: %s",
                         local_n, e)
+        if status_out is not None:
+            status_out["status"] = "failed_fallback_dense"
         return list(results)
