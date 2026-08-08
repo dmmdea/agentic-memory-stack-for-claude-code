@@ -150,6 +150,16 @@ else
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 
+# AMS-09b (2026-08-07, the leg's second death): the encoder warm below must
+# land in the SAME cache dir the server reads. fastembed defaults to
+# $TMPDIR/fastembed_cache — a reboot wipes it, and the unit runs
+# HF_HUB_OFFLINE=1 so the server can never re-download; one cache-missing
+# init at boot poisoned mem0's lazy sentinel until a manual restart. The unit
+# pins FASTEMBED_CACHE_PATH to a durable dir; warm the same one (parity
+# pinned by tests/test_systemd_parity.py).
+export FASTEMBED_CACHE_PATH="${FASTEMBED_CACHE_PATH:-$HOME/.cache/fastembed}"
+mkdir -p "$FASTEMBED_CACHE_PATH"
+
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
 "$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=48.0.1, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }

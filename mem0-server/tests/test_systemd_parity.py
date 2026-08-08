@@ -40,6 +40,47 @@ def test_mem0_unit_disables_runtime_phone_home():
     assert "Environment=HF_HUB_OFFLINE=1" in service_section
 
 
+def test_mem0_unit_pins_durable_fastembed_cache():
+    """AMS-09b (2026-08-07): the sparse leg died a second time because the
+    fastembed model cache lived in /tmp (reboot-wiped) while HF_HUB_OFFLINE=1
+    forbids the server from re-downloading. The versioned unit must pin the
+    cache to a reboot-surviving dir — dropping this line resurrects the
+    boot-window death."""
+    text = UNIT.read_text(encoding="utf-8")
+    service_section = text.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    assert "Environment=FASTEMBED_CACHE_PATH=%h/.cache/fastembed" in service_section
+
+
+def test_installer_warms_fastembed_cache_into_durable_dir():
+    """The installer's encoder warm must populate the SAME dir the unit reads:
+    the export must exist AND precede the SparseTextEmbedding warm, else the
+    warm lands in /tmp and the server (offline) starts cold after every
+    reboot."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    export_ix = text.find(
+        'export FASTEMBED_CACHE_PATH="${FASTEMBED_CACHE_PATH:-$HOME/.cache/fastembed}"')
+    warm_ix = text.find('SparseTextEmbedding(model_name="Qdrant/bm25")')
+    assert export_ix != -1, "installer no longer exports FASTEMBED_CACHE_PATH"
+    assert warm_ix != -1, "installer no longer warms the BM25 encoder"
+    assert export_ix < warm_ix, "cache-dir export must precede the encoder warm"
+
+
+def test_deploy_seeds_durable_fastembed_cache_before_restart():
+    """AMS-09b (W5 review F2): deploy.sh must seed the durable cache and must
+    do it BEFORE the service restart, so the fresh process loads from the
+    reboot-surviving dir on first encode. Dropping the step re-arms the
+    reboot time-bomb the cache_note check exists to catch."""
+    deploy = (REPO_ROOT / "scripts" / "wsl" / "deploy.sh").read_text(
+        encoding="utf-8")
+    seed_ix = deploy.find(
+        "FASTEMBED_CACHE_PATH=\"$FASTEMBED_CACHE\" \"$APP_DIR/.venv/bin/python\"")
+    restart_ix = deploy.find("systemctl --user restart mem0.service")
+    assert seed_ix != -1, "deploy.sh no longer seeds the fastembed cache"
+    assert restart_ix != -1
+    assert seed_ix < restart_ix, "seed must precede the restart"
+    assert 'SparseTextEmbedding(model_name=' in deploy
+
+
 def test_mem0_unit_execstartpre_ordered_before_execstart():
     """systemd runs ExecStartPre before ExecStart regardless of file order, but
     keep the unit readable: the key fetch appears before the uvicorn line."""
