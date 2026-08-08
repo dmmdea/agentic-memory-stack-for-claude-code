@@ -912,6 +912,11 @@ def query_similar(http: httpx.Client, vector: list, user_id: str,
 def _append_summary(record: dict) -> None:
     record.setdefault("ts", _iso_now())
     record.setdefault("schema_version", "v20")  # v0.20 Phase C: outcome + canonical_total
+    # W6 PR-D (F1): when running under the queue, stamp the run's idempotency
+    # key so jobs.py's observation predicate can attribute THIS run's line.
+    _jk = os.environ.get("JOBS_IDEMPOTENCY_KEY")
+    if _jk:
+        record.setdefault("jobs_key", _jk)
     try:
         SWEEP_LOG.parent.mkdir(parents=True, exist_ok=True)
         with SWEEP_LOG.open("a", encoding="utf-8") as f:

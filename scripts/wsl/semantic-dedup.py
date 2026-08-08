@@ -50,6 +50,13 @@ TIER_THRESHOLDS = {"canonical": 0.97, "stable": 0.95, "evidence": 0.94, "tempora
 # 0.92 threshold deleted 27 atomic facts on the v0.13 inaugural run, some of which may have
 # been such distinctions. Tighter 0.94 trades dedup compression for variation preservation.
 REPORT = Path.home() / ".mem0" / "dedup-report.jsonl"
+# W6 (roast F6): --dry-run writes its would-delete report HERE — the real
+# report is the ONLY holder of deleted_full_payload (the restore record) and
+# a dry-run must never unlink it.
+REPORT_DRY = Path.home() / ".mem0" / "dedup-report.dryrun.jsonl"
+# W6 PR-D (roast F1c): the job's own outcome-coded receipt — per-adopter
+# file, never the shared monthly ledger, never the unlink-rewritten report.
+SUMMARY = Path.home() / ".mem0" / "dedup-summary.jsonl"
 LEDGER_DIR = Path.home() / ".mem0"
 DEDUP_LOCK = Path.home() / ".mem0" / "dedup.lock"
 
@@ -76,6 +83,28 @@ def _append_ledger(rec):
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with ledger.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
+
+def _append_summary(outcome: str, deletions: int = 0, dry_run: bool = False) -> None:
+    """W6 PR-D (roast F1e): a ts-bearing, outcome-coded line on EVERY exit
+    path — preflight-skip, lock-held, mid-run abort, dry-run, success — into
+    the job's OWN receipt file (never the shared monthly ledger; never the
+    unlink-rewritten report). Carries jobs_key from JOBS_IDEMPOTENCY_KEY so
+    the queue's observation predicate can attribute THIS run. Advisory:
+    never crashes the dedup."""
+    try:
+        rec = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "outcome": outcome, "deletions": deletions, "dry_run": dry_run,
+        }
+        key = os.environ.get("JOBS_IDEMPOTENCY_KEY")
+        if key:
+            rec["jobs_key"] = key
+        SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        with SUMMARY.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"semantic-dedup: summary append failed (non-fatal): {e}", flush=True)
+
 
 def _acquire_dedup_lock() -> int | None:
     """Acquire exclusive flock on DEDUP_LOCK. Returns fd or None."""
@@ -126,6 +155,7 @@ def main():
     lock_fd = _acquire_dedup_lock()
     if lock_fd is None:
         print("semantic-dedup: another instance holds the lock; aborting", flush=True)
+        _append_summary("no-op:lock-held", dry_run=dry_run)
         return 0
     try:
         return _run(dry_run)
@@ -142,14 +172,18 @@ def _run(dry_run=False):
     except (httpx.HTTPError, httpx.ConnectError, OSError) as e:
         _append_ledger({"event": "dedup-scan-skip", "actor": "semantic-dedup", "reason": f"backend unreachable: {type(e).__name__}: {str(e)[:120]}"})
         print(f"semantic-dedup: SKIP - backend unreachable ({e})", flush=True)
+        _append_summary(f"no-op:backend-unreachable:{type(e).__name__}", dry_run=dry_run)
         return 0
     try:
         pts = scroll_all_with_vectors()
         print(f"loaded {len(pts)} points")
-        REPORT.parent.mkdir(parents=True, exist_ok=True)
-        REPORT.unlink(missing_ok=True)
+        # F6: dry runs write (and unlink) ONLY their own report file — the
+        # real report is the restore record and only a real run replaces it.
+        report_path = REPORT_DRY if dry_run else REPORT
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.unlink(missing_ok=True)
         keep = {str(p["id"]): True for p in pts}
-        with httpx.Client(headers=H, timeout=15.0) as c, REPORT.open("a", encoding="utf-8") as report:
+        with httpx.Client(headers=H, timeout=15.0) as c, report_path.open("a", encoding="utf-8") as report:
             for i, a in enumerate(pts):
                 if not keep.get(str(a["id"])): continue
                 pa = a.get("payload") or {}
@@ -203,9 +237,12 @@ def _run(dry_run=False):
     except (httpx.HTTPError, OSError) as e:
         _append_ledger({"event": "dedup-scan-abort", "actor": "semantic-dedup", "reason": f"mid-run failure: {type(e).__name__}: {str(e)[:120]}", "partial_deletions": deletions})
         print(f"semantic-dedup: ABORT mid-run after deletions={deletions} ({e})", flush=True)
+        _append_summary(f"degraded:aborted:{type(e).__name__}", deletions=deletions, dry_run=dry_run)
         return 1
     label = "DRY-RUN would_delete" if dry_run else "deletions"
-    print(f"semantic-dedup: {label}={deletions}, tier_thresholds={TIER_THRESHOLDS}, report={REPORT}")
+    print(f"semantic-dedup: {label}={deletions}, tier_thresholds={TIER_THRESHOLDS}, report={report_path}")
+    _append_summary("ok", deletions=deletions, dry_run=dry_run)
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
