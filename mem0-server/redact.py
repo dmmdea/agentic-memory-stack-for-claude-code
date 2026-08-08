@@ -74,13 +74,33 @@ _SECRET_PATTERNS = tuple(
          r"(?:[\"'](?:\\.|[^\\\r\n]){4,200}[\"']|[\"'](?:\\.|[^\"'\\\r\n]){4,200}"
          r"|(?=[^\s\"'\r\n]{4})(?:[^\s\"'\r\n]{16,200}|[^\s\"'\r\n]{0,200}[0-9][^\s\"'\r\n]{0,200}))",
          r"\1[REDACTED]"),
+        # W5 T6.2: JSON-quoted-key assignment (`{"api_key": "..."}`) — the
+        # closing quote between keyword and colon made every JSON credential
+        # invisible to the rule above. A SEPARATE rule, deliberately narrower:
+        # the value must carry a DIGIT, because quoted-key/quoted-value is
+        # also the shape of prose JSON ('"secret": "sauce of the design"' is
+        # a pinned must-keep) — the >=16-chars-alone arm of the bare rule
+        # would eat it. A digit-less JSON password is missed BY DESIGN and
+        # the fixture pins both sides.
+        (r"(?i)([\"'][A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[\"']"
+         r"[ \t]*:[ \t]*[\"'])([^\"'\r\n]{0,200}[0-9][^\"'\r\n]{0,200})([\"'])",
+         r"\1[REDACTED]\3"),
         # A labelled value line: `Value: <32+ alnum>` / `- Key: `<hex>``. This is the corpus shape
         # where the key NAME is on one line and the credential on the next; a >= 32-char unbroken
         # alphanumeric run is the entropy floor that keeps paths and dated slugs out.
+        # W5 T6.2: the second alternative admits DASH-SEPARATED HEX (UUID-shaped
+        # secrets) — hex chars only, so kebab-case slugs under a `value:` label
+        # stay untouched, and benign labels (`zone id:`, `Correlation-Id:`) are
+        # outside the keyword set entirely (the no-bare-hex rationale bounds
+        # this: label-gated, hex-only, >=32 chars incl. dashes).
         (r"(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)"
-         r"[ \t]*[:=][ \t]*)[\"'\x60]?[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*", r"\1[REDACTED]"),
+         r"[ \t]*[:=][ \t]*)[\"'\x60]?(?:[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*|[0-9a-f][0-9a-f-]{31,})",
+         r"\1[REDACTED]"),
         # Provider families.
-        (r"(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36})", "[REDACTED_GITHUB_TOKEN]"),
+        # W5 T6.2: `{36,}` — the exactly-{36} quantifier left the tail of
+        # longer-than-36 tokens in cleartext (verified: a 40-char token leaked
+        # its last 4 chars).
+        (r"(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,})", "[REDACTED_GITHUB_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})", "[REDACTED_GITHUB_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,})", "[REDACTED_SLACK_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})", "[REDACTED_NVIDIA_KEY]"),
@@ -105,3 +125,27 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def count_redactions(text: Optional[str]) -> dict:
+    """W5 T6.1 (count-only entrance telemetry): how many redactions WOULD
+    apply to `text`, per runtime-derived rule key — the marker name for
+    family-named rules ('REDACTED_GITHUB_TOKEN'), else 'pattern_<index>' for
+    the generic '[REDACTED]' rules (review R8: no structural change to the
+    byte-pinned tuples). NEVER mutates or stores anything; the store's
+    entrance policy is the operator's fork, this only measures it."""
+    counts: dict = {}
+    if not text:
+        return counts
+    # Review fix 8: SEQUENTIAL subn on a working copy — running every pattern
+    # against the ORIGINAL text double-counted one credential matched by two
+    # rules; redact_secrets applies rules sequentially, so the honest
+    # would-apply count must too. The input is never mutated (subn copies).
+    work = text
+    for i, (pattern, replacement) in enumerate(_SECRET_PATTERNS):
+        work, n = pattern.subn(replacement, work)
+        if n:
+            m = re.search(r"REDACTED_[A-Z_]+", str(replacement))
+            key = m.group(0) if m else f"pattern_{i}"
+            counts[key] = counts.get(key, 0) + n
+    return counts

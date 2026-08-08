@@ -57,3 +57,7 @@ The generic assertions always run. To also guard YOUR names (machines, brands,
 people), create `scripts/windows/tests/pii-patterns.local.txt` (gitignored;
 one regex per line, `#` comments allowed) — start from the shipped
 `pii-patterns.local.txt.example`.
+
+## W5 additions
+
+Live-only suites (never in the headless CI allowlist): `test_w5_explain_union_diagnose.py` (explain zero-mutation on a stable projection + launch-path-env direct-import variant; union-leg rescue/path-gating/fail-closed/leak checks; diagnose purity) and `test_retrieval_families.py` (the deploy gate — see DEVELOPMENT.md). The families suite is executed BY `deploy.sh` post-restart; running it by hand uses the same repo-dir + app-venv form as the full gate.

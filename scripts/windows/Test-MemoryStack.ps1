@@ -1072,8 +1072,16 @@ try {
         # when it is the most recent apply-type action; the normal-sweep freshness/outcome logic
         # reads only NORMAL lines (mode absent) so the rejudge line can't be misparsed.
         $rejudge = @($csRuns | Where-Object { $_.PSObject.Properties['mode'] -and $_.mode -eq 'rejudge-stamped' }) | Select-Object -Last 1
-        $normalRuns = @($csRuns | Where-Object { -not ($_.PSObject.Properties['mode'] -and $_.mode -eq 'rejudge-stamped') })
-        $last = if ($normalRuns.Count) { $normalRuns[-1] } else { $csRuns[-1] }
+        # W5 T3.5: exclude ALL mode-tagged lines from the normal-sweep parse —
+        # the old rejudge-only exclusion let evidence-sweep lines leak into
+        # freshness/outcome logic (pre-existing bug), and the new
+        # retrieval-pairs mode would have leaked the same way.
+        $normalRuns = @($csRuns | Where-Object { -not $_.PSObject.Properties['mode'] })
+        # Review fix 7: on a log holding ONLY mode-tagged lines the old
+        # fallback adopted a mode line as the 'normal' run — the same leak
+        # class, residual. $last is now $null in that state, which the
+        # existing no-normal-sweep-yet branch below reports honestly.
+        $last = if ($normalRuns.Count) { $normalRuns[-1] } else { $null }
         $lastApply = @($normalRuns | Where-Object { $_.dry_run -eq $false }) | Select-Object -Last 1
         $rejudgeNewer = $rejudge -and (($null -eq $lastApply) -or ([datetime]$rejudge.ts -ge [datetime]$lastApply.ts))
         if ($rejudgeNewer) {
@@ -1096,7 +1104,7 @@ try {
             }
         }
         elseif ($null -eq $last) {
-            Add-Check 'RECOVERY' 'contradiction sweep' 'OK' 'only rejudge-stamped runs logged (no normal sweep yet)'
+            Add-Check 'RECOVERY' 'contradiction sweep' 'OK' 'only mode-tagged runs logged (rejudge/evidence/retrieval-pairs); no NORMAL discovery sweep yet'
         }
         else {
             $age = (Get-Date) - [datetime]$last.ts

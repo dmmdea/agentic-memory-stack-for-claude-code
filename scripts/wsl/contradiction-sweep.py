@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -99,6 +100,14 @@ try:
     import codex_shim_client as _codex
 except Exception:  # noqa: BLE001
     _codex = None
+# W5 ADOPT-4: per-pair verdict cache (mem0-server/pair_cache.py via the same
+# sys.path bridge). Its own guard — the codex guard above must not hide a
+# cache import failure and vice versa. A missing cache is a silent no-cache
+# run, never an error (R2 fail-soft).
+try:
+    import pair_cache as _pair_cache
+except Exception:  # noqa: BLE001
+    _pair_cache = None
 
 
 def _install_is_provisioned() -> bool:
@@ -389,12 +398,74 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
     return verdict, detail
 
 
-def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_text: str,
-                   candidate_text: str, timeout_s: float) -> tuple[Optional[bool], str]:
-    """Route to the Codex bridge (default; model-routing rule) or the local llama-swap judge."""
+# W5 ADOPT-4: prompt-version constants — the cache key must change whenever a
+# judge PROMPT changes, or stale verdicts survive a prompt edit. The codex
+# prompts live in codex_shim_client.py and carry their own constants; these
+# cover the local prompts in THIS file. Bump on any prompt edit.
+LOCAL_CONTRADICTION_PROMPT_VERSION = "v1"
+LOCAL_SUPERSESSION_PROMPT_VERSION = "v1"
+
+
+def _prompt_version(question: str, judge_mode: str) -> str:
     if judge_mode == "codex":
-        return judge_pair_codex(canonical_text, candidate_text)
-    return judge_pair(http, model, canonical_text, candidate_text, timeout_s)
+        attr = ("NLI_PROMPT_VERSION" if question == "contradiction"
+                else "SUPERSESSION_PROMPT_VERSION")
+        return getattr(_codex, attr, "codex-unknown") if _codex else "codex-unknown"
+    return (LOCAL_CONTRADICTION_PROMPT_VERSION if question == "contradiction"
+            else LOCAL_SUPERSESSION_PROMPT_VERSION)
+
+
+def _judge_model_id(judge_mode: str, model: str) -> str:
+    """Review fix 2 (R2): the cache key's model dimension must name the
+    JUDGING model. On the codex path that is the shim's CLI identity (model +
+    effort — args.model is the LOCAL llama-swap name and is irrelevant there);
+    on the local path it is args.model."""
+    if judge_mode == "codex":
+        return getattr(_codex, "CODEX_JUDGE_IDENTITY", "codex-unknown") if _codex else "codex-unknown"
+    return str(model)
+
+
+def _cache_hit_detail(created_ts) -> str:
+    """Review fix 4: an applied stamp's justification must say WHEN the
+    cached verdict was actually judged."""
+    try:
+        iso = dt.datetime.fromtimestamp(float(created_ts), dt.timezone.utc
+                                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return f"cache-hit (verdict judged {iso})"
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "cache-hit"
+
+
+def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_text: str,
+                   candidate_text: str, timeout_s: float,
+                   use_cache: bool = True,
+                   cache_stats: Optional[dict] = None) -> tuple[Optional[bool], str]:
+    """Route to the Codex bridge (default; model-routing rule) or the local llama-swap judge.
+
+    W5 ADOPT-4: consults the per-pair verdict cache first (unordered key —
+    contradiction is symmetric) and writes through boolean verdicts. The
+    --rejudge-stamped self-heal path passes use_cache=False (pinned): the
+    cache accelerates DISCOVERY, never re-judgment."""
+    key = None
+    if use_cache and _pair_cache is not None:
+        key = _pair_cache.make_key("contradiction", judge_mode,
+                                   _judge_model_id(judge_mode, model),
+                                   _prompt_version("contradiction", judge_mode),
+                                   str(canonical_text), str(candidate_text))
+        hit = _pair_cache.get_with_ts(key)
+        if hit is not None:
+            if cache_stats is not None:
+                cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
+            return hit[0], _cache_hit_detail(hit[1])
+    if judge_mode == "codex":
+        verdict, detail = judge_pair_codex(canonical_text, candidate_text)
+    else:
+        verdict, detail = judge_pair(http, model, canonical_text, candidate_text, timeout_s)
+    if key is not None and isinstance(verdict, bool):
+        _pair_cache.put(key, verdict, "contradiction", judge_mode)
+        if cache_stats is not None:
+            cache_stats["cache_misses"] = cache_stats.get("cache_misses", 0) + 1
+    return verdict, detail
 
 
 # --- supersession judge (evidence-sweep precision, 2026-06-30) ----------------
@@ -497,11 +568,33 @@ def judge_supersession_codex(older_text: str, newer_text: str,
 
 
 def judge_supersession_dispatch(judge_mode: str, http: httpx.Client, model: str, older_text: str,
-                                newer_text: str, timeout_s: float) -> tuple[Optional[bool], str]:
-    """Route the supersession (HIDE) judgment to Codex (default) or the local llama-swap judge."""
+                                newer_text: str, timeout_s: float,
+                                use_cache: bool = True,
+                                cache_stats: Optional[dict] = None) -> tuple[Optional[bool], str]:
+    """Route the supersession (HIDE) judgment to Codex (default) or the local llama-swap judge.
+
+    W5 ADOPT-4: cached with an ORDERED key — 'does newer supersede older' is
+    direction-dependent, so a swapped pair must never hit."""
+    key = None
+    if use_cache and _pair_cache is not None:
+        key = _pair_cache.make_key("supersession", judge_mode,
+                                   _judge_model_id(judge_mode, model),
+                                   _prompt_version("supersession", judge_mode),
+                                   str(older_text), str(newer_text))
+        hit = _pair_cache.get_with_ts(key)
+        if hit is not None:
+            if cache_stats is not None:
+                cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
+            return hit[0], _cache_hit_detail(hit[1])
     if judge_mode == "codex":
-        return judge_supersession_codex(older_text, newer_text)
-    return judge_supersession_local(http, model, older_text, newer_text, timeout_s)
+        verdict, detail = judge_supersession_codex(older_text, newer_text)
+    else:
+        verdict, detail = judge_supersession_local(http, model, older_text, newer_text, timeout_s)
+    if key is not None and isinstance(verdict, bool):
+        _pair_cache.put(key, verdict, "supersession", judge_mode)
+        if cache_stats is not None:
+            cache_stats["cache_misses"] = cache_stats.get("cache_misses", 0) + 1
+    return verdict, detail
 
 
 def stamp_candidate(http: httpx.Client, candidate_id: str, checked_at: str,
@@ -960,8 +1053,12 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                 skipped += 1
                 print(f"  SKIP {cid}: canonical {canonical_id} present but empty text — NOT clearing", flush=True)
                 continue
+            # W5 ADOPT-4: use_cache=False is BINDING — rejudge-stamped is the
+            # self-heal path; a cached verdict here would extend a false-
+            # positive hide window by up to the cache TTL (M9 pin).
             verdict, detail = judge_dispatch(args.judge, llm_http, args.model, str(can_text),
-                                             str(cand_text), CODEX_JUDGE_TIMEOUT_S)
+                                             str(cand_text), CODEX_JUDGE_TIMEOUT_S,
+                                             use_cache=False)
             checked += 1
             # SAFE policy (2026-06-30): by default a YES on an advisory-pending record is QUEUED
             # for human review, NEVER auto-hidden — a live Codex rejudge over-promoted 3/4
@@ -1075,6 +1172,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
+    ev_cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     consec_fail = 0  # fail fast if the judge dies mid-run (mirrors the canonical sweep)
     aborted = None
     queued_ids: list[dict] = []
@@ -1118,7 +1216,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                 # NEWER (anchor)? NOT "does B contradict A?" — that over-flags valid historical
                 # ship-logs that logically-supersede but must be kept (2026-06-30 precision fix).
                 verdict, detail = judge_supersession_dispatch(args.judge, llm_http, args.model,
-                                                              str(nb_text), str(a_text), CODEX_JUDGE_TIMEOUT_S)
+                                                              str(nb_text), str(a_text), CODEX_JUDGE_TIMEOUT_S,
+                                                              cache_stats=ev_cache_stats)
                 pairs += 1
                 if verdict is None:
                     skipped += 1
@@ -1152,9 +1251,213 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     outcome = f"degraded:aborted:{aborted}" if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
                      "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
-                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome})
+                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome,
+                     "cache_hits": int(ev_cache_stats.get("cache_hits", 0)),
+                     "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
           f"queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
+    return exit_code_for(outcome)
+
+
+PAIRS_LOCK = Path.home() / ".mem0" / ".retrieval-pairs.lock"
+PAIRS_RECEIPT = Path.home() / ".mem0" / "retrieval-pairs-yield.json"
+RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
+
+
+def _read_retrieval_rows(days: int) -> tuple[list[dict], dict]:
+    """Rows from the retrieval log + rotations, newest window only.
+    Returns (rows, counts) where counts records exclusions — review F7: a
+    mixed-era read must stay honest (rows without the W5 route field are
+    EXCLUDED and counted, never silently treated as search traffic)."""
+    counts = {"scanned": 0, "unparsable": 0, "excluded_legacy_rows": 0,
+              "excluded_other_route": 0, "too_old": 0}
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    rows: list[dict] = []
+    files = [RETRIEVAL_LOG.with_suffix(f".jsonl.{i}") for i in range(5, 0, -1)]
+    files.append(RETRIEVAL_LOG)
+    for f in files:
+        if not f.exists():
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            counts["scanned"] += 1
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                counts["unparsable"] += 1
+                continue
+            route = rec.get("route")
+            if route is None:
+                counts["excluded_legacy_rows"] += 1
+                continue
+            if route != "search":
+                counts["excluded_other_route"] += 1
+                continue
+            try:
+                ts = dt.datetime.fromisoformat(str(rec.get("ts")).replace("Z", "+00:00"))
+                if ts < cutoff:
+                    counts["too_old"] += 1
+                    continue
+            except (ValueError, TypeError):
+                pass  # undated rows stay in (they are new-era rows)
+            rows.append(rec)
+    return rows, counts
+
+
+def run_retrieval_pairs(args) -> int:
+    """W5 ADOPT-4: retrieval-space pair-yield DRY-RUN — counts, NEVER judges
+    and NEVER stamps (the judged mode is a future operator fork gated on this
+    receipt's yield over a real 30-day widened+route-stamped window).
+
+    Samples pairs from CO-RETRIEVAL (what actually lands together in one
+    result set) rather than storage-space cosine neighborhoods, dedupes by
+    unordered pair, ranks by distinct-query co-occurrence, applies the
+    sweep's eligibility rules, splits out canonical-member pairs (the storage
+    sweep never allowed hiding canonicals — they are counted, not actionable),
+    and measures NOVELTY against the storage sweep's reachable set
+    (canonical x its cosine neighborhood)."""
+    # Review fix 5: use the stale-reclaiming lock (a SIGKILLed run must not
+    # block the mode forever) and leave a summary line on lock-held exits.
+    if not _acquire_lock(PAIRS_LOCK):
+        print("contradiction-sweep: --retrieval-pairs already running (lock held) — exiting", flush=True)
+        _append_summary({"mode": "retrieval-pairs", "dry_run": True,
+                         "outcome": "no-op:lock-held"})
+        return 0
+    qdrant_http = httpx.Client()
+    outcome = "ok"
+    try:
+        rows, counts = _read_retrieval_rows(args.pairs_days)
+        pair_queries: dict[tuple, set] = {}
+        for rec in rows:
+            ids = [str(i) for i in (rec.get("returned_top_ids") or []) if i]
+            qh = rec.get("query_hash") or "?"
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    key = tuple(sorted((ids[i], ids[j])))
+                    pair_queries.setdefault(key, set()).add(qh)
+        ranked = sorted(pair_queries.items(), key=lambda kv: -len(kv[1]))
+        ranked = ranked[: args.pairs_max_pairs]
+
+        # Bulk payload fetch for eligibility checks.
+        involved = sorted({m for pair, _ in ranked for m in pair})
+        payloads: dict[str, dict] = {}
+        for chunk_start in range(0, len(involved), 128):
+            chunk = involved[chunk_start:chunk_start + 128]
+            r = qdrant_http.post(f"{QDRANT}/collections/{COLLECTION}/points",
+                                 json={"ids": chunk, "with_payload": True},
+                                 timeout=30.0)
+            r.raise_for_status()
+            for pt in r.json().get("result") or []:
+                payloads[str(pt.get("id"))] = pt.get("payload") or {}
+
+        eligible = []
+        canonical_member = 0
+        ineligible = 0
+        for pair, qhs in ranked:
+            a, b = payloads.get(pair[0]), payloads.get(pair[1])
+            if not a or not b:
+                ineligible += 1
+                continue
+            ta = a.get("data") or a.get("memory")
+            tb = b.get("data") or b.get("memory")
+            if not ta or not tb:
+                ineligible += 1
+                continue
+            if not same_brand_scope(a.get("brand"), b.get("brand")):
+                ineligible += 1
+                continue
+            if any(p.get("retired_at") or p.get("retrievable") is False
+                   or p.get("superseded_by") for p in (a, b)):
+                ineligible += 1
+                continue
+            if a.get("tier") == "canonical" or b.get("tier") == "canonical":
+                canonical_member += 1
+                continue
+            eligible.append({"ids": list(pair), "co_occurrence": len(qhs)})
+
+        # Novelty vs what the STORAGE sweeps can actually reach — the
+        # receipt's headline number. Review fix 1 (MAJOR): the canonical
+        # neighborhood alone is VACUOUS here — every canonical-reachable pair
+        # has a canonical member and the eligibility loop above discards
+        # exactly those, so eligible∩canonical-reach is empty a priori and
+        # 'novel' would always equal 'eligible'. The honest baseline is the
+        # UNION of both sweeps' reach: canonical×neighbors (kept, it bounds
+        # the canonical_member split) PLUS the EVIDENCE sweep's reach
+        # (recent non-canonical anchors × cosine neighbors at the sim floor —
+        # mirrors run_evidence_sweep's exact selection).
+        reachable: set = set()
+        try:
+            for can in scroll_canonicals(qdrant_http, user_id=args.user_id):
+                can_id = str(can.get("id"))
+                vec = dense_vector(can)
+                can_user = (can.get("payload") or {}).get("user_id")
+                if vec is None or not can_user:
+                    continue
+                for nb in query_similar(qdrant_http, vec, can_user, can_id,
+                                        fetch_n=args.top_k * 3):
+                    reachable.add(tuple(sorted((can_id, str(nb.get("id"))))))
+            allnc = scroll_noncanonical(qdrant_http, user_id=args.user_id)
+            allnc.sort(key=lambda p: (parse_created(p)
+                                      or dt.datetime.min.replace(tzinfo=dt.timezone.utc)),
+                       reverse=True)
+            anchor_pts = fetch_with_vectors(
+                qdrant_http, [p.get("id") for p in allnc[: args.max_anchors]])
+            for anchor in anchor_pts:
+                a_id = str(anchor.get("id"))
+                a_user = (anchor.get("payload") or {}).get("user_id")
+                vec = dense_vector(anchor)
+                if vec is None or not a_user:
+                    continue
+                for nb in query_similar(qdrant_http, vec, a_user, a_id,
+                                        fetch_n=max(args.top_k * 2, args.top_k)):
+                    if float(nb.get("score", 0.0) or 0.0) < args.evidence_sim_floor:
+                        continue
+                    reachable.add(tuple(sorted((a_id, str(nb.get("id"))))))
+        except (httpx.HTTPError, OSError) as e:
+            print(f"contradiction-sweep: novelty baseline failed (reported as null): {e}", flush=True)
+            reachable = None
+        novel = (sum(1 for p in eligible if tuple(sorted(p["ids"])) not in reachable)
+                 if reachable is not None else None)
+
+        if not rows:
+            outcome = "no-op:no-route-stamped-rows"
+        receipt = {
+            "generated_at": _iso_now(),
+            "window_days": args.pairs_days,
+            "log_counts": counts,
+            "rows_in_window": len(rows),
+            "pairs_distinct": len(pair_queries),
+            "pairs_ranked": len(ranked),
+            "pairs_eligible": len(eligible),
+            "pairs_canonical_member": canonical_member,
+            "pairs_ineligible": ineligible,
+            "pairs_novel_vs_storage_sweep": novel,
+            "novelty_baseline": "canonical-neighborhood UNION evidence-sweep reach",
+            "ids_source": ("returned_top_ids (top-3 per row until the [:10] "
+                           "widening deploys — co-occurrence is a lower bound)"),
+            "top_pairs": eligible[:20],
+            "note": ("count-only dry run — the judged retrieval-pairs mode is an "
+                     "operator fork gated on material yield over a full widened "
+                     "window (W5 review F7)"),
+        }
+        tmp = PAIRS_RECEIPT.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(receipt, indent=1), encoding="utf-8")
+        os.replace(tmp, PAIRS_RECEIPT)
+        print(f"contradiction-sweep: retrieval-pairs dry-run done. rows={len(rows)} "
+              f"pairs={len(pair_queries)} eligible={len(eligible)} "
+              f"canonical-member={canonical_member} novel={novel} "
+              f"legacy-excluded={counts['excluded_legacy_rows']} -> {PAIRS_RECEIPT}",
+              flush=True)
+    except Exception as e:  # noqa: BLE001 — a shape bug must still leave a summary line
+        outcome = f"degraded:aborted:{type(e).__name__}: {str(e)[:120]}"
+        print(f"contradiction-sweep: retrieval-pairs ABORT: {e}", flush=True)
+    finally:
+        qdrant_http.close()
+        try:
+            PAIRS_LOCK.rmdir()
+        except OSError:
+            pass
+    _append_summary({"mode": "retrieval-pairs", "dry_run": True,
+                     "outcome": outcome})
     return exit_code_for(outcome)
 
 
@@ -1212,8 +1515,25 @@ def main() -> int:
     parser.add_argument("--evidence-sim-floor", type=float, default=0.45,
                         help="evidence-sweep: only judge an older neighbor whose cosine similarity to "
                              "the anchor is >= this (default 0.45) — bounds judging to near-duplicates")
+    parser.add_argument("--retrieval-pairs", action="store_true",
+                        help="W5 ADOPT-4 DRY-RUN ONLY: count co-retrieval pairs from the retrieval "
+                             "log (route='search' rows), rank by co-occurrence, apply eligibility, "
+                             "and measure novelty vs the storage sweep's reachable set. Judges "
+                             "NOTHING and stamps NOTHING; writes ~/.mem0/retrieval-pairs-yield.json. "
+                             "The judged mode is an operator fork gated on this receipt's yield.")
+    parser.add_argument("--pairs-days", type=int, default=30,
+                        help="retrieval-pairs: log window in days (default 30)")
+    parser.add_argument("--pairs-max-pairs", type=int, default=200,
+                        help="retrieval-pairs: cap on ranked pairs fetched for eligibility (default 200)")
     args = parser.parse_args()
     dry_run = not args.apply
+
+    if args.retrieval_pairs:
+        if args.apply:
+            print("contradiction-sweep: --retrieval-pairs is count-only this wave; "
+                  "--apply is refused (the judged mode is an operator fork).", flush=True)
+            return 2
+        return run_retrieval_pairs(args)
 
     # v0.27.3: when judging with Codex, the Windows shim must be reachable. Preflight it; if it is
     # NOT, record a NO-OP (exit 0 — NOT a hard failure, so the weekly timer is not noisy) and never
@@ -1349,6 +1669,7 @@ def main() -> int:
                                       "Content-Type": "application/json"})
 
     pairs_checked = yes_count = no_count = skipped_pairs = stamped_count = 0
+    cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     cleared_count = 0
     stamped_ids: list[dict] = []   # YES stamps applied this run (visibility fix-pass)
     cleared_ids: list[dict] = []   # stale YES stamps cleared on re-judge NO
@@ -1404,7 +1725,8 @@ def main() -> int:
                 cand_text = cand_payload.get("data") or cand_payload.get("memory")
                 timeout = COLD_LOAD_TIMEOUT_S if first_llm_call else PAIR_TIMEOUT_S
                 verdict, detail = judge_dispatch(args.judge, llm_http, args.model, str(can_text),
-                                                 str(cand_text), timeout)
+                                                 str(cand_text), timeout,
+                                                 cache_stats=cache_stats)
                 # v0.20 M7: keep the cold-load budget until the judge ANSWERS
                 # once — a timed-out cold load no longer demotes the whole run
                 # to 30s pair timeouts while the model is still loading.
@@ -1498,6 +1820,10 @@ def main() -> int:
         "cleared_ids": cleared_ids,
         "judge": args.judge,                  # v0.29.4: local YES = advisory PENDING (not hidden); codex = enforced
         "outcome": outcome,                   # v0.20 M7: ok | degraded:* | no-op:*
+        # W5 ADOPT-4: cache receipt — a rejudge-free double run must show
+        # cache_hits>0 on the second pass (the wave acceptance).
+        "cache_hits": int(cache_stats.get("cache_hits", 0)),
+        "cache_misses": int(cache_stats.get("cache_misses", 0)),
     }
     if aborted:
         summary["aborted"] = aborted

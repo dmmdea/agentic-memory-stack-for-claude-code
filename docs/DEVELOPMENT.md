@@ -60,12 +60,13 @@ It rsyncs server modules + maintenance scripts + sentinel-resolved systemd units
 |---|---|---|
 | `eval/faithfulness/` | does injected memory actually change behavior (causal-intervention, CMI loop) | Codex-judged (spend) |
 | `eval/injection-gating/` | relevance-gate calibration + paraphrase robustness | free |
-| `eval/findability/` | multi-hop + temporal retrieval guard (consumer-exact, deterministic) | free |
+| `eval/findability/` | multi-hop + temporal retrieval guard (consumer-exact, deterministic; floors + exit 2 since W5) | free |
 | `eval/promotion-gate/` | 4C gate calibration | Codex-judged |
+| `eval/replay/` | real-query export/replay/compare (Jaccard@10 + top-1 stability; replay-vs-replay primary; needs the MEM0_LOG_FULL_QUERY operator opt-in for data) | free |
 
 (Plus three narrower harnesses: `extractor-specificity/`, `intensification/`, `retrieval-drift/`.)
 
-The free ones are regression guards — re-run them on any retrieval-path change; they exist precisely because "retrieval feels fine" has been wrong before.
+The free ones are regression guards — re-run them on any retrieval-path change; they exist precisely because "retrieval feels fine" has been wrong before. **Since W5 the honor system has a floor:** `deploy.sh` runs the PUBLIC retrieval-families suite (`mem0-server/tests/test_retrieval_families.py` — paraphrase, dilution, temporal supersession, cross-brand hard-negative with positive control, ES exact-token, keyword-only-tail union rescue) post-restart and ABORTS with a rollback hint on a family breach (`MEM0_SKIP_RETRIEVAL_GATE=1` is the recorded escape hatch). On any reranker/embedder/mem0 bump, additionally run `eval/replay/` export-before/replay-after.
 
 ## Conventions (the process that ships releases)
 

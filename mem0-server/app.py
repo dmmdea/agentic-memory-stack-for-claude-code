@@ -29,6 +29,7 @@ from admission_gate import default_policy_for_class
 # MEM-8 (2026-07-03): daily rejection counters for /health/deep observability.
 from admission_gate import admission_rejections_today as _admission_rejections_today
 from redact import redact_secrets  # server-side secret scrub for stored prompt_text
+from redact import count_redactions  # W5 T6.1: count-only entrance telemetry
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
 import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps injected below)
@@ -483,6 +484,45 @@ def _put_carryover_bump(puts=0, restored=0, lost=0):
     _put_carryover_today["keys_restored"] += restored
     _put_carryover_today["keys_lost"] += lost
 
+# W5 T6.1 (count-only entrance-redaction telemetry — the operator fork's
+# evidence base). The store DELIBERATELY holds live plaintext credentials; the
+# add() entrance therefore counts what the rule set WOULD redact and mutates
+# NOTHING. /health/deep exposes the OPAQUE daily total only (review F6: a
+# per-rule breakdown on an unauthenticated 0.0.0.0 endpoint is per-credential-
+# type targeting telemetry); the per-rule split lives in the local 0600 JSONL
+# (~/.mem0/redaction-counter.jsonl, count>0 events only, 10MB-rotated — R11).
+_redactions_today = {"date": None, "total": 0}
+
+def _redactions_bump(n=0):
+    today = _dt.date.today().isoformat()
+    if _redactions_today["date"] != today:
+        _redactions_today.update({"date": today, "total": 0})
+    _redactions_today["total"] += n
+
+def _record_would_redact(counts: dict) -> None:
+    """Daily counter + local per-rule JSONL. Never raises into add()."""
+    try:
+        _redactions_bump(sum(counts.values()))
+        if not counts:
+            return
+        log_path = Path.home() / ".mem0" / "redaction-counter.jsonl"
+        if log_path.exists() and log_path.stat().st_size > 10 * 1024 * 1024:
+            for i in range(5, 0, -1):
+                src = log_path.with_suffix(f".jsonl.{i - 1}") if i > 1 else log_path
+                dst = log_path.with_suffix(f".jsonl.{i}")
+                if i == 5:
+                    dst.unlink(missing_ok=True)
+                if src.exists():
+                    src.rename(dst)
+        with _secure_open(log_path) as f:
+            f.write(json.dumps({
+                "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "total": sum(counts.values()),
+                "rules": counts,
+            }) + "\n")
+    except Exception:
+        log.warning("redaction counter failed (non-fatal)", exc_info=True)
+
 # v0.29 R4 — raw-trace fallback (opt-in, default OFF). When the condensed
 # (semantic) memory search admits nothing in context_bundle, optionally surface
 # ONE compact snippet from the most SEMANTICALLY-relevant past EPISODE (NEMORI
@@ -910,6 +950,9 @@ def health_deep() -> dict:
     # AMS-01 (2026-08-07): carry-over counters — informational invocation proof.
     _put_carryover_bump()  # roll the date on idle days so 'date' stays current
     out["checks"]["put_carryover_today"] = dict(_put_carryover_today)
+    # W5 T6.1: OPAQUE total only (F6) — the per-rule split never leaves the box.
+    _redactions_bump()
+    out["checks"]["redactions_would_apply_today"] = dict(_redactions_today)
     # W3 (2026-08-07): the alarm mouths — nightly-job receipt ages, the
     # retrieval-drift guard's state file, and the capability manifest folded
     # over everything above. ALL informational: the gating checks already
@@ -952,6 +995,10 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
     # Storage cap enforcement (audit finding 2026-06-08: 341/384 backfilled points
     # exceeded the previously-documented 600-char cap which was never enforced).
     text_for_check = _coerce_to_text(b.messages)
+    # W5 T6.1: count-only entrance telemetry, BEFORE any gate can raise
+    # (attempt semantics — 'what arrives at the door', the operator fork's
+    # denominator). ZERO mutation of the stored text, ever.
+    _record_would_redact(count_redactions(text_for_check))
     if len(text_for_check) > MAX_MEMORY_CHARS:
         raise HTTPException(
             413,
@@ -1474,7 +1521,11 @@ def _search_core(b: SearchIn, _route: str = "search"):
             "forensic": qclass == "history",
             "threshold": b.threshold,
             "returned_count": len(results.get("results", [])) if isinstance(results, dict) else 0,
-            "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:3]] if isinstance(results, dict) else [],
+            # W5 T3.3 (ADOPT-4/5): top-10 (was top-3) — pair sampling and
+            # replay Jaccard@10 both need the fuller result set. No reader
+            # pins the old length (verified); mixed-era rows are handled by
+            # both consumers.
+            "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:10]] if isinstance(results, dict) else [],
             "reranked": (results.get("reranked") if isinstance(results, dict) else None),
             # W5 T5.5: the union leg's receipt — candidates seen, unioned into
             # the pool, and surviving the final list. lexical_candidates==0 on
