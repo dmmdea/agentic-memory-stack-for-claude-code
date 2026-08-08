@@ -23,12 +23,20 @@ Environment=MEM0_DEFAULT_USER_ID=__WSL_USER__
 # telemetry ON by default — mem0/memory/telemetry.py reads MEM0_TELEMETRY and
 # treats anything outside ("true","1","yes") as off, so "False" disables it
 # (verified against the installed lib source, not the docs). HF_HUB_OFFLINE=1
-# is belt-and-braces: the reranker/embedder are HTTP clients to llama-swap (no
-# in-process HF load), so this only stops any transitive huggingface-hub
-# dependency from ever calling home from the server process — it can't break
-# inference because nothing in this process downloads weights.
+# stops any transitive huggingface-hub phone-home from the server process.
+# AMS-09b caveat (2026-08-07): since AMS-09 the fastembed BM25 encoder DOES
+# load model files in-process — under HF_HUB_OFFLINE that load is cache-only,
+# which is exactly the contract: the installer/deploy warm step populates the
+# durable cache below, and the server never fetches from the network.
 Environment=MEM0_TELEMETRY=False
 Environment=HF_HUB_OFFLINE=1
+# AMS-09b (2026-08-07, second sparse-leg death): fastembed's default model
+# cache is $TMPDIR/fastembed_cache — the WSL reboot wiped it, the offline
+# server could not re-download, and mem0's lazy-init sentinel poisoned the
+# leg until a manual restart. Pin the cache somewhere a reboot survives; the
+# installer post-condition warms THIS dir (parity pinned by
+# tests/test_systemd_parity.py).
+Environment=FASTEMBED_CACHE_PATH=%h/.cache/fastembed
 # v0.19 Phase H key chain: private tmpfs runtime dir + best-effort DPAPI key
 # fetch before start. The '-' prefix keeps fresh/plaintext-mode boxes safe:
 # the fetch fails soft and canonical_key_provider falls through to plaintext.

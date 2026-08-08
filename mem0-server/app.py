@@ -31,6 +31,7 @@ import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows 
 import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps injected below)
 from payload_carryover import compute_carryover  # AMS-01: PUT payload carry-over (P0)
 from sparse_health import sparse_leg_health      # AMS-09: BM25 leg liveness (gating)
+from sparse_health import encode_with_selfheal   # AMS-09b: bounded sentinel un-poison
 from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
@@ -849,9 +850,13 @@ def health_deep() -> dict:
     # the venv rebuild that killed the leg is precisely the event this catches.
     # sparse_leg_health never raises (module contract) — belt here anyway.
     try:
+        # AMS-09b: encode via the self-healing wrapper — a transiently-failed
+        # encoder init (cache evicted at boot + HF_HUB_OFFLINE) otherwise stays
+        # poisoned until a manual restart. /health/deep is hit by every
+        # SessionStart heartbeat, so recovery gets a mouth automatically.
         _sl = sparse_leg_health(
             mem.vector_store.client, mem.vector_store.collection_name,
-            lambda q: mem.vector_store._encode_bm25(q),
+            lambda q: encode_with_selfheal(mem.vector_store, q),
         )
     except Exception as e:
         _sl = {"ok": False, "error": str(e)[:120]}

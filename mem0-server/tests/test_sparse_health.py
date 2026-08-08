@@ -8,7 +8,68 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sparse_health import evaluate_sparse_leg, pick_canary_token  # noqa: E402
+from sparse_health import (  # noqa: E402
+    evaluate_sparse_leg,
+    encode_with_selfheal,
+    pick_canary_token,
+)
+
+
+class _FakeStore:
+    """Mirrors mem0's Qdrant store lazy-init contract: ``_bm25_encoder`` is
+    None (never tried) / False (tried, failed — POISONED) / encoder object.
+    ``_encode_bm25`` returns None when the encoder is unavailable."""
+
+    def __init__(self, poisoned=True, heal_works=True):
+        self._bm25_encoder = False if poisoned else None
+        self._heal_works = heal_works
+        self.init_attempts = 0
+
+    def _encode_bm25(self, text):
+        if self._bm25_encoder is False:
+            return None
+        if self._bm25_encoder is None:
+            self.init_attempts += 1
+            if not self._heal_works:
+                self._bm25_encoder = False
+                return None
+            self._bm25_encoder = object()
+        return {"indices": [1], "values": [0.5]}
+
+
+def test_selfheal_unpoisons_once_and_returns_vector():
+    # AMS-09b: the exact second-death state — sentinel poisoned by a
+    # boot-window init failure, cache since returned. One reset must heal.
+    store = _FakeStore(poisoned=True, heal_works=True)
+    assert encode_with_selfheal(store, "qube") is not None
+    assert store.init_attempts == 1
+
+
+def test_selfheal_is_bounded_per_call():
+    # Init keeps failing (cache genuinely absent): exactly ONE retry per
+    # call, never a loop; a later call may try once again.
+    store = _FakeStore(poisoned=True, heal_works=False)
+    assert encode_with_selfheal(store, "qube") is None
+    assert store.init_attempts == 1
+    assert encode_with_selfheal(store, "qube") is None
+    assert store.init_attempts == 2
+
+
+def test_selfheal_no_reset_on_healthy_encoder():
+    store = _FakeStore(poisoned=False, heal_works=True)
+    store._bm25_encoder = object()  # already loaded
+    assert encode_with_selfheal(store, "qube") is not None
+    assert store.init_attempts == 0
+
+
+def test_selfheal_never_raises():
+    class _Exploding:
+        _bm25_encoder = False
+
+        def _encode_bm25(self, text):
+            raise RuntimeError("boom")
+
+    assert encode_with_selfheal(_Exploding(), "qube") is None
 
 
 CANARY_OK = {"ran": True, "hit": True, "token": "qdrant"}

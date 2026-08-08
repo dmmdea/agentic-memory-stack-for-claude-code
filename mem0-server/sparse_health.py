@@ -38,6 +38,32 @@ gates (that is a dead leg's signature, not a fresh box's).
 import importlib.util
 
 
+def encode_with_selfheal(store, text):
+    """AMS-09b (2026-08-07, the leg's SECOND death): bounded un-poison of
+    mem0's lazy BM25 encoder sentinel.
+
+    mem0's ``_get_bm25_encoder`` caches ``False`` forever after one failed
+    init. The second production death proved that failure can be transient:
+    the fastembed model cache defaulted to /tmp (wiped by the WSL reboot) and
+    the server runs ``HF_HUB_OFFLINE=1``, so one cache-missing init at boot
+    poisoned the leg until a manual restart — even after the cache returned.
+    This wrapper resets the poisoned sentinel at most ONCE per call and
+    retries. Under ``HF_HUB_OFFLINE`` the retry is a local-disk load or an
+    immediate miss — it can never hang on a network fetch. Healing here heals
+    the WRITE path too (same store object, same encoder). Never raises.
+    """
+    try:
+        sv = store._encode_bm25(text)
+        if sv is not None:
+            return sv
+        if getattr(store, "_bm25_encoder", None) is False:
+            store._bm25_encoder = None  # un-poison: allow exactly one fresh init
+            sv = store._encode_bm25(text)
+        return sv
+    except Exception:
+        return None
+
+
 def pick_canary_token(text_lemmatized):
     """Deterministic token choice: longest token, lexicographic tiebreak."""
     tokens = [t for t in (text_lemmatized or "").split() if t]
