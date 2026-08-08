@@ -43,9 +43,13 @@ _SECRET_PATTERNS = tuple(
          r"(?:[\"'](?:\\.|[^\\\r\n]){4,200}[\"']|[\"'](?:\\.|[^\"'\\\r\n]){4,200}"
          r"|(?=[^\s\"'\r\n]{4})(?:[^\s\"'\r\n]{16,200}|[^\s\"'\r\n]{0,200}[0-9][^\s\"'\r\n]{0,200}))",
          r"\1[REDACTED]"),
+        (r"(?i)([\"'][A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[\"']"
+         r"[ \t]*:[ \t]*[\"'])([^\"'\r\n]{0,200}[0-9][^\"'\r\n]{0,200})([\"'])",
+         r"\1[REDACTED]\3"),
         (r"(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)"
-         r"[ \t]*[:=][ \t]*)[\"'\x60]?[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*", r"\1[REDACTED]"),
-        (r"(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36})", "[REDACTED_GITHUB_TOKEN]"),
+         r"[ \t]*[:=][ \t]*)[\"'\x60]?(?:[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*|[0-9a-f][0-9a-f-]{31,})",
+         r"\1[REDACTED]"),
+        (r"(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,})", "[REDACTED_GITHUB_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})", "[REDACTED_GITHUB_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,})", "[REDACTED_SLACK_TOKEN]"),
         (r"(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})", "[REDACTED_NVIDIA_KEY]"),

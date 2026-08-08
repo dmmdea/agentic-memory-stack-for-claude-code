@@ -20,6 +20,23 @@ redact = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(redact)
 
 
+def test_count_redactions_counts_without_mutating():
+    """W5 T6.1: count-only telemetry — runtime-derived keys, zero mutation."""
+    text = ("deploy sk-ABCD1234567890efgh and a token gh" "p_" +
+            "A" * 36 + " plus api_key=supersecret123")
+    before = text
+    counts = redact.count_redactions(text)
+    assert text == before                       # count NEVER mutates
+    assert counts.get("REDACTED_OPENAI_KEY") == 1
+    assert counts.get("REDACTED_GITHUB_TOKEN") == 1
+    assert sum(counts.values()) >= 3            # + the assignment rule
+    # generic [REDACTED] rules get positional keys — never the bare marker
+    assert "REDACTED" not in counts
+    assert redact.count_redactions("plain prose, no secrets") == {}
+    assert redact.count_redactions("") == {}
+    assert redact.count_redactions(None) == {}
+
+
 def test_scrubs_credential_shapes():
     out = redact.redact_secrets(
         "deploy sk-ABCD1234567890efgh; Authorization: Bearer tok_xyz; api_key=supersecret123"
