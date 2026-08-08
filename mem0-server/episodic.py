@@ -804,6 +804,39 @@ def list_goals(
     return [dict(r) for r in cur.fetchall()]
 
 
+def _count_by_status(conn: sqlite3.Connection, table: str) -> dict[str, Any]:
+    """True row count for a lifecycle table, plus the per-status breakdown.
+
+    AMS-57 (2026-08-08): the health probes used to derive a "total" by counting
+    the rows a LIST call returned under `limit=200`. Once a table passed 200
+    rows that reported exactly 200 — a page presented as a total, stamped OK.
+    Counting belongs in SQL, where the limit cannot silently truncate it.
+
+    `table` is never caller-supplied — it is one of the two literals below —
+    so the f-string cannot carry untrusted input into the statement.
+    """
+    if table not in ("goals", "open_questions"):
+        raise ValueError(f"refusing to count unknown table: {table!r}")
+    total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    by_status = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            f"SELECT status, COUNT(*) FROM {table} GROUP BY status"
+        )
+    }
+    return {"total": int(total), "by_status": by_status}
+
+
+def count_goals(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Unfiltered goal count + per-status breakdown (see _count_by_status)."""
+    return _count_by_status(conn, "goals")
+
+
+def count_open_questions(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Unfiltered open-question count + per-status breakdown."""
+    return _count_by_status(conn, "open_questions")
+
+
 def get_goal_tree(
     conn: sqlite3.Connection,
     root_goal_id: int | None = None,
