@@ -23,6 +23,24 @@ sweep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweep)
 
 
+@pytest.fixture(autouse=True)
+def _no_pair_cache(monkeypatch):
+    """W5 ADOPT-4 isolation: the dispatch layer now consults the pair-verdict
+    cache at ~/.mem0 — a unit test must NEVER touch (or be answered by) the
+    real sidecar. Default every test in this file to cache-off; the cache
+    tests re-enable it explicitly against a tmp home."""
+    monkeypatch.setattr(sweep, "_pair_cache", None)
+
+
+@pytest.fixture()
+def _tmp_pair_cache(monkeypatch, tmp_path):
+    """Opt-in: real pair_cache module against an isolated tmp home."""
+    import pair_cache
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(sweep, "_pair_cache", pair_cache)
+    return pair_cache
+
+
 # ---------------------------------------------------------------------------
 # parse_verdict
 # ---------------------------------------------------------------------------
@@ -641,6 +659,210 @@ def test_judge_dispatch_routes_local(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# W5 ADOPT-4: pair-verdict cache in the dispatch layer
+# ---------------------------------------------------------------------------
+
+def test_judge_dispatch_consults_and_writes_cache(monkeypatch, _tmp_pair_cache):
+    fake = _FakeCodex({"ok": True, "contradicts": True, "raw": "YES"})
+    monkeypatch.setattr(sweep, "_codex", fake)
+    stats: dict = {}
+    v1, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                 cache_stats=stats)
+    v2, d2 = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                  cache_stats=stats)
+    assert v1 is True and v2 is True
+    assert len(fake.calls) == 1, "second identical pair must be served from cache"
+    # review fix 4: an applied stamp's justification names WHEN it was judged
+    assert d2.startswith("cache-hit (verdict judged 2")
+    assert stats == {"cache_misses": 1, "cache_hits": 1}
+
+
+def test_rejudge_path_bypasses_cache(monkeypatch, _tmp_pair_cache):
+    """M9 pin: rejudge-stamped is the self-heal path — a cached YES must
+    never answer it. Warm the cache YES, then rejudge with use_cache=False
+    against a NO judge: the REAL judge is consulted and wins."""
+    fake_yes = _FakeCodex({"ok": True, "contradicts": True, "raw": "YES"})
+    monkeypatch.setattr(sweep, "_codex", fake_yes)
+    sweep.judge_dispatch("codex", None, "m", "A", "B", 30)   # warms cache = YES
+    fake_no = _FakeCodex({"ok": True, "contradicts": False, "raw": "NO"})
+    monkeypatch.setattr(sweep, "_codex", fake_no)
+    v, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                use_cache=False)
+    assert v is False and len(fake_no.calls) == 1
+
+
+def test_rejudge_call_site_pins_cache_bypass():
+    """M9's call-site half: the behavioral bypass test above exercises
+    judge_dispatch directly — this pin makes REVERTING the rejudge call
+    site's use_cache=False red (source-text pin, test_context_bundle
+    precedent)."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    i = src.find("def run_rejudge_stamped")
+    j = src.find("\ndef ", i + 10)
+    body = src[i:j]
+    # Comment-stripped (RegressionGuards precedent): the call-site COMMENT
+    # also contains the literal, and a pin a comment can satisfy is the W1
+    # vacuous-guard class — proven red/green via the M9 mutation.
+    body_code = "\n".join(l for l in body.splitlines()
+                          if not l.strip().startswith("#"))
+    assert "use_cache=False)" in body_code, \
+        "run_rejudge_stamped no longer bypasses the pair cache"
+
+
+def test_error_verdicts_never_negative_cached(monkeypatch, _tmp_pair_cache):
+    """R2: a transient judge outage must not suppress judging — after an
+    error verdict, the next call reaches the real judge again."""
+    fake_err = _FakeCodex({"ok": False, "error": "boom", "error_type": "X"})
+    monkeypatch.setattr(sweep, "_codex", fake_err)
+    v1, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30)
+    assert v1 is None
+    fake_ok = _FakeCodex({"ok": True, "contradicts": False, "raw": "NO"})
+    monkeypatch.setattr(sweep, "_codex", fake_ok)
+    v2, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30)
+    assert v2 is False and len(fake_ok.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# W5 ADOPT-4: --retrieval-pairs dry-run (review fix 1 — the novelty baseline
+# was vacuous by construction and NOTHING tested this mode; these pins exist
+# so that class cannot recur)
+# ---------------------------------------------------------------------------
+
+def _pairs_args(**kw):
+    import argparse
+    d = dict(pairs_days=30, pairs_max_pairs=200, user_id=None, top_k=8,
+             max_anchors=40, evidence_sim_floor=0.45)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _iso(offset_days=0):
+    return (dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(days=offset_days)).isoformat()
+
+
+def test_read_retrieval_rows_excludes_and_counts_legacy(monkeypatch, tmp_path):
+    log = tmp_path / "retrieval-log.jsonl"
+    log.write_text("\n".join([
+        json.dumps({"ts": _iso(), "query_hash": "q1",
+                    "returned_top_ids": ["A", "B"]}),                    # legacy: no route
+        json.dumps({"ts": _iso(), "route": "bundle", "query_hash": "q2",
+                    "returned_top_ids": ["A", "B"]}),                    # wrong route
+        json.dumps({"ts": _iso(45), "route": "search", "query_hash": "q3",
+                    "returned_top_ids": ["A", "B"]}),                    # too old
+        "{torn line",                                                     # unparsable
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q4",
+                    "returned_top_ids": ["A", "B"]}),
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sweep, "RETRIEVAL_LOG", log)
+    rows, counts = sweep._read_retrieval_rows(30)
+    assert len(rows) == 1 and rows[0]["query_hash"] == "q4"
+    assert counts["excluded_legacy_rows"] == 1
+    assert counts["excluded_other_route"] == 1
+    assert counts["too_old"] == 1
+    assert counts["unparsable"] == 1
+
+
+class _FakeQdrantHttp:
+    """Serves ONLY the bulk /points payload fetch run_retrieval_pairs makes
+    directly; the neighborhood helpers are monkeypatched at module level."""
+    def __init__(self, payloads):
+        self._payloads = payloads
+    def post(self, url, json=None, timeout=None):
+        ids = (json or {}).get("ids") or []
+        class _R:
+            def __init__(self, result): self._result = result
+            def raise_for_status(self): pass
+            def json(self): return {"result": self._result}
+        return _R([{"id": i, "payload": self._payloads[i]}
+                   for i in ids if i in self._payloads])
+    def close(self): pass
+
+
+def _wire_pairs_env(monkeypatch, tmp_path, payloads, evidence_neighbors):
+    log = tmp_path / "retrieval-log.jsonl"
+    log.write_text("\n".join([
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q1",
+                    "returned_top_ids": ["A", "B"]}),
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q2",
+                    "returned_top_ids": ["A", "B"]}),
+    ]) + "\n", encoding="utf-8")
+    summaries: list = []
+    monkeypatch.setattr(sweep, "RETRIEVAL_LOG", log)
+    monkeypatch.setattr(sweep, "PAIRS_LOCK", tmp_path / ".pairs.lock")
+    monkeypatch.setattr(sweep, "PAIRS_RECEIPT", tmp_path / "yield.json")
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep.httpx, "Client", lambda *a, **k: _FakeQdrantHttp(payloads))
+    monkeypatch.setattr(sweep, "scroll_canonicals", lambda http, user_id=None: [])
+    monkeypatch.setattr(sweep, "scroll_noncanonical",
+                        lambda http, user_id=None: [{"id": "A", "payload":
+                                                     {"created_at": _iso(), "user_id": "u"}}])
+    monkeypatch.setattr(sweep, "fetch_with_vectors",
+                        lambda http, ids: [{"id": "A", "vector": [0.1],
+                                            "payload": {"user_id": "u"}}])
+    monkeypatch.setattr(sweep, "dense_vector", lambda p: p.get("vector"))
+    monkeypatch.setattr(sweep, "query_similar",
+                        lambda http, vec, user, ex, fetch_n: evidence_neighbors)
+    return summaries
+
+
+_PAYLOADS = {
+    "A": {"data": "fact a", "user_id": "u", "tier": "evidence"},
+    "B": {"data": "fact b", "user_id": "u", "tier": "evidence"},
+}
+
+
+def test_retrieval_pairs_pair_inside_evidence_reach_is_not_novel(monkeypatch, tmp_path):
+    """THE fix-1 pin: an eligible pair the evidence sweep could reach must be
+    counted NOT-novel — the old canonical-only baseline made novel==eligible
+    forever."""
+    summaries = _wire_pairs_env(monkeypatch, tmp_path, _PAYLOADS,
+                                evidence_neighbors=[{"id": "B", "score": 0.9}])
+    rc = sweep.run_retrieval_pairs(_pairs_args())
+    assert rc == 0
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_eligible"] == 1
+    assert receipt["pairs_novel_vs_storage_sweep"] == 0
+    assert summaries and summaries[-1]["mode"] == "retrieval-pairs"
+
+
+def test_retrieval_pairs_out_of_reach_pair_is_novel(monkeypatch, tmp_path):
+    _wire_pairs_env(monkeypatch, tmp_path, _PAYLOADS, evidence_neighbors=[])
+    rc = sweep.run_retrieval_pairs(_pairs_args())
+    assert rc == 0
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_eligible"] == 1
+    assert receipt["pairs_novel_vs_storage_sweep"] == 1
+
+
+def test_retrieval_pairs_canonical_member_split_not_eligible(monkeypatch, tmp_path):
+    payloads = {"A": {"data": "fact a", "user_id": "u", "tier": "canonical"},
+                "B": {"data": "fact b", "user_id": "u", "tier": "evidence"}}
+    _wire_pairs_env(monkeypatch, tmp_path, payloads, evidence_neighbors=[])
+    sweep.run_retrieval_pairs(_pairs_args())
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_canonical_member"] == 1
+    assert receipt["pairs_eligible"] == 0
+
+
+def test_supersession_dispatch_cache_is_order_sensitive(monkeypatch, _tmp_pair_cache):
+    class _FakeCodexSup:
+        def __init__(self, out):
+            self.out = out
+            self.calls = []
+        def judge_supersession(self, older, newer, timeout_s=0):
+            self.calls.append((older, newer))
+            return self.out
+    fake = _FakeCodexSup({"ok": True, "stale": True, "raw": "STALE"})
+    monkeypatch.setattr(sweep, "_codex", fake)
+    v1, _ = sweep.judge_supersession_dispatch("codex", None, "m", "old", "new", 30)
+    # swapped direction MUST reach the judge again (ordered key)
+    v2, _ = sweep.judge_supersession_dispatch("codex", None, "m", "new", "old", 30)
+    assert v1 is True and v2 is True
+    assert len(fake.calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # v0.27.3: fetch_point_text (absent vs transient-error) + run_rejudge_stamped
 # decision matrix + the codex shim-preflight no-op (audit fixes)
 # ---------------------------------------------------------------------------
@@ -706,7 +928,8 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
         return v
     monkeypatch.setattr(sweep, "fetch_point_text", fake_fetch)
     monkeypatch.setattr(sweep, "judge_dispatch",
-                        lambda mode, http, model, can, cand, t: verdict_map[cand])
+                        # **kw absorbs the W5 cache kwargs (use_cache/cache_stats)
+                        lambda mode, http, model, can, cand, t, **kw: verdict_map[cand])
     calls = []
     monkeypatch.setattr(sweep, "stamp_candidate",
                         lambda http, cid, ts, contradicts=None, clear=False, justification="", pending=False: (

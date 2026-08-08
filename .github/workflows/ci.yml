@@ -88,6 +88,7 @@ jobs:
             mem0-server/tests/test_r2_injection_gating.py \
             mem0-server/tests/test_redact.py \
             mem0-server/tests/test_replay_ops.py \
+            mem0-server/tests/test_pair_cache.py \
             mem0-server/tests/test_reranker.py \
             mem0-server/tests/test_shim_offline.py \
             mem0-server/tests/test_sparse_health.py \
