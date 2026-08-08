@@ -187,10 +187,17 @@ _TIME_DERIVED = ("durable_freshness_score", "durable_freshness_weight",
 
 
 def _stable_projection(results):
+    """Excludes time-derived fields AND order: with durable freshness on,
+    now()-drift between two calls legitimately flips near-tied orderings
+    (caught red against production by the full gate) — order changes from
+    TIME are not explain mutations. Content identity per id is the
+    invariant; order sensitivity lives in the REST test's deterministic
+    paths and the trace-shape asserts."""
     out = []
     for r in results or []:
         c = {k: v for k, v in r.items() if k not in _TIME_DERIVED}
         out.append(c)
+    out.sort(key=lambda c: str(c.get("id")))
     return json.dumps(out, sort_keys=True)
 
 
