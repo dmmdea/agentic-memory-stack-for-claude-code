@@ -99,6 +99,14 @@ try:
     import codex_shim_client as _codex
 except Exception:  # noqa: BLE001
     _codex = None
+# W5 ADOPT-4: per-pair verdict cache (mem0-server/pair_cache.py via the same
+# sys.path bridge). Its own guard — the codex guard above must not hide a
+# cache import failure and vice versa. A missing cache is a silent no-cache
+# run, never an error (R2 fail-soft).
+try:
+    import pair_cache as _pair_cache
+except Exception:  # noqa: BLE001
+    _pair_cache = None
 
 
 def _install_is_provisioned() -> bool:
@@ -389,12 +397,52 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
     return verdict, detail
 
 
-def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_text: str,
-                   candidate_text: str, timeout_s: float) -> tuple[Optional[bool], str]:
-    """Route to the Codex bridge (default; model-routing rule) or the local llama-swap judge."""
+# W5 ADOPT-4: prompt-version constants — the cache key must change whenever a
+# judge PROMPT changes, or stale verdicts survive a prompt edit. The codex
+# prompts live in codex_shim_client.py and carry their own constants; these
+# cover the local prompts in THIS file. Bump on any prompt edit.
+LOCAL_CONTRADICTION_PROMPT_VERSION = "v1"
+LOCAL_SUPERSESSION_PROMPT_VERSION = "v1"
+
+
+def _prompt_version(question: str, judge_mode: str) -> str:
     if judge_mode == "codex":
-        return judge_pair_codex(canonical_text, candidate_text)
-    return judge_pair(http, model, canonical_text, candidate_text, timeout_s)
+        attr = ("NLI_PROMPT_VERSION" if question == "contradiction"
+                else "SUPERSESSION_PROMPT_VERSION")
+        return getattr(_codex, attr, "codex-unknown") if _codex else "codex-unknown"
+    return (LOCAL_CONTRADICTION_PROMPT_VERSION if question == "contradiction"
+            else LOCAL_SUPERSESSION_PROMPT_VERSION)
+
+
+def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_text: str,
+                   candidate_text: str, timeout_s: float,
+                   use_cache: bool = True,
+                   cache_stats: Optional[dict] = None) -> tuple[Optional[bool], str]:
+    """Route to the Codex bridge (default; model-routing rule) or the local llama-swap judge.
+
+    W5 ADOPT-4: consults the per-pair verdict cache first (unordered key —
+    contradiction is symmetric) and writes through boolean verdicts. The
+    --rejudge-stamped self-heal path passes use_cache=False (pinned): the
+    cache accelerates DISCOVERY, never re-judgment."""
+    key = None
+    if use_cache and _pair_cache is not None:
+        key = _pair_cache.make_key("contradiction", judge_mode, model,
+                                   _prompt_version("contradiction", judge_mode),
+                                   str(canonical_text), str(candidate_text))
+        hit = _pair_cache.get(key)
+        if hit is not None:
+            if cache_stats is not None:
+                cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
+            return hit, "cache-hit"
+    if judge_mode == "codex":
+        verdict, detail = judge_pair_codex(canonical_text, candidate_text)
+    else:
+        verdict, detail = judge_pair(http, model, canonical_text, candidate_text, timeout_s)
+    if key is not None and isinstance(verdict, bool):
+        _pair_cache.put(key, verdict, "contradiction", judge_mode)
+        if cache_stats is not None:
+            cache_stats["cache_misses"] = cache_stats.get("cache_misses", 0) + 1
+    return verdict, detail
 
 
 # --- supersession judge (evidence-sweep precision, 2026-06-30) ----------------
@@ -497,11 +545,32 @@ def judge_supersession_codex(older_text: str, newer_text: str,
 
 
 def judge_supersession_dispatch(judge_mode: str, http: httpx.Client, model: str, older_text: str,
-                                newer_text: str, timeout_s: float) -> tuple[Optional[bool], str]:
-    """Route the supersession (HIDE) judgment to Codex (default) or the local llama-swap judge."""
+                                newer_text: str, timeout_s: float,
+                                use_cache: bool = True,
+                                cache_stats: Optional[dict] = None) -> tuple[Optional[bool], str]:
+    """Route the supersession (HIDE) judgment to Codex (default) or the local llama-swap judge.
+
+    W5 ADOPT-4: cached with an ORDERED key — 'does newer supersede older' is
+    direction-dependent, so a swapped pair must never hit."""
+    key = None
+    if use_cache and _pair_cache is not None:
+        key = _pair_cache.make_key("supersession", judge_mode, model,
+                                   _prompt_version("supersession", judge_mode),
+                                   str(older_text), str(newer_text))
+        hit = _pair_cache.get(key)
+        if hit is not None:
+            if cache_stats is not None:
+                cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
+            return hit, "cache-hit"
     if judge_mode == "codex":
-        return judge_supersession_codex(older_text, newer_text)
-    return judge_supersession_local(http, model, older_text, newer_text, timeout_s)
+        verdict, detail = judge_supersession_codex(older_text, newer_text)
+    else:
+        verdict, detail = judge_supersession_local(http, model, older_text, newer_text, timeout_s)
+    if key is not None and isinstance(verdict, bool):
+        _pair_cache.put(key, verdict, "supersession", judge_mode)
+        if cache_stats is not None:
+            cache_stats["cache_misses"] = cache_stats.get("cache_misses", 0) + 1
+    return verdict, detail
 
 
 def stamp_candidate(http: httpx.Client, candidate_id: str, checked_at: str,
@@ -960,8 +1029,12 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                 skipped += 1
                 print(f"  SKIP {cid}: canonical {canonical_id} present but empty text — NOT clearing", flush=True)
                 continue
+            # W5 ADOPT-4: use_cache=False is BINDING — rejudge-stamped is the
+            # self-heal path; a cached verdict here would extend a false-
+            # positive hide window by up to the cache TTL (M9 pin).
             verdict, detail = judge_dispatch(args.judge, llm_http, args.model, str(can_text),
-                                             str(cand_text), CODEX_JUDGE_TIMEOUT_S)
+                                             str(cand_text), CODEX_JUDGE_TIMEOUT_S,
+                                             use_cache=False)
             checked += 1
             # SAFE policy (2026-06-30): by default a YES on an advisory-pending record is QUEUED
             # for human review, NEVER auto-hidden — a live Codex rejudge over-promoted 3/4
@@ -1075,6 +1148,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
+    ev_cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     consec_fail = 0  # fail fast if the judge dies mid-run (mirrors the canonical sweep)
     aborted = None
     queued_ids: list[dict] = []
@@ -1118,7 +1192,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                 # NEWER (anchor)? NOT "does B contradict A?" — that over-flags valid historical
                 # ship-logs that logically-supersede but must be kept (2026-06-30 precision fix).
                 verdict, detail = judge_supersession_dispatch(args.judge, llm_http, args.model,
-                                                              str(nb_text), str(a_text), CODEX_JUDGE_TIMEOUT_S)
+                                                              str(nb_text), str(a_text), CODEX_JUDGE_TIMEOUT_S,
+                                                              cache_stats=ev_cache_stats)
                 pairs += 1
                 if verdict is None:
                     skipped += 1
@@ -1152,7 +1227,9 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     outcome = f"degraded:aborted:{aborted}" if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
                      "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
-                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome})
+                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome,
+                     "cache_hits": int(ev_cache_stats.get("cache_hits", 0)),
+                     "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
           f"queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
     return exit_code_for(outcome)
@@ -1349,6 +1426,7 @@ def main() -> int:
                                       "Content-Type": "application/json"})
 
     pairs_checked = yes_count = no_count = skipped_pairs = stamped_count = 0
+    cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     cleared_count = 0
     stamped_ids: list[dict] = []   # YES stamps applied this run (visibility fix-pass)
     cleared_ids: list[dict] = []   # stale YES stamps cleared on re-judge NO
@@ -1404,7 +1482,8 @@ def main() -> int:
                 cand_text = cand_payload.get("data") or cand_payload.get("memory")
                 timeout = COLD_LOAD_TIMEOUT_S if first_llm_call else PAIR_TIMEOUT_S
                 verdict, detail = judge_dispatch(args.judge, llm_http, args.model, str(can_text),
-                                                 str(cand_text), timeout)
+                                                 str(cand_text), timeout,
+                                                 cache_stats=cache_stats)
                 # v0.20 M7: keep the cold-load budget until the judge ANSWERS
                 # once — a timed-out cold load no longer demotes the whole run
                 # to 30s pair timeouts while the model is still loading.
@@ -1498,6 +1577,10 @@ def main() -> int:
         "cleared_ids": cleared_ids,
         "judge": args.judge,                  # v0.29.4: local YES = advisory PENDING (not hidden); codex = enforced
         "outcome": outcome,                   # v0.20 M7: ok | degraded:* | no-op:*
+        # W5 ADOPT-4: cache receipt — a rejudge-free double run must show
+        # cache_hits>0 on the second pass (the wave acceptance).
+        "cache_hits": int(cache_stats.get("cache_hits", 0)),
+        "cache_misses": int(cache_stats.get("cache_misses", 0)),
     }
     if aborted:
         summary["aborted"] = aborted
