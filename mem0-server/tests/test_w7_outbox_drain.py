@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -16,9 +18,28 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "wsl" / "replay-ops.py"
-_spec = importlib.util.spec_from_file_location("replay_ops", SCRIPT)
-ro = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ro)
+
+# replay-ops reads ~/.mem0/api-key AT IMPORT, so a clean CI runner explodes on
+# module load (caught by CI, not locally, where the file exists). Import it
+# against a throwaway HOME holding a dummy key — that keeps these pins GATING
+# in CI instead of skipping the whole file.
+_tmp_home = tempfile.mkdtemp(prefix="w7-outbox-home-")
+(Path(_tmp_home) / ".mem0").mkdir(parents=True, exist_ok=True)
+(Path(_tmp_home) / ".mem0" / "api-key").write_text("ci-dummy-key",
+                                                   encoding="utf-8")
+_saved_env = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+os.environ["HOME"] = _tmp_home
+os.environ["USERPROFILE"] = _tmp_home
+try:
+    _spec = importlib.util.spec_from_file_location("replay_ops", SCRIPT)
+    ro = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(ro)
+finally:
+    for _k, _v in _saved_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
 
 
 def _drain(monkeypatch, outbox: Path) -> dict:
