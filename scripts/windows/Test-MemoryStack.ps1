@@ -1077,7 +1077,11 @@ try {
         # freshness/outcome logic (pre-existing bug), and the new
         # retrieval-pairs mode would have leaked the same way.
         $normalRuns = @($csRuns | Where-Object { -not $_.PSObject.Properties['mode'] })
-        $last = if ($normalRuns.Count) { $normalRuns[-1] } else { $csRuns[-1] }
+        # Review fix 7: on a log holding ONLY mode-tagged lines the old
+        # fallback adopted a mode line as the 'normal' run — the same leak
+        # class, residual. $last is now $null in that state, which the
+        # existing no-normal-sweep-yet branch below reports honestly.
+        $last = if ($normalRuns.Count) { $normalRuns[-1] } else { $null }
         $lastApply = @($normalRuns | Where-Object { $_.dry_run -eq $false }) | Select-Object -Last 1
         $rejudgeNewer = $rejudge -and (($null -eq $lastApply) -or ([datetime]$rejudge.ts -ge [datetime]$lastApply.ts))
         if ($rejudgeNewer) {
@@ -1100,7 +1104,7 @@ try {
             }
         }
         elseif ($null -eq $last) {
-            Add-Check 'RECOVERY' 'contradiction sweep' 'OK' 'only rejudge-stamped runs logged (no normal sweep yet)'
+            Add-Check 'RECOVERY' 'contradiction sweep' 'OK' 'only mode-tagged runs logged (rejudge/evidence/retrieval-pairs); no NORMAL discovery sweep yet'
         }
         else {
             $age = (Get-Date) - [datetime]$last.ts

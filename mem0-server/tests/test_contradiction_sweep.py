@@ -672,7 +672,8 @@ def test_judge_dispatch_consults_and_writes_cache(monkeypatch, _tmp_pair_cache):
                                   cache_stats=stats)
     assert v1 is True and v2 is True
     assert len(fake.calls) == 1, "second identical pair must be served from cache"
-    assert d2 == "cache-hit"
+    # review fix 4: an applied stamp's justification names WHEN it was judged
+    assert d2.startswith("cache-hit (verdict judged 2")
     assert stats == {"cache_misses": 1, "cache_hits": 1}
 
 
@@ -701,6 +702,129 @@ def test_error_verdicts_never_negative_cached(monkeypatch, _tmp_pair_cache):
     monkeypatch.setattr(sweep, "_codex", fake_ok)
     v2, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30)
     assert v2 is False and len(fake_ok.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# W5 ADOPT-4: --retrieval-pairs dry-run (review fix 1 — the novelty baseline
+# was vacuous by construction and NOTHING tested this mode; these pins exist
+# so that class cannot recur)
+# ---------------------------------------------------------------------------
+
+def _pairs_args(**kw):
+    import argparse
+    d = dict(pairs_days=30, pairs_max_pairs=200, user_id=None, top_k=8,
+             max_anchors=40, evidence_sim_floor=0.45)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _iso(offset_days=0):
+    return (dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(days=offset_days)).isoformat()
+
+
+def test_read_retrieval_rows_excludes_and_counts_legacy(monkeypatch, tmp_path):
+    log = tmp_path / "retrieval-log.jsonl"
+    log.write_text("\n".join([
+        json.dumps({"ts": _iso(), "query_hash": "q1",
+                    "returned_top_ids": ["A", "B"]}),                    # legacy: no route
+        json.dumps({"ts": _iso(), "route": "bundle", "query_hash": "q2",
+                    "returned_top_ids": ["A", "B"]}),                    # wrong route
+        json.dumps({"ts": _iso(45), "route": "search", "query_hash": "q3",
+                    "returned_top_ids": ["A", "B"]}),                    # too old
+        "{torn line",                                                     # unparsable
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q4",
+                    "returned_top_ids": ["A", "B"]}),
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sweep, "RETRIEVAL_LOG", log)
+    rows, counts = sweep._read_retrieval_rows(30)
+    assert len(rows) == 1 and rows[0]["query_hash"] == "q4"
+    assert counts["excluded_legacy_rows"] == 1
+    assert counts["excluded_other_route"] == 1
+    assert counts["too_old"] == 1
+    assert counts["unparsable"] == 1
+
+
+class _FakeQdrantHttp:
+    """Serves ONLY the bulk /points payload fetch run_retrieval_pairs makes
+    directly; the neighborhood helpers are monkeypatched at module level."""
+    def __init__(self, payloads):
+        self._payloads = payloads
+    def post(self, url, json=None, timeout=None):
+        ids = (json or {}).get("ids") or []
+        class _R:
+            def __init__(self, result): self._result = result
+            def raise_for_status(self): pass
+            def json(self): return {"result": self._result}
+        return _R([{"id": i, "payload": self._payloads[i]}
+                   for i in ids if i in self._payloads])
+    def close(self): pass
+
+
+def _wire_pairs_env(monkeypatch, tmp_path, payloads, evidence_neighbors):
+    log = tmp_path / "retrieval-log.jsonl"
+    log.write_text("\n".join([
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q1",
+                    "returned_top_ids": ["A", "B"]}),
+        json.dumps({"ts": _iso(), "route": "search", "query_hash": "q2",
+                    "returned_top_ids": ["A", "B"]}),
+    ]) + "\n", encoding="utf-8")
+    summaries: list = []
+    monkeypatch.setattr(sweep, "RETRIEVAL_LOG", log)
+    monkeypatch.setattr(sweep, "PAIRS_LOCK", tmp_path / ".pairs.lock")
+    monkeypatch.setattr(sweep, "PAIRS_RECEIPT", tmp_path / "yield.json")
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep.httpx, "Client", lambda *a, **k: _FakeQdrantHttp(payloads))
+    monkeypatch.setattr(sweep, "scroll_canonicals", lambda http, user_id=None: [])
+    monkeypatch.setattr(sweep, "scroll_noncanonical",
+                        lambda http, user_id=None: [{"id": "A", "payload":
+                                                     {"created_at": _iso(), "user_id": "u"}}])
+    monkeypatch.setattr(sweep, "fetch_with_vectors",
+                        lambda http, ids: [{"id": "A", "vector": [0.1],
+                                            "payload": {"user_id": "u"}}])
+    monkeypatch.setattr(sweep, "dense_vector", lambda p: p.get("vector"))
+    monkeypatch.setattr(sweep, "query_similar",
+                        lambda http, vec, user, ex, fetch_n: evidence_neighbors)
+    return summaries
+
+
+_PAYLOADS = {
+    "A": {"data": "fact a", "user_id": "u", "tier": "evidence"},
+    "B": {"data": "fact b", "user_id": "u", "tier": "evidence"},
+}
+
+
+def test_retrieval_pairs_pair_inside_evidence_reach_is_not_novel(monkeypatch, tmp_path):
+    """THE fix-1 pin: an eligible pair the evidence sweep could reach must be
+    counted NOT-novel — the old canonical-only baseline made novel==eligible
+    forever."""
+    summaries = _wire_pairs_env(monkeypatch, tmp_path, _PAYLOADS,
+                                evidence_neighbors=[{"id": "B", "score": 0.9}])
+    rc = sweep.run_retrieval_pairs(_pairs_args())
+    assert rc == 0
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_eligible"] == 1
+    assert receipt["pairs_novel_vs_storage_sweep"] == 0
+    assert summaries and summaries[-1]["mode"] == "retrieval-pairs"
+
+
+def test_retrieval_pairs_out_of_reach_pair_is_novel(monkeypatch, tmp_path):
+    _wire_pairs_env(monkeypatch, tmp_path, _PAYLOADS, evidence_neighbors=[])
+    rc = sweep.run_retrieval_pairs(_pairs_args())
+    assert rc == 0
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_eligible"] == 1
+    assert receipt["pairs_novel_vs_storage_sweep"] == 1
+
+
+def test_retrieval_pairs_canonical_member_split_not_eligible(monkeypatch, tmp_path):
+    payloads = {"A": {"data": "fact a", "user_id": "u", "tier": "canonical"},
+                "B": {"data": "fact b", "user_id": "u", "tier": "evidence"}}
+    _wire_pairs_env(monkeypatch, tmp_path, payloads, evidence_neighbors=[])
+    sweep.run_retrieval_pairs(_pairs_args())
+    receipt = json.loads((tmp_path / "yield.json").read_text())
+    assert receipt["pairs_canonical_member"] == 1
+    assert receipt["pairs_eligible"] == 0
 
 
 def test_supersession_dispatch_cache_is_order_sensitive(monkeypatch, _tmp_pair_cache):

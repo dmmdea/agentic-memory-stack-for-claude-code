@@ -415,6 +415,27 @@ def _prompt_version(question: str, judge_mode: str) -> str:
             else LOCAL_SUPERSESSION_PROMPT_VERSION)
 
 
+def _judge_model_id(judge_mode: str, model: str) -> str:
+    """Review fix 2 (R2): the cache key's model dimension must name the
+    JUDGING model. On the codex path that is the shim's CLI identity (model +
+    effort — args.model is the LOCAL llama-swap name and is irrelevant there);
+    on the local path it is args.model."""
+    if judge_mode == "codex":
+        return getattr(_codex, "CODEX_JUDGE_IDENTITY", "codex-unknown") if _codex else "codex-unknown"
+    return str(model)
+
+
+def _cache_hit_detail(created_ts) -> str:
+    """Review fix 4: an applied stamp's justification must say WHEN the
+    cached verdict was actually judged."""
+    try:
+        iso = dt.datetime.fromtimestamp(float(created_ts), dt.timezone.utc
+                                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return f"cache-hit (verdict judged {iso})"
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "cache-hit"
+
+
 def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_text: str,
                    candidate_text: str, timeout_s: float,
                    use_cache: bool = True,
@@ -427,14 +448,15 @@ def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_te
     cache accelerates DISCOVERY, never re-judgment."""
     key = None
     if use_cache and _pair_cache is not None:
-        key = _pair_cache.make_key("contradiction", judge_mode, model,
+        key = _pair_cache.make_key("contradiction", judge_mode,
+                                   _judge_model_id(judge_mode, model),
                                    _prompt_version("contradiction", judge_mode),
                                    str(canonical_text), str(candidate_text))
-        hit = _pair_cache.get(key)
+        hit = _pair_cache.get_with_ts(key)
         if hit is not None:
             if cache_stats is not None:
                 cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
-            return hit, "cache-hit"
+            return hit[0], _cache_hit_detail(hit[1])
     if judge_mode == "codex":
         verdict, detail = judge_pair_codex(canonical_text, candidate_text)
     else:
@@ -555,14 +577,15 @@ def judge_supersession_dispatch(judge_mode: str, http: httpx.Client, model: str,
     direction-dependent, so a swapped pair must never hit."""
     key = None
     if use_cache and _pair_cache is not None:
-        key = _pair_cache.make_key("supersession", judge_mode, model,
+        key = _pair_cache.make_key("supersession", judge_mode,
+                                   _judge_model_id(judge_mode, model),
                                    _prompt_version("supersession", judge_mode),
                                    str(older_text), str(newer_text))
-        hit = _pair_cache.get(key)
+        hit = _pair_cache.get_with_ts(key)
         if hit is not None:
             if cache_stats is not None:
                 cache_stats["cache_hits"] = cache_stats.get("cache_hits", 0) + 1
-            return hit, "cache-hit"
+            return hit[0], _cache_hit_detail(hit[1])
     if judge_mode == "codex":
         verdict, detail = judge_supersession_codex(older_text, newer_text)
     else:
@@ -1292,10 +1315,12 @@ def run_retrieval_pairs(args) -> int:
     sweep never allowed hiding canonicals — they are counted, not actionable),
     and measures NOVELTY against the storage sweep's reachable set
     (canonical x its cosine neighborhood)."""
-    try:
-        PAIRS_LOCK.mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
+    # Review fix 5: use the stale-reclaiming lock (a SIGKILLed run must not
+    # block the mode forever) and leave a summary line on lock-held exits.
+    if not _acquire_lock(PAIRS_LOCK):
         print("contradiction-sweep: --retrieval-pairs already running (lock held) — exiting", flush=True)
+        _append_summary({"mode": "retrieval-pairs", "dry_run": True,
+                         "outcome": "no-op:lock-held"})
         return 0
     qdrant_http = httpx.Client()
     outcome = "ok"
@@ -1349,8 +1374,16 @@ def run_retrieval_pairs(args) -> int:
                 continue
             eligible.append({"ids": list(pair), "co_occurrence": len(qhs)})
 
-        # Novelty vs the storage sweep's reachable set (canonical x cosine
-        # neighborhood) — the receipt's headline number.
+        # Novelty vs what the STORAGE sweeps can actually reach — the
+        # receipt's headline number. Review fix 1 (MAJOR): the canonical
+        # neighborhood alone is VACUOUS here — every canonical-reachable pair
+        # has a canonical member and the eligibility loop above discards
+        # exactly those, so eligible∩canonical-reach is empty a priori and
+        # 'novel' would always equal 'eligible'. The honest baseline is the
+        # UNION of both sweeps' reach: canonical×neighbors (kept, it bounds
+        # the canonical_member split) PLUS the EVIDENCE sweep's reach
+        # (recent non-canonical anchors × cosine neighbors at the sim floor —
+        # mirrors run_evidence_sweep's exact selection).
         reachable: set = set()
         try:
             for can in scroll_canonicals(qdrant_http, user_id=args.user_id):
@@ -1362,6 +1395,23 @@ def run_retrieval_pairs(args) -> int:
                 for nb in query_similar(qdrant_http, vec, can_user, can_id,
                                         fetch_n=args.top_k * 3):
                     reachable.add(tuple(sorted((can_id, str(nb.get("id"))))))
+            allnc = scroll_noncanonical(qdrant_http, user_id=args.user_id)
+            allnc.sort(key=lambda p: (parse_created(p)
+                                      or dt.datetime.min.replace(tzinfo=dt.timezone.utc)),
+                       reverse=True)
+            anchor_pts = fetch_with_vectors(
+                qdrant_http, [p.get("id") for p in allnc[: args.max_anchors]])
+            for anchor in anchor_pts:
+                a_id = str(anchor.get("id"))
+                a_user = (anchor.get("payload") or {}).get("user_id")
+                vec = dense_vector(anchor)
+                if vec is None or not a_user:
+                    continue
+                for nb in query_similar(qdrant_http, vec, a_user, a_id,
+                                        fetch_n=max(args.top_k * 2, args.top_k)):
+                    if float(nb.get("score", 0.0) or 0.0) < args.evidence_sim_floor:
+                        continue
+                    reachable.add(tuple(sorted((a_id, str(nb.get("id"))))))
         except (httpx.HTTPError, OSError) as e:
             print(f"contradiction-sweep: novelty baseline failed (reported as null): {e}", flush=True)
             reachable = None
@@ -1381,6 +1431,9 @@ def run_retrieval_pairs(args) -> int:
             "pairs_canonical_member": canonical_member,
             "pairs_ineligible": ineligible,
             "pairs_novel_vs_storage_sweep": novel,
+            "novelty_baseline": "canonical-neighborhood UNION evidence-sweep reach",
+            "ids_source": ("returned_top_ids (top-3 per row until the [:10] "
+                           "widening deploys — co-occurrence is a lower bound)"),
             "top_pairs": eligible[:20],
             "note": ("count-only dry run — the judged retrieval-pairs mode is an "
                      "operator fork gated on material yield over a full widened "
@@ -1394,7 +1447,7 @@ def run_retrieval_pairs(args) -> int:
               f"canonical-member={canonical_member} novel={novel} "
               f"legacy-excluded={counts['excluded_legacy_rows']} -> {PAIRS_RECEIPT}",
               flush=True)
-    except (httpx.HTTPError, OSError) as e:
+    except Exception as e:  # noqa: BLE001 — a shape bug must still leave a summary line
         outcome = f"degraded:aborted:{type(e).__name__}: {str(e)[:120]}"
         print(f"contradiction-sweep: retrieval-pairs ABORT: {e}", flush=True)
     finally:

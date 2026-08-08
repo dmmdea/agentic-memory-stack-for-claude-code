@@ -137,8 +137,13 @@ def count_redactions(text: Optional[str]) -> dict:
     counts: dict = {}
     if not text:
         return counts
+    # Review fix 8: SEQUENTIAL subn on a working copy — running every pattern
+    # against the ORIGINAL text double-counted one credential matched by two
+    # rules; redact_secrets applies rules sequentially, so the honest
+    # would-apply count must too. The input is never mutated (subn copies).
+    work = text
     for i, (pattern, replacement) in enumerate(_SECRET_PATTERNS):
-        n = sum(1 for _ in pattern.finditer(text))
+        work, n = pattern.subn(replacement, work)
         if n:
             m = re.search(r"REDACTED_[A-Z_]+", str(replacement))
             key = m.group(0) if m else f"pattern_{i}"

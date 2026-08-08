@@ -81,6 +81,17 @@ def test_deploy_seeds_durable_fastembed_cache_before_restart():
     assert 'SparseTextEmbedding(model_name=' in deploy
 
 
+def test_deploy_retrieval_gate_rejects_all_skip_runs():
+    """W5 Trains-2+3 review fix 3: pytest exits 0 on an all-skip suite, so a
+    seeding regression that skipped every family would green-light the deploy.
+    The gate must require at least one PASSED family on a zero-exit run."""
+    deploy = (REPO_ROOT / "scripts" / "wsl" / "deploy.sh").read_text(
+        encoding="utf-8")
+    assert "GATE VACUOUS" in deploy
+    assert "grep -qE '[1-9][0-9]* passed'" in deploy
+    assert "test_retrieval_families.py" in deploy
+
+
 def test_mem0_unit_execstartpre_ordered_before_execstart():
     """systemd runs ExecStartPre before ExecStart regardless of file order, but
     keep the unit readable: the key fetch appears before the uvicorn line."""

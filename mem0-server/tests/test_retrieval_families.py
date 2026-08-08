@@ -192,9 +192,10 @@ def test_family_es_exact_token():
     try:
         # Spanish query, exact token — the W2 calibration held ES recall 1.0
         # at the production 0.30 threshold; this family is that receipt's
-        # standing enforcement (OQ#3).
+        # standing enforcement (OQ#3), so it MUST gate at 0.30 (review fix 6:
+        # a 0.1 gate would pass an ES collapse production callers feel).
         r = _search(f"cual es el servicio registrado con el id {t}?",
-                    threshold=0.1)
+                    threshold=0.30)
         assert mid in [x.get("id") for x in r.get("results", [])], (
             "FAMILY BREACH es_exact_token: Spanish exact-token query missed "
             "the fact (the W2 ES floor regressed)")

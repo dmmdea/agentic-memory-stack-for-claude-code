@@ -220,9 +220,22 @@ if [ "${MEM0_SKIP_RETRIEVAL_GATE:-0}" = "1" ]; then
     echo "==> retrieval gate SKIPPED (MEM0_SKIP_RETRIEVAL_GATE=1) — record why in the deploy notes"
 else
     echo "==> retrieval families gate (post-restart; repo suite + app venv; 300s bound)"
-    if ! (cd "$REPO_ROOT/mem0-server" && MEM0_KEY="$(cat "$HOME/.mem0/api-key")" \
+    _gate_out="$(mktemp)"
+    _gate_red=0
+    (cd "$REPO_ROOT/mem0-server" && MEM0_KEY="$(cat "$HOME/.mem0/api-key")" \
           MEM0_URL="http://127.0.0.1:18791" \
-          timeout 300 "$APP_DIR/.venv/bin/python" -m pytest -q tests/test_retrieval_families.py 2>&1 | tail -20); then
+          timeout 300 "$APP_DIR/.venv/bin/python" -m pytest -q tests/test_retrieval_families.py) \
+          > "$_gate_out" 2>&1 || _gate_red=1
+    tail -20 "$_gate_out"
+    # Review fix 3: pytest exits 0 on an ALL-SKIP run — a server regression
+    # that breaks seeding would skip every family loudly and green-light the
+    # deploy. A green gate must have EXERCISED at least one family.
+    if [ "$_gate_red" = "0" ] && ! grep -qE '[1-9][0-9]* passed' "$_gate_out"; then
+        echo "==> RETRIEVAL GATE VACUOUS: zero families actually ran (all skipped)."
+        _gate_red=1
+    fi
+    rm -f "$_gate_out"
+    if [ "$_gate_red" != "0" ]; then
         echo "==> RETRIEVAL GATE RED. /health/deep was GREEN moments ago, so this is a retrieval"
         echo "    REGRESSION (family floor breach), not infrastructure. New code IS live. Roll back:"
         echo "      git checkout $PREV_SHA && bash scripts/wsl/deploy.sh"

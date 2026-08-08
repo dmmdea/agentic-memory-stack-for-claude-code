@@ -87,6 +87,14 @@ def make_key(question_type: str, judge_mode: str, model: str,
 
 def get(key: str, now: Optional[float] = None) -> Optional[bool]:
     """Cached verdict, or None on miss/expiry/ANY cache failure."""
+    hit = get_with_ts(key, now=now)
+    return None if hit is None else hit[0]
+
+
+def get_with_ts(key: str, now: Optional[float] = None):
+    """(verdict, created_ts) or None — review fix 4: an APPLIED stamp whose
+    justification came from the cache must say WHEN the verdict was judged,
+    not just 'cache-hit'."""
     try:
         now = time.time() if now is None else now
         with _connect() as conn:
@@ -98,7 +106,7 @@ def get(key: str, now: Optional[float] = None) -> Optional[bool]:
         verdict, created = int(row[0]), float(row[1])
         if now - created > TTL_SECONDS:
             return None
-        return bool(verdict)
+        return bool(verdict), created
     except Exception:
         return None
 
