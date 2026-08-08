@@ -65,6 +65,22 @@ def test_installer_warms_fastembed_cache_into_durable_dir():
     assert export_ix < warm_ix, "cache-dir export must precede the encoder warm"
 
 
+def test_deploy_seeds_durable_fastembed_cache_before_restart():
+    """AMS-09b (W5 review F2): deploy.sh must seed the durable cache and must
+    do it BEFORE the service restart, so the fresh process loads from the
+    reboot-surviving dir on first encode. Dropping the step re-arms the
+    reboot time-bomb the cache_note check exists to catch."""
+    deploy = (REPO_ROOT / "scripts" / "wsl" / "deploy.sh").read_text(
+        encoding="utf-8")
+    seed_ix = deploy.find(
+        "FASTEMBED_CACHE_PATH=\"$FASTEMBED_CACHE\" \"$APP_DIR/.venv/bin/python\"")
+    restart_ix = deploy.find("systemctl --user restart mem0.service")
+    assert seed_ix != -1, "deploy.sh no longer seeds the fastembed cache"
+    assert restart_ix != -1
+    assert seed_ix < restart_ix, "seed must precede the restart"
+    assert 'SparseTextEmbedding(model_name=' in deploy
+
+
 def test_mem0_unit_execstartpre_ordered_before_execstart():
     """systemd runs ExecStartPre before ExecStart regardless of file order, but
     keep the unit readable: the key fetch appears before the uvicorn line."""

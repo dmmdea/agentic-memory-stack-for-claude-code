@@ -151,6 +151,37 @@ def test_zero_points_coverage_zero_no_crash():
     assert out["coverage"] == 0.0  # ok=True via the empty-collection carve-out
 
 
+def test_pinned_unpopulated_cache_gates_even_when_canary_green():
+    # AMS-09b (W5 review F2): a warm in-process encoder over an UNSEEDED
+    # durable cache is a reboot time-bomb — it must read dead BEFORE the
+    # reboot, not after. This is the pre-reboot signal the deploy gate and
+    # TMS catch.
+    out = evaluate_sparse_leg(True, True, 100, 100, CANARY_OK,
+                              cache_pinned=True, cache_populated=False)
+    assert out["ok"] is False and "cache_note" in out
+
+
+def test_pinned_populated_cache_keeps_verdict():
+    out = evaluate_sparse_leg(True, True, 100, 100, CANARY_OK,
+                              cache_pinned=True, cache_populated=True)
+    assert out["ok"] is True
+    assert out["cache_pinned"] is True and out["cache_populated"] is True
+
+
+def test_unpinned_cache_is_legacy_no_verdict():
+    # cache_pinned=None (legacy caller / env unset): no cache fields, no gate.
+    out = evaluate_sparse_leg(True, True, 100, 100, CANARY_OK)
+    assert out["ok"] is True and "cache_pinned" not in out
+
+
+def test_empty_collection_with_pinned_unpopulated_cache_still_gates():
+    # The fresh-box carve-out forgives a missing corpus, never a time-bomb:
+    # the installer post-condition seeds the cache on every install path.
+    out = evaluate_sparse_leg(True, True, 0, 0, CANARY_NOT_RUN,
+                              cache_pinned=True, cache_populated=False)
+    assert out["ok"] is False and "cache_note" in out
+
+
 def test_canary_token_rule_is_deterministic():
     # Longest token wins; lexicographic tiebreak; stable across calls.
     assert pick_canary_token("alpha beta gamma-long zzz") == "gamma-long"

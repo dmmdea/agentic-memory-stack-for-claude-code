@@ -85,16 +85,23 @@ def pick_canary_token(text_lemmatized):
 
 
 def evaluate_sparse_leg(fastembed_present, bm25_slot, points, with_bm25,
-                        canary, error=None):
+                        canary, error=None, *,
+                        cache_pinned=None, cache_populated=None):
     """Pure verdict. GATING failures: fastembed missing, slot missing,
     canary did not hit (including 'no bm25-bearing point to probe' on a
-    populated corpus). Coverage is reported but does NOT gate here —
-    Test-MemoryStack WARNs below 0.95; a half-backfilled corpus with a live
-    encoder is degraded, not dead."""
+    populated corpus), and — AMS-09b (W5 review F2) — a PINNED durable cache
+    that is unpopulated: the encoder may be warm in-process today, but the
+    next reboot kills the leg (HF_HUB_OFFLINE forbids re-download), so the
+    time-bomb must read dead BEFORE the reboot, not after. ``cache_pinned``
+    None = legacy caller, no cache verdict. Coverage is reported but does NOT
+    gate here — Test-MemoryStack WARNs below 0.95; a half-backfilled corpus
+    with a live encoder is degraded, not dead."""
     coverage = (float(with_bm25) / float(points)) if points else 0.0
     if points == 0 and fastembed_present and bm25_slot:
-        # Fresh install: nothing exists to probe, nothing can be dead.
-        return {
+        # Fresh install: nothing exists to probe, nothing can be dead —
+        # except an unseeded pinned cache, which is a reboot time-bomb on a
+        # fresh box too (the installer post-condition normally seeds it).
+        out = {
             "ok": True,
             "fastembed": bool(fastembed_present),
             "bm25_slot": bool(bm25_slot),
@@ -102,20 +109,49 @@ def evaluate_sparse_leg(fastembed_present, bm25_slot, points, with_bm25,
             "canary": canary,
             "note": "empty collection — canary skipped",
         }
-    ok = bool(fastembed_present and bm25_slot
-              and canary and canary.get("ran") and canary.get("hit"))
-    out = {
-        "ok": ok,
-        "fastembed": bool(fastembed_present),
-        "bm25_slot": bool(bm25_slot),
-        "points": int(points or 0),
-        "with_bm25": int(with_bm25 or 0),
-        "coverage": round(coverage, 4),
-        "canary": canary,
-    }
-    if error:
-        out["error"] = str(error)[:160]
+    else:
+        ok = bool(fastembed_present and bm25_slot
+                  and canary and canary.get("ran") and canary.get("hit"))
+        out = {
+            "ok": ok,
+            "fastembed": bool(fastembed_present),
+            "bm25_slot": bool(bm25_slot),
+            "points": int(points or 0),
+            "with_bm25": int(with_bm25 or 0),
+            "coverage": round(coverage, 4),
+            "canary": canary,
+        }
+        if error:
+            out["error"] = str(error)[:160]
+    if cache_pinned is not None:
+        out["cache_pinned"] = bool(cache_pinned)
+        out["cache_populated"] = bool(cache_populated)
+        if cache_pinned and not cache_populated:
+            out["ok"] = False
+            out["cache_note"] = (
+                "durable fastembed cache UNPOPULATED — the leg dies at the "
+                "next reboot; run deploy.sh (seed step) or the installer"
+            )
     return out
+
+
+def _cache_facts():
+    """AMS-09b: durable-cache posture, computed the way fastembed itself
+    resolves its cache dir (env FASTEMBED_CACHE_PATH, else tempdir). The
+    populated check keys on the models--Qdrant--bm25 layout observed live.
+    Never raises."""
+    import os
+    import tempfile
+    from pathlib import Path
+    try:
+        env = os.environ.get("FASTEMBED_CACHE_PATH")
+        cache_dir = Path(env) if env else (
+            Path(tempfile.gettempdir()) / "fastembed_cache")
+        populated = cache_dir.is_dir() and any(
+            cache_dir.glob("models--Qdrant--bm25*"))
+        return env is not None, bool(populated)
+    except Exception:
+        return None, None
 
 
 def sparse_leg_health(client, collection_name, encode_query_fn):
@@ -123,6 +159,7 @@ def sparse_leg_health(client, collection_name, encode_query_fn):
     encoder (``vector_store._encode_bm25`` — returns a sparse query object,
     or ``None`` when the encoder is unavailable). Never raises."""
     canary = {"ran": False, "hit": False, "token": None}
+    _pinned, _populated = _cache_facts()
     try:
         from qdrant_client import models as _qm
 
@@ -141,6 +178,7 @@ def sparse_leg_health(client, collection_name, encode_query_fn):
         if points == 0:
             return evaluate_sparse_leg(
                 fastembed_present, bm25_slot, 0, 0, canary,
+                cache_pinned=_pinned, cache_populated=_populated,
             )
 
         # Oldest bm25-bearing point: filtered scroll, min created_at (no
@@ -168,6 +206,7 @@ def sparse_leg_health(client, collection_name, encode_query_fn):
             return evaluate_sparse_leg(
                 fastembed_present, bm25_slot, points, with_bm25, canary,
                 error="no bm25-bearing point to canary (populated corpus, zero sparse vectors)",
+                cache_pinned=_pinned, cache_populated=_populated,
             )
 
         token = pick_canary_token(oldest[2])
@@ -190,6 +229,9 @@ def sparse_leg_health(client, collection_name, encode_query_fn):
                 canary["hit"] = oldest[1] in ids
         return evaluate_sparse_leg(
             fastembed_present, bm25_slot, points, with_bm25, canary,
+            cache_pinned=_pinned, cache_populated=_populated,
         )
     except Exception as e:
-        return evaluate_sparse_leg(False, False, 0, 0, canary, error=e)
+        return evaluate_sparse_leg(False, False, 0, 0, canary, error=e,
+                                   cache_pinned=_pinned,
+                                   cache_populated=_populated)

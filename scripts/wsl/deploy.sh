@@ -162,6 +162,23 @@ if ! (cd "$APP_DIR" && ./.venv/bin/python -c "import app" >/dev/null 2>&1); then
 fi
 echo "    import smoke OK"
 
+# --- 4b. AMS-09b (W5 review F2): idempotent durable fastembed-cache seed ---
+# The unit pins FASTEMBED_CACHE_PATH to a reboot-surviving dir and runs
+# HF_HUB_OFFLINE=1, so the SERVER can never download the BM25 model itself —
+# this seed is the only thing standing between the next reboot and the leg's
+# third death. No-op (~1s) when the dir is already populated. Runs BEFORE the
+# restart so the fresh process loads from the durable dir on first encode.
+FASTEMBED_CACHE="$HOME/.cache/fastembed"
+mkdir -p "$FASTEMBED_CACHE"
+if ! FASTEMBED_CACHE_PATH="$FASTEMBED_CACHE" "$APP_DIR/.venv/bin/python" -c \
+    "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')" >/dev/null 2>&1; then
+    echo "==> FASTEMBED SEED FAILED — durable cache at $FASTEMBED_CACHE could not be populated."
+    echo "    The next reboot would kill the BM25 leg (the offline server cannot re-download)."
+    echo "    Check network reachability, then re-run. Deploy ABORTED before restart."
+    exit 1
+fi
+echo "    fastembed durable cache seeded OK ($FASTEMBED_CACHE)"
+
 # --- 5. restart + health gate ---
 systemctl --user restart mem0.service
 for i in $(seq 1 30); do
