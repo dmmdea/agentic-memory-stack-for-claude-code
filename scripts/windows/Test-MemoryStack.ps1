@@ -923,6 +923,23 @@ try {
     }
 } catch { Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'FAIL' 'not registered' }
 
+# R2b (W6 PR-A, roast F3): the 4:30am semantic-dedup task's LIVE action must
+# execute the DEPLOYED copy. A destructive nightly job ran an unmanaged dev
+# worktree's checkout for weeks while 3-verify's substring match stayed green
+# — this probe reads the LIVE task (not installer text, the vacuity M6's
+# mutation targets) and FAILS on any repo/worktree action path.
+try {
+    $dtask = Get-ScheduledTask -TaskName 'ClaudeCode-SemanticDedup-430am' -ErrorAction Stop
+    $dArgs = $dtask.Actions[0].Arguments
+    if ($dArgs -match '/mnt/[a-z]/(Dev|repos)') {
+        Add-Check 'RECOVERY' 'dedup task launch path' 'FAIL' "LIVE action executes a repo/worktree path, not the deployed copy: $dArgs — re-run 2-windows-config.ps1 (repointed W6)"
+    } elseif ($dArgs -match 'apps/mem0-scripts/semantic-dedup\.py') {
+        Add-Check 'RECOVERY' 'dedup task launch path' 'OK' 'LIVE action executes the deployed ~/apps/mem0-scripts copy'
+    } else {
+        Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' "unrecognized action shape: $dArgs"
+    }
+} catch { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered (replica role, or install incomplete)' }
+
 # R3: Latest backup manifest exists and is fresh (< 48h)
 try {
     $backupDir = "$TmsHomeUnc\.mem0\backups"
