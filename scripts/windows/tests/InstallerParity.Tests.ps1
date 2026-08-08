@@ -588,3 +588,24 @@ Describe 'SessionStart self-heal rebuilds a missing mem0-hook-client.exe (v0.20 
         Test-Path $exe | Should -BeFalse
     }
 }
+
+Describe 'W6 PR-A: semantic-dedup task action executes the DEPLOYED copy' {
+    It 'builds $dedupCmd from ~/apps/mem0-scripts, never $RepoRootWsl (checkout-as-deployment guard)' {
+        $cfg = Get-Content (Join-Path $PSScriptRoot '..\..\..\install\2-windows-config.ps1') -Raw
+        $line = ($cfg -split "`n" | Where-Object { $_ -match '^\$dedupCmd = ' }) -join ''
+        $line | Should -Match 'apps/mem0-scripts/semantic-dedup\.py'
+        $line | Should -Not -Match 'RepoRootWsl'
+    }
+    It 'runs the destructive dedup THROUGH the durable queue (W6 review fix 5: reverting to direct exec was green everywhere)' {
+        $cfg = Get-Content (Join-Path $PSScriptRoot '..\..\..\install\2-windows-config.ps1') -Raw
+        $line = ($cfg -split "`n" | Where-Object { $_ -match '^\$dedupCmd = ' }) -join ''
+        $line | Should -Match 'jobs\.py run semantic-dedup'
+        $line | Should -Match '--receipt /home/\$WslUser/\.mem0/dedup-summary\.jsonl'
+        $line | Should -Match '--stale-after \d+'
+    }
+    It '3-verify rejects worktree/repo action paths (the old substring check was vacuous on the path)' {
+        $v = Get-Content (Join-Path $PSScriptRoot '..\..\..\install\3-verify.ps1') -Raw
+        $v | Should -Match 'apps/mem0-scripts/semantic-dedup\\\.py'
+        $v | Should -Match 'notmatch .{1,3}mnt/\[a-z\]/\(Dev\|repos\)'
+    }
+}

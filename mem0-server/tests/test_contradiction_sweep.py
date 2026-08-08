@@ -1017,6 +1017,12 @@ def test_weekly_unit_judges_with_codex_not_local():
     assert exec_line, "contradiction-sweep.service has no ExecStart"
     assert "--judge codex" in exec_line
     assert "--judge local" not in exec_line
+    # W6 PR-D (F7e): the queue wrapper's PRESENCE is forced — the old
+    # substring pins pass equally on a wrapped and an unwrapped ExecStart,
+    # so reverting to direct exec would otherwise stay green.
+    assert "jobs.py run contradiction-sweep" in exec_line
+    assert "--receipt %h/.mem0/contradiction-sweep.jsonl" in exec_line
+    assert "--stale-after" in exec_line
 
 
 def test_main_codex_preflight_noops_when_bridge_import_failed(monkeypatch):

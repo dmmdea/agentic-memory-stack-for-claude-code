@@ -42,6 +42,11 @@ ExecStartPre=-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoP
 # always exits 0, so a shim that never comes up degrades to the documented
 # skipped week rather than failing the unit.
 ExecStartPre=-/bin/sh -c 'for i in $(seq 1 30); do curl -sf -m 2 http://127.0.0.1:18792/health >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
-ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --apply --limit 50 --judge codex
+# W6 PR-D (reference adopter): the sweep runs through the durable queue —
+# claim → execute → keyed-receipt observation (its own summary JSONL, which
+# already speaks the outcome grammar) → done/failed, with per-name reap.
+# stale_after 3h vs a worst-case ~1-2h Codex-judged run; the sweep stamps
+# jobs_key into its summary line so observation attributes THIS run (F1).
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/jobs.py run contradiction-sweep --receipt %h/.mem0/contradiction-sweep.jsonl --stale-after 10800 -- /home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --apply --limit 50 --judge codex
 StandardOutput=journal
 StandardError=journal

@@ -81,6 +81,14 @@ def test_deploy_seeds_durable_fastembed_cache_before_restart():
     assert 'SparseTextEmbedding(model_name=' in deploy
 
 
+def test_jobs_queue_suite_is_ci_gated():
+    """W6 F7e: a test file absent from ci.yml's explicit allowlist gates
+    nothing (the W1 silent-not-gating class) — pin the queue suite's entry."""
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8")
+    assert "mem0-server/tests/test_jobs_queue.py" in ci
+
+
 def test_deploy_retrieval_gate_rejects_all_skip_runs():
     """W5 Trains-2+3 review fix 3: pytest exits 0 on an all-skip suite, so a
     seeding regression that skipped every family would green-light the deploy.

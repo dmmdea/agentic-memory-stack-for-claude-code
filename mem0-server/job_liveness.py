@@ -282,8 +282,41 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
         "outbox_depth": None,
         "outbox_replayed_age_h": None,
         "outbox_drain_log_age_h": None,
+        # --- W6 D5: job-queue aggregates, read from the FILE mirror
+        # (~/.mem0/jobs-heartbeat.json, refreshed by every jobs.py run) —
+        # never the sqlite db (the /health/deep budget note + banner purity).
+        # jobs_heartbeat_age_h age-gates the rest: a dead queue must not
+        # present a stale mirror as current (F7d).
+        "jobs_heartbeat_age_h": None,
+        "jobs_queued": None,
+        "jobs_running": None,
+        "jobs_failed_24h": None,
+        "jobs_reaped_24h": None,
+        "jobs_oldest_running_age_h": None,
+        "jobs_oldest_queued_age_h": None,
     }
     notes = []
+
+    try:
+        hb_path = mem0_dir / "jobs-heartbeat.json"
+        if hb_path.exists():
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            hb_ts = parse_ts_epoch(hb.get("ts"))
+            if hb_ts is not None:
+                out["jobs_heartbeat_age_h"] = round((now_s - hb_ts) / 3600, 2)
+            out["jobs_queued"] = hb.get("queued")
+            out["jobs_running"] = hb.get("running")
+            out["jobs_failed_24h"] = hb.get("failed_24h")
+            out["jobs_reaped_24h"] = hb.get("reaped_24h")
+            if hb.get("oldest_running_age_s") is not None:
+                out["jobs_oldest_running_age_h"] = round(
+                    float(hb["oldest_running_age_s"]) / 3600, 2)
+            if hb.get("oldest_queued_age_s") is not None:
+                out["jobs_oldest_queued_age_h"] = round(
+                    float(hb["oldest_queued_age_s"]) / 3600, 2)
+        # No mirror = no queue adoption yet on this box — silent, not an error.
+    except (OSError, ValueError) as e:
+        notes.append(f"jobs_heartbeat: {e.__class__.__name__}")
 
     # --- WSL-native sources ---
     try:

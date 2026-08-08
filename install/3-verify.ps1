@@ -175,8 +175,14 @@ Check "Task Scheduler 3am dream-consolidate" {
     $t -ne $null -and $t.Actions[0].Arguments -match 'dream-consolidate\.ps1'
 } "Re-run 2-windows-config.ps1"
 Check "Task Scheduler 4:30am semantic-dedup" {
+    # W6 PR-A: the old substring match ('semantic-dedup\.py') was VACUOUS on
+    # the path — it stayed green while the live action executed an unmanaged
+    # dev worktree. The check now asserts the DEPLOYED launch path and
+    # explicitly rejects any /mnt/*worktree*/repo action.
     $t = Get-ScheduledTask -TaskName 'ClaudeCode-SemanticDedup-430am' -ErrorAction SilentlyContinue
-    $t -ne $null -and $t.Actions[0].Arguments -match 'semantic-dedup\.py'
+    ($t -ne $null) -and
+    ($t.Actions[0].Arguments -match 'apps/mem0-scripts/semantic-dedup\.py') -and
+    ($t.Actions[0].Arguments -notmatch '/mnt/[a-z]/(Dev|repos)')
 } "Re-run 2-windows-config.ps1"
 } else {
 Check "Replica role: dream/dedup tasks absent (one-brain rule)" {

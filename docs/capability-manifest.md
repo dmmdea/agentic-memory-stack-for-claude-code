@@ -66,6 +66,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `tier-policy` | tier enforcement (canonical HMAC, insight allowlist) | checks.admission_probe.tier_rejected — read-half server-probed; write-half proven by Test-MemoryStack I-rows on demand | both | F17 |
 | `brand-isolation` | brand-scoped retrieval isolation | checks.admission_probe.brand_rejected (read half) + job_liveness.brand_scope_misscoped/brand_scope_age_h (nightly write-side audit) | both | F17 |
 | `offline-outbox` | shim outbox queue/replay when the authority is unreachable | job_liveness.outbox_depth + outbox_replayed_age_h + outbox_drain_log_age_h — evaluated on the REPLICA only (F8 keeps it non-convicting on a brain box) | replica | F17 |
+| `job-queue` | durable two-phase job queue (jobs.py): claim/receipt/reap for adopted scheduled jobs | job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h | optional | W6 |
 
 Verdict rules per probe family (all thresholds live in `capabilities.py`):
 
@@ -146,3 +147,21 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
   proves the mechanism); empty queue with no replay ever → `unknown` (F9 — an empty outbox on a box
   that never went offline is silence, not health). `required: replica`, so on a brain box F8 keeps
   it out of `dead_required` whatever it says.
+
+## job-queue
+
+**What:** the W6 durable two-phase job queue (`scripts/wsl/jobs.py`): adopted scheduled jobs run
+through claim → execute → keyed-receipt observation → done/failed, with per-name stale-claim reap
+(same-host reap requires the recorded pid DEAD and the claim past its stale_after; foreign-host
+rows reap on age alone — the owner is host-keyed so a restored `jobs.db` can never let this box
+requeue another box's live work).
+
+**Probe:** `job_liveness.jobs_heartbeat_age_h` + `jobs_failed_24h` + `jobs_oldest_running_age_h`
++ `jobs_oldest_queued_age_h`, all read from the file mirror `~/.mem0/jobs-heartbeat.json` that
+every `jobs.py` invocation refreshes — the sqlite db itself is never opened on the health path
+(the deploy-gate budget rule), and the SessionStart banner reads the same mirror as a plain file.
+
+**Verdict:** no mirror at all → `unknown` (no adopter has run on this box; an idle box must never
+read dead); mirror older than 8 days (past the weekly cadence) → `degraded` — a dead queue must
+not present a stale mirror as current (the designed-but-dead class); `jobs_failed_24h > 0` →
+`degraded`; otherwise `alive`. `required: optional` — adoption is per-job and staged.
