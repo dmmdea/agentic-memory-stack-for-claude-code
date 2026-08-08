@@ -19,6 +19,61 @@ recon = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(recon)
 
 
+# --- W7 AMS-20/19: the verdict must reflect the count; coverage measured ---
+
+def test_ams20_orphan_backlog_degrades_the_outcome():
+    """The finding itself: the run COUNTED dozens of orphans and still wrote
+    outcome='ok', so nothing ever escalated. Past the threshold the verdict
+    must degrade (TMS + the heartbeat key off outcome)."""
+    assert recon.reconcile_outcome(True, True, orphaned_count=0) == "ok"
+    assert recon.reconcile_outcome(
+        True, True, orphaned_count=recon.ORPHAN_DEGRADE_THRESHOLD) == "ok"
+    out = recon.reconcile_outcome(True, True, orphaned_count=59)
+    assert out.startswith("degraded:orphaned-links:59")
+    assert recon.exit_code_for(out) == 1
+
+
+def test_ams20_infra_degradations_still_win_over_the_orphan_verdict():
+    assert recon.reconcile_outcome(False, True, orphaned_count=99) == \
+        "degraded:no-episodic-db"
+    assert recon.reconcile_outcome(True, False, orphaned_count=99) == \
+        "degraded:qdrant-unreachable"
+
+
+def test_ams19_embedding_coverage_measured(tmp_path):
+    db = tmp_path / "e.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, summary TEXT)")
+    conn.executemany("INSERT INTO episodes (summary) VALUES (?)",
+                     [("a summary",), ("another",), ("",), (None,)])
+    conn.commit()
+
+    def handler(request):
+        return httpx.Response(200, json={"result": {"count": 1}})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    out = recon.embedding_coverage(conn, http)
+    conn.close()
+    # 2 eligible (non-empty summaries), 1 embedded -> 1 missing
+    assert out == {"eligible": 2, "embedded": 1, "missing": 1}
+
+
+def test_ams19_coverage_probe_never_raises(tmp_path):
+    """A coverage probe must never fail the reconciliation run."""
+    db = tmp_path / "e.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, summary TEXT)")
+    conn.commit()
+
+    def boom(request):
+        raise httpx.ConnectError("down")
+
+    http = httpx.Client(transport=httpx.MockTransport(boom))
+    out = recon.embedding_coverage(conn, http)
+    conn.close()
+    assert out["missing"] is None and "error" in out
+
+
 # --- classify_links (pure) ---
 
 def _link(lid, ep, kind, tid, lt="produced_evidence"):

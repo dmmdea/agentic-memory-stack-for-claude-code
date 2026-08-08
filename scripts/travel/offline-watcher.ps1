@@ -113,7 +113,20 @@ elseif ($next.transition -eq 'go_online') {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
     $RepoWsl  = "$(Wsl "wslpath '$($repoRoot -replace '\\','/')'")".Trim()
     if ($RepoWsl) {
-        Wsl "MEM0_URL='$Authority' ~/apps/mem0-server/.venv/bin/python $RepoWsl/scripts/wsl/replay-ops.py" | Out-Null
+        # AMS-48 (2026-08-08): the drain's output used to go to Out-Null, so a
+        # replay that abandoned writes to mutation-conflicts.jsonl left NO trace
+        # anywhere — the one moment the outbox's whole purpose is on the line
+        # was the one moment nothing was recorded. Tee the stats (with a ts) to
+        # ~/.mem0/outbox-drain.log, which job_liveness already ages.
+        # Also run the DEPLOYED replay-ops (~/apps/mem0-scripts), not the
+        # checkout copy: a watcher firing against a stale/absent worktree was
+        # the same checkout-as-deployment class as the dedup task (AMS-31/50).
+        $drainOut = Wsl "MEM0_URL='$Authority' ~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/replay-ops.py 2>&1"
+        $drainTs  = (Get-Date).ToUniversalTime().ToString('o')
+        $drainLine = ('{{"ts":"{0}","event":"outbox-drain","result":{1}}}' -f `
+            $drainTs, (($drainOut | Out-String).Trim() | ForEach-Object { if ($_ -match '^\s*\{') { $_ } else { ($_ | ConvertTo-Json -Compress) } }))
+        Wsl "printf '%s\n' '$($drainLine -replace "'", "''")' >> ~/.mem0/outbox-drain.log" | Out-Null
+        Write-Host "offline-watcher: outbox drain -> $drainOut"
     } else {
         # transient WSL failure: skip replay rather than run a garbage path — the outbox
         # persists on disk, so the drain happens on the next offline->online cycle

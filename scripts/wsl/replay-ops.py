@@ -80,6 +80,11 @@ def dispatch(op: str, args: dict) -> httpx.Response:
     r.raise_for_status()
     return r
 
+# AMS-28: the shim's retryable set, mirrored here so the two halves of the
+# offline path agree on what "try again later" means (the shim queues on
+# these; the drainer must not then discard them as conflicts).
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]", ""}
 
 
@@ -164,6 +169,26 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
             done_keys.add(k)  # in-batch dedup: a duplicated key later in this batch must skip
             stats["replayed"] += 1
         except httpx.HTTPStatusError as e:
+            # AMS-28 (2026-08-08): a RETRYABLE status is not a conflict. The
+            # drainer treated every HTTP error as terminal, so a 503 (the
+            # authority still coming up — precisely the condition the outbox
+            # exists for) sent the write to mutation-conflicts.jsonl, which
+            # nothing alarms on: the queued write was silently abandoned.
+            # Mirror the shim's _RETRYABLE_STATUS: keep the record, stop the
+            # drain (a 503 now means the rest will 503 too), honour
+            # Retry-After when the server sends one.
+            if e.response.status_code in _RETRYABLE_STATUS:
+                kept.append(rec)
+                stats["kept"] += 1
+                retry_after = e.response.headers.get("retry-after")
+                stats["stopped_retryable"] = {
+                    "status": e.response.status_code, "op": rec["op"],
+                    "retry_after": retry_after,
+                }
+                # everything after this record stays queued, in order
+                kept.extend(recs[recs.index(rec) + 1:])
+                stats["kept"] += len(recs) - recs.index(rec) - 1
+                break
             with conflicts.open("a", encoding="utf-8") as cf:
                 cf.write(json.dumps({"op": rec["op"], "args": rec.get("args"), "key": k,
                                      "status": e.response.status_code}) + "\n")
@@ -182,6 +207,16 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
         replaying.write_text("\n".join(json.dumps(r) for r in kept) + "\n", encoding="utf-8")
     else:
         replaying.unlink(missing_ok=True)
+    # AMS-28: a non-empty conflicts file is an abandoned WRITE — surface its
+    # depth in the stats every caller already prints/logs, so it can never sit
+    # there unnoticed again.
+    try:
+        if conflicts.exists():
+            stats["conflicts_total"] = sum(
+                1 for ln in conflicts.read_text(encoding="utf-8").splitlines()
+                if ln.strip())
+    except OSError:
+        pass
     return stats
 
 if __name__ == "__main__":
