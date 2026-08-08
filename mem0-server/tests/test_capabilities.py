@@ -65,6 +65,10 @@ GREEN_CHECKS = {
         "brand_scope_age_h": 12.0, "brand_scope_misscoped": 0,
         "outbox_depth": 0, "outbox_replayed_age_h": 100.0,
         "outbox_drain_log_age_h": 100.0,
+        # W6 D5: fresh queue mirror, nothing failed/stuck -> alive.
+        "jobs_heartbeat_age_h": 0.5, "jobs_queued": 0, "jobs_running": 0,
+        "jobs_failed_24h": 0, "jobs_reaped_24h": 0,
+        "jobs_oldest_running_age_h": None, "jobs_oldest_queued_age_h": None,
     },
     "retrieval_drift": {
         "state_present": True, "last_compare_ts": "2026-08-07T03:00:00",

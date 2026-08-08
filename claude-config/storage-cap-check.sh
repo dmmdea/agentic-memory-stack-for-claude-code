@@ -393,6 +393,26 @@ if [ -s "$_CSW" ]; then
   _noop=$(grep -v '"mode":' "$_CSW" 2>/dev/null | tail -n 3 | grep -c '"outcome": *"no-op' 2>/dev/null)
   [ "${_noop:-0}" -ge 3 ] && _hb+="contradiction sweep: 3+ consecutive no-op runs (judgment leg dead — see AMS-07). "
 fi
+# W6 D5: job-queue signals — a cheap FILE read of the jobs.py mirror (never
+# the sqlite db; the banner's no-/health/deep pin applies to db opens in
+# spirit). Age-gated (F7d): a stale mirror is itself the alarm.
+_JHB="$HOME/.mem0/jobs-heartbeat.json"
+if [ -s "$_JHB" ]; then
+  _jq=$(python3 -c "
+import json, datetime as dt
+try:
+    d = json.load(open('$_JHB'))
+    ts = dt.datetime.fromisoformat(str(d.get('ts')).replace('Z', '+00:00'))
+    age_h = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds() / 3600
+    bits = []
+    if age_h > 192: bits.append('job-queue mirror STALE %.0fh (dead queue?)' % age_h)
+    if int(d.get('failed_24h') or 0) > 0: bits.append('%d job(s) FAILED in 24h (jobs.py status <name>)' % int(d['failed_24h']))
+    if d.get('oldest_queued_age_s') and float(d['oldest_queued_age_s']) > 172800: bits.append('a queued job has waited %.0fh (stuck row?)' % (float(d['oldest_queued_age_s'])/3600))
+    print('; '.join(bits))
+except Exception:
+    pass" 2>/dev/null)
+  [ -n "$_jq" ] && _hb+="$_jq. "
+fi
 [ -n "$_hb" ] && echo "[heartbeat] $_hb"
 
 [ -n "$warnings" ] && echo "[storage-cap] $warnings Triage with: python scripts/wsl/audit-flags-triage.py --summary  (then --resolve --reason ...)."

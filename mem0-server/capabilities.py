@@ -195,6 +195,13 @@ CAPABILITIES = [
      "probe": ("job_liveness.outbox_depth + outbox_replayed_age_h + outbox_drain_log_age_h "
                "— evaluated on the REPLICA only (F8 keeps it non-convicting on a brain box)"),
      "required": "replica", "escalation_documented": True},
+    # W6 D5 (appended LAST — the manifest doc is order-pinned): the durable
+    # job queue. File-mirror-based per R4 (the db is never opened here).
+    {"id": "job-queue",
+     "what": "durable two-phase job queue (jobs.py): claim/receipt/reap for adopted scheduled jobs",
+     "probe": ("job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + "
+               "jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h"),
+     "required": "optional", "escalation_documented": True},
 ]
 
 _ROLES = ("brain", "replica")
@@ -599,7 +606,30 @@ def _state_for(row, checks, stack_version=None, now_s=None):
         return _brand_isolation_state(checks.get("admission_probe"), jl)
     if cid == "offline-outbox":
         return _offline_outbox_state(jl)
+    if cid == "job-queue":
+        return _job_queue_state(jl)
     return "unknown"           # a row without an evaluator is a named blind spot
+
+
+def _job_queue_state(jl):
+    """W6 D5. Two-signal + F7d: no mirror at all = 'unknown' (no adopter has
+    run on this box — an idle box must never read dead); a mirror OLDER than
+    the weekly cadence (>8 days) is 'degraded' (a dead queue must not present
+    a stale mirror as current); failures in the last 24h = 'degraded';
+    otherwise alive."""
+    if not isinstance(jl, dict):
+        return "unknown"
+    age = jl.get("jobs_heartbeat_age_h")
+    if age is None:
+        return "unknown"
+    try:
+        if float(age) > 8 * 24:
+            return "degraded"
+        if int(jl.get("jobs_failed_24h") or 0) > 0:
+            return "degraded"
+    except (TypeError, ValueError):
+        return "unknown"
+    return "alive"
 
 
 def _required_applies(required, role):

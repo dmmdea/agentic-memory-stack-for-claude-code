@@ -50,7 +50,12 @@ JL_KEYS = {"role", "last_dream_age_h", "prune_age_h", "gather_age_h",
            "mcp_shim_receipt_age_h", "mcp_shim_host_match",
            "mcp_shim_stack_version",
            "brand_scope_age_h", "brand_scope_misscoped",
-           "outbox_depth", "outbox_replayed_age_h", "outbox_drain_log_age_h"}
+           "outbox_depth", "outbox_replayed_age_h", "outbox_drain_log_age_h",
+           # W6 D5: job-queue aggregates from the jobs-heartbeat.json mirror
+           # (same-commit with job_liveness.py — this set is strict-equality).
+           "jobs_heartbeat_age_h", "jobs_queued", "jobs_running",
+           "jobs_failed_24h", "jobs_reaped_24h",
+           "jobs_oldest_running_age_h", "jobs_oldest_queued_age_h"}
 DS_KEYS = {"state_present", "last_compare_ts", "age_hours",
            "before_retrievable", "n_total", "hwm", "hwm_seeded",
            "consecutive_below_hwm", "consecutive_snapshot_failures",

@@ -144,7 +144,8 @@ def _refresh_heartbeat(conn: sqlite3.Connection) -> None:
             " SUM(CASE WHEN state='running' THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN state='failed' AND finished_at > ? THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN reap_count > 0 AND claimed_at > ? THEN 1 ELSE 0 END),"
-            " MIN(CASE WHEN state='running' THEN claimed_at END)"
+            " MIN(CASE WHEN state='running' THEN claimed_at END),"
+            " MIN(CASE WHEN state='queued' THEN created_at END)"
             " FROM jobs", (now - 86400, now - 86400)).fetchone()
         hb = {
             "ts": _iso(now),
@@ -154,6 +155,10 @@ def _refresh_heartbeat(conn: sqlite3.Connection) -> None:
             "reaped_24h": int(row[3] or 0),
             "oldest_running_age_s": (round(now - row[4], 1)
                                      if row[4] is not None else None),
+            # F7c: a stuck-queued row is the 'deployed, never triggered'
+            # class — its age must be visible, not just its existence.
+            "oldest_queued_age_s": (round(now - row[5], 1)
+                                    if row[5] is not None else None),
         }
         tmp = HEARTBEAT.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(hb), encoding="utf-8")
