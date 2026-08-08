@@ -627,6 +627,16 @@ def _job_queue_state(jl):
             return "degraded"
         if int(jl.get("jobs_failed_24h") or 0) > 0:
             return "degraded"
+        # Review fix 3: a WEDGED claim (crash + pid recycling, or any owner
+        # that never returns) makes every later run exit 'claim lost' — which
+        # still refreshes the mirror, so freshness alone reads healthy while
+        # the job never runs again. Convict on the stuck row itself.
+        stuck = jl.get("jobs_oldest_running_age_h")
+        if stuck is not None and float(stuck) > 48:
+            return "degraded"
+        queued = jl.get("jobs_oldest_queued_age_h")
+        if queued is not None and float(queued) > 48:
+            return "degraded"
     except (TypeError, ValueError):
         return "unknown"
     return "alive"

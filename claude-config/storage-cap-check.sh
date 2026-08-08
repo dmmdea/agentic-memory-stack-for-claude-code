@@ -408,6 +408,7 @@ try:
     if age_h > 192: bits.append('job-queue mirror STALE %.0fh (dead queue?)' % age_h)
     if int(d.get('failed_24h') or 0) > 0: bits.append('%d job(s) FAILED in 24h (jobs.py status <name>)' % int(d['failed_24h']))
     if d.get('oldest_queued_age_s') and float(d['oldest_queued_age_s']) > 172800: bits.append('a queued job has waited %.0fh (stuck row?)' % (float(d['oldest_queued_age_s'])/3600))
+    if d.get('oldest_running_age_s') and float(d['oldest_running_age_s']) > 172800: bits.append('a job has been RUNNING %.0fh (wedged claim - jobs.py status <name>)' % (float(d['oldest_running_age_s'])/3600))
     print('; '.join(bits))
 except Exception:
     pass" 2>/dev/null)

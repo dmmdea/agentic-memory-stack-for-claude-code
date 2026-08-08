@@ -165,30 +165,104 @@ def test_stale_dead_same_host_claim_is_reaped_with_same_key(_tmp_home):
 
 def test_stale_but_alive_same_host_claim_survives(_tmp_home):
     # F2: age alone must not requeue a same-host job whose pid is ALIVE
-    # (long-running destructive work). Own pid = alive.
+    # (long-running destructive work). Own pid + THIS boot = alive.
     conn = jobs._connect()
     with conn:
         conn.execute(
             "INSERT INTO jobs (name, state, idempotency_key, owner_host,"
-            " owner_pid, claimed_at, stale_after, created_at)"
-            " VALUES ('j1','running','k1',?,?,?,60,?)",
-            (jobs._host(), os.getpid(), time.time() - 3600, time.time() - 3600))
+            " owner_pid, owner_boot_id, claimed_at, stale_after, created_at)"
+            " VALUES ('j1','running','k1',?,?,?,?,60,?)",
+            (jobs._host(), os.getpid(), jobs._boot_id(),
+             time.time() - 3600, time.time() - 3600))
     assert jobs.reap(conn, "j1") == 0
     conn.close()
     assert _rows(_tmp_home, "j1")[0][0] == "running"
 
 
-def test_foreign_host_stale_claim_reaps_on_age_alone(_tmp_home):
+def test_stale_alive_pid_from_a_DIFFERENT_boot_is_reaped(_tmp_home):
+    """Review fix 3 (the wedge): after `wsl --shutdown` the pid counter
+    restarts and an unrelated process can occupy a crashed job's pid, so
+    _pid_alive answers True forever and the row is never reaped — the job
+    silently never runs again. A boot-id mismatch means the owner cannot be
+    alive whatever the pid table says. Uses OUR OWN (definitely alive) pid so
+    the test isolates the boot check, not pid liveness."""
     conn = jobs._connect()
     with conn:
         conn.execute(
             "INSERT INTO jobs (name, state, idempotency_key, owner_host,"
-            " owner_pid, claimed_at, stale_after, created_at)"
-            " VALUES ('j1','running','k1','other-box',12345,?,60,?)",
-            (time.time() - 3600, time.time() - 3600))
+            " owner_pid, owner_boot_id, claimed_at, stale_after, created_at)"
+            " VALUES ('j1','running','k1',?,?,'boot-from-a-previous-life',?,60,?)",
+            (jobs._host(), os.getpid(), time.time() - 3600, time.time() - 3600))
     assert jobs.reap(conn, "j1") == 1
     conn.close()
     assert _rows(_tmp_home, "j1")[0][0] == "queued"
+
+
+def test_foreign_host_stale_claim_reaps_on_age_alone(_tmp_home):
+    # Review fix 4c: owner_pid is OUR OWN pid — locally alive, so the row is
+    # only reapable because the HOST differs. With owner_pid=12345 (dead on
+    # most runners) deleting the host check entirely stayed green.
+    conn = jobs._connect()
+    with conn:
+        conn.execute(
+            "INSERT INTO jobs (name, state, idempotency_key, owner_host,"
+            " owner_pid, owner_boot_id, claimed_at, stale_after, created_at)"
+            " VALUES ('j1','running','k1','other-box',?,?,?,60,?)",
+            (os.getpid(), jobs._boot_id(),
+             time.time() - 3600, time.time() - 3600))
+    assert jobs.reap(conn, "j1") == 1
+    conn.close()
+    assert _rows(_tmp_home, "j1")[0][0] == "queued"
+
+
+def test_reap_does_not_requeue_a_row_reclaimed_since_the_snapshot(_tmp_home):
+    """Review fix 2 (TOCTOU): between reap's SELECT (autocommit) and its
+    UPDATE another reaper can requeue the row and a third claimant re-claim
+    it FRESH. A `state='running'`-only guard would requeue that live claim
+    and allow two concurrent executions. Simulated by mutating the row
+    between snapshot and update via a patched connection."""
+    conn = jobs._connect()
+    stale = time.time() - 3600
+    with conn:
+        conn.execute(
+            "INSERT INTO jobs (name, state, idempotency_key, owner_host,"
+            " owner_pid, owner_boot_id, claimed_at, stale_after, created_at)"
+            " VALUES ('j1','running','k1',?,999999,'old-boot',?,60,?)",
+            (jobs._host(), stale, stale))
+    fired = {"done": False}
+
+    class _RacingConn:
+        """sqlite3.Connection attributes are read-only, so intercept via a
+        thin proxy (delegates everything else verbatim)."""
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a, **kw):
+            if (sql.strip().startswith("UPDATE jobs SET state='queued'")
+                    and not fired["done"]):
+                fired["done"] = True
+                # A NEW owner claims the row between snapshot and update.
+                with self._inner:
+                    self._inner.execute(
+                        "UPDATE jobs SET owner_pid=?, owner_boot_id=?,"
+                        " claimed_at=? WHERE name='j1'",
+                        (os.getpid(), jobs._boot_id(), time.time()))
+            return self._inner.execute(sql, *a, **kw)
+
+        def __enter__(self):
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    assert jobs.reap(_RacingConn(conn), "j1") == 0, \
+        "reap clobbered a freshly re-claimed row"
+    assert fired["done"], "the race was never simulated — test is vacuous"
+    conn.close()
+    assert _rows(_tmp_home, "j1")[0][0] == "running"
 
 
 def test_foreign_host_fresh_claim_survives(_tmp_home):
@@ -252,6 +326,51 @@ def test_role_gate_replica_refuses(_tmp_home):
     assert jobs.cmd_run(_args("j1", receipt, _writer_argv(receipt))) == 0
     assert _rows(_tmp_home, "j1") == []         # nothing claimed, nothing ran
     assert not receipt.exists()
+
+
+def test_cli_parses_the_shipped_call_site_token_order(_tmp_home, monkeypatch):
+    """THE blocker regression pin (review finding 1): every test above calls
+    cmd_run(Namespace(...)) and therefore BYPASSES the parser — while both
+    SHIPPED call sites (the systemd ExecStart and the installer's task
+    action) failed at argparse with exit 2 before any code ran, because
+    REMAINDER after a positional swallowed --receipt. This drives the real
+    CLI, as a subprocess, in the byte-exact token order the unit uses."""
+    import subprocess as sp
+
+    receipt = _tmp_home / "job.jsonl"
+    child = _writer_argv(receipt)
+    argv = [sys.executable, str(SCRIPT), "run", "cli-probe",
+            "--receipt", str(receipt), "--stale-after", "10800", "--"] + child
+    env = dict(os.environ)
+    env["HOME"] = str(_tmp_home)          # isolate: never touch the real ~/.mem0
+    env["USERPROFILE"] = str(_tmp_home)
+    proc = sp.run(argv, env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, (
+        f"CLI failed on the shipped token order: rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    assert "-> done outcome=ok" in proc.stdout
+    import sqlite3
+    conn = sqlite3.connect(str(_tmp_home / ".mem0" / "jobs.db"))
+    try:
+        row = conn.execute(
+            "SELECT state, outcome FROM jobs WHERE name='cli-probe'").fetchone()
+    finally:
+        conn.close()
+    assert row == ("done", "ok")
+
+
+def test_cli_call_site_order_matches_the_unit_and_installer():
+    """Pins the token ORDER itself: if a future edit reorders the shipped
+    call sites, the CLI test above stops proving what production runs."""
+    unit = (REPO_ROOT / "systemd" / "contradiction-sweep.service").read_text(
+        encoding="utf-8")
+    exec_line = next(ln for ln in unit.splitlines()
+                     if ln.strip().startswith("ExecStart="))
+    assert "jobs.py run contradiction-sweep --receipt " in exec_line
+    assert " -- " in exec_line
+    installer = (REPO_ROOT / "install" / "2-windows-config.ps1").read_text(
+        encoding="utf-8")
+    assert "jobs.py run semantic-dedup --receipt " in installer
 
 
 def test_concurrent_claim_race_one_winner(_tmp_home):

@@ -97,6 +97,7 @@ def _connect() -> sqlite3.Connection:
         " idempotency_key TEXT NOT NULL,"
         " owner_host TEXT,"
         " owner_pid INTEGER,"
+        " owner_boot_id TEXT,"
         " claimed_at REAL,"
         " finished_at REAL,"
         " outcome TEXT,"
@@ -104,11 +105,30 @@ def _connect() -> sqlite3.Connection:
         " stale_after REAL NOT NULL,"
         " created_at REAL NOT NULL)"
     )
+    # Migration for a db created before owner_boot_id existed (review fix 3).
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "owner_boot_id" not in cols:
+        with conn:
+            conn.execute("ALTER TABLE jobs ADD COLUMN owner_boot_id TEXT")
     try:
         os.chmod(DB_PATH, 0o600)
     except (OSError, NotImplementedError):
         pass
     return conn
+
+
+def _boot_id() -> Optional[str]:
+    """Review fix 3 (pid-recycling wedge): a pid is only meaningful WITHIN a
+    boot. After `wsl --shutdown` the pid counter restarts from ~300 and an
+    unrelated process can occupy a crashed job's pid — making _pid_alive
+    answer True forever, so the row is never reaped and every later run exits
+    'claim lost'. The claim records the boot id; a mismatch means the owner
+    cannot possibly be alive, whatever the pid table says."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -174,20 +194,32 @@ def reap(conn: sqlite3.Connection, name: str) -> int:
     reaped = 0
     rows = conn.execute(
         "SELECT id, owner_host, owner_pid, claimed_at, stale_after,"
-        " idempotency_key FROM jobs WHERE name = ? AND state = 'running'",
-        (name,)).fetchall()
-    for rid, host, pid, claimed, stale_after, key in rows:
+        " idempotency_key, owner_boot_id FROM jobs"
+        " WHERE name = ? AND state = 'running'", (name,)).fetchall()
+    for rid, host, pid, claimed, stale_after, key, boot in rows:
         age = now - float(claimed or 0)
         if age <= float(stale_after or DEFAULT_STALE_AFTER_S):
             continue
-        if host == _host() and pid and _pid_alive(int(pid)):
-            continue  # F2: NEVER requeue a live same-host destructive job
+        if host == _host():
+            # Same host: the pid only means something within the SAME boot
+            # (review fix 3). Different/unknown boot => the owner is gone.
+            same_boot = bool(boot) and boot == _boot_id()
+            if same_boot and pid and _pid_alive(int(pid)):
+                continue  # F2: NEVER requeue a live same-host destructive job
         with conn:
+            # Review fix 2 (TOCTOU): the snapshot above was read in
+            # autocommit, so between SELECT and UPDATE another reaper could
+            # have requeued this row and a third claimant re-claimed it —
+            # `state='running'` alone would then requeue a LIVE claim and
+            # allow two concurrent executions. Bind the UPDATE to the exact
+            # snapshot identity (REAL round-trips bit-exactly in SQLite).
             cur = conn.execute(
                 "UPDATE jobs SET state='queued', owner_host=NULL,"
-                " owner_pid=NULL, claimed_at=NULL,"
+                " owner_pid=NULL, owner_boot_id=NULL, claimed_at=NULL,"
                 " reap_count = reap_count + 1"
-                " WHERE id = ? AND state = 'running'", (rid,))
+                " WHERE id = ? AND state = 'running'"
+                "   AND owner_pid IS ? AND claimed_at IS ?",
+                (rid, pid, claimed))
         if cur.rowcount:
             reaped += 1
             _append_reap_receipt({
@@ -213,8 +245,9 @@ def _claim(conn: sqlite3.Connection, name: str, stale_after: float):
             rid, key = int(row[0]), str(row[1])
             cur = conn.execute(
                 "UPDATE jobs SET state='running', owner_host=?, owner_pid=?,"
-                " claimed_at=?, stale_after=? WHERE id=? AND state='queued'",
-                (_host(), os.getpid(), now, stale_after, rid))
+                " owner_boot_id=?, claimed_at=?, stale_after=?"
+                " WHERE id=? AND state='queued'",
+                (_host(), os.getpid(), _boot_id(), now, stale_after, rid))
             if cur.rowcount:
                 return rid, key
             return None
@@ -224,11 +257,12 @@ def _claim(conn: sqlite3.Connection, name: str, stale_after: float):
         key = str(uuid.uuid4())
         cur = conn.execute(
             "INSERT INTO jobs (name, state, idempotency_key, owner_host,"
-            " owner_pid, claimed_at, stale_after, created_at)"
-            " SELECT ?, 'running', ?, ?, ?, ?, ?, ?"
+            " owner_pid, owner_boot_id, claimed_at, stale_after, created_at)"
+            " SELECT ?, 'running', ?, ?, ?, ?, ?, ?, ?"
             " WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE name = ?"
             "                   AND state IN ('queued', 'running'))",
-            (name, key, _host(), os.getpid(), now, stale_after, now, name))
+            (name, key, _host(), os.getpid(), _boot_id(), now, stale_after,
+             now, name))
         if not cur.rowcount:
             return None  # fresh claim held elsewhere — quiet loss
         return int(cur.lastrowid), key
@@ -276,38 +310,46 @@ def cmd_run(args) -> int:
             _refresh_heartbeat(conn)
             return 0
         rid, key = claim
-        claimed_at = _now()
+        # Review fix 2: every completion write is bound to OUR claim
+        # (state + owner identity). If a reaper took the row away mid-run,
+        # rowcount 0 tells us so instead of stomping a newer owner's row.
+        claimed_at = float(conn.execute(
+            "SELECT claimed_at FROM jobs WHERE id=?", (rid,)).fetchone()[0])
+        my_owner = (_host(), os.getpid(), claimed_at, rid)
+
+        def _finish(state: str, outcome: str) -> bool:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE jobs SET state=?, finished_at=?, outcome=?"
+                    " WHERE state='running' AND owner_host=? AND owner_pid=?"
+                    "   AND claimed_at IS ? AND id=?",
+                    (state, _now(), str(outcome)[:200]) + my_owner)
+            if not cur.rowcount:
+                print(f"jobs: WARNING — our claim on {args.name} was reaped "
+                      "mid-run; not overwriting the newer owner's row")
+                return False
+            return True
+
         env = dict(os.environ)
         env["JOBS_IDEMPOTENCY_KEY"] = key
         try:
             proc = subprocess.run(args.argv, env=env)
             child_rc = proc.returncode
         except OSError as e:
-            with conn:
-                conn.execute(
-                    "UPDATE jobs SET state='failed', finished_at=?,"
-                    " outcome=? WHERE id=?",
-                    (_now(), f"failed:exec-error:{e}"[:200], rid))
+            _finish("failed", f"failed:exec-error:{e}")
             print(f"jobs: exec failed for {args.name}: {e}")
             _refresh_heartbeat(conn)
             return 1
         outcome = observe_receipt(Path(args.receipt), key, claimed_at)
         if outcome is None:
-            with conn:
-                conn.execute(
-                    "UPDATE jobs SET state='failed', finished_at=?, outcome=?"
-                    " WHERE id=?",
-                    (_now(), "failed:receipt-missing", rid))
+            _finish("failed", "failed:receipt-missing")
             print(f"jobs: {args.name} exited {child_rc} but NO keyed receipt line "
                   f"observed in {args.receipt} — marked failed:receipt-missing "
                   "(the exact silent-completion class this queue exists to kill)")
             _refresh_heartbeat(conn)
             return child_rc if child_rc != 0 else 3
         state = "done" if child_rc == 0 else "failed"
-        with conn:
-            conn.execute(
-                "UPDATE jobs SET state=?, finished_at=?, outcome=? WHERE id=?",
-                (state, _now(), str(outcome)[:200], rid))
+        _finish(state, outcome)
         print(f"jobs: {args.name} -> {state} outcome={outcome} (exit {child_rc})")
         _refresh_heartbeat(conn)
         return child_rc   # F7b: propagate — degraded:* exits stay loud
@@ -351,6 +393,17 @@ def cmd_reap(args) -> int:
 
 
 def main() -> int:
+    # W6 review BLOCKER fix: argparse REMAINDER after a positional swallowed
+    # the options at both SHIPPED call sites (`run <name> --receipt ...`
+    # died with exit 2 before any code ran — verified live). Pre-split on the
+    # first standalone `--`: everything after is the child argv verbatim;
+    # argparse only ever sees what precedes it.
+    raw = sys.argv[1:]
+    child: list = []
+    if "--" in raw:
+        i = raw.index("--")
+        child = raw[i + 1:]
+        raw = raw[:i]
     p = argparse.ArgumentParser(description="W6 durable job queue (no daemon)")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="claim-run-observe-complete one job")
@@ -361,17 +414,14 @@ def main() -> int:
     r.add_argument("--stale-after", type=float, default=DEFAULT_STALE_AFTER_S,
                    help="seconds before an abandoned claim is reapable "
                         "(set per adopter vs its own time limit)")
-    r.add_argument("argv", nargs=argparse.REMAINDER,
-                   help="-- <command...> to execute")
     s = sub.add_parser("status", help="recent rows for a job name")
     s.add_argument("name")
     s.add_argument("--limit", type=int, default=5)
     rp = sub.add_parser("reap", help="per-name stale-claim reap")
     rp.add_argument("name")
-    args = p.parse_args()
+    args = p.parse_args(raw)
     if args.cmd == "run":
-        if args.argv and args.argv[0] == "--":
-            args.argv = args.argv[1:]
+        args.argv = child
         if not args.argv:
             print("jobs: run requires -- <command...>")
             return 2
