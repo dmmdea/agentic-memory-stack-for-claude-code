@@ -48,6 +48,12 @@ H5 fix (v0.17 Final): fetch_current_tier distinguishes three outcomes:
                             records whose tier was stripped by H1 race before set_payload retry.
   - tier string          -> normal path.
 
+AMS-21 fix (2026-08-08): a retrieve EXCEPTION (Qdrant connectivity blip) no longer
+  returns None — it raises HTTPException(503) so the mutation is REFUSED. The old
+  fail-open let a canonical record be mutated without HMAC when the tier gate hit
+  a transient store error but the mutation itself succeeded moments later. Mirrors
+  the imperative-canary in app.py, which 503s on the identical failure.
+
 H8 fix (v0.17 Final): TRUSTED_PATCH_ACTORS allowlist; stamp-retired-v013 actor allowed to
   PATCH retired_at on canonical/insight records via the mem0 API (bypasses direct Qdrant write).
 
@@ -234,12 +240,17 @@ def _check_and_record_nonce_locked(nonce: str, ts: str) -> bool:
 def fetch_current_tier(client, collection_name: str, memory_id: str):
     """Fetch tier from Qdrant payload.
 
-    H5 fix (v0.17 Final): returns one of four distinct outcomes:
+    H5 fix (v0.17 Final) + AMS-21 (2026-08-08): three distinct return outcomes,
+    plus a raise:
       _NOT_FOUND sentinel  → point does not exist in Qdrant (let caller handle 404).
-      None                 → Qdrant connectivity error (caller treats as not-found).
       "canonical" fallback → point exists but tier field absent; fail-closed to protect
                              records whose tier was stripped by a transient H1 race.
       tier string          → normal path: returns the stored tier value.
+      raises HTTPException(503) → the retrieve itself failed (connectivity blip).
+        AMS-21: the old `return None` here was fail-OPEN — assert_writable passed
+        None through and the canonical/insight mutation proceeded ungated when the
+        store recovered by mutation time. Mirrors the imperative-canary's 503
+        ("fail-open would be wrong for a write gate").
 
     Parameters
     ----------
@@ -254,8 +265,14 @@ def fetch_current_tier(client, collection_name: str, memory_id: str):
             with_payload=True,
             with_vectors=False,
         )
-    except Exception:
-        return None  # connectivity error
+    except Exception as e:
+        # AMS-21: connectivity error → REFUSE the mutation (fail-closed).
+        raise HTTPException(
+            503,
+            f"cannot verify tier for memory_id={memory_id!r} "
+            f"(store retrieve failed: {str(e)[:120]}); "
+            "mutation rejected — retry when the store is reachable",
+        ) from e
     if not records:
         return _NOT_FOUND  # H5: point genuinely does not exist
     rec = records[0]
@@ -464,9 +481,11 @@ def assert_writable(
             f"valid actions: {sorted(VALID_HMAC_ACTIONS)}",
         )
 
+    # AMS-21: a connectivity error now RAISES 503 inside fetch_current_tier
+    # (fail-closed) instead of returning None — only genuine not-found passes.
     current_tier = fetch_current_tier(client, collection_name, memory_id)
 
-    # H5: None (connectivity error) or _NOT_FOUND (point absent) → pass through
+    # H5: _NOT_FOUND (point absent) → pass through (None kept as a defensive belt)
     if current_tier is None or current_tier == _NOT_FOUND:
         # Let the underlying PUT/DELETE/PATCH fail naturally (404/error)
         return None

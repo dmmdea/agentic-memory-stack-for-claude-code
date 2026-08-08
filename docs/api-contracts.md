@@ -2,13 +2,15 @@
 
 The mem0 stack exposes two surfaces: a **REST API** (HTTP, used internally by L1a/C1/L10 and the MCP shim) and an **MCP tool surface** (stdio JSON-RPC, used by Claude Code / Codex CLI). This doc is the contract — upgrades must preserve it, breakages here are user-visible regressions.
 
+**Coverage:** the memories core (`/health*` + `/v1/memories*` and their MCP tools) is specified in full below. The goals / open-questions / episodes / context-bundle surfaces are enumerated as one-line contracts (existence, signature, purpose); their authoritative body schemas are the Pydantic models in `mem0-server/app.py` and the tool docstrings in `scripts/wsl/mem0-mcp-shim.py`, exercised by the pytest suite.
+
 ---
 
 ## REST API — `mem0-server/app.py`
 
 Base URL: `http://127.0.0.1:18791` (loopback only, accessible from Windows via WSL mirrored networking).
 
-Auth: every endpoint except `/health` requires the `X-API-Key` header. Key is at `~/.mem0/api-key` (WSL, mode 0600). Comparison uses `hmac.compare_digest` (constant-time).
+Auth: every endpoint except `GET /health` and `GET /health/deep` requires the `X-API-Key` header. Key is at `~/.mem0/api-key` (WSL, mode 0600). Comparison uses `hmac.compare_digest` (constant-time).
 
 All endpoints return JSON. On error, HTTP 401 (auth), 400 (validation), 503 (upstream rate-limited — **retryable**, carries `Retry-After`), or 500 (server). Error body is `{"detail": "..."}`.
 
@@ -20,8 +22,14 @@ Liveness + version probe. No auth.
 
 **Response 200:**
 ```json
-{"ok": true, "version": "2.0.4-v012", "store": "qdrant", "embedder": "embeddinggemma-300m"}
+{"ok": true, "version": "2.0.4-v012", "stack": "<stack release>", "store": "qdrant", "embedder": "embeddinggemma-300m"}
 ```
+
+`version` is the historical mem0-lib+phase tag (kept stable — dashboards may pattern-match it). `stack` is the actual stack release (the repo `VERSION` file) — the field the operations runbook tells you to read.
+
+### `GET /health/deep`
+
+Deep diagnostic probe. No auth. Exercises Qdrant + the embedder + the live collection binding (reported as `collection`), plus job liveness, canonical-key source, and drift canaries. Slow — use `/health` for liveness, `/health/deep` for diagnostics.
 
 ### `POST /v1/memories` — add memory
 
@@ -34,7 +42,7 @@ Liveness + version probe. No auth.
   "run_id": null,                    // optional
   "metadata": {                      // optional — anything; convention below
     "source": "l1a-extractor",
-    "tier": "evidence",              // evidence | canonical | insight | temporal
+    "tier": "evidence",              // on add: evidence | temporal only (see below)
     "event": "Stop",                 // any string
     "...": "..."
   },
@@ -44,21 +52,26 @@ Liveness + version probe. No auth.
 
 **Response 200:** `mem0.Memory.add()` return value. Typically `{"results":[{"id":"...","memory":"...","event":"ADD",...}]}` or `{"results":[]}` if `infer=true` and nothing extractable.
 
-**Convention for `metadata.tier`:**
+**Convention for `metadata.tier`** (server-enforced at add: only `evidence` and `temporal` are accepted; `insight` additionally with a consolidator `source`; anything else → 400):
 - `evidence` — default. Hook-extracted or programmatic writes. Subject to L10 audit + auto-promote.
-- `canonical` — explicit human-blessed truth. Lock-in via `memory_promote` MCP tool.
-- `insight` — synthesized higher-order facts from C1 consolidator.
-- `temporal` — time-scoped facts; consumer must check validity window.
+- `stable` — promotion-only (audited evidence); cannot be set on add.
+- `canonical` — explicit human-blessed truth. Promotion-only, and **not reachable via MCP**: it requires the user-direct HMAC token that only the operator CLI `scripts/wsl/mem0-canonize.sh` produces (see `PATCH /tier` below).
+- `insight` — synthesized higher-order facts; actor/source-allowlisted to the C1/dream consolidator.
+- `temporal` — time-scoped facts; consumers read the validity window from the memory text.
 
 ### `GET /v1/memories` — list
 
 **Query params:**
 - `user_id` (required)
-- `limit` (default 100)
+- `limit` (default 100, silently clamped server-side at 500)
 
 **Response 200:** `{"results":[{"id":..., "memory":..., "metadata":..., "user_id":..., "created_at":..., "updated_at":..., "hash":...}, ...]}`
 
-> **Known quirk (mem0 v2.0.4):** `get_all` returns a hardcoded ~20 items regardless of `limit`. Use the Qdrant scroll API directly (`POST :6333/collections/memories/points/scroll`) if you need more.
+> **Known quirk (mem0 v2.0.4):** `Memory.get_all`'s size param is named `top_k` (default 20) — `app.py` passes `top_k` explicitly, so `limit` is honored up to the 500 cap. Beyond that, use the Qdrant scroll API directly (`POST :6333/collections/<collection>/points/scroll`) against the collection mem0 is bound to — the `collection_name` in `mem0-server/config.py` (`mem0_egemma_768` as shipped; `/health/deep` reports the live binding as `collection`).
+
+### `GET /v1/memories/{mid}` — exact read
+
+Returns one record by id: text, metadata (incl. tier), timestamps. Use before update/delete/promote — search and list are not substitutes for an exact read. 404 when the id does not exist.
 
 ### `POST /v1/memories/search` — semantic search
 
@@ -94,32 +107,71 @@ Liveness + version probe. No auth.
 
 **Response 200:** mem0 `update()` return value.
 
-> **Limitation:** mem0 v2.0.4's `Memory.update(memory_id, data=text)` only updates `text`, not metadata. Use `PATCH /v1/memories/{mid}/tier` for metadata.tier; for other metadata changes, currently no endpoint — add one if needed.
+> **Scope:** `PUT` updates `text` only. Tier changes go through `PATCH /v1/memories/{mid}/tier`; other metadata through `PATCH /v1/memories/{mid}/metadata` (shallow merge). On a `canonical`/`insight` target, PUT additionally requires the user-direct HMAC headers (`assert_writable` gate) and `actor`/`reason` query params — `mem0-canonize.sh --action put` produces a valid call. The full existing payload is carried over into the update (AMS-01 fix), and canonical targets reject imperative-phrased text (422 — declarative facts only).
 
 ### `PATCH /v1/memories/{mid}/tier` — update tier metadata (custom endpoint, our addition)
 
 **Request body (`TierIn`):**
 ```json
 {
-  "tier": "canonical",               // evidence | canonical | insight | temporal
-  "reason": "user said lock it in",  // optional, written to ledger
-  "actor": "claude"                   // optional, default "claude"
+  "tier": "stable",                   // evidence | stable | canonical | insight | temporal
+  "actor": "claude-autonomous",       // REQUIRED — 400 if missing or empty
+  "reason": "audited: survived L10"   // optional (REQUIRED for canonical), written to ledger
 }
 ```
 
+**Server-enforced tier rules:**
+- `canonical` — requires `actor="user-direct"` (or the server-side `dream-autopromote` allowlist), a **non-empty `reason`**, AND a valid HMAC format-2 user-direct token: headers `X-User-Direct-Token` / `X-User-Direct-Ts` / `X-User-Direct-Nonce` signing `<ts>|<nonce>|promote|<mid>|<reason>` (403 without them; the nonce is burned server-side for replay protection). `scripts/wsl/mem0-canonize.sh` is the only shipped producer of that token. Imperative-phrased text is rejected 422 (canonical is declarative facts only).
+- `insight` — requires an actor from the consolidator allowlist (403 otherwise).
+- `evidence` / `stable` / `temporal` — any non-empty actor.
+
 **Response 200:**
 ```json
-{"ok": true, "memory_id": "abc...", "tier": "canonical", "actor": "claude", "ts": "2026-06-08T..."}
+{"ok": true, "memory_id": "abc...", "tier": "stable", "actor": "claude-autonomous", "ts": "2026-06-08T..."}
 ```
 
 **Side effect:** appends an entry to the monthly ledger segment `~/.mem0/tier-ledger-YYYY-MM.jsonl`:
 ```json
-{"ts":"...", "memory_id":"...", "tier":"canonical", "actor":"claude", "reason":"..."}
+{"ts":"...", "event":"tier-change", "memory_id":"...", "tier":"...", "actor":"...", "reason":"...", "transport":"cli-user-direct | autonomous | rest-api"}
 ```
+
+### `PATCH /v1/memories/{mid}/metadata` — shallow-merge metadata (custom endpoint, our addition)
+
+**Request body (`MetadataIn`):** `{"metadata": {...non-empty...}, "actor": "...", "reason": "..."}` — shallow-merges into the existing payload. Cannot change `tier` (400 — use `PATCH /tier`); lifecycle-gating keys (`retrievable`, `expires_at`, `created_at`, `tier_actor`, `superseded_by`, `contradicts_canonical`, …) are forbidden to generic callers (per-actor server-side allowlists only). `canonical`/`insight` targets require the user-direct HMAC headers (`mem0-canonize.sh --action patch_metadata`). Every successful merge is ledgered.
 
 ### `DELETE /v1/memories/{mid}`
 
-**Response 200:** mem0 `delete()` return value.
+**Query params:** `actor`, `reason` (optional, ledgered), `cascade` (default false — `true` also deletes records superseded by the target). `canonical`/`insight` targets require the user-direct HMAC headers (`mem0-canonize.sh --action delete`).
+
+**Response 200:** mem0 `delete()` return value. Always appends a `delete` ledger entry (with the prior payload's source) so destructive ops are audit-covered.
+
+### Goals / open-questions / episodes / context-bundle routes (one-line contracts)
+
+| Route | Purpose |
+|---|---|
+| `POST /v1/goals` | create a goal (title, priority 1–5, brand, optional parent_goal_id) |
+| `GET /v1/goals` | list goals; `status`/`brand`/`limit` filters |
+| `GET /v1/goals/tree` | recursive goal hierarchy (optional `root_id`) |
+| `GET /v1/goals/{goal_id}` | full goal detail incl. linked-episode count |
+| `PATCH /v1/goals/{goal_id}/status` | set goal status |
+| `PATCH /v1/goals/{goal_id}/abandon` | mark abandoned (actor + reason) |
+| `PATCH /v1/goals/{goal_id}/complete` | mark completed (actor + reason) |
+| `PATCH /v1/goals/{goal_id}/priority` | set priority |
+| `POST /v1/goals/{goal_id}/link_episode` | link an episode (link_type) |
+| `POST /v1/goals/{source_goal_id}/merge` | merge a duplicate goal into a target |
+| `POST /v1/open_questions` | record a frontier question |
+| `GET /v1/open_questions` | list open questions (`status`/`brand`/`limit`) |
+| `POST /v1/open_questions/search` | FTS5 search across questions |
+| `GET /v1/open_questions/{oq_id}` | question detail incl. related goal |
+| `PATCH /v1/open_questions/{oq_id}/resolve` | resolve with resolution text + session id |
+| `PATCH /v1/open_questions/{oq_id}/status` | set question status |
+| `POST /v1/episodes` | finalize/write an episode (session summary) |
+| `POST /v1/episodes/checkpoint` | fast in-progress episode upsert (per-prompt hook) |
+| `POST /v1/episodes/search` | FTS5 episode search (since/until/brand) |
+| `GET /v1/episodes` | recent episodes (`recent`, `brand`) |
+| `GET /v1/episodes/count` | episode count |
+| `GET /v1/episodes/{episode_id}` | episode detail + linked mem0 memory ids |
+| `POST /v1/context/bundle` | one-round-trip bundle: episode checkpoint + gated memories + goals + open questions (the per-prompt hook / `memory_recall` wire) |
 
 ---
 
@@ -134,25 +186,56 @@ Returns `GET /health/deep` — the probe that actually exercises the store and t
 Wraps `POST /v1/memories`. Use `metadata={"source":"...", "tier":"evidence"}` minimum.
 
 ### `memory_search(query, user_id="youruser", limit=5, threshold=0.1, rerank=None, query_class="durable", brand=None, allow_cross_brand=False)` → dict
-Wraps `POST /v1/memories/search` with filter `{"user_id": user_id}` (+ brand scoping). Auto-reranks when `limit>=5`. W5 surfacing: adds `rerank_note` when the reranker fell back dense-only, and `withheld_note` when superseded/contradicted records were withheld by admission.
+Wraps `POST /v1/memories/search` with filter `{"user_id": user_id}` (+ brand scoping). Auto-reranks when `limit>=5` (`rerank=True/False` overrides). `query_class`: `durable` (default) | `operational` (recency-decayed) | `canonical` (**required** to retrieve `tier=canonical` records — the default class excludes them) | `history` (forensic — hide checks disabled). `brand` scopes to one brand; a brandless search fail-closes to brand-neutral records only, with `allow_cross_brand=True` as the explicit audited opt-in. W5 surfacing: adds `rerank_note` when the reranker fell back dense-only, and `withheld_note` when superseded/contradicted records were withheld by admission.
 
 ### `memory_diagnose(query, target_id, user_id="youruser", brand=None, query_class="durable", threshold=0.1, limit=20, rerank=False, allow_cross_brand=False)` → dict
 Wraps `POST /v1/memories/diagnose` (W5 ADOPT-2). Names the first retrieval stage that eats the target; read-only. Set the parameters to the FAILING search's values.
 
-### `memory_list(user_id="youruser", limit=100)` → dict
-Wraps `GET /v1/memories`.
+### `memory_list(user_id="youruser", limit=50)` → dict
+Wraps `GET /v1/memories`. Client-clamps `limit` at 500 (the server clamps too). Prefer `memory_search` for content discovery; this is for inventory.
+
+### `memory_get_by_id(memory_id)` → dict
+Wraps `GET /v1/memories/{id}` — exact read (text, metadata, tier, timestamps). Call it before update/delete/promote to confirm the right record.
+
+### `memory_recall(query, brand=None, initiative=None, project=None, user_id="youruser")` → dict
+The proactive start-of-task pull: wraps `POST /v1/context/bundle` (checkpoint suppressed) plus a `query_class="canonical"` search. Returns `{ok, canonical, memories, goals, open_questions}` — a branded recall returns that brand's facts plus the brand-neutral set; brandless returns neutral only.
 
 ### `memory_update(memory_id, text)` → dict
-Wraps `PUT /v1/memories/{id}`. Text only.
+Wraps `PUT /v1/memories/{id}`. Text only. Queues to the offline outbox when the authority is unreachable.
 
-### `memory_promote(memory_id, tier="canonical", reason=None)` → dict
-Wraps `PATCH /v1/memories/{id}/tier` with `actor="claude"`. Use when user says "lock that in" / "save as canon".
+### `memory_promote(memory_id, tier="stable", reason=None)` → dict
+Wraps `PATCH /v1/memories/{id}/tier` with `actor="claude-autonomous"` (always — the shim never sends another actor). Tiers reachable via MCP: `evidence` | `stable` | `temporal` (`insight` 403s — consolidator-only). **`tier="canonical"` is rejected inside the shim itself**: canonical promotion cannot execute over MCP because the server demands the user-direct HMAC token + nonce headers the shim never sends. The "lock that in" flow is therefore: `memory_add` (evidence) → optionally `memory_promote(tier="stable")` → the operator runs `bash mem0-canonize.sh <id> "<reason>"` (deployed to `~/apps/mem0-scripts/`).
 
 ### `memory_demote(memory_id, tier="evidence", reason=None)` → dict
-Same as promote, opposite direction. Use to walk back wrong canonicalizations.
+Same wire as promote, opposite direction (also `actor="claude-autonomous"`). Use to walk back wrong tier assignments.
 
 ### `memory_delete(memory_id)` → dict
-Wraps `DELETE /v1/memories/{id}`.
+Wraps `DELETE /v1/memories/{id}`. Queues to the offline outbox when the authority is unreachable.
+
+### Episodic tools (one-line contracts)
+
+- `episodic_search(query, since=None, until=None, brand=None, limit=10)` — FTS5 search over past sessions; ISO-8601 date bounds.
+- `episodic_recent(limit=7, brand=None)` — last N episodes by `ended_at`.
+- `episodic_get(episode_id)` — full episode detail + linked mem0 memory ids.
+
+### Goal tools (one-line contracts)
+
+- `goals_list(status=None, brand=None, limit=20)` — list goals; status ∈ {open, blocked, advanced, completed, abandoned}.
+- `goals_tree(root_id=None)` — recursive hierarchy with depth.
+- `goals_open(brand=None, limit=10)` / `goals_blocked(brand=None, limit=10)` — convenience filters.
+- `goal_details(goal_id)` — full detail incl. linked_episode_count.
+- `goal_create_manual(title, description=None, brand=None, priority=3, parent_goal_id=None)` — operator-direct goal creation.
+- `goal_abandon(goal_id, reason, actor="claude-autonomous")` / `goal_complete(goal_id, reason, actor="claude-autonomous")` — lifecycle closes; non-empty reason required.
+- `goal_set_priority(goal_id, priority, reason=None, actor="claude-autonomous")` — 1=highest, 5=lowest.
+- `goal_link_episode(goal_id, episode_id, link_type="advanced_goal", delta_text=None, actor="claude-autonomous")` — link_type ∈ {advanced_goal, blocked_goal, completed_goal, cited_goal}.
+- `goal_merge(source_goal_id, target_goal_id, reason, actor="claude-autonomous")` — merge duplicates; source kept for audit, excluded from listings.
+
+### Open-question tools (one-line contracts)
+
+- `open_questions_open(brand=None, limit=7)` — current open frontier questions.
+- `open_question_search(query, brand=None, status="open", limit=10)` — FTS5 search; `status="all"` includes resolved.
+- `open_question_resolve(open_question_id, resolution_text, resolved_in_session_id, actor="claude-autonomous")` — mark resolved.
+- `open_question_details(open_question_id)` — full detail incl. related goal.
 
 ---
 
@@ -171,4 +254,4 @@ Wraps `DELETE /v1/memories/{id}`.
 
 ## When upgrading mem0 or fastmcp
 
-After upgrade, run `audit/upgrade-smoke.ps1` — it exercises **every contracted endpoint and tool above**. If any phase fails, the contract is broken; rollback or fix `mem0-server/app.py` / `mem0-mcp-shim.py` to restore the surface.
+After upgrade, run the real gates: the deployed **`Test-MemoryStack.ps1`** (`~/.claude/scripts/Test-MemoryStack.ps1` — liveness + invariants, pass/fail per row) and the server **pytest suite** (`mem0-server/tests/`, on the server venv). If either fails, the contract is broken; roll back or fix `mem0-server/app.py` / `mem0-mcp-shim.py` to restore the surface. (An earlier revision of this doc pointed at an `audit/upgrade-smoke.ps1` script that never shipped.)

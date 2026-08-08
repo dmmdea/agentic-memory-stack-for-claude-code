@@ -1,5 +1,5 @@
 [Unit]
-Description=Weekly agentic memory stack snapshot
+Description=Daily agentic memory stack snapshot
 
 [Service]
 Type=oneshot

@@ -152,9 +152,9 @@ A self-writing store drifts unless something hunts stale and contradicting facts
 | When | Job | What |
 |---|---|---|
 | daily 3:00 | dream consolidator (Task Scheduler, WakeToRun) | consolidate → insight, gated canonical autopromote, prune/index, drift canaries |
+| daily 3:30 | `stack-backup.timer` | SQLite online backups + Qdrant snapshot + ledger/config; integrity-checked. **Retention: last 8 daily snapshots kept ≈ an 8-day restore window** (daily since 2026-07-14, for read-replica freshness — was weekly) |
 | daily 4:30 | semantic dedup (Task Scheduler) | tier-scoped near-duplicate removal (thresholds 0.94–0.97); deleted payloads preserved in `dedup-report.jsonl` |
 | Sun 02:00 | `decay-scan.timer` | expire `temporal`, flag stale `evidence` (>90 d) for review |
-| Sun 03:30 | `stack-backup.timer` | SQLite online backups + Qdrant snapshot + ledger/config; last 8 kept, integrity-checked |
 | Sun 04:00 | `goals-stale-sweep.timer` | stale goal hygiene |
 | Sun 05:00 | `contradiction-sweep.timer` | weekly Codex-judged contradiction pass |
 | Sun 05:30 | `episodic-reconcile.timer` | read-only drift detector (mem0 ↔ episodic links) |
@@ -182,7 +182,7 @@ The same system mapped to the cognitive taxonomy used in agent-memory literature
 | Episodic (events) | `episodic.db` sessions/episodes ledger + raw-trace fallback | ★★★ |
 | Working (current task) | per-prompt `[MEMORY CONTEXT]` + in-progress episode checkpoint | ★★ |
 | Short-term | `temporal` tier + operational recency decay | ★★ |
-| Long-term | `stable`/`canonical` — no decay, weekly-backed-up | ★★★ |
+| Long-term | `stable`/`canonical` — no decay, backed up daily | ★★★ |
 | Prospective (intentions) | goals tree + open questions, surfaced each session | ★★ |
 | Procedural (how-to) | thin by design — how-to *lessons* store as semantic facts; executable procedures belong to Claude Code skills, not this store | ★ |
 | Associative | entity boosts in hybrid search | ★ |
@@ -232,7 +232,7 @@ Historical codes you may meet in old notes: M2 (an episodic MCP surface removed 
 |---|---|---|
 | :18791 | mem0 FastAPI server | WSL systemd-user `mem0.service` |
 | :6333 | Qdrant | WSL systemd-user |
-| :11436 | llama-swap (EmbeddingGemma + bge-reranker) | WSL systemd-user |
+| :11436 | llama-swap (EmbeddingGemma + bge-reranker) | per-host: WSL systemd-user *or* Windows-native (e.g. a scheduled task) — mirrored networking serves `:11436` either way; see the operations runbook before restarting |
 | :18792 | Codex HTTP shim (judgment bridge) | Windows PowerShell daemon (flag-gated, idle-shutdown) |
 | — | Codex CLI | on-demand, ChatGPT OAuth, shared lock (extractor / dream / shim never run it concurrently) |
 
