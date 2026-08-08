@@ -63,3 +63,10 @@ The search response is identical in shape whether reranking succeeded or failed;
 | Current status | `always_loaded` persistent | On disk; TTL-load only |
 
 Decision for v0.13: keep base in `always_loaded`. The 250MB persistent cost is already paid; adding v2-m3 at ~419MB would push the always-loaded group close to the 700MB practical limit on the Mobile RTX 3070 (8GB VRAM shared with other always-loaded models). Re-evaluate after Phase C re-extraction lands and retrieval quality can be measured empirically with a blind eval set.
+
+## W5 (ADOPT-2/AMS-56): rerank_status, force, and the union-leg contract
+
+- `reranker.rerank(query, results, text_key, *, force=False, status_out=None)` — the list-return signature is pinned; the two additions are keyword-only. `status_out["status"]` reports `ran | skipped_small_n | skipped_confident | failed_fallback_dense` (the skip reasons were previously collapsed inside `should_rerank`).
+- `force=True` bypasses BOTH skip heuristics. The search path passes it whenever keyword-union candidates joined the pool: a silent skip would delete every lexical rescue via the fail-closed drop (`lexical_only` items without a `rerank_score` never reach the caller).
+- The 0.92 confidence skip is measured-inert on the live combined-score scale (max observed 0.737 pre-W5); `rerank_status` now measures `skipped_confident` occurrences so the constant's behavior is observable rather than assumed (AMS-43).
+- Passive liveness counters (W4) are unchanged: skips still bump nothing; `failed_fallback_dense` corresponds to a real transport failure.

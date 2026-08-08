@@ -67,13 +67,23 @@ Liveness + version probe. No auth.
 {
   "query": "what we know about X",
   "filters": {"user_id": "youruser"},
-  "top_k": 20,
+  "limit": 20,
   "threshold": 0.1,
-  "rerank": false
+  "rerank": false,
+  "query_class": "durable",
+  "explain": false
 }
 ```
 
-**Response 200:** `{"results":[{"id":..., "memory":..., "metadata":..., "score":0.7, ...}, ...]}` — list ordered by descending similarity score.
+(The field is `limit` — an earlier revision of this doc showed a `top_k` field that never existed on this endpoint.)
+
+**Response 200:** `{"results":[...], "rejected_brand_scoped": 0, "rejected_superseded": 0, "rejected_contradicted": 0, ...}` — `results` ordered by descending score; the `rejected_*` counters report per-call admission withholding by family (W5 ADOPT-3). With `rerank: true` the response also carries `rerank_status` (`ran | skipped_small_n | skipped_confident | failed_fallback_dense`), and the keyword-recall union leg activates (W5 AMS-56): exact-token hits outside the dense window are unioned into the pool marked `lexical_only: true`, forced through the cross-encoder, and DROPPED fail-closed if the rerank did not actually run. With `explain: true` the response adds `_explain.stages` — a per-stage `{stage, in, out, detail}` trace (counts and scalars only).
+
+### `POST /v1/memories/diagnose` — why does memory X not surface for query Q (W5 ADOPT-2)
+
+**Request body (`DiagnoseIn`):** `{"query", "target_id", "user_id?", "brand?", "allow_cross_brand?", "query_class?": "durable", "threshold?": 0.1, "limit?": 20, "rerank?": false}` — set threshold/limit/rerank to the FAILING search's values (defaults mirror `SearchIn`).
+
+**Response 200:** `{"target_id", "verdict", "dense": {rank_at_500, score, overfetch_limit, within_overfetch}, "flags": {retired, canonical_intent}, "admission": {admit, reason, query_class}, "rerank": {...}, "freshness", "caveats"}` — `verdict` names the FIRST eating stage (`dense_retrieval:below_500_horizon`, `threshold:…`, `overfetch_pool:…`, `retired_filter`, `canonical_intent_filter`, `admission:<reason>`, `trim…`, or `returned`). Read-only: the admission verdict uses the pure evaluate path and never mutates the rejection counters or audit log. 404 when the target does not exist.
 
 ### `PUT /v1/memories/{mid}` — update text only
 
@@ -123,8 +133,11 @@ Returns `GET /health/deep` — the probe that actually exercises the store and t
 ### `memory_add(text, user_id="youruser", infer=False, metadata=None)` → dict
 Wraps `POST /v1/memories`. Use `metadata={"source":"...", "tier":"evidence"}` minimum.
 
-### `memory_search(query, user_id="youruser", top_k=5, threshold=0.1)` → dict
-Wraps `POST /v1/memories/search` with filter `{"user_id": user_id}`.
+### `memory_search(query, user_id="youruser", limit=5, threshold=0.1, rerank=None, query_class="durable", brand=None, allow_cross_brand=False)` → dict
+Wraps `POST /v1/memories/search` with filter `{"user_id": user_id}` (+ brand scoping). Auto-reranks when `limit>=5`. W5 surfacing: adds `rerank_note` when the reranker fell back dense-only, and `withheld_note` when superseded/contradicted records were withheld by admission.
+
+### `memory_diagnose(query, target_id, user_id="youruser", brand=None, query_class="durable", threshold=0.1, limit=20, rerank=False, allow_cross_brand=False)` → dict
+Wraps `POST /v1/memories/diagnose` (W5 ADOPT-2). Names the first retrieval stage that eats the target; read-only. Set the parameters to the FAILING search's values.
 
 ### `memory_list(user_id="youruser", limit=100)` → dict
 Wraps `GET /v1/memories`.
