@@ -691,6 +691,24 @@ def test_rejudge_path_bypasses_cache(monkeypatch, _tmp_pair_cache):
     assert v is False and len(fake_no.calls) == 1
 
 
+def test_rejudge_call_site_pins_cache_bypass():
+    """M9's call-site half: the behavioral bypass test above exercises
+    judge_dispatch directly — this pin makes REVERTING the rejudge call
+    site's use_cache=False red (source-text pin, test_context_bundle
+    precedent)."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    i = src.find("def run_rejudge_stamped")
+    j = src.find("\ndef ", i + 10)
+    body = src[i:j]
+    # Comment-stripped (RegressionGuards precedent): the call-site COMMENT
+    # also contains the literal, and a pin a comment can satisfy is the W1
+    # vacuous-guard class — proven red/green via the M9 mutation.
+    body_code = "\n".join(l for l in body.splitlines()
+                          if not l.strip().startswith("#"))
+    assert "use_cache=False)" in body_code, \
+        "run_rejudge_stamped no longer bypasses the pair cache"
+
+
 def test_error_verdicts_never_negative_cached(monkeypatch, _tmp_pair_cache):
     """R2: a transient judge outage must not suppress judging — after an
     error verdict, the next call reaches the real judge again."""
