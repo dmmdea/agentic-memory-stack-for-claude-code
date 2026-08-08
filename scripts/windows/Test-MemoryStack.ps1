@@ -1059,7 +1059,13 @@ if ($key) {
         $countErr = $_.Exception.Message
         try {
             $lim   = 200
-            $arr   = @(Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5)
+            # Two-step on purpose. `@(Invoke-RestMethod ...)` inline does NOT unroll
+            # the returned JSON array — it wraps it as a SINGLE element, so .Count
+            # reads 1 no matter how many rows came back. Assigning first, then @(),
+            # gives the real row count. (Verified live: inline form reported 1 with
+            # $arr[0] itself being Object[]; two-step reported 200.)
+            $resp  = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $arr   = @($resp)
             $open  = @($arr | Where-Object { $_.status -eq 'open' }).Count
             if ($arr.Count -ge $lim) {
                 Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' ">=$($arr.Count) goals (>=$open open) - /v1/goals/count unavailable, LIST page saturated so the true total is UNKNOWN: $countErr"
@@ -1309,7 +1315,10 @@ if ($key) {
         $countErr = $_.Exception.Message
         try {
             $lim  = 200
-            $arr  = @(Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/open_questions?status=open&limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5)
+            # Two-step: see the note on the goals fallback — an inline @(IRM ...)
+            # wraps the JSON array as one element and undercounts to 1.
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/open_questions?status=open&limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $arr  = @($resp)
             if ($arr.Count -ge $lim) {
                 Add-Check 'RECOVERY' 'open_questions :v0.17' 'WARN' ">=$($arr.Count) open - /v1/open_questions/count unavailable, LIST page saturated so the true total is UNKNOWN: $countErr"
             } else {

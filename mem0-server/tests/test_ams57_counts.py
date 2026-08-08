@@ -134,3 +134,23 @@ def test_tms_no_longer_reports_a_list_page_as_a_total():
         "each LIST fallback must compare the returned page against its own limit"
     assert tms.count('">=$($arr.Count)') == 2, \
         "a saturated fallback page must be reported as a floor, not a total"
+
+
+def test_tms_fallback_does_not_inline_wrap_the_rest_response():
+    """@(Invoke-RestMethod ...) inline does NOT unroll a returned JSON array —
+    it wraps it as ONE element, so .Count reads 1 regardless of how many rows
+    came back. Caught live: the fallback reported "1 total (1 open)" against a
+    200-row page, with $arr[0] itself being Object[].
+
+    An undercounting fallback is the same defect class this finding is about,
+    so the two-step form is pinned rather than left to convention.
+    """
+    tms = (REPO_ROOT / "scripts" / "windows" / "Test-MemoryStack.ps1").read_text(encoding="utf-8")
+    # Comment lines are excluded on purpose — the note explaining this rule
+    # necessarily quotes the banned form.
+    code = [ln for ln in tms.splitlines() if not ln.lstrip().startswith("#")]
+    offenders = [ln.strip() for ln in code if "@(Invoke-RestMethod" in ln]
+    assert not offenders, (
+        "assign the response first, then @($resp) — an inline @(Invoke-RestMethod ...) "
+        f"wraps the array as a single element and silently undercounts to 1: {offenders}"
+    )
