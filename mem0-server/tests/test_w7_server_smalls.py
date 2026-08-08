@@ -20,6 +20,20 @@ sys.path.insert(0, str(REPO_ROOT / "mem0-server"))
 import security_invariants as si  # noqa: E402
 
 
+def _app_module():
+    """app.py imports the `mem0` package at module scope, which the headless
+    CI runner does not install — so the two RUNTIME tests below (AMS-39/42)
+    skip there LOUDLY and gate in the live-stack suite instead. Everything
+    else in this file is pure or source-static and gates in CI."""
+    try:
+        import app
+    except Exception as e:  # noqa: BLE001 — any import failure is a skip
+        pytest.skip(f"needs the live-stack venv (app import failed: "
+                    f"{type(e).__name__}: {str(e)[:60]}) — runs in the "
+                    "live suite")
+    return app
+
+
 # ----------------------------------------------------------------------
 # AMS-21: the canonical/insight mutation gate must FAIL CLOSED on a
 # transient store error (it returned None -> the mutation proceeded ungated)
@@ -117,7 +131,7 @@ def test_ams42_concurrent_large_appends_never_tear(tmp_path, monkeypatch):
     """Without the lock, CPython's buffered writer splits a >8KB line into
     several raw writes and two threads interleave chunks — readers then skip
     the unparseable line silently, i.e. a LOST audit entry."""
-    import app as app_mod
+    app_mod = _app_module()
 
     ledger = tmp_path / "tier-ledger-2026-08.jsonl"
     monkeypatch.setattr(app_mod, "_ledger_segment_path",
@@ -150,7 +164,7 @@ def test_ams42_concurrent_large_appends_never_tear(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------
 
 def test_ams39_counter_records_fire_abstain_and_error():
-    import app as app_mod
+    app_mod = _app_module()
 
     app_mod._raw_fallback_today.update(
         {"date": None, "fired": 0, "abstained": 0, "errors": 0})
