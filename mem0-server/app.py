@@ -475,6 +475,23 @@ def _mid_write_lock(mid):
 # verifier's PUT canary and the live pytest, not by this counter.
 _put_carryover_today = {"date": None, "puts": 0, "keys_restored": 0, "keys_lost": 0}
 
+# AMS-39 (2026-08-08): the raw-trace fallback is ENABLED by default but emitted
+# no receipt on either outcome, so "it fired and helped", "it abstained
+# correctly" and "it has been dead for a month" were indistinguishable — the
+# exact persistence shape AMS-09 was. Same zero-I/O daily-counter pattern as
+# the carry-over counters; surfaced informationally on /health/deep.
+_raw_fallback_today = {"date": None, "fired": 0, "abstained": 0, "errors": 0}
+
+def _raw_fallback_bump(fired=0, abstained=0, errors=0):
+    today = _dt.date.today().isoformat()
+    if _raw_fallback_today["date"] != today:
+        _raw_fallback_today.update(
+            {"date": today, "fired": 0, "abstained": 0, "errors": 0})
+    _raw_fallback_today["fired"] += fired
+    _raw_fallback_today["abstained"] += abstained
+    _raw_fallback_today["errors"] += errors
+
+
 def _put_carryover_bump(puts=0, restored=0, lost=0):
     today = _dt.date.today().isoformat()
     if _put_carryover_today["date"] != today:
@@ -817,6 +834,16 @@ def _ledger_segment_path(mem0_dir: Path, now: Optional[_dt.datetime] = None) -> 
     return mem0_dir / f"tier-ledger-{now.strftime('%Y-%m')}.jsonl"
 
 
+# AMS-42 (2026-08-08): serialize ledger appends. def-endpoints run in AnyIO's
+# threadpool, so concurrent appends were unlocked; O_APPEND makes each RAW write
+# atomic, but CPython's buffered writer splits a line >8 KB into multiple raw
+# writes (a cascade-delete entry embeds the full prior_payload), so two
+# concurrent appends could interleave chunks and TEAR a line — and readers skip
+# unparseable lines silently, so a torn audit entry is a lost audit entry.
+# Same module-level threading.Lock pattern as the nonce replay store.
+_LEDGER_LOCK = threading.Lock()
+
+
 def _append_ledger(record: dict) -> None:
     """Append-only ledger writer for tier-change events. Single source of truth for promotion audit.
     MEM-16: writes to the CURRENT MONTH segment (see _ledger_segment_path);
@@ -828,8 +855,10 @@ def _append_ledger(record: dict) -> None:
         record["ts"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
     # v0.17 F.4.4: every entry stamps its schema version automatically.
     record.setdefault("schema_version", "v17")
-    with ledger.open("a", encoding="utf-8") as f:
-        f.write(_json.dumps(record) + "\n")
+    # AMS-42: one writer at a time — a whole line lands as one contiguous append.
+    with _LEDGER_LOCK:
+        with ledger.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
 
 @app.get("/health")
 def health() -> dict:
@@ -950,6 +979,9 @@ def health_deep() -> dict:
     # AMS-01 (2026-08-07): carry-over counters — informational invocation proof.
     _put_carryover_bump()  # roll the date on idle days so 'date' stays current
     out["checks"]["put_carryover_today"] = dict(_put_carryover_today)
+    # AMS-39: raw-fallback fire/abstain receipt (informational, never gates).
+    _raw_fallback_bump()   # roll the date on idle days
+    out["checks"]["raw_fallback_today"] = dict(_raw_fallback_today)
     # W5 T6.1: OPAQUE total only (F6) — the per-rule split never leaves the box.
     _redactions_bump()
     out["checks"]["redactions_would_apply_today"] = dict(_redactions_today)
@@ -1904,7 +1936,12 @@ def update(
                 if _missing:
                     _put_carryover_bump(lost=len(_missing))
                     _tier_now = str(_expected.get("tier") or "")
-                    if _tier_now in {"canonical", "insight"}:
+                    # AMS-40 (2026-08-08): the 500 fires for ANY truthy tier,
+                    # not just canonical/insight. A 'stable' record could
+                    # silently lose its tier here — the asymmetry made the
+                    # loudness of the alarm depend on which tier happened to
+                    # be losing data, when the defect is identical.
+                    if _tier_now:
                         raise HTTPException(
                             500,
                             f"F.2.5/H1/AMS-01: carry-over restore failed after retries for "
@@ -1959,7 +1996,10 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     nonce + replay protection, HMAC verified before the nonce is burned (MED-8).
     v0.20 Phase G: the nonce-less format-1 path (<ts>|<mid>|<reason>) is
     REMOVED — a promotion without X-User-Direct-Nonce is rejected outright.
-    Writes ONE ledger line after the Qdrant payload update succeeds."""
+    AMS-22 (2026-08-08): write-ahead audit — a tier-change-intent ledger line is
+    appended BEFORE the mutation (503 refusal if that append fails), then the
+    tier-change completion line after; completion-append failure stays fail-soft
+    (the mutation already happened — the intent line is the audit floor)."""
     auth(x_api_key)
     if b.tier not in PROMOTE_ALLOWED_TIERS:
         raise HTTPException(400, f"invalid tier: {b.tier}; allowed: {sorted(PROMOTE_ALLOWED_TIERS)}")
@@ -2028,6 +2068,31 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             )
 
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    # transport field: "autonomous" when actor is from CANONICAL_AUTOPROMOTE_ALLOWED (dream-autopromote),
+    # "cli-user-direct" for HMAC-validated user-direct canonical, "rest-api" otherwise.
+    if b.tier == "canonical" and actor in CANONICAL_AUTOPROMOTE_ALLOWED:
+        transport = "autonomous"
+    elif b.tier == "canonical" and x_user_direct_token:
+        transport = "cli-user-direct"
+    else:
+        transport = "rest-api"
+    # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
+    # change can never complete without an audit trace. If this append fails the
+    # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
+    # would be worse than useless (the tier would already have changed).
+    try:
+        _append_ledger({
+            "ts": now, "event": "tier-change-intent", "memory_id": mid,
+            "tier": b.tier, "actor": actor, "reason": reason or None,
+            "transport": transport, "status": "intent",
+        })
+    except Exception as e:
+        log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
+        raise HTTPException(
+            503,
+            "audit ledger unavailable (intent append failed); tier change refused "
+            f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
+        )
     try:
         # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
         # without this, a promotion landing inside the PUT window was silently
@@ -2041,20 +2106,14 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     except Exception as e:
         log.exception("tier-update failed")
         raise _upstream_error(e)
-    # Single ledger append AFTER successful payload update
-    # transport field: "autonomous" when actor is from CANONICAL_AUTOPROMOTE_ALLOWED (dream-autopromote),
-    # "cli-user-direct" for HMAC-validated user-direct canonical, "rest-api" otherwise.
-    if b.tier == "canonical" and actor in CANONICAL_AUTOPROMOTE_ALLOWED:
-        transport = "autonomous"
-    elif b.tier == "canonical" and x_user_direct_token:
-        transport = "cli-user-direct"
-    else:
-        transport = "rest-api"
+    # Completion ledger append AFTER successful payload update. Fail-SOFT by
+    # design (AMS-22): the mutation already happened and the intent line above
+    # is the audit floor — a 500 here would misreport a completed change.
     try:
         _append_ledger({
             "ts": now, "event": "tier-change", "memory_id": mid,
             "tier": b.tier, "actor": actor, "reason": reason or None,
-            "transport": transport,
+            "transport": transport, "status": "done",
         })
     except Exception:
         log.exception("ledger append failed for tier-change")
@@ -2930,8 +2989,16 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             rf = _episode_raw_fallback((b.prompt or "")[:500], b.brand)
             if rf:
                 out["raw_fallback"] = rf
+                _raw_fallback_bump(fired=1)
+                log.info("raw-fallback FIRED for episode %s",
+                         rf.get("episode_id"))
+            else:
+                # AMS-39: an abstain is the DOMINANT outcome and was
+                # indistinguishable from the feature being dead — count it.
+                _raw_fallback_bump(abstained=1)
         except Exception:
             log.exception("bundle: raw-trace fallback failed (non-fatal)")
+            _raw_fallback_bump(errors=1)
 
     # 3) open goals (5) + 4) open frontier questions (3)
     try:
@@ -3172,7 +3239,11 @@ def delete(
     reason: Optional[str] = Query(None),
     cascade: bool = Query(False),
 ):
-    """Hard delete. ALWAYS append a `delete` ledger entry so destructive ops are audit-covered.
+    """Hard delete. AMS-22 (2026-08-08): audit is write-AHEAD — a `delete-intent`
+    ledger entry is appended BEFORE any deletion (503 refusal if that append
+    fails, nothing deleted), then the `delete` completion entry after; a
+    completion-append failure stays fail-soft (the deletion already happened —
+    the intent line is the audit floor).
     v0.17 Phase A: canonical/insight tier gate applied BEFORE deletion.
     v0.17 Phase F.1: X-User-Direct-Nonce for replay protection; cascade=true for delete_linked."""
     auth(x_api_key)
@@ -3200,6 +3271,29 @@ def delete(
             prior_payload = (prior[0].payload if hasattr(prior[0], 'payload') else prior[0].get('payload'))
     except Exception:
         pass  # if retrieve fails, delete still proceeds; ledger gets minimal record
+    # AMS-22: write-ahead intent — the audit record precedes the destruction, so
+    # a hard delete can never complete with zero ledger trace. Append failure
+    # (disk full, perms, ~/.mem0 unavailable) REFUSES the deletion with a
+    # retryable 503; nothing has been deleted at this point. The intent stays
+    # small on purpose (no prior_payload) — the completion entry carries it.
+    try:
+        _append_ledger({
+            "event": "delete-intent",
+            "memory_id": mid,
+            "actor": (actor or "rest-api"),
+            "reason": (reason or "DELETE /v1/memories/{mid}"),
+            "prior_tier": prior_tier or ((prior_payload or {}).get("tier") if prior_payload else None),
+            "transport": "cli-user-direct" if x_user_direct_token else "rest-api",
+            "cascade": cascade,
+            "status": "intent",
+        })
+    except Exception as e:
+        log.exception("AMS-22: delete intent ledger append failed; refusing deletion")
+        raise HTTPException(
+            503,
+            "audit ledger unavailable (intent append failed); delete refused "
+            f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
+        )
     # H6/H11 fix: mem0ai 2.0.4 signature is mem.delete(memory_id) -- no delete_linked kwarg.
     # Cascade is implemented here: query Qdrant for superseded-by chain, delete each member
     # individually (non-cascade via mem0 API), and write a separate ledger entry per deletion
@@ -3282,6 +3376,8 @@ def delete(
     except Exception as e:
         log.exception("delete failed")
         raise _upstream_error(e)
+    # AMS-22: completion entry — fail-SOFT by design (the deletion already
+    # happened; the delete-intent line above is the audit floor).
     try:
         _append_ledger({
             "event": "delete",
@@ -3294,6 +3390,7 @@ def delete(
             "transport": "cli-user-direct" if x_user_direct_token else "rest-api",
             "cascade": cascade,
             "cascade_root_id": None,  # this IS the root
+            "status": "done",
         })
     except Exception:
         log.exception("ledger append failed for delete")

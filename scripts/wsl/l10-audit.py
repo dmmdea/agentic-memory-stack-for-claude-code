@@ -77,7 +77,13 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    # Keep audited_keys bounded so the file does not grow forever
+    # Keep audited_keys bounded so the file does not grow forever.
+    # AMS-41 (2026-08-08): the list must arrive in INSERTION order — it used
+    # to be built as list(set), i.e. hash order, so this [-5000:] truncation
+    # dropped an arbitrary 'random' subset of dedup keys and their memories
+    # got re-flagged on the next run (a re-flag storm after any bulk ingest).
+    # With insertion order the truncation deterministically drops the OLDEST
+    # keys, which is the intended retention.
     if len(state.get("audited_keys", [])) > 5000:
         state["audited_keys"] = state["audited_keys"][-5000:]
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -136,7 +142,10 @@ def parse_ts(s: str | None) -> dt.datetime | None:
 def main():
     _ = load_key()  # validates API key file exists; not actually needed for Qdrant scroll
     state = load_state()
-    audited_keys: set[str] = set(state.get("audited_keys", []))
+    # AMS-41: an ORDERED set — dict preserves insertion order, so the
+    # bounded-retention truncation in save_state drops the oldest keys
+    # instead of a hash-order-random subset.
+    audited_keys: dict[str, None] = dict.fromkeys(state.get("audited_keys", []))
     now = int(time.time())
     now_dt = dt.datetime.now(dt.timezone.utc)
 
@@ -174,7 +183,7 @@ def main():
                 if dedup_key in audited_keys:
                     skipped_already_flagged += 1
                     continue
-                audited_keys.add(dedup_key)
+                audited_keys[dedup_key] = None
                 rec = {
                     "audited_at": now,
                     "memory_id": str(mid),

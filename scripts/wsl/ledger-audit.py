@@ -84,7 +84,16 @@ SCHEMA: dict[str, dict] = {
     },
     "tier-change": {
         "required": ["ts", "event", "memory_id", "tier", "actor"],
-        "optional": ["reason", "transport", "schema_version"],
+        "optional": ["reason", "transport", "status", "schema_version"],
+    },
+    # AMS-22 (2026-08-08): write-ahead intent entries, appended BEFORE the
+    # mutation (delete / tier change) so a destructive or authority op can never
+    # complete without an audit trace. An intent WITHOUT a matching completion
+    # entry means the mutation was refused/failed OR completed with its
+    # fail-soft completion append lost — either way worth a look, never silent.
+    "tier-change-intent": {
+        "required": ["ts", "event", "memory_id", "tier", "actor"],
+        "optional": ["reason", "transport", "status", "schema_version"],
     },
     "metadata-merge": {
         "required": ["ts", "event", "memory_id", "merged_keys", "actor"],
@@ -92,7 +101,11 @@ SCHEMA: dict[str, dict] = {
     },
     "delete": {
         "required": ["ts", "event", "memory_id", "actor"],
-        "optional": ["reason", "prior_tier", "prior_source", "transport", "cascade", "schema_version"],
+        "optional": ["reason", "prior_tier", "prior_source", "transport", "cascade", "status", "schema_version"],
+    },
+    "delete-intent": {
+        "required": ["ts", "event", "memory_id", "actor"],
+        "optional": ["reason", "prior_tier", "transport", "cascade", "status", "schema_version"],
     },
     "decay-delete": {
         "required": ["ts", "event", "memory_id", "actor", "reason"],
