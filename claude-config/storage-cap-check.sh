@@ -387,7 +387,10 @@ _CSW="$HOME/.mem0/contradiction-sweep.jsonl"
 if [ -s "$_CSW" ]; then
   # grep -c prints the count even on zero matches (exit 1) — no ||-fallback, it
   # would append a second line and break the -ge integer test (diff-review fix 4).
-  _noop=$(tail -n 3 "$_CSW" 2>/dev/null | grep -c '"outcome": *"no-op' 2>/dev/null)
+  # W5 T3.5: the streak reads NORMAL sweep lines only — mode-tagged lines
+  # (rejudge-stamped / evidence-sweep / retrieval-pairs) have their own
+  # semantics and a burst of them must not fake a dead judgment leg.
+  _noop=$(grep -v '"mode":' "$_CSW" 2>/dev/null | tail -n 3 | grep -c '"outcome": *"no-op' 2>/dev/null)
   [ "${_noop:-0}" -ge 3 ] && _hb+="contradiction sweep: 3+ consecutive no-op runs (judgment leg dead — see AMS-07). "
 fi
 [ -n "$_hb" ] && echo "[heartbeat] $_hb"

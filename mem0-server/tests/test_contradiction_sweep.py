@@ -23,6 +23,24 @@ sweep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweep)
 
 
+@pytest.fixture(autouse=True)
+def _no_pair_cache(monkeypatch):
+    """W5 ADOPT-4 isolation: the dispatch layer now consults the pair-verdict
+    cache at ~/.mem0 — a unit test must NEVER touch (or be answered by) the
+    real sidecar. Default every test in this file to cache-off; the cache
+    tests re-enable it explicitly against a tmp home."""
+    monkeypatch.setattr(sweep, "_pair_cache", None)
+
+
+@pytest.fixture()
+def _tmp_pair_cache(monkeypatch, tmp_path):
+    """Opt-in: real pair_cache module against an isolated tmp home."""
+    import pair_cache
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(sweep, "_pair_cache", pair_cache)
+    return pair_cache
+
+
 # ---------------------------------------------------------------------------
 # parse_verdict
 # ---------------------------------------------------------------------------
@@ -641,6 +659,68 @@ def test_judge_dispatch_routes_local(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# W5 ADOPT-4: pair-verdict cache in the dispatch layer
+# ---------------------------------------------------------------------------
+
+def test_judge_dispatch_consults_and_writes_cache(monkeypatch, _tmp_pair_cache):
+    fake = _FakeCodex({"ok": True, "contradicts": True, "raw": "YES"})
+    monkeypatch.setattr(sweep, "_codex", fake)
+    stats: dict = {}
+    v1, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                 cache_stats=stats)
+    v2, d2 = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                  cache_stats=stats)
+    assert v1 is True and v2 is True
+    assert len(fake.calls) == 1, "second identical pair must be served from cache"
+    assert d2 == "cache-hit"
+    assert stats == {"cache_misses": 1, "cache_hits": 1}
+
+
+def test_rejudge_path_bypasses_cache(monkeypatch, _tmp_pair_cache):
+    """M9 pin: rejudge-stamped is the self-heal path — a cached YES must
+    never answer it. Warm the cache YES, then rejudge with use_cache=False
+    against a NO judge: the REAL judge is consulted and wins."""
+    fake_yes = _FakeCodex({"ok": True, "contradicts": True, "raw": "YES"})
+    monkeypatch.setattr(sweep, "_codex", fake_yes)
+    sweep.judge_dispatch("codex", None, "m", "A", "B", 30)   # warms cache = YES
+    fake_no = _FakeCodex({"ok": True, "contradicts": False, "raw": "NO"})
+    monkeypatch.setattr(sweep, "_codex", fake_no)
+    v, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30,
+                                use_cache=False)
+    assert v is False and len(fake_no.calls) == 1
+
+
+def test_error_verdicts_never_negative_cached(monkeypatch, _tmp_pair_cache):
+    """R2: a transient judge outage must not suppress judging — after an
+    error verdict, the next call reaches the real judge again."""
+    fake_err = _FakeCodex({"ok": False, "error": "boom", "error_type": "X"})
+    monkeypatch.setattr(sweep, "_codex", fake_err)
+    v1, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30)
+    assert v1 is None
+    fake_ok = _FakeCodex({"ok": True, "contradicts": False, "raw": "NO"})
+    monkeypatch.setattr(sweep, "_codex", fake_ok)
+    v2, _ = sweep.judge_dispatch("codex", None, "m", "A", "B", 30)
+    assert v2 is False and len(fake_ok.calls) == 1
+
+
+def test_supersession_dispatch_cache_is_order_sensitive(monkeypatch, _tmp_pair_cache):
+    class _FakeCodexSup:
+        def __init__(self, out):
+            self.out = out
+            self.calls = []
+        def judge_supersession(self, older, newer, timeout_s=0):
+            self.calls.append((older, newer))
+            return self.out
+    fake = _FakeCodexSup({"ok": True, "stale": True, "raw": "STALE"})
+    monkeypatch.setattr(sweep, "_codex", fake)
+    v1, _ = sweep.judge_supersession_dispatch("codex", None, "m", "old", "new", 30)
+    # swapped direction MUST reach the judge again (ordered key)
+    v2, _ = sweep.judge_supersession_dispatch("codex", None, "m", "new", "old", 30)
+    assert v1 is True and v2 is True
+    assert len(fake.calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # v0.27.3: fetch_point_text (absent vs transient-error) + run_rejudge_stamped
 # decision matrix + the codex shim-preflight no-op (audit fixes)
 # ---------------------------------------------------------------------------
@@ -706,7 +786,8 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
         return v
     monkeypatch.setattr(sweep, "fetch_point_text", fake_fetch)
     monkeypatch.setattr(sweep, "judge_dispatch",
-                        lambda mode, http, model, can, cand, t: verdict_map[cand])
+                        # **kw absorbs the W5 cache kwargs (use_cache/cache_stats)
+                        lambda mode, http, model, can, cand, t, **kw: verdict_map[cand])
     calls = []
     monkeypatch.setattr(sweep, "stamp_candidate",
                         lambda http, cid, ts, contradicts=None, clear=False, justification="", pending=False: (

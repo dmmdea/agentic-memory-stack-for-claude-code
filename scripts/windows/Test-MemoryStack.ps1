@@ -1072,7 +1072,11 @@ try {
         # when it is the most recent apply-type action; the normal-sweep freshness/outcome logic
         # reads only NORMAL lines (mode absent) so the rejudge line can't be misparsed.
         $rejudge = @($csRuns | Where-Object { $_.PSObject.Properties['mode'] -and $_.mode -eq 'rejudge-stamped' }) | Select-Object -Last 1
-        $normalRuns = @($csRuns | Where-Object { -not ($_.PSObject.Properties['mode'] -and $_.mode -eq 'rejudge-stamped') })
+        # W5 T3.5: exclude ALL mode-tagged lines from the normal-sweep parse —
+        # the old rejudge-only exclusion let evidence-sweep lines leak into
+        # freshness/outcome logic (pre-existing bug), and the new
+        # retrieval-pairs mode would have leaked the same way.
+        $normalRuns = @($csRuns | Where-Object { -not $_.PSObject.Properties['mode'] })
         $last = if ($normalRuns.Count) { $normalRuns[-1] } else { $csRuns[-1] }
         $lastApply = @($normalRuns | Where-Object { $_.dry_run -eq $false }) | Select-Object -Last 1
         $rejudgeNewer = $rejudge -and (($null -eq $lastApply) -or ([datetime]$rejudge.ts -ge [datetime]$lastApply.ts))

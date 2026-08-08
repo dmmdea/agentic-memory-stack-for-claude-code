@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -1235,6 +1236,178 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     return exit_code_for(outcome)
 
 
+PAIRS_LOCK = Path.home() / ".mem0" / ".retrieval-pairs.lock"
+PAIRS_RECEIPT = Path.home() / ".mem0" / "retrieval-pairs-yield.json"
+RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
+
+
+def _read_retrieval_rows(days: int) -> tuple[list[dict], dict]:
+    """Rows from the retrieval log + rotations, newest window only.
+    Returns (rows, counts) where counts records exclusions — review F7: a
+    mixed-era read must stay honest (rows without the W5 route field are
+    EXCLUDED and counted, never silently treated as search traffic)."""
+    counts = {"scanned": 0, "unparsable": 0, "excluded_legacy_rows": 0,
+              "excluded_other_route": 0, "too_old": 0}
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    rows: list[dict] = []
+    files = [RETRIEVAL_LOG.with_suffix(f".jsonl.{i}") for i in range(5, 0, -1)]
+    files.append(RETRIEVAL_LOG)
+    for f in files:
+        if not f.exists():
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            counts["scanned"] += 1
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                counts["unparsable"] += 1
+                continue
+            route = rec.get("route")
+            if route is None:
+                counts["excluded_legacy_rows"] += 1
+                continue
+            if route != "search":
+                counts["excluded_other_route"] += 1
+                continue
+            try:
+                ts = dt.datetime.fromisoformat(str(rec.get("ts")).replace("Z", "+00:00"))
+                if ts < cutoff:
+                    counts["too_old"] += 1
+                    continue
+            except (ValueError, TypeError):
+                pass  # undated rows stay in (they are new-era rows)
+            rows.append(rec)
+    return rows, counts
+
+
+def run_retrieval_pairs(args) -> int:
+    """W5 ADOPT-4: retrieval-space pair-yield DRY-RUN — counts, NEVER judges
+    and NEVER stamps (the judged mode is a future operator fork gated on this
+    receipt's yield over a real 30-day widened+route-stamped window).
+
+    Samples pairs from CO-RETRIEVAL (what actually lands together in one
+    result set) rather than storage-space cosine neighborhoods, dedupes by
+    unordered pair, ranks by distinct-query co-occurrence, applies the
+    sweep's eligibility rules, splits out canonical-member pairs (the storage
+    sweep never allowed hiding canonicals — they are counted, not actionable),
+    and measures NOVELTY against the storage sweep's reachable set
+    (canonical x its cosine neighborhood)."""
+    try:
+        PAIRS_LOCK.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        print("contradiction-sweep: --retrieval-pairs already running (lock held) — exiting", flush=True)
+        return 0
+    qdrant_http = httpx.Client()
+    outcome = "ok"
+    try:
+        rows, counts = _read_retrieval_rows(args.pairs_days)
+        pair_queries: dict[tuple, set] = {}
+        for rec in rows:
+            ids = [str(i) for i in (rec.get("returned_top_ids") or []) if i]
+            qh = rec.get("query_hash") or "?"
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    key = tuple(sorted((ids[i], ids[j])))
+                    pair_queries.setdefault(key, set()).add(qh)
+        ranked = sorted(pair_queries.items(), key=lambda kv: -len(kv[1]))
+        ranked = ranked[: args.pairs_max_pairs]
+
+        # Bulk payload fetch for eligibility checks.
+        involved = sorted({m for pair, _ in ranked for m in pair})
+        payloads: dict[str, dict] = {}
+        for chunk_start in range(0, len(involved), 128):
+            chunk = involved[chunk_start:chunk_start + 128]
+            r = qdrant_http.post(f"{QDRANT}/collections/{COLLECTION}/points",
+                                 json={"ids": chunk, "with_payload": True},
+                                 timeout=30.0)
+            r.raise_for_status()
+            for pt in r.json().get("result") or []:
+                payloads[str(pt.get("id"))] = pt.get("payload") or {}
+
+        eligible = []
+        canonical_member = 0
+        ineligible = 0
+        for pair, qhs in ranked:
+            a, b = payloads.get(pair[0]), payloads.get(pair[1])
+            if not a or not b:
+                ineligible += 1
+                continue
+            ta = a.get("data") or a.get("memory")
+            tb = b.get("data") or b.get("memory")
+            if not ta or not tb:
+                ineligible += 1
+                continue
+            if not same_brand_scope(a.get("brand"), b.get("brand")):
+                ineligible += 1
+                continue
+            if any(p.get("retired_at") or p.get("retrievable") is False
+                   or p.get("superseded_by") for p in (a, b)):
+                ineligible += 1
+                continue
+            if a.get("tier") == "canonical" or b.get("tier") == "canonical":
+                canonical_member += 1
+                continue
+            eligible.append({"ids": list(pair), "co_occurrence": len(qhs)})
+
+        # Novelty vs the storage sweep's reachable set (canonical x cosine
+        # neighborhood) — the receipt's headline number.
+        reachable: set = set()
+        try:
+            for can in scroll_canonicals(qdrant_http, user_id=args.user_id):
+                can_id = str(can.get("id"))
+                vec = dense_vector(can)
+                can_user = (can.get("payload") or {}).get("user_id")
+                if vec is None or not can_user:
+                    continue
+                for nb in query_similar(qdrant_http, vec, can_user, can_id,
+                                        fetch_n=args.top_k * 3):
+                    reachable.add(tuple(sorted((can_id, str(nb.get("id"))))))
+        except (httpx.HTTPError, OSError) as e:
+            print(f"contradiction-sweep: novelty baseline failed (reported as null): {e}", flush=True)
+            reachable = None
+        novel = (sum(1 for p in eligible if tuple(sorted(p["ids"])) not in reachable)
+                 if reachable is not None else None)
+
+        if not rows:
+            outcome = "no-op:no-route-stamped-rows"
+        receipt = {
+            "generated_at": _iso_now(),
+            "window_days": args.pairs_days,
+            "log_counts": counts,
+            "rows_in_window": len(rows),
+            "pairs_distinct": len(pair_queries),
+            "pairs_ranked": len(ranked),
+            "pairs_eligible": len(eligible),
+            "pairs_canonical_member": canonical_member,
+            "pairs_ineligible": ineligible,
+            "pairs_novel_vs_storage_sweep": novel,
+            "top_pairs": eligible[:20],
+            "note": ("count-only dry run — the judged retrieval-pairs mode is an "
+                     "operator fork gated on material yield over a full widened "
+                     "window (W5 review F7)"),
+        }
+        tmp = PAIRS_RECEIPT.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(receipt, indent=1), encoding="utf-8")
+        os.replace(tmp, PAIRS_RECEIPT)
+        print(f"contradiction-sweep: retrieval-pairs dry-run done. rows={len(rows)} "
+              f"pairs={len(pair_queries)} eligible={len(eligible)} "
+              f"canonical-member={canonical_member} novel={novel} "
+              f"legacy-excluded={counts['excluded_legacy_rows']} -> {PAIRS_RECEIPT}",
+              flush=True)
+    except (httpx.HTTPError, OSError) as e:
+        outcome = f"degraded:aborted:{type(e).__name__}: {str(e)[:120]}"
+        print(f"contradiction-sweep: retrieval-pairs ABORT: {e}", flush=True)
+    finally:
+        qdrant_http.close()
+        try:
+            PAIRS_LOCK.rmdir()
+        except OSError:
+            pass
+    _append_summary({"mode": "retrieval-pairs", "dry_run": True,
+                     "outcome": outcome})
+    return exit_code_for(outcome)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v0.19 I.3: offline contradiction sweep")
     parser.add_argument("--apply", action="store_true",
@@ -1289,8 +1462,25 @@ def main() -> int:
     parser.add_argument("--evidence-sim-floor", type=float, default=0.45,
                         help="evidence-sweep: only judge an older neighbor whose cosine similarity to "
                              "the anchor is >= this (default 0.45) — bounds judging to near-duplicates")
+    parser.add_argument("--retrieval-pairs", action="store_true",
+                        help="W5 ADOPT-4 DRY-RUN ONLY: count co-retrieval pairs from the retrieval "
+                             "log (route='search' rows), rank by co-occurrence, apply eligibility, "
+                             "and measure novelty vs the storage sweep's reachable set. Judges "
+                             "NOTHING and stamps NOTHING; writes ~/.mem0/retrieval-pairs-yield.json. "
+                             "The judged mode is an operator fork gated on this receipt's yield.")
+    parser.add_argument("--pairs-days", type=int, default=30,
+                        help="retrieval-pairs: log window in days (default 30)")
+    parser.add_argument("--pairs-max-pairs", type=int, default=200,
+                        help="retrieval-pairs: cap on ranked pairs fetched for eligibility (default 200)")
     args = parser.parse_args()
     dry_run = not args.apply
+
+    if args.retrieval_pairs:
+        if args.apply:
+            print("contradiction-sweep: --retrieval-pairs is count-only this wave; "
+                  "--apply is refused (the judged mode is an operator fork).", flush=True)
+            return 2
+        return run_retrieval_pairs(args)
 
     # v0.27.3: when judging with Codex, the Windows shim must be reachable. Preflight it; if it is
     # NOT, record a NO-OP (exit 0 — NOT a hard failure, so the weekly timer is not noisy) and never
