@@ -144,9 +144,16 @@ def embedding_coverage(conn: sqlite3.Connection, http: httpx.Client) -> dict:
     reads. Read-only; never raises (a coverage probe must not fail the run)."""
     out = {"eligible": None, "embedded": None, "missing": None}
     try:
+        # Eligibility mirrors episode_embeddings._indexable_summary:
+        # column `summary_text`, non-empty, >= MIN_SUMMARY_CHARS (64) after
+        # stripping. (The first cut of this probe guessed a `summary` column
+        # and fail-softed on the live ledger with 'no such column' — the
+        # fail-soft did its job, but a probe that measures nothing is worth
+        # nothing, so the rule is now taken from the embedder itself.)
         eligible = conn.execute(
             "SELECT COUNT(*) FROM episodes"
-            " WHERE summary IS NOT NULL AND TRIM(summary) != ''").fetchone()[0]
+            " WHERE summary_text IS NOT NULL"
+            "   AND LENGTH(TRIM(summary_text)) >= 64").fetchone()[0]
         r = http.post(f"{QDRANT}/collections/{EPISODE_COLLECTION}/points/count",
                       json={"exact": True}, timeout=15.0)
         r.raise_for_status()
