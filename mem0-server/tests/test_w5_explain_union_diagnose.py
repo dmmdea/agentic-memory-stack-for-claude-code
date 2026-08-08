@@ -437,6 +437,26 @@ def test_diagnose_returned_verdict_for_findable_record():
 # withheld counters end-to-end (T2.1)
 # ---------------------------------------------------------------------------
 
+def test_retrieval_log_top_ids_widened_to_ten():
+    """T3.3 pin — this edit was MISSED on the first pass and both builder and
+    reviewer verified its safety without verifying its presence; this test
+    makes absence red. Static half pins the source; live half proves the log
+    when the corpus is deep enough."""
+    app_src = (Path(__file__).resolve().parents[1] / "app.py").read_text(
+        encoding="utf-8")
+    assert "(results.get(\"results\") or [])[:10]]" in app_src, \
+        "returned_top_ids is no longer sliced at [:10]"
+    r = httpx.post(f"{URL}/v1/memories/search", headers=HDR, json={
+        "query": "memoria del sistema", "filters": {"user_id": "dmmdea"},
+        "limit": 12, "threshold": 0.0, "rerank": False}, timeout=60)
+    r.raise_for_status()
+    n = len(r.json().get("results", []))
+    rec = _last_retrieval_log_entry_for("memoria del sistema")
+    if n < 10 or rec is None:
+        pytest.skip("corpus too shallow for the live half; static pin held")
+    assert len(rec.get("returned_top_ids") or []) == 10
+
+
 def test_search_response_carries_withheld_family_fields():
     r = _search("any probe", rerank=False)
     for k in ("rejected_brand_scoped", "rejected_superseded",

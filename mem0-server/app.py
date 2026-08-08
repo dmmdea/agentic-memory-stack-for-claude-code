@@ -1521,7 +1521,11 @@ def _search_core(b: SearchIn, _route: str = "search"):
             "forensic": qclass == "history",
             "threshold": b.threshold,
             "returned_count": len(results.get("results", [])) if isinstance(results, dict) else 0,
-            "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:3]] if isinstance(results, dict) else [],
+            # W5 T3.3 (ADOPT-4/5): top-10 (was top-3) — pair sampling and
+            # replay Jaccard@10 both need the fuller result set. No reader
+            # pins the old length (verified); mixed-era rows are handled by
+            # both consumers.
+            "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:10]] if isinstance(results, dict) else [],
             "reranked": (results.get("reranked") if isinstance(results, dict) else None),
             # W5 T5.5: the union leg's receipt — candidates seen, unioned into
             # the pool, and surviving the final list. lexical_candidates==0 on
