@@ -38,6 +38,13 @@ gates (that is a dead leg's signature, not a fresh box's).
 import importlib.util
 
 
+def _fastembed_available():
+    """Module-local seam so headless tests (runners without fastembed) can
+    stub availability without monkey-patching the shared importlib module —
+    the W1 near-miss class."""
+    return importlib.util.find_spec("fastembed") is not None
+
+
 def encode_with_selfheal(store, text):
     """AMS-09b (2026-08-07, the leg's SECOND death): bounded un-poison of
     mem0's lazy BM25 encoder sentinel.
@@ -48,15 +55,20 @@ def encode_with_selfheal(store, text):
     the server runs ``HF_HUB_OFFLINE=1``, so one cache-missing init at boot
     poisoned the leg until a manual restart — even after the cache returned.
     This wrapper resets the poisoned sentinel at most ONCE per call and
-    retries. Under ``HF_HUB_OFFLINE`` the retry is a local-disk load or an
-    immediate miss — it can never hang on a network fetch. Healing here heals
-    the WRITE path too (same store object, same encoder). Never raises.
+    retries — and only when fastembed is importable, so a box genuinely
+    missing the dependency never pays a doomed re-init on every health call.
+    Under ``HF_HUB_OFFLINE`` the retry is a local-disk load or an immediate
+    miss — it can never hang on a network fetch (verified: the 2026-08-07
+    boot-window failures errored instantly on the local_files_only path).
+    Healing here heals the WRITE path too (same store object, same encoder).
+    Never raises.
     """
     try:
         sv = store._encode_bm25(text)
         if sv is not None:
             return sv
-        if getattr(store, "_bm25_encoder", None) is False:
+        if (getattr(store, "_bm25_encoder", None) is False
+                and _fastembed_available()):
             store._bm25_encoder = None  # un-poison: allow exactly one fresh init
             sv = store._encode_bm25(text)
         return sv

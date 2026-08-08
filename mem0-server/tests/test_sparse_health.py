@@ -37,22 +37,37 @@ class _FakeStore:
         return {"indices": [1], "values": [0.5]}
 
 
-def test_selfheal_unpoisons_once_and_returns_vector():
+def test_selfheal_unpoisons_once_and_returns_vector(monkeypatch):
     # AMS-09b: the exact second-death state — sentinel poisoned by a
     # boot-window init failure, cache since returned. One reset must heal.
+    # (Headless runners lack fastembed; stub the module-local seam.)
+    import sparse_health
+    monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: True)
     store = _FakeStore(poisoned=True, heal_works=True)
     assert encode_with_selfheal(store, "qube") is not None
     assert store.init_attempts == 1
 
 
-def test_selfheal_is_bounded_per_call():
+def test_selfheal_is_bounded_per_call(monkeypatch):
     # Init keeps failing (cache genuinely absent): exactly ONE retry per
     # call, never a loop; a later call may try once again.
+    import sparse_health
+    monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: True)
     store = _FakeStore(poisoned=True, heal_works=False)
     assert encode_with_selfheal(store, "qube") is None
     assert store.init_attempts == 1
     assert encode_with_selfheal(store, "qube") is None
     assert store.init_attempts == 2
+
+
+def test_selfheal_skips_reset_when_dep_missing(monkeypatch):
+    # A box genuinely missing fastembed must not pay a doomed re-init on
+    # every health call — the guard keeps the sentinel poisoned.
+    import sparse_health
+    monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: False)
+    store = _FakeStore(poisoned=True, heal_works=True)
+    assert encode_with_selfheal(store, "qube") is None
+    assert store.init_attempts == 0
 
 
 def test_selfheal_no_reset_on_healthy_encoder():

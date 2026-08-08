@@ -852,8 +852,10 @@ def health_deep() -> dict:
     try:
         # AMS-09b: encode via the self-healing wrapper — a transiently-failed
         # encoder init (cache evicted at boot + HF_HUB_OFFLINE) otherwise stays
-        # poisoned until a manual restart. /health/deep is hit by every
-        # SessionStart heartbeat, so recovery gets a mouth automatically.
+        # poisoned until a manual restart. Recovery mouths = every /health/deep
+        # caller: the nightly dream heartbeat, the deploy gate, Test-MemoryStack,
+        # and the MCP memory_health verb. (The SessionStart banner deliberately
+        # never calls /health/deep — RegressionGuards pins that.)
         _sl = sparse_leg_health(
             mem.vector_store.client, mem.vector_store.collection_name,
             lambda q: encode_with_selfheal(mem.vector_store, q),
