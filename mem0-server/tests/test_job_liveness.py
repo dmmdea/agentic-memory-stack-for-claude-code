@@ -50,7 +50,12 @@ JL_KEYS = {"role", "last_dream_age_h", "prune_age_h", "gather_age_h",
            "mcp_shim_receipt_age_h", "mcp_shim_host_match",
            "mcp_shim_stack_version",
            "brand_scope_age_h", "brand_scope_misscoped",
-           "outbox_depth", "outbox_replayed_age_h", "outbox_drain_log_age_h"}
+           "outbox_depth", "outbox_replayed_age_h", "outbox_drain_log_age_h",
+           # W6 D5: job-queue aggregates from the jobs-heartbeat.json mirror
+           # (same-commit with job_liveness.py — this set is strict-equality).
+           "jobs_heartbeat_age_h", "jobs_queued", "jobs_running",
+           "jobs_failed_24h", "jobs_reaped_24h",
+           "jobs_oldest_running_age_h", "jobs_oldest_queued_age_h"}
 DS_KEYS = {"state_present", "last_compare_ts", "age_hours",
            "before_retrievable", "n_total", "hwm", "hwm_seeded",
            "consecutive_below_hwm", "consecutive_snapshot_failures",
@@ -110,6 +115,50 @@ def test_collector_missing_everything_nulls_not_raises(tmp_path):
     for k in JL_KEYS - {"role"}:
         assert out[k] is None, k
     assert "missing" in out["error"] or "none found" in out["error"]
+
+
+def test_collector_reads_jobs_heartbeat_mirror(tmp_path):
+    """W6 D5 + review fix 4a: the mirror-reading branch had NO functional
+    coverage — all 7 keys initialize to None, so the strict-equality JL_KEYS
+    pin stayed green through any parse regression (renamed field, broken ts).
+    This fixture makes the branch real."""
+    now = 1_700_000_000
+    mem0 = tmp_path / "mem0"
+    mem0.mkdir(parents=True)
+    (mem0 / "jobs-heartbeat.json").write_text(json.dumps({
+        "ts": dt.datetime.fromtimestamp(now - 3600, dt.timezone.utc).isoformat(),
+        "queued": 2, "running": 1, "failed_24h": 3, "reaped_24h": 1,
+        "oldest_running_age_s": 7200, "oldest_queued_age_s": 10800,
+    }), encoding="utf-8")
+    out = job_liveness_health(mem0_dir=mem0, win_home=tmp_path / "winhome",
+                              now_s=now, environ={}, stack_env={})
+    assert out["jobs_heartbeat_age_h"] == 1.0
+    assert out["jobs_queued"] == 2 and out["jobs_running"] == 1
+    assert out["jobs_failed_24h"] == 3 and out["jobs_reaped_24h"] == 1
+    assert out["jobs_oldest_running_age_h"] == 2.0
+    assert out["jobs_oldest_queued_age_h"] == 3.0
+
+
+def test_collector_jobs_mirror_absent_is_silent_not_an_error(tmp_path):
+    """No mirror = no adopter has run on this box — silent nulls, never an
+    error note (a fresh box must not read as broken)."""
+    mem0 = tmp_path / "mem0"
+    mem0.mkdir(parents=True)
+    out = job_liveness_health(mem0_dir=mem0, win_home=tmp_path / "winhome",
+                              now_s=1_700_000_000, environ={}, stack_env={})
+    assert out["jobs_heartbeat_age_h"] is None
+    assert "jobs_heartbeat" not in (out.get("error") or "")
+
+
+def test_collector_jobs_mirror_corrupt_is_fail_soft(tmp_path):
+    mem0 = tmp_path / "mem0"
+    mem0.mkdir(parents=True)
+    (mem0 / "jobs-heartbeat.json").write_text("{not json", encoding="utf-8")
+    out = job_liveness_health(mem0_dir=mem0, win_home=tmp_path / "winhome",
+                              now_s=1_700_000_000, environ={}, stack_env={})
+    assert set(out) == JL_KEYS | {"error"}
+    assert out["jobs_heartbeat_age_h"] is None
+    assert "jobs_heartbeat" in out["error"]
 
 
 def test_collector_dream_age_from_stamp_content_not_mtime(tmp_path):

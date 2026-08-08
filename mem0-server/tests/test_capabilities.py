@@ -65,6 +65,10 @@ GREEN_CHECKS = {
         "brand_scope_age_h": 12.0, "brand_scope_misscoped": 0,
         "outbox_depth": 0, "outbox_replayed_age_h": 100.0,
         "outbox_drain_log_age_h": 100.0,
+        # W6 D5: fresh queue mirror, nothing failed/stuck -> alive.
+        "jobs_heartbeat_age_h": 0.5, "jobs_queued": 0, "jobs_running": 0,
+        "jobs_failed_24h": 0, "jobs_reaped_24h": 0,
+        "jobs_oldest_running_age_h": None, "jobs_oldest_queued_age_h": None,
     },
     "retrieval_drift": {
         "state_present": True, "last_compare_ts": "2026-08-07T03:00:00",
@@ -572,6 +576,46 @@ def test_no_active_reranker_probe_reaches_health_deep():
 
 
 # ---- offline-outbox: replica-scoped ----
+
+# ---- job-queue: W6 D5 verdict edges (review fix 4b — only the alive path
+# was pinned via GREEN_CHECKS, so deleting either gate stayed green) ----
+
+def test_job_queue_no_mirror_is_unknown_not_dead():
+    """An idle box (no adopter has ever run) must read unknown, never dead."""
+    out = _ev(_jl(jobs_heartbeat_age_h=None))
+    assert out["states"]["job-queue"] == "unknown"
+
+
+def test_job_queue_stale_mirror_is_degraded():
+    """F7d: a dead queue must not present a stale mirror as current."""
+    out = _ev(_jl(jobs_heartbeat_age_h=9 * 24))
+    assert out["states"]["job-queue"] == "degraded"
+
+
+def test_job_queue_recent_failure_is_degraded():
+    out = _ev(_jl(jobs_failed_24h=1))
+    assert out["states"]["job-queue"] == "degraded"
+
+
+def test_job_queue_wedged_running_claim_is_degraded():
+    """Review fix 3: a wedged claim keeps refreshing the mirror (every later
+    run exits 'claim lost'), so freshness alone reads healthy while the job
+    never runs again — the stuck row itself must convict."""
+    out = _ev(_jl(jobs_oldest_running_age_h=72))
+    assert out["states"]["job-queue"] == "degraded"
+
+
+def test_job_queue_stuck_queued_row_is_degraded():
+    out = _ev(_jl(jobs_oldest_queued_age_h=72))
+    assert out["states"]["job-queue"] == "degraded"
+
+
+def test_job_queue_optional_never_convicts_dead_required():
+    """required='optional' — adoption is staged; a degraded queue must never
+    block a deploy's dead_required gate."""
+    out = _ev(_jl(jobs_failed_24h=5))
+    assert "job-queue" not in out["dead_required"]
+
 
 def test_offline_outbox_role_scoping():
     """Required on the replica only. A stranded outbox is DEAD there, and F8
