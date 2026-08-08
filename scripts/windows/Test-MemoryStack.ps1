@@ -1029,13 +1029,18 @@ if ($key) {
 }
 
 # R6: goals health (v0.16)
+# AMS-57 (2026-08-08): this used to LIST with limit=200 and report the returned
+# row count as "$total". Once the table passed 200 rows it reported exactly 200
+# every run and stamped it OK — the real figure was 2955 (1623 open). It read as
+# a small, healthy backlog precisely because it was saturated. Counting now
+# happens in SQL via /v1/goals/count; the LIST path survives only as a fallback
+# and is NEVER allowed to present a page as a total (see the >= below).
 if ($key) {
     try {
-        $r     = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/goals?limit=200' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
-        $arr   = @($r)
-        $total   = $arr.Count
-        $open    = @($arr | Where-Object { $_.status -eq 'open' }).Count
-        $blocked = @($arr | Where-Object { $_.status -eq 'blocked' }).Count
+        $c       = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/goals/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $total   = [int]$c.total
+        $open    = [int]$c.by_status.open
+        $blocked = [int]$c.by_status.blocked
         if ($total -ge 1) {
             Add-Check 'RECOVERY' 'goals :v0.16' 'OK' "$total total ($open open, $blocked blocked)"
         } else {
@@ -1046,7 +1051,29 @@ if ($key) {
                 else                { Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' 'no goals yet (normal post-ship; needs sessions)' }
             } catch { Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' 'no goals yet (normal post-ship; needs sessions)' }
         }
-    } catch { Add-Check 'RECOVERY' 'goals :v0.16' 'FAIL' $_.Exception.Message }
+    } catch {
+        # Count endpoint unreachable (server older than AMS-57, or down). Fall
+        # back to the LIST page — but report it as a FLOOR, never as a total. A
+        # saturated page is exactly the failure this check exists to avoid, so
+        # it degrades to WARN rather than quietly printing a confident number.
+        $countErr = $_.Exception.Message
+        try {
+            $lim   = 200
+            # Two-step on purpose. `@(Invoke-RestMethod ...)` inline does NOT unroll
+            # the returned JSON array — it wraps it as a SINGLE element, so .Count
+            # reads 1 no matter how many rows came back. Assigning first, then @(),
+            # gives the real row count. (Verified live: inline form reported 1 with
+            # $arr[0] itself being Object[]; two-step reported 200.)
+            $resp  = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $arr   = @($resp)
+            $open  = @($arr | Where-Object { $_.status -eq 'open' }).Count
+            if ($arr.Count -ge $lim) {
+                Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' ">=$($arr.Count) goals (>=$open open) - /v1/goals/count unavailable, LIST page saturated so the true total is UNKNOWN: $countErr"
+            } else {
+                Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' "$($arr.Count) total ($open open) via LIST fallback - /v1/goals/count unavailable: $countErr"
+            }
+        } catch { Add-Check 'RECOVERY' 'goals :v0.16' 'FAIL' $countErr }
+    }
 }
 
 # R6b: goals stale-sweep freshness (v0.18 MED-13)
@@ -1276,12 +1303,29 @@ try {
 } catch { Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' $_.Exception.Message }
 
 # R7: open_questions health (v0.17 Phase D)
+# AMS-57: same saturated-page defect as R6 above — reported "200 open frontier
+# questions" for as long as it has been over 200; the real figure was 2389.
 if ($key) {
     try {
-        $r     = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/open_questions?status=open&limit=200' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
-        $total = @($r).Count
-        Add-Check 'RECOVERY' 'open_questions :v0.17' 'OK' "$total open frontier questions"
-    } catch { Add-Check 'RECOVERY' 'open_questions :v0.17' 'FAIL' $_.Exception.Message }
+        $c     = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/open_questions/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $open  = [int]$c.by_status.open
+        $total = [int]$c.total
+        Add-Check 'RECOVERY' 'open_questions :v0.17' 'OK' "$open open frontier questions ($total lifetime)"
+    } catch {
+        $countErr = $_.Exception.Message
+        try {
+            $lim  = 200
+            # Two-step: see the note on the goals fallback — an inline @(IRM ...)
+            # wraps the JSON array as one element and undercounts to 1.
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/open_questions?status=open&limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $arr  = @($resp)
+            if ($arr.Count -ge $lim) {
+                Add-Check 'RECOVERY' 'open_questions :v0.17' 'WARN' ">=$($arr.Count) open - /v1/open_questions/count unavailable, LIST page saturated so the true total is UNKNOWN: $countErr"
+            } else {
+                Add-Check 'RECOVERY' 'open_questions :v0.17' 'WARN' "$($arr.Count) open via LIST fallback - /v1/open_questions/count unavailable: $countErr"
+            }
+        } catch { Add-Check 'RECOVERY' 'open_questions :v0.17' 'FAIL' $countErr }
+    }
 }
 
 # R8: systemd-user linger enabled (v0.18 LOW-7)
