@@ -64,6 +64,9 @@ from episodic import (
     get_goal as _episodic_get_goal,
     list_goals as _episodic_list_goals,
     get_goal_tree as _episodic_get_goal_tree,
+    # AMS-57 — true counts for the health probes (a LIST page is not a total)
+    count_goals as _episodic_count_goals,
+    count_open_questions as _episodic_count_open_questions,
     # v0.17 Phase 0 — within-session checkpoint
     upsert_in_progress_episode as _episodic_upsert_checkpoint,
     finalize_episode as _episodic_finalize_episode,
@@ -2318,6 +2321,27 @@ def list_goals_endpoint(
         raise _upstream_error(e)
 
 
+
+# AMS-57 (2026-08-08): declared BEFORE /v1/goals/{goal_id} — that route types
+# goal_id as int, so a literal "count" reaching it first would 422 rather than
+# fall through. Same ordering rule as /v1/goals/tree above.
+@app.get("/v1/goals/count")
+def count_goals_endpoint(x_api_key: Optional[str] = Header(None)):
+    """True goal count + per-status breakdown.
+
+    Exists because the health probe used to report the size of a `limit=200`
+    LIST page as the total, which silently pinned at 200 and read as healthy
+    once the real backlog passed it.
+    """
+    auth(x_api_key)
+    try:
+        with _episodic_connect() as conn:
+            return _episodic_count_goals(conn)
+    except Exception as e:
+        log.exception("goals count failed")
+        raise _upstream_error(e)
+
+
 @app.get("/v1/goals/{goal_id}")
 def get_goal_endpoint(goal_id: int, x_api_key: Optional[str] = Header(None)):
     """Fetch a single goal by integer id."""
@@ -2708,6 +2732,22 @@ def search_open_questions_endpoint(b: OpenQuestionSearchIn, x_api_key: Optional[
             return _episodic_search_open_questions(conn, query=b.query, brand=b.brand, status=b.status, limit=b.limit)
     except Exception as e:
         log.exception("open_questions search failed")
+        raise _upstream_error(e)
+
+
+@app.get("/v1/open_questions/count")
+def count_open_questions_endpoint(x_api_key: Optional[str] = Header(None)):
+    """True open-question count + per-status breakdown (AMS-57).
+
+    Declared before /v1/open_questions/{oq_id} for the same path-matching
+    reason as the goals counterpart.
+    """
+    auth(x_api_key)
+    try:
+        with _episodic_connect() as conn:
+            return _episodic_count_open_questions(conn)
+    except Exception as e:
+        log.exception("open_questions count failed")
         raise _upstream_error(e)
 
 
