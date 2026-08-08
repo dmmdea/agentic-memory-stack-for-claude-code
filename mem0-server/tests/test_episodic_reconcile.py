@@ -41,11 +41,18 @@ def test_ams20_infra_degradations_still_win_over_the_orphan_verdict():
 
 
 def test_ams19_embedding_coverage_measured(tmp_path):
+    """Schema-accurate: the real ledger column is `summary_text` and the
+    embedder's own rule is >= 64 chars after stripping (MIN_SUMMARY_CHARS).
+    The first cut guessed `summary` and fail-softed against the LIVE db —
+    this fixture reproduces the real schema so that cannot recur."""
     db = tmp_path / "e.db"
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, summary TEXT)")
-    conn.executemany("INSERT INTO episodes (summary) VALUES (?)",
-                     [("a summary",), ("another",), ("",), (None,)])
+    conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, "
+                 "summary_text TEXT)")
+    long_enough = "x" * 70
+    conn.executemany("INSERT INTO episodes (summary_text) VALUES (?)",
+                     [(long_enough,), (long_enough,), ("too short",),
+                      ("",), (None,)])
     conn.commit()
 
     def handler(request):
@@ -54,8 +61,29 @@ def test_ams19_embedding_coverage_measured(tmp_path):
     http = httpx.Client(transport=httpx.MockTransport(handler))
     out = recon.embedding_coverage(conn, http)
     conn.close()
-    # 2 eligible (non-empty summaries), 1 embedded -> 1 missing
+    # 2 eligible (>=64 chars), 1 embedded -> 1 missing; the 3 short/empty/null
+    # rows are NOT eligible, exactly as the embedder treats them
     assert out == {"eligible": 2, "embedded": 1, "missing": 1}
+
+
+def test_ams19_coverage_query_matches_the_real_ledger_schema(tmp_path):
+    """A probe that silently measures nothing is worth nothing: pin the
+    column name against the shape the live ledger actually has."""
+    db = tmp_path / "e.db"
+    conn = sqlite3.connect(db)
+    # the real episodes table (subset), from the live ledger
+    conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, session_id "
+                 "TEXT, goal_text TEXT, summary_text TEXT, state TEXT)")
+    conn.commit()
+
+    def handler(request):
+        return httpx.Response(200, json={"result": {"count": 0}})
+
+    out = recon.embedding_coverage(conn, httpx.Client(
+        transport=httpx.MockTransport(handler)))
+    conn.close()
+    assert "error" not in out, f"coverage probe broke on the real schema: {out}"
+    assert out["eligible"] == 0 and out["missing"] == 0
 
 
 def test_ams19_coverage_probe_never_raises(tmp_path):
