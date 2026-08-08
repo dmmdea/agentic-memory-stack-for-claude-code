@@ -37,8 +37,9 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 | session start | banners (storage cap, audit flags, review queue), resume précis, dream catch-up spawn | the banner itself; `~/.claude/logs/` |
 | session end / compaction | L1a fact extraction (10-min throttle) | `~/.claude/logs/l1a.log` |
 | daily 3:00 (Task Scheduler, WakeToRun) | dream consolidation | `schtasks /Query /TN "ClaudeCode-DreamConsolidator-3am" /FO LIST /V`; `~/.claude/logs/dream.log` |
+| daily 3:30 | stack-backup (**last 8 daily snapshots kept ≈ an 8-day restore window**) | `systemctl --user list-timers` in WSL |
 | daily 4:30 (Task Scheduler) | semantic dedup | `~/.mem0/tier-ledger-YYYY-MM.jsonl` (deletes are logged; monthly segments) |
-| Sun 02:00 / 03:30 / 04:00 / 05:00 / 05:30 | decay-scan / stack-backup / goals-stale-sweep / contradiction-sweep / episodic-reconcile | `systemctl --user list-timers` in WSL |
+| Sun 02:00 / 04:00 / 05:00 / 05:30 | decay-scan / goals-stale-sweep / contradiction-sweep / episodic-reconcile | `systemctl --user list-timers` in WSL |
 | every 6 h | L10 heuristic audit | `~/.mem0/audit-flags.jsonl` |
 
 ```bash
@@ -183,7 +184,11 @@ curl -s http://127.0.0.1:11436/v1/models | grep -o embeddinggemma   # embedder b
 ```
 
 - **Qdrant refused** → `systemctl --user restart qdrant.service`.
-- **Embedder refused / wrong dim** → llama-swap issue: `systemctl --user restart llama-swap.service`; confirm `embeddinggemma` is in its config (see `install/llama-swap-setup.md`). First call after a cold start can be slow (model load) — `/health/deep` needs a generous timeout.
+- **Embedder refused / wrong dim** → llama-swap issue. **llama-swap is per-host: it may run as a WSL systemd-user unit OR as a Windows-native process** (mirrored networking makes `:11436` reachable either way, which masks the difference until restart time — find the owner before restarting):
+  - WSL-native: `systemctl --user restart llama-swap.service` (if that unit doesn't exist on this host, llama-swap is not running in WSL — don't stop here).
+  - Windows-native: find the owner (`Get-NetTCPConnection -LocalPort 11436 -State Listen | Select OwningProcess`, then `Get-Process -Id <pid>`); if it runs under a scheduled task (the common setup), restart it with `Stop-ScheduledTask -TaskName <task>; Start-ScheduledTask -TaskName <task>` — otherwise stop the process and relaunch it the way it was started.
+
+  Either way, confirm `embeddinggemma` is in its config (see `install/llama-swap-setup.md`). First call after a cold start can be slow (model load) — `/health/deep` needs a generous timeout.
 - **ImportError at startup** → venv or a missing module from `MEM0_MODULES` (a fresh-install class of bug now guarded by the import-closure test); rerun the installer.
 
 ---
@@ -195,7 +200,7 @@ curl http://127.0.0.1:6333/collections
 curl http://127.0.0.1:6333/collections/mem0_egemma_768    # .points_count, .status
 ```
 
-- **Points dropped to 0 / collection gone** → restore from the weekly snapshot: see [`data-backup.md`](./data-backup.md) and `scripts/wsl/stack-restore.sh`. Deletions by dedup/decay are individually restorable: the **full payloads** are preserved in `~/.mem0/dedup-report.jsonl` (`deleted_full_payload`) and `~/.mem0/decay-report.jsonl` (`full_payload`); the monthly tier-ledger segments (`tier-ledger-YYYY-MM.jsonl`) carry the id/reason/actor audit trail.
+- **Points dropped to 0 / collection gone** → restore from the latest daily snapshot (last 8 kept ≈ an 8-day restore window): see [`data-backup.md`](./data-backup.md) and `scripts/wsl/stack-restore.sh`. Deletions by dedup/decay are individually restorable: the **full payloads** are preserved in `~/.mem0/dedup-report.jsonl` (`deleted_full_payload`) and `~/.mem0/decay-report.jsonl` (`full_payload`); the monthly tier-ledger segments (`tier-ledger-YYYY-MM.jsonl`) carry the id/reason/actor audit trail.
 - **Status red** → corrupted; restore the latest Qdrant snapshot from `~/.mem0/backups/`.
 
 ---
@@ -206,7 +211,7 @@ curl http://127.0.0.1:6333/collections/mem0_egemma_768    # .points_count, .stat
 du -sh ~/.mem0 ~/qdrant-server/storage 2>/dev/null; du -sh $(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')")/.claude/logs 2>/dev/null
 ```
 
-- `~/.mem0/backups/` keeps the last 8 of each artifact — prune older manually if needed.
+- `~/.mem0/backups/` keeps the last 8 of each artifact (daily snapshots → ≈ an 8-day window) — prune older manually if needed.
 - Logs rotate automatically (1 MB, 5 archives); ledgers segment monthly.
 - The SessionStart storage-cap banner warns at growth boundaries; it never auto-prunes.
 
