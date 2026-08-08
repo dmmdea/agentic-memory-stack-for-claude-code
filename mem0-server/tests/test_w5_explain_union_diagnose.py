@@ -352,8 +352,7 @@ def test_union_leg_fail_closed_when_reranker_down():
     stubbed without touching llama-swap."""
     import app as app_mod
 
-    n = _nonce()
-    mid = _seed(f"{FILLER} {n}")
+    n, mid = _seed_keyword_only(FILLER)   # dense-excluded at 0.30, verified
     real = app_mod.bge_rerank
 
     def _down(query, results, text_key="memory", *, force=False, status_out=None):
@@ -363,21 +362,26 @@ def test_union_leg_fail_closed_when_reranker_down():
 
     try:
         app_mod.bge_rerank = _down
+        # RESCUE_THRESHOLD, not 0.1 (mutation ledger M3 caught this run
+        # vacuously green): at 0.1 the long-prose seed is dense-INCLUDED, the
+        # union dedupes it, and the fail-closed drop has nothing to drop. At
+        # 0.30 the target is dense-excluded, the union ADDS it unscored, and
+        # only the drop stands between it and the caller.
         sr = app_mod._search_core(app_mod.SearchIn(
-            query=n, filters={"user_id": USER}, limit=50, threshold=0.1,
-            rerank=True))
-        # The contract is about LEXICAL items (a dense-reachable target may
-        # legitimately return as a dense item): NO lexical_only survivor may
-        # exist, and the log must show candidates seen but zero kept — with
-        # limit=50 > the admitted dense count the trim cannot mask a deleted
-        # filter (M3's red condition).
+            query=n, filters={"user_id": USER}, limit=50,
+            threshold=RESCUE_THRESHOLD, rerank=True))
+        # The contract is about LEXICAL items: NO lexical_only survivor may
+        # exist, and the log must show the leg ADDED something that was then
+        # dropped — lexical_added>=1 is the anti-vacuity receipt proving the
+        # drop actually had work; with limit=50 > the pool the trim cannot
+        # mask a deleted filter (M3's red condition).
         assert not any(x.get("lexical_only") for x in sr.get("results", [])), \
             "unscored lexical item survived a reranker outage"
         assert sr.get("rerank_status") == "failed_fallback_dense"
         rec = _last_retrieval_log_entry_for(n)
         assert rec is not None and rec.get("lexical_kept") == 0
-        assert rec.get("lexical_candidates") >= 1, \
-            "keyword_search never saw the seeded nonce — vacuous run"
+        assert rec.get("lexical_added", 0) >= 1, \
+            "union leg added nothing — the fail-closed drop was never exercised"
     finally:
         app_mod.bge_rerank = real
         _delete(mid)
