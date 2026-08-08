@@ -1645,10 +1645,15 @@ function Measure-MemoryContextBudget {
         $memText = ('x' * 240)   # > 200 so truncation fires
         $goalText = ('g' * 130)  # > 100
         $oqText = ('q' * 150)    # > 120
+        # W5 T2.3 (review Finding 5): worst-case memories carry a STALE
+        # created_at so the conditional staleness line fires in the budget
+        # render — without it the certified worst case silently excluded the
+        # line's length.
+        $staleTs = [System.DateTimeOffset]::UtcNow.AddDays(-400).ToString('o')
         $mems = @()
         for ($i = 0; $i -lt $memN; $i++) {
             $mems += [pscustomobject]@{ id = "bm-$i"; memory = $memText
-                                        metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem' } }
+                                        metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'; created_at = $staleTs } }
         }
         $goals = @()
         for ($i = 0; $i -lt $goalN; $i++) {
@@ -1673,7 +1678,8 @@ function Measure-MemoryContextBudget {
         $headerOverhead = 90
         $legendOverhead = if ($caps.include_legend) { 220 } else { 0 }
         $sectionLabels = 100                       # 3 section headers + blank lines
-        $ceiling = $headerOverhead + $legendOverhead + $sectionLabels +
+        $staleLine = 45                            # W5 T2.3 '(newest matching memory: Nd old)'
+        $ceiling = $headerOverhead + $legendOverhead + $sectionLabels + $staleLine +
                    ($effMem * $perMem) + ($goalN * $perGoal) + ($oqN * $perOq)
 
         return [pscustomobject]@{

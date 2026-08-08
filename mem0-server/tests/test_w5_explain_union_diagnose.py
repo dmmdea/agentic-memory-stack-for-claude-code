@@ -161,7 +161,11 @@ def _seed_keyword_only(base_text: str, threshold: float = RESCUE_THRESHOLD,
     for _ in range(attempts):
         n = _nonce()
         mid = _seed(f"{base_text} {n}")
-        probe = _search(n, rerank=False, limit=20, threshold=threshold)
+        try:
+            probe = _search(n, rerank=False, limit=20, threshold=threshold)
+        except Exception:
+            _delete(mid)   # review Finding 6: no stranded nonce on error paths
+            raise
         if mid not in [x.get("id") for x in probe.get("results", [])]:
             return n, mid
         _delete(mid)
@@ -172,9 +176,28 @@ def _seed_keyword_only(base_text: str, threshold: float = RESCUE_THRESHOLD,
 # explain (T1.1)
 # ---------------------------------------------------------------------------
 
+# Time-derived per-result fields: recomputed from now() on EVERY call when
+# the corresponding path is active (the production unit sets
+# MEM0_DURABLE_FRESHNESS_ENABLED=1 and durable_freshness_score is unrounded),
+# so two sequential calls NEVER byte-match on them. The zero-mutation
+# invariant compares everything BUT these (review Finding 1 — a byte-compare
+# passed on the dev instance only because its process lacked the env flag).
+_TIME_DERIVED = ("durable_freshness_score", "durable_freshness_weight",
+                 "operational_recency_score", "freshness_weight")
+
+
+def _stable_projection(results):
+    out = []
+    for r in results or []:
+        c = {k: v for k, v in r.items() if k not in _TIME_DERIVED}
+        out.append(c)
+    return json.dumps(out, sort_keys=True)
+
+
 def test_explain_zero_mutation_and_trace_shape():
-    """explain=True must not change results[]; the trace must name the
-    pipeline stages in order (M1 target: gutting the trace goes red here)."""
+    """explain=True must not change results[] (stable projection — see
+    _TIME_DERIVED); the trace must name the pipeline stages in order (M1
+    target: gutting the trace goes red here)."""
     n = _nonce()
     mid = _seed(f"explain probe fact {n} about stage tracing")
     try:
@@ -182,9 +205,8 @@ def test_explain_zero_mutation_and_trace_shape():
         on = _search(n, rerank=False, threshold=0.0, explain=True)
         assert "_explain" not in off
         assert "_explain" in on
-        # Zero-mutation on the results themselves (order + content).
-        assert json.dumps(off.get("results"), sort_keys=True) == \
-               json.dumps(on.get("results"), sort_keys=True)
+        assert _stable_projection(off.get("results")) == \
+               _stable_projection(on.get("results"))
         stages = [s.get("stage") for s in on["_explain"]["stages"]]
         for expected in ("overfetch", "dense_fetch", "union_lexical",
                          "retired_filter", "canonical_intent_filter",
@@ -192,6 +214,39 @@ def test_explain_zero_mutation_and_trace_shape():
             assert expected in stages, f"missing trace stage {expected}: {stages}"
         # bundle-path purity: rerank=False search must not stamp rerank_status
         assert "rerank_status" not in off
+    finally:
+        _delete(mid)
+
+
+def test_explain_zero_mutation_under_launch_path_env(monkeypatch):
+    """Review Finding 1 / R7: the invariant parameterized over the LAUNCH
+    PATH env (MEM0_DURABLE_FRESHNESS_ENABLED=1, which the dev process may
+    lack) and over query_class — direct-import so the env is controlled
+    in-process, not inherited from whichever instance happens to serve."""
+    import app as app_mod
+
+    n = _nonce()
+    mid = _seed(f"launch env explain probe {n}")
+    try:
+        for env_on in (False, True):
+            if env_on:
+                monkeypatch.setenv("MEM0_DURABLE_FRESHNESS_ENABLED", "1")
+            else:
+                monkeypatch.delenv("MEM0_DURABLE_FRESHNESS_ENABLED",
+                                   raising=False)
+            for qclass in ("durable", "operational"):
+                off = app_mod._search_core(app_mod.SearchIn(
+                    query=n, filters={"user_id": USER}, limit=5,
+                    threshold=0.0, rerank=False, query_class=qclass))
+                on = app_mod._search_core(app_mod.SearchIn(
+                    query=n, filters={"user_id": USER}, limit=5,
+                    threshold=0.0, rerank=False, query_class=qclass,
+                    explain=True))
+                assert "_explain" not in off and "_explain" in on, \
+                    f"env_on={env_on} qclass={qclass}"
+                assert _stable_projection(off.get("results")) == \
+                       _stable_projection(on.get("results")), \
+                    f"explain mutated results: env_on={env_on} qclass={qclass}"
     finally:
         _delete(mid)
 
@@ -389,12 +444,58 @@ def test_search_response_carries_withheld_family_fields():
         assert k in r and isinstance(r[k], int)
 
 
-def test_bundle_forwards_withheld_counters():
+def test_bundle_forwards_withheld_counters_and_stays_union_free():
+    """Review Finding 2 / R4: pin the BUNDLE exclusion in a test, not a
+    comment — the hot path's retrieval-log row must show route='bundle' and
+    lexical_candidates==0, so a future flip of its hardcoded rerank=False
+    goes red here."""
+    prompt = f"w5 forwarding probe {_nonce()}"
     r = httpx.post(f"{URL}/v1/context/bundle", headers=HDR, json={
-        "session_id": "w5-train1-test", "prompt": "w5 forwarding probe",
+        "session_id": "w5-train1-test", "prompt": prompt,
         "checkpoint": False, "hook_contract_version": "20.0"}, timeout=60)
     r.raise_for_status()
     b = r.json()
     for k in ("rejected_brand_scoped", "rejected_superseded",
               "rejected_contradicted"):
         assert k in b and isinstance(b[k], int)
+    rec = _last_retrieval_log_entry_for(prompt[:500])
+    assert rec is not None, "bundle search did not log"
+    assert rec.get("route") == "bundle"
+    assert rec.get("lexical_candidates") == 0, \
+        "union leg ran on the per-prompt bundle hot path"
+    assert rec.get("rerank") is False
+
+
+def test_nli_search_leg_stays_union_free():
+    """Review Finding 2 / R4: same pin for the NLI gate's internal lookups
+    (route='nli', rerank hardcoded False)."""
+    import app as app_mod
+
+    q = f"nli exclusion probe {_nonce()}"
+    app_mod._nli_search_fn(q, {"user_id": USER}, 0.0, 5)
+    rec = _last_retrieval_log_entry_for(q)
+    assert rec is not None, "nli search did not log"
+    assert rec.get("route") == "nli"
+    assert rec.get("lexical_candidates") == 0, \
+        "union leg ran on the NLI gate's internal lookups"
+    assert rec.get("rerank") is False
+
+
+def test_diagnose_user_id_defaults_and_is_honored():
+    """Review Finding 3 (F3): the omitted-user_id case is pinned — diagnose
+    without user_id runs under the server default tenant (wrong tenant for a
+    test-inv record → dense-absent), while the explicit tenant finds it."""
+    n = _nonce()
+    mid = _seed(f"tenant defaulting probe fact {n}")
+    try:
+        with_uid = _diagnose(n, mid, threshold=0.0)
+        assert with_uid["dense"]["rank_at_500"] is not None
+        r = httpx.post(f"{URL}/v1/memories/diagnose", headers=HDR, json={
+            "query": n, "target_id": mid, "threshold": 0.0}, timeout=120)
+        r.raise_for_status()
+        without_uid = r.json()
+        # default tenant != test-inv on every deployment of this suite
+        assert without_uid["dense"]["rank_at_500"] is None
+        assert without_uid["verdict"].startswith("dense_retrieval")
+    finally:
+        _delete(mid)

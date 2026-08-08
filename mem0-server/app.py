@@ -1634,6 +1634,14 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
         created = target_meta.get("created_at") or payload.get("created_at")
         if created:
             try:
+                # Same env knobs as the live path — incl. kappa (review F4a:
+                # a hardcoded 1.0 silently diverges the day the knob is tuned).
+                try:
+                    _dk = float(os.environ.get("MEM0_WEIBULL_KAPPA", "1.0"))
+                    if _dk <= 0:
+                        _dk = 1.0
+                except (TypeError, ValueError):
+                    _dk = 1.0
                 c_dt = _dt.datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                 age_days = max(0.0, (_dt.datetime.now(_dt.timezone.utc) - c_dt
                                      ).total_seconds() / 86400.0)
@@ -1642,14 +1650,14 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                     freshness = {"age_days": round(age_days, 1),
                                  "weight": round(_freshness_weight(
                                      age_days, float(_eta if _eta > 0 else 30),
-                                     1.0), 6)}
+                                     _dk), 6)}
                 elif (qc == "durable" and _env_flag("MEM0_DURABLE_FRESHNESS_ENABLED")
                       and target_meta.get("tier") == "evidence"):
                     _deta = int(os.environ.get("MEM0_DURABLE_FRESHNESS_HALF_LIFE_DAYS", "365") or 365)
                     freshness = {"age_days": round(age_days, 1),
                                  "weight": round(_freshness_weight(
                                      age_days, float(_deta if _deta > 0 else 365),
-                                     1.0), 6)}
+                                     _dk), 6)}
             except (ValueError, TypeError):
                 pass
         # -- verdict: first eating stage, in live pipeline order --
@@ -1687,6 +1695,7 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
             "caveats": [
                 "bundle path additionally drops insight-tier records and caps K outside _search_core",
                 "union lexical leg (rerank=True) can rescue targets past the dense horizon — a below-horizon verdict is dense-only",
+                "extra Qdrant filters of the failing search (kind/source/tier) are not replayed here, and the filters.tier=canonical admission-class derivation is not applied",
             ],
         }
     except HTTPException:
