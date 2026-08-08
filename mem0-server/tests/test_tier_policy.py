@@ -203,17 +203,48 @@ def test_patch_metadata_canonical_without_token_rejected():
         _delete_canonical(mid, reason="v017-A patch_metadata test cleanup")
 
 
-def test_ledger_has_single_entry_per_promote(tmp_path):
-    """After simplification, each promote writes exactly one ledger line."""
-    # MEM-16: count across legacy archive + monthly segments.
-    from _ledger_paths import ledger_line_count
-    before = ledger_line_count()
+def test_ledger_write_ahead_intent_then_completion_per_promote():
+    """AMS-22: each promote writes an intent line BEFORE the mutation, then a
+    completion line — and nothing else.
+
+    This supersedes the earlier one-line-per-promote pin. That pin encoded the
+    post-simplification shape; AMS-22 deliberately restored a two-phase write
+    because the completion-only ledger was fail-OPEN — a ledger failure left a
+    completed authority change with no audit record at all. The intent line is
+    the audit floor, so the order is the property worth pinning, not the count.
+
+    Asserted per-memory-id rather than as a global line delta: the ledger is
+    append-only and shared with the maintenance jobs, so a global delta races
+    against any concurrent decay-scan/dream append.
+    """
+    import json
+    from _ledger_paths import ledger_lines
+    before = len(ledger_lines())
     mid = _add_evidence(f"ledger test {uuid.uuid4()}")
     r = httpx.patch(f"{URL}/v1/memories/{mid}/tier", json={
         "tier": "stable", "actor": "claude-autonomous", "reason": "test",
     }, headers=H, timeout=10)
     assert r.status_code == 200
-    after = ledger_line_count()
-    # Old two-phase wrote 2 entries (intent + complete); new should write 1.
-    assert after - before == 1, f"expected 1 ledger line, got {after - before}"
+
+    added = []
+    for ln in ledger_lines()[before:]:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if rec.get("memory_id") == mid:
+            added.append(rec)
+
+    events = [rec.get("event") for rec in added]
+    assert events == ["tier-change-intent", "tier-change"], (
+        f"expected write-ahead intent then completion, got {events}"
+    )
+    assert added[0].get("status") == "intent"
+    assert added[1].get("status") == "done"
+    # Both phases describe the same requested change — an intent that disagrees
+    # with its completion would make the audit floor useless.
+    for rec in added:
+        assert rec.get("tier") == "stable"
+        assert rec.get("actor") == "claude-autonomous"
+
     httpx.delete(f"{URL}/v1/memories/{mid}", headers=H)
