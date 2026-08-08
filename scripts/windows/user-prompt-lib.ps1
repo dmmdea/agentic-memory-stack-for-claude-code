@@ -676,6 +676,34 @@ function Format-MemoryContextBlock {
             # order above — relevance for frontier, tier-rank for small) is rendered LAST, the
             # line immediately above the user's prompt (the recency peak). PS 5.1-safe in-place.
             [array]::Reverse($filteredResults)
+            # W5 T2.3 (ADOPT-3): conditional staleness line — HEADER placement,
+            # deliberately NOT trailing: v1.0 R6 pins the top memory bullet as
+            # the literal last raw line (recency peak), and that design intent
+            # outranks the adoption eval's word "trailing" (recorded deviation).
+            # Fires ONLY when the NEWEST admitted memory exceeds the threshold,
+            # so fresh bundles stay byte-identical (Pester-pinned). PS 5.1-safe:
+            # DateTimeOffset::TryParse statics only, no module loads, fail-open
+            # on missing/unparseable created_at (all current fixtures lack it).
+            $staleThresholdDays = 56   # 8 weeks
+            $newestAgeDays = $null
+            foreach ($h in $filteredResults) {
+                $cRaw = $null
+                if ($h.metadata -and $h.metadata.created_at) { $cRaw = [string]$h.metadata.created_at }
+                elseif ($h.created_at) { $cRaw = [string]$h.created_at }
+                if ([string]::IsNullOrWhiteSpace($cRaw)) { continue }
+                $dto = [System.DateTimeOffset]::MinValue
+                if ([System.DateTimeOffset]::TryParse($cRaw,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::AssumeUniversal,
+                        [ref]$dto)) {
+                    $ageD = ([System.DateTimeOffset]::UtcNow - $dto).TotalDays
+                    if ($ageD -lt 0) { $ageD = 0 }
+                    if ($null -eq $newestAgeDays -or $ageD -lt $newestAgeDays) { $newestAgeDays = $ageD }
+                }
+            }
+            if ($null -ne $newestAgeDays -and $newestAgeDays -gt $staleThresholdDays) {
+                $memoryLines.Add("(newest matching memory: $([int][math]::Floor($newestAgeDays))d old)")
+            }
             $memoryLines.Add("Top $($filteredResults.Count) relevant memories:")
             foreach ($h in $filteredResults) {
                 $tier   = if ($h.metadata -and $h.metadata.tier)  { $h.metadata.tier  } else { 'evidence' }
@@ -1617,10 +1645,15 @@ function Measure-MemoryContextBudget {
         $memText = ('x' * 240)   # > 200 so truncation fires
         $goalText = ('g' * 130)  # > 100
         $oqText = ('q' * 150)    # > 120
+        # W5 T2.3 (review Finding 5): worst-case memories carry a STALE
+        # created_at so the conditional staleness line fires in the budget
+        # render — without it the certified worst case silently excluded the
+        # line's length.
+        $staleTs = [System.DateTimeOffset]::UtcNow.AddDays(-400).ToString('o')
         $mems = @()
         for ($i = 0; $i -lt $memN; $i++) {
             $mems += [pscustomobject]@{ id = "bm-$i"; memory = $memText
-                                        metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem' } }
+                                        metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'; created_at = $staleTs } }
         }
         $goals = @()
         for ($i = 0; $i -lt $goalN; $i++) {
@@ -1645,7 +1678,8 @@ function Measure-MemoryContextBudget {
         $headerOverhead = 90
         $legendOverhead = if ($caps.include_legend) { 220 } else { 0 }
         $sectionLabels = 100                       # 3 section headers + blank lines
-        $ceiling = $headerOverhead + $legendOverhead + $sectionLabels +
+        $staleLine = 45                            # W5 T2.3 '(newest matching memory: Nd old)'
+        $ceiling = $headerOverhead + $legendOverhead + $sectionLabels + $staleLine +
                    ($effMem * $perMem) + ($goalN * $perGoal) + ($oqN * $perOq)
 
         return [pscustomobject]@{

@@ -240,6 +240,20 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     if n_hidden:
         data["hint"] = (f"{n_hidden} brand-scoped records were hidden — "
                         "pass brand= or use memory_recall")
+    # W5 T1.2 (ADOPT-2): reranker degradation was invisible to callers — a
+    # dense-only fallback silently drops the lexical (exact-token) rescue.
+    # New key; the brand hint string above is byte-pinned, never reworded.
+    if data.get("rerank_status") == "failed_fallback_dense":
+        data["rerank_note"] = ("reranker unavailable — dense-only order; "
+                               "lexical exact-token rescue dropped fail-closed")
+    # W5 T2.2 (ADOPT-3): withheld-result families — a search that silently
+    # drops a superseded/contradicted record is failure-shaped-as-nothing.
+    _n_sup = data.get("rejected_superseded") or 0
+    _n_con = data.get("rejected_contradicted") or 0
+    if _n_sup or _n_con:
+        data["withheld_note"] = (
+            f"{_n_sup} superseded and {_n_con} contradicting-canonical result(s) "
+            "withheld — use query_class='history' for forensics")
     return data
 
 @mcp.tool
@@ -286,6 +300,32 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
         out["memories"] = b.get("memories", [])
         out["goals"] = b.get("goals", [])
         out["open_questions"] = b.get("open_questions", [])
+        # W5 T2.2 (ADOPT-3): withheld-family note from the bundle's forwarded
+        # counters (older servers don't forward them — .get() fails open).
+        _n_sup = int(b.get("rejected_superseded") or 0)
+        _n_con = int(b.get("rejected_contradicted") or 0)
+        if _n_sup or _n_con:
+            out["withheld_note"] = (
+                f"{_n_sup} superseded and {_n_con} contradicting-canonical "
+                "result(s) withheld — use memory_search query_class='history' "
+                "for forensics")
+        # W5 T2.2: oldest/newest age summary — BUNDLE memories only (the
+        # canonical leg ages well by design and would make every recall read
+        # 'old'; offline _pending_adds carry no created_at and are skipped).
+        _ages = []
+        _now = _dt.datetime.now(_dt.timezone.utc)
+        for _m in out["memories"]:
+            _c = (_m.get("metadata") or {}).get("created_at") or _m.get("created_at")
+            if not _c:
+                continue
+            try:
+                _cd = _dt.datetime.fromisoformat(str(_c).replace("Z", "+00:00"))
+                _ages.append(max(0.0, (_now - _cd).total_seconds() / 86400.0))
+            except (ValueError, TypeError):
+                pass
+        if _ages:
+            out["age_summary"] = {"newest_days": round(min(_ages), 1),
+                                  "oldest_days": round(max(_ages), 1)}
         if _bsource == "local-replica":
             # Stale replica answered (authority unreachable) — mark the bundle as replica-served
             # (same key/value convention as memory_search) and merge queued-but-unsynced adds.
@@ -639,6 +679,36 @@ def memory_get_by_id(memory_id: str) -> dict:
     return data
 
 
+@mcp.tool
+def memory_diagnose(query: str, target_id: str, user_id: str = "__WSL_USER__",
+                    brand: str | None = None, query_class: str = "durable",
+                    threshold: float = 0.1, limit: int = 20,
+                    rerank: bool = False, allow_cross_brand: bool = False) -> dict:
+    """W5 (ADOPT-2): why does memory `target_id` not surface for `query`?
+
+    Replays each retrieval layer INDEPENDENTLY server-side — dense rank (at
+    the overfetch pool and at 500), threshold, retired/canonical-intent flags,
+    the PURE admission verdict (no counters mutated), rerank delta, trim —
+    and returns a verdict naming the FIRST stage that eats the target.
+
+    Set threshold/limit/rerank/query_class to the FAILING search's values —
+    the defaults mirror the server search defaults, not your caller's (a
+    threshold-0.55 hook query diagnosed at 0.1 names the wrong stage).
+    Read-only; safe to run against production."""
+    body: dict = {"query": query, "target_id": target_id, "user_id": user_id,
+                  "query_class": query_class, "threshold": threshold,
+                  "limit": limit, "rerank": rerank}
+    if brand:
+        body["brand"] = brand
+    if allow_cross_brand:
+        body["allow_cross_brand"] = True
+    data, source = _request("POST", "/v1/memories/diagnose", json=body)
+    if source == "local-replica" and isinstance(data, dict):
+        data["source"] = "local-replica"
+        data["stale_note"] = "served from local replica; authority unreachable"
+    return data
+
+
 # ---------------------------------------------------------------------------
 # v0.17 Phase F.3.2: goal management — priority, link_episode, merge
 # ---------------------------------------------------------------------------
@@ -793,7 +863,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.18.0"
+SHIM_STACK_VERSION = "1.19.0"
 
 
 def _write_start_receipt() -> None:

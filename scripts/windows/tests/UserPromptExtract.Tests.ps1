@@ -1128,6 +1128,74 @@ Describe 'v1.0 R6 frontier placement guard: Format-MemoryContextBlock renders th
     }
 }
 
+Describe 'W5 T2.3 (ADOPT-3): conditional staleness line — header placement, fresh bundles byte-identical' {
+
+    It 'renders "(newest matching memory: Nd old)" BEFORE the Top-N header when the newest admitted memory exceeds 8 weeks' {
+        $auditPath = Join-Path $TestDrive ("w5-stale-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        $oldTs = [System.DateTimeOffset]::UtcNow.AddDays(-90).ToString('o')
+        $bundle = [pscustomobject]@{
+            memories = @(
+                [pscustomobject]@{ id = 'm1'; memory = 'old evidence fact'
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'; created_at = $oldTs } }
+            )
+            goals = @(); open_questions = @()
+        }
+        $block = Format-MemoryContextBlock -Bundle $bundle -Brand 'ai-ecosystem' -AuditPath $auditPath
+        $block | Should -Match '\(newest matching memory: \d+d old\)'
+        # HEADER placement (deliberate deviation from the eval doc's word
+        # "trailing": R6 pins the top memory bullet as the literal last line)
+        $block.IndexOf('(newest matching memory:') | Should -BeLessThan $block.IndexOf('Top 1 relevant memories:')
+        # R6 recency peak intact even on the stale path
+        $rawLines = $block -split "`n"
+        $rawLines[-1] | Should -Be '  - [evidence|ai-ecosystem] old evidence fact'
+    }
+
+    It 'fresh bundle stays byte-identical (no staleness line at 2 days old)' {
+        $auditPath = Join-Path $TestDrive ("w5-fresh-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        $freshTs = [System.DateTimeOffset]::UtcNow.AddDays(-2).ToString('o')
+        $bundle = [pscustomobject]@{
+            memories = @(
+                [pscustomobject]@{ id = 'm1'; memory = 'fresh evidence fact'
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'; created_at = $freshTs } }
+            )
+            goals = @(); open_questions = @()
+        }
+        $block = Format-MemoryContextBlock -Bundle $bundle -Brand 'ai-ecosystem' -AuditPath $auditPath
+        $block | Should -Not -Match 'newest matching memory'
+    }
+
+    It 'a stale record beside a fresh one does NOT fire the line (NEWEST governs)' {
+        $auditPath = Join-Path $TestDrive ("w5-mixed-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        $bundle = [pscustomobject]@{
+            memories = @(
+                [pscustomobject]@{ id = 'm1'; memory = 'ancient fact'
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'
+                                                                 created_at = [System.DateTimeOffset]::UtcNow.AddDays(-300).ToString('o') } }
+                [pscustomobject]@{ id = 'm2'; memory = 'fresh fact'
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'
+                                                                 created_at = [System.DateTimeOffset]::UtcNow.AddDays(-1).ToString('o') } }
+            )
+            goals = @(); open_questions = @()
+        }
+        $block = Format-MemoryContextBlock -Bundle $bundle -Brand 'ai-ecosystem' -AuditPath $auditPath
+        $block | Should -Not -Match 'newest matching memory'
+    }
+
+    It 'missing/unparseable created_at fails open (no line, no error)' {
+        $auditPath = Join-Path $TestDrive ("w5-noca-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        $bundle = [pscustomobject]@{
+            memories = @(
+                [pscustomobject]@{ id = 'm1'; memory = 'undated fact'
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = 'ai-ecosystem'; created_at = 'not-a-date' } }
+            )
+            goals = @(); open_questions = @()
+        }
+        $block = Format-MemoryContextBlock -Bundle $bundle -Brand 'ai-ecosystem' -AuditPath $auditPath
+        $block | Should -Not -Match 'newest matching memory'
+        $block | Should -Match 'Top 1 relevant memories:'
+    }
+}
+
 Describe 'v0.22 Phase E R-offload invariant (Test-OffloadNoBlockInvariant)' {
 
     BeforeAll {

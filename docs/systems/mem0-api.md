@@ -291,3 +291,10 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - [`reranker.md`](./reranker.md) — the reranker subsystem.
 - [`../flows/memory-capture.md`](../flows/memory-capture.md) · [`../flows/memory-retrieval.md`](../flows/memory-retrieval.md) — the capture/retrieval flows.
 - [`../glossary.md`](../glossary.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
+
+## W5 additions (ADOPT-2/3, AMS-56)
+
+- `POST /v1/memories/search`: `explain` flag (per-stage trace as `_explain.stages`), `rerank_status` (when rerank requested), withheld-family counters `rejected_superseded` / `rejected_contradicted` beside `rejected_brand_scoped`, and the keyword-union `lexical_only` result marker (see docs/flows/memory-retrieval.md).
+- `POST /v1/memories/diagnose`: per-layer replay for one target; verdict names the first eating stage; read-only (pure admission evaluate).
+- `POST /v1/context/bundle`: forwards the three withheld-family counters.
+- Shim: `memory_diagnose` tool; `memory_search` adds `rerank_note` / `withheld_note`; `memory_recall` adds `withheld_note` + `age_summary` (bundle memories only).
