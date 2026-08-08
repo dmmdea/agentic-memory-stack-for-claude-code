@@ -175,3 +175,7 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 - [`../systems/reconciliation.md`](../systems/reconciliation.md) — how a superseded record is hidden behind its correction.
 - [`./memory-capture.md`](./memory-capture.md) — the write side that produced what is retrieved here.
 - [`../glossary.md`](../glossary.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
+
+## W5 (AMS-56): the keyword-recall union leg
+
+mem0's internal hybrid re-scores ONLY candidates from the dense window, so an exact-token target (a port, id, or slug) whose dense rank sits past the window is structurally unreachable no matter how strong its BM25 score. On the DELIBERATE path only (`rerank: true` — the per-prompt bundle and the NLI gate hardcode `rerank: false` and are structurally excluded), the server unions `keyword_search` hits absent from the dense pool into the candidate list BEFORE the retired/intent filters, rerank, and admission, hydrated to the standard result shape with `lexical_only: true` and NO score key (a BM25 magnitude on the cosine-calibrated scale would poison the brand-coherence floor). The rerank is FORCED when lexical candidates are present, and the fail-closed rule is binding: a `lexical_only` item either carries a real `rerank_score` or is dropped. The leg stands down at `limit > 50` (latency guardrail) and never breaks dense search (whole-leg try/except). Receipts: `lexical_candidates` / `lexical_added` / `lexical_kept` in the retrieval log, plus the `route` field discriminating search/bundle/nli callers.

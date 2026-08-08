@@ -171,3 +171,88 @@ def test_memory_search_no_hint_when_nothing_hidden(shim, monkeypatch):
     monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
                         _FakeResp({"results": []}))   # old server: field absent
     assert "hint" not in _tool_fn(shim.memory_search)("anything")
+
+
+# ---------------------------------------------------------------------------
+# W5 T1.2/T2.2 (ADOPT-2/3): degradation + withheld notes, age summary,
+# memory_diagnose.
+# ---------------------------------------------------------------------------
+
+def test_memory_search_rerank_note_on_failed_fallback(shim, monkeypatch):
+    monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
+                        _FakeResp({"results": [], "rerank_status": "failed_fallback_dense"}))
+    out = _tool_fn(shim.memory_search)("anything", rerank=True)
+    assert "rerank_note" in out and "dense-only" in out["rerank_note"]
+    # ran / skipped / absent -> no note
+    monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
+                        _FakeResp({"results": [], "rerank_status": "ran"}))
+    assert "rerank_note" not in _tool_fn(shim.memory_search)("anything", rerank=True)
+    monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
+                        _FakeResp({"results": []}))
+    assert "rerank_note" not in _tool_fn(shim.memory_search)("anything")
+
+
+def test_memory_search_withheld_note(shim, monkeypatch):
+    monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
+                        _FakeResp({"results": [], "rejected_superseded": 2,
+                                   "rejected_contradicted": 1}))
+    out = _tool_fn(shim.memory_search)("anything")
+    assert "withheld_note" in out
+    assert "2 superseded" in out["withheld_note"]
+    assert "1 contradicting-canonical" in out["withheld_note"]
+    # the byte-pinned brand hint is untouched by the new key
+    monkeypatch.setattr(shim.httpx, "request", lambda method, url, json=None, params=None, headers=None, timeout=None:
+                        _FakeResp({"results": [], "rejected_superseded": 0,
+                                   "rejected_contradicted": 0}))
+    assert "withheld_note" not in _tool_fn(shim.memory_search)("anything")
+
+
+def test_memory_recall_withheld_note_and_age_summary(shim, monkeypatch):
+    import datetime as dt
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=100)).isoformat()
+    fresh = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat()
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        if url.endswith("/bundle"):
+            return _FakeResp({"memories": [
+                {"memory": "a", "created_at": old},
+                {"memory": "b", "metadata": {"created_at": fresh}},
+                {"memory": "c"},                       # no created_at -> skipped
+            ], "goals": [], "open_questions": [],
+                "rejected_superseded": 1, "rejected_contradicted": 0})
+        return _FakeResp({"results": []})
+
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    out = _tool_fn(shim.memory_recall)("what changed")
+    assert "withheld_note" in out and "1 superseded" in out["withheld_note"]
+    assert out["age_summary"]["newest_days"] == pytest.approx(2, abs=1)
+    assert out["age_summary"]["oldest_days"] == pytest.approx(100, abs=1)
+
+
+def test_memory_recall_no_age_summary_without_created_at(shim, monkeypatch):
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        if url.endswith("/bundle"):
+            return _FakeResp({"memories": [{"memory": "a"}], "goals": [],
+                              "open_questions": []})
+        return _FakeResp({"results": []})
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    out = _tool_fn(shim.memory_recall)("anything")
+    assert "age_summary" not in out and "withheld_note" not in out
+
+
+def test_memory_diagnose_posts_diagnose_contract(shim, monkeypatch):
+    posts = []
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        posts.append((method, url, json))
+        return _FakeResp({"verdict": "returned"})
+
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    out = _tool_fn(shim.memory_diagnose)(
+        "why missing", "mid-123", threshold=0.55, limit=5, rerank=False)
+    assert out["verdict"] == "returned"
+    method, url, payload = posts[0]
+    assert method == "POST" and url.endswith("/v1/memories/diagnose")
+    assert payload["target_id"] == "mid-123"
+    assert payload["threshold"] == 0.55 and payload["limit"] == 5
+    assert payload["rerank"] is False

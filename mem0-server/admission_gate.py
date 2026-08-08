@@ -363,9 +363,12 @@ def apply_admission(results: Iterable[dict], scope: dict, query_class: str, laye
     and the search continues; it must never turn a rejecting search into a 500.
     MEM-8 (2026-07-03): every rejection bumps the in-memory daily counters
     (_count_rejection, surfaced at /health/deep). `stats_out`, when passed,
-    receives per-CALL counts — today just rejected_brand_scoped (the
-    brandless fail-closed hides that starve a shim search invisibly; app.py
-    echoes it on the search response so the MCP shim can hint 'pass brand=')."""
+    receives per-CALL counts. W5 T1.4/T2.1 (ADOPT-2/3): counts are now
+    per-FAMILY, increment-only (a key is absent until its family rejects —
+    callers .get() with a default). app.py echoes rejected_brand_scoped /
+    rejected_superseded / rejected_contradicted on the search response and
+    forwards them on the bundle so the MCP shim can hint; the explain trace
+    reads the whole dict."""
     qc = (query_class or "durable").strip().lower() or "durable"
     policy = default_policy_for_class(qc)
     admitted = []
@@ -375,10 +378,34 @@ def apply_admission(results: Iterable[dict], scope: dict, query_class: str, laye
             admitted.append(r)
         else:
             _count_rejection(d.reason)
-            if stats_out is not None and d.reason.startswith("brand_scope_required"):
-                stats_out["rejected_brand_scoped"] = stats_out.get("rejected_brand_scoped", 0) + 1
+            if stats_out is not None:
+                fam = _stats_family(d.reason)
+                if fam:
+                    stats_out[fam] = stats_out.get(fam, 0) + 1
             try:
                 log_rejected(memory_id=r.get("id") or "unknown", reason=d.reason, layer=layer)
             except Exception:
                 log.warning("admission rejection logging failed (non-fatal)", exc_info=True)
     return admitted
+
+
+# W5 T1.4: reason-prefix -> per-call stats_out key. Table-driven and pinned by
+# a one-rejection-per-family test (review R6) — a typo'd mapping here would be
+# a counter that never increments, the W1 vacuous-guard class.
+_STATS_FAMILIES = (
+    ("brand_scope_required", "rejected_brand_scoped"),   # pre-W5 name kept (shim contract)
+    ("superseded_by",        "rejected_superseded"),
+    ("contradicts_canonical", "rejected_contradicted"),
+    ("tier_disallowed",      "rejected_tier_disallowed"),
+    ("brand_mismatch",       "rejected_brand_mismatch"),
+    ("brand_coherence",      "rejected_brand_coherence"),
+    ("recency",              "rejected_recency"),
+    ("relevance_floor",      "rejected_relevance_floor"),
+)
+
+
+def _stats_family(reason: str) -> Optional[str]:
+    for prefix, key in _STATS_FAMILIES:
+        if reason.startswith(prefix):
+            return key
+    return None

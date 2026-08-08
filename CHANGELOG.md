@@ -4,6 +4,27 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.19.0 (2026-08-08) — the hardening-program waves
+
+Waves W1–W5 of the audit-driven hardening program (55 adjudicated findings; see the
+audit register). W1: the verification spine — launch-path parity gates, deploy
+pre-flight, behaviour-verified fixes on the LAUNCH PATH rather than the repo. W2:
+PUT payload carry-over (atomic pre-merge, per-record locks), CP437 mojibake repair
+across four stores, the BM25 sparse leg revived with a gating /health/deep canary.
+W3: alarm delivery legs — capability manifest, job-liveness surface, drift-guard
+cross-run legs, SessionStart heartbeat digest. W4: revive-or-bury — redaction rule
+set fixed and widened under one three-runtime fixture, the Codex judgment leg
+live-proven after two dead dependencies, the one-brain guard made real, DPAPI docs
+truth-pass. W5: retrieval observability (`explain`, `POST /v1/memories/diagnose` +
+`memory_diagnose`, `rerank_status`), gap annotations (withheld-family counters +
+recall age summary + conditional staleness line), the keyword-recall union leg
+(AMS-56: fail-closed on rerank, deliberate path only), per-pair judge cache +
+retrieval-pair dry-run, real-query replay harness + deploy-gated retrieval
+families, count-only entrance-redaction telemetry, and sparse-leg reboot survival
+(durable fastembed cache + bounded sentinel self-heal + pre-reboot cache gate).
+Note: the redaction rule set has a fourth copy in SkillOpt on the offline replica —
+it adopts the shared fixture on that box's next return.
+
 ## v1.18.0 (2026-07-25) — the silent-failure week
 
 Twenty PRs repairing a family of defects that shared one trait: **something stopped working and

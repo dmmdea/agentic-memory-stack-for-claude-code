@@ -23,6 +23,9 @@ from reranker import rerank as bge_rerank
 # restart and the reranker is a CPU cross-encoder (TMS budgets it 90s).
 from reranker import rerank_health as _rerank_health
 from admission_gate import apply_admission
+# W5 T1.3: the PURE evaluate path for the diagnose endpoint — never
+# apply_admission there (it mutates the MEM-8 counters + audit log).
+from admission_gate import default_policy_for_class
 # MEM-8 (2026-07-03): daily rejection counters for /health/deep observability.
 from admission_gate import admission_rejections_today as _admission_rejections_today
 from redact import redact_secrets  # server-side secret scrub for stored prompt_text
@@ -32,6 +35,9 @@ import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps inje
 from payload_carryover import compute_carryover  # AMS-01: PUT payload carry-over (P0)
 from sparse_health import sparse_leg_health      # AMS-09: BM25 leg liveness (gating)
 from sparse_health import encode_with_selfheal   # AMS-09b: bounded sentinel un-poison
+# W5 T5 (AMS-56): the SAME lemmatizer that produced every stored
+# text_lemmatized — exact store-side parity for the keyword union leg.
+from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize_bm25
 from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
@@ -263,6 +269,27 @@ class SearchIn(BaseModel):
     # unversioned in v0.18, so drift on the highest-traffic hook call was
     # undetectable. WARN-only, never rejected (see hook_contract.py).
     hook_contract_version: Optional[str] = None
+    # W5 T1.1 (ADOPT-2): per-stage retrieval trace, attached as results['_explain']
+    # ONLY when True. The bundle endpoint constructs SearchIn without this field,
+    # so the per-prompt hot path structurally never pays for or exposes it.
+    explain: bool = False
+
+
+class DiagnoseIn(BaseModel):
+    """W5 T1.3 (ADOPT-2): 'why does memory X not surface for query Q'.
+
+    Review F3: threshold/limit/rerank mirror SearchIn's DEFAULTS and must be
+    set to the FAILING SEARCH's values — diagnosing a threshold-0.55 hook
+    query at the default 0.1 names the wrong eating stage."""
+    query: str
+    target_id: str
+    user_id: Optional[str] = None          # default: server DEFAULT_USER_ID
+    brand: Optional[str] = None
+    allow_cross_brand: Optional[bool] = None
+    query_class: Optional[str] = "durable"
+    threshold: float = 0.1                 # SearchIn parity
+    limit: int = 20                        # SearchIn parity
+    rerank: bool = False                   # SearchIn parity
 
 class UpdateIn(BaseModel):
     text: str
@@ -526,9 +553,13 @@ def _nli_search_fn(query, filters, threshold, topk):
     the fetched window to canonical/stable. Over-fetch (NLI_GATE_FETCH) so a canonical neighbor
     below several evidence neighbors on the combined scale is not silently truncated. Returns
     the canonical result list (possibly empty)."""
+    # rerank=False is LOAD-BEARING here (W5 T5): it structurally excludes the
+    # keyword union leg from the NLI gate's internal lookups — flipping it
+    # silently activates the leg on a gated path.
     res = _search_core(SearchIn(query=query, filters=filters, query_class="canonical",
                                 threshold=threshold,
-                                limit=max(int(NLI_GATE_FETCH), int(topk or 1)), rerank=False))
+                                limit=max(int(NLI_GATE_FETCH), int(topk or 1)), rerank=False),
+                       _route="nli")
     return (res or {}).get("results") if isinstance(res, dict) else []
 
 def _nli_judge_fn(statement_a_canonical, statement_b_new, timeout_s):
@@ -1068,16 +1099,25 @@ def list_all(user_id: str = Query(...), limit: int = Query(100), x_api_key: Opti
         log.exception("list failed")
         raise _upstream_error(e)
 
-def _search_core(b: SearchIn):
+def _search_core(b: SearchIn, _route: str = "search"):
     """v0.20 A.3: search internals shared by POST /v1/memories/search and
     POST /v1/context/bundle. Contains the FULL retrieval-policy pipeline -
-    retired/intent filtering, rerank, query_class recency policy, the
-    server-side admission gate (apply_admission) and retrieval-log
-    observability - so the bundle endpoint can never become a parallel
-    ungated path. Raises on failure; callers map exceptions to HTTP.
-    hook_contract_version WARN-validation stays at the endpoint layer
-    (each endpoint reports its own route name)."""
+    retired/intent filtering, the W5 keyword-recall union leg, rerank,
+    query_class recency policy, the server-side admission gate
+    (apply_admission) and retrieval-log observability - so the bundle
+    endpoint can never become a parallel ungated path. Raises on failure;
+    callers map exceptions to HTTP. hook_contract_version WARN-validation
+    stays at the endpoint layer (each endpoint reports its own route name).
+
+    W5 T1.5: ``_route`` discriminates the three callers in the retrieval log
+    ('search' | 'bundle' | 'nli') — the actor field is constant and could
+    not; ADOPT-4 pair sampling and ADOPT-5 export both key on it.
+    W5 T1.1: ``b.explain`` attaches a per-stage trace (counts + scalar
+    details only — never result objects, so in-place stamp mutations cannot
+    make earlier stages lie) as results['_explain']. Zero cost when False."""
     capped_limit = min(b.limit, 500)
+    _explain_on = bool(getattr(b, "explain", False))
+    _trace: list = []
     # v0.30 over-fetch: post-fetch filters (retired/_canonical_intent/admission) can drop
     # records and leave a gap; over-fetch a buffer, filter, then trim to capped_limit (below).
     _buf = int(os.environ.get("MEM0_SEARCH_OVERFETCH_BUFFER", "50"))
@@ -1104,16 +1144,91 @@ def _search_core(b: SearchIn):
     # gate still rejects other brands (test_brand_isolation.py is the leak guard).
     _SERVER_FILTER_KEYS = {"include_retired", "include_canonical_intent", "allow_cross_brand", "brand"}
     search_filters = {k: v for k, v in (b.filters or {}).items() if k not in _SERVER_FILTER_KEYS}
+    if _explain_on:
+        _trace.append({"stage": "overfetch", "detail": {
+            "capped_limit": capped_limit, "buffer": _buf,
+            "overfetch_limit": overfetch_limit,
+            "collapsed": bool(capped_limit > 0 and overfetch_limit == capped_limit)}})
     results = mem.search(
         query=b.query,
         filters=search_filters,
         top_k=overfetch_limit,
         threshold=b.threshold,
     )
+    if _explain_on:
+        _n = len(results.get("results") or []) if isinstance(results, dict) else 0
+        _trace.append({"stage": "dense_fetch", "out": _n})
+    # ------------------------------------------------------------------
+    # W5 T5 (AMS-56): keyword-recall union leg — DELIBERATE PATH ONLY.
+    # mem0's fusion builds candidates exclusively from the dense window, so a
+    # bm25-rank-1 / dense-rank->200 target is structurally unreachable. This
+    # leg unions keyword-only hits into the pool BEFORE the retired/intent
+    # filters, rerank, and admission, so every existing hygiene gate applies
+    # to them unchanged. Gated on b.rerank: the bundle (rerank=False
+    # hardcoded) and the NLI gate (rerank=False) are structurally excluded,
+    # and the gate coincides with the BINDING fail-closed rule below — a
+    # lexical item either earns a rerank_score or is dropped. Items carry NO
+    # 'score' key by design: a BM25 magnitude on the cosine-calibrated scale
+    # would poison the brand-coherence floor (readers are .get()/None-safe —
+    # verified admission_gate.py:167-202, freshness.py:68-69).
+    # R4 latency guardrail: top_k=12, and the leg stands down entirely at
+    # capped_limit>50 (a huge deliberate pool needs no rescue; bounds the
+    # CPU rerank pool at dense+12).
+    # ------------------------------------------------------------------
+    _lex_candidates = 0
+    _lex_added = 0
+    if b.rerank and capped_limit <= 50 and isinstance(results, dict) \
+            and isinstance(results.get("results"), list):
+        try:
+            _lex_hits = mem.vector_store.keyword_search(
+                query=_lemmatize_bm25(b.query), top_k=12, filters=search_filters)
+        except Exception:
+            log.warning("union leg: keyword_search failed (non-fatal, dense-only)",
+                        exc_info=True)
+            _lex_hits = None
+        if _lex_hits:
+            _dense_ids = {str(r.get("id")) for r in results["results"]}
+            _CORE_PAYLOAD_KEYS = {"data", "hash", "created_at", "updated_at",
+                                  "id", "text_lemmatized", "attributed_to"}
+            _PROMOTED_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role")
+            for _p in _lex_hits:
+                _lex_candidates += 1
+                _pid = str(getattr(_p, "id", "") or "")
+                _pl = getattr(_p, "payload", None) or {}
+                if not _pid or _pid in _dense_ids or not _pl.get("data"):
+                    continue
+                # Hydrate to the exact mem0 Step-9 result shape ('memory' is
+                # load-bearing for bge_rerank's text_key).
+                _item = {
+                    "id": _pid,
+                    "memory": _pl["data"],
+                    "hash": _pl.get("hash"),
+                    "created_at": _pl.get("created_at"),
+                    "updated_at": _pl.get("updated_at"),
+                    "lexical_only": True,
+                    "metadata": {k: v for k, v in _pl.items()
+                                 if k not in _CORE_PAYLOAD_KEYS
+                                 and k not in _PROMOTED_KEYS},
+                }
+                for _pk in _PROMOTED_KEYS:
+                    if _pl.get(_pk) is not None:
+                        _item[_pk] = _pl[_pk]
+                # Append AFTER dense items so skip heuristics keyed on
+                # results[0] keep seeing a dense head.
+                results["results"].append(_item)
+                _lex_added += 1
+    if _explain_on:
+        _trace.append({"stage": "union_lexical", "detail": {
+            "active": bool(b.rerank and capped_limit <= 50),
+            "candidates": _lex_candidates, "added": _lex_added}})
     # v0.13: exclude retired records (retrievable=false) from search results unless caller explicitly opts in
     if not (b.filters or {}).get("include_retired"):
         if isinstance(results, dict) and isinstance(results.get("results"), list):
+            _pre = len(results["results"])
             results["results"] = [r for r in results["results"] if (r.get("metadata") or {}).get("retrievable") is not False]
+            if _explain_on:
+                _trace.append({"stage": "retired_filter", "in": _pre,
+                               "out": len(results["results"])})
     # v0.17 Phase F.1.2: hide _canonical_intent evidence from default search results.
     # These are memories that were auto-downgraded from tier='canonical' to tier='evidence'
     # (client-side gate in v0.16.1) with metadata._canonical_intent=True as a "promote me
@@ -1124,10 +1239,14 @@ def _search_core(b: SearchIn):
         if isinstance(results, dict) and isinstance(results.get("results"), list):
             # v0.18 MED-5: truthy check (was `is True`) — a truthy non-bool
             # _canonical_intent value (e.g. "true", 1) must not slip past the filter.
+            _pre = len(results["results"])
             results["results"] = [
                 r for r in results["results"]
                 if not ((r.get("metadata") or {}).get("_canonical_intent"))
             ]
+            if _explain_on:
+                _trace.append({"stage": "canonical_intent_filter", "in": _pre,
+                               "out": len(results["results"])})
     # v0.19 M12: strip server-internal intent markers from every surviving
     # result's metadata. F.1.2 above excludes whole _canonical_intent records,
     # but _insight_intent / stable_intent markers (and _canonical_intent on
@@ -1140,13 +1259,45 @@ def _search_core(b: SearchIn):
             if isinstance(_md, dict):
                 for _k in _INTENT_KEYS:
                     _md.pop(_k, None)
+    if _explain_on:
+        _trace.append({"stage": "intent_key_strip",
+                       "note": "metadata-only, non-count-changing"})
     items = results.get("results") if isinstance(results, dict) else None
+    _rr_status: dict = {}
     if b.rerank and isinstance(items, list) and items:
-        reranked_items = bge_rerank(b.query, items, text_key="memory")
+        # W5 T5.3: FORCE the rerank whenever lexical candidates joined the
+        # pool — a silent should_rerank skip (small-N or 0.92-confident head)
+        # would delete every lexical rescue via the fail-closed drop below,
+        # exactly the confidently-wrong-dense shape AMS-56 exists to fix.
+        reranked_items = bge_rerank(b.query, items, text_key="memory",
+                                    force=_lex_added > 0, status_out=_rr_status)
         results = dict(results)
         results["results"] = reranked_items
         # Only mark reranked=True if the reranker actually ran (presence of rerank_score)
         results["reranked"] = any("rerank_score" in r for r in reranked_items)
+        # W5 T1.2: honest per-search status — stamped ONLY when rerank was
+        # requested, so the bundle path (rerank=False) never carries the key.
+        results["rerank_status"] = _rr_status.get("status")
+    # W5 T5.4 — BINDING fail-closed drop (review: non-negotiable): a
+    # lexical_only item either earned a real rerank_score or it leaves the
+    # pipeline. Per-item, which covers reranker fail-open, both skip paths
+    # (unreachable under force, kept for defense in depth), and the
+    # defensive-append path. Admission floors fail OPEN on missing scores —
+    # this drop is the ONLY gate on unscored keyword hits.
+    _lex_dropped = 0
+    if isinstance(results, dict) and isinstance(results.get("results"), list):
+        _pre_drop = len(results["results"])
+        results["results"] = [
+            r for r in results["results"]
+            if not (r.get("lexical_only") and "rerank_score" not in r)
+        ]
+        _lex_dropped = _pre_drop - len(results["results"])
+    if _explain_on:
+        _trace.append({"stage": "rerank", "detail": {
+            "requested": bool(b.rerank),
+            "status": _rr_status.get("status"),
+            "forced_for_lexical": bool(b.rerank and _lex_added > 0),
+            "lexical_dropped_fail_closed": _lex_dropped}})
     # v0.17 F.4.1: query_class recency policy (applied AFTER rerank, BEFORE return)
     qclass = ((b.query_class or "durable") if hasattr(b, "query_class") else "durable").lower()
     if qclass == "operational":
@@ -1255,12 +1406,33 @@ def _search_core(b: SearchIn):
             stats_out=_adm_stats,
         )
         results["rejected_brand_scoped"] = int(_adm_stats.get("rejected_brand_scoped", 0))
+        # W5 T2.1 (ADOPT-3): the two withheld families the shim hints on —
+        # a recall that silently drops a superseded/contradicted record is
+        # failure-shaped-as-nothing without these.
+        results["rejected_superseded"] = int(_adm_stats.get("rejected_superseded", 0))
+        results["rejected_contradicted"] = int(_adm_stats.get("rejected_contradicted", 0))
+        if _explain_on:
+            _trace.append({"stage": "admission", "detail": {
+                "query_class": _adm_qc, "stats": dict(_adm_stats)}})
     # v0.30 over-fetch trim: now that retired/intent/admission filters have run on the
     # larger pool, return only the caller's requested capped_limit (the K slots are now
     # filled with non-filtered records, not gapped). Last mutation before logging so the
     # logged returned_count/returned_top_ids reflect what the caller actually receives.
     if isinstance(results, dict) and isinstance(results.get("results"), list):
+        _pre_trim = len(results["results"])
         results["results"] = results["results"][:capped_limit]
+        if _explain_on:
+            _trace.append({"stage": "trim", "in": _pre_trim,
+                           "out": len(results["results"]),
+                           "n_cut": _pre_trim - len(results["results"])})
+    # W5 T1.1: attach the trace strictly behind the flag, OUTSIDE the logging
+    # try/except (a trace bug must be visible, not swallowed as log noise).
+    if _explain_on and isinstance(results, dict):
+        results["_explain"] = {"stages": _trace}
+    # W5 T5.5: lexical_kept counted on the FINAL list (post-admission,
+    # post-trim) — the M10 path-gating pin reads lexical_candidates.
+    _lex_kept = (sum(1 for r in results.get("results") or [] if r.get("lexical_only"))
+                 if isinstance(results, dict) else 0)
     # v0.17 Phase F.2.3: retrieval observability — log every search to ~/.mem0/retrieval-log.jsonl
     try:
         import hashlib as _hl
@@ -1280,6 +1452,11 @@ def _search_core(b: SearchIn):
         retrieval_record = {
             "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "actor": "rest-api",
+            # W5 T1.5: caller discriminator ('search'|'bundle'|'nli') — actor
+            # is constant, so pair-sampling/export could not tell hook-probe
+            # traffic from deliberate searches. Historical rows lack the key;
+            # readers must treat missing as unknown-legacy (review F7).
+            "route": _route,
             "query_hash": query_hash,
             "query_text": b.query[:200] if log_full else None,
             "filters": log_filters,
@@ -1299,6 +1476,12 @@ def _search_core(b: SearchIn):
             "returned_count": len(results.get("results", [])) if isinstance(results, dict) else 0,
             "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:3]] if isinstance(results, dict) else [],
             "reranked": (results.get("reranked") if isinstance(results, dict) else None),
+            # W5 T5.5: the union leg's receipt — candidates seen, unioned into
+            # the pool, and surviving the final list. lexical_candidates==0 on
+            # every rerank=False row is the M10 path-gating pin.
+            "lexical_candidates": _lex_candidates,
+            "lexical_added": _lex_added,
+            "lexical_kept": _lex_kept,
         }
         log_path = Path.home() / ".mem0" / "retrieval-log.jsonl"
         # Rotate at 10MB — move to .1 through .5, drop .5 if it exists.
@@ -1372,6 +1555,153 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
         raise
     except Exception as e:
         log.exception("get_by_id failed")
+        raise _upstream_error(e)
+
+
+@app.post("/v1/memories/diagnose")
+def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
+    """W5 T1.3 (ADOPT-2, gbrain diagnose-by-target): replay each retrieval
+    layer INDEPENDENTLY for one target and name the first stage that eats it.
+
+    POST deliberately — a GET path would be captured by GET /v1/memories/{mid}.
+    Read-only by construction: the admission verdict comes from the PURE
+    AdmissionPolicy.evaluate (NEVER apply_admission, which bumps the MEM-8
+    daily counters and appends to admission-rejected.jsonl — capabilities.py
+    documents why). Scope caveat: the bundle path applies an additional
+    insight-tier filter + K-cap OUTSIDE _search_core; a durable-class verdict
+    of 'returned' therefore does not guarantee bundle inclusion for
+    insight-tier records (reported in `caveats`)."""
+    auth(x_api_key)
+    try:
+        # -- target fetch (same reshape as GET /v1/memories/{mid}) --
+        records = mem.vector_store.client.retrieve(
+            collection_name=mem.vector_store.collection_name,
+            ids=[b.target_id], with_payload=True, with_vectors=False,
+        )
+        if not records:
+            raise HTTPException(404, f"memory {b.target_id} not found")
+        payload = getattr(records[0], "payload", None) or {}
+        target_meta = {k: v for k, v in payload.items()
+                       if k not in ("data", "memory")}
+        user_id = b.user_id or DEFAULT_USER_ID
+        qc = (b.query_class or "durable").strip().lower() or "durable"
+
+        # -- probe 1: dense rank over the SAME tenant, threshold 0.0 --
+        capped_limit = min(b.limit, 500)
+        _buf = max(0, min(int(os.environ.get("MEM0_SEARCH_OVERFETCH_BUFFER", "50")), 500))
+        if b.rerank:
+            _buf = min(_buf, 10)
+        overfetch_limit = 0 if capped_limit == 0 else min(capped_limit + _buf, 500)
+        probe = mem.search(query=b.query, filters={"user_id": user_id},
+                           top_k=500, threshold=0.0)
+        probe_items = (probe.get("results") or []) if isinstance(probe, dict) else []
+        dense_rank = None
+        dense_score = None
+        for _i, _r in enumerate(probe_items):
+            if str(_r.get("id")) == b.target_id:
+                dense_rank = _i + 1
+                dense_score = _r.get("score")
+                break
+        # -- probe 2: flags off the payload --
+        retired = payload.get("retrievable") is False
+        canonical_intent = bool(payload.get("_canonical_intent"))
+        # -- probe 3: pure admission verdict (query_class normalized — the
+        # v0.19 L4/L8 class: 'Operational' must not skip the recency branch) --
+        adm_record = {"id": b.target_id, "memory": payload.get("data"),
+                      "metadata": target_meta, "score": dense_score,
+                      "created_at": payload.get("created_at")}
+        scope = {"user_id": user_id, "brand": b.brand,
+                 "allow_cross_brand": b.allow_cross_brand}
+        adm = default_policy_for_class(qc).evaluate(adm_record, scope, qc)
+        # -- probe 4: rerank delta, bounded to the overfetch-sized pool
+        # (review: NEVER the 500-pool — multi-minute CPU) --
+        rerank_probe = {"requested": bool(b.rerank), "ran": False,
+                        "pre_rank": None, "post_rank": None}
+        if b.rerank and dense_rank is not None and dense_rank <= overfetch_limit:
+            pool = [dict(r) for r in probe_items[:overfetch_limit]]
+            _st: dict = {}
+            ranked = bge_rerank(b.query, pool, text_key="memory",
+                                force=True, status_out=_st)
+            rerank_probe["ran"] = _st.get("status") == "ran"
+            rerank_probe["pre_rank"] = dense_rank
+            for _i, _r in enumerate(ranked):
+                if str(_r.get("id")) == b.target_id:
+                    rerank_probe["post_rank"] = _i + 1
+                    adm_record["rerank_score"] = _r.get("rerank_score")
+                    break
+        # -- probe 5: freshness weight (same env knobs as the live path) --
+        freshness = None
+        created = target_meta.get("created_at") or payload.get("created_at")
+        if created:
+            try:
+                # Same env knobs as the live path — incl. kappa (review F4a:
+                # a hardcoded 1.0 silently diverges the day the knob is tuned).
+                try:
+                    _dk = float(os.environ.get("MEM0_WEIBULL_KAPPA", "1.0"))
+                    if _dk <= 0:
+                        _dk = 1.0
+                except (TypeError, ValueError):
+                    _dk = 1.0
+                c_dt = _dt.datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                age_days = max(0.0, (_dt.datetime.now(_dt.timezone.utc) - c_dt
+                                     ).total_seconds() / 86400.0)
+                if qc == "operational":
+                    _eta = int(os.environ.get("MEM0_OPERATIONAL_HALF_LIFE_DAYS", "30") or 30)
+                    freshness = {"age_days": round(age_days, 1),
+                                 "weight": round(_freshness_weight(
+                                     age_days, float(_eta if _eta > 0 else 30),
+                                     _dk), 6)}
+                elif (qc == "durable" and _env_flag("MEM0_DURABLE_FRESHNESS_ENABLED")
+                      and target_meta.get("tier") == "evidence"):
+                    _deta = int(os.environ.get("MEM0_DURABLE_FRESHNESS_HALF_LIFE_DAYS", "365") or 365)
+                    freshness = {"age_days": round(age_days, 1),
+                                 "weight": round(_freshness_weight(
+                                     age_days, float(_deta if _deta > 0 else 365),
+                                     _dk), 6)}
+            except (ValueError, TypeError):
+                pass
+        # -- verdict: first eating stage, in live pipeline order --
+        if dense_rank is None:
+            verdict = "dense_retrieval:below_500_horizon"
+        elif dense_score is not None and b.threshold and float(dense_score) < float(b.threshold):
+            verdict = f"threshold:{dense_score}_below_{b.threshold}"
+        elif dense_rank > overfetch_limit:
+            verdict = f"overfetch_pool:rank_{dense_rank}_exceeds_{overfetch_limit}"
+        elif retired:
+            verdict = "retired_filter"
+        elif canonical_intent:
+            verdict = "canonical_intent_filter"
+        elif not adm.admit:
+            verdict = f"admission:{adm.reason}"
+        elif (rerank_probe["ran"] and rerank_probe["post_rank"] is not None
+              and rerank_probe["post_rank"] > capped_limit):
+            verdict = f"trim_after_rerank:rank_{rerank_probe['post_rank']}_exceeds_{capped_limit}"
+        elif not b.rerank and dense_rank > capped_limit:
+            verdict = f"trim:rank_{dense_rank}_exceeds_{capped_limit}"
+        else:
+            verdict = "returned"
+        return {
+            "target_id": b.target_id,
+            "verdict": verdict,
+            "dense": {"rank_at_500": dense_rank, "score": dense_score,
+                      "overfetch_limit": overfetch_limit,
+                      "within_overfetch": (dense_rank is not None
+                                           and dense_rank <= overfetch_limit)},
+            "flags": {"retired": retired, "canonical_intent": canonical_intent},
+            "admission": {"admit": adm.admit, "reason": adm.reason,
+                          "query_class": qc},
+            "rerank": rerank_probe,
+            "freshness": freshness,
+            "caveats": [
+                "bundle path additionally drops insight-tier records and caps K outside _search_core",
+                "union lexical leg (rerank=True) can rescue targets past the dense horizon — a below-horizon verdict is dense-only",
+                "extra Qdrant filters of the failing search (kind/source/tier) are not replayed here, and the filters.tier=canonical admission-class derivation is not applied",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("diagnose failed")
         raise _upstream_error(e)
 
 
@@ -2506,6 +2836,10 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
         filters: dict[str, Any] = {"user_id": DEFAULT_USER_ID}
         if b.brand:
             filters["brand"] = b.brand
+        # rerank=False is LOAD-BEARING (W5 T5): it structurally excludes the
+        # keyword union leg — and its CPU rerank cost — from the per-prompt
+        # bundle hot path. Flipping it would put a cross-encoder call inside
+        # every UserPromptSubmit.
         sr = _search_core(SearchIn(
             query=(b.prompt or "")[:500],
             filters=filters,
@@ -2513,8 +2847,15 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             threshold=_tp["relevance_threshold"],  # v1.0 R2: 0.30 both tiers (kept; calibration-confirmed)
             rerank=False,
             query_class="durable",
-        ))
+        ), _route="bundle")
         _mems = sr.get("results", []) if isinstance(sr, dict) else []
+        # W5 T2.1 (ADOPT-3): forward the withheld counters onto the bundle
+        # response — _search_core computes them but the bundle previously
+        # dropped every non-results field, leaving memory_recall blind to
+        # superseded/contradicted withholding.
+        for _wk in ("rejected_brand_scoped", "rejected_superseded",
+                    "rejected_contradicted"):
+            out[_wk] = int(sr.get(_wk) or 0) if isinstance(sr, dict) else 0
         # v1.12 HK-6: the hook client's admission list REJECTS tier=insight — observed
         # in production as "0.D admission: 2 of 2 results rejected" (full bundle latency
         # paid, zero memories injected, dead churn in admission-rejected.jsonl). Filter

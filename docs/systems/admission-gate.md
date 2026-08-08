@@ -438,3 +438,9 @@ candidate contradicts the canonical statement.
   allowlist pin; v0.20 Phase C: judge-prompt structure/injection contract,
   4xx degradation, model-availability preflight helper, outcome/exit-code
   classification, `--unstamp` before/PATCH/after via mocked HTTP).
+
+## W5 (ADOPT-2/3): per-family stats_out and the diagnose endpoint
+
+- `apply_admission`'s per-call `stats_out` now counts every rejection family, increment-only (a key is absent until its family rejects): `rejected_brand_scoped` (pre-W5 name kept — shim contract), `rejected_superseded`, `rejected_contradicted`, `rejected_tier_disallowed`, `rejected_brand_mismatch`, `rejected_brand_coherence`, `rejected_recency`, `rejected_relevance_floor`. The mapping table is pinned by a one-rejection-per-family test.
+- The search response echoes the first three; `POST /v1/context/bundle` forwards them so `memory_recall` can surface a withheld note.
+- `POST /v1/memories/diagnose` evaluates admission through the PURE `AdmissionPolicy.evaluate` path — never `apply_admission` — so a diagnostic read can never bump the MEM-8 daily counters or append to `admission-rejected.jsonl` (pinned by a rejected-fixture test).
