@@ -35,6 +35,9 @@ import httpx
 
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "mem0_egemma_768"  # the live collection (config.py collection_name)
+# AMS-19: the episode-vector collection (mirrors mem0-server/episode_embeddings.py
+# EPISODE_COLLECTION — this script is deployed standalone and does not import it).
+EPISODE_COLLECTION = "episodes_egemma_768"
 EPISODIC_DB = Path.home() / ".mem0" / "episodic.db"
 RECON_LOG = Path.home() / ".mem0" / "episodic-reconciliation.jsonl"
 QDRANT_BATCH = 256
@@ -82,11 +85,26 @@ def classify_links(links: list[dict], existing_episode_ids: set,
     return {"orphaned_link": orphaned, "dangling": dangling, "memory_links": memory_links, "ok": ok}
 
 
-def reconcile_outcome(db_present: bool, qdrant_ok: bool) -> str:
+ORPHAN_DEGRADE_THRESHOLD = 10
+
+
+def reconcile_outcome(db_present: bool, qdrant_ok: bool,
+                      orphaned_count: int = 0,
+                      threshold: int = ORPHAN_DEGRADE_THRESHOLD) -> str:
+    """AMS-20 (2026-08-08): the run used to report `ok` while COUNTING dozens
+    of orphaned links — the finding is precisely that the number was computed
+    and then contradicted by the verdict, so nothing ever escalated (59 live
+    orphans, ~2/day growth, invisible). A count past the threshold now
+    degrades: TMS's freshness row and the SessionStart heartbeat both key off
+    `outcome`, so the backlog reaches a human without a new alarm channel.
+    Below the threshold stays `ok` (a couple of in-flight deletions are
+    normal); the count is in the receipt either way."""
     if not db_present:
         return "degraded:no-episodic-db"
     if not qdrant_ok:
         return "degraded:qdrant-unreachable"
+    if orphaned_count > threshold:
+        return f"degraded:orphaned-links:{orphaned_count}"
     return "ok"
 
 
@@ -114,6 +132,30 @@ def read_episode_links(conn: sqlite3.Connection) -> list[dict]:
 
 def existing_episode_ids(conn: sqlite3.Connection) -> set:
     return {r[0] for r in conn.execute("SELECT id FROM episodes").fetchall()}
+
+
+def embedding_coverage(conn: sqlite3.Connection, http: httpx.Client) -> dict:
+    """AMS-19 (2026-08-08): episode embeddings leak — a fail-soft 429 during
+    checkpoint drops the vector and NOTHING ever notices or re-embeds, so the
+    episodic semantic search is blind to a growing slice of the ledger (274 of
+    1842 eligible at audit time). The backfill script exists but has no
+    trigger; the durable fix is that the WEEKLY reconcile now MEASURES the
+    coverage, so a growing gap surfaces on the same receipt everything else
+    reads. Read-only; never raises (a coverage probe must not fail the run)."""
+    out = {"eligible": None, "embedded": None, "missing": None}
+    try:
+        eligible = conn.execute(
+            "SELECT COUNT(*) FROM episodes"
+            " WHERE summary IS NOT NULL AND TRIM(summary) != ''").fetchone()[0]
+        r = http.post(f"{QDRANT}/collections/{EPISODE_COLLECTION}/points/count",
+                      json={"exact": True}, timeout=15.0)
+        r.raise_for_status()
+        embedded = int((r.json().get("result") or {}).get("count") or 0)
+        out.update({"eligible": int(eligible), "embedded": embedded,
+                    "missing": max(0, int(eligible) - embedded)})
+    except (httpx.HTTPError, OSError, sqlite3.Error, ValueError, KeyError) as e:
+        out["error"] = f"{type(e).__name__}: {str(e)[:80]}"
+    return out
 
 
 def qdrant_present_ids(http: httpx.Client, ids: list[str]) -> set:
@@ -170,9 +212,13 @@ def main() -> int:
         return 1
 
     conn = open_ledger_ro(db_path)
+    coverage: dict = {"eligible": None, "embedded": None, "missing": None}
     try:
         links = read_episode_links(conn)
         ep_ids = existing_episode_ids(conn)
+        # AMS-19: measure the embedding gap while the read-only handle is open.
+        with httpx.Client() as _cov_http:
+            coverage = embedding_coverage(conn, _cov_http)
     finally:
         conn.close()
 
@@ -189,7 +235,9 @@ def main() -> int:
         http.close()
 
     result = classify_links(links, ep_ids, present)
-    outcome = reconcile_outcome(db_present=True, qdrant_ok=qdrant_ok)
+    n_orphan_pre = len(result["orphaned_link"])
+    outcome = reconcile_outcome(db_present=True, qdrant_ok=qdrant_ok,
+                                orphaned_count=n_orphan_pre)
     n_orphan = len(result["orphaned_link"])
     n_dangling = len(result["dangling"])
     summary = {
@@ -202,11 +250,14 @@ def main() -> int:
         "ok_memory_links": result["ok"],
         "orphaned_sample": result["orphaned_link"][: args.limit_sample],
         "dangling_sample": result["dangling"][: args.limit_sample],
+        "embedding_coverage": coverage,   # AMS-19
         "outcome": outcome,
     }
     _append_summary(summary)
     print(f"episodic-reconcile: done. links={len(links)} memory_links={result['memory_links']} "
-          f"orphaned={n_orphan} dangling={n_dangling} (READ-ONLY) outcome={outcome} -> {RECON_LOG}",
+          f"orphaned={n_orphan} dangling={n_dangling} "
+          f"episode-embeddings missing={coverage.get('missing')}/"
+          f"{coverage.get('eligible')} (READ-ONLY) outcome={outcome} -> {RECON_LOG}",
           flush=True)
     return exit_code_for(outcome)
 
