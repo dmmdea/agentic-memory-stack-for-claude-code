@@ -162,6 +162,12 @@ if ! (cd "$APP_DIR" && ./.venv/bin/python -c "import app" >/dev/null 2>&1); then
 fi
 echo "    import smoke OK"
 
+# --- 4a2. W5 T4.4: remember what is being replaced, for the rollback hint ---
+# The retrieval gate (5b) can only fire AFTER the restart, when new code is
+# already live — the honest remedy on a red gate is a rollback, and the hint
+# must name a real ref. DEPLOYED_SHA is written on every successful deploy.
+PREV_SHA="$(cat "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || echo '<previous-main>')"
+
 # --- 4b. AMS-09b (W5 review F2): idempotent durable fastembed-cache seed ---
 # The unit pins FASTEMBED_CACHE_PATH to a reboot-surviving dir and runs
 # HF_HUB_OFFLINE=1, so the SERVER can never download the BM25 model itself —
@@ -204,4 +210,27 @@ print('    /health/deep OK — ' + ', '.join(
     k + ':' + str(v.get('ok', v) if isinstance(v, dict) else v)
     for k, v in d.get('checks', {}).items()))
 "
-echo "==> deploy complete. Full gate: cd $APP_DIR && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=http://127.0.0.1:18791 ./.venv/bin/pytest -q"
+# --- 5b. W5 T4.4 (AMS-24): retrieval families gate — the honor-system era ends ---
+# Runs the PUBLIC families suite only (review F5: the private findability
+# floors would file-not-found on adopter boxes and train the escape hatch).
+# Sequencing truth (review R5): /health/deep was green seconds ago, so a red
+# gate here is a RETRIEVAL REGRESSION (floor breach), not infrastructure —
+# and new code is already live, so the remedy is the printed rollback.
+if [ "${MEM0_SKIP_RETRIEVAL_GATE:-0}" = "1" ]; then
+    echo "==> retrieval gate SKIPPED (MEM0_SKIP_RETRIEVAL_GATE=1) — record why in the deploy notes"
+else
+    echo "==> retrieval families gate (post-restart; repo suite + app venv; 300s bound)"
+    if ! (cd "$REPO_ROOT/mem0-server" && MEM0_KEY="$(cat "$HOME/.mem0/api-key")" \
+          MEM0_URL="http://127.0.0.1:18791" \
+          timeout 300 "$APP_DIR/.venv/bin/python" -m pytest -q tests/test_retrieval_families.py 2>&1 | tail -20); then
+        echo "==> RETRIEVAL GATE RED. /health/deep was GREEN moments ago, so this is a retrieval"
+        echo "    REGRESSION (family floor breach), not infrastructure. New code IS live. Roll back:"
+        echo "      git checkout $PREV_SHA && bash scripts/wsl/deploy.sh"
+        echo "    Or, deliberately and recorded: MEM0_SKIP_RETRIEVAL_GATE=1 bash scripts/wsl/deploy.sh"
+        exit 4
+    fi
+    echo "    retrieval families gate OK"
+fi
+git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
+
+echo "==> deploy complete. Full gate: cd $REPO_ROOT/mem0-server && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=http://127.0.0.1:18791 $APP_DIR/.venv/bin/python -m pytest -q"
