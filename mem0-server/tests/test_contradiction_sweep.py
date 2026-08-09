@@ -1083,3 +1083,65 @@ def test_main_codex_preflight_never_falls_back_to_local(monkeypatch):
     monkeypatch.setattr(sweep, "judge_pair_codex", _no_judging)
     rc = sweep.main()
     assert rc == 0, "a skipped week is a clean no-op, not a unit failure"
+
+
+# --- AMS-36 + decision 3.5 (2026-08-09): judged retrieval-pairs + the supersession resolve step ---
+
+def test_pairs_supersession_order_orders_by_created_at():
+    """The supersession judge's question is directional (hide the OLDER given
+    the NEWER); a scrambled order silently asks the wrong question."""
+    a = {"data": "old fact", "created_at": "2026-07-01T00:00:00+00:00"}
+    b = {"data": "new fact", "created_at": "2026-08-01T00:00:00+00:00"}
+    assert sweep.pairs_supersession_order("A", a, "B", b) == ("A", "old fact", "B", "new fact")
+    # swapped argument order must yield the SAME older<-newer result
+    assert sweep.pairs_supersession_order("B", b, "A", a) == ("A", "old fact", "B", "new fact")
+
+
+def test_pairs_supersession_order_refuses_unordered():
+    """No parseable created_at (or no text) on either side -> None, never a guess."""
+    dated = {"data": "x", "created_at": "2026-08-01T00:00:00+00:00"}
+    assert sweep.pairs_supersession_order("A", {"data": "x"}, "B", dated) is None
+    assert sweep.pairs_supersession_order("A", dated, "B", {"data": "x", "created_at": "not-a-date"}) is None
+    assert sweep.pairs_supersession_order("A", {"created_at": "2026-08-01T00:00:00+00:00"}, "B", dated) is None
+
+
+def test_resolve_supersede_precheck_matrix():
+    ok = {"tier": "evidence", "data": "old"}
+    assert sweep.resolve_supersede_precheck("L", "W", ok) is None
+    assert "not found" in sweep.resolve_supersede_precheck("L", "W", None)
+    assert "same record" in sweep.resolve_supersede_precheck("L", "L", ok)
+    assert "CANONICAL" in sweep.resolve_supersede_precheck(
+        "L", "W", {"tier": "canonical", "data": "old"})
+    assert "already superseded" in sweep.resolve_supersede_precheck(
+        "L", "W", {"tier": "evidence", "superseded_by": "other"})
+
+
+def test_supersede_resolve_actor_is_registered_with_exactly_one_key():
+    """The sweep's actor name and the server's TRUSTED_PATCH_ACTORS entry must
+    agree, and the allowlist must be exactly {superseded_by} — a wider set
+    would let the resolve step smuggle other forbidden keys."""
+    import importlib.util as _ilu
+    si_path = REPO_ROOT / "mem0-server" / "security_invariants.py"
+    _s = _ilu.spec_from_file_location("security_invariants_ams36", si_path)
+    si = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(si)
+    actor = sweep.SUPERSEDE_RESOLVE_ACTOR
+    assert actor in si.TRUSTED_PATCH_ACTORS, \
+        f"{actor} not registered in TRUSTED_PATCH_ACTORS — the resolve PATCH would 403"
+    assert si.TRUSTED_PATCH_ACTORS[actor] == frozenset({"superseded_by"})
+
+
+def test_judged_pairs_mode_queues_and_never_stamps():
+    """Source-shape pin on the operator fork's safety property: the judged
+    retrieval-pairs block routes YES to the human review queue and contains NO
+    stamping/PATCH call — enforcement stays with --resolve-supersede."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    i = src.find("def run_retrieval_pairs")
+    j = src.find("\ndef ", i + 10)
+    body = src[i:j]
+    assert "append_review_queue" in body, "judged mode must feed the review queue"
+    assert "stamp_candidate(" not in body, "the pairs mode must never stamp"
+    assert ".patch(" not in body, "the pairs mode must never PATCH the store"
+    # and the old refusal is gone: --apply now selects the judged mode
+    assert "count-only this wave" not in src
+    assert "judged=args.apply" in src
