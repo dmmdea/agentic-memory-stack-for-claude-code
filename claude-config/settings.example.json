@@ -18,9 +18,7 @@
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "C:\\Users\\<WIN_USER>\\.claude\\scripts\\mem0-hook-client.exe", "timeout": 5 } ] }
-    ],
-    "PreToolUse": [
-      { "matcher": "Bash|Edit|Write|MultiEdit", "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\pre-tool-check.ps1", "timeout": 3 } ] }
     ]
-  }
+  },
+  "_ams16_note": "The 0.F PreToolUse contradiction check (pre-tool-check.ps1) was RETIRED 2026-08-09 by operator decision — its whole-history warn corpus was ~45 warnings at near-100% false-positive. The installer strips the hook from live settings on re-run; no PreToolUse entry is stack-owned anymore."
 }

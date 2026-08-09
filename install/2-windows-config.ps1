@@ -239,6 +239,9 @@ try {
 }
 
 # H12: added user-prompt-extract.ps1 and pre-tool-check.ps1 for v0.17 Phase 0 hooks
+# AMS-16 (2026-08-09): pre-tool-check.ps1 RETIRED by operator decision (see the
+# retired-hook strip below) — removed from the list, and the deployed copy is
+# deleted on re-run because this copy loop is add-only.
 # v0.19 M13: added user-prompt-lib.ps1 — user-prompt-extract.ps1 dot-sources it;
 # deploying the extractor without the lib silently disables Phase 0.B/0.D.
 # v0.20 Final (adversarial-review HIGH, A.5/A.6 parity): added the resident
@@ -257,7 +260,16 @@ try {
 # memory-index-refresh.ps1 (standalone MEMORY.md index refresh decoupled from the dream) — both
 # spawn detached from SessionStart. Not R9 hash-tracked (they are not hot-path clients), so this
 # stays a superset of $hookNames (InstallerParity holds).
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'pre-tool-check.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+# AMS-16: the copy loop is add-only, so a retired script must be deleted
+# explicitly or it lingers deployed forever (the AMS-50 orphan class).
+foreach ($retired in @('pre-tool-check.ps1')) {
+    $p = Join-Path $ScriptsDir $retired
+    if (Test-Path -LiteralPath $p) {
+        Remove-Item -LiteralPath $p -Force
+        Write-Host "    removed retired script: $retired" -ForegroundColor Yellow
+    }
+}
 foreach ($s in $winScripts) {
     $src = Join-Path $RepoRoot "scripts\windows\$s"
     $dst = Join-Path $ScriptsDir $s
@@ -523,7 +535,6 @@ $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt
 # the global `allowed`-style single-marker logic previously APPENDED a second
 # UserPromptSubmit hook on re-run.
 $psUserPrompt   = New-HookExeCommand 'mem0-hook-client.exe'
-$psPreToolUse   = New-HookCommand 'pre-tool-check.ps1'
 $psDaemonSpawn  = New-HookCommand 'mem0-hook-daemon-spawn.ps1'
 # v0.27.1 R5: the Codex HTTP shim's SessionStart launcher. Flag-gated (no-op unless
 # ~/.claude/state/codex-shim.enabled exists), so registering it costs nothing until
@@ -556,7 +567,38 @@ $hookEntries = @{
     )
     # H12: Phase 0 hooks (v0.20 Final: exe registration + both-shape dedupe)
     'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 5 })
-    'PreToolUse'         = @(@{ markers = @('pre-tool-check.ps1');         command = $psPreToolUse; timeout = 3; matcher = 'Bash|Edit|Write|MultiEdit' })
+}
+
+# AMS-16 (2026-08-09, operator decision): the 0.F PreToolUse contradiction check
+# is RETIRED — its whole-history warn corpus was ~45 warnings, near-100% false
+# positive. Retired markers are actively REMOVED from deployed settings on
+# re-run: merely dropping the entry from $hookEntries would leave the stale hook
+# alive on every existing box, since the merge loop only touches events it owns.
+$retiredHookMarkers = @{
+    'PreToolUse' = @('pre-tool-check.ps1')
+}
+foreach ($evt in $retiredHookMarkers.Keys) {
+    if (-not $hooks.PSObject.Properties[$evt]) { continue }
+    $marks    = @($retiredHookMarkers[$evt])
+    $existing = @($hooks.$evt)
+    $kept = @()
+    foreach ($e in $existing) {
+        $isRetired = $false
+        foreach ($h in @($e.hooks)) {
+            foreach ($mk in $marks) {
+                if ($h.command -like "*$mk*") { $isRetired = $true; break }
+            }
+            if ($isRetired) { break }
+        }
+        if (-not $isRetired) { $kept += $e }
+    }
+    if ($kept.Count -lt $existing.Count) {
+        $hooks.PSObject.Properties.Remove($evt)
+        if ($kept.Count -gt 0) {
+            $hooks | Add-Member -NotePropertyName $evt -NotePropertyValue @($kept) -Force
+        }
+        Write-Host "    hook: $evt  (removed $($existing.Count - $kept.Count) retired entry/entries)"
+    }
 }
 
 # Merge our entries into existing event arrays (don't stomp other hooks).

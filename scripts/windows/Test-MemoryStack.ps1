@@ -1352,7 +1352,7 @@ try {
     $deployedHookDir = Join-Path $env:USERPROFILE '.claude\scripts'
     $hookNames = @(
         'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'stop-extract.ps1',
-        'pre-tool-check.ps1', 'l1a-extract.ps1', 'memory-common.ps1', 'Test-MemoryStack.ps1',
+        'l1a-extract.ps1', 'memory-common.ps1', 'Test-MemoryStack.ps1',
         'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1',  # v0.20 A.5 resident daemon + SessionStart launcher
         'mem0-hook-client.cs',                                 # v0.20 A.6 compiled thin client SOURCE (exe is built FROM the deployed copy)
         'build-hook-client.ps1',                               # v0.20 Final: smoke-gated builder — deployed so a repo-less DR restore can rebuild the exe (SessionStart self-heal in mem0-hook-daemon-spawn.ps1)
