@@ -2172,11 +2172,11 @@ def update_metadata(
     # so an arbitrary API-key holder cannot censor retrieval via the generic
     # shallow-merge endpoint. The per-actor TRUSTED_PATCH_ACTORS dict is the
     # ONLY write path (contradiction-sweep-v019 -> its two contradiction keys).
-    # superseded_by has NO API writer today (the cascade-delete walk below only
-    # READS it; contradiction-sweep skips on it; mem0-backfill skips superseded
-    # rows) so it is blocked for ALL actors — a future supersession-writer must
-    # register in TRUSTED_PATCH_ACTORS (security_invariants.py) with an exact
-    # key allowlist rather than reopen this endpoint.
+    # superseded_by: writable by exactly ONE actor since AMS-36 (2026-08-09) —
+    # supersession-resolve-v030 in TRUSTED_PATCH_ACTORS (security_invariants),
+    # the operator's resolve step for supersede reviews. The judging sweeps
+    # still cannot write it (they queue for review); every other actor stays
+    # blocked, exactly as this comment used to promise for all.
     FORBIDDEN_KEYS = {"retrievable", "expires_at", "created_at", "tier_actor",
                       "superseded_by", "contradicts_canonical", "contradiction_checked_at",
                       "contradicts_canonical_pending",  # v0.29.4: only the sweep actor writes it

@@ -1308,10 +1308,117 @@ def _read_retrieval_rows(days: int) -> tuple[list[dict], dict]:
     return rows, counts
 
 
-def run_retrieval_pairs(args) -> int:
-    """W5 ADOPT-4: retrieval-space pair-yield DRY-RUN — counts, NEVER judges
-    and NEVER stamps (the judged mode is a future operator fork gated on this
-    receipt's yield over a real 30-day widened+route-stamped window).
+SUPERSEDE_RESOLVE_ACTOR = "supersession-resolve-v030"
+
+
+def resolve_supersede_precheck(loser_id: str, winner_id: str,
+                               loser_payload: Optional[dict]) -> Optional[str]:
+    """Pure refusal matrix for the operator's --resolve-supersede step.
+    Returns a refusal reason, or None when the write may proceed.
+
+    AMS-36: superseded_by's ONLY writer is the operator resolve step, so this
+    precheck is the entire safety surface between a review-queue entry and a
+    record being hidden from default retrieval."""
+    if not loser_payload:
+        return f"loser {loser_id} not found in the store"
+    if loser_id == winner_id:
+        return "loser and winner are the same record"
+    if loser_payload.get("tier") == "canonical":
+        return ("loser is CANONICAL — canonicals are never superseded by this "
+                "path (demote first via the tier API if that is really intended)")
+    if loser_payload.get("superseded_by"):
+        return (f"loser already superseded by {loser_payload.get('superseded_by')} "
+                "— refusing to overwrite an existing resolution")
+    return None
+
+
+def run_resolve_supersede(args, dry_run: bool) -> int:
+    """AMS-36 operator resolve step: write superseded_by=<winner> on <loser>
+    via the trusted-actor PATCH path (actor supersession-resolve-v030 — the
+    field's ONLY writer). Dry-run by default. The judging sweeps queue
+    candidates; a human runs this; the admission gate then excludes the loser
+    from default retrieval (v0.19 I.1) while forensic reads keep it."""
+    loser, winner = str(args.resolve_supersede), str(args.winner)
+    try:
+        api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+    except OSError as e:
+        print(f"contradiction-sweep: resolve-supersede FAIL — api-key unreadable: {e}", flush=True)
+        return 1
+    http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    try:
+        payloads = {}
+        for mid in (loser, winner):
+            r = httpx.post(
+                f"{QDRANT}/collections/{COLLECTION}/points",
+                json={"ids": [mid], "with_payload": True}, timeout=15.0)
+            r.raise_for_status()
+            pts = r.json().get("result") or []
+            payloads[mid] = (pts[0].get("payload") or {}) if pts else None
+        if payloads.get(winner) is None:
+            print(f"contradiction-sweep: resolve-supersede REFUSED — winner {winner} "
+                  "not found in the store", flush=True)
+            return 1
+        refusal = resolve_supersede_precheck(loser, winner, payloads.get(loser))
+        if refusal:
+            print(f"contradiction-sweep: resolve-supersede REFUSED — {refusal}", flush=True)
+            return 1
+        print(f"  loser  {loser}: {str((payloads[loser] or {}).get('data'))[:120]}", flush=True)
+        print(f"  winner {winner}: {str((payloads[winner] or {}).get('data'))[:120]}", flush=True)
+        if dry_run:
+            print("contradiction-sweep: resolve-supersede DRY-RUN — add --apply to write "
+                  f"superseded_by={winner} on {loser}", flush=True)
+            return 0
+        r = http.patch(
+            f"{MEM0}/v1/memories/{loser}/metadata",
+            json={"metadata": {"superseded_by": winner},
+                  "actor": SUPERSEDE_RESOLVE_ACTOR,
+                  "reason": f"operator supersede resolution: {loser} superseded by {winner}"},
+            timeout=10.0)
+        if r.status_code != 200:
+            print(f"contradiction-sweep: resolve-supersede FAIL — mem0={r.status_code} "
+                  f"body={r.text[:200]}", flush=True)
+            return 1
+        print(f"contradiction-sweep: RESOLVED — {loser} superseded_by={winner} "
+              f"(actor {SUPERSEDE_RESOLVE_ACTOR})", flush=True)
+        _append_summary({"mode": "resolve-supersede", "dry_run": False,
+                         "loser": loser, "winner": winner, "outcome": "ok"})
+        return 0
+    except (httpx.HTTPError, OSError) as e:
+        print(f"contradiction-sweep: resolve-supersede FAIL — {type(e).__name__}: {e}", flush=True)
+        return 1
+    finally:
+        http.close()
+
+
+def pairs_supersession_order(pid_a: str, a: dict, pid_b: str, b: dict):
+    """Order a co-retrieval pair for the supersession judge (older <- newer).
+
+    The judge's question is directional — "should the OLDER be hidden as stale
+    given the NEWER?" — so the pair must be ordered by created_at. Returns
+    (older_id, older_text, newer_id, newer_text) or None when either side has
+    no parseable created_at or no text: an unordered pair would silently ask
+    the judge a scrambled question, which is worse than not asking."""
+    ta = a.get("data") or a.get("memory")
+    tb = b.get("data") or b.get("memory")
+    if not ta or not tb:
+        return None
+    da = parse_created({"payload": a})
+    db = parse_created({"payload": b})
+    if da is None or db is None:
+        return None
+    if da <= db:
+        return (pid_a, str(ta), pid_b, str(tb))
+    return (pid_b, str(tb), pid_a, str(ta))
+
+
+def run_retrieval_pairs(args, judged: bool = False) -> int:
+    """W5 ADOPT-4: retrieval-space pair yield — counts by default; with
+    judged=True (--apply, operator fork taken 2026-08-09) it ALSO runs the
+    supersession judge over the eligible pairs and queues YES verdicts for
+    human review. It never stamps, hides, or writes superseded_by — the
+    evidence-sweep rule holds here too (Codex over-promotes; a live run once
+    promoted 3/4 consistent facts into hidden, so the enforcement keystroke
+    stays human via --resolve-supersede).
 
     Samples pairs from CO-RETRIEVAL (what actually lands together in one
     result set) rather than storage-space cosine neighborhoods, dedupes by
@@ -1329,6 +1436,8 @@ def run_retrieval_pairs(args) -> int:
         return 0
     qdrant_http = httpx.Client()
     outcome = "ok"
+    judged_stats = None  # assigned in the judged block; must exist for the
+                         # summary line even when the run aborts before it
     try:
         rows, counts = _read_retrieval_rows(args.pairs_days)
         pair_queries: dict[tuple, set] = {}
@@ -1423,6 +1532,56 @@ def run_retrieval_pairs(args) -> int:
         novel = (sum(1 for p in eligible if tuple(sorted(p["ids"])) not in reachable)
                  if reachable is not None else None)
 
+        # --- judged mode (operator fork, 2026-08-09) --------------------------
+        # Supersession verdicts over the eligible pairs, highest co-occurrence
+        # first, capped per run so the weekly Codex spend is bounded. YES goes
+        # to the SAME human review queue the evidence sweep feeds; nothing is
+        # stamped or hidden here. The pair cache makes re-runs cheap: a pair
+        # judged last week is a cache hit this week.
+        if judged:
+            judged_stats = {"judged": 0, "yes": 0, "queued": 0, "skipped": 0,
+                            "unordered": 0, "cache_hits": 0, "cache_misses": 0}
+            llm_http = httpx.Client()
+            consec_fail = 0
+            try:
+                for p in eligible[: args.pairs_max_judged]:
+                    pa, pb = p["ids"]
+                    ordered = pairs_supersession_order(pa, payloads.get(pa) or {},
+                                                       pb, payloads.get(pb) or {})
+                    if ordered is None:
+                        judged_stats["unordered"] += 1
+                        continue
+                    older_id, older_text, newer_id, newer_text = ordered
+                    verdict, detail = judge_supersession_dispatch(
+                        args.judge, llm_http, args.model, older_text, newer_text,
+                        CODEX_JUDGE_TIMEOUT_S, cache_stats=judged_stats)
+                    judged_stats["judged"] += 1
+                    if verdict is None:
+                        judged_stats["skipped"] += 1
+                        if detail.startswith(("llm-error", "codex-error")):
+                            consec_fail += 1
+                            if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
+                                outcome = (f"degraded:judge-unresponsive:"
+                                           f"{MAX_CONSECUTIVE_LLM_FAILURES}-consecutive")
+                                print("contradiction-sweep: retrieval-pairs judge ABORT - "
+                                      f"{detail[:120]}", flush=True)
+                                break
+                        continue
+                    consec_fail = 0
+                    if verdict:
+                        judged_stats["yes"] += 1
+                        print(f"  SUPERSEDE-CANDIDATE older {older_id} <- newer {newer_id} "
+                              f"({detail[:120]})", flush=True)
+                        if append_review_queue(str(REVIEW_QUEUE), {
+                                "memory_id": older_id, "canonical_id": newer_id,
+                                "kind": "supersede",
+                                "candidate_text": older_text[:300],
+                                "justification": ("retrieval-pairs: older co-retrieved fact "
+                                                  f"judged STALE (superseded) — {detail[:160]}")}):
+                            judged_stats["queued"] += 1
+            finally:
+                llm_http.close()
+
         if not rows:
             outcome = "no-op:no-route-stamped-rows"
         receipt = {
@@ -1440,17 +1599,24 @@ def run_retrieval_pairs(args) -> int:
             "ids_source": ("returned_top_ids (top-3 per row until the [:10] "
                            "widening deploys — co-occurrence is a lower bound)"),
             "top_pairs": eligible[:20],
-            "note": ("count-only dry run — the judged retrieval-pairs mode is an "
-                     "operator fork gated on material yield over a full widened "
-                     "window (W5 review F7)"),
+            "mode": "judged" if judged else "count-only",
+            "judged_stats": judged_stats,
+            "note": (("judged supersession over eligible pairs (operator fork "
+                      "2026-08-09); YES -> human review queue, nothing stamped "
+                      "or hidden here") if judged else
+                     ("count-only dry run — pass --apply for the judged mode "
+                      "(operator fork taken 2026-08-09)")),
         }
         tmp = PAIRS_RECEIPT.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(receipt, indent=1), encoding="utf-8")
         os.replace(tmp, PAIRS_RECEIPT)
-        print(f"contradiction-sweep: retrieval-pairs dry-run done. rows={len(rows)} "
-              f"pairs={len(pair_queries)} eligible={len(eligible)} "
+        _js = (f" judged={judged_stats['judged']} yes={judged_stats['yes']} "
+               f"queued={judged_stats['queued']} cache-hits={judged_stats['cache_hits']}"
+               if judged_stats else "")
+        print(f"contradiction-sweep: retrieval-pairs {'judged' if judged else 'dry-run'} done. "
+              f"rows={len(rows)} pairs={len(pair_queries)} eligible={len(eligible)} "
               f"canonical-member={canonical_member} novel={novel} "
-              f"legacy-excluded={counts['excluded_legacy_rows']} -> {PAIRS_RECEIPT}",
+              f"legacy-excluded={counts['excluded_legacy_rows']}{_js} -> {PAIRS_RECEIPT}",
               flush=True)
     except Exception as e:  # noqa: BLE001 — a shape bug must still leave a summary line
         outcome = f"degraded:aborted:{type(e).__name__}: {str(e)[:120]}"
@@ -1461,7 +1627,8 @@ def run_retrieval_pairs(args) -> int:
             PAIRS_LOCK.rmdir()
         except OSError:
             pass
-    _append_summary({"mode": "retrieval-pairs", "dry_run": True,
+    _append_summary({"mode": "retrieval-pairs", "dry_run": not judged,
+                     "judged_stats": judged_stats if judged else None,
                      "outcome": outcome})
     return exit_code_for(outcome)
 
@@ -1530,15 +1697,35 @@ def main() -> int:
                         help="retrieval-pairs: log window in days (default 30)")
     parser.add_argument("--pairs-max-pairs", type=int, default=200,
                         help="retrieval-pairs: cap on ranked pairs fetched for eligibility (default 200)")
+    parser.add_argument("--pairs-max-judged", type=int, default=40,
+                        help="retrieval-pairs --apply: cap on pairs sent to the supersession "
+                             "judge per run — bounds the weekly Codex spend; the pair cache "
+                             "makes re-judging a prior week's pair free (default 40)")
+    parser.add_argument("--resolve-supersede", metavar="LOSER_ID",
+                        help="OPERATOR resolve step for a queued supersede review: write "
+                             "superseded_by=<--winner> on LOSER_ID via the trusted-actor PATCH "
+                             "path. Dry-run by default; add --apply to write. Refuses canonical "
+                             "losers and already-superseded records.")
+    parser.add_argument("--winner", metavar="WINNER_ID",
+                        help="the newer record LOSER_ID is superseded by (required with "
+                             "--resolve-supersede)")
     args = parser.parse_args()
     dry_run = not args.apply
 
-    if args.retrieval_pairs:
-        if args.apply:
-            print("contradiction-sweep: --retrieval-pairs is count-only this wave; "
-                  "--apply is refused (the judged mode is an operator fork).", flush=True)
+    if args.resolve_supersede:
+        if not args.winner:
+            print("contradiction-sweep: --resolve-supersede requires --winner <id>", flush=True)
             return 2
-        return run_retrieval_pairs(args)
+        return run_resolve_supersede(args, dry_run=dry_run)
+
+    if args.retrieval_pairs:
+        # Operator fork taken 2026-08-09 (decision 3.5 "ok"): --apply now runs
+        # the JUDGED mode — supersession verdicts (the HIDE decision, evidence-
+        # sweep semantics) over the co-retrieval pairs, cache-backed, feeding
+        # the SAME human review queue. It never stamps, hides, or writes
+        # superseded_by itself; enforcement stays with the operator's
+        # --resolve-supersede step.
+        return run_retrieval_pairs(args, judged=args.apply)
 
     # v0.27.3: when judging with Codex, the Windows shim must be reachable. Preflight it; if it is
     # NOT, record a NO-OP (exit 0 — NOT a hard failure, so the weekly timer is not noisy) and never

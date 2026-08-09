@@ -147,6 +147,16 @@ TRUSTED_PATCH_ACTORS: dict[str, frozenset[str]] = {
     # re-judge promotes it to contradicts_canonical (enforced). Same trusted actor.
     "contradiction-sweep-v019": frozenset({"contradicts_canonical", "contradiction_checked_at",
                                            "contradicts_canonical_pending"}),
+    # AMS-36 (2026-08-09, operator-approved): the supersession RESOLVE step.
+    # superseded_by had NO writer anywhere — the field was documented, consumed
+    # (admission I.1 rejects on it; the cascade walk reads it) and never once
+    # produced. The producer chain is now: judged retrieval-pairs / evidence
+    # sweep -> human review queue -> the operator resolves via
+    # `contradiction-sweep.py --resolve-supersede` -> THIS actor writes the
+    # field. Exactly one key; the sweep itself still cannot write it (judging
+    # and resolving stay separated — Codex over-promotes, so the enforcement
+    # keystroke remains human).
+    "supersession-resolve-v030": frozenset({"superseded_by"}),
 }
 
 # H5: sentinel for fetch_current_tier when the point does NOT exist in Qdrant.
