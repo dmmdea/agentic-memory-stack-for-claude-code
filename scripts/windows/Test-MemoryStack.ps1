@@ -408,7 +408,13 @@ try {
         if ($la -eq '127.0.0.1' -or $la -eq '::1') {
             Add-Check 'INVARIANTS' 'llama-swap bind' 'OK' "${la}:11436 (Windows-native)"
         } else {
-            Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' "LAN-exposed: Windows-native llama-swap listening on ${la}:11436 — no auth in front of it. Deliberate on a model-serving workstation (the launcher passes --listen 0.0.0.0:11436 so other hosts can use the models); to restrict, set --listen 127.0.0.1:11436 in C:\llama-swap\start-llama-swap.cmd and restart the 'llama-swap' scheduled task."
+            # Operator decision 2026-08-09 ("leave it"): the all-interfaces bind
+            # is the ACCEPTED posture on a model-serving workstation — :11436 is
+            # the shared inference endpoint other nodes rely on, so restricting
+            # it would cut them off. A perpetual un-actionable WARN only trains
+            # the reader to ignore WARNs; the exposure is stated on an OK line
+            # instead. Revisit if auth lands in front or the node role changes.
+            Add-Check 'INVARIANTS' 'llama-swap bind' 'OK' "${la}:11436 (Windows-native, all interfaces) — ACCEPTED RISK, operator 2026-08-09: shared inference endpoint for other nodes; no auth in front. To restrict: --listen 127.0.0.1:11436 in C:\llama-swap\start-llama-swap.cmd."
         }
     }
     else {
