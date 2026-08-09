@@ -41,18 +41,25 @@ def test_ams20_infra_degradations_still_win_over_the_orphan_verdict():
 
 
 def test_ams19_embedding_coverage_measured(tmp_path):
-    """Schema-accurate: the real ledger column is `summary_text` and the
-    embedder's own rule is >= 64 chars after stripping (MIN_SUMMARY_CHARS).
-    The first cut guessed `summary` and fail-softed against the LIVE db —
-    this fixture reproduces the real schema so that cannot recur."""
+    """Schema-accurate AND state-accurate. The real ledger column is
+    `summary_text`, the embedder's own rule is >= 64 chars after stripping
+    (MIN_SUMMARY_CHARS), and only state='complete' episodes are ever indexed —
+    in_progress checkpoint summaries are excluded on purpose. Both halves were
+    learned by running against the live ledger: the first probe cut guessed a
+    `summary` column and fail-softed; the second counted checkpoints and
+    reported 539 missing where the true complete-state gap was ~15."""
     db = tmp_path / "e.db"
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, "
-                 "summary_text TEXT)")
+                 "summary_text TEXT, state TEXT)")
     long_enough = "x" * 70
-    conn.executemany("INSERT INTO episodes (summary_text) VALUES (?)",
-                     [(long_enough,), (long_enough,), ("too short",),
-                      ("",), (None,)])
+    conn.executemany("INSERT INTO episodes (summary_text, state) VALUES (?, ?)",
+                     [(long_enough, "complete"), (long_enough, "complete"),
+                      ("too short", "complete"),
+                      ("", "complete"), (None, "complete"),
+                      # the state-filter killer: long summary, but a checkpoint
+                      # — the indexer never touches it, so neither may the probe
+                      (long_enough, "in_progress")])
     conn.commit()
 
     def handler(request):
@@ -61,8 +68,9 @@ def test_ams19_embedding_coverage_measured(tmp_path):
     http = httpx.Client(transport=httpx.MockTransport(handler))
     out = recon.embedding_coverage(conn, http)
     conn.close()
-    # 2 eligible (>=64 chars), 1 embedded -> 1 missing; the 3 short/empty/null
-    # rows are NOT eligible, exactly as the embedder treats them
+    # 2 eligible (complete + >=64 chars), 1 embedded -> 1 missing; the short/
+    # empty/null rows AND the long in_progress checkpoint are NOT eligible,
+    # exactly as the indexing path treats them
     assert out == {"eligible": 2, "embedded": 1, "missing": 1}
 
 
