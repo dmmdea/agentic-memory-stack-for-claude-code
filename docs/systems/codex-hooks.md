@@ -50,7 +50,7 @@ Codex CLI authenticates via **ChatGPT subscription OAuth** (separate auth surfac
 | `PreCompact` | `stop-extract.ps1` | Snapshot the transcript before compaction mutates it, then extract. |
 | `SessionStart` | `storage-cap-check.sh` (WSL), `mem0-hook-daemon-spawn.ps1` (async), `codex-shim-spawn.ps1` (async), `sessionstart-capture.ps1` (async) | Storage guard + spawn the bundle daemon, the Codex HTTP shim (`:18792`), and the session précis. |
 | `UserPromptSubmit` | `mem0-hook-client.exe` | Inject the `[MEMORY CONTEXT]` block for the prompt. |
-| `PreToolUse` (`Bash\|Edit\|Write\|MultiEdit`) | `pre-tool-check.ps1` | Pre-tool memory/guard check. |
+| `PreToolUse` | *(none — stack-owned entry retired)* | The 0.F contradiction check (`pre-tool-check.ps1`) was retired 2026-08-09 by operator decision (AMS-16, near-100% FP warn corpus); the installer strips it on re-run. |
 
 ## Important flows
 

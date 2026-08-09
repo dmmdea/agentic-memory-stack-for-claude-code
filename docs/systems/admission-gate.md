@@ -156,10 +156,11 @@ search consumer.
   — pass it when working in a brand context) and `allow_cross_brand` (explicit
   opt-in for a brandless search to return brand-scoped records; without either,
   the fail-closed default returns null-brand records only).
-- **Pre-tool hook** (`scripts/windows/pre-tool-check.ps1`, Phase 0.F): the
-  canonical-contradiction search now sends `query_class = 'canonical'`. Without
-  it the server stripped canonical hits before the hook's PS post-filter ran —
-  the contradiction check was dead code from Phase C onward.
+- **Pre-tool hook** (Phase 0.F — RETIRED 2026-08-09, AMS-16): while it lived,
+  its canonical-contradiction search sent `query_class = 'canonical'` (without
+  it the server stripped canonical hits before the hook's PS post-filter ran).
+  The hook was retired by operator decision after its whole-history warn corpus
+  measured near-100% false-positive; see `docs/systems/continuity.md`.
 - **UserPromptSubmit hook layer-1** (`user-prompt-lib.ps1`) is deliberately
   NOT changed: proactive injection stays on the stable+evidence allowlist.
   The fix only restores deliberate, explicit searches.

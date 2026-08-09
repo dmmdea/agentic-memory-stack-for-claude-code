@@ -311,10 +311,20 @@ The hook uses `${CLAUDE_CWD:-$PWD}`. If Claude Code sets `CLAUDE_CWD` at hook in
 
 ---
 
-## Pre-Tool Contradiction Check (Phase 0.F — shipped v0.17 as logging-only stub)
+## Pre-Tool Contradiction Check (Phase 0.F — RETIRED 2026-08-09)
 
-**Status:** Shipped in v0.17. Deployed to `C:\Users\youruser\.claude\scripts\pre-tool-check.ps1`.
-Registered as PreToolUse hook in `settings.json` scoped to `Bash|Edit|Write|MultiEdit`.
+**Status: RETIRED by operator decision (AMS-16).** The stub's own success
+criterion below was finally adjudicated against its whole-history warn corpus:
+~45 warnings ever, near-100% false-positive (after AMS-29 decontaminated the
+mis-scaled entries), zero real contradictions caught. That is the "low signal /
+high noise" branch, and the measured answer was "disable the hook" — the
+installer now strips the PreToolUse registration from live settings and deletes
+the deployed script on re-run. The warn corpus (`~/.mem0/pre-tool-warnings.jsonl`)
+is kept as the historical record. Everything below is preserved as the design
+history of why it shipped logging-only.
+
+Shipped in v0.17. Was deployed to `C:\Users\youruser\.claude\scripts\pre-tool-check.ps1`,
+registered as PreToolUse hook in `settings.json` scoped to `Bash|Edit|Write|MultiEdit`.
 
 **Intent:** Before Claude runs Edit / Write / Bash on a file or command, check if a canonical
 memory contradicts the intended action. Surface "wait — you locked decision X about this" warnings

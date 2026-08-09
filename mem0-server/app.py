@@ -269,7 +269,8 @@ class SearchIn(BaseModel):
     #   admission gate's supersession/contradiction checks are disabled.
     query_class: Optional[str] = "durable"  # durable | operational | canonical | history
     # v0.19 M15: hook contract version stamped by the Windows hook search callers
-    # (user-prompt-extract.ps1 0.D, pre-tool-check.ps1). The search contract was
+    # (user-prompt-extract.ps1 0.D; pre-tool-check.ps1 also stamped it until
+    # AMS-16 retired that hook, 2026-08-09). The search contract was
     # unversioned in v0.18, so drift on the highest-traffic hook call was
     # undetectable. WARN-only, never rejected (see hook_contract.py).
     hook_contract_version: Optional[str] = None

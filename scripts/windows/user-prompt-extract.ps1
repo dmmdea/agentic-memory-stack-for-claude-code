@@ -293,7 +293,8 @@ try {
         # v0.20 Phase F (L9): the byte-faithful write (v0.19 L13 — verbatim
         # $stdinRaw, UTF-8 no BOM, key order untouched, contract version in the
         # FILENAME) + keep-20 prune moved to the lib (Save-HookFixture), shared
-        # with the daemon and pre-tool-check so the three writers cannot drift.
+        # with the daemon so the writers cannot drift (pre-tool-check was the
+        # third writer until AMS-16 retired it, 2026-08-09).
         # 1-in-10 sample via guid hash (Get-Random = Utility load) stays here.
         try {
             if (Test-FunctionAvailable 'Save-HookFixture') {

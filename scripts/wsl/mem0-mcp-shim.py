@@ -144,8 +144,9 @@ def _pending_op_count() -> int:
 # was the last field-less high-traffic caller). Values MUST stay inside
 # hook_contract.py's KNOWN_HOOK_CONTRACT_VERSIONS and are extended in the SAME
 # commit that bumps a wire contract (v0.19 M15 rule — no pre-whitelisting):
-#   '17.0' = the search wire contract (what pre-tool-check.ps1 sends on
-#            /v1/memories/search — the shim's search POSTs speak the same wire),
+#   '17.0' = the search wire contract on /v1/memories/search — the shim's
+#            search POSTs speak this wire (pre-tool-check.ps1 was its other
+#            speaker until AMS-16 retired that hook, 2026-08-09),
 #   '20.0' = the batched /v1/context/bundle contract (user-prompt-extract.ps1).
 # Parity-pinned against hook_contract.py by tests/test_mcp_shim_contract.py.
 SEARCH_HOOK_CONTRACT_VERSION = "17.0"
