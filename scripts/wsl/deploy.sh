@@ -127,6 +127,33 @@ rsync -c $DRY -v "$REPO_ROOT/VERSION" "$APP_DIR/VERSION" | sed 's/^/    version:
 mkdir -p "$SCRIPTS_DIR"
 rsync -rc $DRY -v --include='*.py' --include='*.sh' --exclude='*' \
     "$REPO_ROOT/scripts/wsl/" "$SCRIPTS_DIR/" | grep -v '^$' | sed 's/^/    scripts: /'
+# --- 2b. orphan guard (AMS-50) --------------------------------------------
+# This rsync is add-only by design (deleting from here would have destroyed
+# scripts whose only copies lived deployed). The cost of add-only is silent
+# drift: a script deleted from the repo persists live forever and never
+# updates. So every deploy prints the orphan set. WARN-only, never deletes;
+# pruning is an operator action.
+#
+# Maintainer-side scripts are expected here without being in THIS repo: they
+# are versioned and deployed from the operator's private maintenance repo
+# (deliberately not public — they carry operator-specific data patterns and
+# vault paths). Extend the allowlist only for scripts with a named home.
+MAINTAINER_SIDE="test-debris-purge.py _debris_patterns.py wiki-index-build.py wiki-search.py test_wiki_index.py"
+orphans=""
+for f in "$SCRIPTS_DIR"/*.py "$SCRIPTS_DIR"/*.sh; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f")"
+    case " $MAINTAINER_SIDE " in *" $b "*) continue ;; esac
+    if [ ! -f "$REPO_ROOT/scripts/wsl/$b" ]; then
+        orphans="$orphans $b"
+    fi
+done
+if [ -n "$orphans" ]; then
+    echo "    WARN: orphaned in $SCRIPTS_DIR (live but not in repo):$orphans"
+    echo "    WARN: these never update on deploy; adopt into scripts/wsl/ or delete deliberately."
+else
+    echo "    orphan guard: clean (non-maintainer scripts all match scripts/wsl/)"
+fi
 
 # --- 3. systemd units (same sentinel resolution as the installer) ---
 for src in "$REPO_ROOT"/systemd/*.service "$REPO_ROOT"/systemd/*.timer; do
