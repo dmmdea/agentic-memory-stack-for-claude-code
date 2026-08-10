@@ -619,8 +619,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def test_post_episode_with_advanced_goal_autocreates():
-    """POST episode with advanced_goal that doesn't match → goal auto-created + linked."""
+def test_post_episode_with_unmatched_goal_serializes_not_mints():
+    """Goal redesign (operator-approved 2026-08-09): POST episode with an
+    advanced_goal that doesn't fuzzy-match must NOT create a goal row — the
+    intent (title included) is serialized onto the episode's advanced_goals
+    JSON with unmatched:true, where the nightly recurrence promoter mines it.
+    This supersedes the v0.16 auto-create pin: the per-session mint measured
+    98.4% never-touched-again and was removed."""
     title = f"v016-autocreated-goal-{uuid.uuid4()}"
     body = {
         "session_id": f"test-{uuid.uuid4()}",
@@ -628,14 +633,22 @@ def test_post_episode_with_advanced_goal_autocreates():
         "ended_at": _now_iso(),
         "goal": "test", "summary": "test",
         "brand": "ai-ecosystem",
-        "advanced_goals": [{"goal_title": title, "delta_text": "auto-created"}],
+        "advanced_goals": [{"goal_title": title, "delta_text": "unmatched intent"}],
     }
     r = httpx.post(f"{URL}/v1/episodes", json=body, headers=H, timeout=15)
     assert r.status_code == 200, f"expected 200: {r.text}"
-    # Verify a goal with that title exists
+    ep_id = r.json()["episode_id"]
+    # NO goal row was minted...
     gr = httpx.get(f"{URL}/v1/goals?brand=ai-ecosystem&limit=200", headers=H, timeout=10)
     assert gr.status_code == 200
-    assert any(g["title"] == title for g in gr.json()), f"goal '{title}' not found in list"
+    assert not any(g["title"] == title for g in gr.json()), \
+        f"ingest minted goal '{title}' — the redesign removed per-session creation"
+    # ...and the intent rides the episode JSON for the promoter.
+    ep = httpx.get(f"{URL}/v1/episodes/{ep_id}", headers=H, timeout=10)
+    if ep.status_code == 200:
+        adv = str(ep.json().get("advanced_goals") or "")
+        assert title in adv and "unmatched" in adv, \
+            "unmatched intent must be serialized (title + unmatched flag) for the promoter"
 
 
 def test_post_episode_advanced_goal_fuzzy_matches_existing():
@@ -1245,9 +1258,12 @@ def test_find_goal_fuzzy_single_token_exact_match(tmp_path):
 
 
 def test_post_episode_one_word_goal_title_no_duplicate():
-    """v0.19 M3 endpoint-level: two episodes (two sessions) with the same one-word
-    goal_title must yield exactly ONE goal row — the Stop-hook pipeline dedupes by
-    exact title instead of auto-creating a duplicate per session."""
+    """Goal redesign (2026-08-09) supersedes the v0.19 M3 endpoint pin: two
+    episodes with the same unmatched one-word title now yield ZERO goal rows
+    at ingest — both serialize as unmatched intents, and the ONE-goal outcome
+    the M3 pin protected is delivered by the recurrence promoter instead
+    (2-session recurrence -> exactly one earned goal; pinned in
+    test_goal_redesign.py). What ingest must guarantee is no mint at all."""
     title = f"med3dup{uuid.uuid4().hex}"  # single token — exercises the <2-token path
     for _ in range(2):
         body = {
@@ -1262,7 +1278,8 @@ def test_post_episode_one_word_goal_title_no_duplicate():
     matching = [g for g in listed if g["title"] == title]
     # Clean up BEFORE asserting so a failure doesn't leave duplicate debris
     delete_goal_rows([g["id"] for g in matching])
-    assert len(matching) == 1, f"expected exactly 1 goal titled '{title}', got {len(matching)}"
+    assert len(matching) == 0, \
+        f"ingest minted {len(matching)} goal(s) titled '{title}' — the redesign removed per-session creation"
 
 
 # ---------------------------------------------------------------------------
@@ -1311,29 +1328,26 @@ def test_post_episode_completed_goal_same_title_creates_new_goal():
         }
         er = httpx.post(f"{URL}/v1/episodes", json=body, headers=H, timeout=15)
         assert er.status_code == 200, f"episode POST failed: {er.text}"
+        # Goal redesign (2026-08-09) supersedes the "creates a NEW goal" half
+        # of this pin: the terminal-status guard STAYS (a completed goal never
+        # matches or gains links), but the miss now serializes as an unmatched
+        # intent instead of minting — so exactly ONE goal exists afterwards.
         listed = httpx.get(f"{URL}/v1/goals?brand=ai-ecosystem&limit=200", headers=H, timeout=10).json()
         matching = [g for g in listed if g["title"] == title]
         created_ids = [g["id"] for g in matching]
-        assert len(matching) == 2, \
-            f"expected a NEW goal next to the completed one, got {len(matching)}: {matching}"
-        by_id = {g["id"]: g for g in matching}
-        assert by_id[old_gid]["status"] == "completed", "completed goal must stay completed"
-        new_gid = next(g["id"] for g in matching if g["id"] != old_gid)
-        assert by_id[new_gid]["status"] == "open", "auto-created goal must be open"
-        # the episode link must point at the NEW goal, not the completed one
+        assert len(matching) == 1, \
+            f"expected only the completed goal (no mint on miss), got {len(matching)}: {matching}"
+        assert matching[0]["id"] == old_gid and matching[0]["status"] == "completed", \
+            "completed goal must stay completed and unmatched"
         from _debris_patterns import episodic_db_path
         conn = sqlite3.connect(str(episodic_db_path()), timeout=30)
         try:
             n_old = conn.execute(
                 "SELECT COUNT(*) FROM episode_links WHERE target_kind='goal' AND target_id=?",
                 (str(old_gid),)).fetchone()[0]
-            n_new = conn.execute(
-                "SELECT COUNT(*) FROM episode_links WHERE target_kind='goal' AND target_id=?",
-                (str(new_gid),)).fetchone()[0]
         finally:
             conn.close()
         assert n_old == 0, "completed goal must not gain episode links"
-        assert n_new == 1, "new goal must carry the episode link"
     finally:
         delete_goal_rows(created_ids)
 
@@ -1390,15 +1404,15 @@ def test_post_episode_completed_multitoken_goal_creates_new_goal():
         }
         er = httpx.post(f"{URL}/v1/episodes", json=body, headers=H, timeout=15)
         assert er.status_code == 200, f"episode POST failed: {er.text}"
+        # Goal redesign (2026-08-09): the FTS terminal-status guard STAYS (no
+        # resurrection/re-link), but the miss no longer mints — one goal only.
         listed = httpx.get(f"{URL}/v1/goals?brand=ai-ecosystem&limit=200", headers=H, timeout=10).json()
         matching = [g for g in listed if g["title"] == title]
         created_ids = [g["id"] for g in matching]
-        assert len(matching) == 2, \
-            f"expected a NEW goal next to the completed multi-token one, got {len(matching)}: {matching}"
-        by_id = {g["id"]: g for g in matching}
-        assert by_id[old_gid]["status"] == "completed", "completed goal must stay completed"
-        new_gid = next(g["id"] for g in matching if g["id"] != old_gid)
-        assert by_id[new_gid]["status"] == "open", "auto-created goal must be open"
+        assert len(matching) == 1, \
+            f"expected only the completed multi-token goal (no mint on miss), got {len(matching)}: {matching}"
+        assert matching[0]["id"] == old_gid and matching[0]["status"] == "completed", \
+            "completed goal must stay completed and unmatched"
     finally:
         delete_goal_rows(created_ids)
 
