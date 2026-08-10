@@ -388,8 +388,8 @@ systemctl --user enable --now stack-backup.timer
 # defaults: goals-stale-sweep stays REPORT-ONLY (its ExecStart passes no
 # --auto-abandon, so no destructive goal-status flips on the unattended
 # schedule); contradiction-sweep runs its normal judge-stamp mode.
-systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer \
-    || echo "  WARN: could not enable sweep timers (systemd-user unavailable?) — enable manually: systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer"
+systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer \
+    || echo "  WARN: could not enable sweep timers (systemd-user unavailable?) — enable manually: systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer"
 
 sleep 3
 echo "==> Service status:"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly goal-recurrence-promote timer (04:45 - after the 3am dream and 4:30 dedup; cheap SQL, no LLM)
+
+[Timer]
+OnCalendar=*-*-* 04:45
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

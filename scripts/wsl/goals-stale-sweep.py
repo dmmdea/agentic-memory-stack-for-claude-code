@@ -60,6 +60,8 @@ def find_stale_goals(conn, stale_days: int = DEFAULT_STALE_DAYS) -> list[dict]:
             g.title,
             g.brand,
             g.priority,
+            g.created_by,
+            g.first_seen_session_id,
             g.created_at AS goal_created_at,
             (SELECT MAX(el.created_at) FROM episode_links el
              WHERE el.target_kind = 'goal' AND el.target_id = CAST(g.id AS TEXT)) AS last_link_at
@@ -74,6 +76,18 @@ def find_stale_goals(conn, stale_days: int = DEFAULT_STALE_DAYS) -> list[dict]:
             r["last_activity"] = last_activity
             stale.append(r)
     return stale
+
+
+def abandon_exempt(row: dict) -> bool:
+    """Goal redesign (operator-approved 2026-08-09): auto-abandon NEVER touches
+    a manual goal. Exempt = created_by 'manual', or a legacy row with no
+    first_seen_session_id (the pre-created_by manual path left it NULL —
+    everything extraction-minted always carried a session id)."""
+    if (row.get("created_by") or "") == "manual":
+        return True
+    if row.get("first_seen_session_id") is None and row.get("created_by") is None:
+        return True
+    return False
 
 
 def abandon_goal(conn, goal_id: int, reason: str, commit: bool = True) -> bool:
@@ -101,7 +115,10 @@ def main() -> int:
     parser.add_argument("--stale-days", type=int, default=DEFAULT_STALE_DAYS,
                         help=f"goals open with no link activity in this many days are flagged (default {DEFAULT_STALE_DAYS})")
     parser.add_argument("--auto-abandon", action="store_true",
-                        help="actually flip status to 'abandoned' for flagged goals (default: report only)")
+                        help="actually flip status to 'abandoned' for eligible flagged goals (default: report only)")
+    parser.add_argument("--abandon-days", type=int, default=90,
+                        help="auto-abandon acts only on goals inactive at least this long "
+                             "(operator-set 2026-08-09: 90; reporting still uses --stale-days)")
     args = parser.parse_args()
 
     if not EPISODIC_DB.exists():
@@ -135,13 +152,34 @@ def main() -> int:
                       f"last_activity={g['last_activity'][:10]}: {title}", flush=True)
 
             if args.auto_abandon:
-                ok = 0
+                # Goal redesign (2026-08-09): abandonment is SCOPED — only
+                # auto-created goals (never manual, see abandon_exempt) and
+                # only past --abandon-days (90 by operator ruling), which is
+                # deliberately longer than the --stale-days reporting window:
+                # a goal gets 90 days to earn a second touch before it closes.
+                abandon_cutoff = (dt.datetime.now(dt.timezone.utc)
+                                  - dt.timedelta(days=args.abandon_days)).isoformat()
+                ok = skipped_exempt = skipped_young = 0
                 for g in stale:
-                    if abandon_goal(conn, g["id"], reason=f"no episode_links activity in {args.stale_days}d", commit=False):
+                    if abandon_exempt(g):
+                        skipped_exempt += 1
+                        continue
+                    if g["last_activity"] >= abandon_cutoff:
+                        skipped_young += 1
+                        continue
+                    if abandon_goal(conn, g["id"],
+                                    reason=f"auto-created, no activity in {args.abandon_days}d "
+                                           "(scoped auto-abandon, operator-set 2026-08-09)",
+                                    commit=False):
                         ok += 1
                 conn.commit()
                 sweep_record["abandoned_count"] = ok
-                print(f"[{ts}] auto-abandoned {ok}/{len(stale)} goals", flush=True)
+                sweep_record["abandon_days"] = args.abandon_days
+                sweep_record["skipped_exempt"] = skipped_exempt
+                sweep_record["skipped_young"] = skipped_young
+                print(f"[{ts}] auto-abandoned {ok}/{len(stale)} "
+                      f"(exempt: {skipped_exempt}, under {args.abandon_days}d: {skipped_young})",
+                      flush=True)
             else:
                 print(f"[{ts}] (report-only; pass --auto-abandon to flip status)", flush=True)
 
