@@ -28,8 +28,9 @@ log = logging.getLogger("mem0-server")
 # bumps $HookContractVersion in the Windows hooks, so a stale server then
 # WARNs as designed.
 # v0.20 A.3: '20.0' added in the same commit that bumps user-prompt-extract.ps1
-# to the batched /v1/context/bundle contract. pre-tool-check.ps1 stays '17.0'
-# (its search wire contract is unchanged).
+# to the batched /v1/context/bundle contract. '17.0' is the search wire
+# contract — still spoken by the MCP shim's search POSTs (pre-tool-check.ps1
+# also spoke it until AMS-16 retired that hook, 2026-08-09), so it stays.
 KNOWN_HOOK_CONTRACT_VERSIONS = {"17.0", "20.0"}
 
 # v0.19 M10: drift made readable — incremented in warn_hook_contract_version,

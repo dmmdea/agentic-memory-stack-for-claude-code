@@ -144,15 +144,20 @@ def embedding_coverage(conn: sqlite3.Connection, http: httpx.Client) -> dict:
     reads. Read-only; never raises (a coverage probe must not fail the run)."""
     out = {"eligible": None, "embedded": None, "missing": None}
     try:
-        # Eligibility mirrors episode_embeddings._indexable_summary:
-        # column `summary_text`, non-empty, >= MIN_SUMMARY_CHARS (64) after
-        # stripping. (The first cut of this probe guessed a `summary` column
-        # and fail-softed on the live ledger with 'no such column' — the
-        # fail-soft did its job, but a probe that measures nothing is worth
-        # nothing, so the rule is now taken from the embedder itself.)
+        # Eligibility mirrors what the indexing path actually indexes:
+        # `summary_text` non-empty and >= MIN_SUMMARY_CHARS (64) after
+        # stripping (episode_embeddings._indexable_summary), AND state =
+        # 'complete' — in_progress checkpoint summaries are excluded from
+        # indexing ON PURPOSE (noisy), so a probe that counts them
+        # over-reports the gap. Both halves of this rule were learned by
+        # running the probe against the live ledger: the first cut guessed a
+        # `summary` column and fail-softed on 'no such column'; the second
+        # counted checkpoints and reported 539 missing where the true
+        # complete-state gap was ~15.
         eligible = conn.execute(
             "SELECT COUNT(*) FROM episodes"
-            " WHERE summary_text IS NOT NULL"
+            " WHERE state = 'complete'"
+            "   AND summary_text IS NOT NULL"
             "   AND LENGTH(TRIM(summary_text)) >= 64").fetchone()[0]
         r = http.post(f"{QDRANT}/collections/{EPISODE_COLLECTION}/points/count",
                       json={"exact": True}, timeout=15.0)
