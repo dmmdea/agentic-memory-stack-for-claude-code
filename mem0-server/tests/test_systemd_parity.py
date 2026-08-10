@@ -202,16 +202,22 @@ def test_installer_enables_both_sweep_timers():
         "installer does not enable contradiction-sweep.timer"
 
 
-def test_goals_stale_sweep_service_stays_report_only():
-    """The deployed goals-stale-sweep unit must NOT pass --auto-abandon: the
-    installer-enabled timer must run in report-only mode (no destructive goal
-    status flips on an unattended schedule)."""
+def test_goals_stale_sweep_service_scoped_auto_abandon():
+    """Goal redesign (operator-approved 2026-08-09): --auto-abandon is now
+    STANDING — this supersedes the old report-only pin. The safety that pin
+    protected moved into the script and is pinned there (test_goal_redesign:
+    abandon_exempt never touches manual goals; --abandon-days defaults to the
+    operator-set 90). What the unit must NOT do is quietly shrink that window:
+    passing an explicit --abandon-days here would override the 90d default
+    outside the reviewed script contract."""
     text = GOALS_SWEEP_SERVICE.read_text(encoding="utf-8")
     exec_line = next((ln for ln in text.splitlines()
                       if ln.strip().startswith("ExecStart=")), "")
     assert exec_line, "goals-stale-sweep.service has no ExecStart"
-    assert "--auto-abandon" not in exec_line, \
-        "goals-stale-sweep ExecStart must stay report-only (no --auto-abandon)"
+    assert "--auto-abandon" in exec_line, \
+        "the standing scoped auto-abandon (operator-approved 2026-08-09) is missing"
+    assert "--abandon-days" not in exec_line, \
+        "the unit must not override the script's operator-set 90d window"
 
 
 # --- v0.22 M5: the destructive egemma-rollback-prune one-shot must be ---

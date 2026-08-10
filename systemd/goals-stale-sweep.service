@@ -4,6 +4,9 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/goals-stale-sweep.py
+# Goal redesign (operator-approved 2026-08-09): --auto-abandon is now standing,
+# SCOPED by the script itself — never manual goals, and only past 90 days of
+# inactivity (--abandon-days default). Reporting still flags at --stale-days.
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/goals-stale-sweep.py --auto-abandon
 StandardOutput=journal
 StandardError=journal

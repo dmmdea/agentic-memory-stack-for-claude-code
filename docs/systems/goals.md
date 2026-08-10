@@ -2,6 +2,27 @@
 
 Goals are the persistent, multi-session objectives that episodic memory tracks across Claude Code sessions. They connect the AGI paper's **Value Improvement** and **Epistemic Reachability** principles to a concrete SQLite table — letting the system know not just what happened last session, but what still needs doing.
 
+> **Goal redesign (operator-approved 2026-08-09) — "goals are earned, not
+> minted".** Nine weeks of live data measured the original per-session mint at
+> ~99 goals+questions/day, of which 98.4% were never touched again and 2.8%
+> were ever seen by a second session. Three changes correct it:
+> 1. **Ingest no longer creates goal rows.** A fuzzy-MATCHED intent still
+>    links and advances; a miss serializes onto the episode's own JSON with
+>    `unmatched: true`.
+> 2. **The nightly recurrence promoter** (`goal-recurrence-promote.py`,
+>    04:45) is the only automatic producer: a goal is created when the same
+>    intent recurs across ≥2 distinct sessions, with brand inherited from the
+>    sessions and `created_by='recurrence-promoter'`.
+> 3. **Auto-abandon is standing but scoped** (weekly sweep, `--auto-abandon`):
+>    only auto-created goals, only past 90 days of inactivity; `created_by=
+>    'manual'` rows are never touched.
+>
+> **Field truth:** `priority`, `initiative`, and `related_goal_id` (on
+> open_questions) measured 100% unused in nine weeks of production — no
+> producer has ever set a non-default value. They remain in the schema for
+> compatibility but are LEGACY: do not build against them unless a producer
+> ships first.
+
 ## Why goals?
 
 > "An agent that makes progress on a goal it later abandons has wasted trajectory.  
