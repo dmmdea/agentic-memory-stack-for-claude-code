@@ -229,10 +229,15 @@ Describe 'WSL installer auto-enables the sweep timers in report-safe defaults (v
         $src | Should -Match 'enable --now[^\n]*contradiction-sweep\.timer'
     }
 
-    It 'goals-stale-sweep stays report-only (installer enables no --auto-abandon)' {
+    It 'goals-stale-sweep runs the SCOPED standing auto-abandon (operator-approved 2026-08-09)' {
+        # Supersedes the old report-only pin. The safety moved into the script:
+        # abandon_exempt never touches manual goals and --abandon-days defaults
+        # to the operator-set 90 (pinned in test_goal_redesign.py). The unit
+        # must pass --auto-abandon and must NOT override the 90d window.
         $exec = (Get-Content $goalsSweepSvc | Where-Object { $_ -match '^\s*ExecStart=' })
         $exec | Should -Not -BeNullOrEmpty
-        ($exec -join "`n") | Should -Not -Match '--auto-abandon' -Because 'an unattended timer must not flip goal status destructively'
+        ($exec -join "`n") | Should -Match '--auto-abandon' -Because 'the standing scoped auto-abandon was operator-approved 2026-08-09'
+        ($exec -join "`n") | Should -Not -Match '--abandon-days' -Because 'the 90d window is the script contract; the unit must not quietly shrink it'
     }
 }
 
