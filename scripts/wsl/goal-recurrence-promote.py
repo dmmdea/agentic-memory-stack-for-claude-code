@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -49,7 +50,27 @@ from episodic import find_goal_by_title_fuzzy, create_goal, link_episode_to_goal
 
 DB = Path.home() / ".mem0" / "episodic.db"
 LEDGER_DIR = Path.home() / ".mem0"
+RECEIPT = Path.home() / ".mem0" / "goal-recurrence-promote.jsonl"
 MIN_SESSIONS = 2
+
+
+def _append_receipt(outcome: str, **fields) -> None:
+    """Jobs-queue receipt contract (W6, same as semantic-dedup): a ts-bearing,
+    outcome-coded line on EVERY exit path, carrying jobs_key from
+    JOBS_IDEMPOTENCY_KEY so the queue can attribute THIS run — without it the
+    wrapper marks the run failed:receipt-missing (which is exactly how this
+    gap was caught, on the pre-timer wire test). Advisory: never crashes."""
+    try:
+        rec = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+               "outcome": outcome, **fields}
+        key = os.environ.get("JOBS_IDEMPOTENCY_KEY")
+        if key:
+            rec["jobs_key"] = key
+        RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+        with RECEIPT.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"goal-recurrence-promote: receipt append failed (non-fatal): {e}", flush=True)
 
 
 def _iso_now() -> str:
@@ -132,9 +153,21 @@ def main() -> int:
 
     if not DB.exists():
         print("goal-recurrence-promote: no episodic.db — no-op")
+        _append_receipt("no-op:no-episodic-db", dry_run=not args.apply)
         return 0
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
+    try:
+        return _run(conn, args)
+    except Exception as e:  # noqa: BLE001 — every exit path must leave a receipt
+        _append_receipt(f"degraded:aborted:{type(e).__name__}: {str(e)[:120]}",
+                        dry_run=not args.apply)
+        raise
+    finally:
+        conn.close()
+
+
+def _run(conn: sqlite3.Connection, args) -> int:
     groups = mine_unmatched(conn, args.days)
     recurring = {k: g for k, g in groups.items() if len(g["sessions"]) >= MIN_SESSIONS}
     created = linked = 0
@@ -172,7 +205,9 @@ def main() -> int:
     print(f"goal-recurrence-promote: window={args.days}d unmatched-groups={len(groups)} "
           f"recurring={len(recurring)} created={created} linked={linked} "
           f"{'APPLIED' if args.apply else 'DRY-RUN'}")
-    conn.close()
+    _append_receipt("ok", dry_run=not args.apply, window_days=args.days,
+                    unmatched_groups=len(groups), recurring=len(recurring),
+                    created=created, linked=linked)
     return 0
 
 

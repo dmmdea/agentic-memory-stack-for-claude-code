@@ -141,3 +141,27 @@ def test_weekly_unit_passes_scoped_auto_abandon():
     assert "--auto-abandon" in unit
     promoter_unit = (REPO_ROOT / "systemd" / "goal-recurrence-promote.service").read_text(encoding="utf-8")
     assert "goal-recurrence-promote.py --apply" in promoter_unit
+
+
+def test_promoter_writes_the_jobs_receipt_contract(tmp_path):
+    """W6 queue contract: the child must append a ts-bearing, outcome-coded
+    line carrying jobs_key from JOBS_IDEMPOTENCY_KEY into its receipt file on
+    EVERY exit path — without it jobs.py marks the run failed:receipt-missing.
+    This gap was caught live by the pre-timer wire test; pinned so it cannot
+    return. Exercised via subprocess under a throwaway HOME (no-op path)."""
+    import json as _j
+    import os as _os
+    import subprocess
+    import sys as _sys
+    env = dict(_os.environ)
+    env["HOME"] = str(tmp_path)
+    env["JOBS_IDEMPOTENCY_KEY"] = "pin-key-123"
+    r = subprocess.run(
+        [_sys.executable, str(REPO_ROOT / "scripts" / "wsl" / "goal-recurrence-promote.py"), "--apply"],
+        capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr[-400:]
+    receipt = tmp_path / ".mem0" / "goal-recurrence-promote.jsonl"
+    assert receipt.exists(), "no receipt written on the no-op exit path"
+    rec = _j.loads(receipt.read_text().strip().splitlines()[-1])
+    assert rec.get("jobs_key") == "pin-key-123"
+    assert "ts" in rec and "outcome" in rec
