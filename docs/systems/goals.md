@@ -12,7 +12,10 @@ Goals are the persistent, multi-session objectives that episodic memory tracks a
 > 2. **The nightly recurrence promoter** (`goal-recurrence-promote.py`,
 >    04:45) is the only automatic producer: a goal is created when the same
 >    intent recurs across ≥2 distinct sessions, with brand inherited from the
->    sessions and `created_by='recurrence-promoter'`.
+>    sessions and `created_by='recurrence-promoter'`. `test-` sessions
+>    (live-suite fixtures, v0.19 A.1 prefix convention) are excluded from
+>    mining — paired fixture sessions satisfy the recurrence rule by
+>    construction and once minted 4 junk goals on the first unattended run.
 > 3. **Auto-abandon is standing but scoped** (weekly sweep, `--auto-abandon`):
 >    only auto-created goals, only past 90 days of inactivity; `created_by=
 >    'manual'` rows are never touched.
