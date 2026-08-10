@@ -99,6 +99,25 @@ def test_matched_intents_are_ignored_by_the_miner(conn):
     assert promote.mine_unmatched(conn, days=14) == {}
 
 
+def test_test_session_intents_are_ignored_by_the_miner(conn):
+    """The live suite writes 'test-' sessions into the live DB (v0.19 A.1
+    convention; the purge tool reaps them later) — their fixture intents recur
+    across paired test sessions and must never earn a real goal. First
+    unattended run minted 4 'med3dup<md5>' goals exactly this way."""
+    _ep(conn, "test-aaaa", 3, adv=[{"goal_title": "med3dupcafe", "unmatched": True}],
+        brand="ai-ecosystem")
+    _ep(conn, "test-bbbb", 2, adv=[{"goal_title": "med3dupcafe", "unmatched": True}],
+        brand="ai-ecosystem")
+    assert promote.mine_unmatched(conn, days=14) == {}, \
+        "test-session intents must be excluded from recurrence mining"
+    # a real session mentioning the same title alongside test debris still
+    # counts only its own (single) session — no promotion from mixed pairs
+    _ep(conn, "real-1", 1, adv=[{"goal_title": "med3dupcafe", "unmatched": True}])
+    groups = promote.mine_unmatched(conn, days=14)
+    key = promote.normalize_title("med3dupcafe")
+    assert len(groups.get(key, {"sessions": {}})["sessions"]) <= 1
+
+
 def test_majority_brand_null_when_no_session_carries_one():
     assert promote.majority_brand([None, None]) is None
     assert promote.majority_brand(["a", "b", "b"]) == "b"

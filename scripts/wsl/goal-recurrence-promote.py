@@ -97,10 +97,14 @@ def mine_unmatched(conn: sqlite3.Connection, days: int) -> dict:
     unmatched intents serialized on episodes in the window."""
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     groups: dict = {}
+    # 'test-' sessions are live-suite fixtures (v0.19 A.1 prefix convention;
+    # the purge tool reaps them) — paired fixture sessions satisfy the >=2
+    # recurrence rule by construction, so they must never feed the miner.
     rows = conn.execute(
         """SELECT e.id, e.session_id, e.created_at, e.advanced_goals, e.blocked_goals, s.brand
            FROM episodes e LEFT JOIN sessions s ON s.session_id = e.session_id
-           WHERE e.created_at >= ?""", (cutoff,)).fetchall()
+           WHERE e.created_at >= ? AND e.session_id NOT LIKE 'test-%'""",
+        (cutoff,)).fetchall()
     for ep_id, sid, ts, adv, blk, brand in rows:
         for col in (adv, blk):
             if not col:
