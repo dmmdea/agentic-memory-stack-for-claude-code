@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly goal recurrence promotion (cross-session intents -> earned goal rows)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Goal redesign (operator-approved 2026-08-09, "goals are earned, not minted"):
+# ingest no longer creates goal rows; this job is the only automatic producer.
+# It mines the unmatched intents serialized on episodes and creates a goal
+# exactly when the same intent recurred across >=2 distinct sessions — with
+# brand inherited from the sessions and created_by='recurrence-promoter' (the
+# scoped 90d auto-abandon keys off that stamp; manual goals are never touched).
+ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/jobs.py run goal-recurrence-promote --receipt %h/.mem0/goal-recurrence-promote.jsonl --stale-after 1800 -- /home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/goal-recurrence-promote.py --apply

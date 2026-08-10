@@ -272,6 +272,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # NOT backfilled — existing rows stay NULL (Phase H is data hygiene).
     _add_column_if_missing(conn, "goals", "initiative TEXT", "initiative")
     _add_column_if_missing(conn, "open_questions", "initiative TEXT", "initiative")
+    # Goal redesign (operator-approved 2026-08-09): who created the goal row.
+    # 'manual' = the explicit create endpoint; 'recurrence-promoter' = the
+    # nightly cross-session promotion; NULL = legacy extraction-minted rows.
+    # The scoped auto-abandon (90d) exempts 'manual' rows by this column.
+    _add_column_if_missing(conn, "goals", "created_by TEXT", "created_by")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_goals_initiative_status ON goals(initiative, status)"
     )
@@ -692,6 +697,7 @@ def create_goal(
     priority: int = 3,
     first_seen_session_id: str | None = None,
     initiative: str | None = None,
+    created_by: str | None = None,
     commit: bool = True,
 ) -> int:
     """Create a goal row. Returns new goal id (lastrowid).
@@ -699,11 +705,15 @@ def create_goal(
     v0.22 Pillar 1: initiative stamps the cwd-derived repo/initiative
     (agentic-memory-stack vs local-offload). None == cross-cutting (surfaces
     in every session).
+
+    Goal redesign (2026-08-09): created_by records the producer — 'manual'
+    (explicit endpoint), 'recurrence-promoter' (nightly cross-session
+    promotion), or None (legacy). The 90d scoped auto-abandon keys off it.
     """
     cur = conn.execute(
-        """INSERT INTO goals (title, description, brand, parent_goal_id, priority, first_seen_session_id, initiative)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (title, description, brand, parent_goal_id, priority, first_seen_session_id, initiative),
+        """INSERT INTO goals (title, description, brand, parent_goal_id, priority, first_seen_session_id, initiative, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (title, description, brand, parent_goal_id, priority, first_seen_session_id, initiative, created_by),
     )
     if commit:
         conn.commit()

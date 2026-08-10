@@ -2278,6 +2278,7 @@ def create_goal_endpoint(b: GoalIn, x_api_key: Optional[str] = Header(None)):
                 parent_goal_id=b.parent_goal_id,
                 priority=b.priority if b.priority is not None else 3,  # MED-A: 0 is falsy but valid... Field(ge=1) blocks it
                 initiative=b.initiative,  # v0.22 Pillar 1
+                created_by="manual",  # goal redesign 2026-08-09: manual rows are exempt from the 90d auto-abandon
             )
         return {"ok": True, "goal_id": gid}
     except Exception as e:
@@ -3099,6 +3100,16 @@ def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
                 _episodic_end_session(conn, b.session_id, b.ended_at, (b.message_count or 0), commit=False)
 
                 # v0.16: process advanced_goals / blocked_goals / open_questions
+                # GOAL REDESIGN (operator-approved 2026-08-09, "goals are
+                # earned, not minted"): ingest no longer CREATES goal rows.
+                # Measured basis: ~99 goals+OQs minted per day, 98.4% never
+                # touched again, 2.8% ever seen by a second session — the
+                # per-session mint was write-only exhaust. A fuzzy MATCH still
+                # links and advances (that is the earning signal); a miss now
+                # serializes the intent (title included) onto the episode's own
+                # JSON column, where the nightly recurrence promoter mines it
+                # and creates a goal only when the same intent recurs across
+                # >=2 distinct sessions.
                 advanced_serialized = []
                 if b.advanced_goals:
                     for item in b.advanced_goals:
@@ -3111,17 +3122,14 @@ def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
                             # MED-B: if goal was previously blocked, unblock it on advance signal
                             if candidates[0].get("status") == "blocked":
                                 _episodic_update_goal_status(conn, goal_id, "open", commit=False)
+                            _episodic_link_episode_to_goal(conn, episode_id, goal_id, link_type="advanced_goal", delta_text=item.delta_text, commit=False)
+                            advanced_serialized.append({"goal_id": goal_id, "delta_text": item.delta_text})
                         else:
-                            goal_id = _episodic_create_goal(
-                                conn, title=item.goal_title.strip(),
-                                description=item.delta_text,
-                                brand=b.brand, priority=3,
-                                first_seen_session_id=b.session_id,
-                                initiative=b.initiative,  # v0.22 Pillar 1: stamp the session's initiative
-                                commit=False,
-                            )
-                        _episodic_link_episode_to_goal(conn, episode_id, goal_id, link_type="advanced_goal", delta_text=item.delta_text, commit=False)
-                        advanced_serialized.append({"goal_id": goal_id, "delta_text": item.delta_text})
+                            advanced_serialized.append({
+                                "goal_title": item.goal_title.strip(),
+                                "delta_text": item.delta_text,
+                                "unmatched": True,
+                            })
 
                 blocked_serialized = []
                 if b.blocked_goals:
@@ -3131,19 +3139,19 @@ def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
                         candidates = _episodic_find_goal_by_title_fuzzy(conn, item.goal_title, brand=b.brand, limit=1)
                         if candidates:
                             goal_id = candidates[0]["id"]
+                            _episodic_link_episode_to_goal(conn, episode_id, goal_id, link_type="blocked_goal", delta_text=item.block_reason, commit=False)
+                            # Flip status to blocked
+                            _episodic_update_goal_status(conn, goal_id, "blocked", commit=False)
+                            blocked_serialized.append({"goal_id": goal_id, "block_reason": item.block_reason})
                         else:
-                            goal_id = _episodic_create_goal(
-                                conn, title=item.goal_title.strip(),
-                                description=item.block_reason,
-                                brand=b.brand, priority=3,
-                                first_seen_session_id=b.session_id,
-                                initiative=b.initiative,  # v0.22 Pillar 1: stamp the session's initiative
-                                commit=False,
-                            )
-                        _episodic_link_episode_to_goal(conn, episode_id, goal_id, link_type="blocked_goal", delta_text=item.block_reason, commit=False)
-                        # Flip status to blocked
-                        _episodic_update_goal_status(conn, goal_id, "blocked", commit=False)
-                        blocked_serialized.append({"goal_id": goal_id, "block_reason": item.block_reason})
+                            # Goal redesign 2026-08-09: no mint on miss — the
+                            # intent (title kept) rides the episode JSON for
+                            # the recurrence promoter.
+                            blocked_serialized.append({
+                                "goal_title": item.goal_title.strip(),
+                                "block_reason": item.block_reason,
+                                "unmatched": True,
+                            })
 
                 # Filtered open_questions (skip blank strings)
                 oq_filtered = [q for q in (b.open_questions or []) if q and q.strip()]

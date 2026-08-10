@@ -123,6 +123,12 @@ SCHEMA: dict[str, dict] = {
         "required": ["ts", "event", "goal_id", "actor", "reason"],
         "optional": ["schema_version"],
     },
+    # Goal redesign 2026-08-09: the recurrence promoter is the only automatic
+    # goal producer; each creation is ledgered so goal provenance is auditable.
+    "goal-created": {
+        "required": ["ts", "event", "goal_id", "actor", "reason"],
+        "optional": ["schema_version", "title", "brand"],
+    },
     "goal-priority-change": {
         "required": ["ts", "event", "goal_id", "new_priority", "actor"],
         "optional": ["reason", "schema_version"],

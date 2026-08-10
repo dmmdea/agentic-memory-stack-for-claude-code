@@ -77,6 +77,7 @@ jobs:
             mem0-server/tests/test_episodic_reconcile.py \
             mem0-server/tests/test_failure_injection.py \
             mem0-server/tests/test_freshness.py \
+            mem0-server/tests/test_goal_redesign.py \
             mem0-server/tests/test_job_liveness.py \
             mem0-server/tests/test_l10_audit.py \
             mem0-server/tests/test_ledger_audit.py \
