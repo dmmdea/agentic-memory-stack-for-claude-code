@@ -51,8 +51,18 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 #### `temporal` — explicitly perishable (write-side parking)
 
 - **Purpose:** facts with a shelf life ("the staging deploy is frozen this week"). Keeping them out of `evidence` prevents time-bound state from masquerading as durable knowledge.
-- **Written by:** direct MCP/API `memory_add` with `tier=temporal` (+ optional `expires_at`). The L1a extractor never emits it — every auto-extracted fact posts as `evidence`.
-- **Lifecycle — and an honest caveat:** in the current admission policies temporal is admitted by **no query class at all** — it is *write-side parking*: stored, ledgered, deleted by decay-scan once `expires_at` passes (the deletion is ledgered + reported, not silent), but invisible to every read path until a class admits it. Use it to record expiring state for the audit trail, not for retrieval.
+- **Written by:** direct MCP/API `memory_add` with `tier=temporal`. The L1a extractor never emits it — every auto-extracted fact posts as `evidence`.
+- **`expires_at` CANNOT be set at write time.** It sits in `_ADD_FORBIDDEN_META` (app.py:449), so `add()`
+  **silently strips** it and still returns `200` — the caller believes it set an expiry and did not. The only
+  writer is `PATCH /v1/memories/{id}/metadata` by a trusted actor (app.py:2202), i.e. after the fact.
+  Verified live 2026-08-11: an add carrying `expires_at` returned `200` with the key absent from the stored
+  payload.
+- **Consequence — decay-scan's expiry arm has never fired.** `decay-scan.py` hard-deletes `tier=temporal`
+  records whose `expires_at` has passed, but nothing writes that field, so the arm is inert *by
+  construction*. Treat decay-scan as a ONE-armed job: its surviving arm only **flags**, and nothing
+  consumes `decay-report.jsonl` yet. Temporal is parking with **no automatic expiry** — records sit
+  indefinitely unless something PATCHes an expiry onto them.
+- **Lifecycle — and an honest caveat:** in the current admission policies temporal is admitted by **no query class at all** — it is *write-side parking*: stored and ledgered, but invisible to every read path until a class admits it. Use it to record expiring state for the audit trail, not for retrieval.
 
 #### `insight` — consolidated knowledge (machine-written, machine-only)
 
