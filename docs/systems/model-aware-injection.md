@@ -38,9 +38,10 @@ Notes:
 
 - **Thresholds** are read from `model-tiers.json`, not hardcoded. They were lowered from
   0.4 (nomic era) to 0.30/0.33 in v0.22 when mem0's embedder migrated from English-only
-  `nomic-embed-text` to multilingual **EmbeddingGemma-300m** (768-d, CPU via llama-swap
-  on `:11436`); the reranker is **bge-reranker-v2-m3** (CPU). Ollama was decommissioned in
-  the same migration.
+  `nomic-embed-text` to multilingual **EmbeddingGemma-300m** (768-d, via llama-swap
+  on `:11436`); the reranker is **bge-reranker-v2-m3** (GPU since 2026-08-13; CPU before —
+  score scale is device-independent, so threshold calibration was unaffected). Ollama was
+  decommissioned in the same migration.
 - **Caps** are applied server-side in `context_bundle` (per `ContextBundleIn.tier`). The
   client `Select-AdmittedMemoryResults` independently hard-caps surfaced memories at
   **top-3** (defense in depth, every tier) and truncates each memory to 200 chars.
