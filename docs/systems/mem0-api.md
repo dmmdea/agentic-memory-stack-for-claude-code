@@ -73,7 +73,7 @@ Use for liveness checks (hooks, Test-MemoryStack). Do **not** use for "write pat
 
 ### `GET /health/deep`
 
-Checks Qdrant collection status, EmbeddingGemma embedder dimension (via llama-swap), and mem0 collection point count. Also surfaces the canonical-key health, admission-rejection counters, pending contradiction-review depth, nightly-job + session receipt ages, drift-guard state, the passive reranker counters, the admission self-probe, and the capability manifest. Slow (~1-3s). Use for diagnostics, not polling. **No check here may perform a slow ACTIVE model call** — `scripts/wsl/deploy.sh` gates on this endpoint seconds after a restart (with `--max-time 60`), so a cold CPU model behind a probe here blocks deploys; that is why the reranker is surfaced passively.
+Checks Qdrant collection status, EmbeddingGemma embedder dimension (via llama-swap), and mem0 collection point count. Also surfaces the canonical-key health, admission-rejection counters, pending contradiction-review depth, nightly-job + session receipt ages, drift-guard state, the passive reranker counters, the admission self-probe, and the capability manifest. Slow (~1-3s). Use for diagnostics, not polling. **No check here may perform a slow ACTIVE model call** — `scripts/wsl/deploy.sh` gates on this endpoint seconds after a restart (with `--max-time 60`), so a cold model behind a probe here blocks deploys regardless of device; that is why the reranker is surfaced passively.
 
 ```
 Response 200: {"ok": true, "checks": {"qdrant": {"ok": true, "points": N, "status": "green"}, "embedder": {"ok": true, "dim": 768}}}
@@ -150,7 +150,7 @@ Request: {
 }
 ```
 
-- `rerank=true` triggers `bge-reranker-v2-m3` post-processing (`reranker.py`), applied only when there are ≥ 3 results **and** the top score is < 0.92 (`RERANK_MIN_N` / `RERANK_SKIP_IF_TOP_SCORE`). The reranker is a CPU cross-encoder served on llama-swap `:11436`; any reranker failure returns the dense-only order unchanged and logs a WARN (fail-soft).
+- `rerank=true` triggers `bge-reranker-v2-m3` post-processing (`reranker.py`), applied only when there are ≥ 3 results **and** the top score is < 0.92 (`RERANK_MIN_N` / `RERANK_SKIP_IF_TOP_SCORE`). The reranker is a cross-encoder served on llama-swap `:11436` (GPU since 2026-08-13; raw-logit score scale is device-independent); any reranker failure returns the dense-only order unchanged and logs a WARN (fail-soft).
 - `query_class` (default `durable`) selects the admitted-tier set and recency policy: `operational` applies a 30-day Weibull recency weight; `canonical` filters to `{canonical, stable}`; `history` disables supersession/contradiction hiding (forensic).
 - `limit` clamped at 500 server-side.
 

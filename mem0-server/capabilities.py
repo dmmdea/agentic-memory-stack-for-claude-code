@@ -28,9 +28,10 @@ Do not add a watchdog (house rule: no unattended schedulers).
 W4 (2026-08-07) retired the eight 'none — W4' rows into real verdicts. Three
 review-bound constraints shaped how:
 
-- **F11 — no active reranker probe here.** The reranker is a CPU cross-encoder
-  and scripts/wsl/deploy.sh gates on /health/deep with a bounded curl right
-  after a restart; an active rerank probe would hang deploys on a cold model.
+- **F11 — no active reranker probe here.** scripts/wsl/deploy.sh gates on
+  /health/deep with a bounded curl right after a restart; an active rerank
+  probe would hang deploys on a cold model (true on any device — the reranker
+  moved CPU->GPU 2026-08-13, but cold-load still exceeds the gate's window).
   The row reads reranker.py's PASSIVE counters, bumped by real search traffic.
   The active 3-doc probe stays in Test-MemoryStack (L5), where 90s is affordable.
 - **F12 — one stamp is not a signal.** ``last-l1a`` only stamps on a SUCCESSFUL

@@ -93,8 +93,8 @@ def rerank(query: str, results: list[dict], text_key: str = "memory", *,
     ``force=True`` bypasses BOTH skip heuristics — the union leg passes it
     when lexical_only candidates are present, because a silent skip would
     delete every lexical rescue via the fail-closed drop (exactly the
-    confidently-wrong-dense shape AMS-56 exists to fix; a 2-doc CPU rerank
-    is cheap)."""
+    confidently-wrong-dense shape AMS-56 exists to fix; a 2-doc rerank is
+    cheap on any device)."""
     reason = skip_reason(results)
     if reason is not None and not force:
         if status_out is not None:

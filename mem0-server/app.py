@@ -20,7 +20,9 @@ from config import build_config
 from reranker import rerank as bge_rerank
 # W4 (F11): PASSIVE rerank counters. There is deliberately NO active rerank
 # probe on /health/deep — deploy.sh gates on this endpoint right after a
-# restart and the reranker is a CPU cross-encoder (TMS budgets it 90s).
+# restart, and a cold model behind a probe would block deploys (TMS budgets
+# it 90s). Holds regardless of device: the reranker moved CPU->GPU 2026-08-13,
+# but cold-load + llama-swap spawn can still exceed the deploy gate's window.
 from reranker import rerank_health as _rerank_health
 from admission_gate import apply_admission
 # W5 T1.3: the PURE evaluate path for the diagnose endpoint — never
@@ -1206,8 +1208,11 @@ def _search_core(b: SearchIn, _route: str = "search"):
     _buf = int(os.environ.get("MEM0_SEARCH_OVERFETCH_BUFFER", "50"))
     _buf = max(0, min(_buf, 500))                      # clamp env to [0,500] (Minor: no range validation)
     if b.rerank:
-        _buf = min(_buf, 10)                            # Important: rerank is a CPU cross-encoder;
-                                                        # bound the candidate pool so latency stays sane
+        _buf = min(_buf, 10)                            # Important: bound the rerank candidate pool so
+                                                        # latency stays sane. Cap sized in the CPU era
+                                                        # (2.4-4.6s/20 docs); conservative since the
+                                                        # 2026-08-13 GPU move (~143ms typical) — raise
+                                                        # only with a fresh latency measurement
     overfetch_limit = 0 if capped_limit == 0 else min(capped_limit + _buf, 500)  # Minor: don't fetch 50 for limit=0
     if capped_limit > 0 and overfetch_limit == capped_limit:
         # Important: at limit>=~450 the buffer collapses to 0 and the gap repair is inactive.
@@ -1256,7 +1261,7 @@ def _search_core(b: SearchIn, _route: str = "search"):
     # verified admission_gate.py:167-202, freshness.py:68-69).
     # R4 latency guardrail: top_k=12, and the leg stands down entirely at
     # capped_limit>50 (a huge deliberate pool needs no rescue; bounds the
-    # CPU rerank pool at dense+12).
+    # rerank pool at dense+12 — sized in the CPU era, still fine on GPU).
     # ------------------------------------------------------------------
     _lex_candidates = 0
     _lex_added = 0
@@ -2989,9 +2994,13 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
         if b.brand:
             filters["brand"] = b.brand
         # rerank=False is LOAD-BEARING (W5 T5): it structurally excludes the
-        # keyword union leg — and its CPU rerank cost — from the per-prompt
-        # bundle hot path. Flipping it would put a cross-encoder call inside
-        # every UserPromptSubmit.
+        # keyword union leg and the cross-encoder call from the per-prompt
+        # bundle hot path. Originally a CPU-cost decision; since the
+        # 2026-08-13 GPU move the cost argument is weak (~143ms typical), but
+        # the decision now rests on the MEASURED quality result (2026-08-11,
+        # n=578 paired): bge reranking does not improve recall@1 over dense
+        # order (p=0.43). Revisit only with a reranker that measurably does
+        # (llama.cpp PR #24083 / nemotron-rerank was such a candidate).
         sr = _search_core(SearchIn(
             query=(b.prompt or "")[:500],
             filters=filters,
