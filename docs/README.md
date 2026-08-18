@@ -30,6 +30,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/codex-hooks.md`](./systems/codex-hooks.md) | The L1a extractor + C1 consolidator hooks, and why unattended cron runs on Codex |
 | [`systems/dream-skill.md`](./systems/dream-skill.md) | The nightly 4-phase consolidation ("dream") pattern — *design doc; marked DESIGN in-file* |
 | [`systems/l10-audit.md`](./systems/l10-audit.md) | The post-hoc audit job: what it flags and how to triage the flags |
+| [`systems/stale-paths-audit.md`](./systems/stale-paths-audit.md) | Read-only staleness audit: memories asserting dead filesystem paths, and the hand-label worksheet that decides whether a validity schema is worth building |
 | [`systems/mem0-api.md`](./systems/mem0-api.md) | The mem0 server's REST endpoints and the MCP shim in detail |
 | [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker stage — *design doc; marked DESIGN in-file* |
 | [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md) | Canonical-key custody: DPAPI blob, runtime injection, recovery, rotation |
