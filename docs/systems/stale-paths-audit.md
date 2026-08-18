@@ -57,7 +57,7 @@ Each extracted path resolves to exactly one verdict:
 | `missing-recorded` | missing, and the memory's prose *records* the removal | decidable, **correct** |
 | `missing-unexplained` | missing, no explanation | decidable, **STALE** |
 | `root-unavailable` | the drive/root is not reachable from this runtime | **undecidable** |
-| `missing-foreign-host` | path belongs to another machine (Aorus, Lenovo, Juan) | **undecidable** |
+| `missing-foreign-host` | path belongs to another machine in the fleet | **undecidable** |
 | `artifact` | extraction noise, not a path claim | excluded |
 
 A memory takes the **worst decidable** verdict among its paths, so one surviving path cannot
@@ -72,9 +72,11 @@ once inflated it.
    one. The report prints the **decidable fraction of the corpus** and cross-tabs staleness by
    tier and source, so the reader sees which stratum is rotting instead of being handed a bare
    percentage. The rate remains an **upper bound**.
-2. **Other machines.** A path under `ops-sre` that "runs on Juan's PC" is correct and always
-   reads missing here. Memories naming a foreign host are undecidable — unless the memory also
-   names *this* box, in which case the local claim wins.
+2. **Other machines.** A path that lives on another machine in the fleet is correct there and
+   always reads missing here. Memories naming a foreign host are undecidable — unless the memory
+   also names *this* box, in which case the local claim wins. Fleet topology is **operator
+   config**, not source: set `MEM0_FOREIGN_HOSTS` (comma-separated). **Unset means the correction
+   is OFF**, cross-machine paths read as stale, and the report says so rather than hiding it.
 3. **Deletion records.** "The GLM model was deleted from `V:\models\...`" is a **correct**
    memory whose subject *is* the removal; scoring it stale inverts its meaning. The vocabulary
    here is much wider than the proxy's, which found **1** such record where this finds **137**.
@@ -103,7 +105,20 @@ one run decides everything:
 | WSL | POSIX + mounted drives | `/mnt/<d>/…` for drive paths; `G:`/`P:` unreachable |
 
 Receipts always land in the **WSL sidecar** `~/.mem0/`, whichever interpreter runs, so the
-audit trail never forks in two. Override with `MEM0_SIDECAR_DIR`.
+audit trail never forks in two. On Windows the sidecar is located through the WSL share and is
+inferred **only when unambiguous** (exactly one home already carrying a `.mem0`); guessing a
+username is what would fork the trail. Override with `MEM0_SIDECAR_DIR`.
+
+### Configuration
+
+| env var | effect if unset |
+|---|---|
+| `MEM0_FOREIGN_HOSTS` | foreign-host correction **off** — cross-machine paths counted stale |
+| `MEM0_LOCAL_HOST` | defaults to this machine's hostname |
+| `MEM0_WSL_DISTRO` | POSIX paths stay undecidable when run from Windows |
+| `MEM0_WSL_USER` | sidecar inferred only if exactly one candidate home exists |
+| `MEM0_SIDECAR_DIR` | receipts follow the rules above |
+| `MEM0_QDRANT_URL` / `MEM0_QDRANT_COLLECTION` | local defaults; scheme allow-listed to http/https |
 
 ## Guarantees
 
@@ -131,31 +146,40 @@ python scripts/wsl/stale-paths-audit.py --summarise-worksheet   # read back hand
 Receipts: `~/.mem0/stale-paths-audit.jsonl` (append-only summaries),
 `~/.mem0/stale-paths-worksheet.jsonl` (rewritten per run).
 
-## First full-corpus result (2026-08-18, Windows, 10,366 points)
+## First full-corpus result (2026-08-18, Windows, 10,384 points)
+
+**These numbers replace an earlier run of the same tool. Two fresh-context reviews found
+nine defects in the instrument, three of which changed which memories reach the human; the
+numbers moved twice as they were fixed. Treat any earlier figure as retracted.**
 
 | | n |
 |---|---|
-| paths still exist | 187 |
-| missing, memory records the removal | 137 |
-| **missing, unexplained → STALE** | **201** |
-| undecidable: foreign host | 55 |
-| undecidable: unreachable root | 0 |
-| artifacts only / names no path | 157 / 9,561 |
+| paths still exist | 233 |
+| missing, memory records the removal | 86 |
+| **missing, unexplained -> STALE** | **644** |
+| undecidable: foreign host / unreachable root | 183 / 1 |
+| artifacts only / names no path | 18 / 9,148 |
 
-**Stale rate 38.3% of decidable** — but decidable is only **5.1%** of the corpus, so in
-absolute terms this is **201 of 10,298 memories ≈ 2%**. Staleness concentrates almost entirely
-in `evidence`:
+**Stale rate 66.9% of decidable**, and decidable is **9.3%** of the corpus — so ~644 of
+10,316 memories, about **6%** in absolute terms.
 
 | tier | stale / scanned |
 |---|---|
-| evidence | 199 / 9,886 (2.0%) |
-| insight | 1 / 275 (0.4%) |
-| stable | 1 / 16 |
-| **canonical** | **0 / 52 (0.0%)** |
+| evidence | 628 / 9,892 (6.3%) |
+| unknown | 6 / 75 (8.0%) |
+| **canonical** | **4 / 57 (7.0%)** |
+| stable | 4 / 16 (25.0%) |
+| insight | 2 / 276 (0.7%) |
 
-The tiers the system actually trusts are clean. That is a materially different picture from
-"56% of the corpus is stale", and it is the reason the next step is a hand-label rather than a
-schema.
+### A retracted claim, kept on the record
+
+An earlier run of this tool reported **canonical 0/52 stale** and concluded *"the tiers the
+system actually trusts are clean."* That was an artifact of a broken extractor: paths
+containing spaces were truncated, and forward-slash and `~/` paths were invisible entirely,
+so most canonical path claims were never checked. With the extractor fixed, **canonical
+shows 4 stale entries and `stable` shows 25%**. The reassuring version of this finding was
+the buggy one — which is exactly why the instrument gets tests before the output gets
+trusted.
 
 ## The decision this feeds — including the kill
 
