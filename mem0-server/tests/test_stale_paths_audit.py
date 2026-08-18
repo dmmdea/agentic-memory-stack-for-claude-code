@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import platform
 from pathlib import Path
 
 import pytest
@@ -415,8 +414,14 @@ def test_aggregation_keeps_undecidables_out_of_the_denominator(monkeypatch, tmp_
     monkeypatch.setattr(sp, "REPORT", tmp_path / "r.jsonl")
 
     class A:
-        sample = 0; seed = 42; min_len = 10; excerpt = 200
-        worksheet = False; json = True; controls = 0; force_worksheet = False
+        sample = 0
+        seed = 42
+        min_len = 10
+        excerpt = 200
+        worksheet = False
+        json = True
+        controls = 0
+        force_worksheet = False
     assert sp.run_audit(A()) == 0
     summary = json.loads((tmp_path / "r.jsonl").read_text(encoding="utf-8").strip())
     assert summary["stale"] == 2
