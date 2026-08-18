@@ -70,6 +70,7 @@ import random
 import re
 import socket
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -241,17 +242,38 @@ def classify_memory(text: str) -> dict:
     return {"verdict": "no-path", "paths": per_path}
 
 
+def _checked_endpoint() -> str:
+    """Build the scroll URL, refusing any scheme urllib would honour but we never want.
+
+    QDRANT_URL is env-controlled, and urllib happily opens file:// (and ftp://, data://).
+    A hostile or fat-fingered MEM0_QDRANT_URL would otherwise turn a read-only audit into
+    an arbitrary-file reader. Allow-list the two schemes this tool can legitimately use."""
+    url = QDRANT_URL.rstrip("/") + "/collections/" + COLLECTION + "/points/scroll"
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            "refusing scheme " + repr(scheme) + " for MEM0_QDRANT_URL; expected http/https")
+    return url
+
+
 def scroll_all(limit):
     pts, offset = [], None
+    endpoint = _checked_endpoint()
     while True:
         body = {"limit": 1000, "with_payload": True, "with_vector": False}
         if offset is not None:
             body["offset"] = offset
         req = urllib.request.Request(
-            QDRANT_URL + "/collections/" + COLLECTION + "/points/scroll",
+            endpoint,
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        # REFUTED, with the mitigation in code: the rule fires on any dynamic value
+        # reaching urlopen. The risk it names is the file:// scheme, and
+        # _checked_endpoint() allow-lists http/https and raises otherwise (pinned by
+        # test_scheme_guard_refuses_file_url). The URL is an operator env var on a
+        # local read-only diagnostic, not attacker-controlled input.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        with urllib.request.urlopen(req, timeout=60) as r:  # noqa: S310
             res = json.load(r)["result"]
         pts.extend(res.get("points") or [])
         offset = res.get("next_page_offset")

@@ -187,6 +187,28 @@ def test_memory_with_only_artifacts_is_not_stale():
     assert out["verdict"] == "artifact-only"
 
 
+# --- endpoint scheme guard (semgrep dynamic-urllib finding) -----------------------
+
+@pytest.mark.parametrize("bad_url", [
+    "file:///C:/Windows/win.ini",
+    "ftp://example.invalid/x",
+    "data:text/plain;base64,AAAA",
+])
+def test_scheme_guard_refuses_file_url(bad_url, monkeypatch):
+    """urllib honours file:// / ftp:// / data://, and MEM0_QDRANT_URL is env-controlled,
+    so an unguarded urlopen would turn a read-only audit into an arbitrary-file reader."""
+    monkeypatch.setattr(sp, "QDRANT_URL", bad_url)
+    with pytest.raises(ValueError, match="refusing scheme"):
+        sp._checked_endpoint()
+
+
+@pytest.mark.parametrize("ok_url", ["http://127.0.0.1:6333", "https://qdrant.internal:6333"])
+def test_scheme_guard_allows_http(ok_url, monkeypatch):
+    monkeypatch.setattr(sp, "QDRANT_URL", ok_url)
+    assert sp._checked_endpoint().startswith(ok_url.rstrip("/"))
+    assert sp._checked_endpoint().endswith("/points/scroll")
+
+
 # --- read-only guarantee ----------------------------------------------------------
 
 def test_audit_never_mutates_the_store():
