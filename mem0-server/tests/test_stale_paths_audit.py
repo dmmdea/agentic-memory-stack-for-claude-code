@@ -428,3 +428,57 @@ def test_aggregation_keeps_undecidables_out_of_the_denominator(monkeypatch, tmp_
     assert summary["undecidable_root_unavailable"] == 1
     assert summary["decidable"] == 2, "an unreachable root must not enter the denominator"
     assert summary["stale_rate_pct"] == 100.0
+
+
+def test_blind_controls_actually_reach_the_worksheet(tmp_path, monkeypatch):
+    """Regression: control_pool was populated and then DISCARDED - _emit_worksheet took a
+    control_rows argument that no caller supplied, and no CLI flag existed. The worksheet
+    held only rows the mechanism ACCUSED, so recall was unmeasurable while the feature
+    looked shipped. The whole 57-test suite passed while this was dead code."""
+    pts = [
+        {"id": "stale1", "payload": {"data": r"Report at D:\gone\a.md covers phase two.",
+                                     "tier": "evidence"}},
+        {"id": "ctrl1", "payload": {"data": r"The model was deleted from D:\gone\b.md last week.",
+                                    "tier": "evidence"}},
+    ]
+    monkeypatch.setattr(sp, "scroll_all", lambda limit: pts)
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: str(p).rstrip("/\\").upper() == "D:")
+    monkeypatch.setattr(sp, "REPORT", tmp_path / "r.jsonl")
+    ws = tmp_path / "ws.jsonl"
+    monkeypatch.setattr(sp, "WORKSHEET", ws)
+
+    class A:
+        sample = 0
+        seed = 42
+        min_len = 10
+        excerpt = 200
+        worksheet = True
+        json = True
+        controls = 40
+        force_worksheet = False
+    assert sp.run_audit(A()) == 0
+
+    verdicts = []
+    for line in ws.read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        if not r.get("_worksheet_header"):
+            verdicts.append(r["verdict_mechanical"])
+    assert "missing-unexplained" in verdicts, "the accused row must be present"
+    assert "missing-recorded" in verdicts, \
+        "a blind CONTROL row must reach the worksheet, or recall cannot be computed"
+
+
+def test_controls_are_labelled_blind(tmp_path, monkeypatch):
+    """Control rows must carry an empty `label` like every other row - a control the
+    human can identify as a control is not a control."""
+    rows = [{"memory_id": "a", "verdict_mechanical": "missing-unexplained"}]
+    ctrls = [{"memory_id": "c", "verdict_mechanical": "missing-recorded"}]
+    ws = tmp_path / "ws.jsonl"
+    monkeypatch.setattr(sp, "WORKSHEET", ws)
+    sp._emit_worksheet(rows, [], {"ts": "t", "seed": 42, "runtime": "Windows"},
+                       control_rows=ctrls)
+    for line in ws.read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        if not r.get("_worksheet_header"):
+            assert r["label"] == "", "every row, control included, must start unlabelled"
