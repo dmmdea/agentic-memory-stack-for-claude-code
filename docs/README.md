@@ -33,6 +33,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/mem0-api.md`](./systems/mem0-api.md) | The mem0 server's REST endpoints and the MCP shim in detail |
 | [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker stage — *design doc; marked DESIGN in-file* |
 | [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md) | Canonical-key custody: DPAPI blob, runtime injection, recovery, rotation |
+| [`systems/key-custody.md`](./systems/key-custody.md) | Every secret the stack depends on, where each copy lives, and the verified restore path |
 | [`systems/llama-swap-binding.md`](./systems/llama-swap-binding.md) | The loopback-bind requirement for local inference — *historical record; the current setup guide is [`../install/llama-swap-setup.md`](../install/llama-swap-setup.md)* |
 | [`systems/installer-and-deploy.md`](./systems/installer-and-deploy.md) | How the stack is installed and updated: the 4 install phases, the receipt + sentinels, the brain/replica role gate, the gated deploy pipeline, and R9 parity |
 | [`systems/offline-travel.md`](./systems/offline-travel.md) | Offline resilience that emerges from connectivity: the shim's replica read-failover + write-outbox, the offline-watcher task, snapshot restore, and adds-first idempotent replay |
