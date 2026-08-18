@@ -524,7 +524,17 @@ def run_audit(args) -> int:
         print("WARNING: receipt not written: " + str(e), file=sys.stderr)
 
     if args.worksheet:
-        _emit_worksheet(stale_rows, undecidable_rows, summary)
+        # Draw the blind controls. Without this the control_pool was collected and
+        # DISCARDED: the worksheet held only rows the mechanism accused, so recall was
+        # structurally unmeasurable while the feature looked shipped.
+        rng = random.Random(args.seed)
+        controls = []
+        for kind, cap in (("missing-recorded", args.controls),
+                          ("exists", max(1, args.controls // 2))):
+            pool = control_pool.get(kind, [])
+            controls += rng.sample(pool, min(cap, len(pool)))
+        _emit_worksheet(stale_rows, undecidable_rows, summary,
+                        control_rows=controls, force=args.force_worksheet)
     return 0
 
 
@@ -744,6 +754,11 @@ def main() -> int:
     ap.add_argument("--min-len", type=int, default=40, help="skip memories shorter than this")
     ap.add_argument("--excerpt", type=int, default=400, help="worksheet text excerpt chars")
     ap.add_argument("--worksheet", action="store_true", help="emit the hand-label worksheet")
+    ap.add_argument("--controls", type=int, default=40,
+                    help="blind control rows the mechanism called NOT stale, so recall "
+                         "is measurable and not just precision")
+    ap.add_argument("--force-worksheet", action="store_true",
+                    help="overwrite a worksheet that already carries hand-labels")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--summarise-worksheet", action="store_true",
                     help="read back hand-labels and report the corrected rate")
