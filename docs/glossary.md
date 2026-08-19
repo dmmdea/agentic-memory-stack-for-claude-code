@@ -88,7 +88,7 @@ The mode in which memory is asked for — `durable` (default), `operational`, `c
 
 ## L1a Extractor
 
-The session fact extractor (`scripts/windows/l1a-extract.ps1`): on a Stop/PreCompact hook a Codex subagent reads the last ~24 turns under an inferability-gate prompt, keeping only genuinely project-specific facts (max 5/run, one success per 10 min) and posting each to mem0 as `tier=evidence`. See [memory-capture.md](flows/memory-capture.md).
+The session fact extractor (`scripts/windows/l1a-extract.ps1`): on a Stop/PreCompact hook a Codex subagent reads the last ~24 turns under an inferability-gate + ephemera-gate prompt, keeping only genuinely project-specific facts that outlive the session (max 5/run, one success per 10 min) and posting each to mem0 as `tier=evidence`. See [memory-capture.md](flows/memory-capture.md).
 
 ## Ship-Log
 

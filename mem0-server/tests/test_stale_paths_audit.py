@@ -24,6 +24,21 @@ sp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sp)
 
 
+@pytest.fixture(autouse=True)
+def _reset_run_caches(monkeypatch):
+    """The module caches per-run state (_SHARED_ROOTS, _UNC_ROOT, _WSL_HOME). Without a
+    reset, whichever test first trips a cache under ITS monkeypatched filesystem leaks
+    that state into every later test - order-dependent and runtime-dependent (verified:
+    the G:-root test caches _SHARED_ROOTS=[] via mocked probes)."""
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", sp._UNSET)
+    monkeypatch.setattr(sp, "_UNC_ROOT", sp._UNSET)
+    monkeypatch.setattr(sp, "_WSL_HOME", sp._UNSET)
+    monkeypatch.delenv("MEM0_SHARED_DRIVE_LETTERS", raising=False)
+    # SHARED_DRIVE_DIR binds at import, so an operator's MEM0_SHARED_DRIVE_DIR would
+    # otherwise leak into every hardcoded "My Drive" fixture below.
+    monkeypatch.setattr(sp, "SHARED_DRIVE_DIR", "My Drive")
+
+
 # --- the instrument bug: an unreachable ROOT is never staleness -----------------
 
 def test_unreachable_root_is_undecidable_never_stale(monkeypatch):
@@ -183,8 +198,11 @@ def test_windows_without_wsl_share_is_undecidable(monkeypatch):
 
 
 def test_wsl_maps_drive_to_mnt(monkeypatch):
+    # ismount, not Path.is_dir: _translate moved to ismount (empty /mnt/<d> stubs) and
+    # the stale is_dir stub silently made this test depend on the REAL /mnt/c mount -
+    # green under WSL, red under the recommended Windows interpreter.
     monkeypatch.setattr(sp.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(sp.Path, "is_dir", lambda self: True)
+    monkeypatch.setattr(sp.os.path, "ismount", lambda p: True)
     assert sp._translate("C:\\Users\\dmmde") == "/mnt/c/Users/dmmde"
 
 
@@ -561,3 +579,190 @@ def test_worksheet_all_emits_every_accused_row(monkeypatch, tmp_path):
     accused = [r for r in rows if r["verdict_mechanical"] == "missing-unexplained"]
     assert len(accused) == 400
     assert header["sampled"] is False
+
+
+# --- shared-Drive alias (gate verdict 2026-08-19) ---------------------------------
+# The single largest systematic error of the hand-label round: D:\My Drive\... is the
+# OTHER box's letter for the same synced Drive that is G:\ here. The letter belongs to
+# the machine, not the memory, so a shared-Drive path must be re-checked under every
+# local root carrying the shared dir before any staleness verdict.
+
+def test_shared_drive_alias_rescues_other_boxes_letter(monkeypatch):
+    """D:\\My Drive\\... recorded on the other box must read EXISTS on the box where
+    the same Drive is G: - this exact shape was mass-accused in the first run."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp, "_translate", lambda p: "D:/My Drive/Eco/spec.md")
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: p == "G:/My Drive/Eco/spec.md")
+    verdict, resolved = sp.classify_path(r"D:\My Drive\Eco\spec.md",
+                                         r"Spec at D:\My Drive\Eco\spec.md today.")
+    assert verdict == "exists"
+    assert resolved == "G:/My Drive/Eco/spec.md"
+
+
+def test_shared_drive_alias_also_rescues_an_unreachable_root(monkeypatch):
+    """When the recorded LETTER does not even exist here, the alias still decides:
+    an alias hit is a decidable EXISTS, not a root-unavailable coverage gap."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp, "_translate", lambda p: None)
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: p == "G:/My Drive/Eco/spec.md")
+    verdict, resolved = sp.classify_path(r"D:\My Drive\Eco\spec.md",
+                                         r"Spec at D:\My Drive\Eco\spec.md today.")
+    assert verdict == "exists"
+    assert resolved == "G:/My Drive/Eco/spec.md"
+
+
+def test_alias_accepts_the_mnt_form(monkeypatch):
+    """/mnt/d/My Drive/... is the same claim in WSL clothing."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: p == "/mnt/g/My Drive/Eco/spec.md")
+    assert sp._alias_hit("/mnt/d/My Drive/Eco/spec.md") == "/mnt/g/My Drive/Eco/spec.md"
+
+
+def test_alias_never_excuses_a_path_outside_the_shared_dir(monkeypatch):
+    """D:\\Dev\\... is NOT on the shared Drive; a missing file there must stay stale
+    even when shared roots exist locally. The alias is a normalisation, not a pardon."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp, "_translate", lambda p: p.replace("\\", "/"))
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
+    verdict, _ = sp.classify_path(r"D:\Dev\thing\report.md",
+                                  r"The report is at D:\Dev\thing\report.md today.")
+    assert verdict == "missing-unexplained"
+
+
+def test_shared_path_missing_under_every_root_is_still_stale(monkeypatch):
+    """A file deleted FROM the Drive is stale everywhere - the alias must not convert
+    'missing under all roots' into anything but the normal missing-* path."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp, "_translate", lambda p: p.replace("\\", "/"))
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
+    verdict, _ = sp.classify_path(r"D:\My Drive\Eco\gone.md",
+                                  r"Notes at D:\My Drive\Eco\gone.md cover phase two.")
+    assert verdict == "missing-unexplained"
+
+
+def test_alias_ignores_non_path_shapes():
+    assert sp._alias_hit("http://qube:18791") is None
+    assert sp._alias_hit("relative/My Drive/x") is None
+
+
+def test_shared_root_detection_is_local_and_cached(monkeypatch):
+    """Detection probes the bare root FIRST (the _translate guard - a disconnected
+    mapped letter blocks on SMB), then <letter>:/<shared dir>; the result is cached
+    for the run."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    probed = []
+
+    def fake_exists(p):
+        probed.append(p)
+        return p in ("G:/", "D:/", "G:/My Drive", "D:/My Drive")
+    monkeypatch.setattr(sp.os.path, "exists", fake_exists)
+    assert sp._shared_drive_letters() == ["d", "g"]
+    probed.clear()
+    assert sp._shared_drive_letters() == ["d", "g"]
+    assert probed == [], "second call must hit the cache, not the filesystem"
+
+
+def test_shared_root_cache_returns_a_copy(monkeypatch):
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    got = sp._shared_drive_letters()
+    got.append("z")
+    assert sp._shared_drive_letters() == ["g"], "caller mutation must not corrupt the cache"
+
+
+def test_zero_shared_roots_makes_shared_claims_undecidable(monkeypatch):
+    """The box has NO local shared root (Drive app not mounted yet, crashed, or absent):
+    it cannot falsify any shared-Drive claim. 'Could not check' must never become
+    'missing' - that would silently resurrect the mass false accusation wholesale."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", [])
+    monkeypatch.setattr(sp, "_translate", lambda p: p.replace("\\", "/"))
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
+    verdict, resolved = sp.classify_path(r"D:\My Drive\Eco\spec.md",
+                                         r"Spec at D:\My Drive\Eco\spec.md today.")
+    # A DISTINCT verdict: the drive letters may all exist here, so the letter-based
+    # coverage banner cannot see this cause - it needs its own counter to be visible.
+    assert verdict == "shared-root-unavailable"
+    assert resolved is None
+    assert sp.PRECEDENCE.index("missing-unexplained") \
+        < sp.PRECEDENCE.index("shared-root-unavailable") \
+        < sp.PRECEDENCE.index("missing-recorded")
+    # control: a NON-shared path on the same rootless box still decides normally
+    verdict2, _ = sp.classify_path(r"D:\Dev\thing\report.md",
+                                   r"Report at D:\Dev\thing\report.md today.")
+    assert verdict2 == "missing-unexplained"
+
+
+def test_shared_root_itself_is_a_shared_claim(monkeypatch):
+    """'D:\\My Drive' (the root, no tail) must alias too - rejecting it re-invents the
+    false accusation whenever the recorded letter exists locally without the Drive."""
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: p == "G:/My Drive")
+    assert sp._alias_hit(r"D:\My Drive") == "G:/My Drive"
+    assert sp._alias_hit(r"D:\My Drive\_") is None   # tail still has to exist
+
+
+def test_pinned_letters_override_detection(monkeypatch):
+    """MEM0_SHARED_DRIVE_LETTERS pins the roots (backup-mirror / second-account guard).
+    Pinned letters are still VALIDATED against the filesystem - accepting them verbatim
+    let a typo'd pin reinstate the mass false accusation (round-2 review, CRITICAL)."""
+    monkeypatch.setenv("MEM0_SHARED_DRIVE_LETTERS", " G , h ")
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp.os.path, "exists",
+                        lambda p: p in ("G:/", "H:/", "G:/My Drive", "H:/My Drive"))
+    assert sp._shared_drive_letters() == ["g", "h"]
+    # detection letters must NOT be scanned when a pin is set: only the pin was probed
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", sp._UNSET)
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: True)   # every letter would match
+    assert sp._shared_drive_letters() == ["g", "h"], "pin must override detection"
+
+
+def test_malformed_pin_is_refused_not_dropped(monkeypatch):
+    """Silently dropping bad entries can collapse the pin to [] - every shared claim
+    flips to undecidable with no warning. Refuse loudly instead."""
+    monkeypatch.setenv("MEM0_SHARED_DRIVE_LETTERS", "gg, 7")
+    with pytest.raises(SystemExit, match="malformed"):
+        sp._shared_drive_letters()
+    monkeypatch.setattr(sp, "_SHARED_ROOTS", sp._UNSET)
+    monkeypatch.setenv("MEM0_SHARED_DRIVE_LETTERS", "g;h")   # semicolon slip
+    with pytest.raises(SystemExit, match="malformed"):
+        sp._shared_drive_letters()
+
+
+def test_unresolvable_pin_is_refused(monkeypatch):
+    """A pin naming a letter that does not carry the shared dir here (typo, or the
+    Drive moved letters) would make the alias miss everywhere while the zero-roots
+    guard stays off - the false-accusation class, reinstated through the guard knob."""
+    monkeypatch.setenv("MEM0_SHARED_DRIVE_LETTERS", "z")
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: p in ("G:/", "G:/My Drive"))
+    with pytest.raises(SystemExit, match="do not carry"):
+        sp._shared_drive_letters()
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, "My Drive"),
+    ("", "My Drive"),
+    ("My Drive/", "My Drive"),
+    ("My Drive\\", "My Drive"),
+    ("  My Drive  ", "My Drive"),
+])
+def test_shared_dir_env_is_normalised(raw, expected):
+    """A trailing separator passes root DETECTION but makes the prefix match
+    unsatisfiable - the alias would die silently while the run looks healthy."""
+    assert sp._normalize_shared_dir(raw) == expected
+
+
+def test_shared_dir_env_normalising_to_empty_is_refused():
+    with pytest.raises(SystemExit, match="normalises to empty"):
+        sp._normalize_shared_dir("/")
+
+
+def test_mnt_form_requires_a_drive_letter():
+    assert sp._shared_rest("/mnt/1/My Drive/x") is None
+    assert sp._shared_rest("/mnt/d/My Drive/x") == "My Drive/x"

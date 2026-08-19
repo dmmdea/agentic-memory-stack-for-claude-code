@@ -91,6 +91,16 @@ try {
         exit 0
     }
 
+    # EPHEMERA GATE (gate verdict 2026-08-19, memory-frontier hand-label): of the 60
+    # memories the mechanical audit accused, only 5 were genuinely stale while 20
+    # were EPHEMERAL - point-in-time work pointers that should never have been stored
+    # (80% of the accused STALE+EPHEMERAL rows; 81% across all 135 hand-labelled
+    # rows; the verdict extrapolates ephemera to ~22% of path-naming memories).
+    # The same hand-label found 23 VALID accused memories
+    # whose substance was durable and whose path was incidental - which is why the
+    # gate below carries an explicit KEEP clause. The verdict killed the validity
+    # schema and named THIS prompt rule the cheapest fix: stop admitting ephemera at
+    # write time instead of detecting them at read time.
     $prompt = @"
 You are a memory fact extractor. Read the conversation excerpt below and output STRICT JSON only - no prose, no markdown fences, no preamble.
 
@@ -99,6 +109,7 @@ Output this exact shape:
 
 Rules for facts (apply the INFERABILITY GATE first — it is the most important rule):
 - INFERABILITY GATE: before keeping a fact, ask "could a competent engineer who knows general software/tools but has NEVER worked on THIS project infer or guess this?" If YES, DROP it. Keep ONLY genuinely project-specific facts that cannot be known without having been here (our ports, paths, collection names, config values, decisions, IDs, flags, versions, locked-in choices). Generic best-practices and things the reader already knows are noise.
+- EPHEMERA GATE (second, equally binding): DROP point-in-time work-state that the next session's events supersede, even when it is project-specific. That means: one-off task/PR/branch/worktree pointers ("the task-3 report is at <path>", "branch X has worktree Y", "PR #12 is open"); session checkpoints and progress markers ("phase 2 is next", "deployed to staging, awaiting review"); temp or scratch locations (paths under AppData\Local\Temp, scratchpad dirs, Desktop exports, render output dirs); and point-in-time counts or sizes ("the ledger had 19,883 lines"). Test: would this still be true AND worth retrieving in 30 days, by someone with no memory of this session? If NO, DROP it. KEEP a fact that names a path ONLY when the sentence asserts a decision, rule, or measured finding that stays true without re-checking the path ("worktrees live under D:\Dev\worktrees, never under Drive" is a rule; "the egemma migration was rolled back because X" is a finding). A sentence whose only claim is "artifact X is/lives at path P" is a pointer, not a fact - DROP it, however important the artifact feels right now.
 - Prefer FEWER, higher-signal facts over filling a quota; max 5; output [] if nothing is genuinely project-specific.
 - Each fact self-contained and declarative, <= 30 words preferred, 60 words HARD MAXIMUM — but NEVER drop the distinguishing detail to hit the limit (a fact that loses the specific value/name/path/number is useless; specific-and-concrete beats short-and-vague).
 - ATOMIC facts only: ONE fact = ONE claim about ONE topic. NEVER emit a multi-topic dump (a session recap, a list of changes, several decisions welded into one string). If a candidate fact bundles multiple claims, SPLIT it into separate single-topic facts BEFORE output — each must stand alone when retrieved individually.

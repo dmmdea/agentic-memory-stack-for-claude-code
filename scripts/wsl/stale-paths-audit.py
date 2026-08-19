@@ -128,9 +128,34 @@ VALID_LABELS = {"STALE", "VALID", "RECORDED", "FOREIGN", "EPHEMERAL"}
 # WSL distro reachable from Windows as //wsl.localhost/<distro>. Set MEM0_WSL_DISTRO
 # per box; unset means POSIX paths stay undecidable on Windows rather than guessed at.
 WSL_DISTRO = os.environ.get("MEM0_WSL_DISTRO", "")
+# The shared, synced Drive is mounted at a DIFFERENT drive letter per machine (the
+# same Google Drive is D:\My Drive on one box and G:\My Drive on another). The letter
+# is a property of the MACHINE, not of the memory - so a shared-Drive path recorded
+# under another box's letter must be re-checked under every LOCAL root that carries
+# the shared dir before it can be called missing. This was the single largest
+# systematic error of the first hand-label round (gate verdict 2026-08-19): a whole
+# class of perfectly valid D:\My Drive\... memories read as stale on the G: box.
+
+
+def _normalize_shared_dir(value):
+    """Normalise MEM0_SHARED_DRIVE_DIR. A trailing separator ("My Drive/") would pass
+    root DETECTION yet make the per-path prefix match unsatisfiable - the alias dies
+    silently while the run looks healthy - and an empty-but-set var would widen root
+    detection to every mounted drive. Empty/unset falls back to the default; a value
+    that normalises to nothing (e.g. "/") is refused loudly, matching _sidecar_dir."""
+    v = (value or "My Drive").strip().strip("\\/").replace("\\", "/")
+    if not v:
+        raise SystemExit(
+            "stale-paths-audit: MEM0_SHARED_DRIVE_DIR normalises to empty - "
+            "set a real directory name or unset it.")
+    return v
+
+
+SHARED_DRIVE_DIR = _normalize_shared_dir(os.environ.get("MEM0_SHARED_DRIVE_DIR"))
 _UNSET = object()
 _UNC_ROOT = _UNSET
 _WSL_HOME = _UNSET
+_SHARED_ROOTS = _UNSET
 
 # Path extraction MUST tolerate internal spaces. Stopping at the first space truncated
 # every "Program Files", "My Drive" and "Port Directory" path - i.e. the most-cited roots
@@ -287,6 +312,103 @@ def _translate(p: str):
     return None
 
 
+def _shared_drive_letters():
+    """Lowercase local drive letters that carry the shared Drive dir at their root.
+    Cached per run (the mount set does not change mid-audit); callers get a COPY so
+    a mutation cannot corrupt the cache. MEM0_SHARED_DRIVE_LETTERS, when set, pins
+    the letters (comma-separated) instead of detecting - the guard against a backup
+    mirror or a second Drive account's mount masquerading as THE shared Drive."""
+    global _SHARED_ROOTS
+    if _SHARED_ROOTS is _UNSET:
+        pinned = os.environ.get("MEM0_SHARED_DRIVE_LETTERS", "")
+        if pinned.strip():
+            # The pin fails LOUD, in both directions. Silently dropping a malformed
+            # entry ("gg", "g;h") can collapse the pin to [] - every shared claim
+            # flips to undecidable with no warning - and accepting an unresolvable
+            # letter verbatim (a typo, or the Drive moved letters after the pin was
+            # set) makes _alias_hit miss everywhere while the zero-roots guard stays
+            # off: the mass false accusation, reinstated through the guard knob.
+            letters, bad = [], []
+            for tok in pinned.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                (letters if (len(tok) == 1 and tok.isalpha()) else bad).append(tok.lower())
+            if bad or not letters:
+                raise SystemExit(
+                    "stale-paths-audit: MEM0_SHARED_DRIVE_LETTERS is malformed: "
+                    + repr(pinned) + (" (bad entries: " + ", ".join(bad) + ")" if bad
+                                      else " (no valid letters)")
+                    + ". Use comma-separated single drive letters, e.g. \"g\" or \"d,g\".")
+            win = platform.system() == "Windows"
+            unresolved = [c for c in letters if not (
+                (os.path.exists(c.upper() + ":/")
+                 and os.path.exists(c.upper() + ":/" + SHARED_DRIVE_DIR)) if win
+                else (os.path.ismount("/mnt/" + c)
+                      and os.path.exists("/mnt/" + c + "/" + SHARED_DRIVE_DIR)))]
+            if unresolved:
+                raise SystemExit(
+                    "stale-paths-audit: pinned shared-Drive letter(s) do not carry "
+                    + repr(SHARED_DRIVE_DIR) + " on this box: " + ", ".join(unresolved)
+                    + ". Fix the pin or unset MEM0_SHARED_DRIVE_LETTERS.")
+            _SHARED_ROOTS = letters
+        else:
+            letters = []
+            win = platform.system() == "Windows"
+            for c in "abcdefghijklmnopqrstuvwxyz":
+                if win:
+                    # Root probe FIRST, same guard _translate uses: probing the shared
+                    # dir directly on a disconnected mapped letter can block on an SMB
+                    # timeout, and A:/B: can raise removable-media noise.
+                    if (os.path.exists(c.upper() + ":/")
+                            and os.path.exists(c.upper() + ":/" + SHARED_DRIVE_DIR)):
+                        letters.append(c)
+                elif (os.path.ismount("/mnt/" + c)
+                      and os.path.exists("/mnt/" + c + "/" + SHARED_DRIVE_DIR)):
+                    letters.append(c)
+            _SHARED_ROOTS = letters
+    return list(_SHARED_ROOTS)
+
+
+def _shared_rest(p: str):
+    """If p is a claim about the shared Drive dir - recorded under ANY drive letter,
+    Windows or /mnt/<d> form - return its drive-relative part ("My Drive/..."),
+    normalised to forward slashes. None for everything else. The shared root ITSELF
+    ("D:\\My Drive") is a shared claim too - rejecting it re-invented the exact false
+    accusation this exists to kill whenever the recorded letter existed locally."""
+    m = re.match(r"^[A-Za-z]:[\\/](.+)$", p)
+    if m:
+        rest = m.group(1)
+    elif (p.startswith("/mnt/") and len(p) > 6
+          and p[5].isalpha() and p[6] == "/"):
+        rest = p[7:]
+    else:
+        return None
+    rest = rest.replace("\\", "/").rstrip("/")
+    low = rest.lower()
+    if low == SHARED_DRIVE_DIR.lower() or low.startswith(SHARED_DRIVE_DIR.lower() + "/"):
+        return rest
+    return None
+
+
+def _alias_hit(p: str):
+    """Shared-Drive alias resolution: if p is a shared-Drive claim (see _shared_rest)
+    and the same relative path exists under a LOCAL shared-Drive root, return that
+    local resolved path. Returns None otherwise. It never excuses a path outside the
+    shared dir, and a shared-Drive path that is missing under every local root still
+    falls through to the normal missing-* verdicts (a file deleted from the Drive is
+    stale everywhere)."""
+    rest = _shared_rest(p)
+    if rest is None:
+        return None
+    win = platform.system() == "Windows"
+    for letter in _shared_drive_letters():
+        cand = (letter.upper() + ":/" + rest) if win else ("/mnt/" + letter + "/" + rest)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def _prose(text: str) -> str:
     """The text with path literals removed, so vocabulary tests read what the memory
     SAYS rather than what its filenames happen to spell."""
@@ -316,14 +438,37 @@ def _records_removal(text: str, raw_path: str) -> bool:
 
 def classify_path(raw: str, text: str):
     """-> (verdict, resolved_path). Verdicts: artifact | root-unavailable |
-    exists | missing-recorded | missing-foreign-host | missing-unexplained."""
+    shared-root-unavailable | exists | missing-recorded | missing-foreign-host |
+    missing-unexplained."""
     if _artifact(raw):
         return "artifact", None
     resolved = _translate(raw)
     if resolved is None:
+        # The recorded root is unreachable HERE, but the path may be a shared-Drive
+        # path wearing another machine's drive letter (e.g. D:\My Drive\... checked
+        # on the box where the same Drive is G:). An alias hit is a decidable EXISTS,
+        # not a coverage gap.
+        alias = _alias_hit(raw)
+        if alias is not None:
+            return "exists", alias
         return "root-unavailable", None
     if os.path.exists(resolved):
         return "exists", resolved
+    # Missing at the recorded letter - but the shared Drive may live at a different
+    # letter on this box. Check the alias BEFORE any staleness verdict.
+    alias = _alias_hit(raw)
+    if alias is not None:
+        return "exists", alias
+    if _shared_rest(raw) is not None and not _shared_drive_letters():
+        # A shared-Drive claim on a box where ZERO local roots carry the shared dir
+        # (Drive app not mounted yet, crashed, or genuinely absent) CANNOT be
+        # falsified here. "Could not check" is not "missing" - handing down a
+        # missing-* verdict from an unmounted Drive would silently resurrect the
+        # mass false accusation the alias exists to kill. A DISTINCT verdict, not
+        # plain root-unavailable: the drive LETTERS may all exist here, so the
+        # letter-based coverage banner stays silent - this cause needs its own
+        # counter and its own console line to be visible at all.
+        return "shared-root-unavailable", None
     # Missing here. Decide WHY before calling it stale.
     # Match the removal vocabulary against PROSE ONLY. Scanning the raw text let a
     # path excuse itself: D:\...\gone.md, D:\archive\..., V:\models\deleted\... all
@@ -343,8 +488,8 @@ def classify_path(raw: str, text: str):
 # undecidable reason never masquerades as fresh.
 # missing-recorded sits BELOW the undecidables: a memory that also names an unchecked
 # path must not be booked as decidable-and-correct on the strength of a different path.
-PRECEDENCE = ["missing-unexplained", "root-unavailable", "missing-foreign-host",
-              "missing-recorded", "exists", "artifact"]
+PRECEDENCE = ["missing-unexplained", "root-unavailable", "shared-root-unavailable",
+              "missing-foreign-host", "missing-recorded", "exists", "artifact"]
 
 
 def classify_memory(text: str) -> dict:
@@ -457,7 +602,8 @@ def run_audit(args) -> int:
         source = pay.get("source") or "unknown"
         by_tier[tier][v] += 1
         by_source[source][v] += 1
-        if v in ("missing-unexplained", "missing-foreign-host", "root-unavailable"):
+        if v in ("missing-unexplained", "missing-foreign-host", "root-unavailable",
+                 "shared-root-unavailable"):
             missing = [rp for rp, (pv, _) in res["paths"].items() if pv == v]
             rec = {
                 "memory_id": p.get("id"), "verdict_mechanical": v,
@@ -497,9 +643,15 @@ def run_audit(args) -> int:
         "counts": dict(counts), "decidable": decidable, "stale": stale,
         "stale_rate_pct": round(rate, 1),
         "unreachable_roots": unreachable,
+        # Visibility for the alias seam: a run with ZERO shared roots decides no
+        # shared-Drive claim, and MORE than one root means ambiguity (backup mirror /
+        # second account) worth pinning via MEM0_SHARED_DRIVE_LETTERS.
+        "shared_drive_dir": SHARED_DRIVE_DIR,
+        "shared_drive_roots": _shared_drive_letters(),
         "wsl_unc_root": _wsl_unc_root(),
         "wsl_distro": WSL_DISTRO or None,
         "undecidable_root_unavailable": counts["root-unavailable"],
+        "undecidable_shared_drive_unmounted": counts["shared-root-unavailable"],
         "undecidable_foreign_host": counts["missing-foreign-host"],
         "recorded_removals": counts["missing-recorded"],
         "foreign_hosts_configured": FOREIGN_HOSTS is not None,
@@ -566,6 +718,14 @@ def _print_report(s, by_tier, by_source, stale_rows, unreachable):
               + " memories held UNDECIDABLE because of it (NOT counted stale).")
         if s["runtime"] != "Windows":
             print("     Re-run under the Windows interpreter for full drive coverage.")
+    shared_roots = s.get("shared_drive_roots") or []
+    print("shared Drive \"" + str(s.get("shared_drive_dir")) + "\" local roots: "
+          + (", ".join(shared_roots) if shared_roots else "NONE"))
+    if not shared_roots:
+        # The letter-based banner above cannot see this cause: the drive letters may
+        # all exist while none carries the shared dir (Drive app down / not mounted).
+        print("  !! SHARED DRIVE UNMOUNTED: shared-Drive claims are UNDECIDABLE on this box ("
+              + str(s["undecidable_shared_drive_unmounted"]) + " memories held out, NOT counted stale).")
     print("\n  DECIDABLE")
     print("    paths still exist                  : " + str(s["counts"].get("exists", 0)))
     print("    missing, memory RECORDS the removal: " + str(s["recorded_removals"])
@@ -573,6 +733,7 @@ def _print_report(s, by_tier, by_source, stale_rows, unreachable):
     print("    missing, unexplained  -> STALE     : " + str(s["stale"]))
     print("  UNDECIDABLE (never counted stale)")
     print("    root unavailable in this runtime   : " + str(s["undecidable_root_unavailable"]))
+    print("    shared Drive not mounted here      : " + str(s["undecidable_shared_drive_unmounted"]))
     print("    path owned by another machine      : " + str(s["undecidable_foreign_host"]))
     if not s.get("foreign_hosts_configured"):
         print("      ^ MEM0_FOREIGN_HOSTS is unset, so this correction is OFF and paths")
