@@ -57,6 +57,7 @@ Each extracted path resolves to exactly one verdict:
 | `missing-recorded` | missing, and the memory's prose *records* the removal | decidable, **correct** |
 | `missing-unexplained` | missing, no explanation | decidable, **STALE** |
 | `root-unavailable` | the drive/root is not reachable from this runtime | **undecidable** |
+| `shared-root-unavailable` | a shared-Drive claim on a box where no local root carries the shared dir | **undecidable** |
 | `missing-foreign-host` | path belongs to another machine in the fleet | **undecidable** |
 | `artifact` | extraction noise, not a path claim | excluded |
 
@@ -64,6 +65,37 @@ A memory takes the **worst decidable** verdict among its paths, so one surviving
 whitewash a record that also names a dead one. Undecidable reasons never masquerade as fresh
 **and never enter the denominator** — a coverage gap must not deflate the rate the way it
 once inflated it.
+
+### The shared-Drive alias
+
+The hand-label round's **single largest systematic error**: the same synced Google Drive is
+mounted at a **different drive letter per machine** (`D:\My Drive` on one box is `G:\My Drive`
+on another). The letter is a property of the *machine*, not of the memory, so a path-existence
+check on one box invented staleness for a whole class of perfectly valid memories written on
+the other.
+
+The fix is a normalisation, not a pardon: before any `missing-*` verdict, a path under the
+shared-Drive dir (default `My Drive`, override `MEM0_SHARED_DRIVE_DIR` — normalised, a
+trailing separator or empty value cannot silently disable matching) is re-checked under
+**every local root that carries that dir**, whether the memory recorded it in the Windows
+(`X:\My Drive\…`) or the WSL (`/mnt/x/My Drive/…`) spelling. An alias hit is a decidable
+`exists` (even when the recorded letter does not exist here at all); a path *outside* the
+shared dir is never excused; and a file deleted **from** the Drive is missing under every
+root and still reads stale.
+
+Two seams are handled explicitly. **Zero local roots** (Drive app not mounted yet, crashed,
+or absent): the box cannot falsify any shared-Drive claim, so those paths take their own
+verdict, `shared-root-unavailable` — undecidable, never stale, counted separately from
+`root-unavailable` because the drive *letters* may all exist while none carries the shared
+dir, which keeps the letter-based coverage banner silent. Both the console report and the
+JSONL receipt print the detected root set (`shared_drive_roots`), with a loud banner when it
+is empty. **More than one root** (a backup mirror or a second Drive account also mounts a
+`My Drive`): detection would trust the wrong copy, so `MEM0_SHARED_DRIVE_LETTERS` pins the
+letters. The pin fails **loud** in both directions — a malformed entry (`gg`, `g;h`) and a
+letter that does not carry the shared dir here are each a `SystemExit`, because a silently
+dropped or stale pin would reinstate the very false-accusation class the alias kills. A hit
+through a stale mirror is at least traceable: the worksheet row carries the alias-resolved
+path, wrong letter and all.
 
 ### The three proxy biases, and what changed
 
@@ -115,6 +147,8 @@ username is what would fork the trail. Override with `MEM0_SIDECAR_DIR`.
 |---|---|
 | `MEM0_FOREIGN_HOSTS` | foreign-host correction **off** — cross-machine paths counted stale |
 | `MEM0_LOCAL_HOST` | defaults to this machine's hostname |
+| `MEM0_SHARED_DRIVE_DIR` | defaults to `My Drive` — the synced-Drive dir checked across all local drive letters (normalised; empty falls back to the default) |
+| `MEM0_SHARED_DRIVE_LETTERS` | shared roots auto-detected — set (comma-separated letters) to pin them when a mirror or second account also carries the dir; pinned letters are validated and refused loudly when malformed or not carrying the dir |
 | `MEM0_WSL_DISTRO` | POSIX paths stay undecidable when run from Windows |
 | `MEM0_WSL_USER` | sidecar inferred only if exactly one candidate home exists |
 | `MEM0_SIDECAR_DIR` | receipts follow the rules above |
@@ -208,6 +242,26 @@ visible:
 
 The worksheet also carries `label_recalled`, because a memory that has never been recalled is
 not worth a schema to invalidate.
+
+### The verdict landed (2026-08-19): DO NOT BUILD
+
+135 rows were hand-labelled against evidence (recall counts from 21,320 retrieval-log rows,
+live payloads, fresh path re-checks, git history). Mechanical precision was **8.3%** (5 of 60
+accused genuinely stale); recall ~71% via the blind controls; true staleness extrapolates to
+**~0.6%** of the corpus against the 20% bar — a **30× miss**. 81% of the hand-labelled
+STALE+EPHEMERAL rows (across all 135) were EPHEMERAL, and 86% of the genuinely stale rows
+were never served once. The validity schema is
+**killed**; what shipped instead is exactly the cheapest-kill pair this section anticipated:
+
+- the **EPHEMERA GATE** in the L1a extraction prompt (`l1a-extract.ps1`) — one-off
+  task/PR/worktree pointers, session checkpoints, temp dirs, and point-in-time counts are
+  dropped at write time (see [memory-capture.md](../flows/memory-capture.md));
+- the **shared-Drive alias** in this instrument (above), which removes its largest class of
+  false accusations.
+
+Full verdict: `Ecosystem/Arquitechture/2026-08-16_memory-frontier/07-GATE-VERDICT-milestone-validity.md`
+(operator archive, outside this repo). The instrument survives as an evidence harness; its
+precision makes it a poor detector, and it must never auto-act on its accusations.
 
 ## Constraints any future validity schema must honour
 
