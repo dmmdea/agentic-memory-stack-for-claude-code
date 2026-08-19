@@ -181,6 +181,19 @@ shows 4 stale entries and `stable` shows 25%**. The reassuring version of this f
 the buggy one — which is exactly why the instrument gets tests before the output gets
 trusted.
 
+### The worksheet is a labelling task, not a dump
+
+Emitting every accused row produced **890 rows** with the blind controls diluted to about
+1-in-14. Labelling a realistic few dozen would then have caught roughly **four** controls —
+far too few to measure recall, which is the only reason the controls exist. So the worksheet
+**samples the accused down** (`--worksheet-size`, default 60) and keeps the full control
+draw, making the ratio a human actually labels the ratio that was designed. `--worksheet-all`
+emits every row when that is genuinely wanted.
+
+The header records `sampled`, the `population` it was drawn from, and the row counts, because
+a labeller who cannot tell a sample from the population will mis-scale any rate computed from
+the sheet.
+
 ## The decision this feeds — including the kill
 
 `--summarise-worksheet` reads the hand-labels back and reports the split. The label set

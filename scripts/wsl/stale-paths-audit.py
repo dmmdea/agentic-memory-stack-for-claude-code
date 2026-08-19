@@ -533,8 +533,22 @@ def run_audit(args) -> int:
                           ("exists", max(1, args.controls // 2))):
             pool = control_pool.get(kind, [])
             controls += rng.sample(pool, min(cap, len(pool)))
-        _emit_worksheet(stale_rows, undecidable_rows, summary,
-                        control_rows=controls, force=args.force_worksheet)
+
+        # A worksheet is a LABELLING TASK, not a dump. Emitting every accused row
+        # produced 890 rows with the controls diluted ~1:14, so labelling a realistic
+        # few dozen would have caught ~4 controls - too few to measure recall, which is
+        # the only reason the controls exist. Sample the accused down instead, so the
+        # ratio the human actually labels is the ratio that was designed.
+        accused, undec = stale_rows, undecidable_rows
+        if not args.worksheet_all:
+            accused = rng.sample(stale_rows, min(args.worksheet_size, len(stale_rows)))
+            n_undec = max(1, args.worksheet_size // 4)
+            undec = rng.sample(undecidable_rows, min(n_undec, len(undecidable_rows)))
+        _emit_worksheet(accused, undec, summary,
+                        control_rows=controls, force=args.force_worksheet,
+                        sampled=not args.worksheet_all,
+                        population={"stale": len(stale_rows),
+                                    "undecidable": len(undecidable_rows)})
     return 0
 
 
@@ -613,7 +627,8 @@ def _existing_labels(path) -> int:
     return n
 
 
-def _emit_worksheet(stale_rows, undecidable_rows, summary, control_rows=(), force=False):
+def _emit_worksheet(stale_rows, undecidable_rows, summary, control_rows=(), force=False,
+                    sampled=False, population=None):
     """The actual deliverable: a hand-label worksheet. Mechanical verdicts are a
     PROPOSAL; the human's `label` is what the schema gets designed from."""
     already = _existing_labels(WORKSHEET)
@@ -636,6 +651,14 @@ def _emit_worksheet(stale_rows, undecidable_rows, summary, control_rows=(), forc
                     "EPHEMERAL, do not build a validity schema - stop writing them."),
                 "recall_hint": ("label_recalled: has this memory ever actually been "
                                 "useful? yes/no/unknown"),
+                # Without this a labeller cannot tell whether they are looking at the
+                # whole population or a sample of it, and any rate they compute from
+                # the sheet would be quietly mis-scaled.
+                "sampled": bool(sampled),
+                "population": population or {},
+                "rows_accused": len(stale_rows),
+                "rows_undecidable": len(undecidable_rows),
+                "rows_control": len(control_rows),
             }) + "\n")
             # Controls are shuffled in so the human labels BLIND. Without them only
             # precision on STALE is computable; recall - "how much staleness did the
@@ -754,6 +777,11 @@ def main() -> int:
     ap.add_argument("--min-len", type=int, default=40, help="skip memories shorter than this")
     ap.add_argument("--excerpt", type=int, default=400, help="worksheet text excerpt chars")
     ap.add_argument("--worksheet", action="store_true", help="emit the hand-label worksheet")
+    ap.add_argument("--worksheet-size", type=int, default=60,
+                    help="accused rows to put in the worksheet (default 60 - a labelling "
+                         "task, not a dump; use --worksheet-all for every row)")
+    ap.add_argument("--worksheet-all", action="store_true",
+                    help="emit EVERY accused row instead of a labelling-sized sample")
     ap.add_argument("--controls", type=int, default=40,
                     help="blind control rows the mechanism called NOT stale, so recall "
                          "is measurable and not just precision")
