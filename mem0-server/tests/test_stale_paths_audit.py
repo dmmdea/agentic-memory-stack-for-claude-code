@@ -422,6 +422,8 @@ def test_aggregation_keeps_undecidables_out_of_the_denominator(monkeypatch, tmp_
         json = True
         controls = 0
         force_worksheet = False
+        worksheet_size = 60
+        worksheet_all = True
     assert sp.run_audit(A()) == 0
     summary = json.loads((tmp_path / "r.jsonl").read_text(encoding="utf-8").strip())
     assert summary["stale"] == 2
@@ -457,6 +459,8 @@ def test_blind_controls_actually_reach_the_worksheet(tmp_path, monkeypatch):
         json = True
         controls = 40
         force_worksheet = False
+        worksheet_size = 60
+        worksheet_all = True
     assert sp.run_audit(A()) == 0
 
     verdicts = []
@@ -482,3 +486,78 @@ def test_controls_are_labelled_blind(tmp_path, monkeypatch):
         r = json.loads(line)
         if not r.get("_worksheet_header"):
             assert r["label"] == "", "every row, control included, must start unlabelled"
+
+
+def _fake_points(n_stale, n_recorded):
+    pts = []
+    for i in range(n_stale):
+        pts.append({"id": f"s{i}", "payload": {
+            "data": rf"Report number {i} is at D:\gone\r{i}.md for reference.",
+            "tier": "evidence"}})
+    for i in range(n_recorded):
+        pts.append({"id": f"c{i}", "payload": {
+            "data": rf"The file was deleted from D:\gone\c{i}.md last week.",
+            "tier": "evidence"}})
+    return pts
+
+
+class _Args:
+    sample = 0
+    seed = 42
+    min_len = 10
+    excerpt = 200
+    worksheet = True
+    json = True
+    controls = 40
+    force_worksheet = True
+    worksheet_size = 60
+    worksheet_all = False
+
+
+def _run_worksheet(monkeypatch, tmp_path, pts, **over):
+    monkeypatch.setattr(sp, "scroll_all", lambda limit: pts)
+    monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(sp.os.path, "exists", lambda p: str(p).rstrip("/\\").upper() == "D:")
+    monkeypatch.setattr(sp, "REPORT", tmp_path / "r.jsonl")
+    ws = tmp_path / "ws.jsonl"
+    monkeypatch.setattr(sp, "WORKSHEET", ws)
+    a = _Args()
+    for k, v in over.items():
+        setattr(a, k, v)
+    assert sp.run_audit(a) == 0
+    rows, header = [], None
+    for line in ws.read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        if r.get("_worksheet_header"):
+            header = r
+        else:
+            rows.append(r)
+    return header, rows
+
+
+def test_worksheet_is_a_labelling_task_not_a_dump(monkeypatch, tmp_path):
+    """890 accused rows with controls diluted ~1:14 meant labelling a realistic few dozen
+    would catch ~4 controls - too few to measure recall, the only reason controls exist."""
+    header, rows = _run_worksheet(monkeypatch, tmp_path, _fake_points(400, 100))
+    accused = [r for r in rows if r["verdict_mechanical"] == "missing-unexplained"]
+    controls = [r for r in rows if r["verdict_mechanical"] in ("missing-recorded", "exists")]
+    assert len(accused) == 60, "accused rows must be sampled down to a labellable size"
+    assert len(controls) >= 20, "controls must not be diluted away by the accused rows"
+    # the ratio a human actually labels is the ratio that was designed
+    assert len(controls) / len(rows) > 0.2
+
+
+def test_worksheet_header_states_it_is_a_sample(monkeypatch, tmp_path):
+    """A labeller who cannot tell sample from population will mis-scale any rate."""
+    header, _ = _run_worksheet(monkeypatch, tmp_path, _fake_points(400, 100))
+    assert header["sampled"] is True
+    assert header["population"]["stale"] == 400
+    assert header["rows_accused"] == 60
+
+
+def test_worksheet_all_emits_every_accused_row(monkeypatch, tmp_path):
+    header, rows = _run_worksheet(monkeypatch, tmp_path, _fake_points(400, 100),
+                                  worksheet_all=True)
+    accused = [r for r in rows if r["verdict_mechanical"] == "missing-unexplained"]
+    assert len(accused) == 400
+    assert header["sampled"] is False
