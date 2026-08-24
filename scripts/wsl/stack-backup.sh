@@ -216,7 +216,7 @@ echo "stack-backup: local files done (rc=$rc so far)"
   if [ -f "$SNAP_SRC" ]; then
     cp "$SNAP_SRC" "$SNAP_DST.tmp" && mv "$SNAP_DST.tmp" "$SNAP_DST" \
       && echo "qdrant snapshot $SNAP -> $SNAP_DST" \
-      || echo "WARN: failed to copy Qdrant snapshot" >&2
+      || { rm -f "$SNAP_DST.tmp"; echo "WARN: failed to copy Qdrant snapshot" >&2; }
     test -s "$SNAP_DST" || echo "WARN: qdrant snapshot backup empty" >&2
   else
     echo "WARN: Qdrant snapshot file not found at $SNAP_SRC" >&2

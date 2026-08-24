@@ -93,3 +93,23 @@ def test_missing_state_still_defaults_cleanly(monkeypatch, tmp_path):
     monkeypatch.setattr(l10, "STATE_FILE", tmp_path / "absent.json")
     st = l10.load_state()
     assert st["last_audit_ts"] == 0 and st["audited_keys"] == []
+
+
+def test_lingering_quarantine_blocks_every_subsequent_run(monkeypatch, tmp_path):
+    """Round-2 review: a one-shot gate moved the corrupt file aside and the NEXT
+    unattended run defaulted clean and durably wrote a state with no reviewed_keys -
+    the erase merely moved to run N+1. The quarantine must block until resolved."""
+    import pytest as _pytest
+    state = tmp_path / "l10-state.json"
+    state.write_text('{"reviewed_keys": [BROKEN', encoding="utf-8")
+    monkeypatch.setattr(l10, "STATE_FILE", state)
+    with _pytest.raises(SystemExit, match="corrupt"):
+        l10.load_state()
+    assert not state.exists()
+    # run N+1: state file absent, quarantine present -> must STILL refuse to default
+    with _pytest.raises(SystemExit, match="unresolved l10-state quarantine"):
+        l10.load_state()
+    # operator resolves (removes the quarantine) -> defaulting is allowed again
+    for q in tmp_path.glob("l10-state.json.corrupt-*"):
+        q.unlink()
+    assert l10.load_state()["audited_keys"] == []

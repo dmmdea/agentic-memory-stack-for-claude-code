@@ -169,8 +169,8 @@ for pair in "qdrant_snapshot:$QDRANT_SNAP_FILE" "history_db:$HISTORY_FILE" \
     if [ -z "$fname" ]; then
         echo "ERROR: manifest lists no $key — this snapshot lacks a REQUIRED artifact (pick an older snapshot)" >&2
         MISSING=$((MISSING+1))
-    elif [ ! -f "$BACKUP_DIR/$fname" ]; then
-        echo "WARN: backup file missing: $BACKUP_DIR/$fname"
+    elif [ ! -s "$BACKUP_DIR/$fname" ]; then
+        echo "WARN: backup file missing or EMPTY: $BACKUP_DIR/$fname"
         MISSING=$((MISSING+1))
     fi
 done
@@ -256,6 +256,7 @@ if [ -f "$SNAP_PATH" ] && [ -s "$SNAP_PATH" ]; then
     else
         echo "WARN: Qdrant snapshot upload response: $upload_resp" >&2
         echo "WARN: Continuing (restore may be partial)." >&2
+        WARNS=$((WARNS+1))
     fi
 
     # Verify restored point count (allow +-10 tolerance for in-flight writes)
@@ -269,10 +270,12 @@ if [ -f "$SNAP_PATH" ] && [ -s "$SNAP_PATH" ]; then
         echo "Qdrant point count: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (within tolerance)"
     else
         echo "WARN: Qdrant point count mismatch: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (>10 tolerance)" >&2
+        WARNS=$((WARNS+1))
     fi
 else
     echo "WARN: Qdrant snapshot file not found or empty: $SNAP_PATH (skipping)" >&2
     restored_pts=0
+    WARNS=$((WARNS+1))
 fi
 
 # ---------------------------------------------------------------------------
@@ -481,6 +484,10 @@ r_schema=$(_query_episodic   "$TARGET_EPISODIC" "SELECT value FROM schema_meta W
 echo "Restored episodic counts:"
 echo "  schema_version : $r_schema"
 echo "  sessions       : $r_sessions (manifest: $MANIFEST_EP_SESSIONS)"
+if [ "${r_sessions:-0}" != "$MANIFEST_EP_SESSIONS" ]; then
+    echo "WARN: episodic session count ${r_sessions:-?} != manifest $MANIFEST_EP_SESSIONS" >&2
+    WARNS=$((WARNS+1))
+fi
 echo "  episodes       : $r_episodes (manifest: $MANIFEST_EP_EPISODES)"
 echo "  goals          : $r_goals (manifest: $MANIFEST_EP_GOALS)"
 

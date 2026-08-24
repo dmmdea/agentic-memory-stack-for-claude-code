@@ -963,22 +963,27 @@ try {
                 $mfJson = $null
                 try { $mfJson = Get-Content $latest.FullName -Raw | ConvertFrom-Json } catch {}
                 $reqNull = @(); $optNull = @()
-                if ($mfJson -and $mfJson.files) {
+                if (-not $mfJson) {
+                    Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh but does not parse as JSON — stack-restore will refuse it"
+                } elseif (-not $mfJson.files) {
+                    # round-2 review: a manifest with no files block used to fall through to
+                    # "all required artifacts present" for a check that never opened it.
+                    Add-Check 'RECOVERY' 'backup manifest' 'FAIL' "$($latest.Name) has no files block — nothing can be verified; stack-restore will refuse it"
+                } else {
                     foreach ($k in 'qdrant_snapshot','history_db','episodic_db','tier_ledger') {
                         if (-not $mfJson.files.$k) { $reqNull += $k }
                     }
-                    foreach ($k in 'l10_flags','l10_state','claude_settings') {
+                    # every optional artifact incl. the irreplaceable worksheet
+                    foreach ($k in 'memory_md','audit_baseline','claude_settings','l10_flags','l10_state','promote_review','stale_worksheet') {
                         if (($mfJson.files.PSObject.Properties[$k]) -and (-not $mfJson.files.$k)) { $optNull += $k }
                     }
-                }
-                if ($reqNull.Count -gt 0) {
-                    Add-Check 'RECOVERY' 'backup manifest' 'FAIL' "$($latest.Name) is fresh but REQUIRED artifact(s) are null: $($reqNull -join ', ') — that night's copies failed (journalctl --user -u stack-backup)"
-                } elseif ($optNull.Count -gt 0) {
-                    Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh; optional artifact(s) null: $($optNull -join ', ')"
-                } elseif (-not $mfJson) {
-                    Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh but does not parse as JSON — stack-restore will refuse it"
-                } else {
-                    Add-Check 'RECOVERY' 'backup manifest' 'OK' "$($latest.Name) — $([int]$age.TotalHours)h old; all required artifacts present"
+                    if ($reqNull.Count -gt 0) {
+                        Add-Check 'RECOVERY' 'backup manifest' 'FAIL' "$($latest.Name) is fresh but REQUIRED artifact(s) are null: $($reqNull -join ', ') — that night's copies failed (journalctl --user -u stack-backup)"
+                    } elseif ($optNull.Count -gt 0) {
+                        Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh; optional artifact(s) null: $($optNull -join ', ')"
+                    } else {
+                        Add-Check 'RECOVERY' 'backup manifest' 'OK' "$($latest.Name) — $([int]$age.TotalHours)h old; all required artifacts present"
+                    }
                 }
             } else {
                 Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) — $([int]$age.TotalDays)d old (stack-backup.sh may be failing)"
@@ -998,6 +1003,10 @@ try {
     $sbState = (wsl.exe -d $TmsDistro -e bash -c "systemctl --user is-failed stack-backup.service 2>/dev/null || true" | Select-Object -First 1)
     if ("$sbState".Trim() -eq 'failed') {
         Add-Check 'RECOVERY' 'stack-backup unit state' 'FAIL' 'stack-backup.service is in FAILED state - last night''s backup errored (journalctl --user -u stack-backup)'
+    } elseif (-not "$sbState".Trim()) {
+        # round-2 review: an empty probe (unit absent, user bus unreachable from the
+        # non-login shell, distro down) must not read as green.
+        Add-Check 'RECOVERY' 'stack-backup unit state' 'WARN' 'unit state unreadable (systemctl --user is-failed gave no output) - replica role, or the user bus is not reachable from this shell'
     } else {
         Add-Check 'RECOVERY' 'stack-backup unit state' 'OK' "unit state: $("$sbState".Trim())"
     }

@@ -65,6 +65,16 @@ def load_key() -> str:
 
 
 def load_state() -> dict:
+    # 2026-08-24 review round 2: the corrupt-state gate must be PERSISTENT. A
+    # one-shot quarantine moved the file aside and the NEXT unattended run then
+    # defaulted clean and save_state durably wrote a review state with no
+    # reviewed_keys - the erase merely moved from run N to run N+1. An unresolved
+    # quarantine file therefore blocks every run until the operator restores.
+    stray = sorted(STATE_FILE.parent.glob(STATE_FILE.name + ".corrupt-*"))
+    if stray:
+        sys.exit(f"FAIL: unresolved l10-state quarantine present ({stray[-1].name}); "
+                 "restore reviewed_keys from the newest backups/l10-state-*.json, then "
+                 "remove the quarantine file to resume.")
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
