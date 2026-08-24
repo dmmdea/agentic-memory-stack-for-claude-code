@@ -267,3 +267,93 @@ def test_judge_supersession_shim_down_is_fail_soft():
     with _client(handler) as c:
         out = shim.judge_supersession("a", "b", client=c)
     assert out["ok"] is False
+
+
+# --- lock patience (2026-08-24 judge-resilience) ----------------------------------
+# A 503 lock_contended is a LIVE co-tenant, not an unresponsive judge. Opt-in budget
+# waits it out; default budget 0 preserves every existing caller's fast fail-open.
+
+def _lock_contended_response():
+    return httpx.Response(503, json={"ok": False, "error": "codex busy",
+                                     "error_type": "lock_contended"})
+
+
+def test_lock_contended_is_waited_out_within_budget():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return _lock_contended_response()
+        return httpx.Response(200, json={"ok": True, "response": "YES"})
+    slept = []
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: (slept.append(s), t.__setitem__("v", t["v"] + s)),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is True and calls["n"] == 3
+    assert slept == [20.0, 20.0]
+    assert out["lock_waited_s"] == 40.0
+
+
+def test_lock_budget_exhaustion_returns_contended_with_waited():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=50.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False
+    assert out["error_type"] == "lock_contended"   # structured type survives for callers
+    assert out["lock_waited_s"] == 50.0            # partial final sleep honored the budget
+    assert calls["n"] == 4                          # 0s, 20s, 40s, 50s
+
+
+def test_default_budget_zero_never_retries_contention():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    with _client(handler) as c:
+        out = shim.judge("p", client=c)
+    assert out["ok"] is False and calls["n"] == 1
+    assert out["lock_waited_s"] == 0.0
+
+
+def test_non_lock_errors_are_never_retried_even_with_budget():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(503, json={"ok": False, "error": "boom", "error_type": "codex_failed"})
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: None, _monotonic=lambda: 0.0)
+    assert out["ok"] is False and calls["n"] == 1
+    assert out["error_type"] == "codex_failed"
+
+
+def test_wrappers_propagate_budget_and_waited():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _lock_contended_response()
+        return httpx.Response(200, json={"ok": True, "response": "NO"})
+    t = {"v": 0.0}
+    import codex_shim_client as m
+    real_judge = m.judge
+    def patched(*a, **k):
+        k.setdefault("_sleep", lambda s: t.__setitem__("v", t["v"] + s))
+        k.setdefault("_monotonic", lambda: t["v"])
+        return real_judge(*a, **k)
+    m.judge = patched
+    try:
+        with _client(handler) as c:
+            out = shim.judge_contradiction("a", "b", client=c, lock_retry_budget_s=60.0)
+    finally:
+        m.judge = real_judge
+    assert out["ok"] is True and out["contradicts"] is False
+    assert out["lock_waited_s"] == 20.0

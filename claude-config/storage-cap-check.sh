@@ -324,6 +324,13 @@ if [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
   # (~/apps/mem0-scripts, B1/MEM-7), never the dev working tree. Placement stays at
   # SessionStart deliberately: the Codex shim is only reliably up at session time,
   # and the resolver is queue-only (never auto-hides) by design.
+  # 2026-08-24 judge-resilience: at SessionStart the spawn hook may still be binding
+  # the shim when this probe fires (--max-time 2), which silently skipped whole rejudge
+  # weeks. ensure-codex-shim.sh is idempotent and bounded (30s here); fail-soft — if it
+  # cannot bring the shim up, the curl below skips exactly as before.
+  _ENSURE="$HOME/apps/mem0-scripts/ensure-codex-shim.sh"
+  [ -f "$_ENSURE" ] || _ENSURE="$MEM0_REPO_ROOT_WSL/scripts/wsl/ensure-codex-shim.sh"
+  [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ] && [ -f "$_ENSURE" ] && bash "$_ENSURE" 30 >/dev/null 2>&1
   if [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ] && curl -sf --max-time 2 http://127.0.0.1:18792/health >/dev/null 2>&1; then
     touch "$RESOLVE_MARKER"
     _PYB="$HOME/apps/mem0-server/.venv/bin/python"; [ -x "$_PYB" ] || _PYB=python3

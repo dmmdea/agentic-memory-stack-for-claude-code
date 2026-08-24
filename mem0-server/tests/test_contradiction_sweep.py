@@ -541,13 +541,15 @@ class _FakeCodex:
         self.calls = []
         self.super_calls = []
 
-    def judge_contradiction(self, a, b, timeout_s=45):
+    # lock_retry_budget_s mirrors the real client interface (judge resilience,
+    # 2026-08-24) — the sweep's _codex_call always passes it.
+    def judge_contradiction(self, a, b, timeout_s=45, lock_retry_budget_s=0.0):
         self.calls.append((a, b, timeout_s))
-        return self._out
+        return dict(self._out)
 
-    def judge_supersession(self, older, newer, timeout_s=45):
+    def judge_supersession(self, older, newer, timeout_s=45, lock_retry_budget_s=0.0):
         self.super_calls.append((older, newer, timeout_s))
-        return self._out
+        return dict(self._out)
 
 
 def test_collection_is_the_live_egemma_collection():
@@ -850,9 +852,9 @@ def test_supersession_dispatch_cache_is_order_sensitive(monkeypatch, _tmp_pair_c
         def __init__(self, out):
             self.out = out
             self.calls = []
-        def judge_supersession(self, older, newer, timeout_s=0):
+        def judge_supersession(self, older, newer, timeout_s=0, lock_retry_budget_s=0.0):
             self.calls.append((older, newer))
-            return self.out
+            return dict(self.out)
     fake = _FakeCodexSup({"ok": True, "stale": True, "raw": "STALE"})
     monkeypatch.setattr(sweep, "_codex", fake)
     v1, _ = sweep.judge_supersession_dispatch("codex", None, "m", "old", "new", 30)
@@ -1145,3 +1147,110 @@ def test_judged_pairs_mode_queues_and_never_stamps():
     # and the old refusal is gone: --apply now selects the judged mode
     assert "count-only this wave" not in src
     assert "judged=args.apply" in src
+
+
+# --- judge resilience (2026-08-24): lock patience, ensure-shim, live stamp --------
+
+@pytest.fixture(autouse=True)
+def _reset_resilience_state(monkeypatch, tmp_path):
+    """The resilience layer keeps per-RUN module state; tests must not leak it."""
+    monkeypatch.setattr(sweep, "_LOCK_BUDGET", {"remaining_s": sweep.LOCK_PATIENCE_BUDGET_S})
+    monkeypatch.setattr(sweep, "_ENSURE_SHIM", {"tried": False})
+    monkeypatch.setattr(sweep, "LIVE_JUDGE_STAMP", tmp_path / "last-live-judge")
+
+
+class _StubCodex:
+    """Scripted judge_contradiction/judge_supersession doubles."""
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.NLI_PROMPT_VERSION = "v1"
+        self.SUPERSESSION_PROMPT_VERSION = "v1"
+        self.CODEX_JUDGE_IDENTITY = "stub"
+
+    def _next(self, kwargs):
+        self.calls.append(kwargs)
+        return dict(self.script.pop(0))
+
+    def judge_contradiction(self, a, b, timeout_s=30, lock_retry_budget_s=0.0):
+        return self._next({"budget": lock_retry_budget_s})
+
+    def judge_supersession(self, a, b, timeout_s=30, lock_retry_budget_s=0.0):
+        return self._next({"budget": lock_retry_budget_s})
+
+
+def test_lock_exhaustion_yields_distinct_detail_and_decrements_budget(monkeypatch):
+    stub = _StubCodex([{"ok": False, "error_type": "lock_contended", "lock_waited_s": 123.0}])
+    monkeypatch.setattr(sweep, "_codex", stub)
+    verdict, detail = sweep.judge_pair_codex("a", "b")
+    assert verdict is None
+    assert detail.startswith(sweep.LOCK_CONTENDED_PREFIX)
+    assert "unresponsive" not in detail
+    assert sweep._LOCK_BUDGET["remaining_s"] == sweep.LOCK_PATIENCE_BUDGET_S - 123.0
+    # the call received the run's (then-full) budget, not a per-call constant
+    assert stub.calls[0]["budget"] == sweep.LOCK_PATIENCE_BUDGET_S
+
+
+def test_budget_is_per_run_shared_across_calls(monkeypatch):
+    stub = _StubCodex([
+        {"ok": False, "error_type": "lock_contended", "lock_waited_s": 2000.0},
+        {"ok": False, "error_type": "lock_contended", "lock_waited_s": 400.0},
+    ])
+    monkeypatch.setattr(sweep, "_codex", stub)
+    sweep.judge_pair_codex("a", "b")
+    sweep.judge_supersession_codex("old", "new")
+    assert stub.calls[1]["budget"] == sweep.LOCK_PATIENCE_BUDGET_S - 2000.0
+    assert sweep._LOCK_BUDGET["remaining_s"] == 0.0
+
+
+def test_unreachable_triggers_ensure_shim_exactly_once(monkeypatch):
+    ensured = {"n": 0}
+    def fake_ensure():
+        # replicate the real one-shot contract: only the first call may succeed
+        if sweep._ENSURE_SHIM["tried"]:
+            return False
+        sweep._ENSURE_SHIM["tried"] = True
+        ensured["n"] += 1
+        return True
+    monkeypatch.setattr(sweep, "_ensure_shim_once", fake_ensure)
+    stub = _StubCodex([
+        {"ok": False, "error_type": "unreachable", "lock_waited_s": 0.0},
+        {"ok": True, "contradicts": True, "raw": "YES", "lock_waited_s": 0.0},
+        {"ok": False, "error_type": "unreachable", "lock_waited_s": 0.0},
+    ])
+    monkeypatch.setattr(sweep, "_codex", stub)
+    verdict, detail = sweep.judge_pair_codex("a", "b")
+    assert verdict is True and ensured["n"] == 1           # ensured + retried once
+    verdict2, detail2 = sweep.judge_pair_codex("a", "b")
+    assert verdict2 is None and ensured["n"] == 1          # never a second ensure
+    assert detail2.startswith("codex-error: unreachable")
+
+
+def test_live_verdict_writes_the_freshness_stamp(monkeypatch):
+    stub = _StubCodex([{"ok": True, "stale": False, "raw": "KEEP", "lock_waited_s": 0.0}])
+    monkeypatch.setattr(sweep, "_codex", stub)
+    verdict, _ = sweep.judge_supersession_codex("old", "new")
+    assert verdict is False
+    stamped = json.loads(sweep.LIVE_JUDGE_STAMP.read_text(encoding="utf-8"))
+    assert stamped["epoch"] > 0 and "ts" in stamped
+
+
+def test_failed_verdict_does_not_stamp(monkeypatch):
+    stub = _StubCodex([{"ok": False, "error_type": "codex_failed", "lock_waited_s": 0.0}])
+    monkeypatch.setattr(sweep, "_codex", stub)
+    sweep.judge_pair_codex("a", "b")
+    assert not sweep.LIVE_JUDGE_STAMP.exists()
+
+
+def test_all_four_legs_handle_lock_and_codex_failures():
+    """Source-shape pin: every judged leg must (a) abort DISTINCTLY on the
+    lock-exhausted detail and (b) count codex-error toward the unresponsive
+    abort — the discovery leg's llm-error-only counting let a dead Codex judge
+    fast-skip ~400 pairs into a benign-looking no-op (08-16), and rejudge
+    counted nothing at all."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert src.count("LOCK_CONTENDED_PREFIX):") >= 4, \
+        "all four judged legs must branch on the lock-exhausted detail"
+    assert 'startswith("llm-error")' not in src.replace(
+        'detail.startswith("llm-error") or detail.startswith("codex-error")', ""), \
+        "no leg may count llm-error without also counting codex-error"

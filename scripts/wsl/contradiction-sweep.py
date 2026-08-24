@@ -73,7 +73,9 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -170,6 +172,84 @@ PAIR_TIMEOUT_S = 30.0
 COLD_LOAD_TIMEOUT_S = 120.0
 PROMPT_TEXT_MAX_CHARS = 1500  # MAX_MEMORY_CHARS — payloads never legally exceed it
 MAX_CONSECUTIVE_LLM_FAILURES = 5  # v0.20 M7: abort instead of N silent skips
+
+# --- judge resilience (2026-08-24) -------------------------------------------------
+# A shim 503 `lock_contended` is a LIVE co-tenant (dream / L1a) holding the shared
+# codex lock — the opposite of "judge unresponsive". The 08-23 retrieval-pairs run
+# burned its 5-consecutive abort on one lock-hold sampled five times in one second
+# and lost the week. Sweeps are latency-insensitive, so they opt in to the client's
+# lock patience with a per-RUN budget. 40 min ON PURPOSE: Acquire-CodexLock treats a
+# holder as live for up to 30 min (MaxAgeMinutes), so the budget outlasts both any
+# legitimate hold chain AND the stale-reclaim of a wedged holder; everything nests
+# far inside jobs.py --stale-after (3 h) and the oneshot units' infinite timeout.
+# Budget exhaustion aborts with the DISTINCT outcome degraded:judge-lock-contended —
+# never the unresponsive one — so receipts tell the truth about what happened.
+LOCK_PATIENCE_BUDGET_S = 2400.0
+_LOCK_BUDGET = {"remaining_s": LOCK_PATIENCE_BUDGET_S}
+LOCK_CONTENDED_PREFIX = "codex-lock-contended"
+LOCK_EXHAUSTED_OUTCOME = "degraded:judge-lock-contended"
+
+# Stamped on every LIVE Codex verdict (any leg, cache misses only by construction —
+# cache hits never reach the codex functions). Test-MemoryStack reads it: "no live
+# judging for over a week" must be a visible WARN, not something a paid audit finds.
+LIVE_JUDGE_STAMP = Path.home() / ".mem0" / "last-live-judge"
+
+_ENSURE_SHIM = {"tried": False}
+
+
+def _stamp_live_judge() -> None:
+    """Best-effort: record that a real (non-cache) Codex verdict landed just now."""
+    try:
+        LIVE_JUDGE_STAMP.write_text(
+            json.dumps({"epoch": int(time.time()),
+                        "ts": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _ensure_shim_once() -> bool:
+    """One attempt per run to bring the Windows codex shim up via the shared
+    ensure-codex-shim.sh (WSL interop; fail-soft). Returns True when the script
+    reports the shim healthy. The systemd units' ExecStartPre already does this
+    spawn+wait; this is the in-run backstop for every other launch context
+    (SessionStart-detached rejudge, manual runs) and for a spawn that needed
+    longer than the unit's 30 s poll."""
+    if _ENSURE_SHIM["tried"]:
+        return False
+    _ENSURE_SHIM["tried"] = True
+    script = Path(__file__).resolve().parent / "ensure-codex-shim.sh"
+    if not script.is_file():
+        # deployed layout: this file runs from ~/apps/mem0-scripts/ where the
+        # ensure script is rsynced alongside — same directory either way.
+        return False
+    try:
+        proc = subprocess.run(["bash", str(script)], timeout=150,
+                              capture_output=True, text=True)
+        if proc.returncode == 0:
+            print("contradiction-sweep: codex shim ensured up "
+                  f"({(proc.stdout or '').strip()[:120]})", flush=True)
+            return True
+        print("contradiction-sweep: ensure-codex-shim failed "
+              f"({(proc.stderr or proc.stdout or '').strip()[:120]})", flush=True)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"contradiction-sweep: ensure-codex-shim error: {e}", flush=True)
+    return False
+
+
+def _codex_call(fn, *args, **kwargs) -> dict:
+    """Run a codex_shim_client judge function with the run's remaining lock-patience
+    budget, decrement the budget by the time actually waited, and on `unreachable`
+    try the one-shot ensure-shim then retry once. Fail-soft dict passthrough."""
+    budget = max(0.0, _LOCK_BUDGET["remaining_s"])
+    out = fn(*args, lock_retry_budget_s=budget, **kwargs)
+    _LOCK_BUDGET["remaining_s"] = max(
+        0.0, _LOCK_BUDGET["remaining_s"] - float(out.get("lock_waited_s") or 0.0))
+    if not out.get("ok") and out.get("error_type") == "unreachable" and _ensure_shim_once():
+        out = fn(*args, lock_retry_budget_s=max(0.0, _LOCK_BUDGET["remaining_s"]), **kwargs)
+        _LOCK_BUDGET["remaining_s"] = max(
+            0.0, _LOCK_BUDGET["remaining_s"] - float(out.get("lock_waited_s") or 0.0))
+    return out
 
 # v0.20 M5: instruction-first, data-marked judge prompt. The memory texts are
 # attacker-influenceable stored content, so they are framed as untrusted DATA
@@ -387,9 +467,17 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
     statement_a = canonical (A), statement_b = candidate (B): 'does B contradict A'."""
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
-    out = _codex.judge_contradiction(str(canonical_text), str(candidate_text), timeout_s=int(timeout_s))
+    out = _codex_call(_codex.judge_contradiction, str(canonical_text), str(candidate_text),
+                      timeout_s=int(timeout_s))
     if not out.get("ok"):
+        # Distinct prefix for budget-exhausted contention: the legs abort with
+        # degraded:judge-lock-contended instead of miscounting a live co-tenant
+        # as an unresponsive judge.
+        if out.get("error_type") == "lock_contended":
+            return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
+                          f"(waited {out.get('lock_waited_s', 0)}s)")
         return None, f"codex-error: {out.get('error_type')}: {str(out.get('error'))[:120]}"
+    _stamp_live_judge()
     verdict = out.get("contradicts")
     raw = str(out.get("raw") or "")
     detail = raw.splitlines()[0][:200] if raw else "(empty reply)"
@@ -556,9 +644,14 @@ def judge_supersession_codex(older_text: str, newer_text: str,
     (verdict, detail) contract as judge_pair_codex: True=STALE, False=KEEP, None on failure."""
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
-    out = _codex.judge_supersession(str(older_text), str(newer_text), timeout_s=int(timeout_s))
+    out = _codex_call(_codex.judge_supersession, str(older_text), str(newer_text),
+                      timeout_s=int(timeout_s))
     if not out.get("ok"):
+        if out.get("error_type") == "lock_contended":
+            return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
+                          f"(waited {out.get('lock_waited_s', 0)}s)")
         return None, f"codex-error: {out.get('error_type')}: {str(out.get('error'))[:120]}"
+    _stamp_live_judge()
     verdict = out.get("stale")
     raw = str(out.get("raw") or "")
     detail = raw.splitlines()[0][:200] if raw else "(empty reply)"
@@ -1017,6 +1110,8 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
     mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
     checked = yes = no = cleared = skipped = queued = 0
     aborted = None
+    consec_fail = 0  # 2026-08-24: rejudge previously counted NO judge failure at all —
+    # a dead judge fast-skipped every stamped record and reported outcome=ok.
     cleared_ids, kept_ids = [], []
     try:
         stamped = scroll_stamped(qdrant_http)
@@ -1072,7 +1167,19 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             if decision == "skip":
                 skipped += 1
                 print(f"  SKIP {cid}: judge gave no verdict ({detail})", flush=True)
+                if detail.startswith(LOCK_CONTENDED_PREFIX):
+                    aborted = f"judge-lock-contended: {detail[:120]}"
+                    print(f"contradiction-sweep: rejudge-stamped ABORT - {aborted}", flush=True)
+                    break
+                if detail.startswith(("llm-error", "codex-error")):
+                    consec_fail += 1
+                    if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
+                        aborted = (f"judge unresponsive: {MAX_CONSECUTIVE_LLM_FAILURES} "
+                                   f"consecutive failures (last: {detail[:120]})")
+                        print(f"contradiction-sweep: rejudge-stamped ABORT - {aborted}", flush=True)
+                        break
                 continue
+            consec_fail = 0  # a real verdict resets the failure streak
             if decision == "clear":
                 no += 1
                 print(f"  CLEAR {cid}: re-judged NO vs {canonical_id} — false positive ({detail})", flush=True)
@@ -1226,6 +1333,10 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                 pairs += 1
                 if verdict is None:
                     skipped += 1
+                    if detail.startswith(LOCK_CONTENDED_PREFIX):
+                        aborted = f"judge-lock-contended: {detail[:120]}"
+                        print(f"contradiction-sweep: evidence-sweep ABORT - {aborted}", flush=True)
+                        break
                     if detail.startswith("llm-error") or detail.startswith("codex-error"):
                         consec_fail += 1
                         if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
@@ -1558,6 +1669,11 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                     judged_stats["judged"] += 1
                     if verdict is None:
                         judged_stats["skipped"] += 1
+                        if detail.startswith(LOCK_CONTENDED_PREFIX):
+                            outcome = LOCK_EXHAUSTED_OUTCOME
+                            print("contradiction-sweep: retrieval-pairs judge ABORT - "
+                                  f"{detail[:120]}", flush=True)
+                            break
                         if detail.startswith(("llm-error", "codex-error")):
                             consec_fail += 1
                             if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
@@ -1929,10 +2045,17 @@ def main() -> int:
                 if verdict is None:
                     skipped_pairs += 1
                     print(f"    SKIP pair {cand_id}: {detail}", flush=True)
-                    if detail.startswith("llm-error"):
+                    if detail.startswith(LOCK_CONTENDED_PREFIX):
+                        aborted = f"judge-lock-contended: {detail[:120]}"
+                        print(f"contradiction-sweep: ABORT - {aborted}", flush=True)
+                        break
+                    # 2026-08-24: codex-error now COUNTS here too — the discovery leg
+                    # previously counted only llm-error, so a dead Codex judge fast-
+                    # skipped every pair and the run reported a benign-looking no-op.
+                    if detail.startswith(("llm-error", "codex-error")):
                         consecutive_llm_failures += 1
                         if consecutive_llm_failures >= MAX_CONSECUTIVE_LLM_FAILURES:
-                            aborted = (f"llm unresponsive: "
+                            aborted = (f"judge unresponsive: "
                                        f"{MAX_CONSECUTIVE_LLM_FAILURES} consecutive "
                                        f"judge failures (last: {detail[:120]})")
                             print(f"contradiction-sweep: ABORT - {aborted}", flush=True)

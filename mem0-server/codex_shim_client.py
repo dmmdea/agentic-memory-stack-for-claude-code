@@ -19,11 +19,22 @@ returns HTTP 400. The shim binds both, but localhost is the verified-clean path.
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 import httpx
 
 DEFAULT_URL = "http://localhost:18792"
+
+# Lock-patience defaults (2026-08-24, judge-resilience). A shim 503
+# `lock_contended` is proof of LIVENESS — a co-tenant (dream / L1a) is working —
+# and it returns in milliseconds, so counting a contended burst as
+# "unresponsive" samples one lock-hold five times (the 08-23 retrieval-pairs
+# abort). Callers that can afford to wait (scheduled sweeps) opt IN via
+# `lock_retry_budget_s`; the default 0.0 keeps every existing caller —
+# including the app.py NLI write-gate, which must fail open FAST — exactly
+# as before.
+LOCK_RETRY_INTERVAL_S = 20.0
 
 
 def shim_url() -> str:
@@ -62,14 +73,9 @@ def health(timeout_s: float = 3.0, client: Optional[httpx.Client] = None) -> dic
             client.close()
 
 
-def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
-          client: Optional[httpx.Client] = None) -> dict:
-    """POST /judge — run a Codex judgment via the shim.
-
-    Returns {ok: True, response, tokens_used, duration_ms} on success, else a fail-soft
-    {ok: False, error_type, error}. Never raises. The HTTP client timeout intentionally
-    exceeds the shim's codex timeout so we don't abandon a call codex is still running.
-    """
+def _judge_once(prompt: str, effort: str, timeout_s: int,
+                client: Optional[httpx.Client]) -> dict:
+    """Single POST /judge attempt. Fail-soft dict, never raises."""
     key = _api_key()
     if not key:
         return {"ok": False, "error_type": "no_key", "error": "mem0 api key unavailable"}
@@ -101,6 +107,41 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
         data.setdefault("error_type", f"http_{r.status_code}")
         return data
     return {"ok": False, "error_type": f"http_{r.status_code}", "error": (r.text or "")[:200]}
+
+
+def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
+          client: Optional[httpx.Client] = None,
+          lock_retry_budget_s: float = 0.0,
+          lock_retry_interval_s: float = LOCK_RETRY_INTERVAL_S,
+          _sleep=time.sleep, _monotonic=time.monotonic) -> dict:
+    """POST /judge — run a Codex judgment via the shim.
+
+    Returns {ok: True, response, tokens_used, duration_ms} on success, else a fail-soft
+    {ok: False, error_type, error}. Never raises. The HTTP client timeout intentionally
+    exceeds the shim's codex timeout so we don't abandon a call codex is still running.
+
+    Lock patience (opt-in): when `lock_retry_budget_s` > 0, a shim 503 with
+    error_type `lock_contended` is WAITED OUT — sleep `lock_retry_interval_s`,
+    retry — until the budget is spent; every other failure returns immediately,
+    unchanged. The returned dict always carries `lock_waited_s` (0.0 when no
+    contention was seen) so a caller managing a per-RUN budget can decrement it.
+    The classification happens on the structured `error_type`, never on a
+    flattened detail string. `_sleep`/`_monotonic` are injectable for tests.
+    """
+    waited = 0.0
+    start = _monotonic()
+    while True:
+        out = _judge_once(prompt, effort, timeout_s, client)
+        if out.get("ok") or out.get("error_type") != "lock_contended":
+            out["lock_waited_s"] = round(waited, 1)
+            return out
+        waited = _monotonic() - start
+        remaining = lock_retry_budget_s - waited
+        if remaining <= 0:
+            out["lock_waited_s"] = round(waited, 1)
+            return out
+        _sleep(min(lock_retry_interval_s, remaining))
+        waited = _monotonic() - start
 
 
 # ---------------------------------------------------------------------------
@@ -167,19 +208,23 @@ def parse_contradiction_verdict(text: str):
 
 
 def judge_contradiction(statement_a: str, statement_b: str, effort: str = "low",
-                        timeout_s: int = 30, client: Optional[httpx.Client] = None) -> dict:
+                        timeout_s: int = 30, client: Optional[httpx.Client] = None,
+                        lock_retry_budget_s: float = 0.0) -> dict:
     """Ask Codex (via the shim) whether statement B contradicts statement A.
 
     Returns {ok: True, contradicts: bool|None, raw} on a clean call (contradicts=None
     means the reply was unparseable/hedged — treat as 'not a confident contradiction'),
     else the fail-soft {ok: False, error_type, ...} from judge(). NEVER raises.
+    Both shapes carry judge()'s `lock_waited_s`.
     """
     out = judge(build_nli_prompt(statement_a, statement_b), effort=effort,
-                timeout_s=timeout_s, client=client)
+                timeout_s=timeout_s, client=client,
+                lock_retry_budget_s=lock_retry_budget_s)
     if not out.get("ok"):
         return out
     return {"ok": True, "contradicts": parse_contradiction_verdict(out.get("response", "")),
-            "raw": out.get("response", ""), "tokens_used": out.get("tokens_used")}
+            "raw": out.get("response", ""), "tokens_used": out.get("tokens_used"),
+            "lock_waited_s": out.get("lock_waited_s", 0.0)}
 
 
 # ---------------------------------------------------------------------------
@@ -246,16 +291,20 @@ def parse_supersession_verdict(text: str):
 
 
 def judge_supersession(older_fact: str, newer_fact: str, effort: str = "low",
-                       timeout_s: int = 30, client: Optional[httpx.Client] = None) -> dict:
+                       timeout_s: int = 30, client: Optional[httpx.Client] = None,
+                       lock_retry_budget_s: float = 0.0) -> dict:
     """Ask Codex (via the shim) whether the OLDER fact should be HIDDEN as stale given the NEWER.
 
     Returns {ok: True, stale: bool|None, raw} on a clean call (stale=None means the reply was
     unparseable/hedged — treat as 'not a confident stale' = KEEP), else the fail-soft
     {ok: False, error_type, ...} from judge(). NEVER raises.
+    Both shapes carry judge()'s `lock_waited_s`.
     """
     out = judge(build_supersession_prompt(older_fact, newer_fact), effort=effort,
-                timeout_s=timeout_s, client=client)
+                timeout_s=timeout_s, client=client,
+                lock_retry_budget_s=lock_retry_budget_s)
     if not out.get("ok"):
         return out
     return {"ok": True, "stale": parse_supersession_verdict(out.get("response", "")),
-            "raw": out.get("response", ""), "tokens_used": out.get("tokens_used")}
+            "raw": out.get("response", ""), "tokens_used": out.get("tokens_used"),
+            "lock_waited_s": out.get("lock_waited_s", 0.0)}

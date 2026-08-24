@@ -1203,6 +1203,28 @@ try {
     }
 } catch { Add-Check 'RECOVERY' 'contradiction sweep' 'WARN' $_.Exception.Message }
 
+# Judge-resilience (2026-08-24): LIVE Codex judging freshness. The sweeps stamp
+# ~/.mem0/last-live-judge on every real (non-cache) Codex verdict, any leg. The
+# 08-16/08-23 incident: two consecutive weeks passed with ZERO live judging while
+# every per-run row above showed a defensible ok/no-op — cache-only and fast-skip
+# runs are individually benign, so only a cross-run freshness stamp can see the
+# class. WARN past 9 days (one weekly cycle + grace); missing stamp = the same
+# silent state, reported honestly, self-clears on the first live verdict.
+try {
+    $ljStamp = "$TmsHomeUnc\.mem0\last-live-judge"
+    if (Test-Path $ljStamp) {
+        $lj = Get-Content $ljStamp -Raw | ConvertFrom-Json
+        $ljAge = (Get-Date) - ([System.DateTimeOffset]::FromUnixTimeSeconds([long]$lj.epoch).LocalDateTime)
+        if ($ljAge.TotalDays -gt 9) {
+            Add-Check 'RECOVERY' 'codex live-judge freshness' 'WARN' "last LIVE Codex verdict $([int]$ljAge.TotalDays)d ago ($($lj.ts)) - the judge legs are running without judging (shim down, lock starvation, or cache-only weeks). Probe :18792/health, then run a bounded live check: contradiction-sweep.py --retrieval-pairs --judge codex (dry-run default)"
+        } else {
+            Add-Check 'RECOVERY' 'codex live-judge freshness' 'OK' "last LIVE Codex verdict $($lj.ts) ($([Math]::Round($ljAge.TotalDays,1))d ago)"
+        }
+    } else {
+        Add-Check 'RECOVERY' 'codex live-judge freshness' 'WARN' 'no live-judge stamp recorded yet - zero live Codex verdicts since this check shipped (expected to self-clear at the next Sunday sweep or rejudge; if it persists past a week the judge legs are dead)'
+    }
+} catch { Add-Check 'RECOVERY' 'codex live-judge freshness' 'WARN' $_.Exception.Message }
+
 # R6d: episodic-ledger reconciliation freshness + drift (v0.27.4 R5)
 # episodic-reconcile.py logs one JSONL line per run to ~/.mem0/episodic-reconciliation.jsonl
 # (READ-ONLY drift detection: orphaned mem0 links / dangling episodes). WARN on any drift, a
