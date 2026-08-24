@@ -1,0 +1,74 @@
+"""Tests for scripts/wsl/audit-flags-triage.py (2026-08-24: --only-types + atomic state).
+
+The triage tool writes the operator's review state (l10-state.json reviewed_keys) —
+the file the daily backup now protects. Two properties are load-bearing:
+(1) --only-types resolves EXACTLY the named class (an en-masse resolve that
+    accidentally swallows a security class is the failure the flag prevents);
+(2) the state write is atomic (the l10 timer floats and can coincide with the
+    03:30 backup; a torn state restored later wipes reviewed_keys).
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_spec = importlib.util.spec_from_file_location(
+    "audit_flags_triage", REPO_ROOT / "scripts" / "wsl" / "audit-flags-triage.py")
+tri = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tri)
+
+
+@pytest.fixture(autouse=True)
+def _tmp_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(tri, "STATE_FILE", tmp_path / "l10-state.json")
+    monkeypatch.setattr(tri, "FLAGS_FILE", tmp_path / "audit-flags.jsonl")
+
+
+def _rows():
+    return [
+        {"memory_id": "m1", "flag_type": "oversize"},
+        {"memory_id": "m2", "flag_type": "oversize"},
+        {"memory_id": "m3", "flag_type": "possible-credential"},
+        {"memory_id": "m4", "flag_type": "missing-provenance"},
+    ]
+
+
+def _reviewed():
+    return set(json.loads(tri.STATE_FILE.read_text(encoding="utf-8"))["reviewed_keys"])
+
+
+def test_only_types_resolves_exactly_the_named_class():
+    tri.resolve(_rows(), {}, "burn the oversize backlog", set(), only_types={"oversize"})
+    reviewed = _reviewed()
+    assert len(reviewed) == 2
+    assert all("m1" in k or "m2" in k for k in reviewed), \
+        "only the oversize rows may be marked; credential + provenance stay open"
+
+
+def test_keep_types_still_wins_over_only_types():
+    tri.resolve(_rows(), {}, "r", {"oversize"}, only_types={"oversize"})
+    assert tri.STATE_FILE.exists() and _reviewed() == set(), \
+        "keep-types is the operator's hard protection - it must beat only-types"
+
+
+def test_no_only_types_keeps_the_old_resolve_all_behavior():
+    tri.resolve(_rows(), {}, "r", {"possible-credential"})
+    assert len(_reviewed()) == 3   # everything except the kept security class
+
+
+def test_review_log_records_the_class_scope():
+    tri.resolve(_rows(), {}, "scoped burn", set(), only_types={"oversize"})
+    state = json.loads(tri.STATE_FILE.read_text(encoding="utf-8"))
+    entry = state["review_log"][-1]
+    assert entry["only_types"] == ["oversize"] and entry["marked"] == 2
+
+
+def test_state_write_is_atomic_no_tmp_left_behind():
+    tri.resolve(_rows(), {}, "r", set(), only_types={"oversize"})
+    leftovers = [p.name for p in tri.STATE_FILE.parent.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+    json.loads(tri.STATE_FILE.read_text(encoding="utf-8"))  # parses whole
