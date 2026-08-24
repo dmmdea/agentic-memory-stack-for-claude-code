@@ -92,9 +92,10 @@ ORPHAN_DEGRADE_THRESHOLD = 10
 # lineage debt, not integrity loss — yet the count WARNed forever and trained the
 # operator to ignore the row. Orphans are now split by DELETION EVIDENCE:
 #   explained   = a DELETE row in mem0's history.db  OR  a delete/decay-delete event
-#                 in the tier-ledger (scripted deleters write the ledger; the API
-#                 path writes history.db; joining BOTH is what makes this
-#                 migration-proof — a mem0ai upgrade could rebuild history.db).
+#                 in the tier-ledger. Measured live 2026-08-24: history.db is the
+#                 SUPERSET (every deleter goes through DELETE /v1/memories, 63/63),
+#                 the ledger explains 49/63 and is the ACTOR/REASON source plus the
+#                 hedge for the day a mem0ai upgrade rebuilds history.db.
 #   unexplained = the memory vanished from Qdrant with NO trace = corruption,
 #                 bypass, or data loss — the page-worthy class.
 # "Explained" means "did not silently vanish", NOT "benign": a buggy deletion
@@ -104,6 +105,7 @@ ORPHAN_DEGRADE_THRESHOLD = 10
 # deletion noise removed, even one traceless orphan is store-level integrity loss.
 UNEXPLAINED_DEGRADE_THRESHOLD = 0
 LEDGER_DELETE_EVENTS = ("delete", "decay-delete")
+EVIDENCE_SOURCES = ("history.db", "tier-ledger")
 
 
 def explain_orphans(orphaned: list[dict], history_deleted: set,
@@ -247,6 +249,7 @@ def qdrant_present_ids(http: httpx.Client, ids: list[str]) -> set:
 
 HISTORY_DB = Path.home() / ".mem0" / "history.db"
 LEDGER_DIR = Path.home() / ".mem0"
+LEDGER_PARSE_ERRORS: dict = {}   # per-segment bad-line counts from the last ledger_deleted()
 
 
 def history_deleted_ids(ids: list[str], db_path: Path = HISTORY_DB) -> set:
@@ -263,11 +266,24 @@ def history_deleted_ids(ids: list[str], db_path: Path = HISTORY_DB) -> set:
             # REFUTED semgrep sqlalchemy-execute-raw-query: the only thing concatenated
             # is the PLACEHOLDER count ("?,?,?"); every value is bound as a parameter
             # via sqlite3's DB-API, so no input text ever reaches the SQL string.
-            q = ("SELECT DISTINCT memory_id FROM history WHERE event = 'DELETE' "
+            q = ("SELECT DISTINCT memory_id FROM history WHERE UPPER(event) = 'DELETE' "
                  "AND memory_id IN (" + ",".join("?" * len(chunk)) + ")")
             # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
             out.update(str(r[0]) for r in conn.execute(q, chunk).fetchall())
         return out
+    finally:
+        conn.close()
+
+
+def history_delete_row_count(db_path: Path = HISTORY_DB) -> int:
+    """Total DELETE rows in history.db (READ-ONLY; RAISES if unreadable). A live
+    store carries tens of thousands; ZERO alongside existing orphans means the
+    table was rebuilt/rotated (a mem0ai migration) - evidence loss that would
+    otherwise read as 'no deletions' with no error anywhere (review R1 HIGH)."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM history WHERE UPPER(event) = 'DELETE'").fetchone()[0])
     finally:
         conn.close()
 
@@ -289,6 +305,7 @@ def ledger_deleted(ids: list[str], ledger_dir: Path = LEDGER_DIR) -> dict:
     if not paths:
         raise FileNotFoundError(f"no tier-ledger files under {ledger_dir}")
     for p in paths:
+        parsed = bad = 0
         with p.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 if '"memory_id"' not in line:
@@ -296,13 +313,25 @@ def ledger_deleted(ids: list[str], ledger_dir: Path = LEDGER_DIR) -> dict:
                 try:
                     rec = json.loads(line)
                 except ValueError:
+                    bad += 1
                     continue
+                if not isinstance(rec, dict):
+                    # a bare JSON string/array containing "memory_id" passes the
+                    # prefilter; .get on it would crash the run with no receipt
+                    bad += 1
+                    continue
+                parsed += 1
                 if rec.get("event") not in LEDGER_DELETE_EVENTS:
                     continue
                 mid = str(rec.get("memory_id"))
                 if mid in wanted:
                     found[mid] = {"actor": rec.get("actor"), "reason": rec.get("reason"),
                                   "event": rec.get("event")}
+        if bad and not parsed:
+            # a wholly unparseable segment (truncated by disk-full, wrong encoding) is
+            # missing evidence, not "no deletions" - raise so the caller records it
+            raise OSError(f"{p.name}: {bad} unparseable line(s), 0 parseable - ledger segment unreadable")
+        LEDGER_PARSE_ERRORS[p.name] = bad
     return found
 
 
@@ -376,16 +405,24 @@ def main() -> int:
     evidence_errors: dict = {}
     hist_del: set = set()
     led_del: dict = {}
+    history_delete_total = None
     try:
+        # probed UNCONDITIONALLY (even with zero orphans) so a dead source is a
+        # standing health field, not something discovered the week orphans appear
+        history_delete_total = history_delete_row_count()
         hist_del = history_deleted_ids(orphan_ids)
+        if n_orphan and history_delete_total == 0:
+            # rotated/rebuilt table: "no DELETE rows at all" alongside live orphans is
+            # evidence LOSS, not a clean store (review R1 HIGH)
+            evidence_errors["history.db"] = "zero DELETE rows in history table (rotated/rebuilt?)"
     except (sqlite3.Error, OSError) as e:
         evidence_errors["history.db"] = f"{type(e).__name__}: {str(e)[:80]}"
     try:
-        led_del = ledger_deleted(orphan_ids)
+        led_del = ledger_deleted(orphan_ids if orphan_ids else ["__probe__"])
     except OSError as e:
         evidence_errors["tier-ledger"] = f"{type(e).__name__}: {str(e)[:80]}"
 
-    if n_orphan and len(evidence_errors) == 2:
+    if n_orphan and set(evidence_errors) >= set(EVIDENCE_SOURCES):
         split = None
         outcome = f"degraded:orphan-evidence-unavailable:{n_orphan}"
         print("episodic-reconcile: orphan deletion-evidence sources BOTH unreadable "
@@ -395,6 +432,14 @@ def main() -> int:
         outcome = reconcile_outcome(db_present=True, qdrant_ok=qdrant_ok,
                                     orphaned_count=n_orphan,
                                     unexplained_count=len(split["unexplained"]))
+        if n_orphan and evidence_errors:
+            # ONE source failed: the split ran on half the evidence. A history-only
+            # failure would otherwise page "14 unexplained = data loss" with the real
+            # cause buried in JSONL; a ledger-only failure would report ok while half
+            # the evidence pipeline is dead (review R1 HIGH). Distinct outcome, always.
+            missing = ",".join(sorted(evidence_errors))
+            outcome = (f"degraded:orphan-evidence-partial:{missing}:"
+                       f"unexplained={len(split['unexplained'])}")
 
     summary = {
         "ts": run_ts,
@@ -413,12 +458,17 @@ def main() -> int:
         "orphaned_explained_sample": (split["explained"][: args.limit_sample] if split else []),
         "orphaned_unexplained_sample": (split["unexplained"][: args.limit_sample] if split else []),
         "orphan_evidence_errors": evidence_errors,
+        "history_delete_rows_total": history_delete_total,
+        "ledger_parse_errors": dict(LEDGER_PARSE_ERRORS),
         "embedding_coverage": coverage,   # AMS-19
         "outcome": outcome,
     }
     _append_summary(summary)
+    n_ex = len(split["explained"]) if split else "n/a"
+    n_un = len(split["unexplained"]) if split else "n/a"
     print(f"episodic-reconcile: done. links={len(links)} memory_links={result['memory_links']} "
-          f"orphaned={n_orphan} dangling={n_dangling} "
+          f"orphaned={n_orphan} (explained={n_ex} unexplained={n_un} "
+          f"evidence_errors={evidence_errors or 'none'}) dangling={n_dangling} "
           f"episode-embeddings missing={coverage.get('missing')}/"
           f"{coverage.get('eligible')} (READ-ONLY) outcome={outcome} -> {RECON_LOG}",
           flush=True)

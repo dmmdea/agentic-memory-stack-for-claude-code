@@ -56,7 +56,12 @@ trace: possible data loss). Only unexplained orphans degrade the outcome
 (`degraded:orphaned-links-unexplained:<n>`, threshold zero); explained ones stay in the
 receipt with actor + reason so a suspicious burst is still visible. If neither evidence
 source can be read the run abstains (`degraded:orphan-evidence-unavailable:<n>`) rather than
-accusing every orphan.
+accusing every orphan; if exactly one source fails (or `history.db` reports zero DELETE rows
+beside live orphans — a rebuilt table) the split still runs but the outcome is
+`degraded:orphan-evidence-partial:<source>:unexplained=<n>` and Test-MemoryStack prefixes
+the row with `EVIDENCE PARTIAL` — fix the source before reading the counts. Both sources are
+probed every run, so a dead source is a standing signal, not a discovery made the week
+orphans appear.
 
 ---
 

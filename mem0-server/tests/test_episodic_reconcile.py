@@ -277,20 +277,27 @@ def _ledger_with(tmp_path, links):
 
 
 def _run_main(monkeypatch, db, *, readyz_ok=True, present=None, present_raises=None,
-              hist_deleted=None, led_deleted=None, evidence_raises=False):
+              hist_deleted=None, led_deleted=None, evidence_raises=False,
+              evidence_raises_history=False, hist_delete_total=1):
     summaries = []
     monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(recon, "LEDGER_PARSE_ERRORS", {})
     # 2026-08-24: main() consults the deletion-evidence sources; a unit run must
     # never touch the live ~/.mem0 history.db / tier-ledger (and CI has neither).
     def fake_hist(ids, db_path=None):
-        if evidence_raises:
+        if evidence_raises or evidence_raises_history:
             raise sqlite3.OperationalError("unable to open database file")
         return set(hist_deleted or [])
+    def fake_hist_total(db_path=None):
+        if evidence_raises or evidence_raises_history:
+            raise sqlite3.OperationalError("unable to open database file")
+        return hist_delete_total
     def fake_led(ids, ledger_dir=None):
         if evidence_raises:
             raise FileNotFoundError("no tier-ledger files")
         return dict(led_deleted or {})
     monkeypatch.setattr(recon, "history_deleted_ids", fake_hist)
+    monkeypatch.setattr(recon, "history_delete_row_count", fake_hist_total)
     monkeypatch.setattr(recon, "ledger_deleted", fake_led)
 
     def fake_get(url, **kw):
@@ -436,3 +443,59 @@ def test_ledger_deleted_scans_legacy_and_monthly_segments(tmp_path):
 def test_ledger_deleted_raises_when_no_ledger_files(tmp_path):
     with pytest.raises(OSError):
         recon.ledger_deleted(["x"], ledger_dir=tmp_path)
+
+
+# --- 2026-08-24 round 2: partial-evidence, rotation, parse-error surfacing ---------
+
+def test_history_delete_row_count_reads_delete_rows(tmp_path):
+    db = tmp_path / "history.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE history (memory_id TEXT, event TEXT)")
+    conn.executemany("INSERT INTO history (memory_id, event) VALUES (?, ?)",
+                     [("a", "ADD"), ("a", "DELETE"), ("b", "delete"), ("c", "UPDATE")])
+    conn.commit(); conn.close()
+    assert recon.history_delete_row_count(db_path=db) == 2   # DELETE + delete (case-tolerant)
+
+
+def test_rotated_history_table_is_evidence_loss_not_no_deletions(monkeypatch, tmp_path):
+    """A rebuilt history table (0 DELETE rows) beside live orphans must NOT read as
+    'no deletions' - it is evidence loss (review R1 HIGH). It surfaces as a partial
+    outcome, not a clean unexplained accusation."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "gone")])
+    rc, s = _run_main(monkeypatch, db, present=set(),
+                      hist_delete_total=0, led_deleted={})
+    assert rc == 1 and s["outcome"].startswith("degraded:orphan-evidence-partial:")
+    assert "history.db" in s["orphan_evidence_errors"]
+    assert s["history_delete_rows_total"] == 0
+
+
+def test_single_source_failure_is_partial_not_full_accusation(monkeypatch, tmp_path):
+    """history.db unreadable but the ledger explains the orphan: the split still runs,
+    the outcome is partial (names the dead source), NOT a data-loss accusation."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "gone")])
+    rc, s = _run_main(monkeypatch, db, present=set(), evidence_raises_history=True,
+                      led_deleted={"gone": {"actor": "semantic-dedup", "reason": "dup",
+                                            "event": "decay-delete"}})
+    assert rc == 1 and s["outcome"].startswith("degraded:orphan-evidence-partial:history.db")
+    assert s["orphaned_explained_count"] == 1 and s["orphaned_unexplained_count"] == 0
+
+
+def test_ledger_non_dict_line_does_not_crash(tmp_path):
+    # a JSON ARRAY containing the quoted "memory_id" token passes the substring
+    # prefilter and parses, but is not a dict -> counted bad, never .get-crashed
+    lines = ['["memory_id", "not-a-dict"]',
+             '{"event": "delete", "memory_id": "real", "actor": "x"}']
+    (tmp_path / "tier-ledger-2026-08.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = recon.ledger_deleted(["real", "never"], ledger_dir=tmp_path)
+    assert set(out) == {"real"}
+    assert recon.LEDGER_PARSE_ERRORS.get("tier-ledger-2026-08.jsonl") == 1
+
+
+def test_wholly_unparseable_ledger_segment_raises(tmp_path):
+    # lines carry the quoted "memory_id" token (so the prefilter admits them) but are
+    # not valid JSON -> 0 parseable, all bad -> the segment is unreadable, raise
+    lines = ['{"memory_id": TRUNCATED', '{"memory_id": also broken']
+    (tmp_path / "tier-ledger-2026-08.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(OSError, match="unreadable"):
+        recon.ledger_deleted(["x"], ledger_dir=tmp_path)
+

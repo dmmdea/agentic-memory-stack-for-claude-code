@@ -1223,6 +1223,17 @@ try {
         $hasSplit = $erLast.PSObject.Properties['orphaned_unexplained_count'] -and ($null -ne $erLast.orphaned_unexplained_count)
         $unexplained = if ($hasSplit) { [int]$erLast.orphaned_unexplained_count } else { $orphan }
         $explained   = if ($hasSplit) { [int]$erLast.orphaned_explained_count } else { 0 }
+        # partial evidence (one source unreadable) must be visible on the ROW, not only in
+        # the JSONL: a history.db failure would otherwise page "N unexplained = data loss"
+        # with the real cause buried; a ledger failure would read ok with half the
+        # evidence pipeline dead.
+        $evErr = $erLast.PSObject.Properties['orphan_evidence_errors'] -and $erLast.orphan_evidence_errors -and ($erLast.orphan_evidence_errors.PSObject.Properties.Count -gt 0)
+        if ($evErr) {
+            $evNames = ($erLast.orphan_evidence_errors.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value)" }) -join '; '
+            Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "EVIDENCE PARTIAL ($evNames) - last run $($erLast.ts) outcome=$erOutcome; the explained/unexplained split ran on incomplete evidence, fix the source before reading the counts"
+        }
+        elseif ($erOutcome -ne 'ok') { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) outcome=$erOutcome (journalctl --user -u episodic-reconcile)" }
+        elseif ($false) { }
         if ($erOutcome -ne 'ok') { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) outcome=$erOutcome (journalctl --user -u episodic-reconcile)" }
         elseif (($unexplained + $dangling) -gt 0) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts): $unexplained UNEXPLAINED orphaned mem0 link(s) (no DELETE trace = possible data loss) + $dangling dangling episode link(s) of $($erLast.total_links) total; $explained explained (deletion on record)" }
         elseif ($erAge.TotalDays -gt 14) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) >14d ago - timer may not be firing" }
