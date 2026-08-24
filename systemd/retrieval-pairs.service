@@ -1,6 +1,10 @@
 [Unit]
 Description=Weekly judged retrieval-pairs sweep (co-retrieval supersession candidates -> human review queue)
-After=network-online.target
+# 2026-08-24 review R2: ORDERING, not a clock offset, is what prevents the two
+# Codex-judged units from queueing on the single-threaded shim after a boot
+# catch-up compresses both Persistent timers into one instant. After= makes this
+# unit wait for the discovery sweep whenever both are queued in one transaction.
+After=network-online.target contradiction-sweep.service
 
 [Service]
 Type=oneshot

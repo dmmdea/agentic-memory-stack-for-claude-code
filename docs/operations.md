@@ -70,7 +70,9 @@ $PY ~/apps/mem0-scripts/contradiction-sweep.py --unstamp <memory_id>
 $PY ~/apps/mem0-scripts/contradiction-sweep.py --rejudge-stamped --judge codex --apply
 ```
 
-The Codex judge needs the Windows shim up (`:18792`; it self-starts at session start when enabled, idle-stops after 4 h). If the sweep reports `outcome=no-op:codex-shim-unreachable`, start a Claude Code session (or run the shim spawn script) and retry — it deliberately refuses to fall back to a local judge.
+The Codex judge needs the Windows shim up (`:18792`; it self-starts at session start when enabled, idle-stops after 4 h). Since 2026-08-24 every judged run brings it up on demand itself (`ensure-codex-shim.sh`, WSL interop — the units' `ExecStartPre` plus an in-run backstop), so `outcome=no-op:codex-shim-unreachable` now means the bring-up **also** failed (the receipt's `ensure_attempted` says whether it ran): check `~/.claude/logs/codex-shim.log`, then run `bash ~/apps/mem0-scripts/ensure-codex-shim.sh` by hand. It deliberately refuses to fall back to a local judge.
+
+Two more outcomes you may see: `degraded:judge-lock-contended` — the sweep waited its full 40-min patience budget for the shared codex lock (dream/L1a hold it legitimately; a wedged holder is reclaimed after 30 min) and gave up; it self-heals next run. `degraded:aborted:judge unresponsive` — five consecutive real judge failures. And Test-MemoryStack's `codex live-judge freshness` row WARNs when **no live Codex verdict** has landed in 9 days — cache-only and fast-skip runs look benign individually, that row is the cross-run alarm.
 
 ---
 

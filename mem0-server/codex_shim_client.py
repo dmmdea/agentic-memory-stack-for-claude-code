@@ -35,6 +35,14 @@ DEFAULT_URL = "http://localhost:18792"
 # including the app.py NLI write-gate, which must fail open FAST — exactly
 # as before.
 LOCK_RETRY_INTERVAL_S = 20.0
+# The two BUSY-shaped failures a budgeted caller waits out. EXPORTED so the sweep's
+# own classifiers key off the same tuple - the two sides drifted once (review R2).
+RETRYABLE_BUSY = ("lock_contended", "client_timeout")
+# A client_timeout is NOT free like a lock_contended (ms, no codex spend): the shim's
+# single-threaded loop runs the abandoned request to completion as a PAID, un-read
+# codex call, and a saturated shim makes the next attempt time out too. So timeouts
+# are capped by ATTEMPT COUNT, never by the shared wall budget (review R2).
+MAX_TIMEOUT_RETRIES = 2
 
 
 def shim_url() -> str:
@@ -134,12 +142,12 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
     structured `error_type`, never on a flattened detail string.
     `_sleep`/`_monotonic` are injectable for tests.
     """
-    _RETRYABLE_BUSY = ("lock_contended", "client_timeout")
     waited = 0.0
+    timeout_retries = 0
     start = _monotonic()
     while True:
         out = _judge_once(prompt, effort, timeout_s, client)
-        if out.get("ok") or out.get("error_type") not in _RETRYABLE_BUSY:
+        if out.get("ok") or out.get("error_type") not in RETRYABLE_BUSY:
             out["lock_waited_s"] = round(waited, 1)
             return out
         waited = _monotonic() - start
@@ -147,6 +155,11 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
         if remaining <= 0:
             out["lock_waited_s"] = round(waited, 1)
             return out
+        if out.get("error_type") == "client_timeout":
+            if timeout_retries >= MAX_TIMEOUT_RETRIES:
+                out["lock_waited_s"] = round(waited, 1)
+                return out
+            timeout_retries += 1
         # clamp: a non-positive caller interval must neither raise (the module
         # never raises) nor hot-spin against the shim.
         _sleep(max(0.1, min(lock_retry_interval_s, remaining)))

@@ -208,6 +208,25 @@ LIVE_JUDGE_STAMP = Path.home() / ".mem0" / "last-live-judge"
 _ENSURE_SHIM = {"tried": False}
 
 
+def _classify_judge_failure(detail: str) -> str:
+    """ONE classifier for all four judged legs (review R2: four inline copies
+    drifted). 'lock' = patience budget exhausted (abort with the distinct
+    outcome); 'count' = a judge failure that counts toward the consecutive
+    abort; 'skip' = an ordinary no-verdict (unparseable etc.)."""
+    if detail.startswith(LOCK_CONTENDED_PREFIX):
+        return "lock"
+    if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
+        return "count"
+    return "skip"
+
+
+def _busy_types() -> tuple:
+    """The client's retryable-busy set; the sweep must classify exhaustion with the
+    SAME tuple the client waited on, or a busy type the client retries gets
+    mislabelled 'unresponsive' here (review R2). Falls back for a stale client."""
+    return getattr(_codex, "RETRYABLE_BUSY", ("lock_contended",)) if _codex else ("lock_contended",)
+
+
 def _stamp_live_judge() -> None:
     """Best-effort: record that a real (non-cache) Codex verdict landed just now.
     Atomic replace — TMS reads this over \\\\wsl$ and a truncate-then-write torn
@@ -257,6 +276,23 @@ def _ensure_shim_once() -> bool:
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"contradiction-sweep: ensure-codex-shim error: {e}", flush=True)
     return False
+
+
+def _preflight_codex_health() -> tuple:
+    """(healthy, ensure_attempted, health_dict). 2026-08-24 review HIGH: the codex
+    health preflight used to record no-op:codex-shim-unreachable and return BEFORE
+    any judging for 3 of 4 legs, bypassing the ensure-shim backstop entirely - a
+    shim that merely needed longer than the unit's 30s ExecStartPre poll still lost
+    the week. When the shim is down: try the one-shot bring-up, re-check ONCE.
+    The attempt is returned so the receipt can distinguish "down, never tried"
+    from "down, bring-up also failed"."""
+    h = _codex.health()
+    attempted = False
+    if not h.get("ok"):
+        attempted = True
+        if _ensure_shim_once():
+            h = _codex.health()
+    return bool(h.get("ok")), attempted, h
 
 
 def _codex_call(fn, *args, **kwargs) -> dict:
@@ -495,7 +531,7 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
         # Distinct prefix for budget-exhausted contention: the legs abort with
         # degraded:judge-lock-contended instead of miscounting a live co-tenant
         # as an unresponsive judge.
-        if out.get("error_type") == "lock_contended":
+        if out.get("error_type") in _busy_types():
             consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
             return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
                           f"(this call waited {out.get('lock_waited_s', 0)}s; run consumed "
@@ -671,7 +707,7 @@ def judge_supersession_codex(older_text: str, newer_text: str,
     out = _codex_call(_codex.judge_supersession, str(older_text), str(newer_text),
                       timeout_s=int(timeout_s))
     if not out.get("ok"):
-        if out.get("error_type") == "lock_contended":
+        if out.get("error_type") in _busy_types():
             consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
             return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
                           f"(this call waited {out.get('lock_waited_s', 0)}s; run consumed "
@@ -1139,6 +1175,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
     consec_fail = 0  # 2026-08-24: rejudge previously counted NO judge failure at all —
     # a dead judge fast-skipped every stamped record and reported outcome=ok.
     cleared_ids, kept_ids = [], []
+    stamped: list = []  # bound BEFORE the try: an early scroll failure must still reach the receipt
     try:
         stamped = scroll_stamped(qdrant_http)
         print(f"contradiction-sweep: {len(stamped)} stamped record(s) to re-judge", flush=True)
@@ -1193,11 +1230,11 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             if decision == "skip":
                 skipped += 1
                 print(f"  SKIP {cid}: judge gave no verdict ({detail})", flush=True)
-                if detail.startswith(LOCK_CONTENDED_PREFIX):
+                if _classify_judge_failure(detail) == "lock":
                     aborted = f"judge-lock-contended: {detail[:120]}"
                     print(f"contradiction-sweep: rejudge-stamped ABORT - {aborted}", flush=True)
                     break
-                if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
+                if _classify_judge_failure(detail) == "count":
                     consec_fail += 1
                     if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                         aborted = (f"judge unresponsive: {MAX_CONSECUTIVE_LLM_FAILURES} "
@@ -1359,11 +1396,11 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                 pairs += 1
                 if verdict is None:
                     skipped += 1
-                    if detail.startswith(LOCK_CONTENDED_PREFIX):
+                    if _classify_judge_failure(detail) == "lock":
                         aborted = f"judge-lock-contended: {detail[:120]}"
                         print(f"contradiction-sweep: evidence-sweep ABORT - {aborted}", flush=True)
                         break
-                    if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
+                    if _classify_judge_failure(detail) == "count":
                         consec_fail += 1
                         if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                             aborted = (f"judge unresponsive: {MAX_CONSECUTIVE_LLM_FAILURES} consecutive "
@@ -1695,12 +1732,12 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                     judged_stats["judged"] += 1
                     if verdict is None:
                         judged_stats["skipped"] += 1
-                        if detail.startswith(LOCK_CONTENDED_PREFIX):
-                            outcome = LOCK_EXHAUSTED_OUTCOME
+                        if _classify_judge_failure(detail) == "lock":
+                            outcome = _outcome_for_abort(f"judge-lock-contended: {detail[:120]}")
                             print("contradiction-sweep: retrieval-pairs judge ABORT - "
                                   f"{detail[:120]}", flush=True)
                             break
-                        if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
+                        if _classify_judge_failure(detail) == "count":
                             consec_fail += 1
                             if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                                 outcome = (f"degraded:judge-unresponsive:"
@@ -1897,21 +1934,16 @@ def main() -> int:
                              "skipped": "codex_shim_client import failed",
                              "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
             return 0
-        _h = _codex.health()
-        if not _h.get("ok"):
-            # 2026-08-24 review HIGH: this preflight used to bypass the ensure-shim
-            # backstop entirely — a shim that merely needed longer than the unit's
-            # 30s ExecStartPre poll still lost the week as a benign-looking no-op.
-            # Try the one-shot bring-up, then re-check ONCE before giving up.
-            if _ensure_shim_once():
-                _h = _codex.health()
-        if not _h.get("ok"):
+        _ok, _ensured, _h = _preflight_codex_health()
+        if not _ok:
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "
-                  f"({_h.get('error_type')}) — NO-OP (start the shim or run --judge local). "
+                  f"({_h.get('error_type')}; ensure-shim attempted={_ensured}) — NO-OP "
+                  "(start the shim or run --judge local). "
                   "NOT falling back to local (would re-introduce the audited misrouting).", flush=True)
             _append_summary({"dry_run": dry_run, "judge": "codex",
                              "outcome": "no-op:codex-shim-unreachable",
-                             "skipped": f"codex shim health: {_h.get('error_type')}"})
+                             "skipped": f"codex shim health: {_h.get('error_type')}",
+                             "ensure_attempted": _ensured})
             return 0
 
     if args.rejudge_stamped:
@@ -2078,14 +2110,14 @@ def main() -> int:
                 if verdict is None:
                     skipped_pairs += 1
                     print(f"    SKIP pair {cand_id}: {detail}", flush=True)
-                    if detail.startswith(LOCK_CONTENDED_PREFIX):
+                    if _classify_judge_failure(detail) == "lock":
                         aborted = f"judge-lock-contended: {detail[:120]}"
                         print(f"contradiction-sweep: ABORT - {aborted}", flush=True)
                         break
                     # 2026-08-24: codex-error now COUNTS here too — the discovery leg
                     # previously counted only llm-error, so a dead Codex judge fast-
                     # skipped every pair and the run reported a benign-looking no-op.
-                    if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
+                    if _classify_judge_failure(detail) == "count":
                         consecutive_llm_failures += 1
                         if consecutive_llm_failures >= MAX_CONSECUTIVE_LLM_FAILURES:
                             aborted = (f"judge unresponsive: "

@@ -350,7 +350,63 @@ def test_client_timeout_exhaustion_keeps_its_own_error_type():
                          _sleep=lambda s: t.__setitem__("v", t["v"] + s),
                          _monotonic=lambda: t["v"])
     assert out["ok"] is False and out["error_type"] == "client_timeout"
-    assert out["lock_waited_s"] == 30.0
+
+
+def test_client_timeout_is_capped_by_attempt_count_not_the_wall_budget():
+    """Review R2: an abandoned timed-out request still runs to completion on the
+    single-threaded shim as a PAID, un-read codex call; a 2400s wall budget would
+    buy ~30 of them on one pair. Timeouts are capped at MAX_TIMEOUT_RETRIES."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        raise httpx.ReadTimeout("queued")
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100000.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and out["error_type"] == "client_timeout"
+    assert calls["n"] == 1 + shim.MAX_TIMEOUT_RETRIES
+
+
+def test_lock_contention_is_wall_bounded_not_attempt_capped():
+    """The cheap busy shape (ms, no spend) keeps the wall budget: many attempts."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        shim.judge("p", client=c, lock_retry_budget_s=200.0,
+                   _sleep=lambda s: t.__setitem__("v", t["v"] + s), _monotonic=lambda: t["v"])
+    assert calls["n"] > shim.MAX_TIMEOUT_RETRIES + 1   # 200s / 20s interval = ~11 attempts
+
+
+def test_attempt_duration_counts_against_the_budget():
+    """The docstring's contract: elapsed time INCLUDING the attempts themselves is
+    charged, not just the sleeps. A clock that advances 60s per call (a timing-out
+    request) must exhaust a 100s budget after the second attempt, before any
+    third — with no sleep ever charged."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    def clock():
+        return t["v"]
+    def sleeper(s):
+        t["v"] += s
+    # advance the clock 60s per ATTEMPT by hooking the transport call
+    class _SlowClient(httpx.Client):
+        def post(self, *a, **k):
+            t["v"] += 60.0
+            return super().post(*a, **k)
+    with _SlowClient(transport=httpx.MockTransport(handler)) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=sleeper, _monotonic=clock)
+    assert out["ok"] is False
+    assert calls["n"] == 2                      # 60s + 20s sleep + 60s = 140 > 100 -> stop
+    assert out["lock_waited_s"] >= 100.0
 
 
 def test_sleep_interval_is_clamped_never_raises():

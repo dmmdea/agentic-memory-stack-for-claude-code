@@ -1242,36 +1242,91 @@ def test_failed_verdict_does_not_stamp(monkeypatch):
     assert not sweep.LIVE_JUDGE_STAMP.exists()
 
 
-def test_all_four_legs_handle_lock_and_codex_failures():
-    """Source-shape pin: every judged leg must (a) abort DISTINCTLY on the
-    lock-exhausted detail and (b) count codex-error toward the unresponsive
-    abort — the discovery leg's llm-error-only counting let a dead Codex judge
-    fast-skip ~400 pairs into a benign-looking no-op (08-16), and rejudge
-    counted nothing at all."""
-    src = SCRIPT.read_text(encoding="utf-8")
-    assert src.count("LOCK_CONTENDED_PREFIX):") >= 4, \
-        "all four judged legs must branch on the lock-exhausted detail"
-    assert 'startswith("llm-error")' not in src, \
-        "no leg may count llm-error without also counting codex-error"
-    # review HIGH: an unimportable bridge ("codex-bridge-unavailable") matched neither
-    # counted prefix; on the un-preflighted retrieval-pairs leg it fast-skipped every
-    # pair into outcome=ok. Every counting site must name all three.
-    assert src.count('startswith(("llm-error", "codex-error", "codex-bridge-unavailable"))') >= 4
+def test_judge_failure_classifier_is_the_single_source_of_truth():
+    """Review R2: four inline copies of the failure branch drifted (discovery
+    counted llm-error only; rejudge counted nothing; bridge-unavailable matched
+    nothing). ONE classifier, behaviorally pinned, and every leg must call it."""
+    c = sweep._classify_judge_failure
+    assert c(f"{sweep.LOCK_CONTENDED_PREFIX}: budget exhausted") == "lock"
+    assert c("llm-error: ReadTimeout") == "count"
+    assert c("codex-error: unreachable: refused") == "count"
+    assert c("codex-bridge-unavailable: import failed") == "count"
+    assert c("codex-unparseable: hmm") == "skip"
+    assert c("unparseable: hedged") == "skip"
+    # every leg routes through it (code, not comments: strip comment lines first)
+    src = "\n".join(ln for ln in SCRIPT.read_text(encoding="utf-8").splitlines()
+                    if not ln.strip().startswith("#"))
+    assert src.count('_classify_judge_failure(detail) == "lock"') == 4
+    assert src.count('_classify_judge_failure(detail) == "count"') == 4
 
 
-def test_abort_outcome_grammar_is_uniform():
-    """LOCK_EXHAUSTED_OUTCOME must be greppable across every leg's receipts."""
+def test_abort_outcome_grammar_is_uniform_in_every_leg():
+    """LOCK_EXHAUSTED_OUTCOME must be greppable across every leg's receipts — the
+    retrieval-pairs leg used to assign the constant directly (coincidental, not
+    enforced); now all four route the lock abort through _outcome_for_abort."""
     assert sweep._outcome_for_abort("judge-lock-contended: waited 2400s").startswith(
         sweep.LOCK_EXHAUSTED_OUTCOME)
     assert sweep._outcome_for_abort("judge unresponsive: 5 consecutive").startswith(
         "degraded:aborted:")
+    src = "\n".join(ln for ln in SCRIPT.read_text(encoding="utf-8").splitlines()
+                    if not ln.strip().startswith("#"))
+    assert "outcome = LOCK_EXHAUSTED_OUTCOME" not in src, \
+        "no leg may bypass _outcome_for_abort"
 
 
-def test_preflight_unreachable_tries_ensure_shim_once(monkeypatch):
-    """Review HIGH: the codex-health preflight returned no-op:codex-shim-unreachable
-    BEFORE any judging for 3 of 4 legs, so the in-run backstop never fired."""
-    src = SCRIPT.read_text(encoding="utf-8")
-    i = src.find('_h = _codex.health()')
-    j = src.find('"outcome": "no-op:codex-shim-unreachable"', i)
-    assert i > 0 and j > i
-    assert "_ensure_shim_once()" in src[i:j], "preflight must attempt the ensure before the no-op"
+def test_sweep_exhaustion_classifier_tracks_the_clients_busy_set(monkeypatch):
+    """Review R2 CRITICAL: the client retried client_timeout as 'busy' but the sweep
+    still classified only lock_contended as lock-exhaustion, so a timeout that burned
+    the whole budget was mislabelled 'judge unresponsive'. Behavioral pin."""
+    stub = _StubCodex([{"ok": False, "error_type": "client_timeout", "lock_waited_s": 2400.0}])
+    stub.RETRYABLE_BUSY = ("lock_contended", "client_timeout")
+    monkeypatch.setattr(sweep, "_codex", stub)
+    verdict, detail = sweep.judge_pair_codex("a", "b")
+    assert verdict is None and detail.startswith(sweep.LOCK_CONTENDED_PREFIX)
+
+
+def test_preflight_health_tries_ensure_then_rechecks_once(monkeypatch):
+    """Review HIGH: the preflight returned no-op:codex-shim-unreachable BEFORE any
+    judging for 3 of 4 legs, bypassing the ensure backstop. Behavioral: health fails,
+    ensure succeeds, the RE-CHECK must run and its answer must win."""
+    calls = {"health": 0, "ensure": 0}
+    class _Health:
+        RETRYABLE_BUSY = ("lock_contended", "client_timeout")
+        def health(self):
+            calls["health"] += 1
+            return {"ok": calls["health"] >= 2}          # down first, up after ensure
+    monkeypatch.setattr(sweep, "_codex", _Health())
+    def fake_ensure():
+        calls["ensure"] += 1
+        return True
+    monkeypatch.setattr(sweep, "_ensure_shim_once", fake_ensure)
+    ok, attempted, h = sweep._preflight_codex_health()
+    assert ok is True and attempted is True
+    assert calls == {"health": 2, "ensure": 1}, "exactly one ensure + one re-check"
+
+
+def test_preflight_health_reports_attempt_when_ensure_fails(monkeypatch):
+    class _Down:
+        def health(self):
+            return {"ok": False, "error_type": "unreachable"}
+    monkeypatch.setattr(sweep, "_codex", _Down())
+    monkeypatch.setattr(sweep, "_ensure_shim_once", lambda: False)
+    ok, attempted, h = sweep._preflight_codex_health()
+    assert ok is False and attempted is True and h["error_type"] == "unreachable"
+
+
+def test_rejudge_early_scroll_failure_still_writes_the_receipt(monkeypatch):
+    """Review R2 CRITICAL (introduced by a prior fix round): `stamped_found=len(stamped)`
+    raised UnboundLocalError when scroll_stamped failed before `stamped` was bound -
+    the receipt was never written and the abort became invisible (the SessionStart
+    caller runs this under nohup >/dev/null). Drive the real leg."""
+    summaries = []
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep, "scroll_stamped", lambda http: (_ for _ in ()).throw(
+        httpx.ConnectError("qdrant blip")))
+    monkeypatch.setattr(sweep, "_read_api_key", lambda: "k", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: Path(__import__("tempfile").mkdtemp()))
+    rc = sweep.run_rejudge_stamped(_types.SimpleNamespace(judge="codex", model="m"), dry_run=True)
+    assert rc == 1
+    assert summaries and summaries[-1]["outcome"].startswith("degraded:aborted:")
+    assert summaries[-1]["stamped_found"] == 0

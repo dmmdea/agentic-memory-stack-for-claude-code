@@ -405,6 +405,20 @@ candidate contradicts the canonical statement.
   (`outcome=degraded:aborted:...`, exit nonzero) instead of N silent skips.
   Mid-run backend failure → abort with partial counts, exit nonzero. The gate
   is unaffected either way.
+  **Judge resilience (2026-08-24):** a shim `503 lock_contended` (a co-tenant —
+  dream/L1a — holds the shared codex lock) and a client timeout against the
+  single-threaded shim are *busy*, not *unresponsive*: the Codex judge functions
+  wait them out under one per-run 40-min patience budget (timeouts additionally
+  capped at 2 retries each, since an abandoned request is still a paid Codex
+  call). Exhaustion aborts with the DISTINCT `outcome=degraded:judge-lock-contended`
+  in every leg. All four judged legs (discovery, `--rejudge-stamped`,
+  `--evidence-sweep`, `--retrieval-pairs`) share one failure classifier, so
+  `codex-error`, `llm-error` and `codex-bridge-unavailable` all count toward the
+  consecutive-failure abort everywhere (the discovery leg once counted only
+  `llm-error`, letting a dead Codex judge fast-skip every pair into a no-op).
+  Every live (non-cache) verdict stamps `~/.mem0/last-live-judge`; a shim that is
+  down is brought up on demand (`ensure-codex-shim.sh`, once per run, also from
+  the health preflight — the receipt's `ensure_attempted` records it).
 - **Run log:** every run (incl. dry-run) appends one JSONL summary to
   `~/.mem0/contradiction-sweep.jsonl` (`ts`, `pairs_checked`, `yes_count`,
   `no_count`, `skipped_pairs`, `stamped_count`, `dry_run`, `model`,
