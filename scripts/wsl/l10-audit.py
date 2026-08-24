@@ -70,6 +70,8 @@ def load_state() -> dict:
     # defaulted clean and save_state durably wrote a review state with no
     # reviewed_keys - the erase merely moved from run N to run N+1. An unresolved
     # quarantine file therefore blocks every run until the operator restores.
+    # Runs FIRST (review R3): an unresolved quarantine must block before the
+    # exists/parse block, else a valid state file beside it silently un-gates.
     stray = sorted(STATE_FILE.parent.glob(STATE_FILE.name + ".corrupt-*"))
     if stray:
         sys.exit(f"FAIL: unresolved l10-state quarantine present ({stray[-1].name}); "

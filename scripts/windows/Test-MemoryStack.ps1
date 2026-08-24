@@ -973,9 +973,22 @@ try {
                     foreach ($k in 'qdrant_snapshot','history_db','episodic_db','tier_ledger') {
                         if (-not $mfJson.files.$k) { $reqNull += $k }
                     }
-                    # every optional artifact incl. the irreplaceable worksheet
+                    # optionals WARN on a TRANSITION only (review R3): present in the previous
+                    # manifest, null now = last night's copy failed. Never-produced artifacts
+                    # (audit_baseline on a normal install) must not be a standing WARN.
+                    $prevFiles = $null
+                    if ($manifests.Count -gt 1) {
+                        try { $prevFiles = (Get-Content $manifests[1].FullName -Raw | ConvertFrom-Json).files } catch {}
+                    }
                     foreach ($k in 'memory_md','audit_baseline','claude_settings','l10_flags','l10_state','promote_review','stale_worksheet') {
-                        if (($mfJson.files.PSObject.Properties[$k]) -and (-not $mfJson.files.$k)) { $optNull += $k }
+                        $nowNull  = ($mfJson.files.PSObject.Properties[$k]) -and (-not $mfJson.files.$k)
+                        $wasThere = $prevFiles -and $prevFiles.PSObject.Properties[$k] -and $prevFiles.$k
+                        # transition (present->null) catches a copy that started failing; but
+                        # the two IRREPLACEABLE optionals (operator hand-labels, queued human
+                        # decisions) warn on ANY null - a source that silently vanishes never
+                        # transitions and must not go silent forever (review R4).
+                        $irreplaceable = $k -in 'stale_worksheet','promote_review'
+                        if ($nowNull -and ($wasThere -or $irreplaceable)) { $optNull += $k }
                     }
                     if ($reqNull.Count -gt 0) {
                         Add-Check 'RECOVERY' 'backup manifest' 'FAIL' "$($latest.Name) is fresh but REQUIRED artifact(s) are null: $($reqNull -join ', ') — that night's copies failed (journalctl --user -u stack-backup)"
@@ -1004,8 +1017,10 @@ try {
     if ("$sbState".Trim() -eq 'failed') {
         Add-Check 'RECOVERY' 'stack-backup unit state' 'FAIL' 'stack-backup.service is in FAILED state - last night''s backup errored (journalctl --user -u stack-backup)'
     } elseif (-not "$sbState".Trim()) {
-        # round-2 review: an empty probe (unit absent, user bus unreachable from the
-        # non-login shell, distro down) must not read as green.
+        # round-2 review: an empty probe (user bus unreachable from the non-login
+        # shell, or the distro down) must not read as green. NOTE: a MISSING unit
+        # prints "inactive" (non-empty) and lands in the OK branch - R1's timer
+        # probe is what catches an uninstalled stack-backup.
         Add-Check 'RECOVERY' 'stack-backup unit state' 'WARN' 'unit state unreadable (systemctl --user is-failed gave no output) - replica role, or the user bus is not reachable from this shell'
     } else {
         Add-Check 'RECOVERY' 'stack-backup unit state' 'OK' "unit state: $("$sbState".Trim())"

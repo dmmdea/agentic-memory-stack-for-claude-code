@@ -113,3 +113,16 @@ def test_lingering_quarantine_blocks_every_subsequent_run(monkeypatch, tmp_path)
     for q in tmp_path.glob("l10-state.json.corrupt-*"):
         q.unlink()
     assert l10.load_state()["audited_keys"] == []
+
+
+def test_quarantine_gate_runs_before_the_state_file_is_read(monkeypatch, tmp_path):
+    """Round-3 review mutation: with the gate placed AFTER the exists/parse block, a
+    VALID state file sitting next to an unresolved quarantine was returned normally
+    and the block silently stopped blocking. Pin the ordering."""
+    import pytest as _pytest
+    state = tmp_path / "l10-state.json"
+    state.write_text('{"reviewed_keys": ["a:b"], "audited_keys": []}', encoding="utf-8")
+    (tmp_path / "l10-state.json.corrupt-20260824000000").write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(l10, "STATE_FILE", state)
+    with _pytest.raises(SystemExit, match="unresolved l10-state quarantine"):
+        l10.load_state()

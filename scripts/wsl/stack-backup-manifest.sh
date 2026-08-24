@@ -103,6 +103,9 @@ TS_ISO="${TS_DATE:0:4}-${TS_DATE:4:2}-${TS_DATE:6:2}T${TS_TIME:0:2}:${TS_TIME:2:
 # restore chased a phantom. Every entry is now conditional on the artifact being
 # present in THIS snapshot; absent artifacts are an explicit JSON null.
 mf() { if [ -f "$BACKUP_DIR/$1" ]; then echo "\"$1\""; else echo "null"; fi; }
+# required artifacts: a 0-byte file is NOT a backup (review R3) - null it so the restore
+# gate and the TMS FAIL row both see it the same night instead of at disaster time
+mfreq() { if [ -s "$BACKUP_DIR/$1" ]; then echo "\"$1\""; else echo "null"; fi; }
 
 cat > "$MANIFEST.tmp" <<EOF
 {
@@ -112,12 +115,12 @@ cat > "$MANIFEST.tmp" <<EOF
   "schema_version": "$SCHEMA_VERSION",
   "git_sha": "$GIT_SHA",
   "files": {
-    "qdrant_snapshot": $(mf "qdrant-$TS.snapshot"),
-    "history_db": $(mf "history-$TS.db"),
-    "tier_ledger": $(mf "tier-ledger-$TS.jsonl"),
+    "qdrant_snapshot": $(mfreq "qdrant-$TS.snapshot"),
+    "history_db": $(mfreq "history-$TS.db"),
+    "tier_ledger": $(mfreq "tier-ledger-$TS.jsonl"),
     "memory_md": $(mf "MEMORY-$TS.md"),
     "audit_baseline": $(mf "audit-flags-$TS.baseline"),
-    "episodic_db": $(mf "episodic-$TS.db"),
+    "episodic_db": $(mfreq "episodic-$TS.db"),
     "claude_settings": $(mf "claude-settings-$TS.json"),
     "l10_flags": $(mf "l10-flags-$TS.jsonl"),
     "l10_state": $(mf "l10-state-$TS.json"),

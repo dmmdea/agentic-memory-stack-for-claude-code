@@ -269,8 +269,10 @@ if [ -f "$SNAP_PATH" ] && [ -s "$SNAP_PATH" ]; then
     if [ "$abs_delta" -le 10 ]; then
         echo "Qdrant point count: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (within tolerance)"
     else
-        echo "WARN: Qdrant point count mismatch: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (>10 tolerance)" >&2
-        WARNS=$((WARNS+1))
+        # NOT a WARNS++ (review R3): the manifest samples the LIVE collection after
+        # the snapshot was cut, so dream/dedup writes in that window make a legitimate
+        # drift - flipping a healthy drill to outcome=partial would mask the drill credit.
+        echo "WARN: Qdrant point count drift: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (>10; manifest counts the LIVE collection post-snapshot, drift is expected when writers ran)" >&2
     fi
 else
     echo "WARN: Qdrant snapshot file not found or empty: $SNAP_PATH (skipping)" >&2
@@ -543,7 +545,7 @@ echo "    rm -f $HOME/.mem0/MEMORY-restore.md $HOME/.mem0/audit-flags-restore.ba
 echo ""
 if [ "${WARNS:-0}" -gt 0 ]; then
     echo ""
-    echo "NOTE: $WARNS optional artifact(s) FAILED to stage (see WARN lines above) — drill logged as outcome=partial"
+    echo "NOTE: $WARNS restore check(s) FAILED (see WARN lines above: core upload/copy failures AND optional stagings both count) — drill logged as outcome=partial"
     log_drill live partial
 else
     log_drill live ok   # v0.19 M9: live restore completed
