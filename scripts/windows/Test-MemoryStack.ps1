@@ -1228,13 +1228,13 @@ try {
         # with the real cause buried; a ledger failure would read ok with half the
         # evidence pipeline dead.
         $evErr = $erLast.PSObject.Properties['orphan_evidence_errors'] -and $erLast.orphan_evidence_errors -and ($erLast.orphan_evidence_errors.PSObject.Properties.Count -gt 0)
+        # ONE chain (review R2): the EVIDENCE PARTIAL branch is the head of the existing
+        # outcome chain, not a second standalone `if` (which fired a duplicate row).
         if ($evErr) {
             $evNames = ($erLast.orphan_evidence_errors.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value)" }) -join '; '
             Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "EVIDENCE PARTIAL ($evNames) - last run $($erLast.ts) outcome=$erOutcome; the explained/unexplained split ran on incomplete evidence, fix the source before reading the counts"
         }
         elseif ($erOutcome -ne 'ok') { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) outcome=$erOutcome (journalctl --user -u episodic-reconcile)" }
-        elseif ($false) { }
-        if ($erOutcome -ne 'ok') { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) outcome=$erOutcome (journalctl --user -u episodic-reconcile)" }
         elseif (($unexplained + $dangling) -gt 0) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts): $unexplained UNEXPLAINED orphaned mem0 link(s) (no DELETE trace = possible data loss) + $dangling dangling episode link(s) of $($erLast.total_links) total; $explained explained (deletion on record)" }
         elseif ($erAge.TotalDays -gt 14) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) >14d ago - timer may not be firing" }
         else { Add-Check 'RECOVERY' 'episodic reconcile' 'OK' "last $($erLast.ts): 0 unexplained drift over $($erLast.memory_links) mem0 links / $($erLast.episodes) episodes ($explained orphan(s) explained by deletion records - lineage debt, not loss)" }
