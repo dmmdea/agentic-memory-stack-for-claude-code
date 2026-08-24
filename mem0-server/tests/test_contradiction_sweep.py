@@ -1322,10 +1322,14 @@ def test_rejudge_early_scroll_failure_still_writes_the_receipt(monkeypatch):
     caller runs this under nohup >/dev/null). Drive the real leg."""
     summaries = []
     monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    # Stub the Qdrant readyz + mem0 health preflight to PASS so scroll_stamped is
+    # deterministically the failure point regardless of whether a live stack is up
+    # (CI has none; a dev box does - without this the test passes locally on the live
+    # stack and fails in CI at degraded:qdrant-unreachable before reaching the fix).
+    monkeypatch.setattr(sweep.httpx, "get",
+                        lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
     monkeypatch.setattr(sweep, "scroll_stamped", lambda http: (_ for _ in ()).throw(
         httpx.ConnectError("qdrant blip")))
-    monkeypatch.setattr(sweep, "_read_api_key", lambda: "k", raising=False)
-    monkeypatch.setattr(Path, "home", lambda: Path(__import__("tempfile").mkdtemp()))
     rc = sweep.run_rejudge_stamped(_types.SimpleNamespace(judge="codex", model="m"), dry_run=True)
     assert rc == 1
     assert summaries and summaries[-1]["outcome"].startswith("degraded:aborted:")
