@@ -65,11 +65,36 @@ def load_key() -> str:
 
 
 def load_state() -> dict:
+    # 2026-08-24 review round 2: the corrupt-state gate must be PERSISTENT. A
+    # one-shot quarantine moved the file aside and the NEXT unattended run then
+    # defaulted clean and save_state durably wrote a review state with no
+    # reviewed_keys - the erase merely moved from run N to run N+1. An unresolved
+    # quarantine file therefore blocks every run until the operator restores.
+    # Runs FIRST (review R3): an unresolved quarantine must block before the
+    # exists/parse block, else a valid state file beside it silently un-gates.
+    stray = sorted(STATE_FILE.parent.glob(STATE_FILE.name + ".corrupt-*"))
+    if stray:
+        sys.exit(f"FAIL: unresolved l10-state quarantine present ({stray[-1].name}); "
+                 "restore reviewed_keys from the newest backups/l10-state-*.json, then "
+                 "remove the quarantine file to resume.")
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            # 2026-08-24 review: silently defaulting here + the now-atomic
+            # save_state would DURABLY ERASE the operator's reviewed_keys on the
+            # very next run — a corrupt state must fail loud and preserve the
+            # evidence, never masquerade as a fresh install. Restore path:
+            # the daily backup's l10-state-<TS>.json (stack-restore.sh step 5c).
+            quarantine = STATE_FILE.with_suffix(
+                ".json.corrupt-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S"))
+            try:
+                os.replace(STATE_FILE, quarantine)
+            except OSError:
+                quarantine = "(quarantine move failed)"
+            sys.exit(f"FAIL: l10-state.json is corrupt ({e}); preserved at {quarantine}. "
+                     "Restore reviewed_keys from the newest backups/l10-state-*.json, "
+                     "then re-run.")
     return {
         "last_audit_ts": 0,
         "audited_keys": [],  # ["{memory_id}:{flag_type}", ...]  - dedup across runs
@@ -86,7 +111,13 @@ def save_state(state: dict) -> None:
     # keys, which is the intended retention.
     if len(state.get("audited_keys", [])) > 5000:
         state["audited_keys"] = state["audited_keys"][-5000:]
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    # 2026-08-24: atomic replace, not truncate-then-write. This file holds the
+    # operator's reviewed_keys; the timer floats (OnBootSec+6h) and can coincide
+    # with the 03:30 backup, whose raw cp of a half-written file would restore as
+    # an empty review state and resurrect every reviewed flag.
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 def scroll_all_qdrant_points(client: httpx.Client) -> list[dict]:

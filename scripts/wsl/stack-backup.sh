@@ -34,7 +34,7 @@ if [ -f "$HIST_SRC" ]; then
     sqlite3 "$HIST_SRC" ".backup '$HIST_DST.tmp'" 2>/dev/null \
       && mv "$HIST_DST.tmp" "$HIST_DST" \
       && echo "history.db backed up" \
-      || { echo "WARN: history.db backup failed" >&2; rc=1; }
+      || { rm -f "$HIST_DST.tmp"; echo "WARN: history.db backup failed" >&2; rc=1; }
     if [ -f "$HIST_DST" ]; then
       result=$(sqlite3 "$HIST_DST" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
@@ -48,7 +48,7 @@ if [ -f "$HIST_SRC" ]; then
     # low-write-rate history.db while sqlite3 is absent)
     cp "$HIST_SRC" "$HIST_DST.tmp" 2>/dev/null && mv "$HIST_DST.tmp" "$HIST_DST" \
       && echo "history.db backed up (cp fallback; install sqlite3 for online-backup)" \
-      || { echo "WARN: history.db backup failed (cp fallback)" >&2; rc=1; }
+      || { rm -f "$HIST_DST.tmp"; echo "WARN: history.db backup failed (cp fallback)" >&2; rc=1; }
   fi
 fi
 
@@ -67,7 +67,7 @@ for seg in "$HOME/.mem0"/tier-ledger-[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl; do
 done
 if [ "${#ledger_parts[@]}" -gt 0 ]; then
   cat "${ledger_parts[@]}" > "$LEDGER_DST.tmp" && mv "$LEDGER_DST.tmp" "$LEDGER_DST" \
-    || { echo "WARN: tier-ledger backup failed" >&2; rc=1; }
+    || { rm -f "$LEDGER_DST.tmp"; echo "WARN: tier-ledger backup failed" >&2; rc=1; }
   test -s "$LEDGER_DST" || { echo "WARN: tier-ledger backup empty" >&2; rc=1; }
 fi
 
@@ -76,7 +76,7 @@ MEMORY_SRC="$HOME/.mem0/MEMORY.md"
 MEMORY_DST="$BACKUP_DIR/MEMORY-$TS.md"
 if [ -f "$MEMORY_SRC" ]; then
   cp "$MEMORY_SRC" "$MEMORY_DST.tmp" && mv "$MEMORY_DST.tmp" "$MEMORY_DST" \
-    || { echo "WARN: MEMORY.md backup failed" >&2; rc=1; }
+    || { rm -f "$MEMORY_DST.tmp"; echo "WARN: MEMORY.md backup failed" >&2; rc=1; }
   test -s "$MEMORY_DST" || { echo "WARN: MEMORY.md backup empty" >&2; rc=1; }
 fi
 
@@ -85,7 +85,7 @@ BASELINE_SRC="$HOME/.mem0/audit-flags.baseline"
 BASELINE_DST="$BACKUP_DIR/audit-flags-$TS.baseline"
 if [ -f "$BASELINE_SRC" ]; then
   cp "$BASELINE_SRC" "$BASELINE_DST.tmp" && mv "$BASELINE_DST.tmp" "$BASELINE_DST" \
-    || { echo "WARN: audit-flags.baseline backup failed" >&2; rc=1; }
+    || { rm -f "$BASELINE_DST.tmp"; echo "WARN: audit-flags.baseline backup failed" >&2; rc=1; }
   test -s "$BASELINE_DST" || { echo "WARN: audit-flags.baseline backup empty" >&2; rc=1; }
 fi
 
@@ -98,7 +98,7 @@ if [ -f "$EPISODIC_SRC" ]; then
     sqlite3 "$EPISODIC_SRC" ".backup '$EPISODIC_DST.tmp'" 2>/dev/null \
       && mv "$EPISODIC_DST.tmp" "$EPISODIC_DST" \
       && echo "episodic.db backed up" \
-      || { echo "WARN: episodic.db backup failed" >&2; rc=1; }
+      || { rm -f "$EPISODIC_DST.tmp"; echo "WARN: episodic.db backup failed" >&2; rc=1; }
     if [ -f "$EPISODIC_DST" ]; then
       result=$(sqlite3 "$EPISODIC_DST" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
@@ -111,7 +111,7 @@ if [ -f "$EPISODIC_SRC" ]; then
     # sqlite3 not installed — fall back to cp
     cp "$EPISODIC_SRC" "$EPISODIC_DST.tmp" 2>/dev/null && mv "$EPISODIC_DST.tmp" "$EPISODIC_DST" \
       && echo "episodic.db backed up (cp fallback; install sqlite3 for online-backup)" \
-      || { echo "WARN: episodic.db backup failed (cp fallback)" >&2; rc=1; }
+      || { rm -f "$EPISODIC_DST.tmp"; echo "WARN: episodic.db backup failed (cp fallback)" >&2; rc=1; }
   fi
 fi
 
@@ -128,8 +128,68 @@ SETTINGS_SRC="/mnt/c/Users/$WIN_USER_BK/.claude/settings.json"
 SETTINGS_DST="$BACKUP_DIR/claude-settings-$TS.json"
 if [ -f "$SETTINGS_SRC" ]; then
   cp "$SETTINGS_SRC" "$SETTINGS_DST.tmp" && mv "$SETTINGS_DST.tmp" "$SETTINGS_DST" \
-    || { echo "WARN: claude settings.json backup failed" >&2; rc=1; }
+    || { rm -f "$SETTINGS_DST.tmp"; echo "WARN: claude settings.json backup failed" >&2; rc=1; }
   test -s "$SETTINGS_DST" || { echo "WARN: claude settings.json backup empty" >&2; rc=1; }
+fi
+
+# 1g. L10 admission-audit FLAGS (2026-08-24, review finding): ~/.mem0/audit-flags.jsonl
+# held 765 flags in NO backup — a restore resurfaced every reviewed flag as unreviewed.
+# Distinct 'l10-flags' prefix ON PURPOSE: the prune glob "audit-flags-*.*" already owns
+# the baseline family, and a shared glob halves both retention windows with mtime
+# interleave able to evict a whole family.
+L10FLAGS_SRC="$HOME/.mem0/audit-flags.jsonl"
+L10FLAGS_DST="$BACKUP_DIR/l10-flags-$TS.jsonl"
+if [ -f "$L10FLAGS_SRC" ]; then
+  cp "$L10FLAGS_SRC" "$L10FLAGS_DST.tmp" && mv "$L10FLAGS_DST.tmp" "$L10FLAGS_DST" \
+    || { rm -f "$L10FLAGS_DST.tmp"; echo "WARN: audit-flags.jsonl backup failed" >&2; rc=1; }
+  # no test -s: l10-audit opens the flags file append-mode unconditionally, so a
+  # 0-byte file is the LEGITIMATE zero-flags state (same reasoning as 1i below);
+  # a test -s here would fail every nightly backup on a clean corpus.
+fi
+
+# 1h. L10 review STATE (reviewed_keys). The parse check below is the ONLY guard
+# this block relies on — do NOT assume every writer of this file is atomic
+# (l10-audit's save_state is since 2026-08-24; other writers must be checked,
+# not presumed), and the l10-audit timer floats (OnBootSec+6h) so a write can
+# coincide with this backup. VALIDATE the copy parses before letting it into the
+# retention window: a torn state file restored later would wipe reviewed_keys
+# and resurrect every reviewed flag — the exact loss this block exists to prevent.
+L10STATE_SRC="$HOME/.mem0/l10-state.json"
+L10STATE_DST="$BACKUP_DIR/l10-state-$TS.json"
+if [ -f "$L10STATE_SRC" ]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    # distinct diagnosis (review M3): a vanished python3 must not read as a
+    # daily "torn write?" while the artifact silently drops out of every backup
+    echo "WARN: python3 missing - l10-state.json copy cannot be validated, SKIPPED" >&2; rc=1
+  elif cp "$L10STATE_SRC" "$L10STATE_DST.tmp" \
+     && _l10err=$(python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$L10STATE_DST.tmp" 2>&1); then
+    mv "$L10STATE_DST.tmp" "$L10STATE_DST" \
+      || { rm -f "$L10STATE_DST.tmp"; echo "WARN: l10-state.json final rename failed" >&2; rc=1; }
+  else
+    rm -f "$L10STATE_DST.tmp"
+    echo "WARN: l10-state.json backup failed or copy did not parse (torn write?): $(echo "${_l10err:-cp failed}" | tail -1)" >&2; rc=1
+  fi
+fi
+
+# 1i. Contradiction-promote review queue — the human review queue the SAFE resolver
+# feeds; losing it silently loses queued genuine contradictions. Zero-byte is a
+# legitimate state (queue empty), so no test -s here.
+PRQ_SRC="$HOME/.mem0/contradiction-promote-review.jsonl"
+PRQ_DST="$BACKUP_DIR/promote-review-$TS.jsonl"
+if [ -f "$PRQ_SRC" ]; then
+  cp "$PRQ_SRC" "$PRQ_DST.tmp" && mv "$PRQ_DST.tmp" "$PRQ_DST" \
+    || { rm -f "$PRQ_DST.tmp"; echo "WARN: contradiction-promote-review.jsonl backup failed" >&2; rc=1; }
+fi
+
+# 1j. Stale-paths hand-label worksheet — 135 operator-labelled rows; the one artifact
+# in the sidecar that cannot be regenerated (the labels killed a feature; the evidence
+# must survive the machine).
+WS_SRC="$HOME/.mem0/stale-paths-worksheet.jsonl"
+WS_DST="$BACKUP_DIR/stale-worksheet-$TS.jsonl"
+if [ -f "$WS_SRC" ]; then
+  cp "$WS_SRC" "$WS_DST.tmp" && mv "$WS_DST.tmp" "$WS_DST" \
+    || { rm -f "$WS_DST.tmp"; echo "WARN: stale-paths-worksheet backup failed" >&2; rc=1; }
+  test -s "$WS_DST" || { echo "WARN: stale-paths-worksheet backup empty" >&2; rc=1; }
 fi
 
 echo "stack-backup: local files done (rc=$rc so far)"
@@ -156,7 +216,7 @@ echo "stack-backup: local files done (rc=$rc so far)"
   if [ -f "$SNAP_SRC" ]; then
     cp "$SNAP_SRC" "$SNAP_DST.tmp" && mv "$SNAP_DST.tmp" "$SNAP_DST" \
       && echo "qdrant snapshot $SNAP -> $SNAP_DST" \
-      || echo "WARN: failed to copy Qdrant snapshot" >&2
+      || { rm -f "$SNAP_DST.tmp"; echo "WARN: failed to copy Qdrant snapshot" >&2; }
     test -s "$SNAP_DST" || echo "WARN: qdrant snapshot backup empty" >&2
   else
     echo "WARN: Qdrant snapshot file not found at $SNAP_SRC" >&2
@@ -166,9 +226,17 @@ echo "stack-backup: local files done (rc=$rc so far)"
 echo "stack-backup: Qdrant block done"
 
 # ── 3. Prune: keep last 8 snapshots of each kind ──────────────────────────────
-for kind in qdrant history tier-ledger MEMORY audit-flags episodic claude-settings; do
-  ls -1t "$BACKUP_DIR/$kind"-*.* 2>/dev/null | tail -n +9 | xargs -r rm -f
+# NOTE: kinds must be glob-disjoint — "audit-flags" matches audit-flags-*.*, so the
+# jsonl flags file lives under the distinct "l10-flags" prefix (see 1g).
+for kind in qdrant history tier-ledger MEMORY audit-flags episodic claude-settings \
+            l10-flags l10-state promote-review stale-worksheet; do
+  # .tmp strays are EXCLUDED (review H3): a lingering partial from a failed day,
+  # sorted newest by mtime, would otherwise occupy a retention slot and push the
+  # oldest GOOD copy out of the window.
+  ls -1t "$BACKUP_DIR/$kind"-*.* 2>/dev/null | grep -v '\.tmp$' | tail -n +9 | xargs -r rm -f
 done
+# sweep stale partials from crashed runs (older than 60 min = garbage, not a snapshot)
+find "$BACKUP_DIR" -maxdepth 1 -name '*.tmp' -mmin +60 -delete 2>/dev/null
 
 du -sh "$BACKUP_DIR"
 
@@ -177,7 +245,7 @@ du -sh "$BACKUP_DIR"
 # Run after all backup files (including Qdrant) are written. Fail open.
 MANIFEST_SCRIPT="$(dirname "$0")/stack-backup-manifest.sh"
 if [ -f "$MANIFEST_SCRIPT" ]; then
-    bash "$MANIFEST_SCRIPT" "$TS" || echo "WARN: manifest writer failed (non-fatal)" >&2
+    bash "$MANIFEST_SCRIPT" "$TS" || { echo "WARN: manifest writer failed - this snapshot will be UNLISTABLE by stack-restore" >&2; rc=1; }
 else
     echo "WARN: stack-backup-manifest.sh not found at $MANIFEST_SCRIPT" >&2
 fi

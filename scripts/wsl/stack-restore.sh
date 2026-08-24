@@ -104,6 +104,14 @@ if [ ! -f "$MANIFEST" ]; then
     echo "Run without --snapshot to list available snapshots." >&2
     exit 1
 fi
+# 2026-08-24 review CRITICAL: an unreadable manifest used to collapse every file
+# name to "" and "successfully restore nothing" with outcome=ok. Gate it LOUDLY,
+# stderr intact — the traceback names the corrupt byte.
+python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$MANIFEST" || {
+    echo "ERROR: manifest unreadable/corrupt (or python3 missing): $MANIFEST" >&2
+    echo "Pick an older snapshot, or re-run stack-backup.sh." >&2
+    exit 1
+}
 
 echo "=== stack-restore v0.17 Phase B ==="
 echo "Snapshot   : $SNAPSHOT_TS"
@@ -122,12 +130,25 @@ MANIFEST_EP_SESSIONS=$(python3 -c "import json; print(json.load(open('$MANIFEST'
 MANIFEST_EP_EPISODES=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['counts']['episodic_episodes'])" 2>/dev/null || echo 0)
 MANIFEST_EP_GOALS=$(python3    -c "import json; print(json.load(open('$MANIFEST'))['counts']['episodic_goals'])"    2>/dev/null || echo 0)
 
-QDRANT_SNAP_FILE=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['files']['qdrant_snapshot'])"  2>/dev/null || echo "")
-HISTORY_FILE=$(python3     -c "import json; print(json.load(open('$MANIFEST'))['files']['history_db'])"        2>/dev/null || echo "")
-LEDGER_FILE=$(python3      -c "import json; print(json.load(open('$MANIFEST'))['files']['tier_ledger'])"       2>/dev/null || echo "")
-MEMORY_FILE=$(python3      -c "import json; print(json.load(open('$MANIFEST'))['files']['memory_md'])"         2>/dev/null || echo "")
-AUDIT_FILE=$(python3       -c "import json; print(json.load(open('$MANIFEST'))['files']['audit_baseline'])"   2>/dev/null || echo "")
-EPISODIC_FILE=$(python3    -c "import json; print(json.load(open('$MANIFEST'))['files']['episodic_db'])"       2>/dev/null || echo "")
+# 2026-08-24: manifests now write JSON null for artifacts absent from a snapshot;
+# python prints that as "None" — normalize both spellings to empty so every
+# [ -n ] guard below stays truthful. get() with a default also tolerates keys
+# that pre-date this manifest version.
+mfile() {
+    python3 -c "import json,sys; v=(json.load(open(sys.argv[1])).get('files') or {}).get(sys.argv[2]); print(v if isinstance(v,str) else '')" \
+        "$MANIFEST" "$1" 2>/dev/null || echo ""
+}
+QDRANT_SNAP_FILE=$(mfile qdrant_snapshot)
+HISTORY_FILE=$(mfile history_db)
+LEDGER_FILE=$(mfile tier_ledger)
+MEMORY_FILE=$(mfile memory_md)
+AUDIT_FILE=$(mfile audit_baseline)
+EPISODIC_FILE=$(mfile episodic_db)
+L10FLAGS_FILE=$(mfile l10_flags)
+L10STATE_FILE=$(mfile l10_state)
+PRQ_FILE=$(mfile promote_review)
+WS_FILE=$(mfile stale_worksheet)
+CLAUDE_SETTINGS_FILE=$(mfile claude_settings)
 
 echo "--- Manifest contents ---"
 echo "  app_version    : $MANIFEST_APP_VERSION"
@@ -137,16 +158,24 @@ echo "  qdrant_points  : $MANIFEST_QDRANT_PTS"
 echo "  episodic: sessions=$MANIFEST_EP_SESSIONS episodes=$MANIFEST_EP_EPISODES goals=$MANIFEST_EP_GOALS"
 echo ""
 
-# Verify all files exist
+# Verify all REQUIRED files exist — and a null/empty manifest entry for a required
+# artifact is itself a missing artifact (review C1: the [ -n ] guard was written
+# for optionals; applied to required files it let an all-null manifest skip every
+# check and restore nothing with a clean exit).
 MISSING=0
-for fname in "$QDRANT_SNAP_FILE" "$HISTORY_FILE" "$LEDGER_FILE" "$EPISODIC_FILE"; do
-    if [ -n "$fname" ] && [ ! -f "$BACKUP_DIR/$fname" ]; then
-        echo "WARN: backup file missing: $BACKUP_DIR/$fname"
+for pair in "qdrant_snapshot:$QDRANT_SNAP_FILE" "history_db:$HISTORY_FILE" \
+            "tier_ledger:$LEDGER_FILE" "episodic_db:$EPISODIC_FILE"; do
+    key="${pair%%:*}"; fname="${pair#*:}"
+    if [ -z "$fname" ]; then
+        echo "ERROR: manifest lists no $key — this snapshot lacks a REQUIRED artifact (pick an older snapshot)" >&2
+        MISSING=$((MISSING+1))
+    elif [ ! -s "$BACKUP_DIR/$fname" ]; then
+        echo "WARN: backup file missing or EMPTY: $BACKUP_DIR/$fname"
         MISSING=$((MISSING+1))
     fi
 done
-# MEMORY and audit are optional (may not exist in older backups)
-for fname in "$MEMORY_FILE" "$AUDIT_FILE"; do
+# MEMORY, audit and the 2026-08-24 additions are optional (may not exist in older backups)
+for fname in "$MEMORY_FILE" "$AUDIT_FILE" "$L10FLAGS_FILE" "$L10STATE_FILE" "$PRQ_FILE" "$WS_FILE" "$CLAUDE_SETTINGS_FILE"; do
     if [ -n "$fname" ] && [ ! -f "$BACKUP_DIR/$fname" ]; then
         echo "INFO: optional file absent: $BACKUP_DIR/$fname (non-fatal)"
     fi
@@ -167,6 +196,18 @@ fi
 if [ -n "$AUDIT_FILE" ] && [ -f "$BACKUP_DIR/$AUDIT_FILE" ]; then
 echo "  5. audit-baseline  : $BACKUP_DIR/$AUDIT_FILE -> $HOME/.mem0/audit-flags-restore.baseline"
 fi
+if [ -n "$L10FLAGS_FILE" ] && [ -f "$BACKUP_DIR/$L10FLAGS_FILE" ]; then
+echo "  5b. L10 flags      : $BACKUP_DIR/$L10FLAGS_FILE -> $HOME/.mem0/audit-flags-restore.jsonl"
+fi
+if [ -n "$L10STATE_FILE" ] && [ -f "$BACKUP_DIR/$L10STATE_FILE" ]; then
+echo "  5c. L10 state      : $BACKUP_DIR/$L10STATE_FILE -> $HOME/.mem0/l10-state-restore.json (parse-checked)"
+fi
+if [ -n "$PRQ_FILE" ] && [ -f "$BACKUP_DIR/$PRQ_FILE" ]; then
+echo "  5d. promote-review : $BACKUP_DIR/$PRQ_FILE -> $HOME/.mem0/contradiction-promote-review-restore.jsonl"
+fi
+if [ -n "$WS_FILE" ] && [ -f "$BACKUP_DIR/$WS_FILE" ]; then
+echo "  5e. worksheet      : $BACKUP_DIR/$WS_FILE -> $HOME/.mem0/stale-paths-worksheet-restore.jsonl"
+fi
 echo "  6. episodic.db     : $BACKUP_DIR/$EPISODIC_FILE -> $TARGET_EPISODIC"
 echo "     (integrity_check + schema migration to current version)"
 echo "  7. post-restore health: count comparison against manifest"
@@ -179,6 +220,7 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
+WARNS=0   # optional-staging failures: reported, and the drill logs outcome=partial
 echo "=== Starting live restore ==="
 
 # ---------------------------------------------------------------------------
@@ -214,6 +256,7 @@ if [ -f "$SNAP_PATH" ] && [ -s "$SNAP_PATH" ]; then
     else
         echo "WARN: Qdrant snapshot upload response: $upload_resp" >&2
         echo "WARN: Continuing (restore may be partial)." >&2
+        WARNS=$((WARNS+1))
     fi
 
     # Verify restored point count (allow +-10 tolerance for in-flight writes)
@@ -226,11 +269,15 @@ if [ -f "$SNAP_PATH" ] && [ -s "$SNAP_PATH" ]; then
     if [ "$abs_delta" -le 10 ]; then
         echo "Qdrant point count: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (within tolerance)"
     else
-        echo "WARN: Qdrant point count mismatch: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (>10 tolerance)" >&2
+        # NOT a WARNS++ (review R3): the manifest samples the LIVE collection after
+        # the snapshot was cut, so dream/dedup writes in that window make a legitimate
+        # drift - flipping a healthy drill to outcome=partial would mask the drill credit.
+        echo "WARN: Qdrant point count drift: restored=$restored_pts manifest=$MANIFEST_QDRANT_PTS delta=$delta (>10; manifest counts the LIVE collection post-snapshot, drift is expected when writers ran)" >&2
     fi
 else
     echo "WARN: Qdrant snapshot file not found or empty: $SNAP_PATH (skipping)" >&2
     restored_pts=0
+    WARNS=$((WARNS+1))
 fi
 
 # ---------------------------------------------------------------------------
@@ -240,7 +287,11 @@ fi
 echo ""
 echo "--- Step 2: history.db restore ---"
 HIST_DST="$HOME/.mem0/history-restore.db"
-cp "$BACKUP_DIR/$HISTORY_FILE" "$HIST_DST.tmp" && mv "$HIST_DST.tmp" "$HIST_DST"
+cp "$BACKUP_DIR/$HISTORY_FILE" "$HIST_DST.tmp" && mv "$HIST_DST.tmp" "$HIST_DST" || {
+    rm -f "$HIST_DST.tmp"
+    echo "ERROR: history.db staging FAILED — aborting (a required artifact did not copy)" >&2
+    exit 1
+}
 echo "history.db restored to: $HIST_DST"
 
 # ---------------------------------------------------------------------------
@@ -250,7 +301,11 @@ echo "history.db restored to: $HIST_DST"
 echo ""
 echo "--- Step 3: tier-ledger restore ---"
 LEDGER_DST="$HOME/.mem0/tier-ledger-restore.jsonl"
-cp "$BACKUP_DIR/$LEDGER_FILE" "$LEDGER_DST.tmp" && mv "$LEDGER_DST.tmp" "$LEDGER_DST"
+cp "$BACKUP_DIR/$LEDGER_FILE" "$LEDGER_DST.tmp" && mv "$LEDGER_DST.tmp" "$LEDGER_DST" || {
+    rm -f "$LEDGER_DST.tmp"
+    echo "ERROR: tier-ledger staging FAILED — aborting (a required artifact did not copy)" >&2
+    exit 1
+}
 LEDGER_LINES=$(wc -l < "$LEDGER_DST" 2>/dev/null || echo 0)
 echo "tier-ledger restored to: $LEDGER_DST ($LEDGER_LINES lines)"
 
@@ -262,8 +317,11 @@ if [ -n "$MEMORY_FILE" ] && [ -f "$BACKUP_DIR/$MEMORY_FILE" ]; then
     echo ""
     echo "--- Step 4: MEMORY.md restore ---"
     MEMORY_DST="$HOME/.mem0/MEMORY-restore.md"
-    cp "$BACKUP_DIR/$MEMORY_FILE" "$MEMORY_DST.tmp" && mv "$MEMORY_DST.tmp" "$MEMORY_DST"
-    echo "MEMORY.md restored to: $MEMORY_DST"
+    if cp "$BACKUP_DIR/$MEMORY_FILE" "$MEMORY_DST.tmp" && mv "$MEMORY_DST.tmp" "$MEMORY_DST"; then
+        echo "MEMORY.md restored to: $MEMORY_DST"
+    else
+        rm -f "$MEMORY_DST.tmp"; echo "WARN: MEMORY.md staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -274,8 +332,73 @@ if [ -n "$AUDIT_FILE" ] && [ -f "$BACKUP_DIR/$AUDIT_FILE" ]; then
     echo ""
     echo "--- Step 5: audit-baseline restore ---"
     AUDIT_DST="$HOME/.mem0/audit-flags-restore.baseline"
-    cp "$BACKUP_DIR/$AUDIT_FILE" "$AUDIT_DST.tmp" && mv "$AUDIT_DST.tmp" "$AUDIT_DST"
-    echo "audit-baseline restored to: $AUDIT_DST"
+    if cp "$BACKUP_DIR/$AUDIT_FILE" "$AUDIT_DST.tmp" && mv "$AUDIT_DST.tmp" "$AUDIT_DST"; then
+        echo "audit-baseline restored to: $AUDIT_DST"
+    else
+        rm -f "$AUDIT_DST.tmp"; echo "WARN: audit-baseline staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6b. L10 review state + flags, promote-review queue, worksheet (optional,
+#     2026-08-24) — staged to *-restore names like everything else; the
+#     l10-state copy is parse-checked before it can masquerade as reviewable
+#     state (a torn JSON restored over l10-state.json would wipe reviewed_keys).
+# ---------------------------------------------------------------------------
+
+if [ -n "$L10FLAGS_FILE" ] && [ -f "$BACKUP_DIR/$L10FLAGS_FILE" ]; then
+    echo ""
+    echo "--- Step 5b: L10 audit-flags restore ---"
+    DST="$HOME/.mem0/audit-flags-restore.jsonl"
+    if cp "$BACKUP_DIR/$L10FLAGS_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"; then
+        echo "audit-flags.jsonl restored to: $DST ($(wc -l < "$DST" 2>/dev/null || echo 0) flags)"
+    else
+        rm -f "$DST.tmp"; echo "WARN: L10 flags staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
+fi
+if [ -n "$L10STATE_FILE" ] && [ -f "$BACKUP_DIR/$L10STATE_FILE" ]; then
+    echo ""
+    echo "--- Step 5c: L10 review-state restore ---"
+    DST="$HOME/.mem0/l10-state-restore.json"
+    if cp "$BACKUP_DIR/$L10STATE_FILE" "$DST.tmp" \
+       && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$DST.tmp" 2>/dev/null; then
+        mv "$DST.tmp" "$DST"
+        echo "l10-state.json restored to: $DST"
+    else
+        rm -f "$DST.tmp"
+        echo "WARN: l10-state backup copy does not parse — NOT staged (reviewed_keys would be lost)" >&2
+        WARNS=$((WARNS+1))
+    fi
+fi
+if [ -n "$PRQ_FILE" ] && [ -f "$BACKUP_DIR/$PRQ_FILE" ]; then
+    echo ""
+    echo "--- Step 5d: promote-review queue restore ---"
+    DST="$HOME/.mem0/contradiction-promote-review-restore.jsonl"
+    if cp "$BACKUP_DIR/$PRQ_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"; then
+        echo "promote-review queue restored to: $DST"
+    else
+        rm -f "$DST.tmp"; echo "WARN: promote-review staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
+fi
+if [ -n "$WS_FILE" ] && [ -f "$BACKUP_DIR/$WS_FILE" ]; then
+    echo ""
+    echo "--- Step 5e: stale-paths worksheet restore ---"
+    DST="$HOME/.mem0/stale-paths-worksheet-restore.jsonl"
+    if cp "$BACKUP_DIR/$WS_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"; then
+        echo "stale-paths worksheet restored to: $DST"
+    else
+        rm -f "$DST.tmp"; echo "WARN: worksheet staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
+fi
+if [ -n "$CLAUDE_SETTINGS_FILE" ] && [ -f "$BACKUP_DIR/$CLAUDE_SETTINGS_FILE" ]; then
+    echo ""
+    echo "--- Step 5f: claude settings.json restore ---"
+    DST="$HOME/.mem0/claude-settings-restore.json"
+    if cp "$BACKUP_DIR/$CLAUDE_SETTINGS_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"; then
+        echo "claude settings.json restored to: $DST (copy to the Windows ~/.claude after review)"
+    else
+        rm -f "$DST.tmp"; echo "WARN: claude settings staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -285,8 +408,14 @@ fi
 echo ""
 echo "--- Step 6: episodic.db restore ---"
 
-# Atomic copy to .tmp first
-cp "$BACKUP_DIR/$EPISODIC_FILE" "$TARGET_EPISODIC.tmp"
+# Atomic copy to .tmp first — MUST be checked (review C1: sqlite3 integrity_check
+# on a nonexistent .tmp CREATES an empty DB and prints "ok", promoting a 0-byte
+# episodic store as a "successful" restore).
+cp "$BACKUP_DIR/$EPISODIC_FILE" "$TARGET_EPISODIC.tmp" || {
+    rm -f "$TARGET_EPISODIC.tmp"
+    echo "ERROR: episodic.db staging copy FAILED — aborting" >&2
+    exit 1
+}
 
 # Integrity check before rename (prefer sqlite3 CLI, fall back to python3)
 integrity="ok"
@@ -357,6 +486,10 @@ r_schema=$(_query_episodic   "$TARGET_EPISODIC" "SELECT value FROM schema_meta W
 echo "Restored episodic counts:"
 echo "  schema_version : $r_schema"
 echo "  sessions       : $r_sessions (manifest: $MANIFEST_EP_SESSIONS)"
+if [ "${r_sessions:-0}" != "$MANIFEST_EP_SESSIONS" ]; then
+    echo "WARN: episodic session count ${r_sessions:-?} != manifest $MANIFEST_EP_SESSIONS" >&2
+    WARNS=$((WARNS+1))
+fi
 echo "  episodes       : $r_episodes (manifest: $MANIFEST_EP_EPISODES)"
 echo "  goals          : $r_goals (manifest: $MANIFEST_EP_GOALS)"
 
@@ -387,6 +520,10 @@ echo "  $HOME/.mem0/history-restore.db"
 echo "  $HOME/.mem0/tier-ledger-restore.jsonl"
 [ -f "$HOME/.mem0/MEMORY-restore.md" ]              && echo "  $HOME/.mem0/MEMORY-restore.md"
 [ -f "$HOME/.mem0/audit-flags-restore.baseline" ]   && echo "  $HOME/.mem0/audit-flags-restore.baseline"
+[ -f "$HOME/.mem0/audit-flags-restore.jsonl" ]      && echo "  $HOME/.mem0/audit-flags-restore.jsonl"
+[ -f "$HOME/.mem0/l10-state-restore.json" ]         && echo "  $HOME/.mem0/l10-state-restore.json"
+[ -f "$HOME/.mem0/contradiction-promote-review-restore.jsonl" ] && echo "  $HOME/.mem0/contradiction-promote-review-restore.jsonl"
+[ -f "$HOME/.mem0/stale-paths-worksheet-restore.jsonl" ]        && echo "  $HOME/.mem0/stale-paths-worksheet-restore.jsonl"
 echo "  $TARGET_EPISODIC"
 echo ""
 echo "Next steps:"
@@ -406,7 +543,13 @@ echo "    curl -X DELETE $QDRANT_BASE/collections/$TARGET_COLLECTION"
 echo "    rm $TARGET_EPISODIC $HOME/.mem0/history-restore.db $HOME/.mem0/tier-ledger-restore.jsonl"
 echo "    rm -f $HOME/.mem0/MEMORY-restore.md $HOME/.mem0/audit-flags-restore.baseline"
 echo ""
-log_drill live ok   # v0.19 M9: live restore completed
+if [ "${WARNS:-0}" -gt 0 ]; then
+    echo ""
+    echo "NOTE: $WARNS restore check(s) FAILED (see WARN lines above: core upload/copy failures AND optional stagings both count) — drill logged as outcome=partial"
+    log_drill live partial
+else
+    log_drill live ok   # v0.19 M9: live restore completed
+fi
 trap - EXIT         # v0.21 Phase A (L4): success logged — disarm the failure trap so a trailing stdout write error (or a signal during the two echos below) cannot append a bogus outcome=failed tail entry
 echo "Drill logged to: $DRILL_LOG"
 echo "=== Restore complete ==="
