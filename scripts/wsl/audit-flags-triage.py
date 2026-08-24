@@ -142,7 +142,8 @@ def main() -> int:
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--resolve", action="store_true")
     ap.add_argument("--reason", default="operator triage")
-    ap.add_argument("--keep-types", default="", help="comma-separated flag types to leave open")
+    ap.add_argument("--keep-types", default=None,
+                    help="comma-separated flag types to leave open (the security classes)")
     ap.add_argument("--only-types", default=None,
                     help="resolve ONLY these comma-separated flag types (safer for a "
                          "single-class backlog burn, e.g. --only-types oversize). "
@@ -153,7 +154,15 @@ def main() -> int:
     if a.summary or not (a.summary or a.resolve):
         summary(rows, state)
     if a.resolve:
-        keep = {t.strip() for t in a.keep_types.split(",") if t.strip()}
+        keep = set()
+        if a.keep_types is not None:
+            keep = {t.strip() for t in a.keep_types.split(",") if t.strip()}
+            if not keep:
+                # review R2: the twin of the --only-types hazard - an unset shell
+                # variable would silently drop the operator's hard protection set
+                # and resolve the security classes.
+                sys.exit("audit-flags-triage: --keep-types was given but empty - name at "
+                         "least one flag type to keep open, or omit the flag")
         only = None
         if a.only_types is not None:
             only = {t.strip() for t in a.only_types.split(",") if t.strip()}

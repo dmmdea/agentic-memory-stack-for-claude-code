@@ -85,13 +85,27 @@ def test_still_open_report_counts_every_unreviewed_flag(capsys):
     assert "possible-credential" in out and "missing-provenance" in out
 
 
-def test_empty_only_types_is_refused_not_resolve_all(monkeypatch, capsys):
+def test_empty_only_types_is_refused_not_resolve_all(monkeypatch):
     """An unset shell variable (--only-types "$TYPES") must never invert the
     narrowest scope into the widest."""
-    import pytest as _pytest
     tri.FLAGS_FILE.write_text("\n".join(json.dumps(r) for r in _rows()) + "\n", encoding="utf-8")
     for bad in ("", "  ", ","):
         monkeypatch.setattr(tri.sys, "argv", ["triage", "--resolve", "--only-types", bad])
-        with _pytest.raises(SystemExit, match="given but empty"):
+        with pytest.raises(SystemExit, match="given but empty"):
             tri.main()
     assert not tri.STATE_FILE.exists(), "nothing may be resolved on a refused invocation"
+
+
+def test_empty_keep_types_is_refused_not_drop_protection(monkeypatch):
+    """Review R2: the twin hazard - --keep-types "$SEC" with $SEC unset silently
+    dropped the operator's hard protection set and resolved the security classes;
+    the docs teach exactly that invocation."""
+    tri.FLAGS_FILE.write_text("\n".join(json.dumps(r) for r in _rows()) + "\n", encoding="utf-8")
+    for bad in ("", " , "):
+        monkeypatch.setattr(tri.sys, "argv", ["triage", "--resolve", "--keep-types", bad])
+        with pytest.raises(SystemExit, match="keep-types was given but empty"):
+            tri.main()
+    assert not tri.STATE_FILE.exists()
+    # omitting the flag entirely keeps the legacy resolve-all behavior
+    monkeypatch.setattr(tri.sys, "argv", ["triage", "--resolve", "--reason", "r"])
+    assert tri.main() == 0 and tri.STATE_FILE.exists()

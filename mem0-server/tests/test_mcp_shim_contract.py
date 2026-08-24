@@ -192,6 +192,7 @@ def test_oversize_advisory_composes_with_tier_downgrade_note(shim, monkeypatch):
     _ok_add(monkeypatch, shim)
     out = _tool_fn(shim.memory_add)("y" * 2000, infer=False, metadata={"tier": "canonical"})
     assert "auto-downgraded" in out["note"] and "stored INTACT" in out["note"]
+    assert " | " in out["note"], "the documented join separator (api-contracts.md)"
 
 
 # ---------------------------------------------------------------------------
