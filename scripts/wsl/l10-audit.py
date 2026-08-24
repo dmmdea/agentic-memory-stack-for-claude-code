@@ -86,7 +86,13 @@ def save_state(state: dict) -> None:
     # keys, which is the intended retention.
     if len(state.get("audited_keys", [])) > 5000:
         state["audited_keys"] = state["audited_keys"][-5000:]
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    # 2026-08-24: atomic replace, not truncate-then-write. This file holds the
+    # operator's reviewed_keys; the timer floats (OnBootSec+6h) and can coincide
+    # with the 03:30 backup, whose raw cp of a half-written file would restore as
+    # an empty review state and resurrect every reviewed flag.
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 def scroll_all_qdrant_points(client: httpx.Client) -> list[dict]:

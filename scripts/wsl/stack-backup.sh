@@ -132,6 +132,57 @@ if [ -f "$SETTINGS_SRC" ]; then
   test -s "$SETTINGS_DST" || { echo "WARN: claude settings.json backup empty" >&2; rc=1; }
 fi
 
+# 1g. L10 admission-audit FLAGS (2026-08-24, review finding): ~/.mem0/audit-flags.jsonl
+# held 765 flags in NO backup — a restore resurfaced every reviewed flag as unreviewed.
+# Distinct 'l10-flags' prefix ON PURPOSE: the prune glob "audit-flags-*.*" already owns
+# the baseline family, and a shared glob halves both retention windows with mtime
+# interleave able to evict a whole family.
+L10FLAGS_SRC="$HOME/.mem0/audit-flags.jsonl"
+L10FLAGS_DST="$BACKUP_DIR/l10-flags-$TS.jsonl"
+if [ -f "$L10FLAGS_SRC" ]; then
+  cp "$L10FLAGS_SRC" "$L10FLAGS_DST.tmp" && mv "$L10FLAGS_DST.tmp" "$L10FLAGS_DST" \
+    || { echo "WARN: audit-flags.jsonl backup failed" >&2; rc=1; }
+  test -s "$L10FLAGS_DST" || { echo "WARN: audit-flags.jsonl backup empty" >&2; rc=1; }
+fi
+
+# 1h. L10 review STATE (reviewed_keys). The writer is atomic (tmp+rename) since
+# 2026-08-24, but the l10-audit timer is a floating 6h schedule that can coincide
+# with this backup — VALIDATE the copy parses before letting it into the retention
+# window: a torn state file restored later would wipe reviewed_keys and resurrect
+# every reviewed flag, which is the exact loss this block exists to prevent.
+L10STATE_SRC="$HOME/.mem0/l10-state.json"
+L10STATE_DST="$BACKUP_DIR/l10-state-$TS.json"
+if [ -f "$L10STATE_SRC" ]; then
+  if cp "$L10STATE_SRC" "$L10STATE_DST.tmp" \
+     && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$L10STATE_DST.tmp" 2>/dev/null; then
+    mv "$L10STATE_DST.tmp" "$L10STATE_DST"
+  else
+    rm -f "$L10STATE_DST.tmp"
+    echo "WARN: l10-state.json backup failed or copy did not parse as JSON (torn write?)" >&2; rc=1
+  fi
+fi
+
+# 1i. Contradiction-promote review queue — the human review queue the SAFE resolver
+# feeds; losing it silently loses queued genuine contradictions. Zero-byte is a
+# legitimate state (queue empty), so no test -s here.
+PRQ_SRC="$HOME/.mem0/contradiction-promote-review.jsonl"
+PRQ_DST="$BACKUP_DIR/promote-review-$TS.jsonl"
+if [ -f "$PRQ_SRC" ]; then
+  cp "$PRQ_SRC" "$PRQ_DST.tmp" && mv "$PRQ_DST.tmp" "$PRQ_DST" \
+    || { echo "WARN: contradiction-promote-review.jsonl backup failed" >&2; rc=1; }
+fi
+
+# 1j. Stale-paths hand-label worksheet — 135 operator-labelled rows; the one artifact
+# in the sidecar that cannot be regenerated (the labels killed a feature; the evidence
+# must survive the machine).
+WS_SRC="$HOME/.mem0/stale-paths-worksheet.jsonl"
+WS_DST="$BACKUP_DIR/stale-worksheet-$TS.jsonl"
+if [ -f "$WS_SRC" ]; then
+  cp "$WS_SRC" "$WS_DST.tmp" && mv "$WS_DST.tmp" "$WS_DST" \
+    || { echo "WARN: stale-paths-worksheet backup failed" >&2; rc=1; }
+  test -s "$WS_DST" || { echo "WARN: stale-paths-worksheet backup empty" >&2; rc=1; }
+fi
+
 echo "stack-backup: local files done (rc=$rc so far)"
 
 # ── 2. Qdrant snapshot (isolated — failure here does NOT affect above) ─────────
@@ -166,7 +217,10 @@ echo "stack-backup: local files done (rc=$rc so far)"
 echo "stack-backup: Qdrant block done"
 
 # ── 3. Prune: keep last 8 snapshots of each kind ──────────────────────────────
-for kind in qdrant history tier-ledger MEMORY audit-flags episodic claude-settings; do
+# NOTE: kinds must be glob-disjoint — "audit-flags" matches audit-flags-*.*, so the
+# jsonl flags file lives under the distinct "l10-flags" prefix (see 1g).
+for kind in qdrant history tier-ledger MEMORY audit-flags episodic claude-settings \
+            l10-flags l10-state promote-review stale-worksheet; do
   ls -1t "$BACKUP_DIR/$kind"-*.* 2>/dev/null | tail -n +9 | xargs -r rm -f
 done
 

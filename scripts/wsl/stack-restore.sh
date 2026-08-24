@@ -122,12 +122,24 @@ MANIFEST_EP_SESSIONS=$(python3 -c "import json; print(json.load(open('$MANIFEST'
 MANIFEST_EP_EPISODES=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['counts']['episodic_episodes'])" 2>/dev/null || echo 0)
 MANIFEST_EP_GOALS=$(python3    -c "import json; print(json.load(open('$MANIFEST'))['counts']['episodic_goals'])"    2>/dev/null || echo 0)
 
-QDRANT_SNAP_FILE=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['files']['qdrant_snapshot'])"  2>/dev/null || echo "")
-HISTORY_FILE=$(python3     -c "import json; print(json.load(open('$MANIFEST'))['files']['history_db'])"        2>/dev/null || echo "")
-LEDGER_FILE=$(python3      -c "import json; print(json.load(open('$MANIFEST'))['files']['tier_ledger'])"       2>/dev/null || echo "")
-MEMORY_FILE=$(python3      -c "import json; print(json.load(open('$MANIFEST'))['files']['memory_md'])"         2>/dev/null || echo "")
-AUDIT_FILE=$(python3       -c "import json; print(json.load(open('$MANIFEST'))['files']['audit_baseline'])"   2>/dev/null || echo "")
-EPISODIC_FILE=$(python3    -c "import json; print(json.load(open('$MANIFEST'))['files']['episodic_db'])"       2>/dev/null || echo "")
+# 2026-08-24: manifests now write JSON null for artifacts absent from a snapshot;
+# python prints that as "None" — normalize both spellings to empty so every
+# [ -n ] guard below stays truthful. get() with a default also tolerates keys
+# that pre-date this manifest version.
+mfile() {
+    python3 -c "import json,sys; v=(json.load(open(sys.argv[1])).get('files') or {}).get(sys.argv[2]); print(v if isinstance(v,str) else '')" \
+        "$MANIFEST" "$1" 2>/dev/null || echo ""
+}
+QDRANT_SNAP_FILE=$(mfile qdrant_snapshot)
+HISTORY_FILE=$(mfile history_db)
+LEDGER_FILE=$(mfile tier_ledger)
+MEMORY_FILE=$(mfile memory_md)
+AUDIT_FILE=$(mfile audit_baseline)
+EPISODIC_FILE=$(mfile episodic_db)
+L10FLAGS_FILE=$(mfile l10_flags)
+L10STATE_FILE=$(mfile l10_state)
+PRQ_FILE=$(mfile promote_review)
+WS_FILE=$(mfile stale_worksheet)
 
 echo "--- Manifest contents ---"
 echo "  app_version    : $MANIFEST_APP_VERSION"
@@ -145,8 +157,8 @@ for fname in "$QDRANT_SNAP_FILE" "$HISTORY_FILE" "$LEDGER_FILE" "$EPISODIC_FILE"
         MISSING=$((MISSING+1))
     fi
 done
-# MEMORY and audit are optional (may not exist in older backups)
-for fname in "$MEMORY_FILE" "$AUDIT_FILE"; do
+# MEMORY, audit and the 2026-08-24 additions are optional (may not exist in older backups)
+for fname in "$MEMORY_FILE" "$AUDIT_FILE" "$L10FLAGS_FILE" "$L10STATE_FILE" "$PRQ_FILE" "$WS_FILE"; do
     if [ -n "$fname" ] && [ ! -f "$BACKUP_DIR/$fname" ]; then
         echo "INFO: optional file absent: $BACKUP_DIR/$fname (non-fatal)"
     fi
@@ -166,6 +178,18 @@ echo "  4. MEMORY.md       : $BACKUP_DIR/$MEMORY_FILE -> $HOME/.mem0/MEMORY-rest
 fi
 if [ -n "$AUDIT_FILE" ] && [ -f "$BACKUP_DIR/$AUDIT_FILE" ]; then
 echo "  5. audit-baseline  : $BACKUP_DIR/$AUDIT_FILE -> $HOME/.mem0/audit-flags-restore.baseline"
+fi
+if [ -n "$L10FLAGS_FILE" ] && [ -f "$BACKUP_DIR/$L10FLAGS_FILE" ]; then
+echo "  5b. L10 flags      : $BACKUP_DIR/$L10FLAGS_FILE -> $HOME/.mem0/audit-flags-restore.jsonl"
+fi
+if [ -n "$L10STATE_FILE" ] && [ -f "$BACKUP_DIR/$L10STATE_FILE" ]; then
+echo "  5c. L10 state      : $BACKUP_DIR/$L10STATE_FILE -> $HOME/.mem0/l10-state-restore.json (parse-checked)"
+fi
+if [ -n "$PRQ_FILE" ] && [ -f "$BACKUP_DIR/$PRQ_FILE" ]; then
+echo "  5d. promote-review : $BACKUP_DIR/$PRQ_FILE -> $HOME/.mem0/contradiction-promote-review-restore.jsonl"
+fi
+if [ -n "$WS_FILE" ] && [ -f "$BACKUP_DIR/$WS_FILE" ]; then
+echo "  5e. worksheet      : $BACKUP_DIR/$WS_FILE -> $HOME/.mem0/stale-paths-worksheet-restore.jsonl"
 fi
 echo "  6. episodic.db     : $BACKUP_DIR/$EPISODIC_FILE -> $TARGET_EPISODIC"
 echo "     (integrity_check + schema migration to current version)"
@@ -279,6 +303,48 @@ if [ -n "$AUDIT_FILE" ] && [ -f "$BACKUP_DIR/$AUDIT_FILE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 6b. L10 review state + flags, promote-review queue, worksheet (optional,
+#     2026-08-24) — staged to *-restore names like everything else; the
+#     l10-state copy is parse-checked before it can masquerade as reviewable
+#     state (a torn JSON restored over l10-state.json would wipe reviewed_keys).
+# ---------------------------------------------------------------------------
+
+if [ -n "$L10FLAGS_FILE" ] && [ -f "$BACKUP_DIR/$L10FLAGS_FILE" ]; then
+    echo ""
+    echo "--- Step 5b: L10 audit-flags restore ---"
+    DST="$HOME/.mem0/audit-flags-restore.jsonl"
+    cp "$BACKUP_DIR/$L10FLAGS_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"
+    echo "audit-flags.jsonl restored to: $DST ($(wc -l < "$DST" 2>/dev/null || echo 0) flags)"
+fi
+if [ -n "$L10STATE_FILE" ] && [ -f "$BACKUP_DIR/$L10STATE_FILE" ]; then
+    echo ""
+    echo "--- Step 5c: L10 review-state restore ---"
+    DST="$HOME/.mem0/l10-state-restore.json"
+    if cp "$BACKUP_DIR/$L10STATE_FILE" "$DST.tmp" \
+       && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$DST.tmp" 2>/dev/null; then
+        mv "$DST.tmp" "$DST"
+        echo "l10-state.json restored to: $DST"
+    else
+        rm -f "$DST.tmp"
+        echo "WARN: l10-state backup copy does not parse — NOT staged (reviewed_keys would be lost)" >&2
+    fi
+fi
+if [ -n "$PRQ_FILE" ] && [ -f "$BACKUP_DIR/$PRQ_FILE" ]; then
+    echo ""
+    echo "--- Step 5d: promote-review queue restore ---"
+    DST="$HOME/.mem0/contradiction-promote-review-restore.jsonl"
+    cp "$BACKUP_DIR/$PRQ_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"
+    echo "promote-review queue restored to: $DST"
+fi
+if [ -n "$WS_FILE" ] && [ -f "$BACKUP_DIR/$WS_FILE" ]; then
+    echo ""
+    echo "--- Step 5e: stale-paths worksheet restore ---"
+    DST="$HOME/.mem0/stale-paths-worksheet-restore.jsonl"
+    cp "$BACKUP_DIR/$WS_FILE" "$DST.tmp" && mv "$DST.tmp" "$DST"
+    echo "stale-paths worksheet restored to: $DST"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. episodic.db restore
 # ---------------------------------------------------------------------------
 
@@ -387,6 +453,10 @@ echo "  $HOME/.mem0/history-restore.db"
 echo "  $HOME/.mem0/tier-ledger-restore.jsonl"
 [ -f "$HOME/.mem0/MEMORY-restore.md" ]              && echo "  $HOME/.mem0/MEMORY-restore.md"
 [ -f "$HOME/.mem0/audit-flags-restore.baseline" ]   && echo "  $HOME/.mem0/audit-flags-restore.baseline"
+[ -f "$HOME/.mem0/audit-flags-restore.jsonl" ]      && echo "  $HOME/.mem0/audit-flags-restore.jsonl"
+[ -f "$HOME/.mem0/l10-state-restore.json" ]         && echo "  $HOME/.mem0/l10-state-restore.json"
+[ -f "$HOME/.mem0/contradiction-promote-review-restore.jsonl" ] && echo "  $HOME/.mem0/contradiction-promote-review-restore.jsonl"
+[ -f "$HOME/.mem0/stale-paths-worksheet-restore.jsonl" ]        && echo "  $HOME/.mem0/stale-paths-worksheet-restore.jsonl"
 echo "  $TARGET_EPISODIC"
 echo ""
 echo "Next steps:"

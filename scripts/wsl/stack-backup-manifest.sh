@@ -98,6 +98,12 @@ TS_ISO="${TS_DATE:0:4}-${TS_DATE:4:2}-${TS_DATE:6:2}T${TS_TIME:0:2}:${TS_TIME:2:
 # 5. Write manifest (atomic tmp-then-rename)
 # ---------------------------------------------------------------------------
 
+# 2026-08-24: the manifest must describe what the snapshot CONTAINS, not what was
+# hoped — the audit_baseline entry named a file that never existed on disk, so a
+# restore chased a phantom. Every entry is now conditional on the artifact being
+# present in THIS snapshot; absent artifacts are an explicit JSON null.
+mf() { if [ -f "$BACKUP_DIR/$1" ]; then echo "\"$1\""; else echo "null"; fi; }
+
 cat > "$MANIFEST.tmp" <<EOF
 {
   "ts": "$TS_ISO",
@@ -106,13 +112,19 @@ cat > "$MANIFEST.tmp" <<EOF
   "schema_version": "$SCHEMA_VERSION",
   "git_sha": "$GIT_SHA",
   "files": {
-    "qdrant_snapshot": "qdrant-$TS.snapshot",
-    "history_db": "history-$TS.db",
-    "tier_ledger": "tier-ledger-$TS.jsonl",
-    "memory_md": "MEMORY-$TS.md",
-    "audit_baseline": "audit-flags-$TS.baseline",
-    "episodic_db": "episodic-$TS.db"
+    "qdrant_snapshot": $(mf "qdrant-$TS.snapshot"),
+    "history_db": $(mf "history-$TS.db"),
+    "tier_ledger": $(mf "tier-ledger-$TS.jsonl"),
+    "memory_md": $(mf "MEMORY-$TS.md"),
+    "audit_baseline": $(mf "audit-flags-$TS.baseline"),
+    "episodic_db": $(mf "episodic-$TS.db"),
+    "claude_settings": $(mf "claude-settings-$TS.json"),
+    "l10_flags": $(mf "l10-flags-$TS.jsonl"),
+    "l10_state": $(mf "l10-state-$TS.json"),
+    "promote_review": $(mf "promote-review-$TS.jsonl"),
+    "stale_worksheet": $(mf "stale-worksheet-$TS.jsonl")
   },
+  "deliberately_excluded": "pair-verdict-cache.db (TTL'd rebuildable cache), jobs.db (transient queue), canonical-replay.jsonl (anti-replay nonce ledger; signed tokens carry a 300s skew gate and the ledger GCs at 600s, so a lost ledger reopens at most a 10-minute window), telemetry ledgers (retrieval-log, admission-rejected, receipts) - see docs/data-backup.md",
   "counts": {
     "qdrant_points": $QDRANT_POINTS,
     "episodic_sessions": $EPISODIC_SESSIONS,
@@ -122,6 +134,13 @@ cat > "$MANIFEST.tmp" <<EOF
   }
 }
 EOF
+# Refuse to publish a manifest that does not parse (a malformed manifest is worse
+# than none — stack-restore trusts it).
+python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$MANIFEST.tmp" || {
+    echo "ERROR: generated manifest does not parse — not publishing" >&2
+    rm -f "$MANIFEST.tmp"
+    exit 1
+}
 
 mv "$MANIFEST.tmp" "$MANIFEST"
 echo "manifest written: $MANIFEST"
