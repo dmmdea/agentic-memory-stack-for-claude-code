@@ -128,9 +128,12 @@ def resolve(rows: list[dict], state: dict, reason: str, keep_types: set[str],
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     os.replace(tmp, STATE_FILE)
-    still_open = sum(1 for r in rows if r.get("flag_type") in keep_types and _key(r) not in reviewed)
+    # review fix: this used to count only KEPT types, so a scoped --only-types run
+    # printed "still-open: 0" while the security classes it protects were still open.
+    open_by_type = collections.Counter(
+        r.get("flag_type", "?") for r in rows if _key(r) not in reviewed)
     print(f"marked {marked} flag(s) reviewed (reviewed_keys {before} -> {len(reviewed)})")
-    print(f"still-open (kept types {sorted(keep_types)}): {still_open}")
+    print(f"still-open: {sum(open_by_type.values())} by type: {dict(open_by_type)}")
     print("SLOWDRIP backlog now reflects only unreviewed flags; audit trail preserved in audit-flags.jsonl")
 
 
@@ -140,9 +143,10 @@ def main() -> int:
     ap.add_argument("--resolve", action="store_true")
     ap.add_argument("--reason", default="operator triage")
     ap.add_argument("--keep-types", default="", help="comma-separated flag types to leave open")
-    ap.add_argument("--only-types", default="",
+    ap.add_argument("--only-types", default=None,
                     help="resolve ONLY these comma-separated flag types (safer for a "
-                         "single-class backlog burn, e.g. --only-types oversize)")
+                         "single-class backlog burn, e.g. --only-types oversize). "
+                         "Omit for the legacy resolve-all-except-kept behavior.")
     a = ap.parse_args()
     rows = _load_flags()
     state = _load_state()
@@ -150,7 +154,14 @@ def main() -> int:
         summary(rows, state)
     if a.resolve:
         keep = {t.strip() for t in a.keep_types.split(",") if t.strip()}
-        only = {t.strip() for t in a.only_types.split(",") if t.strip()} or None
+        only = None
+        if a.only_types is not None:
+            only = {t.strip() for t in a.only_types.split(",") if t.strip()}
+            if not only:
+                # an unset shell variable here would otherwise burn EVERY class,
+                # the exact failure --only-types exists to prevent
+                sys.exit("audit-flags-triage: --only-types was given but empty - "
+                         "name at least one flag type, or omit the flag for resolve-all")
         resolve(rows, state, a.reason, keep, only_types=only)
     return 0
 

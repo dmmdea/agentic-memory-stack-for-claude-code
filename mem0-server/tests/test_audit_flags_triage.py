@@ -72,3 +72,26 @@ def test_state_write_is_atomic_no_tmp_left_behind():
     leftovers = [p.name for p in tri.STATE_FILE.parent.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
     json.loads(tri.STATE_FILE.read_text(encoding="utf-8"))  # parses whole
+
+
+def test_still_open_report_counts_every_unreviewed_flag(capsys):
+    """Review fix: the confirmation line used to count only KEPT types, so a scoped
+    --only-types run printed "still-open: 0" while the security classes it protects
+    were still open - the operator's only confirmation line reported the safety
+    property backwards."""
+    tri.resolve(_rows(), {}, "burn", set(), only_types={"oversize"})
+    out = capsys.readouterr().out
+    assert "still-open: 2" in out
+    assert "possible-credential" in out and "missing-provenance" in out
+
+
+def test_empty_only_types_is_refused_not_resolve_all(monkeypatch, capsys):
+    """An unset shell variable (--only-types "$TYPES") must never invert the
+    narrowest scope into the widest."""
+    import pytest as _pytest
+    tri.FLAGS_FILE.write_text("\n".join(json.dumps(r) for r in _rows()) + "\n", encoding="utf-8")
+    for bad in ("", "  ", ","):
+        monkeypatch.setattr(tri.sys, "argv", ["triage", "--resolve", "--only-types", bad])
+        with _pytest.raises(SystemExit, match="given but empty"):
+            tri.main()
+    assert not tri.STATE_FILE.exists(), "nothing may be resolved on a refused invocation"

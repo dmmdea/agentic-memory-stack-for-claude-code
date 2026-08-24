@@ -12,7 +12,7 @@ L10 is a heuristic post-hoc audit pass that scans every Qdrant point (bypassing 
 
 | Flag | Trigger |
 |---|---|
-| `oversize` | `len(text) > 800 chars` |
+| `oversize` | `len(text) > 1200 chars` |
 | `possible-injection` | text contains "ignore previous instructions" or similar |
 | `possible-credential` | text contains `password:`, `api_key:`, `bearer `, etc. |
 | `missing-provenance` | no `source` field in payload |
