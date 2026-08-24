@@ -57,11 +57,22 @@ def _load_flags() -> list[dict]:
 
 
 def _load_state() -> dict:
+    # Parity with l10-audit.py's gate (2026-08-24 review): this tool is the operator's
+    # natural next move after l10-audit quarantines a corrupt state - and it used to
+    # swallow the corrupt file into {} and then WRITE a fresh state with no
+    # reviewed_keys, the exact durable erase the quarantine exists to prevent.
+    stray = sorted(STATE_FILE.parent.glob(STATE_FILE.name + ".corrupt-*"))
+    if stray:
+        sys.exit(f"audit-flags-triage: unresolved l10-state quarantine present ({stray[-1].name}); "
+                 "restore reviewed_keys from the newest backups/l10-state-*.json, then remove "
+                 "the quarantine file to resume.")
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except ValueError:
-            pass
+        except ValueError as e:
+            sys.exit(f"audit-flags-triage: l10-state.json is corrupt ({e}) - refusing to "
+                     "default (that would erase reviewed_keys on the next write). Run "
+                     "l10-audit.py to quarantine it, or restore from backups/l10-state-*.json.")
     return {}
 
 

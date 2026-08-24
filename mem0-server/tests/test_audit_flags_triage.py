@@ -106,6 +106,21 @@ def test_empty_keep_types_is_refused_not_drop_protection(monkeypatch):
         with pytest.raises(SystemExit, match="keep-types was given but empty"):
             tri.main()
     assert not tri.STATE_FILE.exists()
-    # omitting the flag entirely keeps the legacy resolve-all behavior
+    # omitting the flag entirely keeps the legacy resolve-all behavior — assert the
+    # COUNT, not mere file existence (resolve() writes state even when it marks zero;
+    # only a count kills the resolve-all -> resolve-nothing mutant, review R3)
     monkeypatch.setattr(tri.sys, "argv", ["triage", "--resolve", "--reason", "r"])
-    assert tri.main() == 0 and tri.STATE_FILE.exists()
+    assert tri.main() == 0 and len(_reviewed()) == 4
+
+
+def test_corrupt_or_quarantined_state_is_refused_never_defaulted(monkeypatch):
+    """Parity with l10-audit's gate: a corrupt state file, or an unresolved
+    quarantine beside a valid one, must refuse - defaulting to {} and then writing
+    would erase reviewed_keys."""
+    tri.STATE_FILE.write_text('{"reviewed_keys": ["a:b"], TRUNCATED', encoding="utf-8")
+    with pytest.raises(SystemExit, match="corrupt"):
+        tri._load_state()
+    tri.STATE_FILE.write_text('{"reviewed_keys": ["a:b"]}', encoding="utf-8")
+    (tri.STATE_FILE.parent / "l10-state.json.corrupt-20260824000000").write_text("x", encoding="utf-8")
+    with pytest.raises(SystemExit, match="unresolved l10-state quarantine"):
+        tri._load_state()
