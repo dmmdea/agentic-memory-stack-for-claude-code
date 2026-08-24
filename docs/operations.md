@@ -47,6 +47,17 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 systemctl --user list-timers --all | grep -E "decay|backup|goals|contradiction|reconcile|l10"
 ```
 
+**Reading the episodic-reconcile receipt** (`~/.mem0/episodic-reconciliation.jsonl`): an
+*orphaned link* is an episode→memory link whose memory is gone from Qdrant. Since 2026-08-24
+the receipt splits them by deletion evidence — `orphaned_explained_count` (a DELETE row in
+`history.db` **or** a `delete`/`decay-delete` event in the tier-ledger: the semantic-dedup and
+decay purges, lineage debt on record) vs `orphaned_unexplained_count` (vanished with **no**
+trace: possible data loss). Only unexplained orphans degrade the outcome
+(`degraded:orphaned-links-unexplained:<n>`, threshold zero); explained ones stay in the
+receipt with actor + reason so a suspicious burst is still visible. If neither evidence
+source can be read the run abstains (`degraded:orphan-evidence-unavailable:<n>`) rather than
+accusing every orphan.
+
 ---
 
 ## "The session banner says contradictions await review"

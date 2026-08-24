@@ -87,22 +87,78 @@ def classify_links(links: list[dict], existing_episode_ids: set,
 
 ORPHAN_DEGRADE_THRESHOLD = 10
 
+# 2026-08-24 (9-agent review + adversarial council): every one of the 63 live
+# orphans had a DELETE event on record (semantic-dedup / decay purges) — legitimate
+# lineage debt, not integrity loss — yet the count WARNed forever and trained the
+# operator to ignore the row. Orphans are now split by DELETION EVIDENCE:
+#   explained   = a DELETE row in mem0's history.db  OR  a delete/decay-delete event
+#                 in the tier-ledger (scripted deleters write the ledger; the API
+#                 path writes history.db; joining BOTH is what makes this
+#                 migration-proof — a mem0ai upgrade could rebuild history.db).
+#   unexplained = the memory vanished from Qdrant with NO trace = corruption,
+#                 bypass, or data loss — the page-worthy class.
+# "Explained" means "did not silently vanish", NOT "benign": a buggy deletion
+# travels the same authorized transport, so the explained breakdown stays in the
+# receipt (count + actor/reason sample) and the tier-ledger actor is surfaced.
+# The degraded threshold applies to UNEXPLAINED only, and it is ZERO: with the
+# deletion noise removed, even one traceless orphan is store-level integrity loss.
+UNEXPLAINED_DEGRADE_THRESHOLD = 0
+LEDGER_DELETE_EVENTS = ("delete", "decay-delete")
+
+
+def explain_orphans(orphaned: list[dict], history_deleted: set,
+                    ledger_deleted: dict) -> dict:
+    """PURE split of orphaned links by deletion evidence.
+
+    history_deleted: memory_ids with a DELETE row in history.db.
+    ledger_deleted: {memory_id: {"actor", "reason", "event"}} from the tier-ledger.
+    Returns {"explained": [...], "unexplained": [...]}; each explained entry carries
+    its evidence source(s) and, when the ledger knows, the actor + reason."""
+    explained, unexplained = [], []
+    for o in orphaned:
+        tid = str(o.get("target_id"))
+        src = []
+        if tid in history_deleted:
+            src.append("history.db")
+        if tid in ledger_deleted:
+            src.append("tier-ledger")
+        if src:
+            entry = dict(o, evidence=src)
+            led = ledger_deleted.get(tid) or {}
+            if led:
+                entry["actor"] = led.get("actor")
+                entry["reason"] = (led.get("reason") or "")[:80]
+                entry["event"] = led.get("event")
+            explained.append(entry)
+        else:
+            unexplained.append(dict(o))
+    return {"explained": explained, "unexplained": unexplained}
+
 
 def reconcile_outcome(db_present: bool, qdrant_ok: bool,
                       orphaned_count: int = 0,
-                      threshold: int = ORPHAN_DEGRADE_THRESHOLD) -> str:
+                      threshold: int = ORPHAN_DEGRADE_THRESHOLD,
+                      unexplained_count: int | None = None) -> str:
     """AMS-20 (2026-08-08): the run used to report `ok` while COUNTING dozens
     of orphaned links — the finding is precisely that the number was computed
     and then contradicted by the verdict, so nothing ever escalated (59 live
     orphans, ~2/day growth, invisible). A count past the threshold now
     degrades: TMS's freshness row and the SessionStart heartbeat both key off
     `outcome`, so the backlog reaches a human without a new alarm channel.
-    Below the threshold stays `ok` (a couple of in-flight deletions are
-    normal); the count is in the receipt either way."""
+
+    2026-08-24: when the caller supplies `unexplained_count` (deletion-evidence
+    split available), the verdict keys off UNEXPLAINED orphans only, at
+    UNEXPLAINED_DEGRADE_THRESHOLD (zero) — explained orphans are reported, never
+    degraded. The legacy total-count path (unexplained_count=None) is kept for
+    callers/tests that predate the split."""
     if not db_present:
         return "degraded:no-episodic-db"
     if not qdrant_ok:
         return "degraded:qdrant-unreachable"
+    if unexplained_count is not None:
+        if unexplained_count > UNEXPLAINED_DEGRADE_THRESHOLD:
+            return f"degraded:orphaned-links-unexplained:{unexplained_count}"
+        return "ok"
     if orphaned_count > threshold:
         return f"degraded:orphaned-links:{orphaned_count}"
     return "ok"
@@ -189,6 +245,67 @@ def qdrant_present_ids(http: httpx.Client, ids: list[str]) -> set:
     return present
 
 
+HISTORY_DB = Path.home() / ".mem0" / "history.db"
+LEDGER_DIR = Path.home() / ".mem0"
+
+
+def history_deleted_ids(ids: list[str], db_path: Path = HISTORY_DB) -> set:
+    """memory_ids among `ids` with a DELETE row in mem0's history.db (READ-ONLY).
+    RAISES on any failure — the caller decides whether missing evidence is a
+    reason to abstain from classifying (it is; see main)."""
+    if not ids:
+        return set()
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        out = set()
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            # REFUTED semgrep sqlalchemy-execute-raw-query: the only thing concatenated
+            # is the PLACEHOLDER count ("?,?,?"); every value is bound as a parameter
+            # via sqlite3's DB-API, so no input text ever reaches the SQL string.
+            q = ("SELECT DISTINCT memory_id FROM history WHERE event = 'DELETE' "
+                 "AND memory_id IN (" + ",".join("?" * len(chunk)) + ")")
+            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+            out.update(str(r[0]) for r in conn.execute(q, chunk).fetchall())
+        return out
+    finally:
+        conn.close()
+
+
+def ledger_deleted(ids: list[str], ledger_dir: Path = LEDGER_DIR) -> dict:
+    """{memory_id: {actor, reason, event}} for `ids` that carry a delete-class event
+    in the tier-ledger (legacy tier-ledger.jsonl + monthly segments). Scripted
+    deleters (semantic-dedup, decay-scan) write ONLY here, so this source is what
+    explains their purges; the API path writes both. RAISES when no ledger file
+    can be read at all (missing evidence is not 'no deletions')."""
+    wanted = set(ids)
+    found: dict = {}
+    if not wanted:
+        return found
+    paths = sorted(ledger_dir.glob("tier-ledger-[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl"))
+    legacy = ledger_dir / "tier-ledger.jsonl"
+    if legacy.is_file():
+        paths.insert(0, legacy)
+    if not paths:
+        raise FileNotFoundError(f"no tier-ledger files under {ledger_dir}")
+    for p in paths:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"memory_id"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("event") not in LEDGER_DELETE_EVENTS:
+                    continue
+                mid = str(rec.get("memory_id"))
+                if mid in wanted:
+                    found[mid] = {"actor": rec.get("actor"), "reason": rec.get("reason"),
+                                  "event": rec.get("event")}
+    return found
+
+
 def _append_summary(record: dict) -> None:
     record.setdefault("ts", _iso_now())
     record.setdefault("schema_version", "v1")
@@ -247,11 +364,38 @@ def main() -> int:
         http.close()
 
     result = classify_links(links, ep_ids, present)
-    n_orphan_pre = len(result["orphaned_link"])
-    outcome = reconcile_outcome(db_present=True, qdrant_ok=qdrant_ok,
-                                orphaned_count=n_orphan_pre)
     n_orphan = len(result["orphaned_link"])
     n_dangling = len(result["dangling"])
+
+    # 2026-08-24: split orphans by deletion evidence (history.db + tier-ledger).
+    # Missing evidence is NOT "no deletions": if NEITHER source can be read the run
+    # abstains from the split and degrades distinctly rather than accusing every
+    # orphan of being traceless; if one source fails, classify with the other and
+    # say so in the receipt.
+    orphan_ids = [str(o.get("target_id")) for o in result["orphaned_link"]]
+    evidence_errors: dict = {}
+    hist_del: set = set()
+    led_del: dict = {}
+    try:
+        hist_del = history_deleted_ids(orphan_ids)
+    except (sqlite3.Error, OSError) as e:
+        evidence_errors["history.db"] = f"{type(e).__name__}: {str(e)[:80]}"
+    try:
+        led_del = ledger_deleted(orphan_ids)
+    except OSError as e:
+        evidence_errors["tier-ledger"] = f"{type(e).__name__}: {str(e)[:80]}"
+
+    if n_orphan and len(evidence_errors) == 2:
+        split = None
+        outcome = f"degraded:orphan-evidence-unavailable:{n_orphan}"
+        print("episodic-reconcile: orphan deletion-evidence sources BOTH unreadable "
+              f"({evidence_errors}) - abstaining from the explained/unexplained split", flush=True)
+    else:
+        split = explain_orphans(result["orphaned_link"], hist_del, led_del)
+        outcome = reconcile_outcome(db_present=True, qdrant_ok=qdrant_ok,
+                                    orphaned_count=n_orphan,
+                                    unexplained_count=len(split["unexplained"]))
+
     summary = {
         "ts": run_ts,
         "total_links": len(links),
@@ -262,6 +406,13 @@ def main() -> int:
         "ok_memory_links": result["ok"],
         "orphaned_sample": result["orphaned_link"][: args.limit_sample],
         "dangling_sample": result["dangling"][: args.limit_sample],
+        # 2026-08-24 deletion-evidence split (explained != benign: the actor/reason
+        # sample is there precisely so a suspicious explained burst is visible)
+        "orphaned_explained_count": (len(split["explained"]) if split else None),
+        "orphaned_unexplained_count": (len(split["unexplained"]) if split else None),
+        "orphaned_explained_sample": (split["explained"][: args.limit_sample] if split else []),
+        "orphaned_unexplained_sample": (split["unexplained"][: args.limit_sample] if split else []),
+        "orphan_evidence_errors": evidence_errors,
         "embedding_coverage": coverage,   # AMS-19
         "outcome": outcome,
     }

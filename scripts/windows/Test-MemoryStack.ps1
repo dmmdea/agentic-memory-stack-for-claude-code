@@ -1215,10 +1215,18 @@ try {
         $erAge = (Get-Date) - [datetime]$erLast.ts
         $erOutcome = if ($erLast.PSObject.Properties['outcome']) { [string]$erLast.outcome } else { 'n/a' }
         $orphan = [int]$erLast.orphaned_count; $dangling = [int]$erLast.dangling_count
+        # 2026-08-24: receipts now split orphans by deletion evidence. Only UNEXPLAINED
+        # orphans (vanished with no DELETE trace) are drift worth a WARN; explained ones
+        # (dedup/decay purges on record) are lineage debt, shown in the OK detail with
+        # their count so a suspicious burst stays visible. Older receipts lack the
+        # split -> fall back to the legacy total-count WARN.
+        $hasSplit = $erLast.PSObject.Properties['orphaned_unexplained_count'] -and ($null -ne $erLast.orphaned_unexplained_count)
+        $unexplained = if ($hasSplit) { [int]$erLast.orphaned_unexplained_count } else { $orphan }
+        $explained   = if ($hasSplit) { [int]$erLast.orphaned_explained_count } else { 0 }
         if ($erOutcome -ne 'ok') { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) outcome=$erOutcome (journalctl --user -u episodic-reconcile)" }
-        elseif (($orphan + $dangling) -gt 0) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts): $orphan orphaned mem0 link(s) + $dangling dangling episode link(s) of $($erLast.total_links) total - ledger<->store drift (READ-ONLY report; ledger is immutable by design)" }
+        elseif (($unexplained + $dangling) -gt 0) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts): $unexplained UNEXPLAINED orphaned mem0 link(s) (no DELETE trace = possible data loss) + $dangling dangling episode link(s) of $($erLast.total_links) total; $explained explained (deletion on record)" }
         elseif ($erAge.TotalDays -gt 14) { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' "last run $($erLast.ts) >14d ago - timer may not be firing" }
-        else { Add-Check 'RECOVERY' 'episodic reconcile' 'OK' "last $($erLast.ts): 0 drift over $($erLast.memory_links) mem0 links / $($erLast.episodes) episodes" }
+        else { Add-Check 'RECOVERY' 'episodic reconcile' 'OK' "last $($erLast.ts): 0 unexplained drift over $($erLast.memory_links) mem0 links / $($erLast.episodes) episodes ($explained orphan(s) explained by deletion records - lineage debt, not loss)" }
     } else {
         $erTimer = wsl.exe -d $TmsDistro -e bash -c "systemctl --user list-timers --no-pager 2>/dev/null | grep episodic-reconcile || true"
         if ($erTimer -match 'episodic-reconcile') { Add-Check 'RECOVERY' 'episodic reconcile' 'OK' 'no run yet (timer enabled - first weekly fire pending)' }
