@@ -323,6 +323,48 @@ def test_default_budget_zero_never_retries_contention():
     assert out["lock_waited_s"] == 0.0
 
 
+def test_client_timeout_is_retried_under_budget_as_busy():
+    """The shim is a single-threaded accept loop: a request queued behind another
+    consumer's codex call times out client-side — same busy-judge condition as
+    lock_contended, retried under the same budget, exhaustion keeps its own type."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadTimeout("queued behind the discovery sweep")
+        return httpx.Response(200, json={"ok": True, "response": "NO"})
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is True and calls["n"] == 3
+
+
+def test_client_timeout_exhaustion_keeps_its_own_error_type():
+    def handler(request):
+        raise httpx.ReadTimeout("still queued")
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=30.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and out["error_type"] == "client_timeout"
+    assert out["lock_waited_s"] == 30.0
+
+
+def test_sleep_interval_is_clamped_never_raises():
+    def handler(request):
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    slept = []
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=1.0, lock_retry_interval_s=-5.0,
+                         _sleep=lambda s: (slept.append(s), t.__setitem__("v", t["v"] + s)),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and all(s > 0 for s in slept)
+
+
 def test_non_lock_errors_are_never_retried_even_with_budget():
     calls = {"n": 0}
     def handler(request):

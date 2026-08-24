@@ -1251,6 +1251,27 @@ def test_all_four_legs_handle_lock_and_codex_failures():
     src = SCRIPT.read_text(encoding="utf-8")
     assert src.count("LOCK_CONTENDED_PREFIX):") >= 4, \
         "all four judged legs must branch on the lock-exhausted detail"
-    assert 'startswith("llm-error")' not in src.replace(
-        'detail.startswith("llm-error") or detail.startswith("codex-error")', ""), \
+    assert 'startswith("llm-error")' not in src, \
         "no leg may count llm-error without also counting codex-error"
+    # review HIGH: an unimportable bridge ("codex-bridge-unavailable") matched neither
+    # counted prefix; on the un-preflighted retrieval-pairs leg it fast-skipped every
+    # pair into outcome=ok. Every counting site must name all three.
+    assert src.count('startswith(("llm-error", "codex-error", "codex-bridge-unavailable"))') >= 4
+
+
+def test_abort_outcome_grammar_is_uniform():
+    """LOCK_EXHAUSTED_OUTCOME must be greppable across every leg's receipts."""
+    assert sweep._outcome_for_abort("judge-lock-contended: waited 2400s").startswith(
+        sweep.LOCK_EXHAUSTED_OUTCOME)
+    assert sweep._outcome_for_abort("judge unresponsive: 5 consecutive").startswith(
+        "degraded:aborted:")
+
+
+def test_preflight_unreachable_tries_ensure_shim_once(monkeypatch):
+    """Review HIGH: the codex-health preflight returned no-op:codex-shim-unreachable
+    BEFORE any judging for 3 of 4 legs, so the in-run backstop never fired."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    i = src.find('_h = _codex.health()')
+    j = src.find('"outcome": "no-op:codex-shim-unreachable"', i)
+    assert i > 0 and j > i
+    assert "_ensure_shim_once()" in src[i:j], "preflight must attempt the ensure before the no-op"
