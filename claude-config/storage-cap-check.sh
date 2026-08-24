@@ -325,18 +325,28 @@ if [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
   # SessionStart deliberately: the Codex shim is only reliably up at session time,
   # and the resolver is queue-only (never auto-hides) by design.
   # 2026-08-24 judge-resilience: at SessionStart the spawn hook may still be binding
-  # the shim when this probe fires (--max-time 2), which silently skipped whole rejudge
-  # weeks. ensure-codex-shim.sh is idempotent and bounded (30s here); fail-soft — if it
-  # cannot bring the shim up, the curl below skips exactly as before.
-  _ENSURE="$HOME/apps/mem0-scripts/ensure-codex-shim.sh"
-  [ -f "$_ENSURE" ] || _ENSURE="$MEM0_REPO_ROOT_WSL/scripts/wsl/ensure-codex-shim.sh"
-  [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ] && [ -f "$_ENSURE" ] && bash "$_ENSURE" 30 >/dev/null 2>&1
-  if [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ] && curl -sf --max-time 2 http://127.0.0.1:18792/health >/dev/null 2>&1; then
-    touch "$RESOLVE_MARKER"
+  # the shim when the old inline probe fired (--max-time 2), which silently skipped
+  # whole rejudge weeks. ensure-codex-shim.sh (idempotent, bounded) closes that — but
+  # it can legitimately take ~30s+, and THIS hook runs synchronously in SessionStart:
+  # blocking here past the harness hook timeout would kill the whole hook's output
+  # (brand auto-load, cap warnings). So the ENTIRE ensure→gate→rejudge chain runs in
+  # a detached subshell; SessionStart latency is unchanged, and a failed ensure
+  # degrades to the exact pre-fix behavior (probe misses, rejudge skips this week).
+  if [ "$_do" = 1 ] && [ "${MEM0_UP:-0}" = 1 ]; then
+    _ENSURE="$HOME/apps/mem0-scripts/ensure-codex-shim.sh"
+    [ -f "$_ENSURE" ] || _ENSURE="$MEM0_REPO_ROOT_WSL/scripts/wsl/ensure-codex-shim.sh"
     _PYB="$HOME/apps/mem0-server/.venv/bin/python"; [ -x "$_PYB" ] || _PYB=python3
     _SWEEP="$HOME/apps/mem0-scripts/contradiction-sweep.py"
     [ -f "$_SWEEP" ] || _SWEEP="$MEM0_REPO_ROOT_WSL/scripts/wsl/contradiction-sweep.py"
-    nohup "$_PYB" "$_SWEEP" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
+    (
+      [ -f "$_ENSURE" ] && bash "$_ENSURE" 45 >/dev/null 2>&1
+      if curl -sf --max-time 2 http://127.0.0.1:18792/health >/dev/null 2>&1; then
+        # marker touched only when the rejudge actually fires — a failed ensure must
+        # not burn the weekly throttle on a run that never happened.
+        touch "$RESOLVE_MARKER"
+        nohup "$_PYB" "$_SWEEP" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
+      fi
+    ) >/dev/null 2>&1 &
   fi
 fi
 

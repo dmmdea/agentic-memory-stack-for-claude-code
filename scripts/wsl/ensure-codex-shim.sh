@@ -48,8 +48,10 @@ if [ ! -x "$PSEXE" ]; then
 fi
 
 # Spawn (idempotent on the Windows side); the spawn script reads stdin, feed it EOF.
-"$PSEXE" -NoProfile -ExecutionPolicy Bypass -File "$SPAWN" </dev/null >/dev/null 2>&1 || {
-    echo "ensure-codex-shim: spawn invocation failed (interop dead or script missing at ${SPAWN})" >&2
+# Capture output — when the later health poll fails, the spawn's own words are the
+# only clue WHY (missing venv, port conflict, wedged mutex holder).
+spawn_out="$("$PSEXE" -NoProfile -ExecutionPolicy Bypass -File "$SPAWN" </dev/null 2>&1)" || {
+    echo "ensure-codex-shim: spawn invocation failed (interop dead or script missing at ${SPAWN}): $(echo "$spawn_out" | head -1)" >&2
     exit 1
 }
 
@@ -62,5 +64,5 @@ while [ "$i" -lt "$POLL_SECONDS" ]; do
     sleep 1
     i=$((i + 1))
 done
-echo "ensure-codex-shim: shim did not answer /health within ${POLL_SECONDS}s" >&2
+echo "ensure-codex-shim: shim did not answer /health within ${POLL_SECONDS}s (spawn said: $(echo "$spawn_out" | head -1))" >&2
 exit 1

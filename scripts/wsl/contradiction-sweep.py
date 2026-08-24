@@ -198,14 +198,20 @@ _ENSURE_SHIM = {"tried": False}
 
 
 def _stamp_live_judge() -> None:
-    """Best-effort: record that a real (non-cache) Codex verdict landed just now."""
+    """Best-effort: record that a real (non-cache) Codex verdict landed just now.
+    Atomic replace — TMS reads this over \\\\wsl$ and a truncate-then-write torn
+    mid-read would show an empty stamp ("judge dead since 1970"). A failed write
+    is printed (not raised): the TMS WARN it causes should name its real cause."""
     try:
-        LIVE_JUDGE_STAMP.write_text(
+        tmp = LIVE_JUDGE_STAMP.with_suffix(".tmp")
+        tmp.write_text(
             json.dumps({"epoch": int(time.time()),
                         "ts": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n",
             encoding="utf-8")
-    except OSError:
-        pass
+        os.replace(tmp, LIVE_JUDGE_STAMP)
+    except OSError as e:
+        print(f"contradiction-sweep: WARN live-judge stamp not written ({e}) - "
+              "the TMS freshness row will WARN until a stamped run succeeds", flush=True)
 
 
 def _ensure_shim_once() -> bool:
@@ -221,7 +227,12 @@ def _ensure_shim_once() -> bool:
     script = Path(__file__).resolve().parent / "ensure-codex-shim.sh"
     if not script.is_file():
         # deployed layout: this file runs from ~/apps/mem0-scripts/ where the
-        # ensure script is rsynced alongside — same directory either way.
+        # ensure script is rsynced alongside — same directory either way. Say so
+        # LOUDLY: a hand-copied .py without its .sh (the AMS-50 orphan class)
+        # would otherwise send the operator hunting the shim while the real
+        # defect is the deploy.
+        print(f"contradiction-sweep: ensure-codex-shim.sh NOT FOUND beside this script "
+              f"({script}) - shim backstop unavailable, check the deploy", flush=True)
         return False
     try:
         proc = subprocess.run(["bash", str(script)], timeout=150,
@@ -474,8 +485,10 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
         # degraded:judge-lock-contended instead of miscounting a live co-tenant
         # as an unresponsive judge.
         if out.get("error_type") == "lock_contended":
+            consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
             return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
-                          f"(waited {out.get('lock_waited_s', 0)}s)")
+                          f"(this call waited {out.get('lock_waited_s', 0)}s; run consumed "
+                          f"{consumed:.0f}s of {LOCK_PATIENCE_BUDGET_S:.0f}s)")
         return None, f"codex-error: {out.get('error_type')}: {str(out.get('error'))[:120]}"
     _stamp_live_judge()
     verdict = out.get("contradicts")
@@ -648,8 +661,10 @@ def judge_supersession_codex(older_text: str, newer_text: str,
                       timeout_s=int(timeout_s))
     if not out.get("ok"):
         if out.get("error_type") == "lock_contended":
+            consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
             return None, (f"{LOCK_CONTENDED_PREFIX}: patience budget exhausted "
-                          f"(waited {out.get('lock_waited_s', 0)}s)")
+                          f"(this call waited {out.get('lock_waited_s', 0)}s; run consumed "
+                          f"{consumed:.0f}s of {LOCK_PATIENCE_BUDGET_S:.0f}s)")
         return None, f"codex-error: {out.get('error_type')}: {str(out.get('error'))[:120]}"
     _stamp_live_judge()
     verdict = out.get("stale")
