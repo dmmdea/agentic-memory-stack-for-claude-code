@@ -570,6 +570,23 @@ def _delete_one(qc, cand: dict, stats: dict, operator_ack: str) -> None:
         return
     qc.delete(collection_name=COLLECTION,
               points_selector=models.PointIdsList(points=[pid]), wait=True)
+    # 2026-08-24 (reconcile review): this is the ONE deleter that bypasses
+    # DELETE /v1/memories, so it left NO trace in history.db or the tier-ledger
+    # and any episode link to the point read as an UNEXPLAINED orphan (possible
+    # data loss) in episodic-reconcile. Append the same ledger event every other
+    # destructive script writes, so the deletion is explained where it is looked for.
+    try:
+        seg = Path.home() / ".mem0" / (
+            "tier-ledger-" + dt.datetime.now(dt.timezone.utc).strftime("%Y-%m") + ".jsonl")
+        with seg.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(), "schema_version": "v17",
+                "event": "delete", "memory_id": pid, "actor": "ams01-repair",
+                "reason": f"surface-delete (operator ack: {operator_ack})",
+                "prior_tier": live_payload.get("tier"), "prior_source": live_payload.get("source"),
+            }) + "\n")
+    except OSError as e:
+        print(f"  WARN ledger append failed for {pid[:8]}: {e} (receipt still written)")
     # Receipt captures identity fields only, not the full payload/vector —
     # deliberate: deletion is operator-acked test debris, and the pre-repair
     # snapshots retain the complete point should it ever matter.

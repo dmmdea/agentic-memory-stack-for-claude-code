@@ -276,9 +276,29 @@ def _ledger_with(tmp_path, links):
     return db
 
 
-def _run_main(monkeypatch, db, *, readyz_ok=True, present=None, present_raises=None):
+def _run_main(monkeypatch, db, *, readyz_ok=True, present=None, present_raises=None,
+              hist_deleted=None, led_deleted=None, evidence_raises=False,
+              evidence_raises_history=False, hist_delete_total=1):
     summaries = []
     monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(recon, "LEDGER_PARSE_ERRORS", {})
+    # 2026-08-24: main() consults the deletion-evidence sources; a unit run must
+    # never touch the live ~/.mem0 history.db / tier-ledger (and CI has neither).
+    def fake_hist(ids, db_path=None):
+        if evidence_raises or evidence_raises_history:
+            raise sqlite3.OperationalError("unable to open database file")
+        return set(hist_deleted or [])
+    def fake_hist_total(db_path=None):
+        if evidence_raises or evidence_raises_history:
+            raise sqlite3.OperationalError("unable to open database file")
+        return hist_delete_total
+    def fake_led(ids, ledger_dir=None):
+        if evidence_raises:
+            raise FileNotFoundError("no tier-ledger files")
+        return dict(led_deleted or {})
+    monkeypatch.setattr(recon, "history_deleted_ids", fake_hist)
+    monkeypatch.setattr(recon, "history_delete_row_count", fake_hist_total)
+    monkeypatch.setattr(recon, "ledger_deleted", fake_led)
 
     def fake_get(url, **kw):
         if not readyz_ok:
@@ -325,7 +345,157 @@ def test_main_happy_path_reports_orphaned_and_dangling(monkeypatch, tmp_path):
         (2, 10, "produced_evidence", "mem0", "gone-mem"),      # orphaned (absent from Qdrant)
         (3, 999, "produced_evidence", "mem0", "x"),            # dangling (episode 999 missing)
     ])
-    rc, s = _run_main(monkeypatch, db, present={"present-mem"})
+    # the orphan has a DELETE on record -> explained -> ok (the live 63/63 shape)
+    rc, s = _run_main(monkeypatch, db, present={"present-mem"}, hist_deleted={"gone-mem"})
     assert rc == 0 and s["outcome"] == "ok"
     assert s["orphaned_count"] == 1 and s["dangling_count"] == 1
+    assert s["orphaned_explained_count"] == 1 and s["orphaned_unexplained_count"] == 0
+    assert s["orphaned_explained_sample"][0]["evidence"] == ["history.db"]
     assert s["ok_memory_links"] == 1  # present-mem (the dangling one isn't counted as a memory link)
+
+
+def test_main_unexplained_orphan_degrades_at_zero(monkeypatch, tmp_path):
+    """A memory gone from Qdrant with NO deletion trace is possible data loss - one is enough."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "vanished")])
+    rc, s = _run_main(monkeypatch, db, present=set())
+    assert rc == 1 and s["outcome"] == "degraded:orphaned-links-unexplained:1"
+    assert s["orphaned_unexplained_sample"][0]["target_id"] == "vanished"
+
+
+def test_main_abstains_when_both_evidence_sources_unreadable(monkeypatch, tmp_path):
+    """Missing evidence is not 'no deletions': accusing every orphan would be the
+    false-positive storm; refusing to split, loudly, is the honest verdict."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "gone")])
+    rc, s = _run_main(monkeypatch, db, present=set(), evidence_raises=True)
+    assert rc == 1 and s["outcome"] == "degraded:orphan-evidence-unavailable:1"
+    assert s["orphaned_explained_count"] is None
+    assert set(s["orphan_evidence_errors"]) == {"history.db", "tier-ledger"}
+
+
+# --- 2026-08-24: orphans split by deletion evidence ------------------------------
+# Every one of the 63 live orphans had a DELETE on record (dedup/decay purges), yet
+# the count WARNed forever. Explained (traced deletion) vs unexplained (vanished
+# with no trace) — only the latter is drift worth a page, at threshold ZERO.
+
+def _orphans(*ids):
+    return [{"link_id": i, "episode_id": 10, "link_type": "produced_evidence",
+             "target_id": t} for i, t in enumerate(ids)]
+
+
+def test_explain_orphans_splits_by_either_evidence_source():
+    out = recon.explain_orphans(
+        _orphans("h-only", "l-only", "both", "none"),
+        history_deleted={"h-only", "both"},
+        ledger_deleted={"l-only": {"actor": "semantic-dedup", "reason": "dup of x",
+                                   "event": "decay-delete"},
+                        "both": {"actor": "rest-api", "reason": "DELETE", "event": "delete"}})
+    ex = {e["target_id"]: e for e in out["explained"]}
+    assert set(ex) == {"h-only", "l-only", "both"}
+    assert ex["h-only"]["evidence"] == ["history.db"]
+    assert ex["l-only"]["evidence"] == ["tier-ledger"] and ex["l-only"]["actor"] == "semantic-dedup"
+    assert ex["both"]["evidence"] == ["history.db", "tier-ledger"]
+    assert [u["target_id"] for u in out["unexplained"]] == ["none"]
+
+
+def test_unexplained_orphans_degrade_at_zero_explained_never_do():
+    # 63 explained, 0 unexplained -> ok (the live state this shipped against)
+    assert recon.reconcile_outcome(True, True, orphaned_count=63, unexplained_count=0) == "ok"
+    # ONE traceless orphan is store-level integrity loss
+    out = recon.reconcile_outcome(True, True, orphaned_count=1, unexplained_count=1)
+    assert out == "degraded:orphaned-links-unexplained:1" and recon.exit_code_for(out) == 1
+    # legacy path (no split supplied) keeps the old threshold semantics
+    assert recon.reconcile_outcome(True, True, orphaned_count=11) == "degraded:orphaned-links:11"
+
+
+def test_history_deleted_ids_reads_only_delete_rows(tmp_path):
+    db = tmp_path / "history.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE history (id TEXT, memory_id TEXT, old_memory TEXT, "
+                 "new_memory TEXT, event TEXT, created_at TEXT, updated_at TEXT, "
+                 "is_deleted INTEGER, actor_id TEXT, role TEXT)")
+    conn.executemany("INSERT INTO history (memory_id, event) VALUES (?, ?)",
+                     [("m-del", "ADD"), ("m-del", "DELETE"), ("m-upd", "ADD"), ("m-upd", "UPDATE")])
+    conn.commit()
+    conn.close()
+    assert recon.history_deleted_ids(["m-del", "m-upd", "m-unknown"], db_path=db) == {"m-del"}
+    assert recon.history_deleted_ids([], db_path=db) == set()
+
+
+def test_history_deleted_ids_raises_when_db_missing(tmp_path):
+    """Missing evidence must RAISE (the caller abstains), never read as 'no deletions'."""
+    with pytest.raises(sqlite3.Error):
+        recon.history_deleted_ids(["x"], db_path=tmp_path / "absent.db")
+
+
+def test_ledger_deleted_scans_legacy_and_monthly_segments(tmp_path):
+    (tmp_path / "tier-ledger.jsonl").write_text(
+        '{"event": "delete", "memory_id": "old", "actor": "rest-api", "reason": "DELETE /v1"}\n'
+        '{"event": "promote", "memory_id": "kept", "actor": "user-direct"}\n', encoding="utf-8")
+    (tmp_path / "tier-ledger-2026-08.jsonl").write_text(
+        'garbage line\n'
+        '{"event": "decay-delete", "memory_id": "purged", "actor": "semantic-dedup", "reason": "dup"}\n',
+        encoding="utf-8")
+    out = recon.ledger_deleted(["old", "kept", "purged", "never"], ledger_dir=tmp_path)
+    assert set(out) == {"old", "purged"}
+    assert out["purged"]["actor"] == "semantic-dedup" and out["purged"]["event"] == "decay-delete"
+
+
+def test_ledger_deleted_raises_when_no_ledger_files(tmp_path):
+    with pytest.raises(OSError):
+        recon.ledger_deleted(["x"], ledger_dir=tmp_path)
+
+
+# --- 2026-08-24 round 2: partial-evidence, rotation, parse-error surfacing ---------
+
+def test_history_delete_row_count_reads_delete_rows(tmp_path):
+    db = tmp_path / "history.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE history (memory_id TEXT, event TEXT)")
+    conn.executemany("INSERT INTO history (memory_id, event) VALUES (?, ?)",
+                     [("a", "ADD"), ("a", "DELETE"), ("b", "delete"), ("c", "UPDATE")])
+    conn.commit(); conn.close()
+    assert recon.history_delete_row_count(db_path=db) == 2   # DELETE + delete (case-tolerant)
+
+
+def test_rotated_history_table_is_evidence_loss_not_no_deletions(monkeypatch, tmp_path):
+    """A rebuilt history table (0 DELETE rows) beside live orphans must NOT read as
+    'no deletions' - it is evidence loss (review R1 HIGH). It surfaces as a partial
+    outcome, not a clean unexplained accusation."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "gone")])
+    rc, s = _run_main(monkeypatch, db, present=set(),
+                      hist_delete_total=0, led_deleted={})
+    assert rc == 1 and s["outcome"].startswith("degraded:orphan-evidence-partial:")
+    assert "history.db" in s["orphan_evidence_errors"]
+    assert s["history_delete_rows_total"] == 0
+
+
+def test_single_source_failure_is_partial_not_full_accusation(monkeypatch, tmp_path):
+    """history.db unreadable but the ledger explains the orphan: the split still runs,
+    the outcome is partial (names the dead source), NOT a data-loss accusation."""
+    db = _ledger_with(tmp_path, [(1, 10, "produced_evidence", "mem0", "gone")])
+    rc, s = _run_main(monkeypatch, db, present=set(), evidence_raises_history=True,
+                      led_deleted={"gone": {"actor": "semantic-dedup", "reason": "dup",
+                                            "event": "decay-delete"}})
+    assert rc == 1 and s["outcome"].startswith("degraded:orphan-evidence-partial:history.db")
+    assert s["orphaned_explained_count"] == 1 and s["orphaned_unexplained_count"] == 0
+
+
+def test_ledger_non_dict_line_does_not_crash(tmp_path):
+    # a JSON ARRAY containing the quoted "memory_id" token passes the substring
+    # prefilter and parses, but is not a dict -> counted bad, never .get-crashed
+    lines = ['["memory_id", "not-a-dict"]',
+             '{"event": "delete", "memory_id": "real", "actor": "x"}']
+    (tmp_path / "tier-ledger-2026-08.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = recon.ledger_deleted(["real", "never"], ledger_dir=tmp_path)
+    assert set(out) == {"real"}
+    assert recon.LEDGER_PARSE_ERRORS.get("tier-ledger-2026-08.jsonl") == 1
+
+
+def test_wholly_unparseable_ledger_segment_raises(tmp_path):
+    # lines carry the quoted "memory_id" token (so the prefilter admits them) but are
+    # not valid JSON -> 0 parseable, all bad -> the segment is unreadable, raise
+    lines = ['{"memory_id": TRUNCATED', '{"memory_id": also broken']
+    (tmp_path / "tier-ledger-2026-08.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(OSError, match="unreadable"):
+        recon.ledger_deleted(["x"], ledger_dir=tmp_path)
+
