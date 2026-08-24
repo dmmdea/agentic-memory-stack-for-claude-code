@@ -956,7 +956,30 @@ try {
             $latest = $manifests[0]
             $age = (Get-Date) - $latest.LastWriteTime
             if ($age.TotalHours -lt 48) {
-                Add-Check 'RECOVERY' 'backup manifest' 'OK' "$($latest.Name) — $([int]$age.TotalHours)h old"
+                # 2026-08-24 review H1: the manifest is now TRUTHFUL (null = artifact
+                # absent from that snapshot) — a fresh manifest full of nulls means the
+                # backup RAN and captured nothing. Freshness alone turned a night where
+                # every copy failed into a green row; read the nulls.
+                $mfJson = $null
+                try { $mfJson = Get-Content $latest.FullName -Raw | ConvertFrom-Json } catch {}
+                $reqNull = @(); $optNull = @()
+                if ($mfJson -and $mfJson.files) {
+                    foreach ($k in 'qdrant_snapshot','history_db','episodic_db','tier_ledger') {
+                        if (-not $mfJson.files.$k) { $reqNull += $k }
+                    }
+                    foreach ($k in 'l10_flags','l10_state','claude_settings') {
+                        if (($mfJson.files.PSObject.Properties[$k]) -and (-not $mfJson.files.$k)) { $optNull += $k }
+                    }
+                }
+                if ($reqNull.Count -gt 0) {
+                    Add-Check 'RECOVERY' 'backup manifest' 'FAIL' "$($latest.Name) is fresh but REQUIRED artifact(s) are null: $($reqNull -join ', ') — that night's copies failed (journalctl --user -u stack-backup)"
+                } elseif ($optNull.Count -gt 0) {
+                    Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh; optional artifact(s) null: $($optNull -join ', ')"
+                } elseif (-not $mfJson) {
+                    Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) fresh but does not parse as JSON — stack-restore will refuse it"
+                } else {
+                    Add-Check 'RECOVERY' 'backup manifest' 'OK' "$($latest.Name) — $([int]$age.TotalHours)h old; all required artifacts present"
+                }
             } else {
                 Add-Check 'RECOVERY' 'backup manifest' 'WARN' "$($latest.Name) — $([int]$age.TotalDays)d old (stack-backup.sh may be failing)"
             }
@@ -967,6 +990,18 @@ try {
         Add-Check 'RECOVERY' 'backup manifest' 'WARN' 'backups dir not found at ~/.mem0/backups'
     }
 } catch { Add-Check 'RECOVERY' 'backup manifest' 'WARN' $_.Exception.Message }
+
+# R3b (2026-08-24 review H1): the backup's exit code previously landed in an
+# unmonitored grave — nothing anywhere read the unit state, so rc=1 nights were
+# invisible while the fresh-manifest row stayed green.
+try {
+    $sbState = (wsl.exe -d $TmsDistro -e bash -c "systemctl --user is-failed stack-backup.service 2>/dev/null || true" | Select-Object -First 1)
+    if ("$sbState".Trim() -eq 'failed') {
+        Add-Check 'RECOVERY' 'stack-backup unit state' 'FAIL' 'stack-backup.service is in FAILED state - last night''s backup errored (journalctl --user -u stack-backup)'
+    } else {
+        Add-Check 'RECOVERY' 'stack-backup unit state' 'OK' "unit state: $("$sbState".Trim())"
+    }
+} catch { Add-Check 'RECOVERY' 'stack-backup unit state' 'WARN' $_.Exception.Message }
 
 # R4: Restore drill check (v0.19 M9 rewrite; v0.20 Phase E M10: mode+outcome honored)
 # Proof = ~/.mem0/restore-drill.jsonl, appended by stack-restore.sh at the end of

@@ -70,3 +70,26 @@ def test_l1a_extractor_carries_the_write_time_guard():
     common = (REPO_ROOT / "scripts" / "windows" / "memory-common.ps1").read_text(encoding="utf-8")
     assert "function Split-OversizeFact" in common
     assert "$MaxChars = 700" in common
+
+
+# --- 2026-08-24: corrupt review state must fail LOUD, never silently default ------
+# With save_state now atomic, a silent default here + the next save would DURABLY
+# erase the operator's reviewed_keys. The corrupt file is quarantined as evidence.
+
+def test_corrupt_state_fails_loud_and_quarantines(monkeypatch, tmp_path):
+    import pytest as _pytest
+    state = tmp_path / "l10-state.json"
+    state.write_text('{"reviewed_keys": ["a:b", TRUNCATED', encoding="utf-8")
+    monkeypatch.setattr(l10, "STATE_FILE", state)
+    with _pytest.raises(SystemExit, match="corrupt"):
+        l10.load_state()
+    assert not state.exists(), "corrupt file must be moved aside, not left in place"
+    quarantined = [p for p in tmp_path.iterdir() if "corrupt" in p.name]
+    assert len(quarantined) == 1, "the evidence must be preserved in a quarantine file"
+    assert "TRUNCATED" in quarantined[0].read_text(encoding="utf-8")
+
+
+def test_missing_state_still_defaults_cleanly(monkeypatch, tmp_path):
+    monkeypatch.setattr(l10, "STATE_FILE", tmp_path / "absent.json")
+    st = l10.load_state()
+    assert st["last_audit_ts"] == 0 and st["audited_keys"] == []

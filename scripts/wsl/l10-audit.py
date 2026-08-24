@@ -68,8 +68,21 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            # 2026-08-24 review: silently defaulting here + the now-atomic
+            # save_state would DURABLY ERASE the operator's reviewed_keys on the
+            # very next run — a corrupt state must fail loud and preserve the
+            # evidence, never masquerade as a fresh install. Restore path:
+            # the daily backup's l10-state-<TS>.json (stack-restore.sh step 5c).
+            quarantine = STATE_FILE.with_suffix(
+                ".json.corrupt-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S"))
+            try:
+                os.replace(STATE_FILE, quarantine)
+            except OSError:
+                quarantine = "(quarantine move failed)"
+            sys.exit(f"FAIL: l10-state.json is corrupt ({e}); preserved at {quarantine}. "
+                     "Restore reviewed_keys from the newest backups/l10-state-*.json, "
+                     "then re-run.")
     return {
         "last_audit_ts": 0,
         "audited_keys": [],  # ["{memory_id}:{flag_type}", ...]  - dedup across runs
