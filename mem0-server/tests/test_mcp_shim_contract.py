@@ -152,6 +152,50 @@ def test_memory_add_forward_stamps_contract_version(shim, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 2026-08-24: oversize ADVISORY on direct saves (never a split, never a reject —
+# the server deliberately accepts up to 4000; the writer knows the semantics).
+# ---------------------------------------------------------------------------
+
+def _ok_add(monkeypatch, shim):
+    posts = []
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        posts.append((url, json))
+        return _FakeResp({"results": [{"id": "x"}]})
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    return posts
+
+
+def test_oversize_direct_save_is_stored_intact_with_advisory(shim, monkeypatch):
+    posts = _ok_add(monkeypatch, shim)
+    text = "y" * (shim.OVERSIZE_ADVISORY_CHARS + 100)
+    out = _tool_fn(shim.memory_add)(text, infer=False)
+    assert posts[0][1]["messages"] == text, "the record must reach the server UNSPLIT"
+    assert "stored INTACT" in out["note"] and f"{len(text)} chars" in out["note"]
+    assert "advisory" in out["note"]
+
+
+def test_oversize_advisory_not_emitted_at_or_below_the_line(shim, monkeypatch):
+    _ok_add(monkeypatch, shim)
+    out = _tool_fn(shim.memory_add)("y" * shim.OVERSIZE_ADVISORY_CHARS, infer=False)
+    assert "note" not in out
+
+
+def test_oversize_advisory_skipped_for_infer_true(shim, monkeypatch):
+    """infer=True hands the text to the server's LLM extraction, which reshapes it
+    into atomic facts itself — advising the writer to split would be noise."""
+    _ok_add(monkeypatch, shim)
+    out = _tool_fn(shim.memory_add)("y" * 3000, infer=True)
+    assert "note" not in out
+
+
+def test_oversize_advisory_composes_with_tier_downgrade_note(shim, monkeypatch):
+    _ok_add(monkeypatch, shim)
+    out = _tool_fn(shim.memory_add)("y" * 2000, infer=False, metadata={"tier": "canonical"})
+    assert "auto-downgraded" in out["note"] and "stored INTACT" in out["note"]
+    assert " | " in out["note"], "the documented join separator (api-contracts.md)"
+
+
+# ---------------------------------------------------------------------------
 # MEM-8 (2026-07-03): shim ergonomics — brandless fail-closed hides get a hint.
 # ---------------------------------------------------------------------------
 

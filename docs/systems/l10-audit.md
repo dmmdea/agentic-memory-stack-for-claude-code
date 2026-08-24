@@ -12,7 +12,7 @@ L10 is a heuristic post-hoc audit pass that scans every Qdrant point (bypassing 
 
 | Flag | Trigger |
 |---|---|
-| `oversize` | `len(text) > 800 chars` |
+| `oversize` | `len(text) > 1200 chars` |
 | `possible-injection` | text contains "ignore previous instructions" or similar |
 | `possible-credential` | text contains `password:`, `api_key:`, `bearer `, etc. |
 | `missing-provenance` | no `source` field in payload |
@@ -46,18 +46,26 @@ The original `delta>20` spike check (in `Test-MemoryStack.ps1`) catches sudden b
 
 ## Reviewing flags
 
-To mark a flag as reviewed and suppress future alerts for it:
+To mark flags as reviewed and suppress future alerts, use the triage tool — never a
+hand-rolled write: `l10-state.json` holds the operator's `reviewed_keys`, is copied by the
+daily backup, and must only ever be written atomically (the tool does tmp + rename; a
+truncate-then-write racing the 03:30 backup would restore as an empty review state).
 
 ```bash
-# Add to state["reviewed_keys"]:
-python3 -c "
-import json; from pathlib import Path
-state = json.loads(Path.home().joinpath('.mem0/l10-state.json').read_text())
-state.setdefault('reviewed_keys', []).append('<memory_id>:<flag_type>')
-Path.home().joinpath('.mem0/l10-state.json').write_text(json.dumps(state, indent=2))
-print('marked reviewed')
-"
+PY=~/apps/mem0-server/.venv/bin/python
+$PY ~/apps/mem0-scripts/audit-flags-triage.py --summary                   # breakdown + the security-critical flags in full
+$PY ~/apps/mem0-scripts/audit-flags-triage.py --resolve --only-types oversize \
+    --reason "advisory class; records intact"                             # burn ONE class; everything else stays open
+$PY ~/apps/mem0-scripts/audit-flags-triage.py --resolve \
+    --keep-types possible-credential,possible-injection,canonical-without-actor \
+    --reason "..."                                                        # resolve all EXCEPT the security classes
 ```
+
+`--only-types` (2026-08-24) is the safe shape for a single-class backlog: the security
+classes stay open without having to enumerate them, and every resolve is logged in the
+state file's `review_log` with its scope and reason. The `oversize` class is an
+**advisory** (the write path stores the record intact and tells the writer; see
+`mem0-mcp-shim.py`'s add note) — it never needs a per-record decision.
 
 ## Alert output
 

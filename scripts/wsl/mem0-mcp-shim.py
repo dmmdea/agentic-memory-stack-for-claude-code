@@ -152,6 +152,16 @@ def _pending_op_count() -> int:
 SEARCH_HOOK_CONTRACT_VERSION = "17.0"
 BUNDLE_HOOK_CONTRACT_VERSION = "20.0"
 
+# 2026-08-24 oversize ADVISORY line (= l10-audit OVERSIZE_CHARS). Direct session
+# saves over this length are the l10 audit's oversize class - measured as 100% of
+# the flag backlog's steady inflow (~10/day). The server DELIBERATELY accepts up
+# to 4000 chars (the v0.22 cap raise exists because 1500 rejected legitimate
+# milestone records), and an auto-split here would silently corrupt deliberate
+# authored records and break the add->promote first-id contract - so this is
+# advisory ONLY: the record is stored intact and the WRITER (who knows the
+# semantics) is told to split when the record bundles several claims.
+OVERSIZE_ADVISORY_CHARS = 1200
+
 mcp = FastMCP("mem0")
 
 def _headers() -> dict:
@@ -197,6 +207,13 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
         result = _authority_only("POST", "/v1/memories", json=payload)
     except OfflineError:
         return _queue_op("add", {"text": text, "user_id": user_id, "infer": infer, "metadata": md})
+    if (not infer) and isinstance(text, str) and len(text) > OVERSIZE_ADVISORY_CHARS:
+        adv = (f"stored INTACT ({len(text)} chars) - above the l10-audit oversize advisory "
+               f"line ({OVERSIZE_ADVISORY_CHARS}). If this bundles several claims, split it "
+               "into atomic facts (<=~700 chars each) and re-save; one embedding per topic "
+               "retrieves better. A single coherent record (a milestone, a causal finding) "
+               "is fine as-is - the flag is advisory, never a failure.")
+        note = f"{note} | {adv}" if note else adv
     if note:
         result["note"] = note
     return result

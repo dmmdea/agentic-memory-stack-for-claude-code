@@ -83,7 +83,10 @@ L10's 6-hourly heuristics flagged writes (oversize / injection-shaped / credenti
 ```bash
 PY=~/apps/mem0-server/.venv/bin/python
 $PY ~/apps/mem0-scripts/audit-flags-triage.py --summary     # what's flagged, grouped
-# --resolve marks the WHOLE current backlog reviewed (there is no per-id mode);
+# --resolve --only-types <class> marks ONE flag class reviewed (2026-08-24) — the safe shape for a
+# backlog burn: e.g. the advisory `oversize` class, leaving possible-credential etc. open:
+$PY ~/apps/mem0-scripts/audit-flags-triage.py --resolve --only-types oversize --reason "advisory class; records intact"
+# --resolve (no --only-types) marks the WHOLE current backlog reviewed (there is no per-id mode);
 # hold back categories you still want visible with --keep-types
 $PY ~/apps/mem0-scripts/audit-flags-triage.py --resolve --reason "reviewed: benign"
 ```
