@@ -267,3 +267,191 @@ def test_judge_supersession_shim_down_is_fail_soft():
     with _client(handler) as c:
         out = shim.judge_supersession("a", "b", client=c)
     assert out["ok"] is False
+
+
+# --- lock patience (2026-08-24 judge-resilience) ----------------------------------
+# A 503 lock_contended is a LIVE co-tenant, not an unresponsive judge. Opt-in budget
+# waits it out; default budget 0 preserves every existing caller's fast fail-open.
+
+def _lock_contended_response():
+    return httpx.Response(503, json={"ok": False, "error": "codex busy",
+                                     "error_type": "lock_contended"})
+
+
+def test_lock_contended_is_waited_out_within_budget():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return _lock_contended_response()
+        return httpx.Response(200, json={"ok": True, "response": "YES"})
+    slept = []
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: (slept.append(s), t.__setitem__("v", t["v"] + s)),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is True and calls["n"] == 3
+    assert slept == [20.0, 20.0]
+    assert out["lock_waited_s"] == 40.0
+
+
+def test_lock_budget_exhaustion_returns_contended_with_waited():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=50.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False
+    assert out["error_type"] == "lock_contended"   # structured type survives for callers
+    assert out["lock_waited_s"] == 50.0            # partial final sleep honored the budget
+    assert calls["n"] == 4                          # 0s, 20s, 40s, 50s
+
+
+def test_default_budget_zero_never_retries_contention():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    with _client(handler) as c:
+        out = shim.judge("p", client=c)
+    assert out["ok"] is False and calls["n"] == 1
+    assert out["lock_waited_s"] == 0.0
+
+
+def test_client_timeout_is_retried_under_budget_as_busy():
+    """The shim is a single-threaded accept loop: a request queued behind another
+    consumer's codex call times out client-side — same busy-judge condition as
+    lock_contended, retried under the same budget, exhaustion keeps its own type."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadTimeout("queued behind the discovery sweep")
+        return httpx.Response(200, json={"ok": True, "response": "NO"})
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is True and calls["n"] == 3
+
+
+def test_client_timeout_exhaustion_keeps_its_own_error_type():
+    def handler(request):
+        raise httpx.ReadTimeout("still queued")
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=30.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and out["error_type"] == "client_timeout"
+
+
+def test_client_timeout_is_capped_by_attempt_count_not_the_wall_budget():
+    """Review R2: an abandoned timed-out request still runs to completion on the
+    single-threaded shim as a PAID, un-read codex call; a 2400s wall budget would
+    buy ~30 of them on one pair. Timeouts are capped at MAX_TIMEOUT_RETRIES."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        raise httpx.ReadTimeout("queued")
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100000.0,
+                         _sleep=lambda s: t.__setitem__("v", t["v"] + s),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and out["error_type"] == "client_timeout"
+    assert calls["n"] == 1 + shim.MAX_TIMEOUT_RETRIES
+
+
+def test_lock_contention_is_wall_bounded_not_attempt_capped():
+    """The cheap busy shape (ms, no spend) keeps the wall budget: many attempts."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    with _client(handler) as c:
+        shim.judge("p", client=c, lock_retry_budget_s=200.0,
+                   _sleep=lambda s: t.__setitem__("v", t["v"] + s), _monotonic=lambda: t["v"])
+    assert calls["n"] > shim.MAX_TIMEOUT_RETRIES + 1   # 200s / 20s interval = ~11 attempts
+
+
+def test_attempt_duration_counts_against_the_budget():
+    """The docstring's contract: elapsed time INCLUDING the attempts themselves is
+    charged, not just the sleeps. A clock that advances 60s per call (a timing-out
+    request) must exhaust a 100s budget after the second attempt, before any
+    third — with no sleep ever charged."""
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    def clock():
+        return t["v"]
+    def sleeper(s):
+        t["v"] += s
+    # advance the clock 60s per ATTEMPT by hooking the transport call
+    class _SlowClient(httpx.Client):
+        def post(self, *a, **k):
+            t["v"] += 60.0
+            return super().post(*a, **k)
+    with _SlowClient(transport=httpx.MockTransport(handler)) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=sleeper, _monotonic=clock)
+    assert out["ok"] is False
+    assert calls["n"] == 2                      # 60s + 20s sleep + 60s = 140 > 100 -> stop
+    assert out["lock_waited_s"] >= 100.0
+
+
+def test_sleep_interval_is_clamped_never_raises():
+    def handler(request):
+        return _lock_contended_response()
+    t = {"v": 0.0}
+    slept = []
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=1.0, lock_retry_interval_s=-5.0,
+                         _sleep=lambda s: (slept.append(s), t.__setitem__("v", t["v"] + s)),
+                         _monotonic=lambda: t["v"])
+    assert out["ok"] is False and all(s > 0 for s in slept)
+
+
+def test_non_lock_errors_are_never_retried_even_with_budget():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(503, json={"ok": False, "error": "boom", "error_type": "codex_failed"})
+    with _client(handler) as c:
+        out = shim.judge("p", client=c, lock_retry_budget_s=100.0,
+                         _sleep=lambda s: None, _monotonic=lambda: 0.0)
+    assert out["ok"] is False and calls["n"] == 1
+    assert out["error_type"] == "codex_failed"
+
+
+def test_wrappers_propagate_budget_and_waited():
+    calls = {"n": 0}
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _lock_contended_response()
+        return httpx.Response(200, json={"ok": True, "response": "NO"})
+    t = {"v": 0.0}
+    import codex_shim_client as m
+    real_judge = m.judge
+    def patched(*a, **k):
+        k.setdefault("_sleep", lambda s: t.__setitem__("v", t["v"] + s))
+        k.setdefault("_monotonic", lambda: t["v"])
+        return real_judge(*a, **k)
+    m.judge = patched
+    try:
+        with _client(handler) as c:
+            out = shim.judge_contradiction("a", "b", client=c, lock_retry_budget_s=60.0)
+    finally:
+        m.judge = real_judge
+    assert out["ok"] is True and out["contradicts"] is False
+    assert out["lock_waited_s"] == 20.0

@@ -1,6 +1,10 @@
 [Unit]
 Description=Weekly judged retrieval-pairs sweep (co-retrieval supersession candidates -> human review queue)
-After=network-online.target
+# 2026-08-24 review R2: ORDERING, not a clock offset, is what prevents the two
+# Codex-judged units from queueing on the single-threaded shim after a boot
+# catch-up compresses both Persistent timers into one instant. After= makes this
+# unit wait for the discovery sweep whenever both are queued in one transaction.
+After=network-online.target contradiction-sweep.service
 
 [Service]
 Type=oneshot
@@ -13,4 +17,11 @@ Type=oneshot
 # stamped or hidden, and superseded_by is written solely by the operator's
 # --resolve-supersede step. --pairs-max-judged bounds the weekly Codex spend;
 # the pair cache makes repeat pairs free.
+# 2026-08-24 judge-resilience: same ExecStartPre pair as contradiction-sweep.service
+# (AMS-07) — this unit judged via Codex but never spawned the shim, so a Sunday with
+# no recent Claude session found :18792 dark and burned the week. Bounded, fail-soft
+# (the leading '-' keeps a failed spawn from blocking the run; the sweep's own
+# ensure-shim backstop then gets a second chance in-process).
+ExecStartPre=-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\__WIN_USER__\\.claude\\scripts\\codex-shim-spawn.ps1
+ExecStartPre=-/bin/sh -c 'for i in $(seq 1 30); do curl -sf -m 2 http://127.0.0.1:18792/health >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
 ExecStart=/home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/jobs.py run retrieval-pairs --receipt %h/.mem0/contradiction-sweep.jsonl --stale-after 10800 -- /home/__WSL_USER__/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --retrieval-pairs --apply --judge codex

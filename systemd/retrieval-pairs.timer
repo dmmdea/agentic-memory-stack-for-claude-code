@@ -1,8 +1,14 @@
 [Unit]
-Description=Weekly judged retrieval-pairs timer (Sun 05:15 - between contradiction-sweep 05:00 and episodic-reconcile 05:30; Codex-judged, capped)
+Description=Weekly judged retrieval-pairs timer (Sun 07:00 - clears the discovery sweep's common case; After= ordering in the .service covers the overlap; Codex-judged, capped)
+# 2026-08-24 review HIGH: 05:15 sat inside the discovery sweep's own 05:00 +
+# <=15m + "worst-case ~1-2h" window, and the codex shim is a SINGLE-THREADED
+# accept loop - this unit's requests queued behind 20-45s codex calls and
+# surfaced as client timeouts (the lost-week class wearing a different label).
+# 07:00 clears the common case; the client-side busy-retry budget covers the
+# residual overlap and boot catch-up compression.
 
 [Timer]
-OnCalendar=Sun 05:15
+OnCalendar=Sun 07:00
 Persistent=true
 RandomizedDelaySec=5m
 
