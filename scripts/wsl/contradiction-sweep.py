@@ -189,6 +189,17 @@ _LOCK_BUDGET = {"remaining_s": LOCK_PATIENCE_BUDGET_S}
 LOCK_CONTENDED_PREFIX = "codex-lock-contended"
 LOCK_EXHAUSTED_OUTCOME = "degraded:judge-lock-contended"
 
+
+def _outcome_for_abort(aborted: str) -> str:
+    """ONE grammar for abort outcomes across all four judged legs: lock
+    exhaustion is always the distinct LOCK_EXHAUSTED_OUTCOME (a grep on the
+    constant must find every leg's receipts); everything else keeps the
+    established degraded:aborted:<reason> shape."""
+    if aborted.startswith("judge-lock-contended"):
+        tail = aborted[len("judge-lock-contended"):].lstrip(": ")
+        return f"{LOCK_EXHAUSTED_OUTCOME}: {tail[:100]}" if tail else LOCK_EXHAUSTED_OUTCOME
+    return f"degraded:aborted:{aborted[:120]}"
+
 # Stamped on every LIVE Codex verdict (any leg, cache misses only by construction —
 # cache hits never reach the codex functions). Test-MemoryStack reads it: "no live
 # judging for over a week" must be a visible WARN, not something a paid audit finds.
@@ -426,7 +437,7 @@ def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
     R6c WARNs). pairs_checked==0 with canonicals present is 'ok' — the
     idempotent steady state where every candidate was checked recently."""
     if aborted:
-        return f"degraded:aborted: {aborted[:120]}"
+        return _outcome_for_abort(aborted)
     if canonical_total == 0:
         return "no-op:zero-canonicals"
     if pairs_checked > 0 and skipped_pairs == pairs_checked:
@@ -1186,7 +1197,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                     aborted = f"judge-lock-contended: {detail[:120]}"
                     print(f"contradiction-sweep: rejudge-stamped ABORT - {aborted}", flush=True)
                     break
-                if detail.startswith(("llm-error", "codex-error")):
+                if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
                     consec_fail += 1
                     if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                         aborted = (f"judge unresponsive: {MAX_CONSECUTIVE_LLM_FAILURES} "
@@ -1230,10 +1241,10 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             REJUDGE_LOCK.rmdir()  # release the single-runner lock
         except OSError:
             pass
-    outcome = f"degraded:aborted:{aborted}" if aborted else "ok"
+    outcome = _outcome_for_abort(aborted) if aborted else "ok"
     _append_summary({"mode": "rejudge-stamped", "dry_run": dry_run, "judge": args.judge,
                      "allow_auto_promote": getattr(args, "allow_auto_promote", False),
-                     "stamped_found": len(cleared_ids) + len(kept_ids) + skipped,
+                     "stamped_found": len(stamped),
                      "checked": checked, "yes": yes, "no": no, "cleared": cleared, "queued_for_review": queued,
                      "kept": len(kept_ids), "skipped": skipped,
                      "cleared_ids": cleared_ids, "kept_ids": kept_ids, "outcome": outcome})
@@ -1352,7 +1363,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                         aborted = f"judge-lock-contended: {detail[:120]}"
                         print(f"contradiction-sweep: evidence-sweep ABORT - {aborted}", flush=True)
                         break
-                    if detail.startswith("llm-error") or detail.startswith("codex-error"):
+                    if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
                         consec_fail += 1
                         if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                             aborted = (f"judge unresponsive: {MAX_CONSECUTIVE_LLM_FAILURES} consecutive "
@@ -1379,7 +1390,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
             EVIDENCE_LOCK.rmdir()
         except OSError:
             pass
-    outcome = f"degraded:aborted:{aborted}" if aborted else "ok"
+    outcome = _outcome_for_abort(aborted) if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
                      "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
                      "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome,
@@ -1689,7 +1700,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                             print("contradiction-sweep: retrieval-pairs judge ABORT - "
                                   f"{detail[:120]}", flush=True)
                             break
-                        if detail.startswith(("llm-error", "codex-error")):
+                        if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
                             consec_fail += 1
                             if consec_fail >= MAX_CONSECUTIVE_LLM_FAILURES:
                                 outcome = (f"degraded:judge-unresponsive:"
@@ -1888,6 +1899,13 @@ def main() -> int:
             return 0
         _h = _codex.health()
         if not _h.get("ok"):
+            # 2026-08-24 review HIGH: this preflight used to bypass the ensure-shim
+            # backstop entirely — a shim that merely needed longer than the unit's
+            # 30s ExecStartPre poll still lost the week as a benign-looking no-op.
+            # Try the one-shot bring-up, then re-check ONCE before giving up.
+            if _ensure_shim_once():
+                _h = _codex.health()
+        if not _h.get("ok"):
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "
                   f"({_h.get('error_type')}) — NO-OP (start the shim or run --judge local). "
                   "NOT falling back to local (would re-introduce the audited misrouting).", flush=True)
@@ -2067,7 +2085,7 @@ def main() -> int:
                     # 2026-08-24: codex-error now COUNTS here too — the discovery leg
                     # previously counted only llm-error, so a dead Codex judge fast-
                     # skipped every pair and the run reported a benign-looking no-op.
-                    if detail.startswith(("llm-error", "codex-error")):
+                    if detail.startswith(("llm-error", "codex-error", "codex-bridge-unavailable")):
                         consecutive_llm_failures += 1
                         if consecutive_llm_failures >= MAX_CONSECUTIVE_LLM_FAILURES:
                             aborted = (f"judge unresponsive: "

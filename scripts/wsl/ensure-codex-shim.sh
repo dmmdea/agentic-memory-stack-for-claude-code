@@ -29,10 +29,11 @@ if curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Resolve the Windows user from the installer's receipt (same pattern as
-# stack-backup.sh). No receipt or no interop -> fail soft, never guess a user.
-WIN_USER=""
-if [ -f "$HOME/.mem0/stack.env" ]; then
+# Resolve the Windows user: env override first (parity with job_liveness.py),
+# then the installer's receipt (same pattern as stack-backup.sh). No source of
+# truth -> fail soft, never guess a user.
+WIN_USER="${MEM0_WIN_USER:-}"
+if [ -z "$WIN_USER" ] && [ -f "$HOME/.mem0/stack.env" ]; then
     # shellcheck disable=SC1091
     . "$HOME/.mem0/stack.env" 2>/dev/null || true
     WIN_USER="${MEM0_WIN_USER:-}"
@@ -50,6 +51,10 @@ fi
 # Spawn (idempotent on the Windows side); the spawn script reads stdin, feed it EOF.
 # Capture output — when the later health poll fails, the spawn's own words are the
 # only clue WHY (missing venv, port conflict, wedged mutex holder).
+# NOTE: command substitution blocks until every inheriting fd closes. That is safe
+# ONLY because codex-shim-spawn.ps1 launches the daemon with UseShellExecute=$true
+# (no std-handle inheritance). If that flag ever flips, this wrapper would hang for
+# the shim's whole idle life — keep the two in sync.
 spawn_out="$("$PSEXE" -NoProfile -ExecutionPolicy Bypass -File "$SPAWN" </dev/null 2>&1)" || {
     echo "ensure-codex-shim: spawn invocation failed (interop dead or script missing at ${SPAWN}): $(echo "$spawn_out" | head -1)" >&2
     exit 1

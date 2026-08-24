@@ -120,19 +120,26 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
     {ok: False, error_type, error}. Never raises. The HTTP client timeout intentionally
     exceeds the shim's codex timeout so we don't abandon a call codex is still running.
 
-    Lock patience (opt-in): when `lock_retry_budget_s` > 0, a shim 503 with
-    error_type `lock_contended` is WAITED OUT — sleep `lock_retry_interval_s`,
-    retry — until the budget is spent; every other failure returns immediately,
-    unchanged. The returned dict always carries `lock_waited_s` (0.0 when no
-    contention was seen) so a caller managing a per-RUN budget can decrement it.
-    The classification happens on the structured `error_type`, never on a
-    flattened detail string. `_sleep`/`_monotonic` are injectable for tests.
+    Lock patience (opt-in): when `lock_retry_budget_s` > 0, two BUSY-shaped
+    failures are WAITED OUT — sleep `lock_retry_interval_s`, retry — until the
+    budget is spent: a shim 503 with error_type `lock_contended`, and a
+    `client_timeout` (the shim is a single-threaded accept loop, so a request
+    queued behind another consumer's 20-45s codex call times out client-side —
+    same busy-judge condition wearing a different error). Attempt duration
+    counts against the budget (monotonic elapsed, not just sleeps). Every other
+    failure returns immediately, unchanged; the final failure keeps its own
+    error_type so exhaustion reports truthfully. The returned dict always
+    carries `lock_waited_s` (0.0 when no busy-wait happened) so a caller
+    managing a per-RUN budget can decrement it. Classification happens on the
+    structured `error_type`, never on a flattened detail string.
+    `_sleep`/`_monotonic` are injectable for tests.
     """
+    _RETRYABLE_BUSY = ("lock_contended", "client_timeout")
     waited = 0.0
     start = _monotonic()
     while True:
         out = _judge_once(prompt, effort, timeout_s, client)
-        if out.get("ok") or out.get("error_type") != "lock_contended":
+        if out.get("ok") or out.get("error_type") not in _RETRYABLE_BUSY:
             out["lock_waited_s"] = round(waited, 1)
             return out
         waited = _monotonic() - start
@@ -140,7 +147,9 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
         if remaining <= 0:
             out["lock_waited_s"] = round(waited, 1)
             return out
-        _sleep(min(lock_retry_interval_s, remaining))
+        # clamp: a non-positive caller interval must neither raise (the module
+        # never raises) nor hot-spin against the shim.
+        _sleep(max(0.1, min(lock_retry_interval_s, remaining)))
         waited = _monotonic() - start
 
 
