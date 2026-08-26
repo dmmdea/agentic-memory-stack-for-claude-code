@@ -226,17 +226,26 @@ def _run(dry_run=False):
                     older, newer = (a, b) if ca <= cb else (b, a)
                     p_older = older.get("payload") or {}
                     p_newer = newer.get("payload") or {}
-                    if p_older.get("tier") == "canonical":  # never delete canonical
-                        newer, older = older, newer
-                        p_older, p_newer = p_newer, p_older
-                    elif _is_migration_protected(p_newer):
+                    # The deletion below always targets `newer`. Protecting a record therefore
+                    # means either skipping the pair or moving that record onto `older` - and
+                    # the old canonical branch did the opposite: with canonical on the older
+                    # side it SWAPPED, putting canonical onto `newer` and deleting exactly what
+                    # it set out to protect. Dead today (the loop requires a shared tier and
+                    # skips canonical as primary), a landmine the moment those filters change.
+                    #
+                    # Canonical on the older side needs NO action: `newer` is the ordinary
+                    # record, which is the one that should go.
+                    if p_newer.get("tier") == "canonical":
+                        continue  # never delete a canonical record
+                    if _is_migration_protected(p_newer):
                         # An auto-memory migration is the only live copy of a fact whose index
-                        # line is already gone. If the older side is an ordinary record, keep
-                        # the migration instead; if BOTH sides are migrations, delete neither.
-                        if _is_migration_protected(p_older):
+                        # line is already gone, so it must not be the deleted side.
+                        if p_older.get("tier") == "canonical" or _is_migration_protected(p_older):
+                            # Neither side may be deleted: leave the pair alone. (A retry
+                            # duplicate is undone by the compactor itself, not here.)
                             continue
                         newer, older = older, newer
-                        p_older, p_newer = p_newer, p_older
+                        p_newer, p_older = p_older, p_newer
                     rid = str(newer["id"])
                     # Preserve FULL payload of the deletion so restore is possible (lens S3)
                     full_payload = dict(p_newer)

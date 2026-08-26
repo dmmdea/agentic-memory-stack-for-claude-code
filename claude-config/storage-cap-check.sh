@@ -161,22 +161,36 @@ if [ -z "$_AMLINT" ]; then
 fi
 if [ -n "$_AMLINT" ]; then
   _amline=$(AMLINT="$_AMLINT" python3 - <<'PY' 2>/dev/null
-import json, os
+import json, os, datetime
 try:
     d = json.load(open(os.environ["AMLINT"], encoding="utf-8"))
 except Exception:
     raise SystemExit(0)
-c = d.get("counts") or {}
-n = int(c.get("actionable") or 0)
 parts = []
-if n:
-    kinds = {}
-    for f in d.get("findings") or []:
-        k = f.get("kind")
-        if k in ("orphan", "dangling", "dup-slug", "over-sync-limit", "over-inject-limit", "compactor-silent", "history-remote"):
-            kinds[k] = kinds.get(k, 0) + 1
-    detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
-    parts.append(f"auto-memory lint: {n} actionable ({detail})")
+# The lint fails open on every path and never rewrites this file on failure, so an old summary
+# would otherwise be presented as this morning's truth. Report the staleness instead of counts.
+gen = d.get("generated_at")
+stale_h = None
+if gen:
+    try:
+        t = datetime.datetime.fromisoformat(gen.replace("Z", "+00:00"))
+        stale_h = round((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600.0, 1)
+    except Exception:
+        stale_h = None
+if stale_h is not None and stale_h > 12:
+    parts.append(f"auto-memory lint: STALE ({stale_h}h old) - memory-lint.ps1 has not completed since then")
+else:
+    c = d.get("counts") or {}
+    n = int(c.get("actionable") or 0)
+    if n:
+        kinds = {}
+        for f in d.get("findings") or []:
+            k = f.get("kind")
+            if k in ("orphan", "dangling", "dup-slug", "over-sync-limit", "over-inject-limit",
+                     "compactor-silent", "compactor-unproductive", "history-remote", "scan-error"):
+                kinds[k] = kinds.get(k, 0) + 1
+        detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
+        parts.append(f"auto-memory lint: {n} actionable ({detail})")
 age = d.get("last_receipt_age_hours")
 if age is not None and age <= 24:
     parts.append(f"compactor ran {age}h ago (receipt: ~/.claude/state/automemory/compact-receipts.jsonl)")

@@ -393,15 +393,21 @@ try {
     } else {
         . $storeLib
         $amStores = @(Get-AmStores) | Where-Object { -not $_.IsAlias }
-        $bad = @(); $struct = @()
+        $bad = @(); $struct = @(); $unreadable = @()
         foreach ($amS in $amStores) {
-            $amStats = Get-AmStoreStats -Store $amS
-            if ($amStats.Bytes -ge 25000) { $bad += "$($amS.Workspace) $($amStats.Bytes)B" }
-            if ($amStats.Lines -ge 200)   { $bad += "$($amS.Workspace) $($amStats.Lines) lines" }
-            foreach ($fnd in @(Get-AmLintFindings -Store $amS)) {
-                if (@('orphan', 'dangling', 'dup-slug') -contains $fnd.kind) { $struct += "$($amS.Workspace)/$($fnd.file) $($fnd.kind)" }
-            }
+            # Per-store guard: one unreadable store must not downgrade the whole row to a WARN
+            # carrying an exception - this is the row meant to catch exactly that state.
+            try {
+                $amStats = Get-AmStoreStats -Store $amS
+                # Caps come from the library that owns them, never re-typed here.
+                if ($amStats.Bytes -ge $script:AmSyncLimitBytes)   { $bad += "$($amS.Workspace) $($amStats.Bytes)B" }
+                if ($amStats.Lines -ge $script:AmInjectLimitLines) { $bad += "$($amS.Workspace) $($amStats.Lines) lines" }
+                foreach ($fnd in @(Get-AmLintFindings -Store $amS)) {
+                    if (@('orphan', 'dangling', 'dup-slug') -contains $fnd.kind) { $struct += "$($amS.Workspace)/$($fnd.file) $($fnd.kind)" }
+                }
+            } catch { $unreadable += "$($amS.Workspace): $($_.Exception.Message)" }
         }
+        if ($unreadable.Count -gt 0) { $bad += ("unreadable: " + ($unreadable -join '; ')) }
         if ($bad.Count -gt 0) {
             Add-Check 'INVARIANTS' 'auto-memory store budgets' 'FAIL' ("over a hard cap: " + ($bad -join '; '))
         } elseif ($struct.Count -gt 0) {

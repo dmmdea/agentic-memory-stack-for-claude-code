@@ -61,9 +61,36 @@ try {
     $stale = ($overTrigger.Count -gt 0 -and ($null -eq $lastReceiptAgeH -or $lastReceiptAgeH -gt 48))
     if ($stale) {
         [void]$findings.Add([pscustomobject]@{
-            store = '(fleet)'; kind = 'compactor-silent'; file = 'ClaudeCode-MemoryCompactor'
+            store = '(fleet)'; kind = 'compactor-silent'; file = 'ClaudeCode-MemoryCompactor-5am'
             detail = ('' + $overTrigger.Count + ' store(s) above trigger, last compactor receipt: ' + $(if ($null -eq $lastReceiptAgeH) { 'never' } else { '' + $lastReceiptAgeH + 'h ago' }))
         })
+    }
+    # A FRESH receipt file is not proof of progress: a compactor that aborts every night writes
+    # a receipt every night. If the last few runs for a store above trigger all ended in a
+    # non-productive status, the maintainer is stuck, not working.
+    if ($overTrigger.Count -gt 0 -and (Test-Path -LiteralPath $receiptPath)) {
+        try {
+            $tail = @(Get-Content -LiteralPath $receiptPath -Tail 40 -ErrorAction Stop)
+            foreach ($row in $storeRows) {
+                if (-not $row.over_trigger) { continue }
+                $mine = @()
+                foreach ($l in $tail) {
+                    if (-not $l.Trim()) { continue }
+                    try { $o = $l | ConvertFrom-Json } catch { continue }
+                    if ($o.workspace -eq $row.workspace -and -not $o.dry_run) { $mine += $o }
+                }
+                $recent = @($mine | Select-Object -Last 3)
+                if (@($recent).Count -ge 3) {
+                    $good = @($recent | Where-Object { @('applied', 'applied-unrecorded', 'no-op') -contains $_.status })
+                    if (@($good).Count -eq 0) {
+                        [void]$findings.Add([pscustomobject]@{
+                            store = $row.workspace; kind = 'compactor-unproductive'; file = 'MEMORY.md'
+                            detail = ('above trigger and the last 3 runs all ended: ' + (@($recent | ForEach-Object { $_.status }) -join ', '))
+                        })
+                    }
+                }
+            }
+        } catch {}
     }
     # The history repo must never gain a remote: these stores hold credentials and private
     # brand facts, and a push would publish them.
@@ -83,7 +110,11 @@ try {
             long_line   = @($findings | Where-Object kind -eq 'long-line').Count
             oversized   = @($findings | Where-Object kind -eq 'oversized-file').Count
             over_budget = @($findings | Where-Object { $_.kind -eq 'over-sync-limit' -or $_.kind -eq 'over-inject-limit' }).Count
-            actionable  = @($findings | Where-Object { $_.kind -eq 'orphan' -or $_.kind -eq 'dangling' -or $_.kind -eq 'dup-slug' -or $_.kind -eq 'over-sync-limit' -or $_.kind -eq 'over-inject-limit' -or $_.kind -eq 'compactor-silent' -or $_.kind -eq 'history-remote' }).Count
+            scan_error  = @($findings | Where-Object kind -eq 'scan-error').Count
+            # 'scan-error' and 'compactor-unproductive' MUST be here: the banner renders only
+            # actionable kinds, so a finding missing from this list reaches no surface at all -
+            # a store that cannot be read would have been completely invisible.
+            actionable  = @($findings | Where-Object { @('orphan', 'dangling', 'dup-slug', 'over-sync-limit', 'over-inject-limit', 'compactor-silent', 'compactor-unproductive', 'history-remote', 'scan-error') -contains $_.kind }).Count
         }
         last_receipt_age_hours = $lastReceiptAgeH
     }

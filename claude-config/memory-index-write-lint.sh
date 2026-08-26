@@ -26,6 +26,12 @@ payload="$(cat 2>/dev/null || true)"
 path="$(printf '%s' "$payload" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 [ -n "$path" ] || exit 0
 
+# The payload is JSON, so a Windows path arrives with its backslashes DOUBLED
+# ("C:\\Users\\...\\memory\\MEMORY.md"). Without this unescape the pattern match below never
+# matched on Windows and this entire hook was inert in production while its registration test
+# stayed green. Unescape the JSON string before doing anything else with it.
+path="$(printf '%s' "$path" | sed -e 's/\\\\/\\/g' -e 's/\\\//\//g')"
+
 # Only ever act on a workspace memory index: <...>/projects/<workspace>/memory/MEMORY.md
 case "$path" in
   *[/\\]memory[/\\]MEMORY.md|*/memory/MEMORY.md) : ;;
@@ -43,12 +49,17 @@ case "$file" in
 esac
 [ -f "$file" ] || exit 0
 
-total_bytes=$(wc -c < "$file" 2>/dev/null || echo 0)
-total_lines=$(grep -c '' "$file" 2>/dev/null || echo 0)
+total_bytes=$(wc -c < "$file" 2>/dev/null); : "${total_bytes:=0}"
+# NOT `grep -c '' || echo 0`: grep -c prints 0 AND exits 1 on no match, so the `||` appends a
+# SECOND line and every later numeric test errors on "0\n0".
+total_lines=$(grep -c '' "$file" 2>/dev/null); : "${total_lines:=0}"
 
-# Report the offending lines: index entries whose UTF-8 byte length exceeds the hook budget.
-over="$(awk -v cap="$CAP_LINE_BYTES" '
-  /^- \[.*\]\(.*\.md\)/ { n = length($0); if (n > cap) { printf "  line %d: %d B  %s\n", NR, n, substr($0, 1, 60) } }
+# Report the offending lines: index entries whose UTF-8 BYTE length exceeds the hook budget.
+# LC_ALL=C is load-bearing: in a UTF-8 locale awk's length() counts CHARACTERS, so every line
+# containing the em-dash separator (3 bytes) or an accent was under-measured - by exactly the
+# quantity this hook exists to measure, and disagreeing with the PowerShell side's byte count.
+over="$(LC_ALL=C awk -v cap="$CAP_LINE_BYTES" '
+  /^[[:space:]]*- \[.*\]\(.*\.md\)/ { n = length($0); if (n > cap) { printf "  line %d: %d B  %s\n", NR, n, substr($0, 1, 60) } }
 ' "$file" 2>/dev/null)"
 over_count=$(printf '%s' "$over" | grep -c '^' 2>/dev/null || echo 0)
 [ -z "$over" ] && over_count=0

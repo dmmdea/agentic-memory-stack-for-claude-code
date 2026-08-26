@@ -61,9 +61,15 @@ function Get-AmByteCount {
 }
 
 function Get-AmNewline {
-    # The store's existing line ending; new files default to LF (what the harness writes).
+    # The store's PREVAILING line ending; new files default to LF (what the harness writes).
+    # Majority, not "contains": a mostly-LF index with one stray CRLF would otherwise be
+    # rewritten wholly to CRLF, changing every line the job never touched.
     param([AllowEmptyString()][string]$Text)
-    if ($Text -and $Text.Contains("`r`n")) { return "`r`n" }
+    if (-not $Text) { return "`n" }
+    $crlf = ([regex]::Matches($Text, "`r`n")).Count
+    if ($crlf -eq 0) { return "`n" }
+    $lf = ([regex]::Matches($Text, "`n")).Count
+    if ($crlf * 2 -ge $lf) { return "`r`n" }
     return "`n"
 }
 
@@ -73,11 +79,18 @@ function Write-AmTextAtomic {
     param([Parameter(Mandatory)][string]$Path, [AllowEmptyString()][string]$Text)
     $tmp = $Path + '.am-tmp'
     [System.IO.File]::WriteAllText($tmp, $Text, (Get-AmUtf8))
-    if (Test-Path -LiteralPath $Path) {
-        # $null binds as "" on a .NET string parameter; NullString is the real null.
-        [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
-    } else {
-        [System.IO.File]::Move($tmp, $Path)
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            # $null binds as "" on a .NET string parameter; NullString is the real null.
+            [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } catch {
+        # The swap failed (sharing violation, ACL, cross-volume). Never leave a full copy of
+        # the index behind in the store - that directory is synced and globbed.
+        try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch {}
+        throw
     }
 }
 
@@ -94,7 +107,12 @@ function Get-AmContentHash {
 
 function Resolve-AmReparseTarget {
     # A workspace dir may be a junction/symlink alias of another (observed: the same store
-    # reachable under a spaces-vs-dashes name). Returns the canonical directory path.
+    # reachable under a spaces-vs-dashes name). Returns the canonical directory path, or $null
+    # when the link cannot be resolved.
+    #
+    # Returning $Dir on failure would be fail-OPEN: an unresolvable junction would be crowned
+    # its own canonical store and the same physical store compacted TWICE in one run, the
+    # second pass reading the first pass's output and defeating both the seal and the blast cap.
     param([Parameter(Mandatory)][string]$Dir)
     try {
         $item = Get-Item -LiteralPath $Dir -ErrorAction Stop
@@ -102,8 +120,9 @@ function Resolve-AmReparseTarget {
             $t = $null
             try { $t = $item.Target } catch { $t = $null }
             if ($t) { return ([string]@($t)[0]).TrimEnd('\') }
+            return $null   # it IS a link and we could not read where it points
         }
-    } catch {}
+    } catch { return $null }
     return $Dir.TrimEnd('\')
 }
 
@@ -119,21 +138,46 @@ function Get-AmStores {
     # canonical one and an alias can never be crowned by sort order.
     $dirs = @(Get-ChildItem -LiteralPath $ProjectsRoot -Directory -ErrorAction SilentlyContinue |
         Sort-Object @{ Expression = { [bool]($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } }, Name)
+    $rows = @()
     foreach ($d in $dirs) {
         $memDir = Join-Path $d.FullName 'memory'
         $idx = Join-Path $memDir 'MEMORY.md'
         if (-not (Test-Path -LiteralPath $idx)) { continue }
-        $canon = (Join-Path (Resolve-AmReparseTarget -Dir $d.FullName) 'memory').ToLowerInvariant()
+        $target = Resolve-AmReparseTarget -Dir $d.FullName
+        if ($null -eq $target) {
+            # Unresolvable link: treat as an alias of nothing, i.e. never mutate through it.
+            $rows += [pscustomobject]@{
+                Workspace = $d.Name; Dir = $memDir; IndexPath = $idx
+                CanonicalDir = $null; IsAlias = $true; AliasOf = '(unresolved link)'; WorkspaceDir = $d.FullName
+            }
+            continue
+        }
+        $canon = (Join-Path $target 'memory').ToLowerInvariant()
         $isAlias = $seen.ContainsKey($canon)
         if (-not $isAlias) { $seen[$canon] = $d.Name }
-        $out += [pscustomobject]@{
+        $rows += [pscustomobject]@{
             Workspace    = $d.Name
             Dir          = $memDir
             IndexPath    = $idx
             CanonicalDir = $canon
             IsAlias      = $isAlias
             AliasOf      = $(if ($isAlias) { $seen[$canon] } else { $null })
+            WorkspaceDir = $d.FullName
         }
+    }
+    # Give every canonical store the list of workspace directories that reach it. A session
+    # running under an ALIAS path writes its transcripts into the alias directory, so a liveness
+    # probe that only looks at the canonical name would miss it entirely - and the liveness gate
+    # is the guard that exists because a live session was observed writing mid-run.
+    foreach ($r in $rows) {
+        $dirsForStore = @($r.WorkspaceDir)
+        if (-not $r.IsAlias -and $r.CanonicalDir) {
+            foreach ($o in $rows) {
+                if ($o.IsAlias -and $o.CanonicalDir -eq $r.CanonicalDir) { $dirsForStore += $o.WorkspaceDir }
+            }
+        }
+        $r | Add-Member -NotePropertyName ProbeDirs -NotePropertyValue @($dirsForStore) -Force
+        $out += $r
     }
     # Plain return: callers wrap in @(). A `return ,$out` here hands back ONE element that IS
     # the array (observed: every store concatenated into a single object under 5.1 and 7).
@@ -143,14 +187,35 @@ function Get-AmStores {
 function Get-AmFactFiles {
     # Fact files = every *.md in the store except the index. Never recurses: subdirectories
     # are not part of the harness contract and must never be created by a maintainer.
+    #
+    # THROWS on an enumeration failure, deliberately. With -ErrorAction SilentlyContinue an
+    # unreadable directory and an empty one both returned @(), and a caller comparing the index
+    # against that empty set concludes every line is dangling - then every downstream guard
+    # agrees, because they all compare against the same empty set, and the whole index is wiped
+    # with a receipt reporting success. "Could not read" must never be spellable as "nothing
+    # there".
     param([Parameter(Mandatory)][string]$Dir)
-    return @(Get-ChildItem -LiteralPath $Dir -Filter '*.md' -File -ErrorAction SilentlyContinue |
+    return @(Get-ChildItem -LiteralPath $Dir -Filter '*.md' -File -ErrorAction Stop |
         Where-Object { $_.Name -ne 'MEMORY.md' } | Sort-Object Name)
+}
+
+function Clear-AmStoreTempFiles {
+    # A crashed atomic write can leave a full copy of the index as <name>.am-tmp INSIDE the
+    # store, where the harness syncs it and agents glob it. Sweep them; a leftover is evidence
+    # of a previously failed write, so the caller logs what it removed.
+    param([Parameter(Mandatory)][string]$Dir)
+    $found = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter '*.am-tmp' -File -ErrorAction SilentlyContinue)) {
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $found += $f.Name } catch {}
+    }
+    return $found
 }
 
 # ---------------------------------------------------------------- index parsing
 
-$script:AmEntryRegex = [regex]'^- \[(?<title>[^\]]*)\]\((?<slug>[^)\s]+\.md)\)(?<rest>.*)$'
+# Lazy title so a title containing "]" still parses; leading whitespace so an indented pointer
+# is an entry rather than opaque text. Both shapes previously fell through to Kind='other'.
+$script:AmEntryRegex = [regex]'^(?<indent>\s*)- \[(?<title>.*?)\]\((?<slug>[^)\s]+\.md)\)(?<rest>.*)$'
 $script:AmLinkRegex  = [regex]'\(([^)\s]+\.md)\)'
 
 function Read-AmIndex {
@@ -175,6 +240,7 @@ function Read-AmIndex {
                 Index   = $i
                 Kind    = 'entry'
                 Raw     = $ln
+                Indent  = $m.Groups['indent'].Value
                 Title   = $m.Groups['title'].Value
                 Slug    = $m.Groups['slug'].Value
                 Summary = $summary
@@ -183,7 +249,7 @@ function Read-AmIndex {
             })
         } else {
             [void]$records.Add([pscustomobject]@{
-                Index = $i; Kind = 'other'; Raw = $ln; Title = $null; Slug = $null
+                Index = $i; Kind = 'other'; Raw = $ln; Indent = ''; Title = $null; Slug = $null
                 Summary = $null; ExtraSlugs = @(); Bytes = (Get-AmByteCount -Text $ln)
             })
         }
@@ -193,8 +259,13 @@ function Read-AmIndex {
 }
 
 function New-AmEntryLine {
-    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][string]$Slug, [AllowEmptyString()][string]$Summary)
-    $line = '- [' + $Title + '](' + $Slug + ')'
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Slug,
+        [AllowEmptyString()][string]$Summary,
+        [AllowEmptyString()][string]$Indent = ''
+    )
+    $line = $Indent + '- [' + $Title + '](' + $Slug + ')'
     if ($Summary) { $line += ' ' + $script:AmEmDash + ' ' + $Summary }
     return $line
 }
@@ -206,7 +277,9 @@ function ConvertTo-AmIndexText {
     $out = New-Object System.Collections.Generic.List[string]
     foreach ($r in $Records) {
         if ($r.Kind -eq 'entry' -and $r.PSObject.Properties['Dirty'] -and $r.Dirty) {
-            $out.Add((New-AmEntryLine -Title $r.Title -Slug $r.Slug -Summary $r.Summary))
+            $ind = ''
+            if ($r.PSObject.Properties['Indent'] -and $r.Indent) { $ind = $r.Indent }
+            $out.Add((New-AmEntryLine -Title $r.Title -Slug $r.Slug -Summary $r.Summary -Indent $ind))
         } else {
             $out.Add($r.Raw)
         }
@@ -215,13 +288,23 @@ function ConvertTo-AmIndexText {
 }
 
 function Get-AmIndexLinkedSlugs {
-    # Every fact file the index references, primary or extra (a merged line may carry two).
+    # Every fact file the index references, from ANY line - parsed entry or not.
+    #
+    # Deliberately independent of entry parsing. A line whose title contains "]" or that is
+    # indented does not match the entry regex, so treating only entries as "linked" reported its
+    # file as an ORPHAN; the compactor then appended a SECOND pointer to a file that was already
+    # indexed, growing a store it exists to shrink (reproduced in review: 24,014 -> 24,101 B on
+    # a store already at 96% of the sync limit). Reachability must be decided by "is there a
+    # link to it anywhere", never by "did my regex like the line".
     param([Parameter(Mandatory)]$Records)
     $set = @{}
     foreach ($r in $Records) {
-        if ($r.Kind -ne 'entry') { continue }
-        $set[$r.Slug] = $true
-        foreach ($e in $r.ExtraSlugs) { $set[$e] = $true }
+        if ($r.Kind -eq 'entry') {
+            $set[$r.Slug] = $true
+            foreach ($e in $r.ExtraSlugs) { $set[$e] = $true }
+            continue
+        }
+        foreach ($m in $script:AmLinkRegex.Matches([string]$r.Raw)) { $set[$m.Groups[1].Value] = $true }
     }
     return $set
 }
@@ -351,16 +434,64 @@ function Get-AmLintFindings {
 # ---------------------------------------------------------------- session liveness
 
 function Test-AmWorkspaceLive {
-    # A session in THIS workspace wrote its transcript recently. The harness holds an in-context
+    # A session in this workspace wrote its transcript recently. The harness holds an in-context
     # copy of the index and writes it back whole, so mutating under a live session loses one
     # side's changes. Transcripts are the top-level *.jsonl files of the workspace dir.
-    param([Parameter(Mandatory)][string]$Workspace, [int]$WithinMinutes = 30, [string]$ProjectsRoot = (Get-AmProjectsRoot))
-    $wsDir = Join-Path $ProjectsRoot $Workspace
-    if (-not (Test-Path -LiteralPath $wsDir)) { return $false }
+    #
+    # FAILS CLOSED: an enumeration error reports LIVE. "I could not tell" must mean "do not
+    # touch it", never "go ahead". Pass -Dirs (a store's ProbeDirs) so alias paths are covered.
+    param(
+        [string]$Workspace,
+        [string[]]$Dirs,
+        [int]$WithinMinutes = 30,
+        [string]$ProjectsRoot = (Get-AmProjectsRoot)
+    )
+    $probe = @()
+    if ($Dirs -and @($Dirs).Count -gt 0) { $probe = @($Dirs) }
+    elseif ($Workspace) { $probe = @((Join-Path $ProjectsRoot $Workspace)) }
+    else { return $true }
     $cutoff = [DateTime]::UtcNow.AddMinutes(-1 * $WithinMinutes)
-    $recent = @(Get-ChildItem -LiteralPath $wsDir -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -ge $cutoff })
-    return ($recent.Count -gt 0)
+    foreach ($d in $probe) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        try {
+            $recent = @(Get-ChildItem -LiteralPath $d -Filter '*.jsonl' -File -ErrorAction Stop |
+                Where-Object { $_.LastWriteTimeUtc -ge $cutoff })
+            if ($recent.Count -gt 0) { return $true }
+        } catch { return $true }
+    }
+    return $false
+}
+
+function Test-AmLineRoundTrips {
+    # A line the job CONSTRUCTS must parse back to exactly the entry it intended: same slug, no
+    # extra links, and recognised as an entry at all.
+    #
+    # Without this, two constructed lines can poison the store permanently. A model-written hook
+    # containing something like "(see other.md)" injects a second link to a file that may not
+    # exist - a ghost the hygiene pass never removes, so the post-write invariant fails every
+    # night, the index is restored every night, and the run is discarded forever. A title
+    # containing "]" makes the regenerated line unparseable, so its file reads back as an orphan
+    # on the next run - same endless loop.
+    param([Parameter(Mandatory)][string]$Line, [Parameter(Mandatory)][string]$ExpectedSlug)
+    $rt = Read-AmIndex -Text $Line
+    $recs = @($rt.Records | Where-Object { $_.Kind -eq 'entry' })
+    if (@($recs).Count -ne 1) { return $false }
+    if ($recs[0].Slug -ne $ExpectedSlug) { return $false }
+    if (@($recs[0].ExtraSlugs).Count -gt 0) { return $false }
+    return $true
+}
+
+function Get-AmTruncatedToBytes {
+    # Truncate to a BYTE budget (not a character count) on a word boundary where possible.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$MaxBytes = 100)
+    if ((Get-AmByteCount -Text $Text) -le $MaxBytes) { return $Text }
+    $s = $Text
+    while ($s.Length -gt 0 -and (Get-AmByteCount -Text $s) -gt $MaxBytes) {
+        $s = $s.Substring(0, $s.Length - 1)
+    }
+    $cut = $s.LastIndexOf(' ')
+    if ($cut -gt [int]($s.Length * 0.6)) { $s = $s.Substring(0, $cut) }
+    return $s.TrimEnd()
 }
 
 # ---------------------------------------------------------------- git history (out of tree)
@@ -392,8 +523,11 @@ function Invoke-AmGit {
     $psi.StandardOutputEncoding = (Get-AmUtf8)
     $psi.StandardErrorEncoding = (Get-AmUtf8)
     $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
+    # Read stdout asynchronously while draining stderr: two sequential ReadToEnd calls deadlock
+    # if the child fills the pipe we are not reading yet.
+    $outTask = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEnd()
+    $out = $outTask.GetAwaiter().GetResult()
     $p.WaitForExit()
     return [pscustomobject]@{ Code = $p.ExitCode; Out = $out; Err = $err }
 }
@@ -474,7 +608,11 @@ function Write-AmJsonFile {
 }
 
 function Read-AmJsonFile {
+    # Returns the parsed object, or $null when the file does not exist.
+    # THROWS when the file exists but does not parse - "absent" and "corrupt" must not collapse
+    # into the same answer. A corrupt seal file silently read as "no seals" would re-arm the
+    # model on every already-shortened line, which is exactly the drift the seal prevents.
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    try { return (Read-AmText -Path $Path | ConvertFrom-Json) } catch { return $null }
+    return (Read-AmText -Path $Path | ConvertFrom-Json)
 }

@@ -159,30 +159,42 @@ depends on the migration source tag.
 
 ## Invariants and assumptions
 
-- Every populated Index stays under both hard caps.
+- Every populated Index stays under both hard caps, and **maintenance never grows a store** past
+  one — re-indexing an orphan is skipped rather than crossing the sync limit.
 - No orphans, no dangling links, no duplicate slugs after a run.
+- Reachability is decided by "is this file linked from any line", never by whether a line
+  matched the entry pattern — otherwise an unparseable pointer makes its file look like an
+  orphan and earns it a second, duplicate pointer.
 - A Doctrine Entry is never shortened by a model, merged, migrated or dropped.
 - No file is ever deleted without its content existing either in the memory corpus (verified by
   id) or in the history repository.
-- The job writes exactly one file per store: the Index.
-- A model-driven edit must strictly shrink the Index; hygiene is exempt from that rule.
+- The job writes exactly one file per store: the Index. Fact files are deleted only *after*
+  that write and its invariant check succeed, so an abort leaves the store untouched.
+- A model-driven edit must strictly shrink the Index; hygiene is exempt from that rule, because
+  correctness must never be gated on saving bytes.
+- Every line the job constructs must parse back to the same single pointer.
 - Each line may be rewritten by the model at most once, ever.
-- No run removes more than a fifth of the lines.
+- No run removes more than a fifth of the lines — hygiene removals included.
 
 ## Error handling
 
 | Failure | Behaviour |
 |---|---|
-| A session is live in the workspace | skip that store; receipt records why |
-| The store changed during the run | abort before writing; never revert over the live write |
-| Judge unreachable | deterministic hygiene only; the judge-only work waits |
-| Judge returns unparseable output | same as unreachable |
-| Memory server down or returns no id | migration not performed; the line stays |
-| Post-write invariants fail | restore the Index alone from the snapshot |
+| A session is live in the workspace (or cannot be probed) | skip that store; receipt records why |
+| The store changed during the run | abort before anything is written **or deleted** |
+| The fact directory cannot be read, or enumerates empty under a non-empty Index | abort; never treat every line as dangling |
+| Hygiene wants to remove more than a fifth of the lines | abort and report; never silently gut an Index |
+| Judge unreachable or unparseable | deterministic hygiene only; status says so; throttle **not** marked |
+| Memory server returns no id, or the read-back does not match | migration not performed, the line stays, and the unverified record is deleted |
+| Post-write invariants fail | restore the Index alone; if that restore fails, say so loudly with the recovery command |
 | Doctrine set alone exceeds the budget | stop and report; never loosen the rule |
+| No verified pre-run snapshot | skip the store; never mutate without a restore point |
+| One store throws | that store is recorded as an error; the others continue |
 
-There is no local fallback for judgment work, and a run that only skipped does not mark the
-throttle, so it is retried rather than silently counted as done.
+There is no local fallback for judgment work. A run that only skipped does not mark the
+throttle, so it is retried rather than silently counted as done. Each store's receipt is written
+the moment that store finishes, never buffered to the end of the run — a job killed by its
+execution time limit must not lose the record of what it already did.
 
 ## Security and privacy notes
 
@@ -198,6 +210,11 @@ the diff beside them shows exactly what changed. Two health-check rows cover thi
 invariants row asserting the budgets and structural cleanliness of every store, and a recovery
 row asserting both that the task is registered against the deployed script and that a store
 above trigger has produced a receipt within 48 hours.
+
+Freshness is not progress, and both surfaces say so: a compactor that aborts every night still
+writes a receipt every night, so the lint additionally reports a store above trigger whose last
+three runs all ended in a non-productive status. The banner reports the lint summary's own age
+rather than presenting stale counts as current.
 
 To rehearse safely: run with `-DryRun` (decides, writes nothing), or with `-Workspace` against a
 throwaway store.

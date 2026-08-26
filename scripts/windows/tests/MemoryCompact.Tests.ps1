@@ -70,8 +70,12 @@ function Add-Mem0Memory {
     }
 }
 function Invoke-RestMethod {
-    # shadows the cmdlet for the by-id read-back
+    # shadows the cmdlet for the by-id read-back AND the undo delete
     param($Uri, $Headers, $TimeoutSec, $Method, $Body, $ContentType)
+    if ($Method -eq 'Delete') {
+        Add-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\mem0-deleted.txt') -Value ([string]$Uri)
+        return [pscustomobject]@{ ok = $true }
+    }
     if ($env:STUB_MEM0_MODE -eq 'mismatch') { return [pscustomobject]@{ memory = 'SOMETHING ELSE'; retrievable = $true } }
     $t = Get-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\mem0-last.txt') -Raw
     return [pscustomobject]@{ memory = $t.TrimEnd("`r", "`n"); retrievable = $true }
@@ -220,17 +224,139 @@ Describe 'GUARD 4: strict decrease, anchors, seal, blast cap' {
     }
 
     It 'seals a shortened line so a second run never re-sends it to the model' {
+        # The shortened hook must stay OVER the 130 B line cap, or the byte filter alone would
+        # keep it out of the second prompt and this test would pass with the seal deleted -
+        # the seam-test trap. It shrinks (so the rewrite applies) but stays a candidate, so
+        # ONLY the seal can exclude it.
         $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
-        $plan = '{"plan":[{"slug":"fact1.md","action":"SHORTEN","hook":"detail number 1 kept short"}]}'
+        $stillLong = 'detail number 1 ' + ('kept but still long ' * 9)
+        $plan = '{"plan":[{"slug":"fact1.md","action":"SHORTEN","hook":"' + $stillLong + '"}]}'
         $sb = New-Sandbox -CodexPlanJson $plan
         Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
-        Invoke-Compactor -Sandbox $sb | Out-Null
+        $r1 = Invoke-Compactor -Sandbox $sb
+        $r1.Receipts[0].shortened | Should -Be 1 -Because 'the rewrite must actually apply for the seal to mean anything'
+        $line1 = (Get-Content -LiteralPath (Join-Path $sb.Projects 'ws\memory\MEMORY.md') | Where-Object { $_ -match '\(fact1\.md\)' })
+        ([System.Text.Encoding]::UTF8.GetByteCount($line1)) | Should -BeGreaterThan 130 -Because 'the sealed line must remain a byte-cap candidate, else the byte filter (not the seal) is what excludes it'
         Invoke-Compactor -Sandbox $sb | Out-Null
         $prompt = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') -Raw
         # A sealed line may still appear as a MIGRATE candidate; what must never recur is its
-        # offer as a SHORTEN candidate (the "| <n> B" form). One LLM rewrite per line, ever.
-        $prompt | Should -Not -Match 'slug: fact1\.md \| type: [a-z]+ \| \d+ B' -Because 'one LLM rewrite per line, ever - this is what stops nightly drift'
+        # offer as a SHORTEN candidate (the "| <n> B" form). One judge rewrite per line, ever.
+        $prompt | Should -Not -Match 'slug: fact1\.md \| type: [a-z]+ \| \d+ B' -Because 'one judge rewrite per line, ever - this is what stops nightly drift'
         $prompt | Should -Match 'slug: fact2\.md \| type: [a-z]+ \| \d+ B' -Because 'an unsealed long line is still offered'
+    }
+
+    It 'rejects a hook containing a markdown link (it would inject a permanent ghost)' {
+        # A second link to a non-existent file is a ghost hygiene cannot remove: the invariant
+        # check would fail, the index would be restored, and the run discarded - every night.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $plan = '{"plan":[{"slug":"fact1.md","action":"SHORTEN","hook":"detail number 1 see [other](ghost.md)"}]}'
+        $sb = New-Sandbox -CodexPlanJson $plan
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].shortened | Should -Be 0
+        (Get-Content -LiteralPath (Join-Path $sb.Projects 'ws\memory\MEMORY.md') -Raw) | Should -Not -Match 'ghost\.md'
+    }
+
+    It 'keeps an anchor containing regex/wildcard characters (no false accept)' {
+        # `cfg[0].name` is a character class to -like: the guard both rejected good hooks and
+        # accepted hooks that had dropped the anchor entirely.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $lines = New-BigIndexLines
+        $lines += '- [Brackety](bracket.md) ' + $script:EmDash + ' the `cfg[0].name` knob ' + ('matters a great deal here ' * 5)
+        $facts['bracket.md'] = (New-FactFile 'bracket' 'd')
+        # hook DROPS the anchor -> must be rejected
+        $plan = '{"plan":[{"slug":"bracket.md","action":"SHORTEN","hook":"the cfg0.name knob matters"}]}'
+        $sb = New-Sandbox -CodexPlanJson $plan
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines $lines -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].shortened | Should -Be 0 -Because 'the rewritten hook no longer contains the anchor cfg[0].name'
+    }
+}
+
+Describe 'store-shape robustness (review-reproduced defects)' {
+    It 'never duplicates a pointer whose line the entry regex cannot parse, and never grows the index' {
+        # Reproduced in review: a bracketed title and an indented pointer both parsed as
+        # non-entries, their files were called orphans, and a SECOND pointer was appended to
+        # each - growing a store that was already at 96% of the sync limit.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $facts['bracket.md'] = (New-FactFile 'bracket' 'desc for bracket')
+        $facts['nested.md']  = (New-FactFile 'nested' 'desc for nested')
+        $lines = New-BigIndexLines
+        $lines += '- [Title [with] brackets](bracket.md) ' + $script:EmDash + ' a hook'
+        $lines += '  - [Nested](nested.md) ' + $script:EmDash + ' a nested pointer'
+        $sb = New-Sandbox
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines $lines -Facts $facts | Out-Null
+        $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
+        $before = Get-Bytes $idx
+        $r = Invoke-Compactor -Sandbox $sb
+        $text = Get-Content -LiteralPath $idx -Raw
+        ([regex]::Matches($text, [regex]::Escape('(bracket.md)'))).Count | Should -Be 1 -Because 'the file is already indexed; a second pointer is duplication'
+        ([regex]::Matches($text, [regex]::Escape('(nested.md)'))).Count | Should -Be 1
+        $r.Receipts[0].reindexed | Should -Be 0
+        (Get-Bytes $idx) | Should -BeLessOrEqual $before -Because 'the maintainer must never grow a store'
+    }
+
+    It 'aborts instead of wiping the index when the store enumerates no fact files' {
+        # If the fact directory cannot be read, every line looks dangling - and every downstream
+        # guard agrees, because they all compare against the same empty set.
+        $sb = New-Sandbox
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts @{} | Out-Null
+        $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
+        $before = Get-Bytes $idx
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].status | Should -Be 'aborted-no-fact-files'
+        (Get-Bytes $idx) | Should -Be $before
+    }
+
+    It 'caps hygiene removals: a mass-dangling index is reported, not silently gutted' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $lines = New-BigIndexLines
+        # 30 dangling lines out of 90 entries - far over the 20% blast cap.
+        for ($i = 1; $i -le 30; $i++) { $lines += ('- [Gone ' + $i + '](missing' + $i + '.md) ' + $script:EmDash + ' dangling') }
+        $sb = New-Sandbox
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines $lines -Facts $facts | Out-Null
+        $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
+        $before = Get-Bytes $idx
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].status | Should -Be 'aborted-blast-cap'
+        (Get-Bytes $idx) | Should -Be $before
+    }
+
+    It 'a concurrent write aborts with the fact file still on disk (nothing deleted, not just nothing written)' {
+        # The delete used to happen before the CAS, so an abort left the store with a dangling
+        # link while the receipt claimed "no write performed".
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $plan = '{"plan":[{"slug":"fact3.md","action":"MIGRATE"}]}'
+        $sb = New-Sandbox -CodexPlanJson $plan
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
+        $sb | Add-Member -NotePropertyName MutateTarget -NotePropertyValue $idx
+        $sb.Mutate = '- [Appended by a live session](fact1.md) ' + $script:EmDash + ' written mid-run'
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].status | Should -Be 'aborted-concurrent-write'
+        Test-Path (Join-Path $sb.Projects 'ws\memory\fact3.md') | Should -BeTrue -Because 'an abort must leave the store exactly as it was'
+        (Get-Content -LiteralPath $idx -Raw) | Should -Match 'fact3\.md'
+    }
+
+    It 'reports skipped-judge-unavailable (not no-op) and does not mark the throttle' {
+        # A store over trigger with nothing for hygiene to fix and no judge: the run accomplished
+        # nothing, so it must be retried rather than counted as done.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexThrows
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].status | Should -Be 'skipped-judge-unavailable'
+        Test-Path (Join-Path $sb.Home '.claude\state\throttle-marked') | Should -BeFalse -Because 'no local fallback: the judge-only work waits and is retried'
+    }
+
+    It 'undoes an unverifiable migration write instead of leaving an orphan record' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[{"slug":"fact3.md","action":"MIGRATE"}]}' -Mem0Mode 'mismatch'
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].migrated | Should -Be 0
+        Test-Path (Join-Path $sb.Projects 'ws\memory\fact3.md') | Should -BeTrue
+        (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\mem0-deleted.txt') -Raw -ErrorAction SilentlyContinue) | Should -Match 'stub-id-0001' -Because 'the unverified record must be removed, not left dangling in the corpus'
     }
 }
 
@@ -348,9 +474,10 @@ Describe 'dry run' {
         $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-DryRun')
         $r.Receipts[0].status | Should -Be 'dry-run'
         $r.Receipts[0].after_bytes | Should -BeLessThan $r.Receipts[0].before_bytes
-        # A dry run reports no line change here (nothing was posted, so no line was removed).
-        # before/after line counts must be computed identically or the receipt misreports.
-        $r.Receipts[0].after_lines | Should -Be $r.Receipts[0].before_lines
+        # A dry run PROJECTS its migrations, so the reported line count and `migrated` describe
+        # the same world; before/after must also be counted identically or the receipt misreports.
+        $r.Receipts[0].migrated | Should -Be 1
+        $r.Receipts[0].after_lines | Should -Be ($r.Receipts[0].before_lines - $r.Receipts[0].migrated)
         [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($idx)) | Should -Be ([System.BitConverter]::ToString($before))
         Test-Path (Join-Path $sb.Home '.claude\state\mem0-posts.txt') | Should -BeFalse -Because 'a dry run must not post to mem0'
     }

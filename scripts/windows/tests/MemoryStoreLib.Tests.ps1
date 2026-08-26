@@ -137,13 +137,57 @@ Describe 'store enumeration' {
         $alias = Join-Path $root 'ws a alias'
         $made = $false
         try { New-Item -ItemType Junction -Path $alias -Target $target -ErrorAction Stop | Out-Null; $made = $true } catch { $made = $false }
+        if (-not $made) { Set-ItResult -Skipped -Because 'this environment cannot create a junction (the alias half of the test is unverifiable here)' }
         $stores = @(Get-AmStores -ProjectsRoot $root)
         ($stores | Where-Object { -not $_.IsAlias }).Count | Should -Be 1
         ($stores | Where-Object { $_.Workspace -eq 'empty' }).Count | Should -Be 0
-        if ($made) {
-            ($stores | Where-Object IsAlias).Workspace | Should -Be 'ws a alias'
-            ($stores | Where-Object IsAlias).AliasOf | Should -Be 'ws-a'
-        }
+        ($stores | Where-Object IsAlias).Workspace | Should -Be 'ws a alias'
+        ($stores | Where-Object IsAlias).AliasOf | Should -Be 'ws-a'
+        # The canonical store must carry BOTH directories, so the liveness probe covers a
+        # session running under the alias path.
+        $canon = $stores | Where-Object { -not $_.IsAlias }
+        @($canon.ProbeDirs).Count | Should -Be 2
+    }
+
+    It 'the physical directory is canonical even when the alias sorts first' {
+        # Sorting by name alone once crowned the alias (spaces sort before dashes), so the job
+        # would have mutated the store THROUGH the link and reported the real one as the alias.
+        $root = Join-Path $TestDrive 'projects1b'
+        New-TestStore -Root $root -Workspace 'zzz-real' -IndexLines @('- [A](a.md)') -Facts @{ 'a.md' = (New-Fact 'a' 'd') } | Out-Null
+        $made = $false
+        try { New-Item -ItemType Junction -Path (Join-Path $root 'aaa alias') -Target (Join-Path $root 'zzz-real') -ErrorAction Stop | Out-Null; $made = $true } catch {}
+        if (-not $made) { Set-ItResult -Skipped -Because 'cannot create a junction here' }
+        $stores = @(Get-AmStores -ProjectsRoot $root)
+        ($stores | Where-Object { -not $_.IsAlias }).Workspace | Should -Be 'zzz-real'
+    }
+}
+
+Describe 'Windows PowerShell 5.1 parity' {
+    # The library is dot-sourced by memory-lint.ps1 under 5.1 and by memory-compact.ps1 under
+    # pwsh 7. Everything above runs under 7; without this, the dual-edition contract the file's
+    # header depends on is asserted by nothing.
+    It 'loads under 5.1 and round-trips a multi-byte index byte-for-byte' {
+        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path $ps51)) { Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 is not present' }
+        $lib = Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1'
+        $work = Join-Path $TestDrive 'ps51'
+        [System.IO.Directory]::CreateDirectory($work) | Out-Null
+        $idx = Join-Path $work 'MEMORY.md'
+        $line = '- [Caf' + [char]0xE9 + '](x.md) ' + $script:EmDash + ' hook with 3-byte dash'
+        [System.IO.File]::WriteAllBytes($idx, (New-Object System.Text.UTF8Encoding($false)).GetBytes($line + "`n"))
+        $script = @"
+. '$lib'
+`$t = Read-AmText -Path '$idx'
+Write-AmTextAtomic -Path '$idx' -Text `$t
+`$i = Read-AmIndex -Text `$t
+`$e = @(`$i.Records | Where-Object { `$_.Kind -eq 'entry' })
+Write-Output ('entries=' + `$e.Count + ' slug=' + `$e[0].Slug + ' bytes=' + (Get-AmByteCount -Text `$t) + ' imperative=' + (Test-AmImperative -Text 'NEVER bind port 80'))
+"@
+        $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -Command $script 2>&1 | Out-String
+        $out | Should -Match 'entries=1 slug=x\.md bytes=\d+ imperative=True' -Because "the library must behave identically under 5.1; got: $out"
+        $bytes = [System.IO.File]::ReadAllBytes($idx)
+        $bytes[0] | Should -Be 0x2D -Because '5.1 must not prepend a BOM when rewriting a store file'
+        $bytes.Length | Should -Be ((New-Object System.Text.UTF8Encoding($false)).GetByteCount($line + "`n"))
     }
 }
 
