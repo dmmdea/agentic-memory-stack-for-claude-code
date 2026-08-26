@@ -105,3 +105,19 @@ The `episodic.db` SQLite + FTS5 sidecar that records one episode per session (go
 ## Open Question
 
 A declarative uncertainty raised but left unanswered in a session, tracked cross-session in the open_questions registry (FTS5 search + open/resolved/abandoned/duplicate lifecycle). It operationalizes Epistemic Reachability — knowing what you don't know. See [open-questions.md](systems/open-questions.md).
+
+## Auto-Memory Store
+
+The coding-agent harness's own per-workspace file memory: an Index of one-line pointers plus one Fact File per pointer, machine-local, written by the agent through the harness's memory tool. Distinct from the memory corpus this stack serves — the Index is *pushed* into every session, while the corpus is *pulled* by retrieval. See [auto-memory-maintenance.md](systems/auto-memory-maintenance.md).
+
+## Index (Auto-Memory)
+
+The `MEMORY.md` file of an Auto-Memory Store. Injected in full at every session start, which is why it carries hard size limits and why one line per memory is the format. Its Fact Files load only when the agent follows a pointer.
+
+## Hook (Index Line)
+
+The short text after an Index pointer. Its job is to tell the agent *when* to open the Fact File, so it must keep the distinguishing detail rather than merely naming the topic — a rewrite that drops every identifier has lost the memory while appearing to preserve it.
+
+## Doctrine Entry
+
+An Auto-Memory record that states a standing order — typed as feedback, or phrased imperatively. No automated maintenance may shorten, merge, migrate or drop one; when doctrine alone will not fit the budget, the job stops and reports rather than loosening the rule. See [auto-memory-maintenance.md](systems/auto-memory-maintenance.md).

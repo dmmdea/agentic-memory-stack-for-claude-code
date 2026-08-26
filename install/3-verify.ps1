@@ -191,6 +191,15 @@ Check "Replica role: dream/dedup tasks absent (one-brain rule)" {
     ($null -eq $dream) -and ($null -eq $dedup)
 } "A read-replica must not run nightly canonical mutations - re-run 2-windows-config.ps1 -Role replica (it unregisters them)"
 }
+Check "Task Scheduler 5am auto-memory compactor" {
+    # Registered on every role (the stores are machine-local; see 2-windows-config.ps1 §5c).
+    # Assert the DEPLOYED launch path, not just the task name - the dedup precedent is a task
+    # that stayed green while its action executed an unmanaged dev worktree.
+    $t = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue
+    ($t -ne $null) -and
+    ($t.Actions[0].Arguments -match '\.claude\\scripts\\memory-compact\.ps1') -and
+    ($t.Actions[0].Arguments -notmatch '[/\\](Dev|repos|worktrees)[/\\]')
+} "Re-run 2-windows-config.ps1"
 Check "canonical-key exists (DPAPI blob or plaintext mode 600)" {
     # v0.20 Phase D (M9): post-Phase-H a DPAPI box has ONLY the .dpapi blob —
     # the old plaintext-only check false-failed there and its remediation
