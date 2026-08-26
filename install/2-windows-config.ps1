@@ -260,7 +260,12 @@ try {
 # memory-index-refresh.ps1 (standalone MEMORY.md index refresh decoupled from the dream) — both
 # spawn detached from SessionStart. Not R9 hash-tracked (they are not hot-path clients), so this
 # stays a superset of $hookNames (InstallerParity holds).
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+# 2026-08-26: auto-memory maintenance (System A - the harness's own per-workspace
+# ~/.claude/projects/<ws>/memory/ stores, distinct from the mem0 corpus). memory-store-lib.ps1
+# is the shared primitive library; memory-lint.ps1 is the read-only SessionStart child
+# (spawned by memory-maintenance-spawn.ps1); memory-compact.ps1 is the nightly task registered
+# in section 5c. None are R9 hash-tracked.
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
 # AMS-16: the copy loop is add-only, so a retired script must be deleted
 # explicitly or it lingers deployed forever (the AMS-50 orphan class).
 foreach ($retired in @('pre-tool-check.ps1')) {
@@ -321,6 +326,25 @@ if (Test-Path -LiteralPath $capCheckSrc) {
     Write-Host "    installed: storage-cap-check.sh (from claude-config)"
 } else {
     Write-Host "    WARN: $capCheckSrc not found" -ForegroundColor Yellow
+}
+
+# 2026-08-26: the auto-memory INDEX write-time lint (PostToolUse Write|Edit). The harness
+# itself warns when a workspace index passes its 200-line injection cap, but nothing checks
+# BYTES PER LINE - and that is what fills the 25,000-byte per-file sync limit (a live store hit
+# 96% of the byte cap at 64% of the line cap). This hook tells the agent in the same turn, so
+# the bloat is fixed at the source instead of being compacted forever by the nightly job.
+$idxLintSrc = Join-Path $RepoRoot 'claude-config\memory-index-write-lint.sh'
+$idxLintDst = Join-Path $ScriptsDir 'memory-index-write-lint.sh'
+if (Test-Path -LiteralPath $idxLintSrc) {
+    Copy-Item -LiteralPath $idxLintSrc -Destination $idxLintDst -Force
+    # bash file - BOM-safe write is mandatory (a BOM before the shebang breaks it).
+    $raw = Get-Content -LiteralPath $idxLintDst -Raw
+    if ($raw -match '__WSL_USER__|__WIN_USER__|__WSL_DISTRO__') {
+        Write-StackFile $idxLintDst (Resolve-StackTokens $raw)
+    }
+    Write-Host "    installed: memory-index-write-lint.sh (from claude-config)"
+} else {
+    Write-Host "    WARN: $idxLintSrc not found" -ForegroundColor Yellow
 }
 
 # B1 (2026-06-28): SessionStart durable/evidence bundle enrichment helper, invoked by
@@ -521,6 +545,10 @@ $bashCapCheck = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "bash /mnt/c/Users/' +
 # compaction. A failure of wsl.exe itself returns non-2 codes, which PreCompact treats as
 # non-blocking.
 $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/precompact_capture.py || true"'
+# Auto-memory index write lint (PostToolUse). Same wsl.exe form as the cap-check: Git Bash on
+# Windows cannot resolve /mnt/c from a hook command string. Fail-open by construction - the
+# script always exits 0 - and `|| true` guards the wsl.exe layer itself.
+$bashIndexLint = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "bash /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/memory-index-write-lint.sh || true"'
 
 # H12: v0.17 Phase 0 hooks — UserPromptSubmit (checkpoint + decision-capture + proactive-search)
 # and PreToolUse (audit gate). Previously only registered in the operator's local settings.json;
@@ -567,6 +595,10 @@ $hookEntries = @{
     )
     # H12: Phase 0 hooks (v0.20 Final: exe registration + both-shape dedupe)
     'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 5 })
+    # 2026-08-26: auto-memory index write-time byte lint. Matcher-scoped to Write|Edit; the
+    # script itself exits immediately for any path that is not a workspace MEMORY.md, and
+    # ALWAYS exits 0 (advisory only - a hook must never be able to block a memory write).
+    'PostToolUse'        = @(@{ markers = @('memory-index-write-lint.sh'); command = $bashIndexLint; matcher = 'Write|Edit'; timeout = 5 })
 }
 
 # AMS-16 (2026-08-09, operator decision): the 0.F PreToolUse contradiction check
@@ -818,6 +850,33 @@ $dedupPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERN
 Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
 Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 } # end brain-role gate (v1.16 §6.3)
+
+# ----------------------------------------------------------------------
+# 5c. Auto-memory compactor (5:00am) - registered on EVERY role, on purpose
+# ----------------------------------------------------------------------
+# Deliberately OUTSIDE the brain-role gate above. The one-brain rule protects the SHARED mem0
+# corpus: only the brain may mutate it, because every box reads the same server. A workspace
+# auto-memory store is the opposite - it is LOCAL to the machine it lives on, so a replica that
+# never ran this job would simply let its own stores grow past the sync limit unmaintained.
+# The job's only shared-state action is a bounded mem0 write, which flows through the same
+# server API any box may call.
+#
+# 5:00am is offset from the 3:00 dream and 4:30 dedup so the shared Codex mutex is free.
+# WakeToRun + StartWhenAvailable: on a box that is powered off overnight this fires at the next
+# logon instead - which is exactly when sessions start, so the job's own liveness gate (skip
+# while a session in that workspace is active) and compare-and-swap are what make the catch-up
+# path safe. run-hidden.vbs keeps the firing windowless.
+$compactTaskName = 'ClaudeCode-MemoryCompactor-5am'
+Write-Host "==> [5c] Registering Task Scheduler entry: $compactTaskName"
+Unregister-ScheduledTask -TaskName $compactTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+$compactVbs = "C:\Users\$env:USERNAME\.claude\scripts\run-hidden.vbs"
+$compactAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
+    -Argument ("//nologo `"$compactVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\memory-compact.ps1`"")
+$compactTrigger = New-ScheduledTaskTrigger -Daily -At 5:00am
+$compactSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+$compactPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $compactTaskName -Action $compactAction -Trigger $compactTrigger -Settings $compactSettings -Principal $compactPrincipal -Description 'Daily 5am auto-memory compactor: keeps each workspace MEMORY.md index under the harness sync/injection caps. Archive-free by design - history is an out-of-tree local git repo; doctrine entries are never touched.' | Out-Null
+Write-Host "    Auto-memory compactor registered (next fire: 5:00 AM)"
 
 Write-Host ""
 Write-Host "==> Windows config complete." -ForegroundColor Green

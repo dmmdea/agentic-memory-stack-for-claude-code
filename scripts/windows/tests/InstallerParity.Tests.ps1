@@ -425,6 +425,59 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $replicaBranch | Should -Match 'Unregister-ScheduledTask' -Because 'a replica must remove tasks a pre-v1.16 install registered'
     }
 
+    It 'the auto-memory compactor is registered OUTSIDE the brain gate (every role) and the other two stay inside' {
+        # The one-brain rule protects the SHARED corpus. A workspace auto-memory store is
+        # machine-LOCAL, so gating its maintainer on the brain role would leave every replica's
+        # stores to grow past the harness sync limit unmaintained. This asserts the placement
+        # both ways, so a future edit cannot quietly move it inside the gate (or move the
+        # corpus-mutating tasks out of it).
+        $src = Get-Content $installerPath -Raw
+        $gateIdx = $src.IndexOf("if (`$Role -ne 'brain')")
+        $endIdx  = $src.IndexOf('} # end brain-role gate')
+        $compact = $src.IndexOf('Register-ScheduledTask -TaskName $compactTaskName')
+        $compact | Should -BeGreaterThan 0 -Because 'the compactor task must be registered'
+        $compact | Should -BeGreaterThan $endIdx -Because 'workspace stores are machine-local: every role maintains its own'
+        $src.IndexOf('Register-ScheduledTask -TaskName $dedupTaskName') | Should -BeLessThan $endIdx
+    }
+
+    It 'the compactor task action launches the DEPLOYED script, never a repo or worktree path' {
+        # The dedup precedent: a destructive nightly task executed an unmanaged dev worktree for
+        # weeks while a substring check stayed green.
+        $src = Get-Content $installerPath -Raw
+        $line = ($src -split "`n" | Where-Object { $_ -match '^\$compactVbs\s*=|^\$compactAction\s*=|^\s+-Argument .*memory-compact\.ps1' }) -join "`n"
+        $line | Should -Match 'run-hidden\.vbs' -Because 'a 5am firing must never draw a console on the desktop'
+        $line | Should -Match '\.claude\\scripts\\memory-compact\.ps1' -Because 'the action must execute the deployed copy'
+        $line | Should -Not -Match '\$RepoRoot|worktrees' -Because 'a nightly job must never run whatever a dev checkout happens to contain'
+    }
+
+    It 'the write-time index lint is registered on PostToolUse, is fail-open, and is bash-safe' {
+        $src = Get-Content $installerPath -Raw
+        $line = ($src -split "`n" | Where-Object { $_ -match '^\$bashIndexLint\s*=' }) -join "`n"
+        $line | Should -Not -BeNullOrEmpty -Because 'the hook command must be built'
+        $line | Should -Match ([regex]::Escape('$wslDistroArg')) -Because 'the shared settings.json must not carry a machine-specific -d'
+        $line | Should -Match ([regex]::Escape('|| true')) -Because 'a hook that can fail must never be able to block a memory write'
+        $src | Should -Match "'PostToolUse'\s*=\s*@\(@\{ markers = @\('memory-index-write-lint\.sh'\)" -Because 'the hook must be registered with a dedupe marker like every other stack hook'
+        $src | Should -Match "matcher = 'Write\|Edit'" -Because 'the hook must be matcher-scoped to write tools'
+    }
+
+    It 'deploys the write-time lint script and the three auto-memory scripts' {
+        $wins = Get-AstArrayStrings -Path $installerPath -VarName 'winScripts'
+        foreach ($n in @('memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1')) {
+            $wins | Should -Contain $n -Because "$n must be deployed or the SessionStart child and the nightly task launch nothing"
+        }
+        (Get-Content $installerPath -Raw) | Should -Match 'memory-index-write-lint\.sh' -Because 'the PostToolUse hook script must be deployed from claude-config'
+        Test-Path (Join-Path $repoRoot 'claude-config\memory-index-write-lint.sh') | Should -BeTrue
+    }
+
+    It 'the SessionStart spawner launches the lint child' {
+        (Get-Content (Join-Path $winDir 'memory-maintenance-spawn.ps1') -Raw) |
+            Should -Match "'memory-lint\.ps1'" -Because 'lint runs as a detached SessionStart child beside the other two'
+    }
+
+    It '3-verify asserts the compactor task' {
+        (Get-Content $verifierPath -Raw) | Should -Match 'ClaudeCode-MemoryCompactor-5am' -Because 'a task nobody verifies is a task that silently stops firing'
+    }
+
     It 'the operator receipt records the Role' {
         (Get-Content $installerPath -Raw) | Should -Match "Role\s+= '\`$eRole'" -Because '3-verify and runtime scripts resolve the box role from the receipt (quote-escaped like every other receipt value)'
     }

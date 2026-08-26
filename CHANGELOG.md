@@ -4,6 +4,70 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.0 (2026-08-26) — auto-memory maintenance
+
+The coding-agent harness keeps its own per-workspace file memory — an index of one-line
+pointers, injected in full at every session start, plus one fact file per pointer. Nothing
+in this stack maintained it. A live store was found at 96% of its hard per-file limit, with
+an unindexed fact file no session had ever loaded and an index line pointing at a deleted
+file; no job existed that would ever have noticed. This release makes those stores
+self-maintaining, in three pillars.
+
+**Lint** (`memory-lint.ps1`, spawned at session start, read-only, 6h throttle): enumerates
+every populated store — deduplicating alias directories by canonical path — and recomputes
+findings from disk: orphan, dangling link, duplicate slug, over-long line, oversized fact
+file, missing frontmatter, near or over a budget. Stateless by design: the finding set is a
+handful of items recomputable in milliseconds, and a monotone watermark would have silently
+suppressed a defect that was fixed and later recurred. Two findings watch the maintainer
+itself — a store above trigger with no run receipt in 48h, and a history repo that has
+gained a remote.
+
+**Write-time lint** (`memory-index-write-lint.sh`, PostToolUse on Write/Edit): the harness
+warns on its *line* cap, but nothing checked *bytes per line* — which is what fills the byte
+budget first (the store above was at 64% of the line cap and 96% of the byte cap). The hook
+reports an over-long index line to the agent that just wrote it, in the same turn, so the
+bloat is fixed at the source instead of being compacted forever. Advisory; always exits 0.
+
+**Compaction** (`memory-compact.ps1`, new 5:00am task, every role — these stores are
+machine-local, unlike the shared corpus): fires at 20,000 B or 160 lines, targets below
+17,000 B and 140 lines. Deterministic hygiene first (dangling and duplicate lines removed,
+orphans re-indexed from their own frontmatter), then one judge call over the *delta only* —
+long lines and migration candidates, never the whole index.
+
+Five guards, one behavioural test each, written so that removing the guard fails the test:
+
+- **Liveness gate + compare-and-swap.** No process locks the index, and a box that sleeps
+  runs its catch-up at the next logon — exactly when sessions start. Observed during the
+  build: a store grew three entries mid-flight. The job skips a workspace with recent session
+  activity, and re-reads the index hash and file set immediately before the swap, aborting on
+  any drift. Abort, never roll back: a directory-level revert would clobber the live write.
+- **Doctrine is untouchable.** `metadata.type: feedback` is *nested* — a top-level match finds
+  nothing, which would have made the rule inert and every standing order eligible for deletion.
+  Doctrine is classified deterministically and never even offered to the judge.
+- **Strict decrease, seal, blast cap.** A judge edit applies only if it strictly shrinks the
+  index past the hygiene baseline (hygiene is correctness and is exempt); each line may be
+  rewritten by the judge at most once, ever; no run removes more than a fifth of the lines.
+  A rewritten hook must retain an anchor token, so a line cannot be reduced to a label that
+  no longer says when to open the file.
+- **Write-then-verify migration.** A migrated fact is posted verbatim, tagged
+  `source: automemory:<workspace>/<file>`, and read back **by id** with byte equality before
+  its line and file are removed. A write returning no id counts as unverifiable and the line
+  stays. Verification by semantic search was rejected: ranking top for its own text can be
+  satisfied by a pre-existing near-duplicate.
+- **Feasibility.** If doctrine alone exceeds the target budget, the job stops and reports
+  rather than loosening the hard rule.
+
+Supporting changes: `semantic-dedup.py` now protects auto-memory migrations — it deletes the
+newer of a near-duplicate pair, and a migration is always the newer side, so an unguarded run
+would have evicted a just-verified fact the next morning; two migrations delete neither, and
+canonical still wins. History is a local git repository with its git-dir outside the tree and
+no remote, replacing a hand-rolled archive: commits are the audit trail, per-file checkout is
+the undo, and lint fails if a remote ever appears. All maintainer state lives outside the
+store directory — an in-store archive would have resurfaced removed facts in every agent
+search and re-exposed the credential-bearing file that started this work. Two health-check
+rows added: store budgets and structural cleanliness (invariants), and maintainer liveness
+(recovery) — a registered task proves nothing if it never fires.
+
 ## v1.19.0 (2026-08-08) — the hardening-program waves
 
 Waves W1–W5 of the audit-driven hardening program (55 adjudicated findings; see the

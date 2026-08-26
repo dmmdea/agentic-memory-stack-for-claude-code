@@ -41,7 +41,12 @@ import httpx
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
 MEM0 = "http://127.0.0.1:18791"
-KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
+try:
+    KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
+except OSError:
+    # Importable without the live key (unit tests exercise the pure helpers); a real run
+    # still fails loudly at the first authenticated call.
+    KEY = os.environ.get("MEM0_API_KEY", "")
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 TIER_THRESHOLDS = {"canonical": 0.97, "stable": 0.95, "evidence": 0.94, "temporal": 0.94, "insight": 0.95}
 # 2026-06-10: evidence/temporal bumped 0.92 -> 0.94 per the operator's direction.
@@ -59,6 +64,20 @@ REPORT_DRY = Path.home() / ".mem0" / "dedup-report.dryrun.jsonl"
 SUMMARY = Path.home() / ".mem0" / "dedup-summary.jsonl"
 LEDGER_DIR = Path.home() / ".mem0"
 DEDUP_LOCK = Path.home() / ".mem0" / "dedup.lock"
+
+def _is_migration_protected(payload) -> bool:
+    """True for a record migrated out of a workspace auto-memory store.
+
+    2026-08-26: the auto-memory compactor moves a fact from a workspace index into mem0 and
+    then DELETES the index line and the fact file — mem0 becomes the only live copy. Those
+    records are always the NEWER side of any near-duplicate pair (the L1a extractor has often
+    already captured the same fact from the session transcript), and this job deletes the
+    newer side, so an unguarded run would evict a just-migrated fact the very next morning.
+    The payload is preserved in the report/ledger, but the operator would never know to
+    restore it. Marked by source='automemory:<workspace>/<file>.md'.
+    """
+    return str(payload.get("source") or "").startswith("automemory:")
+
 
 def _partition_key(payload):
     """v0.14 C: dedup pairs must share (user_id, workspace, project). Prevents cross-brand merges.
@@ -208,6 +227,14 @@ def _run(dry_run=False):
                     p_older = older.get("payload") or {}
                     p_newer = newer.get("payload") or {}
                     if p_older.get("tier") == "canonical":  # never delete canonical
+                        newer, older = older, newer
+                        p_older, p_newer = p_newer, p_older
+                    elif _is_migration_protected(p_newer):
+                        # An auto-memory migration is the only live copy of a fact whose index
+                        # line is already gone. If the older side is an ordinary record, keep
+                        # the migration instead; if BOTH sides are migrations, delete neither.
+                        if _is_migration_protected(p_older):
+                            continue
                         newer, older = older, newer
                         p_older, p_newer = p_newer, p_older
                     rid = str(newer["id"])

@@ -381,6 +381,37 @@ try {
 # Security gates hold, bind constraints, tier policy enforced, search filters correct
 # ==========================================================================
 
+# I0: auto-memory store budgets. Every populated workspace index must stay under BOTH harness
+# caps: 25,000 bytes (above it the file is not synced) and 200 lines (above it the tail is not
+# injected, silently). Structural defects are asserted here too: an index line pointing at a
+# missing file, a fact file nothing links to (invisible to every session), or the same slug
+# linked twice. This is the row that would have caught the state that started this feature.
+try {
+    $storeLib = Join-Path $env:USERPROFILE '.claude\scripts\memory-store-lib.ps1'
+    if (-not (Test-Path -LiteralPath $storeLib)) {
+        Add-Check 'INVARIANTS' 'auto-memory store budgets' 'WARN' 'memory-store-lib.ps1 not deployed - re-run 2-windows-config.ps1'
+    } else {
+        . $storeLib
+        $amStores = @(Get-AmStores) | Where-Object { -not $_.IsAlias }
+        $bad = @(); $struct = @()
+        foreach ($amS in $amStores) {
+            $amStats = Get-AmStoreStats -Store $amS
+            if ($amStats.Bytes -ge 25000) { $bad += "$($amS.Workspace) $($amStats.Bytes)B" }
+            if ($amStats.Lines -ge 200)   { $bad += "$($amS.Workspace) $($amStats.Lines) lines" }
+            foreach ($fnd in @(Get-AmLintFindings -Store $amS)) {
+                if (@('orphan', 'dangling', 'dup-slug') -contains $fnd.kind) { $struct += "$($amS.Workspace)/$($fnd.file) $($fnd.kind)" }
+            }
+        }
+        if ($bad.Count -gt 0) {
+            Add-Check 'INVARIANTS' 'auto-memory store budgets' 'FAIL' ("over a hard cap: " + ($bad -join '; '))
+        } elseif ($struct.Count -gt 0) {
+            Add-Check 'INVARIANTS' 'auto-memory store budgets' 'WARN' ("$($struct.Count) structural finding(s): " + (($struct | Select-Object -First 4) -join '; '))
+        } else {
+            Add-Check 'INVARIANTS' 'auto-memory store budgets' 'OK' "$(@($amStores).Count) store(s) under both caps, 0 orphans/dangling/duplicates"
+        }
+    }
+} catch { Add-Check 'INVARIANTS' 'auto-memory store budgets' 'WARN' $_.Exception.Message }
+
 # I1: Qdrant bind — must NOT be 0.0.0.0 (v0.17 F.2.2)
 try {
     $listenLine = wsl.exe -d $TmsDistro -e bash -lc "ss -ltn 2>/dev/null | grep ':6333' | head -1"
@@ -945,6 +976,45 @@ try {
         Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' "unrecognized action shape: $dArgs"
     }
 } catch { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered (replica role, or install incomplete)' }
+
+# R2c: the 5am auto-memory compactor. Registered on EVERY role (workspace stores are
+# machine-local, unlike the shared mem0 corpus), so its absence is a FAIL on any box.
+try {
+    $ctask = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction Stop
+    $cArgs = $ctask.Actions[0].Arguments
+    if ($cArgs -match '[/\\](Dev|repos|worktrees)[/\\]') {
+        Add-Check 'RECOVERY' 'auto-memory compactor task' 'FAIL' "LIVE action executes a repo/worktree path, not the deployed copy: $cArgs"
+    } elseif ($cArgs -match 'memory-compact\.ps1') {
+        Add-Check 'RECOVERY' 'auto-memory compactor task' 'OK' "state=$($ctask.State); action=deployed memory-compact.ps1"
+    } else {
+        Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "unrecognized action shape: $cArgs"
+    }
+} catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'FAIL' 'not registered - re-run 2-windows-config.ps1' }
+
+# R2d: WATCH THE WATCHER. A registered task proves nothing: it can be pinned to a vanished
+# launcher, fail with LastTaskResult=1, or never fire because the box sleeps. If any store is
+# over its compaction trigger and no run receipt has landed in 48h, the maintainer is silently
+# dead - which is exactly how this stack has been bitten before.
+try {
+    $amState = Join-Path $env:USERPROFILE '.claude\state\automemory'
+    $lintSummary = Join-Path $amState 'lint-summary.json'
+    $receipts = Join-Path $amState 'compact-receipts.jsonl'
+    if (-not (Test-Path -LiteralPath $lintSummary)) {
+        Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'WARN' 'no lint summary yet (memory-lint.ps1 has not run since install)'
+    } else {
+        $ls = Get-Content -LiteralPath $lintSummary -Raw | ConvertFrom-Json
+        $over = @($ls.stores | Where-Object { $_.over_trigger })
+        $recAge = $null
+        if (Test-Path -LiteralPath $receipts) { $recAge = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $receipts).LastWriteTime).TotalHours, 1) }
+        if ($over.Count -eq 0) {
+            Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'OK' "no store above trigger ($(@($ls.stores).Count) store(s) scanned)"
+        } elseif ($null -ne $recAge -and $recAge -le 48) {
+            Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'OK' "$($over.Count) store(s) above trigger; last compactor receipt ${recAge}h ago"
+        } else {
+            Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'FAIL' "$($over.Count) store(s) above trigger and no compactor receipt in 48h (last: $(if ($null -eq $recAge) { 'never' } else { "${recAge}h" })) - the nightly job is not running"
+        }
+    }
+} catch { Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'WARN' $_.Exception.Message }
 
 # R3: Latest backup manifest exists and is fresh (< 48h)
 try {

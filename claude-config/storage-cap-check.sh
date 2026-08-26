@@ -139,6 +139,53 @@ PY
   [ "${n_unrev:-0}" -gt 20 ] && warnings+="L10 audit-flags: ${n_unrev} unreviewed (total ${n_total}). Review ~/.mem0/audit-flags.jsonl. "
 fi
 
+# Auto-memory (System A) lint surface. memory-lint.ps1 writes this summary from the SessionStart
+# spawn; it is a plain recompute with no watermark, so a count here is always current. Only the
+# ACTIONABLE classes reach the banner (orphan / dangling / duplicate slug / over a hard cap /
+# the compactor having gone silent / the history repo growing a remote) - long-line noise is left
+# to the write-time hook, which reports it where it can actually be fixed. A run receipt from the
+# last 24h is surfaced so a night's changes are visible without opening anything.
+_AMLINT=""
+for _c in "$HOME/.claude/state/automemory/lint-summary.json" "/mnt/c/Users/$USER/.claude/state/automemory/lint-summary.json"; do
+  [ -f "$_c" ] && { _AMLINT="$_c"; break; }
+done
+if [ -z "$_AMLINT" ] && [ -n "${_WINPROFILE:-}" ] && [ -f "$_WINPROFILE/.claude/state/automemory/lint-summary.json" ]; then
+  _AMLINT="$_WINPROFILE/.claude/state/automemory/lint-summary.json"
+fi
+if [ -z "$_AMLINT" ]; then
+  case "${BASH_SOURCE[0]:-}" in
+    /mnt/c/Users/*)
+      _amp="$(echo "${BASH_SOURCE[0]}" | sed -E 's#^(/mnt/c/Users/[^/]+)/.*#\1#')/.claude/state/automemory/lint-summary.json"
+      [ -f "$_amp" ] && _AMLINT="$_amp" ;;
+  esac
+fi
+if [ -n "$_AMLINT" ]; then
+  _amline=$(AMLINT="$_AMLINT" python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    d = json.load(open(os.environ["AMLINT"], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+c = d.get("counts") or {}
+n = int(c.get("actionable") or 0)
+parts = []
+if n:
+    kinds = {}
+    for f in d.get("findings") or []:
+        k = f.get("kind")
+        if k in ("orphan", "dangling", "dup-slug", "over-sync-limit", "over-inject-limit", "compactor-silent", "history-remote"):
+            kinds[k] = kinds.get(k, 0) + 1
+    detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
+    parts.append(f"auto-memory lint: {n} actionable ({detail})")
+age = d.get("last_receipt_age_hours")
+if age is not None and age <= 24:
+    parts.append(f"compactor ran {age}h ago (receipt: ~/.claude/state/automemory/compact-receipts.jsonl)")
+print(". ".join(parts))
+PY
+)
+  [ -n "$_amline" ] && warnings+="$_amline. "
+fi
+
 # Recent-sessions surface (cross-restart). 2026-06-24: REPOINTED from recent-decisions.jsonl to
 # episodic.db. recent-decisions.jsonl was written by UserPromptSubmit 0.B (decision capture), a
 # PER-TURN hook that does NOT fire in the Claude Code VSCode-extension / Agent-SDK runtime — so it
