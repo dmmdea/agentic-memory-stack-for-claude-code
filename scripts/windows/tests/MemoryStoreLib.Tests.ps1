@@ -74,6 +74,72 @@ Describe 'index parsing and regeneration' {
     }
 }
 
+Describe 'review-round primitives' {
+    It 'ghosts come from ENTRY links only; non-entry mentions count for reachability, never as ghosts' {
+        $text = "# Index (older notes moved to (archive.md))`n- [A](a.md) " + $script:EmDash + " see [B](b.md) and [dead](dead.md)`n"
+        $idx = Read-AmIndex -Text $text
+        $onDisk = @{ 'a.md' = $true; 'b.md' = $true }
+        $g = @(Get-AmEntryGhosts -Records $idx.Records -OnDisk $onDisk)
+        $g | Should -Be @('dead.md')
+        (Get-AmIndexLinkedSlugs -Records $idx.Records).ContainsKey('archive.md') | Should -BeTrue -Because 'a file mentioned by a heading is reachable (not an orphan) even though it is not a ghost'
+    }
+
+    It 'round-trip check accepts exactly the expected extra links' {
+        $line = '- [A](a.md) ' + $script:EmDash + ' see [B](b.md)'
+        Test-AmLineRoundTrips -Line $line -ExpectedSlug 'a.md' | Should -BeFalse
+        Test-AmLineRoundTrips -Line $line -ExpectedSlug 'a.md' -ExpectedExtras @('b.md') | Should -BeTrue
+        Test-AmLineRoundTrips -Line $line -ExpectedSlug 'a.md' -ExpectedExtras @('c.md') | Should -BeFalse
+    }
+
+    It 'a list item inside a code fence is not an entry' {
+        $text = "- [Real](real.md)`n" + '```' + "`n- [Example](example.md) - illustration`n" + '```' + "`n- [Also real](also.md)`n"
+        $idx = Read-AmIndex -Text $text
+        @($idx.Records | Where-Object Kind -eq 'entry').Slug | Should -Be @('real.md', 'also.md')
+        (ConvertTo-AmIndexText -Records $idx.Records -Newline $idx.Newline) | Should -Be $text
+    }
+
+    It 'a bracketed title and an indented pointer parse as entries and round-trip byte-for-byte' {
+        $text = "- [Title [with] brackets](b.md) " + $script:EmDash + " hook`n  - [Nested](n.md) " + $script:EmDash + " nested`n"
+        $idx = Read-AmIndex -Text $text
+        $e = @($idx.Records | Where-Object Kind -eq 'entry')
+        $e.Count | Should -Be 2
+        $e[0].Title | Should -Be 'Title [with] brackets'
+        $e[1].Indent | Should -Be '  '
+        $e[1] | Add-Member -NotePropertyName Dirty -NotePropertyValue $true
+        (ConvertTo-AmIndexText -Records $idx.Records -Newline $idx.Newline) | Should -Be $text -Because 'a dirty indented entry must keep its indentation'
+    }
+
+    It 'an EMPTY state file throws instead of reading as "no state"' {
+        $p = Join-Path $TestDrive 'empty.json'
+        Set-Content -Path $p -Value ''
+        { Read-AmJsonFile -Path $p } | Should -Throw
+        Read-AmJsonFile -Path (Join-Path $TestDrive 'absent.json') | Should -BeNullOrEmpty
+    }
+
+    It 'byte truncation never splits a surrogate pair' {
+        $emoji = [char]::ConvertFromUtf32(0x1F600)   # 4 bytes in UTF-8, 2 UTF-16 code units
+        $t = ('x' * 97) + $emoji + 'tail'
+        $out = Get-AmTruncatedToBytes -Text $t -MaxBytes 99
+        $out | Should -Not -Match ([regex]::Escape([string][char]0xFFFD))
+        foreach ($i in 0..($out.Length - 1)) { [char]::IsHighSurrogate($out[$i]) -and ($i -eq $out.Length - 1) | Should -BeFalse }
+        (Get-AmByteCount -Text $out) | Should -BeLessOrEqual 99
+    }
+
+    It 'temp-file sweep reports what it removed and what it could not' {
+        $d = Join-Path $TestDrive 'sweep'
+        [System.IO.Directory]::CreateDirectory($d) | Out-Null
+        Set-Content -Path (Join-Path $d 'MEMORY.md.am-tmp') -Value 'leftover'
+        $r = Clear-AmStoreTempFiles -Dir $d
+        @($r.Removed) | Should -Be @('MEMORY.md.am-tmp')
+        @($r.Failed).Count | Should -Be 0
+        $fs = [System.IO.File]::Open((Join-Path $d 'locked.am-tmp'), 'Create', 'ReadWrite', 'None')
+        try {
+            $r2 = Clear-AmStoreTempFiles -Dir $d
+            @($r2.Failed).Count | Should -Be 1 -Because 'a locked temp file must be reported, not swallowed'
+        } finally { $fs.Dispose() }
+    }
+}
+
 Describe 'frontmatter and the doctrine hard rule' {
     It 'reads type NESTED under metadata (the shape every real fact file uses)' {
         $p = Join-Path $TestDrive 'fb.md'

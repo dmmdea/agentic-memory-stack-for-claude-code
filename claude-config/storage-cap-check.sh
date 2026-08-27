@@ -173,7 +173,11 @@ gen = d.get("generated_at")
 stale_h = None
 if gen:
     try:
-        t = datetime.datetime.fromisoformat(gen.replace("Z", "+00:00"))
+        import re as _re
+        # Python 3.10 rejects more than 6 fractional digits; trim so an older runtime cannot
+        # make this guard inert and silently present stale counts as current.
+        g = _re.sub(r"(\.\d{1,6})\d*", r"\1", gen.replace("Z", "+00:00"))
+        t = datetime.datetime.fromisoformat(g)
         stale_h = round((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600.0, 1)
     except Exception:
         stale_h = None

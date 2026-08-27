@@ -70,7 +70,9 @@ try {
     # non-productive status, the maintainer is stuck, not working.
     if ($overTrigger.Count -gt 0 -and (Test-Path -LiteralPath $receiptPath)) {
         try {
-            $tail = @(Get-Content -LiteralPath $receiptPath -Tail 40 -ErrorAction Stop)
+            # 400, not 40: the tail is shared across every store, so a small window on a large
+            # fleet never lets any one store reach three receipts and the finding never fires.
+            $tail = @(Get-Content -LiteralPath $receiptPath -Tail 400 -ErrorAction Stop)
             foreach ($row in $storeRows) {
                 if (-not $row.over_trigger) { continue }
                 $mine = @()
@@ -99,7 +101,10 @@ try {
     }
 
     $summary = [pscustomobject]@{
-        generated_at = (Get-Date).ToUniversalTime().ToString('o')
+        # Whole seconds, not 'o': the 'o' format emits 7 fractional digits, which Python 3.10's
+        # fromisoformat rejects - the banner's staleness guard would then be inert on the very
+        # runtime the banner runs under.
+        generated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         stores       = @($storeRows)
         findings     = @($findings)
         counts       = [pscustomobject]@{

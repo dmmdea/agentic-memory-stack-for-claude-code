@@ -169,7 +169,13 @@ depends on the migration source tag.
 - No file is ever deleted without its content existing either in the memory corpus (verified by
   id) or in the history repository.
 - The job writes exactly one file per store: the Index. Fact files are deleted only *after*
-  that write and its invariant check succeed, so an abort leaves the store untouched.
+  that write **and its invariant check** succeed — in that order — so an abort or a revert
+  leaves every file in place. (The first fix round deleted between the write and the check,
+  which reverted an Index onto files already gone.)
+- A ghost is an **entry** link to a missing file; a mention in a heading or prose counts for
+  reachability but is never a ghost, because the job never rewrites such lines.
+- Ambiguous lines (a checkbox-style item whose bracketed text is followed later by a pointer)
+  are never removed and never ghosts.
 - A model-driven edit must strictly shrink the Index; hygiene is exempt from that rule, because
   correctness must never be gated on saving bytes.
 - Every line the job constructs must parse back to the same single pointer.
@@ -181,12 +187,14 @@ depends on the migration source tag.
 | Failure | Behaviour |
 |---|---|
 | A session is live in the workspace (or cannot be probed) | skip that store; receipt records why |
-| The store changed during the run | abort before anything is written **or deleted** |
+| An entry still links to a missing file after hygiene (unrepairable ghost) | abort **before** the judge runs: nothing written, nothing posted |
+| The store changed during the run | abort before anything is written **or deleted**; migration writes already made are undone |
+| The write succeeded but post-write verification itself failed | `applied-unverified`: no file deleted, migrated files retained (they re-index as orphans and converge on the next run) |
 | The fact directory cannot be read, or enumerates empty under a non-empty Index | abort; never treat every line as dangling |
 | Hygiene wants to remove more than a fifth of the lines | abort and report; never silently gut an Index |
 | Judge unreachable or unparseable | deterministic hygiene only; status says so; throttle **not** marked |
-| Memory server returns no id, or the read-back does not match | migration not performed, the line stays, and the unverified record is deleted |
-| Post-write invariants fail | restore the Index alone; if that restore fails, say so loudly with the recovery command |
+| Memory server returns no id, or the read-back does not match | migration not performed, the line stays, and the unverified record is deleted — **unless the server reported it as a pre-existing (deduplicated) record, which is never deleted** |
+| Post-write invariants fail | nothing has been deleted yet: restore the Index alone, undo the migration writes; if the restore fails, say so loudly with the recovery command |
 | Doctrine set alone exceeds the budget | stop and report; never loosen the rule |
 | No verified pre-run snapshot | skip the store; never mutate without a restore point |
 | One store throws | that store is recorded as an error; the others continue |

@@ -4,6 +4,42 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.1 (2026-08-26) — auto-memory: the fix round reviewed
+
+The operator asked for an adversarial review of the v1.20.0 fix round itself, and it found
+what this stack's own notes predict: a fix applied literally recreated the bug class.
+
+**Critical.** The "delete fact files only after the index write" fix placed the delete
+between the write and the post-write invariant check. An invariant failure then restored
+the pre-run index — which still listed the just-deleted facts — while the receipt reported
+`lost=0`. The new reachability rule ("linked from ANY line") simultaneously created ghosts
+that hygiene could not repair (a file name mentioned in a heading or a prose note), so the
+invariant failed every night. Reproduced end-to-end: up to five files deleted per night,
+index restored onto them, forever. Fixed by ordering — write, verify invariants, THEN
+delete — and by deciding ghosts from entry links only, checked *before* the judge runs, so
+an unrepairable store aborts with nothing written and nothing posted.
+
+**High.** A compare-and-swap abort left verified migration records in the corpus that no
+receipt named (now undone, unless the server reported the id as a pre-existing dedup hit —
+those are never deleted, which closes the second finding: the shared write helper discarded
+the `deduplicated` flag, so an unverifiable write could have deleted an L1a fact or an
+earlier migration). The compactor now performs its own migration POST and reads the flag.
+An enumeration failure *after* the write now reports `applied-unverified` and deletes
+nothing instead of collapsing into a generic error.
+
+**Medium.** The banner staleness guard was inert on Python 3.10 (seven fractional digits);
+the unproductive-compactor finding was fleet-size gated by a 40-line tail; the widened
+entry regex accepted a checkbox line as a pointer and fenced examples as entries (now:
+fenced lines are text, and ambiguous lines are never removed and never ghosts); a
+dead-extra-link repair rejected any line that also carried a live extra link; byte
+truncation could split a surrogate pair; an empty seal file read as "no seals"; a locked
+temp file was swallowed; `-Workspace` with a typo silently rehearsed nothing.
+
+Tests: +7 library, +7 compactor scenarios, boundary assertion on the blast cap. Live
+verification at the deployed config: real scheduled-task start (`LastTaskResult 0`, live
+store correctly skipped), hook through its registered `wsl.exe` command with stdin, lint
+through its real PS 5.1 spawn, banner rendered, exit codes propagate through `run-hidden.vbs`.
+
 ## v1.20.0 (2026-08-26) — auto-memory maintenance
 
 The coding-agent harness keeps its own per-workspace file memory — an index of one-line

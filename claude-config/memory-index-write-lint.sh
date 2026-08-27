@@ -61,7 +61,7 @@ total_lines=$(grep -c '' "$file" 2>/dev/null); : "${total_lines:=0}"
 over="$(LC_ALL=C awk -v cap="$CAP_LINE_BYTES" '
   /^[[:space:]]*- \[.*\]\(.*\.md\)/ { n = length($0); if (n > cap) { printf "  line %d: %d B  %s\n", NR, n, substr($0, 1, 60) } }
 ' "$file" 2>/dev/null)"
-over_count=$(printf '%s' "$over" | grep -c '^' 2>/dev/null || echo 0)
+over_count=$(printf '%s' "$over" | grep -c '^' 2>/dev/null); : "${over_count:=0}"
 [ -z "$over" ] && over_count=0
 
 [ "$over_count" -eq 0 ] && [ "$total_bytes" -lt "$CAP_FILE_BYTES" ] && [ "$total_lines" -lt "$CAP_LINES" ] && exit 0
