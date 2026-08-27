@@ -30,9 +30,10 @@
 # NO LOCAL FALLBACK: if the judge is unreachable the job applies deterministic hygiene only and
 # does NOT mark the throttle, so the judge-only work is retried rather than counted as done.
 #
-# EXIT CODES: 0 normal (including per-store skips); 3 = refused to run (history unavailable, or
-# the history repo has a remote) so the scheduler records a non-zero result for a job that
-# deliberately did nothing.
+# EXIT CODES: 0 normal (including per-store skips); 2 = bad invocation (-Force without scope,
+# or a -Workspace that matches no store); 3 = refused to run (history unavailable, or the
+# history repo has a remote). run-hidden.vbs propagates the code (WScript.Quit exitCode), so
+# the scheduler records a non-zero result for a job that deliberately did nothing.
 
 param(
     [switch]$DryRun,
@@ -92,7 +93,16 @@ if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -
 }
 
 $stores = @(Get-AmStores) | Where-Object { -not $_.IsAlias }
-if ($Workspace) { $stores = @($stores | Where-Object { $_.Workspace -eq $Workspace }) }
+if ($Workspace) {
+    $stores = @($stores | Where-Object { $_.Workspace -eq $Workspace })
+    if (@($stores).Count -eq 0) {
+        # A typo'd -Workspace used to log "no stores found" and exit 0 - a rehearsal that
+        # silently rehearsed nothing.
+        Write-MemoryLog -Component $Component -Message ('-Workspace "' + $Workspace + '" matches no populated store')
+        Write-Host ('memory-compact: -Workspace "' + $Workspace + '" matches no populated store.')
+        exit 2
+    }
+}
 if (@($stores).Count -eq 0) { Write-MemoryLog -Component $Component -Message 'no stores found'; exit 0 }
 
 # Only stores at/above a trigger are candidates; hysteresis (target < trigger) keeps a store
@@ -192,6 +202,34 @@ function Test-AmMigrationLanded {
     return $true
 }
 
+function Add-AmMem0Migration {
+    # The compactor's OWN write, not the shared Add-Mem0Memory helper, for two reasons:
+    #   - the helper discards the server's `deduplicated` flag. add() with infer=false returns an
+    #     EXISTING id on a hash hit; without the flag, a migration whose read-back then times out
+    #     would "undo" itself by deleting a record it never created (an L1a fact, or an earlier
+    #     migration). Never delete a dedup'd id.
+    #   - the helper dead-letters failures and a later drain re-posts them unverified; a failed
+    #     migration must simply be "not migrated".
+    # Same byte-encoded body as the helper (PS 5.1 Invoke-RestMethod Latin-1-encodes a STRING).
+    # Returns @{ Id; Deduplicated } or $null on failure.
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Source, [hashtable]$Metadata = @{})
+    $Metadata['source'] = $Source
+    if (-not $Metadata.ContainsKey('tier')) { $Metadata['tier'] = 'evidence' }
+    $body = @{ messages = $Text; user_id = '__WSL_USER__'; infer = $false; metadata = $Metadata } | ConvertTo-Json -Depth 5 -Compress
+    try {
+        $key = Get-Mem0Key
+        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
+            -Headers @{ 'X-API-Key' = $key; 'Content-Type' = 'application/json' } `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 20
+        $id = $null
+        if ($r -and $r.results -and @($r.results).Count -gt 0) { $id = [string]@($r.results)[0].id }
+        if (-not $id) { return $null }
+        $dedup = $false
+        if ($r.PSObject.Properties['deduplicated'] -and $r.deduplicated) { $dedup = $true }
+        return [pscustomobject]@{ Id = $id; Deduplicated = $dedup }
+    } catch { return $null }
+}
+
 function Remove-AmMem0Record {
     # Undo a migration write whose verification failed. Without it the record stays in the corpus
     # referenced by nothing: its id never reaches a receipt (only verified migrations are
@@ -237,8 +275,14 @@ foreach ($cand in $candidates) {
         continue
     }
 
-    foreach ($swept in @(Clear-AmStoreTempFiles -Dir $store.Dir)) {
+    $sweep = Clear-AmStoreTempFiles -Dir $store.Dir
+    foreach ($swept in @($sweep.Removed)) {
         Write-MemoryLog -Component $Component -Message ($ws + ': swept a leftover temp file from a previously failed write: ' + $swept)
+    }
+    foreach ($stuck in @($sweep.Failed)) {
+        # A full copy of the index stuck inside a synced, globbed directory - say so.
+        Write-MemoryLog -Component $Component -Message ($ws + ': COULD NOT remove leftover temp file: ' + $stuck)
+        $result.note = 'a leftover .am-tmp could not be removed: ' + $stuck
     }
 
     $sealed = Get-AmSealed -Store $store   # throws on corruption -> caught below, store skipped
@@ -296,21 +340,36 @@ foreach ($cand in $candidates) {
     foreach ($r in $records) {
         if ($r.Kind -ne 'entry') { [void]$keep.Add($r); continue }
         if ($seenSlug.ContainsKey($r.Slug)) { $result.dedup_slug++; continue }    # duplicate link
-        if (-not $onDisk.ContainsKey($r.Slug)) { $result.dedangled++; continue }  # dangling link
+        if (-not $onDisk.ContainsKey($r.Slug)) {
+            # A title containing "]" is an ambiguous shape ("- [x] task with [link](f.md)" is a
+            # checkbox, not a pointer). Such a line is still counted for reachability, but the
+            # DESTRUCTIVE step - removing it as dangling - is reserved for the unambiguous form.
+            if ($r.Title -match '\]') {
+                Write-MemoryLog -Component $Component -Message ($ws + ': ambiguous line left alone (bracketed title, missing target ' + $r.Slug + ')')
+                [void]$keep.Add($r); continue
+            }
+            $result.dedangled++; continue                                          # dangling link
+        }
         $seenSlug[$r.Slug] = $true
         # A SECOND link on the line pointing at a missing file is a ghost the invariant check
         # would fail on forever while hygiene never fixed it: the index would be restored every
-        # night and every run discarded. Rebuild the line without the dead extra link.
+        # night and every run discarded. Rebuild the line without the dead extra link, keeping
+        # any LIVE extra link, and tidy the parentheses the removal may leave behind.
         $deadExtras = @($r.ExtraSlugs | Where-Object { -not $onDisk.ContainsKey($_) })
         if (@($deadExtras).Count -gt 0) {
+            $liveExtras = @($r.ExtraSlugs | Where-Object { $onDisk.ContainsKey($_) })
             $newSummary = $r.Summary
-            foreach ($dx in $deadExtras) { $newSummary = ($newSummary -replace ('\s*\(?\[[^\]]*\]\(' + [regex]::Escape($dx) + '\)\)?'), '') }
-            $candidate = New-AmEntryLine -Title $r.Title -Slug $r.Slug -Summary $newSummary.Trim()
-            if (Test-AmLineRoundTrips -Line $candidate -ExpectedSlug $r.Slug) {
-                $r.Summary = $newSummary.Trim(); $r.ExtraSlugs = @()
+            foreach ($dx in $deadExtras) { $newSummary = ($newSummary -replace ('\s*\[[^\]]*\]\(' + [regex]::Escape($dx) + '\)'), '') }
+            $newSummary = ($newSummary -replace '\(\s*(?:also|see also|see|and)?\s*\)', '') -replace '\s{2,}', ' '
+            $newSummary = ($newSummary -replace '\s+and\s*$', '' -replace '\s*,\s*$', '').Trim()
+            $candidate = New-AmEntryLine -Title $r.Title -Slug $r.Slug -Summary $newSummary -Indent $r.Indent
+            if (Test-AmLineRoundTrips -Line $candidate -ExpectedSlug $r.Slug -ExpectedExtras $liveExtras) {
+                $r.Summary = $newSummary; $r.ExtraSlugs = $liveExtras
                 $r.Bytes = Get-AmByteCount -Text $candidate
                 $r | Add-Member -NotePropertyName Dirty -NotePropertyValue $true -Force
                 $result.dedangled++
+            } else {
+                Write-MemoryLog -Component $Component -Message ($ws + ': could not repair dead extra link(s) on ' + $r.Slug + ' (' + ($deadExtras -join ',') + '); left as is')
             }
         }
         [void]$keep.Add($r)
@@ -354,6 +413,20 @@ foreach ($cand in $candidates) {
         [void]$keep.Add($newRec)
         $meta[$n] = [pscustomobject]@{ Frontmatter = $fm; Doctrine = (Test-AmDoctrine -Record $newRec -Frontmatter $fm) }
         $result.reindexed++
+    }
+
+    # ---- planned ghosts: decide BEFORE the judge, before any write, before any mem0 post ----
+    # If the index as hygiene would leave it still carries an entry link to a missing file, the
+    # post-write invariant is guaranteed to fail. Finding that out AFTER writing (and after
+    # posting migrations) is how a store got its files deleted nightly while its restored index
+    # kept pointing at them. Abort here with nothing touched.
+    $plannedGhosts = @(Get-AmEntryGhosts -Records @($keep) -OnDisk $onDisk)
+    if (@($plannedGhosts).Count -gt 0) {
+        $result.status = 'aborted-ghost-links'
+        $result.note = ('entry link(s) to missing files that hygiene cannot repair: ' + ($plannedGhosts -join ', ') + ' - fix by hand; nothing written, nothing posted')
+        Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
+        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
+        continue
     }
 
     # ---- GUARD 4a: blast cap over ALL removals, hygiene included ------------------------
@@ -499,27 +572,31 @@ foreach ($cand in $candidates) {
                 continue
             }
             $mdata = @{ tier = 'evidence'; origin_slug = $slug; workspace = $ws }
-            $id = Add-Mem0Memory -Text $textOut -Source ('automemory:' + $ws + '/' + $slug) -Metadata $mdata
-            if ($id -is [string] -and $id) {
-                if (Test-AmMigrationLanded -Id $id -Text $textOut) {
+            $w = Add-AmMem0Migration -Text $textOut -Source ('automemory:' + $ws + '/' + $slug) -Metadata $mdata
+            if ($w -and $w.Id) {
+                if (Test-AmMigrationLanded -Id $w.Id -Text $textOut) {
                     $keep.Remove($rec) | Out-Null
-                    # The file is deleted only after the index write and its invariants pass -
-                    # deleting here would make the CAS abort path leave the store with dangling
-                    # links while the receipt claimed nothing was written.
-                    $pendingDeletes += [pscustomobject]@{ Slug = $slug; Id = $id; Raw = $rec.Raw }
+                    # The file is deleted only after the index write AND its invariants pass -
+                    # deleting earlier is how an abort or a revert left the store pointing at
+                    # files that were already gone.
+                    $pendingDeletes += [pscustomobject]@{ Slug = $slug; Id = $w.Id; Raw = $rec.Raw; Deduplicated = $w.Deduplicated }
                     $migrationsDone++; $removals++; $result.migrated++
+                } elseif ($w.Deduplicated) {
+                    # The id belongs to a PRE-EXISTING record we did not create. Never delete it.
+                    $result.mem0_orphan += ('' + $w.Id + ' | ' + $slug + ' | pre-existing (dedup) record, read-back failed; line kept, record untouched')
+                    Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' hit an existing record ' + $w.Id + ' whose read-back failed; line kept')
                 } else {
-                    if (Remove-AmMem0Record -Id $id) {
+                    if (Remove-AmMem0Record -Id $w.Id) {
                         Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' unverifiable; the record was removed and the line kept')
                     } else {
-                        $result.mem0_orphan += ('' + $id + ' | ' + $slug + ' | unverified write that could not be removed')
-                        Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' unverifiable AND its record could not be removed; id ' + $id + ' recorded in the receipt')
+                        $result.mem0_orphan += ('' + $w.Id + ' | ' + $slug + ' | unverified write that could not be removed')
+                        Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' unverifiable AND its record could not be removed; id ' + $w.Id + ' recorded in the receipt')
                     }
                 }
             } else {
-                # $true (posted, no id) or $false (dead-lettered) - both unverifiable, and both
-                # may still have landed a record. Recorded so it is not invisible.
-                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned ' + $id + '; line kept')
+                # No id: the write failed or the server returned nothing usable. A record MAY
+                # still have landed; the retry is hash-idempotent, so nothing to undo.
+                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned no id; line kept')
                 Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' returned no id; line kept')
             }
         }
@@ -527,6 +604,25 @@ foreach ($cand in $candidates) {
 
     $newText = ConvertTo-AmIndexText -Records @($keep) -Newline $idx.Newline
     $newBytesTotal = Get-AmByteCount -Text $newText
+
+    # Any exit between here and the index write must undo the migration writes it already made:
+    # the line and file are still in place, so the corpus record is a duplicate nobody indexes -
+    # and the dedup exemption would protect it forever. Records we did not create (dedup hits)
+    # are never deleted.
+    function Undo-AmPendingMigrations {
+        param($Pending, [string]$Why)
+        foreach ($pd in @($Pending)) {
+            if ($pd.Deduplicated) {
+                $result.mem0_orphan += ('' + $pd.Id + ' | ' + $pd.Slug + ' | pre-existing (dedup) record left in place after ' + $Why)
+                continue
+            }
+            if (Remove-AmMem0Record -Id $pd.Id) {
+                Write-MemoryLog -Component $Component -Message ($ws + ': undid migration write ' + $pd.Id + ' for ' + $pd.Slug + ' after ' + $Why)
+            } else {
+                $result.mem0_orphan += ('' + $pd.Id + ' | ' + $pd.Slug + ' | verified write left in corpus after ' + $Why + ' (delete failed)')
+            }
+        }
+    }
 
     if ($newText -eq $preText) {
         # Distinguish "there was nothing to do" from "the judge never answered".
@@ -537,6 +633,8 @@ foreach ($cand in $candidates) {
         continue
     }
     if ($newBytesTotal -gt $hygieneBytes -or (-not $hygieneChanged -and $newBytesTotal -ge $before.Bytes)) {
+        Undo-AmPendingMigrations -Pending $pendingDeletes -Why 'rejected-no-shrink'
+        $result.migrated = 0
         $result.status = 'rejected-no-shrink'
         $result.note = 'the judge-driven edits did not shrink the index past the hygiene baseline; discarded'
         Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
@@ -559,8 +657,10 @@ foreach ($cand in $candidates) {
     $appeared = @($nowFiles | Where-Object { $_ -notin $preFiles })
     $vanished = @($preFiles | Where-Object { $_ -notin $nowFiles })
     if ($nowHash -ne $preHash -or @($appeared).Count -gt 0 -or @($vanished).Count -gt 0) {
+        Undo-AmPendingMigrations -Pending $pendingDeletes -Why 'concurrent-write abort'
+        $result.migrated = 0
         $result.status = 'aborted-concurrent-write'
-        $result.note = ('the store changed under the job (index hash, +' + @($appeared).Count + ' / -' + @($vanished).Count + ' files); nothing written, nothing deleted - abort, never roll back over a live session')
+        $result.note = ('the store changed under the job (index hash, +' + @($appeared).Count + ' / -' + @($vanished).Count + ' files); nothing written, nothing deleted, migration writes undone - abort, never roll back over a live session')
         Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
         Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
         continue
@@ -568,7 +668,65 @@ foreach ($cand in $candidates) {
 
     Write-AmTextAtomic -Path $store.IndexPath -Text $newText
 
-    # ---- deferred deletes: the index no longer references these ------------------------
+    # ---- post-write invariants: computed BEFORE any file is deleted ---------------------
+    # Order is load-bearing. Deleting first and checking second is how a revert restored an
+    # index that still pointed at files already gone (reproduced in review). Files pending
+    # migration are EXPECTED to be unlinked at this point, so they are excluded from the orphan
+    # test; nothing has been deleted, so `lost` must be empty unless a concurrent process acted.
+    $migratedSlugs = @($pendingDeletes | ForEach-Object { $_.Slug })
+    $postText = $null; $postIdx = $null; $postFiles = $null; $postOnDisk = @{}
+    $verifyError = $null
+    try {
+        $postText = Read-AmText -Path $store.IndexPath
+        $postIdx = Read-AmIndex -Text $postText
+        $postFiles = @(Get-AmFactFiles -Dir $store.Dir | ForEach-Object { $_.Name })
+        foreach ($n in $postFiles) { $postOnDisk[$n] = $true }
+    } catch { $verifyError = $_.Exception.Message }
+
+    if ($verifyError) {
+        # The index is written but cannot be verified (enumeration failed AFTER the write).
+        # Delete nothing: the pending files stay on disk, unlinked, and the next run re-indexes
+        # them as orphans (their corpus copies are verified and hash-idempotent, so a later
+        # migration converges). Report honestly instead of 'error-store'.
+        $result.status = 'applied-unverified'
+        $result.note = ('index written but post-write verification failed: ' + $verifyError + '; ' + @($pendingDeletes).Count + ' migrated file(s) NOT deleted')
+        foreach ($pd in $pendingDeletes) { $result.mem0 += ('' + $pd.Id + ' | ' + $pd.Slug + ' | migrated, file retained (unverified state)') }
+        foreach ($k in $newlySealed.Keys) { $sealed[$k] = (Get-Date).ToUniversalTime().ToString('o') }
+        try { Save-AmSealed -Store $store -Sealed $sealed } catch {}
+        try { $result.commit = Save-AmHistorySnapshot -Store $store -Message ('compact (unverified) ' + $ws) } catch {}
+        Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
+        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
+        continue
+    }
+
+    $postLinked = Get-AmIndexLinkedSlugs -Records $postIdx.Records
+    $ghosts = @(Get-AmEntryGhosts -Records $postIdx.Records -OnDisk $postOnDisk)
+    $orphans = @($postFiles | Where-Object { -not $postLinked.ContainsKey($_) -and $_ -notin $migratedSlugs })
+    $lost = @($preFiles | Where-Object { -not $postOnDisk.ContainsKey($_) })
+    $ok = (@($ghosts).Count -eq 0 -and @($orphans).Count -eq 0 -and @($lost).Count -eq 0)
+    if (-not $ok) {
+        # Restore ONLY the index - the single file this job wrote. Nothing has been deleted, so
+        # a successful restore returns the store to exactly its pre-run state; the migration
+        # writes are undone too. The restore's own success is checked: this is the last line
+        # of defence, and a silent failure would leave a mutated index behind a receipt
+        # claiming it was reverted.
+        Undo-AmPendingMigrations -Pending $pendingDeletes -Why 'invariant failure'
+        $result.migrated = 0
+        $restored = Restore-AmHistoryFile -Sha $snapSha -RelPath ($rel + '/MEMORY.md')
+        if ($restored) {
+            $result.status = 'reverted-invariant-failure'
+            $result.note = ('ghosts=' + (@($ghosts) -join ',') + ' orphans=' + @($orphans).Count + ' lost=' + @($lost).Count + '; index restored from ' + $snapSha + '; no file deleted')
+        } else {
+            $result.status = 'invariant-failure-RESTORE-FAILED'
+            $result.note = ('ghosts=' + @($ghosts).Count + ' orphans=' + @($orphans).Count + ' lost=' + @($lost).Count +
+                '; THE INDEX IS MUTATED AND WAS NOT RESTORED (no file deleted). Recover by hand: git --git-dir="' + (Get-AmHistoryGitDir) + '" --work-tree="' + (Get-AmProjectsRoot) + '" checkout ' + $snapSha + ' -- ' + $rel + '/MEMORY.md')
+        }
+        Write-MemoryLog -Component $Component -Message ($ws + ': INVARIANT FAILURE: ' + $result.note)
+        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
+        continue
+    }
+
+    # ---- deferred deletes: invariants hold and the index no longer references these -----
     $deleteFailed = @()
     foreach ($pd in $pendingDeletes) {
         try {
@@ -580,34 +738,6 @@ foreach ($cand in $candidates) {
             $deleteFailed += $pd.Slug
             $result.mem0 += ('' + $pd.Id + ' | ' + $pd.Slug + ' | MIGRATED but file delete FAILED: ' + $_.Exception.Message)
         }
-    }
-
-    # ---- post-apply invariants ---------------------------------------------------------
-    $postText = Read-AmText -Path $store.IndexPath
-    $postIdx = Read-AmIndex -Text $postText
-    $postFiles = @(Get-AmFactFiles -Dir $store.Dir | ForEach-Object { $_.Name })
-    $postLinked = Get-AmIndexLinkedSlugs -Records $postIdx.Records
-    $migratedSlugs = @($pendingDeletes | ForEach-Object { $_.Slug })
-    $ghosts = @($postLinked.Keys | Where-Object { $_ -notin $postFiles })
-    $orphans = @($postFiles | Where-Object { -not $postLinked.ContainsKey($_) -and $_ -notin $deleteFailed })
-    $lost = @($preFiles | Where-Object { $_ -notin $postFiles -and $_ -notin $migratedSlugs })
-    $ok = (@($ghosts).Count -eq 0 -and @($orphans).Count -eq 0 -and @($lost).Count -eq 0)
-    if (-not $ok) {
-        # Restore ONLY the index - the single file this job wrote. Never the directory.
-        # The restore's own success is checked: this is the last line of defence, and a silent
-        # failure here would leave a mutated index behind a receipt claiming it was reverted.
-        $restored = Restore-AmHistoryFile -Sha $snapSha -RelPath ($rel + '/MEMORY.md')
-        if ($restored) {
-            $result.status = 'reverted-invariant-failure'
-            $result.note = ('ghosts=' + @($ghosts).Count + ' orphans=' + @($orphans).Count + ' lost=' + @($lost).Count + '; index restored from ' + $snapSha)
-        } else {
-            $result.status = 'invariant-failure-RESTORE-FAILED'
-            $result.note = ('ghosts=' + @($ghosts).Count + ' orphans=' + @($orphans).Count + ' lost=' + @($lost).Count +
-                '; THE INDEX IS MUTATED AND WAS NOT RESTORED. Recover by hand: git --git-dir="' + (Get-AmHistoryGitDir) + '" --work-tree="' + (Get-AmProjectsRoot) + '" checkout ' + $snapSha + ' -- ' + $rel + '/MEMORY.md')
-        }
-        Write-MemoryLog -Component $Component -Message ($ws + ': INVARIANT FAILURE: ' + $result.note)
-        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
-        continue
     }
 
     foreach ($k in $newlySealed.Keys) { $sealed[$k] = (Get-Date).ToUniversalTime().ToString('o') }

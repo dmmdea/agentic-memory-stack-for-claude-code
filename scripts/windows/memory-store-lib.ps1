@@ -203,12 +203,16 @@ function Clear-AmStoreTempFiles {
     # A crashed atomic write can leave a full copy of the index as <name>.am-tmp INSIDE the
     # store, where the harness syncs it and agents glob it. Sweep them; a leftover is evidence
     # of a previously failed write, so the caller logs what it removed.
+    # Returns @{ Removed; Failed } - a temp file that could NOT be removed (locked) is a full
+    # copy of the index sitting in a synced, globbed directory: the case to shout about, never
+    # one to swallow.
     param([Parameter(Mandatory)][string]$Dir)
-    $found = @()
+    $removed = @(); $failed = @()
     foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter '*.am-tmp' -File -ErrorAction SilentlyContinue)) {
-        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $found += $f.Name } catch {}
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed += $f.Name }
+        catch { $failed += ($f.Name + ': ' + $_.Exception.Message) }
     }
-    return $found
+    return [pscustomobject]@{ Removed = @($removed); Failed = @($failed) }
 }
 
 # ---------------------------------------------------------------- index parsing
@@ -228,9 +232,14 @@ function Read-AmIndex {
     $lines = [regex]::Split($Text, "\r?\n")
     $records = New-Object System.Collections.ArrayList
     $i = 0
+    $inFence = $false
     foreach ($ln in $lines) {
-        $m = $script:AmEntryRegex.Match($ln)
-        if ($m.Success) {
+        # A list item inside a ``` code fence is text, not a pointer. Without fence tracking a
+        # fenced example line would be treated as an entry and its (example) target "dangling".
+        if ($ln -match '^\s*(```|~~~)') { $inFence = -not $inFence }
+        $m = $null
+        if (-not $inFence) { $m = $script:AmEntryRegex.Match($ln) }
+        if ($m -and $m.Success) {
             $rest = $m.Groups['rest'].Value
             # summary = rest with the leading separator (em-dash / hyphen / colon) stripped
             $summary = ($rest -replace ('^\s*(?:' + $script:AmEmDash + '|--?|:)\s*'), '').TrimEnd()
@@ -472,13 +481,42 @@ function Test-AmLineRoundTrips {
     # night, the index is restored every night, and the run is discarded forever. A title
     # containing "]" makes the regenerated line unparseable, so its file reads back as an orphan
     # on the next run - same endless loop.
-    param([Parameter(Mandatory)][string]$Line, [Parameter(Mandatory)][string]$ExpectedSlug)
+    param(
+        [Parameter(Mandatory)][string]$Line,
+        [Parameter(Mandatory)][string]$ExpectedSlug,
+        [string[]]$ExpectedExtras = @()
+    )
     $rt = Read-AmIndex -Text $Line
     $recs = @($rt.Records | Where-Object { $_.Kind -eq 'entry' })
     if (@($recs).Count -ne 1) { return $false }
     if ($recs[0].Slug -ne $ExpectedSlug) { return $false }
-    if (@($recs[0].ExtraSlugs).Count -gt 0) { return $false }
+    # Exactly the expected extra links (none by default): a repair that drops a DEAD extra link
+    # must keep a LIVE one, or the repair is rejected and the dead link stays forever.
+    $got = @($recs[0].ExtraSlugs | Sort-Object)
+    $want = @($ExpectedExtras | Sort-Object)
+    if (@($got).Count -ne @($want).Count) { return $false }
+    for ($i = 0; $i -lt @($got).Count; $i++) { if ($got[$i] -ne $want[$i]) { return $false } }
     return $true
+}
+
+function Get-AmEntryGhosts {
+    # Links that ENTRY lines carry (primary slug or extra links) to files that do not exist.
+    # Only entries count: the compactor never rewrites a non-entry line, so a "(see notes.md)"
+    # in a heading or a prose note must not be a ghost it is expected to repair - that would
+    # fail the post-write invariant every night for a condition hygiene cannot touch. Non-entry
+    # links still count for REACHABILITY (Get-AmIndexLinkedSlugs), just never as ghosts.
+    param([Parameter(Mandatory)]$Records, [Parameter(Mandatory)][hashtable]$OnDisk)
+    $ghosts = @{}
+    foreach ($r in $Records) {
+        if ($r.Kind -ne 'entry') { continue }
+        # An ambiguous shape ("- [x] task, see [notes](missing.md)" - a checkbox, not a pointer)
+        # is never removed by hygiene, so it must not be a ghost either, or a single checkbox
+        # line would abort the store's compaction forever.
+        if ($r.Title -match '\]') { continue }
+        if (-not $OnDisk.ContainsKey($r.Slug)) { $ghosts[$r.Slug] = $true }
+        foreach ($e in $r.ExtraSlugs) { if (-not $OnDisk.ContainsKey($e)) { $ghosts[$e] = $true } }
+    }
+    return @($ghosts.Keys | Sort-Object)
 }
 
 function Get-AmTruncatedToBytes {
@@ -488,6 +526,9 @@ function Get-AmTruncatedToBytes {
     $s = $Text
     while ($s.Length -gt 0 -and (Get-AmByteCount -Text $s) -gt $MaxBytes) {
         $s = $s.Substring(0, $s.Length - 1)
+        # Never cut between the halves of a surrogate pair: a lone high surrogate encodes as
+        # EF BF BD (the replacement character) and the index gains a garbage byte sequence.
+        if ($s.Length -gt 0 -and [char]::IsHighSurrogate($s[$s.Length - 1])) { $s = $s.Substring(0, $s.Length - 1) }
     }
     $cut = $s.LastIndexOf(' ')
     if ($cut -gt [int]($s.Length * 0.6)) { $s = $s.Substring(0, $cut) }
@@ -614,5 +655,9 @@ function Read-AmJsonFile {
     # model on every already-shortened line, which is exactly the drift the seal prevents.
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    return (Read-AmText -Path $Path | ConvertFrom-Json)
+    $raw = Read-AmText -Path $Path
+    # An EMPTY file is present-but-unparseable, not absent: '' | ConvertFrom-Json yields $null
+    # on pwsh 7, which read a truncated seal file as "no seals" - the same disarm as corruption.
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw ('state file is empty (truncated write?): ' + $Path) }
+    return ($raw | ConvertFrom-Json)
 }
