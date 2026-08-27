@@ -204,6 +204,24 @@ Describe 'ghost links: decided before the judge, nothing deleted, nothing posted
     }
 }
 
+Describe 'receipt fidelity' {
+    It 'a re-indexed orphan that is then migrated carries its constructed line in the receipt' {
+        # The receipt row is "id | slug | original line". A line the job itself constructed has
+        # no "original", so it must carry the constructed one - never an empty string, which
+        # would leave the audit trail unable to say what the index looked like before removal.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $facts['orphan.md'] = (New-FactFile 'orphan' 'an unindexed reference fact' 'reference')
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[{"slug":"orphan.md","action":"MIGRATE"}]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts[0].reindexed | Should -Be 1
+        $r.Receipts[0].migrated | Should -Be 1
+        $row = ($r.Receipts[0].mem0 -join "`n")
+        $row | Should -Match 'orphan\.md \| - \[orphan\]\(orphan\.md\)' -Because 'the receipt must show the line as it stood in the index'
+        $row | Should -Not -Match 'orphan\.md \| \s*$'
+    }
+}
+
 Describe 'history and receipts' {
     It 'commits to an out-of-tree repo with no remote, writes a diff, and never creates .git in a store' {
         $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }

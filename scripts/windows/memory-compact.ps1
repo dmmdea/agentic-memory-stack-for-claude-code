@@ -401,6 +401,9 @@ foreach ($cand in $candidates) {
             }
         }
         $newRec.Bytes = Get-AmByteCount -Text $line
+        # Raw carries the constructed line so a receipt row for this entry ("id | slug | line")
+        # can never be blank: the audit trail must show how the index read before a removal.
+        $newRec.Raw = $line
         # Re-indexing is the one hygiene action that ADDS bytes. It must never be the reason a
         # store crosses the hard sync limit - that is the exact failure this system exists to
         # prevent, and it would be perverse to cause it while repairing something else.
@@ -624,7 +627,12 @@ foreach ($cand in $candidates) {
         }
     }
 
-    if ($newText -eq $preText) {
+    # A run with verified migrations pending is NEVER a no-op, even when the index text is
+    # unchanged: an orphan re-indexed by hygiene and then migrated by the judge nets to the same
+    # index bytes, but its file must still be deleted and its corpus id must reach the receipt.
+    # Treating that as no-op left the file on disk, the record unnamed, and `migrated=1` beside
+    # `status=no-op` (found by the receipt-fidelity test).
+    if ($newText -eq $preText -and @($pendingDeletes).Count -eq 0) {
         # Distinguish "there was nothing to do" from "the judge never answered".
         $result.status = if ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
         $result.after_bytes = $before.Bytes; $result.after_lines = $before.Lines
