@@ -4,6 +4,18 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.2 (2026-08-26) — auto-memory: a migration is never a no-op
+
+Found by a receipt-fidelity test written after the v1.20.1 live run showed a blank
+"original line" for a re-indexed orphan. The test exposed something worse than a blank
+field: an orphan that hygiene re-indexes and the judge then migrates leaves the index
+text byte-identical to before, so the run reported `no-op` — while the migration write
+had been made and verified, the orphan file stayed on disk, and no receipt row named the
+corpus id (`migrated=1` beside `status=no-op`). The same unnamed-record class the v1.20.1
+review closed on the abort paths, one exit path further along. A run with verified
+migrations pending now always proceeds through write → verify → delete → receipt, and a
+constructed index line carries itself into the receipt.
+
 ## v1.20.1 (2026-08-26) — auto-memory: the fix round reviewed
 
 The operator asked for an adversarial review of the v1.20.0 fix round itself, and it found
