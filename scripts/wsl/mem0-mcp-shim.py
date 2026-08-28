@@ -881,7 +881,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.20.3"
+SHIM_STACK_VERSION = "1.20.4"
 
 
 def _write_start_receipt() -> None:

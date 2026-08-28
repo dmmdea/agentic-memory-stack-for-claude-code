@@ -781,6 +781,17 @@ if (Test-Path -LiteralPath $claudeMd) {
 # 'replica' box: skip registration AND remove any tasks a pre-v1.16 install left behind.
 $taskName = 'ClaudeCode-DreamConsolidator-3am'
 $dedupTaskName = 'ClaudeCode-SemanticDedup-430am'
+# Every task principal is the CURRENT IDENTITY's resolvable name, never $env:USERDOMAIN\$env:USERNAME.
+# On a workgroup box USERDOMAIN is the literal WORKGROUP, so "WORKGROUP\user" has no SID and
+# Register-ScheduledTask fails with "No mapping between account names and security IDs"
+# (observed 2026-08-28 deploying to a replica; the brain-only tasks carried the same latent
+# bug, masked because the one brain box happens to have a matching USERDOMAIN). The identity
+# name resolves on domain, workgroup and Microsoft-account boxes alike.
+#
+# Defined HERE, before the brain-role gate, on purpose: v1.20.3 defined it inside the brain
+# branch, so on a replica the compactor (registered for every role, after the gate) received a
+# null UserId - the fix for the replica failed on the replica while passing on the brain.
+$taskUserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 if ($Role -ne 'brain') {
     Write-Host "==> [5/5b] Role=replica: dream/dedup scheduled tasks NOT registered (one-brain rule)"
     foreach ($t in @($taskName, $dedupTaskName)) {
@@ -807,14 +818,6 @@ $settingsTask = New-ScheduledTaskSettingsSet `
     -WakeToRun `
     -Hidden `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-# Every task principal is the CURRENT IDENTITY's resolvable name, never $env:USERDOMAIN\$env:USERNAME.
-# On a workgroup box USERDOMAIN is the literal WORKGROUP, so "WORKGROUP\user" has no SID and
-# Register-ScheduledTask fails with "No mapping between account names and security IDs"
-# (observed 2026-08-28 deploying to a replica; the brain-only tasks carried the same latent
-# bug, masked because the one brain box happens to have a matching USERDOMAIN). The identity
-# name resolves on domain, workgroup and Microsoft-account boxes alike. Shared by all three
-# registrations below.
-$taskUserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask `

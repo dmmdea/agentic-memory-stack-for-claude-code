@@ -487,6 +487,13 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $src | Should -Not -Match 'New-ScheduledTaskPrincipal[^\n]*USERDOMAIN' -Because 'a DOMAIN\user principal does not resolve on a workgroup box'
         $src | Should -Match '\$taskUserId\s*=\s*\[System\.Security\.Principal\.WindowsIdentity\]::GetCurrent\(\)\.Name' -Because 'the principal must come from the current identity'
         ([regex]::Matches($src, 'New-ScheduledTaskPrincipal -UserId \$taskUserId')).Count | Should -Be 3 -Because 'dream, dedup and compactor registrations all use the shared principal'
+        # v1.20.3 defined $taskUserId INSIDE the brain branch, so a replica registered the
+        # compactor (all roles, after the gate) with a null UserId. The definition must precede
+        # the gate so every role sees it.
+        $defIdx  = $src.IndexOf('$taskUserId = [System.Security.Principal.WindowsIdentity]')
+        $gateIdx = $src.IndexOf("if (`$Role -ne 'brain')")
+        $defIdx  | Should -BeGreaterThan 0
+        $defIdx  | Should -BeLessThan $gateIdx -Because 'a replica skips the brain branch; the principal must be defined before the role gate'
     }
 
     It 'the operator receipt records the Role' {
