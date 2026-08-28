@@ -478,6 +478,17 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         (Get-Content $verifierPath -Raw) | Should -Match 'ClaudeCode-MemoryCompactor-5am' -Because 'a task nobody verifies is a task that silently stops firing'
     }
 
+    It 'every scheduled-task principal is the current identity name, never $env:USERDOMAIN' {
+        # On a workgroup box $env:USERDOMAIN is the literal WORKGROUP; "WORKGROUP\user" has no
+        # SID and Register-ScheduledTask fails with "No mapping between account names and
+        # security IDs" (observed deploying to a replica). WindowsIdentity.GetCurrent().Name is
+        # the resolvable form on domain, workgroup and Microsoft-account boxes alike.
+        $src = Get-Content $installerPath -Raw
+        $src | Should -Not -Match 'New-ScheduledTaskPrincipal[^\n]*USERDOMAIN' -Because 'a DOMAIN\user principal does not resolve on a workgroup box'
+        $src | Should -Match '\$taskUserId\s*=\s*\[System\.Security\.Principal\.WindowsIdentity\]::GetCurrent\(\)\.Name' -Because 'the principal must come from the current identity'
+        ([regex]::Matches($src, 'New-ScheduledTaskPrincipal -UserId \$taskUserId')).Count | Should -Be 3 -Because 'dream, dedup and compactor registrations all use the shared principal'
+    }
+
     It 'the operator receipt records the Role' {
         (Get-Content $installerPath -Raw) | Should -Match "Role\s+= '\`$eRole'" -Because '3-verify and runtime scripts resolve the box role from the receipt (quote-escaped like every other receipt value)'
     }

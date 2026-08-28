@@ -807,7 +807,15 @@ $settingsTask = New-ScheduledTaskSettingsSet `
     -WakeToRun `
     -Hidden `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+# Every task principal is the CURRENT IDENTITY's resolvable name, never $env:USERDOMAIN\$env:USERNAME.
+# On a workgroup box USERDOMAIN is the literal WORKGROUP, so "WORKGROUP\user" has no SID and
+# Register-ScheduledTask fails with "No mapping between account names and security IDs"
+# (observed 2026-08-28 deploying to a replica; the brain-only tasks carried the same latent
+# bug, masked because the one brain box happens to have a matching USERDOMAIN). The identity
+# name resolves on domain, workgroup and Microsoft-account boxes alike. Shared by all three
+# registrations below.
+$taskUserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$principal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask `
     -TaskName $taskName `
@@ -846,7 +854,7 @@ $dedupAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
     -Argument ("//nologo `"$hiddenVbs`" `"$env:SystemRoot\System32\wsl.exe`" -d " + $Distro + ' -e bash -lc "' + $dedupCmd + '"')
 $dedupTrigger = New-ScheduledTaskTrigger -Daily -At 4:30am
 $dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-$dedupPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$dedupPrincipal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
 Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 } # end brain-role gate (v1.16 §6.3)
@@ -874,7 +882,7 @@ $compactAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
     -Argument ("//nologo `"$compactVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\memory-compact.ps1`"")
 $compactTrigger = New-ScheduledTaskTrigger -Daily -At 5:00am
 $compactSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-$compactPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$compactPrincipal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $compactTaskName -Action $compactAction -Trigger $compactTrigger -Settings $compactSettings -Principal $compactPrincipal -Description 'Daily 5am auto-memory compactor: keeps each workspace MEMORY.md index under the harness sync/injection caps. Archive-free by design - history is an out-of-tree local git repo; doctrine entries are never touched.' | Out-Null
 Write-Host "    Auto-memory compactor registered (next fire: 5:00 AM)"
 

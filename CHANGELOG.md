@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.3 (2026-08-28) — installer: task principals resolve on workgroup boxes
+
+Deploying v1.20.2 to a replica box failed at the compactor task: `Register-ScheduledTask`
+returned "No mapping between account names and security IDs". The installer built every
+task principal as `$env:USERDOMAIN\$env:USERNAME`, and on a workgroup machine USERDOMAIN is
+the literal `WORKGROUP`, which has no SID. The brain-only dream/dedup registrations carried
+the same latent bug; the one brain box happened to have a matching USERDOMAIN. All three now
+use `WindowsIdentity.GetCurrent().Name`, which resolves on domain, workgroup and
+Microsoft-account boxes alike. A parity test fails if `USERDOMAIN` reappears in a principal.
+
 ## v1.20.2 (2026-08-26) — auto-memory: a migration is never a no-op
 
 Found by a receipt-fidelity test written after the v1.20.1 live run showed a blank
