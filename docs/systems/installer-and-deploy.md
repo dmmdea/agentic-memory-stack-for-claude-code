@@ -225,6 +225,7 @@ Verify reads `Role` from the Receipt. On a `brain` box it asserts **both** night
 - **Adding a sentinel/module/hook in only one place.** All of source, installer, `deploy.sh`, and R9 (or phase-1's `MEM0_MODULES`) must agree.
 - **Expecting `deploy.sh` to restart on a failing import** — it deliberately does not.
 - **Registering nightly tasks on a replica.** Use `-Role replica`; the gate keeps the One-Brain Rule intact.
+- **Task principals on a workgroup box.** Every scheduled task is registered under the current identity's resolvable name (`WindowsIdentity.GetCurrent().Name`), never `$env:USERDOMAIN\$env:USERNAME` — on a workgroup machine USERDOMAIN is the literal `WORKGROUP`, which has no SID, and registration fails with "No mapping between account names and security IDs".
 - **Committing `claude-config/brands.json`.** It is gitignored on purpose; the tracked template is `brands.example.json`.
 
 ## Source map
