@@ -4,6 +4,15 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.4 (2026-08-28) — installer: the replica fix, fixed for replicas
+
+v1.20.3 defined the shared `$taskUserId` *inside* the brain-role branch. A replica skips that
+branch, so the compactor registration (every role, after the gate) received a null `UserId`
+and the replica deploy failed again — while the brain deploy passed, and the pre-merge live
+probe had exercised the principal expression rather than the installer's control flow. The
+definition now precedes the role gate, and the parity test asserts that ordering. The proof
+this time is the installer itself completing on the replica.
+
 ## v1.20.3 (2026-08-28) — installer: task principals resolve on workgroup boxes
 
 Deploying v1.20.2 to a replica box failed at the compactor task: `Register-ScheduledTask`
