@@ -25,7 +25,7 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 "Reply with exactly: ok" | codex exec --skip-git-repo-check -c model_reasoning_effort='"low"' -
 ```
 
-`/health` also reports the stack release version. Anything red → matching section below. For the full scripted check, run the deployed **`Test-MemoryStack.ps1`** (`~/.claude/scripts/Test-MemoryStack.ps1`) — liveness + invariants, pass/fail per row.
+`/health` also reports the stack release version. Anything red → matching section below. For the full scripted check, run the deployed **`Test-MemoryStack.ps1`** (`~/.claude/scripts/Test-MemoryStack.ps1`) — liveness + invariants, pass/fail per row. It is role-aware: on a replica the shared-store rows probe the authority in `~/.mem0/authority-url` (the `memory authority` INFO row shows which), mutation probes are skipped, and brain-only machinery reports "by design" (see [systems/installer-and-deploy.md](systems/installer-and-deploy.md#role-aware-health-rows-health-check-time)).
 
 ---
 

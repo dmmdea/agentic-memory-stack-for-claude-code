@@ -416,3 +416,46 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         $script:bannerCode | Should -Not -Match 'health/deep' -Because 'the banner must never call the expensive endpoint inline (the 1s cold-morning guard exists for a reason)'
     }
 }
+
+Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' {
+    # The first replica this verifier ran on reported 14 FAILs - every one a loopback
+    # probe of a service a replica deliberately never runs. The 3-verify comment history
+    # shows the defect class recurring "one site further down the file"; these guards
+    # make a re-introduced loopback literal red instead of a permanent replica alarm.
+    BeforeAll {
+        $script:winDir   = Split-Path -Parent $PSScriptRoot
+        $script:tmsPath  = Join-Path $script:winDir 'Test-MemoryStack.ps1'
+        function script:Get-CodeLines {
+            param([string]$Path)
+            ((Get-Content $Path -Raw) -split "`r?`n" |
+                Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        }
+        $script:tmsCode = script:Get-CodeLines $script:tmsPath
+    }
+
+    It 'the loopback mem0 literal appears exactly once - as the $TmsAuthorityUrl default' {
+        $hits = [regex]::Matches($script:tmsCode, '127\.0\.0\.1:18791')
+        $hits.Count | Should -Be 1 -Because 'every probe must go through $TmsAuthorityUrl; a second literal is a replica FAIL that never clears'
+        $script:tmsCode | Should -Match "\`$TmsAuthorityUrl\s*=\s*'http://127\.0\.0\.1:18791'" -Because 'the single literal must be the default, not a probe'
+        # and the authority is resolved from the same file the shim/3-verify read
+        $script:tmsCode.Contains('cat ~/.mem0/authority-url') | Should -BeTrue -Because 'the receipt alone can be stale; the live per-host file is what the shim actually uses'
+    }
+
+    It 'the mutation probes never run from a replica' {
+        # Each of these writes to the shared store. On a replica they would also depend on
+        # a canonical key this box does not serve (I3) and on the brain's loopback-only
+        # Qdrant (I13). Their gate must carry the role, not just the key.
+        $gated = [regex]::Matches($script:tmsCode, 'if \(\$key -and -not \$TmsIsReplica\) \{').Count
+        $gated | Should -BeGreaterOrEqual 4 -Because 'I3, I13, I4 and I7 must each be gated on -not $TmsIsReplica'
+        foreach ($row in 'canonical immutability', 'admission gate', 'PUT payload survival', 'insight allowlist', 'PATCH /metadata') {
+            $script:tmsCode | Should -Match ("Add-Check 'INVARIANTS' '" + [regex]::Escape($row) + "'\s+'OK' \`$replicaMutNote") -Because "the replica must still emit a '$row' row (a silently missing row is not the same as a by-design one)"
+        }
+    }
+
+    It 'the One-Brain rows flip polarity on a replica (presence FAILs, absence is by design)' {
+        $script:tmsCode | Should -Match "'Task Scheduler 3am Dream' 'FAIL' `"registered on a REPLICA" -Because 'a dream task on a replica is the One-Brain violation, not a healthy install'
+        $script:tmsCode | Should -Match "'dedup task launch path' 'FAIL' `"registered on a REPLICA"  -Because 'same for the dedup task'
+        $script:tmsCode | Should -Match "'Task Scheduler 3am Dream' 'OK'\s+'replica role: absent by design" -Because 'absence on a replica must not be the old unconditional FAIL'
+        $script:tmsCode | Should -Match "'memory authority \(one-brain\)' 'FAIL' `"replica points at ITSELF" -Because 'a replica whose authority is loopback passes every reachability row while losing writes (3-verify asserts it at install; health must too)'
+    }
+}

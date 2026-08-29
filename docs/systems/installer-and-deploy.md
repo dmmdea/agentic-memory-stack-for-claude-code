@@ -142,6 +142,16 @@ Verify reads `Role` from the Receipt. On a `brain` box it asserts **both** night
 - `ClaudeCode-DreamConsolidator-3am` — the nightly 4-phase consolidator.
 - `ClaudeCode-SemanticDedup-430am` — the tier-sensitive semantic dedup (offset from the 3am run so the per-machine `dedup.lock` never blocks the Dream).
 
+### Role-aware health rows (health-check time)
+
+`Test-MemoryStack.ps1` reads the same `Role` and resolves the **memory authority** the way `3-verify.ps1` does — the live `~/.mem0/authority-url` inside WSL, then the Receipt's `AuthorityUrl`, then loopback. Every row that reads the shared store (`/health`, `/health/deep`, list/search, episodes, goals, open questions) targets that authority, so on a replica the rows describe the brain it actually uses instead of the loopback services a replica deliberately keeps dormant (the first replica this ran on reported 14 permanent FAILs, every one a loopback probe). Three further rules apply on a `replica`:
+
+- **Mutation probes are not run** (canonical immutability, admission gate, PUT-survival canary, insight allowlist, `PATCH /metadata`). They prove *server* invariants the brain's own run proves daily; from a replica they would also need a canonical key the box does not serve and the brain's loopback-only Qdrant. Each still emits its row, marked by design.
+- **Brain-only machinery reports "by design"**: the WSL timers, backups/restore drill, the weekly sweeps and the local mem0 journal.
+- **The One-Brain rows flip polarity**: the dream and dedup tasks *present* on a replica is the FAIL; absent is healthy. A new `memory authority (one-brain)` INVARIANTS row FAILs a replica whose authority is loopback — the same assertion verify makes at install, kept standing.
+
+On a `brain` nothing changes: the authority is loopback and every row runs as before.
+
 ### R9 Parity (health-check time)
 
 `Test-MemoryStack.ps1` check **R9** ("deployed hooks freshness") SHA256-compares the repo source against the deployed copy of every hot-path hook script and tracked config (plus a `.sha256` sidecar for the compiled hook client, which has no committed binary to hash). Because deployed scripts carry Sentinels, R9 first normalizes the repo text with the same receipt-driven substitution before hashing, so a legitimate substitution is not mistaken for drift. Any real mismatch or missing file is a **WARN** naming the offender and the redeploy command. R9 is the safety net that makes a drifted or partial deploy visible.
