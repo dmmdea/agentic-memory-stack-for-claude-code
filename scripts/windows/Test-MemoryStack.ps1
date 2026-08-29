@@ -12,6 +12,11 @@
 #   INVARIANTS — security gates hold, tier policy enforced, search filters correct
 #   RECOVERY   — backup + schedule freshness, restore drill within last 30 days
 #
+# v1.20.5: ROLE-AWARE. The receipt's Role decides what "healthy" means: a brain
+# probes loopback and owns every nightly job; a replica probes the AUTHORITY
+# (~/.mem0/authority-url) for the shared-store rows, never runs mutation probes,
+# and reports brain-only machinery as absent by design (see $TmsAuthorityUrl).
+#
 # Top-line summary:
 #   "Memory stack: HEALTHY (3/3 dimensions GREEN; N checks PASS)" if all 3 green
 #   "Memory stack: DEGRADED (LIVENESS GREEN, INVARIANTS WARN, RECOVERY GREEN; ...)" etc.
@@ -49,6 +54,30 @@ $TmsHomeUnc   = "$TmsDistroUnc\home\$TmsWslUser"
 # W3/F3: the box role gates the brain-only rows (dream cycle, drift guard) — a
 # replica never runs the dream, and a permanent FAIL there is alarm fatigue.
 $TmsRole = if ($TmsCfg -and $TmsCfg.Role) { [string]$TmsCfg.Role } else { '' }
+$TmsIsReplica = ($TmsRole -eq 'replica')
+# v1.20.5: the memory authority this box talks to. Resolved exactly as
+# install/3-verify.ps1 does — the live per-host file ~/.mem0/authority-url inside
+# WSL (what the MCP shim and replay-ops actually read), then the receipt's
+# AuthorityUrl, then loopback. Every mem0 probe below targets $TmsAuthorityUrl,
+# never a loopback literal: on a replica the local mem0/Qdrant are deliberately
+# dormant (offline read-replica, started only during an outage), so a loopback
+# probe there is a manufactured failure — 14 of them, permanently, on the first
+# replica this ran on. Loopback is still the right answer on the brain.
+#
+# Replica principle for the rows below: rows that READ the shared store run
+# against the authority as they always did; rows that MUTATE it (the canonical
+# probe, PUT-survival canary, insight write, PATCH /metadata) are the brain's
+# own health run to prove and are not exercised from a replica; rows that watch
+# brain-local machinery (dream/dedup tasks, WSL timers, backups, sweeps, the
+# local mem0 journal) report "by design" — the same convention L9 set.
+$TmsAuthorityUrl = 'http://127.0.0.1:18791'
+try {
+    $af = (wsl.exe -d $TmsDistro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null |
+        Where-Object { "$_".Trim() } | Select-Object -First 1)
+    if ("$af".Trim()) { $TmsAuthorityUrl = "$af".Trim().TrimEnd('/') }
+    elseif ($TmsCfg -and $TmsCfg.AuthorityUrl) { $TmsAuthorityUrl = ([string]$TmsCfg.AuthorityUrl).Trim().TrimEnd('/') }
+} catch {}
+$TmsAuthorityIsLoopback = $TmsAuthorityUrl -match '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)'
 
 # --------------------------------------------------------------------------
 # Check registry: each dimension accumulates into its own list
@@ -104,10 +133,11 @@ try { $key = (Get-Content $keyPath -Raw -ErrorAction Stop).Trim() } catch {}
 
 # L1: mem0 :18791 basic health
 try {
-    $h = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health' -TimeoutSec 3
-    if ($h.ok) { Add-Check 'LIVENESS' 'mem0 :18791' 'OK' "version=$($h.version)" }
-    else        { Add-Check 'LIVENESS' 'mem0 :18791' 'WARN' 'health.ok=false' }
-} catch { Add-Check 'LIVENESS' 'mem0 :18791' 'FAIL' $_.Exception.Message }
+    $h = Invoke-RestMethod -Uri "$TmsAuthorityUrl/health" -TimeoutSec 5
+    $authNote = if ($TmsAuthorityIsLoopback) { '' } else { " (authority $TmsAuthorityUrl)" }
+    if ($h.ok) { Add-Check 'LIVENESS' 'mem0 :18791' 'OK' "version=$($h.version) stack=$($h.stack)$authNote" }
+    else        { Add-Check 'LIVENESS' 'mem0 :18791' 'WARN' "health.ok=false$authNote" }
+} catch { Add-Check 'LIVENESS' 'mem0 :18791' 'FAIL' "$($_.Exception.Message) [$TmsAuthorityUrl]" }
 
 # L2: mem0 deep health (Qdrant + embedder probe)
 # W4: $hdTried records that L2 ALREADY attempted the call. Four downstream rows
@@ -122,7 +152,7 @@ try {
     # keyword probe, first call may load the bm25 model) and the mojibake
     # scroll — 6s flapped on cold starts; 30 matches L8/R10.
     $hdTried = $true
-    $hd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30
+    $hd = Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30
     if ($hd.ok) {
         Add-Check 'LIVENESS' 'mem0 /health/deep' 'OK' "qdrant_points=$($hd.checks.qdrant.points) embed_dim=$($hd.checks.embedder.dim)"
     } else {
@@ -139,6 +169,17 @@ try {
 } catch { Add-Check 'LIVENESS' 'mem0 /health/deep' 'FAIL' $_.Exception.Message }
 
 # L3: Qdrant :6333 direct (bind check in INVARIANTS; liveness only here)
+# Replica: the brain's Qdrant is loopback-bound (I1 FAILs anything else), so it
+# is unreachable from here by design; its state is read from the authority's
+# /health/deep (L2 already fetched it) instead of a probe that cannot succeed.
+if ($TmsIsReplica) {
+    if ($hd -and $hd.checks -and $hd.checks.qdrant) {
+        if ($hd.checks.qdrant.ok) { Add-Check 'LIVENESS' 'Qdrant :6333' 'OK'   "replica role: local Qdrant dormant by design; authority qdrant ok, points=$($hd.checks.qdrant.points) (via /health/deep)" }
+        else                      { Add-Check 'LIVENESS' 'Qdrant :6333' 'FAIL' "authority qdrant NOT ok: $($hd.checks.qdrant.error) (via /health/deep)" }
+    } else {
+        Add-Check 'LIVENESS' 'Qdrant :6333' 'WARN' 'replica role: local Qdrant dormant by design; authority /health/deep unavailable so its Qdrant state was not read (see the mem0 /health/deep row)'
+    }
+} else {
 try {
     $qh = Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3 -ErrorAction Stop
     Add-Check 'LIVENESS' 'Qdrant :6333' 'OK' 'healthz OK'
@@ -148,6 +189,7 @@ try {
         Invoke-RestMethod -Uri 'http://127.0.0.1:6333/collections' -TimeoutSec 3 | Out-Null
         Add-Check 'LIVENESS' 'Qdrant :6333' 'OK' 'collections endpoint reachable'
     } catch { Add-Check 'LIVENESS' 'Qdrant :6333' 'FAIL' $_.Exception.Message }
+}
 }
 
 # v1.12 F1 (file-wide pattern): PS 5.1 Invoke-RestMethod encodes a STRING -Body as
@@ -222,7 +264,7 @@ try {
 # L6: mem0 list pagination (> default cap of 20 returned when limit=100)
 if ($key) {
     try {
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories?user_id=$TmsWslUser&limit=100" -Headers @{'X-API-Key'=$key} -TimeoutSec 10
+        $r = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories?user_id=$TmsWslUser&limit=100" -Headers @{'X-API-Key'=$key} -TimeoutSec 10
         $n = @($r.results).Count
         if    ($n -gt 20) { Add-Check 'LIVENESS' 'mem0 list pagination' 'OK'   "limit=100 returned $n records" }
         elseif ($n -eq 20){ Add-Check 'LIVENESS' 'mem0 list pagination' 'WARN' "limit=100 returned exactly 20 — top_k bug may have regressed" }
@@ -253,7 +295,7 @@ try {
 # half-backfilled corpus is degraded, not dead — the server does not gate on
 # coverage).
 try {
-    $slHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $slHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30 }
     $sl = $slHd.checks.sparse_leg
     if (-not $sl) {
         Add-Check 'LIVENESS' 'bm25 sparse leg' 'FAIL' '/health/deep has no sparse_leg check — server predates W2 (redeploy mem0-server)'
@@ -356,7 +398,7 @@ try {
 # capabilities for this box's role FAIL; unknowns are WARN-class visibility
 # (they are W4's revive-or-bury worklist, not silent gaps).
 try {
-    $capHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $capHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30 }
     $cap = $capHd.checks.capabilities
     if (-not $capHd) {
         Add-Check 'LIVENESS' 'capability manifest' 'WARN' 'deep health unavailable (see the mem0 /health/deep row) - capability verdicts not read'
@@ -419,12 +461,31 @@ try {
 } catch { Add-Check 'INVARIANTS' 'auto-memory store budgets' 'WARN' $_.Exception.Message }
 
 # I1: Qdrant bind — must NOT be 0.0.0.0 (v0.17 F.2.2)
+# Replica: no listener is the designed state (dormant local store); a listener
+# that IS up (travel mode) is still held to the loopback rule.
 try {
     $listenLine = wsl.exe -d $TmsDistro -e bash -lc "ss -ltn 2>/dev/null | grep ':6333' | head -1"
     if      ($listenLine -match '127\.0\.0\.1:6333') { Add-Check 'INVARIANTS' 'Qdrant bind' 'OK'   '127.0.0.1:6333' }
     elseif  ($listenLine -match '0\.0\.0\.0:6333')   { Add-Check 'INVARIANTS' 'Qdrant bind' 'FAIL' '0.0.0.0:6333 — LAN-EXPOSED; fix qdrant.service to bind 127.0.0.1' }
+    elseif  ($TmsIsReplica -and -not "$listenLine".Trim()) { Add-Check 'INVARIANTS' 'Qdrant bind' 'OK' 'replica role: no local listener (dormant read-replica store) - by design' }
     else                                              { Add-Check 'INVARIANTS' 'Qdrant bind' 'WARN' "unexpected: $listenLine" }
 } catch { Add-Check 'INVARIANTS' 'Qdrant bind' 'FAIL' $_.Exception.Message }
+
+# I16 (v1.20.5): the authority this box's health run just exercised must be the
+# One-Brain-correct one: loopback on the brain (it IS the write authority), and
+# NEVER loopback on a replica — a replica pointed at itself passes every
+# reachability row above while its queued writes replay into a disposable local
+# store and are lost. Same assertion 3-verify makes at install; this is the
+# standing-health copy.
+if ($TmsIsReplica) {
+    if ($TmsAuthorityIsLoopback) { Add-Check 'INVARIANTS' 'memory authority (one-brain)' 'FAIL' "replica points at ITSELF ($TmsAuthorityUrl) - queued writes would replay into the disposable local store; re-run 2-windows-config.ps1 -Role replica -AuthorityUrl http://<brain-host>:18791" }
+    else                         { Add-Check 'INVARIANTS' 'memory authority (one-brain)' 'OK'   "replica -> $TmsAuthorityUrl (~/.mem0/authority-url)" }
+} elseif ($TmsRole -eq 'brain') {
+    if ($TmsAuthorityIsLoopback) { Add-Check 'INVARIANTS' 'memory authority (one-brain)' 'OK'   "brain -> $TmsAuthorityUrl (local write authority)" }
+    else                         { Add-Check 'INVARIANTS' 'memory authority (one-brain)' 'WARN' "brain role but authority is REMOTE ($TmsAuthorityUrl) - two boxes may both believe they are the brain; check ~/.mem0/authority-url and the receipt Role" }
+} else {
+    Add-Check 'INVARIANTS' 'memory authority (one-brain)' 'WARN' "role unknown (no Role in mem0-stack.config.psd1); authority probed: $TmsAuthorityUrl - re-run install/2-windows-config.ps1 to write the receipt"
+}
 
 # I2: llama-swap bind — must NOT be 0.0.0.0 (v0.17 F.2.2)
 # 2026-07-14: llama-swap is not always a WSL service. On some workstations it runs
@@ -469,8 +530,21 @@ try {
     }
 } catch { Add-Check 'INVARIANTS' 'llama-swap bind' 'WARN' $_.Exception.Message }
 
+# Replica: the four MUTATION probes below (I3+I10, I13, I4, I7) write to the shared
+# store. They prove SERVER invariants, which the brain's own run proves every day;
+# from a replica they would also depend on a canonical key this box does not
+# serve (I3) and on the brain's loopback-only Qdrant (I13). One row each, by design.
+if ($TmsIsReplica) {
+    $replicaMutNote = 'replica role: mutation probe not run from a replica (server invariant, proven by the brain''s own health run)'
+    Add-Check 'INVARIANTS' 'canonical immutability' 'OK' $replicaMutNote
+    Add-Check 'INVARIANTS' 'admission gate'         'OK' $replicaMutNote
+    Add-Check 'INVARIANTS' 'PUT payload survival'   'OK' $replicaMutNote
+    Add-Check 'INVARIANTS' 'insight allowlist'      'OK' $replicaMutNote
+    Add-Check 'INVARIANTS' 'PATCH /metadata'        'OK' $replicaMutNote
+}
+
 # I3: canonical immutability probe — POST evidence + assert PUT without HMAC = 403
-if ($key) {
+if ($key -and -not $TmsIsReplica) {
     try {
         $probeText = "invariant-probe-$(Get-Random)"
         $addBody = @{
@@ -479,7 +553,7 @@ if ($key) {
             infer     = $false
             metadata  = @{tier='evidence'; source='test-memorystack-invariant-probe'}
         } | ConvertTo-Json
-        $addResp = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($addBody)) `
+        $addResp = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories" -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($addBody)) `
             -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 10
         $probeMid = $addResp.results[0].id
 
@@ -521,20 +595,20 @@ if ($key) {
                 # Promote to canonical — if this throws, log WARN and bail
                 $promoteOk = $false
                 try {
-                    Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$probeMid/tier" -Method Patch `
+                    Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$probeMid/tier" -Method Patch `
                         -Body ([System.Text.Encoding]::UTF8.GetBytes($tierBody)) -ContentType 'application/json' `
                         -Headers @{'X-API-Key'=$key; 'X-User-Direct-Token'=$token; 'X-User-Direct-Ts'=$ts; 'X-User-Direct-Nonce'=$promoteNonce} -TimeoutSec 10 | Out-Null
                     $promoteOk = $true
                 } catch {
                     Add-Check 'INVARIANTS' 'canonical immutability' 'WARN' "probe promote failed: $($_.Exception.Message.Substring(0,[Math]::Min(80,$_.Exception.Message.Length)))"
                     Add-Check 'INVARIANTS' 'admission gate' 'WARN' 'probe promote failed - admission-gate probe skipped'
-                    try { Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$probeMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
+                    try { Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$probeMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
                 }
                 if ($promoteOk) {
                     # Assert ungated PUT is blocked (canonical immutability gate)
                     $putBody = @{text='tampered'} | ConvertTo-Json
                     try {
-                        $putResp = Invoke-WebRequest -Uri "http://127.0.0.1:18791/v1/memories/$probeMid" -Method Put `
+                        $putResp = Invoke-WebRequest -Uri "$TmsAuthorityUrl/v1/memories/$probeMid" -Method Put `
                             -Body ([System.Text.Encoding]::UTF8.GetBytes($putBody)) -ContentType 'application/json' `
                             -Headers @{'X-API-Key'=$key} -TimeoutSec 5 -ErrorAction Stop
                         Add-Check 'INVARIANTS' 'canonical immutability' 'FAIL' "ungated PUT returned $($putResp.StatusCode) (expected 403)"
@@ -551,14 +625,14 @@ if ($key) {
                     # other INVARIANTS row missed (I6 tests the separate F.1.2 filter).
                     try {
                         $admBody = @{query=$probeText; filters=@{user_id='test-inv-healthcheck'}; limit=10; threshold=0.1; rerank=$false} | ConvertTo-Json
-                        $admDefault = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
+                        $admDefault = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
                             -Body ([System.Text.Encoding]::UTF8.GetBytes($admBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
                         $defaultIds = @($admDefault.results | ForEach-Object { $_.id })
                         if ($defaultIds -contains $probeMid) {
                             Add-Check 'INVARIANTS' 'admission gate' 'FAIL' 'admission gate not filtering tier=canonical from default search'
                         } else {
                             $admCanonBody = @{query=$probeText; filters=@{user_id='test-inv-healthcheck'}; limit=10; threshold=0.1; rerank=$false; query_class='canonical'} | ConvertTo-Json
-                            $admCanon = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
+                            $admCanon = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
                                 -Body ([System.Text.Encoding]::UTF8.GetBytes($admCanonBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
                             $canonIds = @($admCanon.results | ForEach-Object { $_.id })
                             if ($canonIds -contains $probeMid) {
@@ -580,7 +654,7 @@ if ($key) {
                         $delMsg = "$delTs|$delNonce|delete|$probeMid|$delReason"
                         $delBytes = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($canonKey)).ComputeHash([System.Text.Encoding]::UTF8.GetBytes($delMsg))
                         $delToken = [Convert]::ToBase64String($delBytes)
-                        Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$probeMid`?actor=user-direct&reason=test+cleanup" `
+                        Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$probeMid`?actor=user-direct&reason=test+cleanup" `
                             -Method Delete -Headers @{'X-API-Key'=$key; 'X-User-Direct-Token'=$delToken; 'X-User-Direct-Ts'=$delTs; 'X-User-Direct-Nonce'=$delNonce} -TimeoutSec 5 | Out-Null
                     } catch {
                         # Swallow — cleanup failure is not a health signal worth surfacing
@@ -590,7 +664,7 @@ if ($key) {
                 Add-Check 'INVARIANTS' 'canonical immutability' 'WARN' 'canonical key unavailable (no runtime tmpfs key, no plaintext, DPAPI decrypt failed) — cannot run immutability probe'
                 Add-Check 'INVARIANTS' 'admission gate' 'WARN' 'canonical key unavailable - cannot run admission-gate probe'
                 # Cleanup the evidence record
-                try { Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$probeMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
+                try { Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$probeMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
             }
         } else {
             Add-Check 'INVARIANTS' 'canonical immutability' 'WARN' 'add returned no id — probe skipped'
@@ -607,7 +681,7 @@ if ($key) {
 # data/text_lemmatized were recomputed for the NEW text (review F13) ->
 # DELETE. Self-cleaning on every path, even assertion failure — the pre-fix
 # live pytest suite leaked 2 damaged records; this probe must never leak.
-if ($key) {
+if ($key -and -not $TmsIsReplica) {
     $psMid = $null
     try {
         $psText1 = "put-survival-probe-$(Get-Random) alpha"
@@ -618,13 +692,13 @@ if ($key) {
             infer     = $false
             metadata  = @{tier='evidence'; source='test-memorystack-put-survival'; brand='probe-brand'; project='probe-project'}
         } | ConvertTo-Json
-        $psAdd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
+        $psAdd = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories" -Method Post `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($psAddBody)) -ContentType 'application/json' `
             -Headers @{'X-API-Key'=$key} -TimeoutSec 10
         $psMid = $psAdd.results[0].id
         if ($psMid) {
             $psPutBody = @{text=$psText2} | ConvertTo-Json
-            Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$psMid" -Method Put `
+            Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$psMid" -Method Put `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($psPutBody)) -ContentType 'application/json' `
                 -Headers @{'X-API-Key'=$key} -TimeoutSec 15 | Out-Null
             # Read the raw Qdrant payload (the API's GET shape does not expose
@@ -656,7 +730,7 @@ if ($key) {
     } catch { Add-Check 'INVARIANTS' 'PUT payload survival' 'WARN' $_.Exception.Message }
     finally {
         if ($psMid) {
-            try { Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$psMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
+            try { Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$psMid" -Method Delete -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null } catch {}
         }
     }
 }
@@ -672,7 +746,7 @@ try {
     # sparse-leg canary + mojibake scroll, so on a slow/cold box this row timed out,
     # FAILed INVARIANTS and flipped the whole run's exit code to 1 while the server
     # was merely busy. 30 matches L2/L8/L10 and the endpoint's real worst case.
-    $ckHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $ckHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30 }
     $ck = $ckHd.checks.canonical_key
     if ($null -eq $ck) {
         Add-Check 'INVARIANTS' 'canonical key (server)' 'WARN' '/health/deep has no canonical_key check - pre-v0.20 server deployed? redeploy app.py + restart mem0'
@@ -686,7 +760,7 @@ try {
 } catch { Add-Check 'INVARIANTS' 'canonical key (server)' 'WARN' $_.Exception.Message }
 
 # I4: insight tier exact-allowlist — POST insight without consolidator source must be 403
-if ($key) {
+if ($key -and -not $TmsIsReplica) {
     try {
         $insBody = @{
             messages = "insight-probe-$(Get-Random)"
@@ -695,7 +769,7 @@ if ($key) {
             metadata = @{tier='insight'; source='not-a-consolidator'}
         } | ConvertTo-Json
         try {
-            $insResp = Invoke-WebRequest -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
+            $insResp = Invoke-WebRequest -Uri "$TmsAuthorityUrl/v1/memories" -Method Post `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($insBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 -ErrorAction Stop
             Add-Check 'INVARIANTS' 'insight allowlist' 'FAIL' "non-consolidator insight write returned $($insResp.StatusCode) (expected 403)"
         } catch {
@@ -710,7 +784,7 @@ if ($key) {
 if ($key) {
     try {
         $srBody = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$false} | ConvertTo-Json
-        $sr = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
+        $sr = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($srBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
         $count = if ($sr.results) { @($sr.results).Count } else { 0 }
         $retiredInResults = @($sr.results | Where-Object { ($_.metadata.retrievable) -eq $false }).Count
@@ -723,7 +797,7 @@ if ($key) {
 if ($key) {
     try {
         $srBody = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$false} | ConvertTo-Json
-        $sr = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
+        $sr = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($srBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 20
         $ciLeaked = @($sr.results | Where-Object { ($_.metadata).'_canonical_intent' -eq $true }).Count
         if ($ciLeaked -eq 0) { Add-Check 'INVARIANTS' '_canonical_intent exclusion' 'OK'   '0 _canonical_intent records in default search' }
@@ -732,22 +806,22 @@ if ($key) {
 }
 
 # I7: v0.13 PATCH /v1/memories/{id}/metadata round-trip
-if ($key) {
+if ($key -and -not $TmsIsReplica) {
     try {
-        $list = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories?user_id=$TmsWslUser&limit=1" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $list = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories?user_id=$TmsWslUser&limit=1" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
         if ($list.results -and $list.results.Count -gt 0) {
             $mid = $list.results[0].id
             # Only probe if it is not canonical (canonical requires HMAC for PATCH /metadata)
             $tier = $list.results[0].metadata.tier
             if ($tier -ne 'canonical') {
                 $body = @{metadata=@{test_probe=$true}; actor='test-memorystack'; reason='healthcheck probe'} | ConvertTo-Json
-                $r = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$mid/metadata" -Method Patch `
+                $r = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$mid/metadata" -Method Patch `
                     -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
                 if ($r.ok) { Add-Check 'INVARIANTS' 'PATCH /metadata' 'OK' "merged $($r.merged_keys -join ',')" }
                 else        { Add-Check 'INVARIANTS' 'PATCH /metadata' 'WARN' 'response missing ok=true' }
                 # Cleanup
                 $cleanBody = @{metadata=@{test_probe=$false}; actor='test-memorystack'; reason='cleanup'} | ConvertTo-Json
-                Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/memories/$mid/metadata" -Method Patch `
+                Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/$mid/metadata" -Method Patch `
                     -Body ([System.Text.Encoding]::UTF8.GetBytes($cleanBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 5 | Out-Null
             } else {
                 Add-Check 'INVARIANTS' 'PATCH /metadata' 'OK' 'skipped (first record is canonical; gate would need HMAC)'
@@ -760,7 +834,7 @@ if ($key) {
 if ($key) {
     try {
         $body = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$true} | ConvertTo-Json
-        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post `
+        $r = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 25
         $reranked = $r.reranked
         $count    = if ($r.results) { @($r.results).Count } else { 0 }
@@ -801,6 +875,9 @@ try {
 #   '99.9'   — legacy pre-v0.19 fixture value from the same test; journal entries
 #              from runs before the rename would otherwise WARN for up to 24h
 # Missing-version lines are logged INFO since v0.19 M10 and never match this grep.
+if ($TmsIsReplica) {
+    Add-Check 'INVARIANTS' 'hook-contract drift' 'OK' 'replica role: local mem0 journal is dormant by design; contract skew is observed on the brain'
+} else {
 try {
     $driftCount = wsl.exe -d $TmsDistro -e bash -c "journalctl --user -u mem0 --since '24 hours ago' --no-pager 2>/dev/null | grep 'MED-17:' | grep 'unknown hook_contract_version' | grep -vE -- '-test|99\.9' | wc -l"
     $driftN = ($driftCount -as [string]).Trim() -as [int]
@@ -812,6 +889,7 @@ try {
         Add-Check 'INVARIANTS' 'hook-contract drift' 'WARN' "$driftN MED-17 unknown-version WARN(s) in mem0 journal (24h) - hook/server contract skew; check journalctl --user -u mem0"
     }
 } catch { Add-Check 'INVARIANTS' 'hook-contract drift' 'WARN' $_.Exception.Message }
+}
 
 # I13 (v0.22 Phase E / R-offload, D7): the offload harness must provably never
 # receive the [MEMORY CONTEXT] block. The block is produced ONLY by the
@@ -929,7 +1007,7 @@ try {
     } elseif ($key) {
         $surfBody = @{ query='canonical ground-truth facts'; query_class='canonical'; threshold=0; limit=50; rerank=$false; filters=@{ tier='canonical'; user_id=$TmsWslUser; brand=$surfBrand } } | ConvertTo-Json
         try {
-            $surf = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories/search' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($surfBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 15
+            $surf = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($surfBody)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 15
             $surfCount = @($surf.results | Where-Object { $_.metadata.tier -eq 'canonical' }).Count
             if ($surfCount -gt 0) { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'OK' "hook uses search path; $surfCount canonical fact(s) surfaceable for $surfBrand" }
             else { Add-Check 'INVARIANTS' 'canonical surfacing (R-surface)' 'WARN' "search path wired but 0 canonical returned for $surfBrand (populate canonical or check brand/user_id)" }
@@ -946,6 +1024,11 @@ try {
 # ==========================================================================
 
 # R1: WSL systemd timers (decay-scan + stack-backup)
+# Replica: deploy.sh (which installs the units) is brain-only; the timers mutate
+# or snapshot the one shared store and belong on the brain. Absent by design.
+if ($TmsIsReplica) {
+    Add-Check 'RECOVERY' 'WSL systemd timers' 'OK' 'replica role: decay-scan/stack-backup run on the brain by design'
+} else {
 try {
     $timers  = wsl.exe -d $TmsDistro -e bash -c "systemctl --user list-timers --no-pager 2>/dev/null | grep -E 'decay-scan|stack-backup|l10-audit' || true"
     $decayOk  = $timers -match 'decay-scan'
@@ -954,17 +1037,26 @@ try {
     elseif  ($decayOk -or $backupOk)  { Add-Check 'RECOVERY' 'WSL systemd timers' 'WARN' "partial: decay=$decayOk backup=$backupOk" }
     else                               { Add-Check 'RECOVERY' 'WSL systemd timers' 'FAIL' 'neither decay-scan nor stack-backup timer found' }
 } catch { Add-Check 'RECOVERY' 'WSL systemd timers' 'FAIL' $_.Exception.Message }
+}
 
 # R2: Windows Task Scheduler 3am Dream
+# Role-aware like 3-verify: registered on the brain; on a replica it must be ABSENT
+# (One-Brain Rule - consolidation mutates the one shared store, no cross-machine lock),
+# so presence there is the FAIL and absence is the designed state.
 try {
     $task = Get-ScheduledTask -TaskName 'ClaudeCode-DreamConsolidator-3am' -ErrorAction Stop
     $taskArgs = $task.Actions[0].Arguments
-    if ($taskArgs -match 'dream-consolidate\.ps1') {
+    if ($TmsIsReplica) {
+        Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'FAIL' "registered on a REPLICA (state=$($task.State)) - violates the One-Brain Rule; re-run 2-windows-config.ps1 -Role replica (it unregisters the nightly mutation tasks)"
+    } elseif ($taskArgs -match 'dream-consolidate\.ps1') {
         Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'OK' "state=$($task.State); script=dream-consolidate.ps1"
     } else {
         Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'WARN' "state=$($task.State); script not dream-consolidate.ps1: $taskArgs"
     }
-} catch { Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'FAIL' 'not registered' }
+} catch {
+    if ($TmsIsReplica) { Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'OK'   'replica role: absent by design (one-brain rule)' }
+    else               { Add-Check 'RECOVERY' 'Task Scheduler 3am Dream' 'FAIL' 'not registered' }
+}
 
 # R2b (W6 PR-A, roast F3): the 4:30am semantic-dedup task's LIVE action must
 # execute the DEPLOYED copy. A destructive nightly job ran an unmanaged dev
@@ -974,14 +1066,19 @@ try {
 try {
     $dtask = Get-ScheduledTask -TaskName 'ClaudeCode-SemanticDedup-430am' -ErrorAction Stop
     $dArgs = $dtask.Actions[0].Arguments
-    if ($dArgs -match '/mnt/[a-z]/(Dev|repos)') {
+    if ($TmsIsReplica) {
+        Add-Check 'RECOVERY' 'dedup task launch path' 'FAIL' "registered on a REPLICA (state=$($dtask.State)) - violates the One-Brain Rule; re-run 2-windows-config.ps1 -Role replica (it unregisters the nightly mutation tasks)"
+    } elseif ($dArgs -match '/mnt/[a-z]/(Dev|repos)') {
         Add-Check 'RECOVERY' 'dedup task launch path' 'FAIL' "LIVE action executes a repo/worktree path, not the deployed copy: $dArgs — re-run 2-windows-config.ps1 (repointed W6)"
     } elseif ($dArgs -match 'apps/mem0-scripts/semantic-dedup\.py') {
         Add-Check 'RECOVERY' 'dedup task launch path' 'OK' 'LIVE action executes the deployed ~/apps/mem0-scripts copy'
     } else {
         Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' "unrecognized action shape: $dArgs"
     }
-} catch { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered (replica role, or install incomplete)' }
+} catch {
+    if ($TmsIsReplica) { Add-Check 'RECOVERY' 'dedup task launch path' 'OK'   'replica role: absent by design (one-brain rule)' }
+    else               { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered on a brain - install incomplete; re-run 2-windows-config.ps1' }
+}
 
 # R2c: the 5am auto-memory compactor. Registered on EVERY role (workspace stores are
 # machine-local, unlike the shared mem0 corpus), so its absence is a FAIL on any box.
@@ -1023,6 +1120,14 @@ try {
 } catch { Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'WARN' $_.Exception.Message }
 
 # R3: Latest backup manifest exists and is fresh (< 48h)
+# Replica: the nightly snapshot set is produced on the brain (stack-backup runs
+# there); a replica CONSUMES snapshots (restore-replica.ps1) and never writes them.
+# Any manifests found here are leftovers from a pre-replica life, not a signal.
+if ($TmsIsReplica) {
+    Add-Check 'RECOVERY' 'backup manifest'        'OK' 'replica role: snapshots are produced on the brain by design'
+    Add-Check 'RECOVERY' 'stack-backup unit state' 'OK' 'replica role: stack-backup.service is not installed here by design'
+    Add-Check 'RECOVERY' 'restore drill <30d'      'OK' 'replica role: the restore drill proves the brain''s restore path; run it there'
+} else {
 try {
     $backupDir = "$TmsHomeUnc\.mem0\backups"
     if (Test-Path $backupDir) {
@@ -1150,11 +1255,12 @@ try {
         Add-Check 'RECOVERY' 'restore drill <30d' 'WARN' 'no entry in ~/.mem0/restore-drill.jsonl - run: bash scripts/wsl/stack-restore.sh --snapshot <TS>'
     }
 } catch { Add-Check 'RECOVERY' 'restore drill <30d' 'WARN' $_.Exception.Message }
+}
 
 # R5: episodic.db health (v0.15)
 if ($key) {
     try {
-        $countResp = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/episodes/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $countResp = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/episodes/count" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
         $n        = if ($countResp.count) { [int]$countResp.count } else { 0 }
         $lastIso  = $countResp.last_ended_at
         if ($n -ge 1 -and $lastIso) {
@@ -1178,7 +1284,7 @@ if ($key) {
 # and is NEVER allowed to present a page as a total (see the >= below).
 if ($key) {
     try {
-        $c       = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/goals/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $c       = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/goals/count" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
         $total   = [int]$c.total
         $open    = [int]$c.by_status.open
         $blocked = [int]$c.by_status.blocked
@@ -1186,7 +1292,7 @@ if ($key) {
             Add-Check 'RECOVERY' 'goals :v0.16' 'OK' "$total total ($open open, $blocked blocked)"
         } else {
             try {
-                $epc = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/episodes/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+                $epc = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/episodes/count" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
                 $epCount = if ($epc.count) { [int]$epc.count } else { 0 }
                 if ($epCount -ge 3) { Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' "0 goals but $epCount episodes — Codex extraction may be failing (check l1a.log)" }
                 else                { Add-Check 'RECOVERY' 'goals :v0.16' 'WARN' 'no goals yet (normal post-ship; needs sessions)' }
@@ -1205,7 +1311,7 @@ if ($key) {
             # reads 1 no matter how many rows came back. Assigning first, then @(),
             # gives the real row count. (Verified live: inline form reported 1 with
             # $arr[0] itself being Object[]; two-step reported 200.)
-            $resp  = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/goals?limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $resp  = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/goals?limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
             $arr   = @($resp)
             $open  = @($arr | Where-Object { $_.status -eq 'open' }).Count
             if ($arr.Count -ge $lim) {
@@ -1217,9 +1323,23 @@ if ($key) {
     }
 }
 
+# Replica: the four weekly sweeps below (goals stale-sweep, contradiction sweep +
+# its live-judge stamp, episodic reconcile) are systemd-user timers installed by
+# the brain-only deploy; they mutate or audit the one shared store. The jsonl
+# logs a replica may still carry are frozen leftovers and would WARN ">14d ago -
+# timer may not be firing" forever. One row each, by design.
+if ($TmsIsReplica) {
+    $replicaSweepNote = 'replica role: weekly sweeps run on the brain by design (brain-only timers)'
+    Add-Check 'RECOVERY' 'goals stale-sweep'          'OK' $replicaSweepNote
+    Add-Check 'RECOVERY' 'contradiction sweep'        'OK' $replicaSweepNote
+    Add-Check 'RECOVERY' 'codex live-judge freshness' 'OK' $replicaSweepNote
+    Add-Check 'RECOVERY' 'episodic reconcile'         'OK' $replicaSweepNote
+}
+
 # R6b: goals stale-sweep freshness (v0.18 MED-13)
 # goals-stale-sweep.py logs every run to ~/.mem0/goals-stale-sweep.jsonl with
 # fields ts / found_count / auto_abandon. Weekly systemd-user timer Sun 04:00.
+if (-not $TmsIsReplica) {
 try {
     $sweepLog = "$TmsHomeUnc\.mem0\goals-stale-sweep.jsonl"
     if (Test-Path $sweepLog) {
@@ -1407,6 +1527,7 @@ try {
         else { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' 'no reconcile log and no timer - install systemd/episodic-reconcile.{service,timer}' }
     }
 } catch { Add-Check 'RECOVERY' 'episodic reconcile' 'WARN' $_.Exception.Message }
+} # end brain-only weekly sweeps (R6b..R6d)
 
 # Phase 5 anti-drift: consolidation retrieval-drift alarm surface.
 # dream-consolidate.ps1 appends typed JSONL records to ~/.mem0/consolidation-drift.jsonl:
@@ -1495,7 +1616,7 @@ try {
 # questions" for as long as it has been over 200; the real figure was 2389.
 if ($key) {
     try {
-        $c     = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/open_questions/count' -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+        $c     = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/open_questions/count" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
         $open  = [int]$c.by_status.open
         $total = [int]$c.total
         Add-Check 'RECOVERY' 'open_questions :v0.17' 'OK' "$open open frontier questions ($total lifetime)"
@@ -1505,7 +1626,7 @@ if ($key) {
             $lim  = 200
             # Two-step: see the note on the goals fallback — an inline @(IRM ...)
             # wraps the JSON array as one element and undercounts to 1.
-            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:18791/v1/open_questions?status=open&limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
+            $resp = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/open_questions?status=open&limit=$lim" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
             $arr  = @($resp)
             if ($arr.Count -ge $lim) {
                 Add-Check 'RECOVERY' 'open_questions :v0.17' 'WARN' ">=$($arr.Count) open - /v1/open_questions/count unavailable, LIST page saturated so the true total is UNKNOWN: $countErr"
@@ -1713,7 +1834,7 @@ try {
 # sample ids before assuming fresh corruption; the repair script's flag gate
 # (--include-flagged) is the sanctioned way to leave quotes intact.
 try {
-    $mjHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30 }
+    $mjHd = if ($hd -and $hd.checks) { $hd } elseif ($hdTried) { $null } else { Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30 }
     $mj = $mjHd.checks.mojibake
     if (-not $mj) {
         Add-Check 'RECOVERY' 'cp437 mojibake' 'WARN' '/health/deep has no mojibake check — server predates W2 (redeploy mem0-server)'
@@ -1771,6 +1892,8 @@ try {
 
 $lastL1a = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\l1a.log"
 if ($lastL1a) { Add-Info 'L1a last activity' 'OK' $lastL1a } else { Add-Info 'L1a last activity' 'WARN' 'no l1a.log yet' }
+
+Add-Info 'memory authority' 'OK' "role=$(if ($TmsRole) { $TmsRole } else { 'unknown' }) -> $TmsAuthorityUrl"
 
 $lastDream = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\dream.log"
 if ($lastDream) { Add-Info 'Dream last activity' 'OK' $lastDream } else { Add-Info 'Dream last activity' 'WARN' 'no dream.log yet (fires nightly 3am)' }

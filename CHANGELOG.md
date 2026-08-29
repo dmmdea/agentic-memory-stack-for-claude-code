@@ -4,6 +4,19 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.5 (2026-08-28) — health: a replica is checked against the brain it uses
+
+`Test-MemoryStack.ps1` probed loopback for every mem0/Qdrant row, so the first replica it ran
+on reported 14 permanent FAILs for services a replica deliberately keeps dormant. It now
+resolves the memory authority the way `3-verify.ps1` does (`~/.mem0/authority-url`, then the
+receipt, then loopback) and every shared-store row targets it; on a replica the mutation
+probes are skipped (server invariants the brain proves daily; they would also need a
+canonical key the replica does not serve), brain-only machinery reports "by design", the
+dream/dedup task rows flip polarity (present on a replica = FAIL), and a new `memory
+authority (one-brain)` row FAILs a replica pointed at itself. The brain path is unchanged.
+Regression guards pin the single loopback literal and the role gates. Proof: the Aorus
+replica went 14 FAIL → 0 FAIL (46 PASS, 2 genuine WARNs); the Qube brain run is unchanged.
+
 ## v1.20.4 (2026-08-28) — installer: the replica fix, fixed for replicas
 
 v1.20.3 defined the shared `$taskUserId` *inside* the brain-role branch. A replica skips that
