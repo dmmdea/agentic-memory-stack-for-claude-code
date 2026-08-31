@@ -194,20 +194,28 @@ fi
 
 echo "stack-backup: local files done (rc=$rc so far)"
 
-# ── 2. Qdrant snapshot (isolated — failure here does NOT affect above) ─────────
+# ── 2. Qdrant snapshot (isolated — a crash here does NOT abort the blocks above,
+# but every skip/failure path sets rc=1 like the local-file blocks do. The vector
+# collection is the most valuable artifact in the set; on a box without jq this
+# block used to parse an empty name, WARN, and exit 0 — so every backup silently
+# shipped without it while the nightly reported success.) ──────────────────────
+if ! command -v jq >/dev/null 2>&1; then
+  echo "WARN: jq not installed — cannot parse the Qdrant snapshot name; vector collection NOT backed up (sudo apt install -y jq)" >&2
+  rc=1
+else
 (
   set +e
   SNAP=$(curl -sf -X POST "http://127.0.0.1:6333/collections/$QDRANT_COLLECTION/snapshots" | jq -r '.result.name // empty')
   if [ -z "$SNAP" ]; then
-    echo "WARN: Qdrant snapshot request failed or returned empty name — skipping" >&2
-    exit 0
+    echo "WARN: Qdrant snapshot request failed or returned empty name — vector collection NOT backed up" >&2
+    exit 1
   fi
 
   # Validate snapshot name: no empty, no path separators, no dot-prefix (traversal guard)
   case "$SNAP" in
     ""|*/*|.*)
       echo "WARN: bad Qdrant snapshot name '$SNAP' — refusing to copy" >&2
-      exit 0
+      exit 1
       ;;
   esac
 
@@ -216,12 +224,14 @@ echo "stack-backup: local files done (rc=$rc so far)"
   if [ -f "$SNAP_SRC" ]; then
     cp "$SNAP_SRC" "$SNAP_DST.tmp" && mv "$SNAP_DST.tmp" "$SNAP_DST" \
       && echo "qdrant snapshot $SNAP -> $SNAP_DST" \
-      || { rm -f "$SNAP_DST.tmp"; echo "WARN: failed to copy Qdrant snapshot" >&2; }
-    test -s "$SNAP_DST" || echo "WARN: qdrant snapshot backup empty" >&2
+      || { rm -f "$SNAP_DST.tmp"; echo "WARN: failed to copy Qdrant snapshot" >&2; exit 1; }
+    test -s "$SNAP_DST" || { echo "WARN: qdrant snapshot backup empty" >&2; exit 1; }
   else
     echo "WARN: Qdrant snapshot file not found at $SNAP_SRC" >&2
+    exit 1
   fi
-) || true
+) || rc=1
+fi
 
 echo "stack-backup: Qdrant block done"
 

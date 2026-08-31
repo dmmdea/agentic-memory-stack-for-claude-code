@@ -1,5 +1,10 @@
+﻿#Requires -Version 7
 # 3-verify.ps1 - end-to-end smoke test of the agentic memory stack
 # Exits nonzero if anything is broken. Tells you what.
+# The installer's PowerShell contract: phases 2 and 3 run under pwsh 7 (checked by
+# 0-prereqs); this file is saved WITH a UTF-8 BOM so Windows PowerShell 5.1 — which
+# reads BOM-less files as ANSI and parse-dies on the em-dashes in comments — parses
+# it cleanly and the #Requires line above produces a clear error instead.
 
 param(
     [Parameter(Mandatory)][string]$WslUser,
@@ -33,6 +38,22 @@ try {
     if ("$af".Trim()) { $authorityUrl = "$af".Trim().TrimEnd('/') }
 } catch {}
 
+# 2026-08-31: bounded-retry HTTP probe for the liveness checks. A single 3s attempt
+# raced whatever wsl.exe activity preceded it and reported false MISSING while the
+# add->search round-trip against the same endpoint passed in the same run (the search
+# leg was hardened 2026-07-25; these probes were the same defect one section up).
+# Two attempts x 10s with a 2s gap absorbs the transient; a genuinely-down service
+# still fails in ~22s worst case.
+function Probe-Url {
+    param([string]$Uri, [int]$Attempts = 2, [int]$TimeoutSec = 10)
+    foreach ($i in 1..$Attempts) {
+        try { return Invoke-RestMethod -Uri $Uri -TimeoutSec $TimeoutSec } catch {
+            if ($i -lt $Attempts) { Start-Sleep -Seconds 2 }
+        }
+    }
+    return $null
+}
+
 function Check {
     param([string]$Name, [scriptblock]$Test, [string]$FixHint)
     Write-Host -NoNewline "  $Name ... "
@@ -54,9 +75,9 @@ Write-Host "WSL services reachable from Windows (mirrored networking):"
 # `travel-mode.ps1 off` stops AND disables it). Demanding it on a replica fails verify for doing
 # exactly what the design says. On a brain it is the live store and must be up.
 if ($stackRole -eq 'brain') {
-    Check "Qdrant :6333 (brain, live store)" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false } } "wsl: systemctl --user status qdrant.service"
+    Check "Qdrant :6333 (brain, live store)" { $null -ne (Probe-Url 'http://127.0.0.1:6333/healthz') } "wsl: systemctl --user status qdrant.service"
 } else {
-    $qdrantUp = try { (Invoke-RestMethod -Uri 'http://127.0.0.1:6333/healthz' -TimeoutSec 3) -ne $null } catch { $false }
+    $qdrantUp = $null -ne (Probe-Url 'http://127.0.0.1:6333/healthz' -Attempts 1 -TimeoutSec 5)
     $state = if ($qdrantUp) { 'up (travel/offline store active)' } else { 'down (online - torn down by design)' }
     Write-Host "  Qdrant :6333 (replica, disposable travel store) ... $state" -ForegroundColor DarkGray
 }
@@ -65,12 +86,12 @@ if ($stackRole -eq 'brain') {
 # health there is wrong by design and made verify unpassable on a replica box. The check that
 # matters on every box is the authority reachability one below.
 if ($stackRole -eq 'brain') {
-    Check "mem0 :18791 (brain, local authority)" { try { (Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health' -TimeoutSec 3).ok } catch { $false } } "wsl: systemctl --user status mem0.service"
+    Check "mem0 :18791 (brain, local authority)" { [bool](Probe-Url 'http://127.0.0.1:18791/health').ok } "wsl: systemctl --user status mem0.service"
 }
 # The address the MCP shim will actually use. A replica pointed at loopback (the pre-2026-07-20
 # failure) silently queued every write to the outbox instead of reaching the brain.
 Check "memory authority reachable ($stackRole -> $authorityUrl)" {
-    try { (Invoke-RestMethod -Uri "$authorityUrl/health" -TimeoutSec 5).ok } catch { $false }
+    [bool](Probe-Url "$authorityUrl/health").ok
 } "Set this box's authority: re-run 2-windows-config.ps1 -AuthorityUrl http://<brain-host>:18791 (writes ~/.mem0/authority-url). On the brain, loopback is correct - check: systemctl --user status mem0.service"
 Check "authority-url file present (per-host, survives reinstall)" {
     $v = $null
@@ -93,8 +114,12 @@ Check "EmbeddingGemma :11436" { try { $b = @{model='embeddinggemma'; input='titl
 Write-Host ""
 Write-Host "Windows-side files + config:"
 Check "Runtime scripts present" { @('memory-common.ps1','l1a-extract.ps1','dream-consolidate.ps1','stop-extract.ps1','mem0-mcp-shim.py','storage-cap-check.sh','sessionstart_bundle.py','precompact_capture.py','user-prompt-extract.ps1','user-prompt-lib.ps1','mem0-hook-daemon.ps1','mem0-hook-daemon-spawn.ps1','mem0-hook-client.cs','build-hook-client.ps1') | ForEach-Object { Test-Path "$env:USERPROFILE\.claude\scripts\$_" } | Where-Object { $_ -eq $false } | Measure-Object | ForEach-Object { $_.Count -eq 0 } } "Re-run 2-windows-config.ps1"
-Check "Stop hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; ($s.hooks.Stop[0].hooks[0].command -match 'stop-extract.ps1') } "Re-run 2-windows-config.ps1"
-Check "PreCompact hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; ($s.hooks.PreCompact[0].hooks[0].command -match 'stop-extract.ps1') } "Re-run 2-windows-config.ps1"
+# Scan ALL entries, not [0]: the idempotent installer preserves unrelated user hooks and
+# appends the stack's after them, and the host fires every registered entry regardless of
+# order — a [0]-only read false-MISSINGed the moment any other Stop hook existed. (Same
+# fix Test-MemoryStack's hook rows got in v1.0 Phase 7A; these two never did.)
+Check "Stop hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; [bool](@($s.hooks.Stop | ForEach-Object { $_.hooks } | ForEach-Object { $_.command }) -match 'stop-extract\.ps1') } "Re-run 2-windows-config.ps1"
+Check "PreCompact hook registered" { $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json; [bool](@($s.hooks.PreCompact | ForEach-Object { $_.hooks } | ForEach-Object { $_.command }) -match 'stop-extract\.ps1') } "Re-run 2-windows-config.ps1"
 # v0.20 Final (adversarial-review HIGH): the A.5/A.6 accelerated chain is the
 # production shape — verify the exe was built+installed, that UserPromptSubmit
 # points at it (exactly ONE stack-owned entry: the dedupe must not have left a

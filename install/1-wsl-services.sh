@@ -129,7 +129,7 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # leg (mem0 fail-softs to dense-only with one log warning). Floor-only, no
     # cap (house rule); the /health/deep sparse_leg canary — not a version pin
     # — is the defense against a future breaking fastembed release.
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -146,7 +146,7 @@ else
     # a live box actually takes on re-run. Adding it only to the fresh-install
     # line would never heal an existing venv (that is exactly how the leg died:
     # a venv rebuild dropped it and nothing re-installed it).
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=48.0.1,<49' fastembed || \
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=48.0.1,<49' fastembed 'fastmcp>=3' || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 
@@ -162,11 +162,19 @@ mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
-"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=48.0.1, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=48.0.1, an importable fastmcp, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
 import sys
 from importlib.metadata import version
 from packaging.version import Version as V
 ok = V(version("starlette")) >= V("1.3.1") and V(version("cryptography")) >= V("48.0.1")
+# The MCP shim runs on this venv's python; without fastmcp it dies on import and
+# the client only ever shows "Failed to connect". Same silent class as AMS-09:
+# a green installer over a shim that can never start.
+try:
+    from fastmcp import FastMCP  # noqa: F401
+except Exception as e:
+    print(f"  fastmcp not importable (MCP shim would never connect): {e}", file=sys.stderr)
+    ok = False
 # AMS-09: the BM25 leg must be LOADABLE, not merely pip-listed. Instantiating
 # the encoder also warms the model cache so the first /health/deep canary and
 # the deploy gate do not eat the cold-download latency. An offline re-run with
@@ -180,7 +188,7 @@ except Exception as e:
     ok = False
 sys.exit(0 if ok else 1)
 PYEOF
-echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=48.0.1,<49, fastembed BM25 encoder loadable)"
+echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=48.0.1,<49, fastmcp importable, fastembed BM25 encoder loadable)"
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the

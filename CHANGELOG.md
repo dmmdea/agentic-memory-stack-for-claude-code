@@ -4,6 +4,32 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.6 (2026-08-31) — installer: four fresh-install gaps, all silent
+
+Four bugs filed against a fresh install, each invisible on a long-lived box because the
+missing piece had been hand-installed or the failure exited 0:
+
+- **fastmcp was never declared.** The MCP shim runs on the server venv's python and imports
+  `fastmcp`, but neither `requirements.txt` nor either installer pip line carried it — a
+  fresh install produced an MCP that only ever said "Failed to connect". Now in the floors
+  file, both pip branches, and the installer's import-gating post-condition; a regression
+  guard pins all three.
+- **jq was required but not a prerequisite, and the backup swallowed its absence.** The
+  nightly backup parses the Qdrant snapshot name with `jq`; without it the parse was empty
+  and the block printed a WARN and exited 0 — the vector collection silently absent from
+  every backup while the run reported success. jq is now a phase-0 prerequisite check, and
+  every skip/failure path in the Qdrant block sets rc=1 like the local-file blocks always did.
+- **3s health probes raced.** `3-verify.ps1`'s Qdrant/mem0/authority liveness probes used a
+  single `-TimeoutSec 3` attempt and reported false MISSING right after wsl.exe activity
+  while the round-trip check passed in the same run (the search leg was hardened 2026-07-25;
+  these were the same defect one section up). Probes now retry once with a 10s timeout.
+- **PowerShell platform truth.** `3-verify.ps1` was BOM-less UTF-8 with em-dashes and no
+  `#Requires` while the docs promised "PowerShell 5.1+" — under 5.1 it parse-dies mid-file.
+  Decision: the installer standardizes on pwsh 7. Phases 2–3 now carry a UTF-8 BOM (so 5.1
+  parses them) plus `#Requires -Version 7` (so 5.1 refuses cleanly), phase 0 checks pwsh is
+  present, and README/skill docs state the real contract: pwsh 7 for the installer, the
+  built-in 5.1 for the deployed hooks.
+
 ## v1.20.5 (2026-08-28) — health: a replica is checked against the brain it uses
 
 `Test-MemoryStack.ps1` probed loopback for every mem0/Qdrant row, so the first replica it ran

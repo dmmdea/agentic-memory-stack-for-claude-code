@@ -287,6 +287,22 @@ Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10
         $script:instCode | Should -Match 'SparseTextEmbedding\(model_name="Qdrant/bm25"\)' -Because 'the post-condition must instantiate the encoder (pip-listed but unloadable = the same dead leg)'
     }
 
+    It 'the MCP shim dep (fastmcp) is installed by BOTH installer branches and import-gated' {
+        # Same silent class as AMS-09, different module: the shim runs on the server
+        # venv's python, fastmcp was never in its requirements, and a fresh install
+        # produced an MCP that only ever said "Failed to connect". Every server pip
+        # line must carry it, and the post-condition must IMPORT it.
+        $pipLines = @($script:instCode -split "`n" | Where-Object { $_ -match 'pip.? install' -and ($_ -match 'mem0ai' -or $_ -match 'starlette') })
+        $pipLines.Count | Should -BeGreaterOrEqual 2 -Because 'fresh and refresh pip lines must both exist (an empty lookup would make this pin vacuous)'
+        $bare = @($pipLines | Where-Object { $_ -notmatch 'fastmcp' })
+        $bare | Should -BeNullOrEmpty -Because "every server pip line must install fastmcp; missing from: $($bare -join ' || ')"
+        $script:instCode | Should -Match 'from fastmcp import FastMCP' -Because 'the post-condition must import the module the shim dies without'
+        # and the documented floor file must declare it too (requirements.txt is the
+        # floors document even though the installer does not pip install -r it)
+        $req = Get-Content (Join-Path $script:repoRoot 'mem0-server\requirements.txt') -Raw
+        $req | Should -Match '(?m)^fastmcp>=' -Because 'requirements.txt documents the floors; an undeclared runtime dep is how this shipped broken'
+    }
+
     It 'AMS-09: /health/deep sparse_leg check exists and GATES ok' {
         $script:appCode | Should -Match 'out\["checks"\]\["sparse_leg"\]' -Because 'the leg must report on /health/deep'
         # the gating flip must be the sparse_leg result, adjacent to its assignment
