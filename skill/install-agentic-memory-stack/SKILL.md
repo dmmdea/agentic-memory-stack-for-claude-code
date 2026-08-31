@@ -31,9 +31,9 @@ See `references/architecture.md` for the full data-flow + the v1.0 faithfulness 
 
 ## Prerequisites (phase 0 verifies all of these and halts with exact fixes)
 
-1. Windows 10+/11, PowerShell 5.1+ (the installer runs under 5.1 or 7).
+1. Windows 10+/11 with PowerShell 7 (`pwsh`) — install phases 2–3 are `#Requires -Version 7`; under Windows PowerShell 5.1 they refuse with a clear error. (The deployed runtime hooks still run under the built-in 5.1.)
 2. WSL2 with a Linux distro, **`mirrored` networking** (`[wsl2]\nnetworkingMode=mirrored` in `%USERPROFILE%\.wslconfig`) and **systemd enabled** (`[boot]\nsystemd=true` in `/etc/wsl.conf`).
-3. In WSL: Python 3.12+, Node 22+, curl, and **llama-swap** on `:11436` (single local inference stack; a llama.cpp build ≥ b6384 for the gemma-embedding arch). No Ollama.
+3. In WSL: Python 3.12+, Node 22+, curl, jq, and **llama-swap** on `:11436` (single local inference stack; a llama.cpp build ≥ b6384 for the gemma-embedding arch). No Ollama.
 4. **Claude Code** installed + authenticated (`npm i -g @anthropic-ai/claude-code`, then `claude /login`).
 5. **Codex CLI** authenticated against a ChatGPT subscription (`npm i -g @openai/codex`, then `codex login` → "Sign in with ChatGPT"). Codex is the subagent LLM for extraction + nightly consolidation — the installer refuses to proceed without it.
 6. `git` for Windows.

@@ -35,6 +35,9 @@ function Check {
 Write-Host "Checking Windows-side prerequisites..."
 
 Check "PowerShell 5.1+" { $PSVersionTable.PSVersion.Major -ge 5 } "Upgrade to Windows 10+/11 (built-in)"
+# Phases 2-windows-config.ps1 and 3-verify.ps1 are `#Requires -Version 7` — checking here
+# means the operator learns it at phase 0, not from a refusal two phases in.
+Check "PowerShell 7 (pwsh) for phases 2-3" { [bool](Get-Command pwsh -ErrorAction SilentlyContinue) } "Install PowerShell 7: winget install Microsoft.PowerShell"
 Check "WSL2 installed" { (wsl.exe --status 2>&1) -match 'WSL' } "Run: wsl --install (admin PowerShell)"
 Check "WSL distro resolved ($Distro)" { [bool]$Distro } "No WSL distro found. Install one (wsl --install -d Ubuntu) or pass -Distro <name> (see: wsl -l -q)"
 Check "WSL is running" { $null -ne (wsl.exe -d $Distro -e echo ok 2>&1 | Select-String 'ok') } "WSL distro not started: wsl -d $Distro"
@@ -58,6 +61,11 @@ Write-Host "Checking WSL-side prerequisites..."
 
 Check "Python 3.12+ in WSL" { (wsl.exe -d $Distro -e python3 --version 2>&1) -match 'Python 3\.(1[2-9]|[2-9])' } "wsl -d $Distro -e sudo apt install -y python3 python3-pip python3-venv"
 Check "curl in WSL" { wsl.exe -d $Distro -e which curl 2>&1 | Out-Null; $LASTEXITCODE -eq 0 } "wsl: sudo apt install -y curl"
+# jq parses the Qdrant snapshot name in scripts/wsl/stack-backup.sh. Without it the
+# nightly backup silently shipped no vector snapshot for weeks (the parse came back
+# empty, the block skipped, rc stayed 0) — the backup script now also fails loudly,
+# but the dependency belongs here where a fresh install learns about it.
+Check "jq in WSL" { wsl.exe -d $Distro -e which jq 2>&1 | Out-Null; $LASTEXITCODE -eq 0 } "wsl: sudo apt install -y jq"
 # v0.22: Ollama is decommissioned from mem0's path (the embedder is EmbeddingGemma on
 # llama-swap :11436). llama-swap (+ its llama.cpp build >= b6384 for gemma-embedding)
 # is the single local inference stack. We check llama-swap is reachable rather than

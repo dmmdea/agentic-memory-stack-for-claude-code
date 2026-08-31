@@ -52,9 +52,10 @@ Fresh machine: `git clone <this repo> $HOME\agentic-memory-stack`, then `cd` in 
 
 | Component | Why |
 |---|---|
-| Windows 10+/11, PowerShell 5.1+ | Host OS / install runtime |
+| Windows 10+/11 with PowerShell 7 (`pwsh`) | Install runtime — phases 2–3 are `#Requires -Version 7`; the built-in Windows PowerShell 5.1 still runs the deployed hooks |
 | WSL2 with a Linux distro, `mirrored` networking, systemd enabled | Storage backend (mem0/Qdrant) runs here |
 | Python 3.12+ in WSL | mem0 server |
+| `curl` + `jq` in WSL | Health probes and the nightly backup's Qdrant snapshot-name parse |
 | Node.js 22+ (WSL + Windows) | Codex / Claude CLIs |
 | [llama-swap](https://github.com/mostlygeek/llama-swap) on `:11436` in WSL (llama.cpp ≥ b6384) | Serves the EmbeddingGemma embedder + bge-reranker (CPU). No Ollama. |
 | [Claude Code](https://docs.claude.com/en/docs/claude-code) (Windows, npm) | The host you're augmenting |

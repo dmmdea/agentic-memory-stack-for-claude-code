@@ -1,4 +1,4 @@
-# 2-windows-config.ps1 - register Claude Code hooks, MCP servers, Task Scheduler.
+﻿# 2-windows-config.ps1 - register Claude Code hooks, MCP servers, Task Scheduler.
 # Idempotent: safe to re-run.
 # pwsh-only (v1.16 review finding): this file has never parsed under Windows PowerShell 5.1
 # (BOM-less UTF-8 + em-dashes in strings decode as ANSI and break quote tracking). NOTE:

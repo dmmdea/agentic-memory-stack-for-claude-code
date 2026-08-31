@@ -13,6 +13,11 @@ starlette>=1.3.1
 cryptography>=48.0.1,<49
 uvicorn>=0.27.0
 httpx>=0.27.0
+# MCP shim runtime (scripts/wsl/mem0-mcp-shim.py runs on THIS venv's python — the
+# MCP registration points at it). Absent, the shim dies on ModuleNotFoundError and
+# the client just shows "Failed to connect"; worked on long-lived boxes only because
+# it had been hand-installed. Floor = the as-tested major.
+fastmcp>=3
 pydantic>=2.6.0
 # qdrant-client floor raised 1.9 -> 1.13 (W2): sparse_health.py uses
 # HasVectorCondition (client >=1.13); an older client would surface as a
