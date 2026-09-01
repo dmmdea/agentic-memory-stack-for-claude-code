@@ -1573,6 +1573,14 @@ try {
         Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'role unknown (no Role in mem0-stack.config.psd1) - cannot judge guard liveness'
     } elseif (-not ($TmsCfg -and $TmsCfg.EvalRootWsl)) {
         Add-Check 'RECOVERY' 'drift guard liveness' 'WARN' 'no EvalRootWsl in the receipt - drift guard not configured on this box (expected on non-maintainer installs)'
+    } elseif (([string]$TmsCfg.EvalRootWsl) -notmatch '^/[^:\\]*$') {
+        # 2026-09-01: a MANGLED EvalRootWsl killed the guard for 4 nights while this row
+        # kept reading the (stale) state sidecar as "guard alive". Git Bash / MSYS path
+        # conversion rewrites a /mnt/... argument into 'C:/Program Files/Git/mnt/...'
+        # before pwsh ever sees it; the installer wrote it to the receipt, and the dream's
+        # snapshot became `python C:/Program Files/...` — bash split it at the space and
+        # every snapshot exited 2. The receipt's FORM is checkable every run; check it first.
+        Add-Check 'RECOVERY' 'drift guard liveness' 'FAIL' "EvalRootWsl in the receipt is not an absolute WSL path: '$($TmsCfg.EvalRootWsl)' - MSYS path conversion from a Git Bash invocation; re-run 2-windows-config.ps1 with the correct -EvalRootWsl under MSYS_NO_PATHCONV=1 (or from PowerShell)"
     } else {
         $rdState = "$TmsHomeUnc\.mem0\retrieval-drift-state.json"
         if (-not (Test-Path $rdState)) {

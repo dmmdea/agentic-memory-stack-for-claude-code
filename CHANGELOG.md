@@ -4,6 +4,23 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.9 (2026-09-01) — installer: a WSL path that isn't one is refused, not recorded
+
+The drift guard died silently for 4 nights: an operator ran the Windows config phase from
+Git Bash, whose MSYS path conversion rewrote `-EvalRootWsl /mnt/...` into
+`C:/Program Files/Git/mnt/...` before pwsh ever saw it. The installer recorded it unchecked;
+the dream's drift snapshot became `python C:/Program Files/...` (bash split at the space,
+exit 2 every night, "no false alarm" skip every night) while the liveness row kept reading
+the stale state sidecar as "guard alive" — only the capability manifest's age check
+eventually surfaced it. Two defenses, both keyed on the same form check:
+
+- `2-windows-config.ps1` refuses a resolved `EvalRootWsl` (explicit or inherited) that is
+  not an absolute POSIX path, with an error naming MSYS conversion and the
+  `MSYS_NO_PATHCONV=1` fix — a poisoned receipt can neither be written nor survive a re-run.
+- `Test-MemoryStack.ps1`'s drift-guard liveness row FAILs on a malformed receipt value
+  before consulting the state sidecar, so an already-poisoned box alarms on the next health
+  run instead of after four quiet nights.
+
 ## v1.20.8 (2026-09-01) — outbox: a stopped drain must resume, and never rewind a record
 
 Found live: during an embedder-contention window (llama-swap 429 → server 503) a session's
