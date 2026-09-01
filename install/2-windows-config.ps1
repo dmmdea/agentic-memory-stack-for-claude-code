@@ -149,6 +149,18 @@ if (-not $EvalRootWsl -and (Test-Path $receiptPath)) {
         }
     } catch {}
 }
+# --- EvalRootWsl: FORM validation (2026-09-01) ----------------------------------------------
+# This is a WSL path consumed inside `bash -c` by the dream's drift snapshot. Git Bash / MSYS
+# path conversion rewrites a /mnt/... argument into 'C:/Program Files/Git/mnt/...' BEFORE pwsh
+# ever sees it; this installer then wrote that to the receipt unchecked, the snapshot became
+# `python C:/Program Files/...` (bash split at the space), and the drift guard died silently
+# for 4 nights. Validate the RESOLVED value (explicit or inherited) so a poisoned receipt can
+# neither be written nor survive a re-run.
+if ($EvalRootWsl -and $EvalRootWsl -notmatch '^/[^:\\]*$') {
+    throw ("-EvalRootWsl '$EvalRootWsl' is not an absolute WSL path (expected /mnt/... style, no drive colon or backslash). " +
+           "If this command came from Git Bash / MSYS, its path conversion mangled the argument - " +
+           "re-run with MSYS_NO_PATHCONV=1, or from PowerShell.")
+}
 $eEvalWsl = $EvalRootWsl.Replace("'", "''")
 
 # --- authority resolution: INHERIT, never silently revert -----------------------------------

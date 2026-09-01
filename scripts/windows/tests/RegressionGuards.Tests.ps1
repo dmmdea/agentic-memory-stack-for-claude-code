@@ -468,6 +468,18 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         }
     }
 
+    It 'a mangled EvalRootWsl is refused at install and FAILs the drift-guard row' {
+        # 2026-09-01: Git Bash MSYS path conversion turned -EvalRootWsl /mnt/... into
+        # 'C:/Program Files/Git/mnt/...'; the installer wrote it unchecked and the dream's
+        # drift snapshot ran `python C:/Program Files/...` (bash split at the space) —
+        # the guard died silently for 4 nights while the liveness row read stale state
+        # as "alive". Both defenses must key on the same form check.
+        $instCode = script:Get-CodeLines (Join-Path $script:winDir '..\..\install\2-windows-config.ps1')
+        $instCode | Should -Match '\$EvalRootWsl -notmatch .\^/\[\^:' -Because 'the installer must refuse a non-POSIX EvalRootWsl (explicit or inherited) before writing the receipt'
+        $instCode | Should -Match 'MSYS_NO_PATHCONV' -Because 'the error must name the actual cause and its fix, not just reject the value'
+        $script:tmsCode | Should -Match "'drift guard liveness' 'FAIL' `"EvalRootWsl in the receipt is not an absolute WSL path" -Because 'an already-poisoned receipt must turn the liveness row red instead of reading stale state as alive'
+    }
+
     It 'the One-Brain rows flip polarity on a replica (presence FAILs, absence is by design)' {
         $script:tmsCode | Should -Match "'Task Scheduler 3am Dream' 'FAIL' `"registered on a REPLICA" -Because 'a dream task on a replica is the One-Brain violation, not a healthy install'
         $script:tmsCode | Should -Match "'dedup task launch path' 'FAIL' `"registered on a REPLICA"  -Because 'same for the dedup task'
