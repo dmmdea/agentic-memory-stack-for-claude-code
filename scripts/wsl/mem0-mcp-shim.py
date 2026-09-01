@@ -856,7 +856,17 @@ def _drain_outbox_async() -> None:
     MCP JSON-RPC channel and any stray byte on it breaks the protocol.
     """
     try:
-        if not OUTBOX.exists() or OUTBOX.stat().st_size == 0:
+        # 2026-09-01: also trigger on a stranded outbox.replaying.jsonl. A drain that
+        # stops on a retryable status (503 while the embedder is contended) keeps its
+        # unfinished ops in the .replaying file and outbox.jsonl is gone — this trigger
+        # then skipped the drain on every later session start, so one queued update sat
+        # stranded for 15 hours across many sessions while /health showed depth None.
+        # replay-ops.py itself has always resumed .replaying (test-pinned); only this
+        # trigger was blind to it.
+        _replaying = OUTBOX.with_suffix(".replaying.jsonl")
+        _pending = ((OUTBOX.exists() and OUTBOX.stat().st_size > 0)
+                    or (_replaying.exists() and _replaying.stat().st_size > 0))
+        if not _pending:
             return
         drainer = Path(__file__).resolve().parent / "replay-ops.py"
         if not drainer.exists():
@@ -881,7 +891,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.20.7"
+SHIM_STACK_VERSION = "1.20.8"
 
 
 def _write_start_receipt() -> None:

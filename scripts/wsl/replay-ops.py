@@ -88,6 +88,42 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]", ""}
 
 
+def update_superseded(args: dict, queued_ts: str) -> bool:
+    """True when the target record was updated AFTER this op was queued.
+
+    2026-09-01: replay is last-writer-wins with an OLD writer. A stranded update
+    (queued 04:32Z during an embedder-contention 503 window) targeted a record the
+    session then successfully re-updated directly at 05:24Z; replaying the queued
+    draft later would have silently regressed the record to the older text. Before
+    dispatching an update, read the record's updated_at from the authority and
+    skip ops the world has moved past (they go to mutation-conflicts.jsonl with
+    reason 'superseded-by-newer-write' — preserved, never dropped).
+
+    Fail-open on anything unverifiable (no queued_ts on legacy ops, GET failure,
+    unparseable timestamp): the op dispatches as before, and the existing
+    retryable/conflict handling owns any error. Fail-closed here would strand
+    every op behind a flaky GET, recreating the exact class this file exists for.
+    """
+    if not queued_ts:
+        return False
+    try:
+        import datetime as _dt
+        r = httpx.get(f"{AUTHORITY}/v1/memories/{args['memory_id']}",
+                      headers=_headers(), timeout=httpx.Timeout(10.0, connect=1.5))
+        if r.status_code != 200:
+            return False
+        updated_at = (r.json() or {}).get("updated_at")
+        if not updated_at:
+            return False
+        u = _dt.datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        q = _dt.datetime.fromisoformat(str(queued_ts).replace("Z", "+00:00"))
+        if u.tzinfo is None or q.tzinfo is None:
+            return False  # naive timestamp: incomparable across zones, dispatch as before
+        return u > q
+    except Exception:
+        return False
+
+
 def _is_local_url(url: str) -> bool:
     """True for loopback/unspecified/malformed. Mirrors offline-watcher.ps1's Test-IsLocalUrl —
     a malformed URL counts as local so it fails CLOSED (refuse to replay) rather than open."""
@@ -163,6 +199,13 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
         if k in done_keys:
             continue
         try:
+            if rec.get("op") == "update" and update_superseded(rec.get("args") or {}, rec.get("queued_ts") or ""):
+                with conflicts.open("a", encoding="utf-8") as cf:
+                    cf.write(json.dumps({"op": rec["op"], "args": rec.get("args"), "key": k,
+                                         "queued_ts": rec.get("queued_ts"),
+                                         "reason": "superseded-by-newer-write"}) + "\n")
+                stats["conflicts"] += 1
+                continue
             dispatch(rec["op"], rec.get("args") or {})
             with ledger.open("a", encoding="utf-8") as lf:
                 lf.write(json.dumps({"key": k, "op": rec["op"]}) + "\n")

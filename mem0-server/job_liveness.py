@@ -396,7 +396,13 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
     # W4: offline-outbox legs (replica-scoped row; on a brain box these stay
     # null/zero and F8 keeps the row out of dead_required regardless).
     try:
-        out["outbox_depth"] = count_lines(mem0_dir / "outbox.jsonl")
+        # 2026-09-01: depth counts BOTH queue files. A retryable-stopped drain keeps
+        # its unfinished ops in outbox.replaying.jsonl; counting only outbox.jsonl
+        # reported depth None while a queued update sat stranded for 15 hours —
+        # the offline-outbox capability row read "unknown" over a real backlog.
+        _ob = count_lines(mem0_dir / "outbox.jsonl")
+        _rp = count_lines(mem0_dir / "outbox.replaying.jsonl")
+        out["outbox_depth"] = None if (_ob is None and _rp is None) else (_ob or 0) + (_rp or 0)
     except OSError as e:
         notes.append(f"outbox: {e.__class__.__name__}")
     for field, name in (("outbox_replayed_age_h", "outbox.replayed.jsonl"),
