@@ -1095,6 +1095,20 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
                         "(only writable via PATCH /metadata by a trusted actor, or by the NLI gate)",
                         sorted(_stripped))
 
+    # Tier birth-default (2026-09-01): every record is BORN with a tier. The gate above
+    # validates tier when present but let an omitted one through — and this endpoint's own
+    # 403 text recommends "(or omit tier)". A tier-less record is a trap: fetch_current_tier
+    # fail-closes an absent tier to "canonical" (the H1-race shield), so the record is
+    # HMAC-locked against update/delete/patch from birth — an agent can create a memory it
+    # can never correct or remove (127 such points found live, including a malformed add
+    # whose metadata block leaked into the text). Default to 'evidence' — the documented
+    # advisory trust level — AFTER the gates (canonical/insight via omission stays
+    # impossible) and BEFORE hash-dedup, so the lookup sees the metadata that gets stored.
+    if b.metadata is None:
+        b.metadata = {"tier": "evidence"}
+    elif "tier" not in b.metadata:
+        b.metadata["tier"] = "evidence"
+
     # Hash idempotency (audit 2026-07-14): 63,350 of 67,787 points (93.5%) were exact-hash
     # duplicates. Cause: the L1a extractor re-extracts the WHOLE transcript on every
     # Stop/PreCompact hook, and this endpoint had no uniqueness check — so every Stop re-inserted
