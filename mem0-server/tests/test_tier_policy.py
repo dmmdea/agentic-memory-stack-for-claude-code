@@ -35,6 +35,32 @@ def _canonical_headers(mid: str, reason: str) -> dict:
     return {"X-User-Direct-Token": token, "X-User-Direct-Ts": ts,
             "X-User-Direct-Nonce": nonce}
 
+def test_add_without_tier_is_born_evidence():
+    """2026-09-01: a record added with NO tier (or no metadata at all) must be
+    stamped tier='evidence' at birth. Before this, fetch_current_tier fail-closed
+    the absent tier to 'canonical', so the record was HMAC-locked against
+    update/delete/patch from the moment it existed — an agent could create a
+    memory it could never correct or remove (127 live points, plus a malformed
+    add whose metadata leaked into the text). The delete at the end is part of
+    the assertion: a newborn default record must be deletable without HMAC."""
+    for meta in (None, {"source": "test-tier-policy"}):
+        body = {"messages": f"tierless add probe {uuid.uuid4()}",
+                "user_id": "test-tier", "infer": False}
+        if meta is not None:
+            body["metadata"] = meta
+        r = httpx.post(f"{URL}/v1/memories", json=body, headers=H, timeout=10)
+        r.raise_for_status()
+        mid = r.json()["results"][0]["id"]
+        g = httpx.get(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        g.raise_for_status()
+        got = g.json()
+        tier = (got.get("metadata") or {}).get("tier") or got.get("tier")
+        assert tier == "evidence", f"born tier={tier!r} for metadata={meta!r}: {got}"
+        d = httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        assert d.status_code == 200, (
+            f"newborn default-tier record not deletable without HMAC ({d.status_code}): {d.text}")
+
+
 def test_add_canonical_rejected():
     r = httpx.post(f"{URL}/v1/memories", json={
         "messages": f"canonical add attempt {uuid.uuid4()}", "user_id": "test-tier", "infer": False,

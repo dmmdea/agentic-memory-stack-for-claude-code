@@ -4,6 +4,18 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.7 (2026-09-01) — server: no record is born without a tier
+
+A record added without `metadata.tier` (a path the add endpoint's own 403 guidance
+recommended) was stored tier-less — and `fetch_current_tier` fail-closes an absent tier to
+`canonical` (the H1-race shield), so every mutation of that record demanded the user-direct
+HMAC. An agent could create a memory it could never correct or delete; 127 such points
+existed live, including a malformed add whose metadata parameter block leaked into the
+memory text. `POST /v1/memories` now defaults the tier to `evidence` at birth (after the
+canonical/insight gates, before hash-dedup), a live test pins born-tier + deletability, and
+`scripts/wsl/tier-backfill.py` stamps the existing stock — skipping and reporting any id the
+tier ledgers ever named with canonical/insight history rather than silently demoting it.
+
 ## v1.20.6 (2026-08-31) — installer: four fresh-install gaps, all silent
 
 Four bugs filed against a fresh install, each invisible on a long-lived box because the
