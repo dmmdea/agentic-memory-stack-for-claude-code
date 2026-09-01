@@ -70,6 +70,53 @@ def test_stranded_replaying_entries_retried_without_live_outbox(ro, tmp_path, mo
     assert calls == ["delete"]
     assert stats["replayed"] == 1
 
+def test_superseded_update_is_conflict_logged_not_dispatched(ro, tmp_path, monkeypatch):
+    """2026-09-01: replay is last-writer-wins with an OLD writer. A stranded update
+    whose target was re-updated directly AFTER queuing must go to
+    mutation-conflicts.jsonl (reason superseded-by-newer-write), never dispatch —
+    replaying it would silently regress the record to the older draft. A NOT-superseded
+    update (record older than the queued op) must still dispatch."""
+    ob = tmp_path / "outbox.jsonl"
+    entries = [
+        {"op": "update", "args": {"memory_id": "m-old", "text": "stale draft"},
+         "key": "k-stale", "queued_ts": "2026-09-01T04:32:22+00:00"},
+        {"op": "update", "args": {"memory_id": "m-fresh", "text": "newest text"},
+         "key": "k-fresh", "queued_ts": "2026-09-01T04:32:22+00:00"},
+    ]
+    ob.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+    dispatched = []
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {}
+    # the authority's view: m-old was updated AFTER queuing, m-fresh BEFORE
+    updated = {"m-old": "2026-09-01T05:24:35+00:00", "m-fresh": "2026-09-01T00:00:00+00:00"}
+    class G:
+        def __init__(self, mid): self._mid = mid
+        status_code = 200
+        def json(self): return {"updated_at": updated[self._mid]}
+    monkeypatch.setattr(ro.httpx, "get",
+                        lambda url, **kw: G(url.rsplit("/", 1)[1]))
+    monkeypatch.setattr(ro, "dispatch", lambda op, args: (dispatched.append(args["memory_id"]) or R()))
+    monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
+    stats = ro.replay(ob, "http://authority.invalid", "test-key")
+    assert dispatched == ["m-fresh"], "only the not-superseded update may dispatch"
+    assert stats["conflicts"] == 1 and stats["replayed"] == 1
+    conflicts = (tmp_path / "mutation-conflicts.jsonl").read_text(encoding="utf-8")
+    assert "superseded-by-newer-write" in conflicts and "m-old" in conflicts
+    assert not (tmp_path / "outbox.replaying.jsonl").exists(), "nothing kept for a retry loop"
+
+
+def test_superseded_guard_fails_open_without_queued_ts_or_on_get_failure(ro, tmp_path, monkeypatch):
+    """Legacy ops (no queued_ts) and GET hiccups must dispatch as before — a
+    fail-closed guard would strand every op behind a flaky GET, recreating the
+    stranded-outbox class this fix exists to kill."""
+    def boom(url, **kw): raise ro.httpx.ConnectError("down")
+    monkeypatch.setattr(ro.httpx, "get", boom)
+    assert ro.update_superseded({"memory_id": "m1"}, "2026-09-01T04:32:22+00:00") is False
+    assert ro.update_superseded({"memory_id": "m1"}, "") is False
+
+
 def test_old_format_record_goes_to_conflicts_not_retried_forever(ro, tmp_path, monkeypatch):
     # An old-format record (no 'op' — e.g. written by the retired outbox.py CLI) raises
     # KeyError on dispatch: deterministic, so it must conflict-log, never retry forever.

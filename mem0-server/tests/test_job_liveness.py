@@ -221,6 +221,11 @@ def test_collector_full_fixture_all_fields(tmp_path):
          "n_misscoped": 0, "misscoped": []}), encoding="utf-8")
     (mem0_dir / "outbox.jsonl").write_text('{"op":"add"}\n\n{"op":"add"}\n',
                                            encoding="utf-8")
+    # 2026-09-01: depth must count a retryable-stopped drain's leftover queue file
+    # too — counting only outbox.jsonl reported None while a stranded update sat
+    # in .replaying for 15 hours and the offline-outbox row read "unknown".
+    (mem0_dir / "outbox.replaying.jsonl").write_text('{"op":"update"}\n',
+                                                     encoding="utf-8")
     for name, age_h in (("outbox.replayed.jsonl", 5), ("outbox-drain.log", 4)):
         f = mem0_dir / name
         f.write_text("x\n", encoding="utf-8")
@@ -246,7 +251,7 @@ def test_collector_full_fixture_all_fields(tmp_path):
     assert out["mcp_shim_stack_version"] == "1.18.0"
     assert out["brand_scope_misscoped"] == 0
     assert out["brand_scope_age_h"] is not None
-    assert out["outbox_depth"] == 2               # blank lines are not entries
+    assert out["outbox_depth"] == 3               # outbox (2, blanks excluded) + stranded .replaying (1)
     assert out["outbox_replayed_age_h"] == 5.0
     assert out["outbox_drain_log_age_h"] == 4.0
     assert set(out) == JL_KEYS  # everything present -> no error key

@@ -197,6 +197,30 @@ def _load_shim(tmp_path, monkeypatch, env_url, file_url):
     return mod
 
 
+def test_drain_triggers_on_stranded_replaying_file(shim, monkeypatch, tmp_path):
+    """2026-09-01: a drain that stops on a retryable 503 keeps its unfinished ops in
+    outbox.replaying.jsonl and deletes/empties outbox.jsonl. The startup trigger
+    checked only outbox.jsonl, so the stranded ops never got a resume — one queued
+    update sat 15 hours across many session starts. The trigger must fire for a
+    non-empty .replaying file, and still stay quiet when neither file has content."""
+    spawned = []
+    monkeypatch.setattr(shim.subprocess, "Popen",
+                        lambda *a, **kw: spawned.append(a) or None)
+    ob = tmp_path / "outbox.jsonl"
+    monkeypatch.setattr(shim, "OUTBOX", ob)
+    # neither file → no drain
+    shim._drain_outbox_async()
+    assert spawned == []
+    # only a stranded .replaying file → drain fires
+    ob.with_suffix(".replaying.jsonl").write_text('{"op":"update"}\n', encoding="utf-8")
+    shim._drain_outbox_async()
+    assert len(spawned) == 1, "a stranded outbox.replaying.jsonl must trigger the startup drain"
+    # classic outbox.jsonl path still fires
+    ob.write_text('{"op":"add"}\n', encoding="utf-8")
+    shim._drain_outbox_async()
+    assert len(spawned) == 2
+
+
 def test_authority_file_is_used_when_env_is_absent(tmp_path, monkeypatch):
     """The core fix: with no MEM0_URL in the environment — exactly how the shim is launched —
     the authority still resolves to the brain instead of loopback."""

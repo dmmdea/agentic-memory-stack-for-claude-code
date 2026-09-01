@@ -4,6 +4,25 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.8 (2026-09-01) — outbox: a stopped drain must resume, and never rewind a record
+
+Found live: during an embedder-contention window (llama-swap 429 → server 503) a session's
+writes queued to the outbox; the drain stopped on the retryable 503 — correctly keeping the
+op — but kept it in `outbox.replaying.jsonl`, which the shim's session-start drain trigger
+never looked at. The op sat stranded 15 hours across many session starts while
+`outbox_depth` read None. Worse, the op was an update whose target the session had already
+re-updated directly: a blind replay would have regressed the record to the older draft.
+
+- shim `_drain_outbox_async`: triggers on a non-empty `outbox.replaying.jsonl` too
+  (`replay-ops.py` has always resumed it; only the trigger was blind).
+- `replay-ops.py`: superseded-update guard — before dispatching an update, compare the
+  record's `updated_at` to the op's `queued_ts`; ops the world moved past go to
+  `mutation-conflicts.jsonl` with reason `superseded-by-newer-write` (preserved, never
+  dispatched, never dropped). Fail-open for legacy ops without `queued_ts` and on GET
+  failures — fail-closed would recreate the stranded class.
+- `job_liveness`: `outbox_depth` counts both queue files, so a stranded backlog is visible
+  to the offline-outbox capability row instead of reading "unknown".
+
 ## v1.20.7 (2026-09-01) — server: no record is born without a tier
 
 A record added without `metadata.tier` (a path the add endpoint's own 403 guidance
