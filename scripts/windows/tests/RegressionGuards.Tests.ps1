@@ -468,6 +468,15 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         }
     }
 
+    It 'the SessionStart banner hook is registered with a startup|clear|compact matcher' {
+        # 2026-09-02 context audit: without a matcher the 1.3 KB orientation banner re-fired
+        # on every resume (308 resume fires vs 225 startups over 76 transcripts). The installer
+        # OWNS this entry (it rewrites it on every run), so the matcher must live here or a
+        # hand edit to settings.json is silently undone by the next install.
+        $instCode = script:Get-CodeLines (Join-Path $script:winDir '..\..\install\2-windows-config.ps1')
+        $instCode.Contains("command = `$bashCapCheck; matcher = 'startup|clear|compact'") | Should -BeTrue -Because 'the banner entry must carry the matcher (resume excluded) at its source of truth'
+    }
+
     It 'a mangled EvalRootWsl is refused at install and FAILs the drift-guard row' {
         # 2026-09-01: Git Bash MSYS path conversion turned -EvalRootWsl /mnt/... into
         # 'C:/Program Files/Git/mnt/...'; the installer wrote it unchecked and the dream's

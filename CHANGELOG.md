@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.10 (2026-09-02) — SessionStart banner fires on open, not on every resume
+
+A context audit over 76 transcripts found the `[agentic-memory-stack]` / `[heartbeat]` /
+`[storage-cap]` orientation banner re-emitted on every session *resume* (308 resume fires vs
+225 startups, ~1.3 KB each) — the single largest routine SessionStart repetition, because the
+installer registered the hook with no matcher. It now registers `startup|clear|compact`:
+a fresh or cleared session gets its orientation, a compaction re-reads it into the rebuilt
+context, a resume already has it. Pinned by a regression guard so a hand edit to
+settings.json is never the only copy.
+
 ## v1.20.9 (2026-09-01) — installer: a WSL path that isn't one is refused, not recorded
 
 The drift guard died silently for 4 nights: an operator ran the Windows config phase from
