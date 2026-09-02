@@ -477,6 +477,15 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         $instCode.Contains("command = `$bashCapCheck; matcher = 'startup|clear|compact'") | Should -BeTrue -Because 'the banner entry must carry the matcher (resume excluded) at its source of truth'
     }
 
+    It 'HK-5 re-injects unchanged goals/questions every 25th prompt, not every 12th' {
+        # 2026-09-02 context audit: [MEMORY CONTEXT] is the second-largest injected class; the
+        # goals/questions half is blanked when unchanged and re-injected on a fixed cadence as a
+        # post-compaction guard. 25 keeps the guard and trims the routine repeat.
+        $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
+        $daemon.Contains('$st.n -lt 25') | Should -BeTrue -Because 'the re-inject cadence is pinned at 25'
+        $daemon.Contains('$st.n -lt 12') | Should -BeFalse -Because 'the old 12 cadence must not linger beside the new one'
+    }
+
     It 'a mangled EvalRootWsl is refused at install and FAILs the drift-guard row' {
         # 2026-09-01: Git Bash MSYS path conversion turned -EvalRootWsl /mnt/... into
         # 'C:/Program Files/Git/mnt/...'; the installer wrote it unchecked and the dream's

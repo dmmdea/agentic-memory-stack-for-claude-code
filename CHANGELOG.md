@@ -14,6 +14,10 @@ a fresh or cleared session gets its orientation, a compaction re-reads it into t
 context, a resume already has it. Pinned by a regression guard so a hand edit to
 settings.json is never the only copy.
 
+Same audit, second-largest class: the resident daemon's HK-5 dedupe re-injected unchanged open
+goals/questions every 12th prompt; the cadence is now every 25th (the re-inject exists only
+as a post-compaction guard, which 25 still serves). Pinned by a regression guard.
+
 ## v1.20.9 (2026-09-01) — installer: a WSL path that isn't one is refused, not recorded
 
 The drift guard died silently for 4 nights: an operator ran the Windows config phase from
