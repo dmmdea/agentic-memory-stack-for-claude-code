@@ -352,3 +352,29 @@ Describe 'convergence floor (2026-09-03): the index leaves every run under the s
         Test-Path (Join-Path $sb.Home '.claude\state\mem0-posts.txt') | Should -BeFalse -Because 'nothing may be POSTed for it'
     }
 }
+
+Describe 'hygiene runs on every store (2026-09-03): a small store is not exempt from correctness' {
+    BeforeAll { . (Join-Path $PSScriptRoot 'MemoryCompact.Fixture.ps1') }
+
+    It 're-indexes an orphan in a below-trigger store without calling the judge, and receipts it' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $facts = @{ 'a.md' = (New-FactFile 'a' 'd'); 'orphan.md' = (New-FactFile 'orphan' 'never indexed') }
+        $dir = Add-SandboxStore -Sandbox $sb -Workspace 'small' -IndexLines @('# Memory Index', '', ('- [A](a.md) ' + $script:EmDash + ' hook')) -Facts $facts
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts.Count | Should -Be 1 -Because 'one receipt for the store that changed'
+        $r.Receipts[0].status | Should -Be 'applied'
+        $r.Receipts[0].reindexed | Should -Be 1
+        (Get-Content (Join-Path $dir 'MEMORY.md') -Raw) | Should -Match '\(orphan\.md\)' -Because 'the orphan must be reachable from the index again'
+        Test-Path (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') | Should -BeFalse -Because 'below the trigger there is nothing for the judge'
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'writes no receipt and no log line for a clean below-trigger store (nightly common case)' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'clean' -IndexLines @('# Memory Index', '', ('- [A](a.md) ' + $script:EmDash + ' hook')) -Facts @{ 'a.md' = (New-FactFile 'a' 'd') } | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.Receipts.Count | Should -Be 0
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Not -Match 'clean: no-op'
+        Test-Path (Join-Path $sb.Home '.claude\state\throttle-marked') | Should -BeTrue -Because 'a clean pass is a real decision; the throttle is marked'
+    }
+}

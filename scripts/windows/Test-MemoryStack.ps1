@@ -1113,7 +1113,16 @@ try {
         # leaving a store at 25,219 B, over the sync limit, for days. The verdict is the STATE: a
         # store at/over the sync limit right now, or whose latest receipt is unconverged, is a
         # FAIL regardless of how fresh the receipt is.
-        $overLimit = @($ls.stores | Where-Object { [int]$_.bytes -ge 25000 })
+        # Measure LIVE, never the SessionStart lint snapshot: after a remediation the summary kept
+        # saying 28.5 KB for hours while the store was already at 23 KB, and this row stayed red.
+        $overLimit = @()
+        if (Get-Command Get-AmStores -ErrorAction SilentlyContinue) {
+            foreach ($amS2 in @(Get-AmStores) | Where-Object { -not $_.IsAlias }) {
+                try { $st2 = Get-AmStoreStats -Store $amS2; if ($st2.Bytes -ge $script:AmSyncLimitBytes) { $overLimit += [pscustomobject]@{ workspace = $amS2.Workspace; bytes = $st2.Bytes } } } catch {}
+            }
+        } else {
+            $overLimit = @($ls.stores | Where-Object { [int]$_.bytes -ge 25000 })
+        }
         $unconv = @()
         if (Test-Path -LiteralPath $receipts) {
             $latest = @{}

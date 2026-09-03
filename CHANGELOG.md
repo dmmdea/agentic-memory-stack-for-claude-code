@@ -4,6 +4,15 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.12 (2026-09-03) — hygiene on every store; the liveness row measures live
+
+- Deterministic hygiene (orphan re-index, dangling/duplicate-slug removal) now runs nightly on
+  EVERY populated store; only stores over the size trigger go on to the judge, migrations and the
+  floor. A small store had carried 7 orphaned facts for days while the lint reported them every
+  session and nothing ever fixed them. Clean below-trigger stores write no receipt.
+- `Test-MemoryStack`'s maintenance-liveness row measures the live stores instead of the
+  SessionStart lint snapshot, which kept a stale size for hours after a remediation.
+
 ## v1.20.11 (2026-09-03) — auto-memory: converge under the sync limit, or say so
 
 Live failure: the AI-Ecosystem index reached 27.4 KB with 126 of 180 lines over the cap and the
