@@ -4,6 +4,21 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.14 (2026-09-03) — Linux replica role
+
+- New `install/linux-replica.sh`: a native-Linux box becomes a replica — thin client plus a
+  dormant local Qdrant + mem0 (user units installed, disabled) and a 2-minute
+  `offline-watcher.timer`. Server module list, Qdrant version and pip line are read from
+  `install/1-wsl-services.sh` at run time (one owner). Ends with a first restore as the proof.
+- New `scripts/travel/restore-replica.sh`: pulls the Brain's newest complete snapshot set over
+  SSH (through `wsl.exe` for a Windows+WSL Brain), size-verified and cached, restores it via
+  the Qdrant snapshot upload API, replaces the ledgers, requires `/health/deep` through the
+  local embedder, stamps `~/.mem0/replica-restored`. Carries the One-Brain guard (role must be
+  `replica`, authority must be remote).
+- New `scripts/travel/offline-watcher.py`: the PowerShell watcher's state machine and
+  transitions on Linux, plus one fix — the replica is refreshed while ONLINE (last restore
+  >24 h), not at `go_offline` when the Brain is unreachable by definition.
+
 ## v1.20.13 (2026-09-03) — Linux thin client
 
 - New `install/linux-client.sh`: a native-Linux box with no WSL and no local store can now use a

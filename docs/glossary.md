@@ -8,7 +8,7 @@ The **brain box**: the single machine that hosts the memory authority (Qdrant + 
 
 ## Replica
 
-A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. Installed with `-Role replica`, it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. Installed with `-Role replica` (Windows + WSL) or `install/linux-replica.sh` (native Linux), it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Client
 

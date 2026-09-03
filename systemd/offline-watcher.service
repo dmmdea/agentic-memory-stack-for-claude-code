@@ -1,0 +1,11 @@
+[Unit]
+Description=agentic-memory-stack offline watcher tick (Linux replica: probe the Brain, fail over / recover)
+After=default.target
+
+[Service]
+Type=oneshot
+# The watcher runs on the thin-client venv (stdlib-only script; the venv python is what the
+# sibling replay-ops.py needs for httpx). Both scripts are deployed beside the MCP shim.
+ExecStart=%h/apps/mem0-client/.venv/bin/python %h/.claude/scripts/offline-watcher.py
+# A tick that refreshes the replica pulls ~100 MB and restores it; never let two overlap.
+TimeoutStartSec=3900

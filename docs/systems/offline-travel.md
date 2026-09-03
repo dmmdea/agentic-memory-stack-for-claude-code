@@ -20,8 +20,8 @@ The older `travel-mode.ps1 on`/`off` switch that an operator flipped by hand is 
 
 - The MCP shim's per-call **authority → replica** read failover and its **write-to-Outbox** queueing ([`../../scripts/wsl/mem0-mcp-shim.py`](../../scripts/wsl/mem0-mcp-shim.py)).
 - The Outbox file, its entry shape, and the ancillary replay/ledger/conflict files.
-- The `mem0-offline-watcher` background task and its offline/online transitions ([`../../scripts/travel/offline-watcher.ps1`](../../scripts/travel/offline-watcher.ps1), [`../../scripts/travel/install-offline-watcher.ps1`](../../scripts/travel/install-offline-watcher.ps1)).
-- Replica restore from a snapshot set ([`../../scripts/travel/restore-replica.ps1`](../../scripts/travel/restore-replica.ps1)).
+- The `mem0-offline-watcher` background task and its offline/online transitions ([`../../scripts/travel/offline-watcher.ps1`](../../scripts/travel/offline-watcher.ps1), [`../../scripts/travel/install-offline-watcher.ps1`](../../scripts/travel/install-offline-watcher.ps1)) and its native-Linux port ([`../../scripts/travel/offline-watcher.py`](../../scripts/travel/offline-watcher.py), a systemd user timer).
+- Replica restore from a snapshot set ([`../../scripts/travel/restore-replica.ps1`](../../scripts/travel/restore-replica.ps1); on Linux [`../../scripts/travel/restore-replica.sh`](../../scripts/travel/restore-replica.sh), which also fetches the set from the Brain over SSH).
 - The reconnect replay driver — adds-first, idempotent ([`../../scripts/wsl/replay-ops.py`](../../scripts/wsl/replay-ops.py)).
 - The `scripts/travel/*` set, including the legacy `travel-mode.ps1` switch.
 
@@ -71,6 +71,12 @@ The shim can only fail reads over to a *running* local replica. Keeping that rep
    - **`go_online`** — run the replay driver to drain the Outbox to the authority, then stop the local `qdrant`/`mem0` services, remove the vestigial `~/.mem0/travel.json` flag, and point `MEM0_URL` back at the authority.
 
 The watcher resolves the authority carefully: an explicit `-Authority` wins; otherwise `MEM0_URL`, but **only if it is not a local/loopback/unspecified/malformed host** (a `Test-IsLocalUrl` guard). This matters because `travel-mode.ps1 on` sets a user-scope `MEM0_URL` pointing at the *replica* — without the guard, a fresh watcher tick would inherit the replica as its "authority", probe it as healthy, and replay the Outbox *into the disposable local store*, which would be a One-Brain violation.
+
+### The Linux replica: same machine, one deliberate difference
+
+On a native-Linux replica ([`installer-and-deploy.md`](installer-and-deploy.md), `install/linux-replica.sh`) the same two layers run: the shim fails over per call, and `offline-watcher.py` ticks every 2 minutes from a systemd user timer with the identical hysteresis (3 down → `go_offline`, 2 up → `go_online`), the identical authority resolution (explicit → `MEM0_URL` unless local → `~/.mem0/authority-url` unless local → refuse), and the identical transitions: `go_offline` starts the dormant `qdrant.service` + `mem0.service`; `go_online` drains the Outbox through the sibling `replay-ops.py` (logged to `~/.mem0/outbox-drain.log`) and stops them. There is no `MEM0_URL` juggling because the Linux shim reads the authority from the file and fails over by itself.
+
+The one difference: **the replica is refreshed while online.** The PowerShell watcher tries to restore a fresh snapshot at `go_offline`, which is the one moment the Brain cannot be reached — so a stale replica stayed stale. The Linux watcher instead runs `restore-replica.sh` on a steady online tick whenever the last restore (`~/.mem0/replica-restored`) is older than 24 h: it pulls the newest set from the Brain over SSH, restores it into the dormant store (started for the duration), proves `/health/deep`, and stops the services again. The copy the box carries into an outage is therefore at most a day old, and `go_offline` only has to start what is already restored.
 
 ### The legacy switch
 
