@@ -144,11 +144,7 @@ def test_restore_stops_services_on_every_failure_path():
     sh = RESTORE.read_text(encoding="utf-8")
     assert 'trap \'[ "$LEAVE_RUNNING" = 1 ] && [ "$RESTORED" = 1 ] || systemctl --user stop mem0.service qdrant.service' in sh
     assert sh.index("trap '") < sh.index("systemctl --user start qdrant.service"), "the trap must be armed before any service starts"
-    assert "
-RESTORED=1
-" in sh and sh.index("log_line ok") < sh.index("
-RESTORED=1
-")
+    assert "\nRESTORED=1\n" in sh and sh.index("log_line ok") < sh.index("\nRESTORED=1\n")
 
 
 @pytestmark_bash
