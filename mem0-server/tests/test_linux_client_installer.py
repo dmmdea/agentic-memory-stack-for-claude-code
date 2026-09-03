@@ -91,6 +91,29 @@ def test_deploys_the_same_client_files_as_the_windows_installer():
         assert (REPO_ROOT / "scripts" / "wsl" / f).is_file(), f
 
 
+def test_resolves_the_tenant_sentinel_the_windows_installer_resolves():
+    """Every deployed tool defaults its user_id to the __WSL_USER__ sentinel; the Windows
+    installer resolves it at deploy time. If this installer copied the files verbatim, every
+    write from a client would land under a literal placeholder tenant."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert 'sed "s|__WSL_USER__|$USER_ID|g"' in sh
+    assert "--user-id" in sh
+    # the substitution is load-bearing: the sources really carry the sentinel
+    for f in ("mem0-mcp-shim.py", "replay-ops.py"):
+        assert "__WSL_USER__" in (REPO_ROOT / "scripts" / "wsl" / f).read_text(encoding="utf-8"), f
+    ps1 = (REPO_ROOT / "install" / "2-windows-config.ps1").read_text(encoding="utf-8")
+    assert "$Text.Replace('__WSL_USER__',   $WslUser)" in ps1
+
+
+def test_user_id_is_reported_and_validated(tmp_path):
+    r, _ = _run(["--authority", "http://brain-host:18791", "--user-id", "tenant-a", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "user_id (mem0 tenant): tenant-a" in r.stdout
+    assert "__WSL_USER__ -> tenant-a" in r.stdout
+    r, _ = _run(["--authority", "http://brain-host:18791", "--user-id", "bad/one", "--dry-run"], tmp_path)
+    assert r.returncode != 0 and "--user-id" in r.stderr
+
+
 def test_role_file_and_protocol_marker_match_the_shared_contract():
     sh = SCRIPT.read_text(encoding="utf-8")
     assert "printf 'client\\n' > \"$MEM0_DIR/role\"" in sh

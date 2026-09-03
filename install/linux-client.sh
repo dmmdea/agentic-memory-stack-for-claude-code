@@ -19,15 +19,19 @@
 # role for the same reason it does on a replica.
 #
 # Usage:
-#   bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file>
+#   bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file> [--user-id <tenant>]
 #   bash install/linux-client.sh --authority http://<brain-host>:18791            # key already in ~/.mem0/api-key
 #   bash install/linux-client.sh --authority ... --dry-run                         # print the plan, write nothing
+#
+# --user-id is the mem0 tenant the Brain stores your memories under (its own install's WSL
+# username). It defaults to this box's login name, which is only right when the two match.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUTHORITY=""
 API_KEY_FILE=""
+USER_ID="${USER:-$(id -un)}"
 DRY_RUN=0
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -42,6 +46,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
+        --user-id) USER_ID="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -71,6 +76,7 @@ AUTHORITY="${AUTHORITY%/}"
 if is_local_url "$AUTHORITY"; then
     fail "a thin client must point at a REMOTE authority; '$AUTHORITY' is loopback/unspecified/malformed (nothing listens locally on a client, and the One-Brain Rule forbids replaying into loopback)"
 fi
+[[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 command -v python3 >/dev/null || fail "python3 is required"
 PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' || fail "python3 >= 3.12 required (found $PYV)"
@@ -82,6 +88,7 @@ done
 STACK_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 echo "    python $PYV, claude $(claude --version 2>/dev/null | head -1), stack $STACK_VERSION"
 echo "    authority: $AUTHORITY"
+echo "    user_id (mem0 tenant): $USER_ID"
 
 # ---------------------------------------------------------------- 1. per-host files
 say "[1] per-host files in $MEM0_DIR"
@@ -110,16 +117,20 @@ fi
 
 # ---------------------------------------------------------------- 3. venv + scripts
 say "[3] client venv at $CLIENT_DIR and scripts in $SCRIPTS_DIR"
-if plan "python3 -m venv $CLIENT_DIR/.venv; pip install 'fastmcp>=3' httpx; copy $CLIENT_FILES"; then :; else
+if plan "python3 -m venv $CLIENT_DIR/.venv; pip install 'fastmcp>=3' httpx; deploy $CLIENT_FILES with __WSL_USER__ -> $USER_ID"; then :; else
     mkdir -p "$CLIENT_DIR" "$SCRIPTS_DIR"
     [ -x "$CLIENT_DIR/.venv/bin/python" ] || python3 -m venv "$CLIENT_DIR/.venv"
     "$CLIENT_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
     # Floors only, no caps (house rule): the shim needs fastmcp>=3 and httpx.
     "$CLIENT_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check 'fastmcp>=3' httpx
     "$CLIENT_DIR/.venv/bin/python" -c 'import fastmcp, httpx' || fail "shim dependencies failed to import in the venv"
+    # The deployed copies carry the operator sentinel __WSL_USER__ (the mem0 tenant every tool
+    # defaults to). The Windows installer resolves it at deploy time; so must this one, or every
+    # write lands under a literal placeholder tenant. Literal, whole-token substitution.
     for f in $CLIENT_FILES; do
-        cp "$REPO_ROOT/scripts/wsl/$f" "$SCRIPTS_DIR/$f"
-        echo "    installed: $f"
+        sed "s|__WSL_USER__|$USER_ID|g" "$REPO_ROOT/scripts/wsl/$f" > "$SCRIPTS_DIR/$f"
+        if grep -q "__WSL_USER__\|__WIN_USER__\|__WSL_DISTRO__" "$SCRIPTS_DIR/$f"; then fail "unresolved operator sentinel left in $SCRIPTS_DIR/$f"; fi
+        echo "    installed: $f (tenant $USER_ID)"
     done
 fi
 SHIM="$SCRIPTS_DIR/mem0-mcp-shim.py"
@@ -159,8 +170,8 @@ fi
 say "[6] receipt"
 if plan "write $MEM0_DIR/client-receipt.json"; then :; else
     SHA="$(sha256sum "$SHIM" | cut -c1-64)"
-    printf '{"role":"client","authority":"%s","stack_version":"%s","shim_sha256":"%s","python":"%s","installed_at":"%s"}\n' \
-        "$AUTHORITY" "$STACK_VERSION" "$SHA" "$PY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MEM0_DIR/client-receipt.json"
+    printf '{"role":"client","authority":"%s","user_id":"%s","stack_version":"%s","shim_sha256":"%s","python":"%s","installed_at":"%s"}\n' \
+        "$AUTHORITY" "$USER_ID" "$STACK_VERSION" "$SHA" "$PY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MEM0_DIR/client-receipt.json"
     echo "    $MEM0_DIR/client-receipt.json"
 fi
 

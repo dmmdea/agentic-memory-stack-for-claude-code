@@ -114,12 +114,12 @@ R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-conso
 
 ### Linux thin client (`install/linux-client.sh`)
 
-A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses another machine's Brain over the network. `install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file>` installs only what a client needs and then proves it:
+A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses another machine's Brain over the network. `install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file> [--user-id <tenant>]` installs only what a client needs and then proves it (`--user-id` is the mem0 tenant the Brain stores under — its own install's WSL username; it defaults to the client's login name, which is only right when the two match):
 
 1. **Refuses a loopback authority** with the same fail-closed host rule as `replay-ops.py`: nothing listens locally on a client, and a loopback authority would queue every write forever.
 2. Writes the per-host files the shim resolves at startup — `~/.mem0/authority-url`, `~/.mem0/role` = `client`, and `~/.mem0/api-key` (copied from `--api-key-file`, mode 0600; the key the authority accepts, i.e. the Brain's own `~/.mem0/api-key`).
 3. Probes the authority's `/health`.
-4. Creates a small venv (`~/apps/mem0-client/.venv`, floors `fastmcp>=3` + `httpx`) and deploys the **same two files** the Windows installer puts in WSL — `mem0-mcp-shim.py` and its sibling `replay-ops.py` — into `~/.claude/scripts`. The shim spawns the sibling to drain the Outbox at startup, so they always deploy together (pinned by a test).
+4. Creates a small venv (`~/apps/mem0-client/.venv`, floors `fastmcp>=3` + `httpx`) and deploys the **same two files** the Windows installer puts in WSL — `mem0-mcp-shim.py` and its sibling `replay-ops.py` — into `~/.claude/scripts`, resolving the `__WSL_USER__` tenant sentinel to `--user-id` exactly as the Windows installer's sentinel pass does (a verbatim copy would write every memory under a literal placeholder tenant; the deploy refuses if any sentinel survives). The shim spawns the sibling to drain the Outbox at startup, so they always deploy together (pinned by a test).
 5. Registers the `mem0` MCP server in Claude Code (user scope) as `<venv python> <shim>`, replacing any previous entry.
 6. Appends the CLAUDE.md memory tier protocol section under the same marker the Windows installer uses.
 7. Writes `~/.mem0/client-receipt.json` (authority, stack version, shim hash) and runs a **real MCP session over stdio** — initialize, then `tools/call memory_health` — which must report `ok:true` from the authority. An install that cannot reach the Brain through the shim fails here, not later in a session.

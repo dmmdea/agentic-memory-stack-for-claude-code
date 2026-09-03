@@ -10,7 +10,8 @@ in the first entries below — full pre-inversion history lives in the maintaine
   remote Brain. It deploys the MCP shim and its sibling replay driver into a small venv, writes
   the per-host authority/role/key files (`role=client`), registers the `mem0` MCP server in
   Claude Code, appends the CLAUDE.md tier protocol, and proves the install with a real MCP
-  session calling `memory_health` against the authority. A loopback authority is refused.
+  session calling `memory_health` against the authority. A loopback authority is refused;
+  the `__WSL_USER__` tenant sentinel is resolved to `--user-id` as on Windows.
 - `replay-ops.py`'s One-Brain refusal (never replay an Outbox into loopback) now covers the
   `client` role as well as `replica`.
 
