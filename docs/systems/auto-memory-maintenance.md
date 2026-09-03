@@ -79,6 +79,9 @@ Two findings watch the maintainer itself: a store above trigger with no run rece
 
 ### Pillar 2 — write-time lint (the source fix)
 
+**2026-09-03 revision — the gate acts at the limit.** The bash advisory (`memory-index-write-lint.sh`) printed a warning and did nothing; live sessions ignored it, one store reached 27.4 KB with 126 of 180 lines over the cap, and the harness loaded only part of the index in another session. The PostToolUse hook is now `scripts/windows/memory-index-write-gate.ps1` (Windows-native, PS 5.1): it keeps the advisory, and **when the index is at/over the 25,000 B sync limit** it truncates the longest non-doctrine hooks to the line cap until the index is back under the compactor trigger (`Invoke-AmConvergenceFloor`, the same rule the nightly job uses), writes atomically behind a compare-and-swap on the content hash it read, receipts to `~/.claude/state/automemory/write-gate-receipts.jsonl`, and tells the session its in-context copy is stale. Doctrine lines are never touched; the full text of every truncated hook still lives in its fact file.
+
+
 The harness warns when an Index passes its line cap, but nothing checks bytes per line — and
 that is what fills the byte budget first. A `PostToolUse` hook on Write/Edit returns instantly
 unless the path is a workspace Index, then reports any line over the hook budget so the agent
@@ -86,6 +89,9 @@ fixes it in the same turn, while the material is still in context. It is advisor
 exits 0: a hook must never be able to block a memory write.
 
 ### Pillar 3 — compaction (nightly)
+
+**2026-09-03 revision — convergence is guaranteed or reported.** The judge-driven shortening ("KEEP is the safe default") converged ~13 lines a night while sessions added more, and the run still stamped `applied` at 25,219 B. Three changes: (1) a deterministic **convergence floor** runs after the judge pass — if the projected index is still at/over the sync limit, the longest non-doctrine lines are truncated to the cap until it is under the trigger; (2) a held codex lock no longer aborts the run — only the judge is skipped, hygiene and the floor still run (the wake-up catch-up fires dream, dedup and compactor in the same second); (3) fact bodies over the server's storage cap (`$script:AmMem0MaxChars`, 4,000 chars) are never offered for or applied as migrations — they 413'd nightly forever. A run whose store is still at/over the sync limit after the floor is **`applied-unconverged`** (or `unconverged` when nothing changed), exits **1** so the scheduled task records the failure, leaves the throttle open, and turns the `auto-memory maintenance liveness` row red. Only doctrine-only overflow can produce it, and doctrine is re-homed by hand by design.
+
 
 `memory-compact.ps1` runs from a scheduled task at 05:00, offset from the other nightly jobs so
 the shared judge mutex is free. Per store, in order:
@@ -137,7 +143,7 @@ agents glob it, so a maintenance folder there would resurface removed facts in e
 | Entry point | Trigger | Writes |
 |---|---|---|
 | `scripts/windows/memory-lint.ps1` | session start, 6h throttle | lint summary only |
-| `claude-config/memory-index-write-lint.sh` | `PostToolUse` Write/Edit | nothing (stdout) |
+| `scripts/windows/memory-index-write-gate.ps1` | `PostToolUse` Write/Edit | MEMORY.md (only at/over the sync limit, CAS-guarded) + `write-gate-receipts.jsonl` |
 | `scripts/windows/memory-compact.ps1` | scheduled task, 05:00, 23h throttle | Index, history, receipts |
 | `scripts/windows/memory-store-lib.ps1` | dot-sourced library | nothing |
 

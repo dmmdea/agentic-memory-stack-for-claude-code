@@ -274,3 +274,81 @@ Describe 'dry run' {
         Test-Path (Join-Path $sb.Home '.claude\state\mem0-posts.txt') | Should -BeFalse -Because 'a dry run must not post to mem0'
     }
 }
+
+Describe 'convergence floor (2026-09-03): the index leaves every run under the sync limit, or the run says so' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'MemoryCompact.Fixture.ps1')
+        # 80 lines x ~360 B = ~29 KB: over the 25,000 B sync limit, every line over the cap.
+        function New-OverLimitStore {
+            param($Sandbox, [int]$Count = 80, [string]$Type = 'project', [switch]$HugeTitles)
+            $lines = @('# Memory Index', '')
+            $facts = @{}
+            for ($i = 1; $i -le $Count; $i++) {
+                $title = if ($HugeTitles) { ('T' * 140) + $i } else { 'Fact ' + $i }
+                $lines += ('- [' + $title + '](fact' + $i + '.md) ' + $script:EmDash + ' ' + ('detail number ' + $i + ' ') * 22)
+                $facts["fact$i.md"] = New-FactFile "fact$i" 'd' $Type
+            }
+            return (Add-SandboxStore -Sandbox $Sandbox -Workspace 'ws' -IndexLines $lines -Facts $facts)
+        }
+    }
+
+    It 'floors an over-limit index deterministically when the judge keeps everything, and reports applied' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $dir = New-OverLimitStore -Sandbox $sb
+        $idx = Join-Path $dir 'MEMORY.md'
+        (Get-Bytes $idx) | Should -BeGreaterThan 25000 -Because 'the fixture must start over the sync limit or the floor is never exercised'
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-Workspace', 'ws')
+        $r.Receipts[0].status | Should -Be 'applied'
+        $r.Receipts[0].floored | Should -BeGreaterThan 0
+        $r.Receipts[0].after_bytes | Should -BeLessThan 20000 -Because 'the floor stops below the TRIGGER (hysteresis), not merely below the sync limit'
+        (Get-Bytes $idx) | Should -BeLessThan 25000
+        $r.ExitCode | Should -Be 0
+        # every floored line still round-trips as the same entry (slug intact) and is under the cap
+        # The floor stops at the TRIGGER (hysteresis), not at zero long lines: everything past that
+        # point is left for the judge, which keeps first crack at hook quality. So the assertion is
+        # "fewer long lines than before", never "none".
+        $long = @((Get-Content $idx) | Where-Object { $_ -match '^- \[' -and ([Text.Encoding]::UTF8.GetByteCount($_)) -gt 130 })
+        $long.Count | Should -BeLessThan 80 -Because 'the floor must have truncated at least some lines (all 80 started over the cap)'
+        $long.Count | Should -BeGreaterThan 0 -Because 'the floor stops at the trigger and leaves the remainder to the judge (hysteresis, not a blanket rewrite)'
+    }
+
+    It 'still floors when the codex lock is held: the judge is skipped, hygiene and the floor are not' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}' -LockHeld
+        $dir = New-OverLimitStore -Sandbox $sb
+        $idx = Join-Path $dir 'MEMORY.md'
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-Workspace', 'ws')
+        $r.Receipts[0].status | Should -Be 'applied'
+        (Get-Bytes $idx) | Should -BeLessThan 25000 -Because 'the lock guards the JUDGE, not the deterministic floor - a store must not stay unloadable because dedup ran first'
+        Test-Path (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') | Should -BeFalse -Because 'no judge call may happen while another worker holds the mutex'
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'codex lock held'
+    }
+
+    It 'reports unconverged and exits 1 when nothing can be floored (titles alone eat the cap)' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $dir = New-OverLimitStore -Sandbox $sb -HugeTitles
+        $idx = Join-Path $dir 'MEMORY.md'
+        $before = Get-Bytes $idx
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-Workspace', 'ws')
+        $r.Receipts[0].status | Should -BeIn @('unconverged', 'applied-unconverged')
+        $r.Receipts[0].note | Should -Match 'UNCONVERGED'
+        $r.ExitCode | Should -Be 1 -Because 'a store still over the sync limit is a failed run and the scheduled task must record it'
+        Test-Path (Join-Path $sb.Home '.claude\state\throttle-marked') | Should -BeFalse -Because 'an unconverged run must be retried, not counted as done'
+    }
+
+    It 'never offers or applies a migration for a body over the server storage cap' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[{"slug":"big.md","action":"MIGRATE"}]}'
+        $lines = New-BigIndexLines 60
+        $lines += ('- [Big](big.md) ' + $script:EmDash + ' a pullable lookup with an enormous body')
+        $facts = @{}
+        1..60 | ForEach-Object { $facts["fact$_.md"] = New-FactFile "fact$_" 'd' }
+        $facts['big.md'] = New-FactFile 'big' 'd' 'project' (('lorem ipsum ') * 500)   # ~6,000 chars > 4,000 cap
+        $dir = Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines $lines -Facts $facts
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-Workspace', 'ws')
+        $r.Receipts[0].migrated | Should -Be 0 -Because 'the server would 413 it; retrying nightly forever is the defect'
+        Test-Path (Join-Path $dir 'big.md') | Should -BeTrue
+        (Get-Content (Join-Path $dir 'MEMORY.md') -Raw) | Should -Match '\(big\.md\)'
+        $prompt = Get-Content (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') -Raw
+        $prompt | Should -Not -Match 'slug: big\.md \| type: project \| migrate-candidate' -Because 'an unmigratable body must not even be offered'
+        Test-Path (Join-Path $sb.Home '.claude\state\mem0-posts.txt') | Should -BeFalse -Because 'nothing may be POSTed for it'
+    }
+}

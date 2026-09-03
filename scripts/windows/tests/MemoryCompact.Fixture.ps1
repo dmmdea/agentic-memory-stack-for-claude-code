@@ -11,7 +11,8 @@
             [string]$CodexPlanJson = '{"plan":[]}',
             [switch]$CodexThrows,
             [string]$Mem0Mode = 'ok',        # ok | noid | mismatch | fail
-            [string]$MutateIndexDuringCodex  # text appended to the index while "Codex thinks" (CAS)
+            [string]$MutateIndexDuringCodex,  # text appended to the index while "Codex thinks" (CAS)
+            [switch]$LockHeld                 # another worker holds the codex mutex for the whole run
         )
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
         $home_ = Join-Path $root 'home'
@@ -28,7 +29,7 @@ function Initialize-MemoryEnv { }
 function Write-MemoryLog { param($Component, $Message) Add-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\logs\compact-test.log') -Value $Message }
 function Test-Throttle { param($Name, $MinIntervalSeconds) return $true }
 function Mark-Throttle { param($Name) Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\throttle-marked') -Value '1' }
-function Acquire-CodexLock { param($Owner, $MaxAgeMinutes) return $true }
+function Acquire-CodexLock { param($Owner, $MaxAgeMinutes) return ($env:STUB_LOCK_HELD -ne '1') }
 function Release-CodexLock { }
 function Get-Mem0Key { return 'test-key' }
 function Invoke-CodexSubagent {
@@ -84,7 +85,7 @@ function Invoke-RestMethod {
         return [pscustomobject]@{
             Root = $root; Home = $home_; Bin = $bin
             Projects = (Join-Path $home_ '.claude\projects')
-            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex
+            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex; LockHeld = [bool]$LockHeld
         }
     }
 
@@ -110,6 +111,7 @@ function Invoke-RestMethod {
             '$env:STUB_CODEX_PLAN=' + "'" + ($Sandbox.Plan -replace "'", "''") + "'"
             '$env:STUB_CODEX_THROWS=' + "'" + $(if ($Sandbox.Throws) { '1' } else { '0' }) + "'"
             '$env:STUB_MEM0_MODE=' + "'" + $Sandbox.Mem0 + "'"
+            '$env:STUB_LOCK_HELD=' + "'" + $(if ($Sandbox.LockHeld) { '1' } else { '0' }) + "'"
         )
         if ($Sandbox.Mutate) {
             $envAssign += '$env:STUB_MUTATE_INDEX=' + "'" + $Sandbox.Mutate + "'"
@@ -118,12 +120,13 @@ function Invoke-RestMethod {
         $argLine = if ($ExtraArgs.Count) { ' ' + ($ExtraArgs -join ' ') } else { '' }
         $cmd = ($envAssign -join '; ') + '; & "' + (Join-Path $Sandbox.Bin 'memory-compact.ps1') + '"' + $argLine
         $out = & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1
+        $exitCode = $LASTEXITCODE
         $receiptPath = Join-Path $Sandbox.Home '.claude\state\automemory\compact-receipts.jsonl'
         $receipts = @()
         if (Test-Path -LiteralPath $receiptPath) {
             foreach ($l in (Get-Content -LiteralPath $receiptPath)) { if ($l.Trim()) { $receipts += ($l | ConvertFrom-Json) } }
         }
-        return [pscustomobject]@{ Output = ($out | Out-String); Receipts = $receipts }
+        return [pscustomobject]@{ Output = ($out | Out-String); Receipts = $receipts; ExitCode = $exitCode }
     }
 
     function Get-Bytes { param([string]$P) return ([System.IO.File]::ReadAllBytes($P)).Length }

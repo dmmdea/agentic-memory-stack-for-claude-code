@@ -450,19 +450,17 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $line | Should -Not -Match '\$RepoRoot|worktrees' -Because 'a nightly job must never run whatever a dev checkout happens to contain'
     }
 
-    It 'the write-time index lint is registered on PostToolUse, is fail-open, and is bash-safe' {
+    It 'the write-time index gate is the Windows-native memory-index-write-gate.ps1 on PostToolUse' {
+        # 2026-09-03: the bash advisory was ignored live; the gate normalizes at the sync limit.
         $src = Get-Content $installerPath -Raw
-        $line = ($src -split "`n" | Where-Object { $_ -match '^\$bashIndexLint\s*=' }) -join "`n"
-        $line | Should -Not -BeNullOrEmpty -Because 'the hook command must be built'
-        $line | Should -Match ([regex]::Escape('$wslDistroArg')) -Because 'the shared settings.json must not carry a machine-specific -d'
-        $line | Should -Match ([regex]::Escape('|| true')) -Because 'a hook that can fail must never be able to block a memory write'
-        $src | Should -Match "'PostToolUse'\s*=\s*@\(@\{ markers = @\('memory-index-write-lint\.sh'\)" -Because 'the hook must be registered with a dedupe marker like every other stack hook'
+        $src.Contains("`$psIndexGate = New-HookCommand 'memory-index-write-gate.ps1'") | Should -BeTrue -Because 'the hook command must be built from the deployed gate script'
+        $src | Should -Match "'PostToolUse'\s*=\s*@\(@\{ markers = @\('memory-index-write-lint\.sh', 'memory-index-write-gate\.ps1'\)" -Because 'the old marker must remain so the previous bash registration is REPLACED, not duplicated'
         $src | Should -Match "matcher = 'Write\|Edit'" -Because 'the hook must be matcher-scoped to write tools'
     }
 
     It 'deploys the write-time lint script and the three auto-memory scripts' {
         $wins = Get-AstArrayStrings -Path $installerPath -VarName 'winScripts'
-        foreach ($n in @('memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1')) {
+        foreach ($n in @('memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'memory-index-write-gate.ps1')) {
             $wins | Should -Contain $n -Because "$n must be deployed or the SessionStart child and the nightly task launch nothing"
         }
         (Get-Content $installerPath -Raw) | Should -Match 'memory-index-write-lint\.sh' -Because 'the PostToolUse hook script must be deployed from claude-config'

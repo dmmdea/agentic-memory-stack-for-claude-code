@@ -150,11 +150,18 @@ if (Test-AmHistoryHasRemote) {
 # worker reclaim the lock mid-run on a multi-store night, and the mutex would quietly stop
 # being one.
 $lockMinutes = [Math]::Max(30, [int][Math]::Ceiling((@($candidates).Count * $CodexTimeoutSeconds) / 60.0) + 5)
+# 2026-09-03: a held lock no longer aborts the run. The wake-up catch-up fires dream + dedup +
+# compactor in the same second, so the compactor lost every catch-up night to the lock while a
+# store sat over the sync limit. Only the JUDGE needs the mutex; deterministic hygiene and the
+# convergence floor run regardless.
+$script:JudgeDisabled = $false
 if (-not (Acquire-CodexLock -Owner 'memory-compact' -MaxAgeMinutes $lockMinutes)) {
-    Write-MemoryLog -Component $Component -Message 'skipping: codex lock held by another worker'
-    exit 0
+    Write-MemoryLog -Component $Component -Message 'codex lock held by another worker: judge skipped this run; deterministic hygiene + convergence floor only'
+    $script:JudgeDisabled = $true
+} else {
+    $lockTaken = $true
 }
-$lockTaken = $true
+$script:ExitCode = 0
 
 function Get-AmSealPath { param($Store) return (Join-Path (Get-AmWorkspaceStateDir -Workspace $Store.Workspace) 'sealed-lines.json') }
 
@@ -253,7 +260,7 @@ foreach ($cand in $candidates) {
     $result = [ordered]@{
         ts = (Get-Date).ToUniversalTime().ToString('o'); workspace = $ws; dry_run = [bool]$DryRun
         before_bytes = $before.Bytes; before_lines = $before.Lines; status = 'unknown'
-        shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0
+        shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0; floored = 0
         mem0 = @(); mem0_orphan = @(); after_bytes = $null; after_lines = $null
         commit = $null; snapshot = $null; note = ''
     }
@@ -472,11 +479,18 @@ foreach ($cand in $candidates) {
         $_.Kind -eq 'entry' -and -not $meta[$_.Slug].Doctrine -and $meta[$_.Slug].Frontmatter -and
         (@('project', 'reference') -contains ("" + $meta[$_.Slug].Frontmatter.Type).ToLowerInvariant())
     })
+    # 2026-09-03: a body over the server's storage cap 413s on every migration attempt, nightly,
+    # forever ("returned no id; line kept" x3 in the log). Flag-only files are not candidates.
+    $migratable = @($migratable | Where-Object {
+        $fm = $meta[$_.Slug].Frontmatter
+        (-not $fm) -or ((("" + $fm.Description + "`n`n" + $fm.Body).Trim()).Length -le $script:AmMem0MaxChars)
+    })
     $judgeNeeded = (@($shortenable).Count -gt 0 -or @($migratable).Count -gt 0)
     $judgeOk = $false
     $plan = $null
 
-    if ($judgeNeeded) {
+    if ($judgeNeeded -and $script:JudgeDisabled) { $result.note = 'codex lock held; judge skipped' }
+    if ($judgeNeeded -and -not $script:JudgeDisabled) {
         $sb = New-Object System.Text.StringBuilder
         [void]$sb.AppendLine('You are compacting one workspace index of an agent memory system. Only the index is loaded into every session; each entry points at a fact file that is loaded on demand.')
         [void]$sb.AppendLine('')
@@ -568,6 +582,7 @@ foreach ($cand in $candidates) {
             # Verbatim, never a paraphrase: a re-run must produce identical text so a retry
             # deduplicates instead of creating a second variant.
             $textOut = ($fm.Description + "`n`n" + $fm.Body).Trim()
+            if ($textOut.Length -gt $script:AmMem0MaxChars) { continue }   # re-checked at apply time: the server would 413
             if ($DryRun) {
                 # Project the removal so after_bytes and `migrated` describe the same world.
                 $keep.Remove($rec) | Out-Null
@@ -605,6 +620,19 @@ foreach ($cand in $candidates) {
         }
     }
 
+    # ---- convergence floor (deterministic; runs with or without the judge) ----------------
+    # The judge shortens what it agrees to; the floor guarantees the index leaves this run UNDER
+    # the sync limit or the run says so out loud. See Invoke-AmConvergenceFloor for the rule.
+    $unconverged = $false
+    $floorResult = Invoke-AmConvergenceFloor -Records $keep -StoreDir $store.Dir -Newline $idx.Newline -Meta $meta
+    $result.floored = $floorResult.Floored
+    if ($floorResult.Bytes -ge $script:AmSyncLimitBytes) {
+        $unconverged = $true
+        $result.note = (($result.note + '; ').TrimStart('; ') + 'UNCONVERGED: ' + $floorResult.Bytes + ' B still >= the ' + $script:AmSyncLimitBytes + ' B sync limit after the floor (doctrine lines are never shortened autonomously) - re-home doctrine into topic files by hand')
+        Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
+        $script:ExitCode = 1
+    }
+
     $newText = ConvertTo-AmIndexText -Records @($keep) -Newline $idx.Newline
     $newBytesTotal = Get-AmByteCount -Text $newText
 
@@ -634,7 +662,7 @@ foreach ($cand in $candidates) {
     # `status=no-op` (found by the receipt-fidelity test).
     if ($newText -eq $preText -and @($pendingDeletes).Count -eq 0) {
         # Distinguish "there was nothing to do" from "the judge never answered".
-        $result.status = if ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
+        $result.status = if ($unconverged) { 'unconverged' } elseif ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
         $result.after_bytes = $before.Bytes; $result.after_lines = $before.Lines
         Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.status)
         Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
@@ -756,14 +784,14 @@ foreach ($cand in $candidates) {
     }
 
     $postLines = Get-AmLineCount -Text $postText
-    $msg = ('compact ' + $ws + ': ' + $before.Bytes + '->' + (Get-AmByteCount -Text $postText) + ' B, ' + $before.Lines + '->' + $postLines + ' lines; shortened=' + $result.shortened + ' migrated=' + $result.migrated + ' reindexed=' + $result.reindexed + ' dedangled=' + $result.dedangled + ' dedup_slug=' + $result.dedup_slug)
+    $msg = ('compact ' + $ws + ': ' + $before.Bytes + '->' + (Get-AmByteCount -Text $postText) + ' B, ' + $before.Lines + '->' + $postLines + ' lines; shortened=' + $result.shortened + ' migrated=' + $result.migrated + ' reindexed=' + $result.reindexed + ' dedangled=' + $result.dedangled + ' dedup_slug=' + $result.dedup_slug + ' floored=' + $result.floored)
     $commit = $null
     try { $commit = Save-AmHistorySnapshot -Store $store -Message $msg }
     catch {
         $result.note = ('post-commit FAILED (' + $_.Exception.Message + '); this run is applied but not in history')
         Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
     }
-    $result.status = if ($commit) { 'applied' } else { 'applied-unrecorded' }
+    $result.status = if ($unconverged) { 'applied-unconverged' } elseif ($commit) { 'applied' } else { 'applied-unrecorded' }
     $result.after_bytes = (Get-AmByteCount -Text $postText)
     $result.after_lines = $postLines
     $result.commit = $commit
@@ -800,4 +828,7 @@ if (-not $DryRun -and -not $Force -and @($productive).Count -gt 0) { Mark-Thrott
 } finally {
     if ($lockTaken) { Release-CodexLock }
 }
-exit 0
+# 2026-09-03: an unconverged store is a FAILED run - the scheduled task's LastTaskResult must
+# say so, not 0. ('applied-unconverged' / 'unconverged' are absent from $productive: the
+# throttle stays open so the next run retries.)
+exit $script:ExitCode
