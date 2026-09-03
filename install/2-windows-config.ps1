@@ -597,7 +597,12 @@ $hookEntries = @{
         @{ markers = @('precompact_capture.py');                           command = $bashPreCompactCapture }
     )
     'SessionStart'       = @(
-        @{ markers = @('storage-cap-check.sh');                            command = $bashCapCheck },
+        # 2026-09-02 (context audit): the banner is session-OPEN orientation (recent sessions,
+        # heartbeat digest, storage-cap alarms). Without a matcher it re-fired on every resume
+        # too - 308 resume fires vs 225 startups across 76 transcripts, ~1.3 KB each - the
+        # single largest routine SessionStart repetition. compact stays: the context was just
+        # rebuilt and the orientation is worth re-reading. resume already has it.
+        @{ markers = @('storage-cap-check.sh');                            command = $bashCapCheck; matcher = 'startup|clear|compact' },
         # v0.20 A.5: async daemon pre-warm (mirrors the live-box registration shape)
         @{ markers = @('mem0-hook-daemon-spawn.ps1');                      command = $psDaemonSpawn; async = $true; timeout = 10 },
         # v0.27.1 R5: async Codex-shim pre-warm (flag-gated; no-op until the write-gate is enabled)

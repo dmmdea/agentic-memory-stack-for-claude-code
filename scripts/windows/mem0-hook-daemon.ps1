@@ -89,7 +89,9 @@ function Limit-RepeatedGoalsOq {
     when the goals+OQ set is UNCHANGED since the last injection for this session,
     blank those sections (Format-MemoryContextBlock omits empty sections) —
     memories stay per-prompt fresh. Re-inject immediately when the set changes
-    (new goal, resolved question) and every 12th substantive prompt as a
+    (new goal, resolved question) and every 25th substantive prompt as a
+    (2026-09-02 context audit: 12 -> 25; the blank rate over 76 transcripts was 59% and
+    the re-inject exists only as a post-compaction/drift guard, which 25 still serves)
     post-compaction/drift guard. Fail-open: any error = old behavior (re-inject).
     #>
     param($Bundle, [string]$SessionId)
@@ -100,7 +102,7 @@ function Limit-RepeatedGoalsOq {
         $sig  = $gSig + '##' + $qSig
         if ($null -eq $script:GoalsOqSeen) { $script:GoalsOqSeen = @{} }
         $st = $script:GoalsOqSeen[$SessionId]
-        if ($null -ne $st -and $st.sig -eq $sig -and $st.n -lt 12) {
+        if ($null -ne $st -and $st.sig -eq $sig -and $st.n -lt 25) {
             $st.n = $st.n + 1
             $Bundle.goals = @()
             $Bundle.open_questions = @()
