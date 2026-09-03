@@ -90,6 +90,8 @@ exits 0: a hook must never be able to block a memory write.
 
 ### Pillar 3 — compaction (nightly)
 
+**2026-09-03 revision (b) — hygiene runs on every store.** Deterministic hygiene (orphan re-index, dangling and duplicate-slug removal) used to run only for stores over the size trigger, so a small store carried orphaned facts for days while the lint reported them every session. Every populated store is now a nightly candidate; below the trigger it gets hygiene only (no judge, no migration, no floor) and writes a receipt only when something changed.
+
 **2026-09-03 revision — convergence is guaranteed or reported.** The judge-driven shortening ("KEEP is the safe default") converged ~13 lines a night while sessions added more, and the run still stamped `applied` at 25,219 B. Three changes: (1) a deterministic **convergence floor** runs after the judge pass — if the projected index is still at/over the sync limit, the longest non-doctrine lines are truncated to the cap until it is under the trigger; (2) a held codex lock no longer aborts the run — only the judge is skipped, hygiene and the floor still run (the wake-up catch-up fires dream, dedup and compactor in the same second); (3) fact bodies over the server's storage cap (`$script:AmMem0MaxChars`, 4,000 chars) are never offered for or applied as migrations — they 413'd nightly forever. A run whose store is still at/over the sync limit after the floor is **`applied-unconverged`** (or `unconverged` when nothing changed), exits **1** so the scheduled task records the failure, leaves the throttle open, and turns the `auto-memory maintenance liveness` row red. Only doctrine-only overflow can produce it, and doctrine is re-homed by hand by design.
 
 

@@ -486,6 +486,14 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         $daemon.Contains('$st.n -lt 12') | Should -BeFalse -Because 'the old 12 cadence must not linger beside the new one'
     }
 
+    It 'the maintenance-liveness row measures the LIVE stores, not the lint snapshot' {
+        # 2026-09-03: after a remediation the SessionStart lint summary kept the old size for hours
+        # and the row stayed red. The verdict must come from Get-AmStoreStats at run time.
+        $m = [regex]::Match($script:tmsCode, "(?s)auto-memory maintenance liveness.{0,2500}")
+        $m.Value | Should -Match 'Get-AmStoreStats' -Because 'the over-limit verdict must be measured live'
+        $m.Value | Should -Match 'AmSyncLimitBytes' -Because 'the limit comes from the library that owns it, never re-typed'
+    }
+
     It 'a mangled EvalRootWsl is refused at install and FAILs the drift-guard row' {
         # 2026-09-01: Git Bash MSYS path conversion turned -EvalRootWsl /mnt/... into
         # 'C:/Program Files/Git/mnt/...'; the installer wrote it unchecked and the dream's

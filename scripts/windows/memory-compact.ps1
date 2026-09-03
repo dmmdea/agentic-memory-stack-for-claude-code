@@ -105,14 +105,18 @@ if ($Workspace) {
 }
 if (@($stores).Count -eq 0) { Write-MemoryLog -Component $Component -Message 'no stores found'; exit 0 }
 
-# Only stores at/above a trigger are candidates; hysteresis (target < trigger) keeps a store
-# that was just compacted from being re-processed every night.
+# 2026-09-03: EVERY store is a candidate. Deterministic hygiene (orphan re-index, dangling and
+# duplicate-slug removal) is cheap, needs no judge, and used to run only for stores over the size
+# trigger - so a small store carried 7 orphaned facts for days while the lint reported them every
+# session and nothing ever fixed them. Below the trigger a store gets HYGIENE ONLY (no judge, no
+# migration, no floor) and writes a receipt only when something changed; hysteresis (target <
+# trigger) still keeps a just-compacted store out of the judge's hands.
 $candidates = @()
 $statsErrors = 0
 foreach ($s in $stores) {
     try {
         $st = Get-AmStoreStats -Store $s
-        if ($st.OverTrigger -or $Force) { $candidates += [pscustomobject]@{ Store = $s; Stats = $st } }
+        $candidates += [pscustomobject]@{ Store = $s; Stats = $st; HygieneOnly = (-not $st.OverTrigger -and -not $Force) }
     } catch {
         $statsErrors++
         Write-MemoryLog -Component $Component -Message ('stats failed for ' + $s.Workspace + ': ' + $_.Exception.Message)
@@ -129,10 +133,12 @@ if (@($candidates).Count -eq 0) {
         Write-MemoryLog -Component $Component -Message ("could not measure $statsErrors store(s); not marking the throttle")
         exit 0
     }
-    Write-MemoryLog -Component $Component -Message ('nothing above trigger (' + $script:AmTriggerBytes + ' B / ' + $script:AmTriggerLines + ' lines) across ' + @($stores).Count + ' store(s)')
+    Write-MemoryLog -Component $Component -Message ('no measurable store across ' + @($stores).Count + ' store(s)')
     if (-not $DryRun) { Mark-Throttle -Name $ThrottleName }
     exit 0
 }
+$overTriggerCount = @($candidates | Where-Object { -not $_.HygieneOnly }).Count
+Write-MemoryLog -Component $Component -Message ('candidates: ' + @($candidates).Count + ' store(s); ' + $overTriggerCount + ' above trigger (' + $script:AmTriggerBytes + ' B / ' + $script:AmTriggerLines + ' lines), the rest hygiene-only')
 
 try { Initialize-AmHistory | Out-Null } catch {
     Write-MemoryLog -Component $Component -Message ('history init failed, aborting (no snapshot = no safe apply): ' + $_.Exception.Message)
@@ -472,6 +478,8 @@ foreach ($cand in $candidates) {
     }
 
     # ---- the delta the judge actually sees ---------------------------------------------
+    # Below the trigger there is no delta for the judge: hygiene is the whole job.
+    $hygieneOnly = [bool]$cand.HygieneOnly
     $shortenable = @($keep | Where-Object {
         $_.Kind -eq 'entry' -and $_.Bytes -gt $script:AmLineByteCap -and -not $meta[$_.Slug].Doctrine -and -not $sealed.ContainsKey($_.Slug)
     })
@@ -485,6 +493,7 @@ foreach ($cand in $candidates) {
         $fm = $meta[$_.Slug].Frontmatter
         (-not $fm) -or ((("" + $fm.Description + "`n`n" + $fm.Body).Trim()).Length -le $script:AmMem0MaxChars)
     })
+    if ($hygieneOnly) { $shortenable = @(); $migratable = @() }
     $judgeNeeded = (@($shortenable).Count -gt 0 -or @($migratable).Count -gt 0)
     $judgeOk = $false
     $plan = $null
@@ -664,8 +673,13 @@ foreach ($cand in $candidates) {
         # Distinguish "there was nothing to do" from "the judge never answered".
         $result.status = if ($unconverged) { 'unconverged' } elseif ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
         $result.after_bytes = $before.Bytes; $result.after_lines = $before.Lines
-        Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.status)
-        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
+        # A clean below-trigger store is the common nightly case: no log line, no receipt (a
+        # receipt per store per night would bury the ones that matter).
+        if (-not $hygieneOnly) {
+            Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.status)
+            Write-AmReceipt -Record ([pscustomobject]$result)
+        }
+        $runStatuses += $result.status
         continue
     }
     if ($newBytesTotal -gt $hygieneBytes -or (-not $hygieneChanged -and $newBytesTotal -ge $before.Bytes)) {
