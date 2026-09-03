@@ -1109,7 +1109,22 @@ try {
         $over = @($ls.stores | Where-Object { $_.over_trigger })
         $recAge = $null
         if (Test-Path -LiteralPath $receipts) { $recAge = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $receipts).LastWriteTime).TotalHours, 1) }
-        if ($over.Count -eq 0) {
+        # 2026-09-03: a receipt within 48h proved nothing - the compactor stamped 'applied' while
+        # leaving a store at 25,219 B, over the sync limit, for days. The verdict is the STATE: a
+        # store at/over the sync limit right now, or whose latest receipt is unconverged, is a
+        # FAIL regardless of how fresh the receipt is.
+        $overLimit = @($ls.stores | Where-Object { [int]$_.bytes -ge 25000 })
+        $unconv = @()
+        if (Test-Path -LiteralPath $receipts) {
+            $latest = @{}
+            foreach ($rl in (Get-Content -LiteralPath $receipts)) { try { $ro = $rl | ConvertFrom-Json; if ($ro.workspace) { $latest[$ro.workspace] = $ro } } catch {} }
+            $unconv = @($latest.Values | Where-Object { $_.status -eq 'applied-unconverged' -or $_.status -eq 'unconverged' } | ForEach-Object { $_.workspace })
+        }
+        if ($overLimit.Count -gt 0) {
+            Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'FAIL' ("store(s) AT/OVER the 25,000 B sync limit now (the harness loads only part of the index): " + (($overLimit | ForEach-Object { "$($_.workspace) $($_.bytes)B" }) -join '; ') + " - run memory-compact.ps1 -Workspace <ws>; if it reports unconverged, doctrine lines must be re-homed by hand")
+        } elseif ($unconv.Count -gt 0) {
+            Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'FAIL' ("last compactor run UNCONVERGED for: " + ($unconv -join ', ') + " - doctrine-only overflow; re-home doctrine into topic files by hand")
+        } elseif ($over.Count -eq 0) {
             Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'OK' "no store above trigger ($(@($ls.stores).Count) store(s) scanned)"
         } elseif ($null -ne $recAge -and $recAge -le 48) {
             Add-Check 'RECOVERY' 'auto-memory maintenance liveness' 'OK' "$($over.Count) store(s) above trigger; last compactor receipt ${recAge}h ago"
@@ -1674,6 +1689,7 @@ try {
         'mem0-hook-client.cs',                                 # v0.20 A.6 compiled thin client SOURCE (exe is built FROM the deployed copy)
         'build-hook-client.ps1',                               # v0.20 Final: smoke-gated builder — deployed so a repo-less DR restore can rebuild the exe (SessionStart self-heal in mem0-hook-daemon-spawn.ps1)
         'dream-consolidate.ps1',                               # v0.20 Phase F (L4): installer deploys it + Task Scheduler runs it nightly — was the one deployed script R9 never checked
+        'memory-index-write-gate.ps1',                          # 2026-09-03: PostToolUse write-time gate for MEMORY.md (normalizes at the sync limit)
         'autopromote-lib.ps1',                                 # Phase 2c: dot-sourced by dream-consolidate.ps1 for the autonomous-promotion decision logic (must deploy beside it)
         'codex-shim.ps1', 'codex-shim-spawn.ps1',              # v0.27.1 R5 keystone: Windows-resident Codex HTTP shim + its flag-gated SessionStart launcher
         # AUDIT 2026-08-07 (AMS-02/AMS-03): THE LAUNCH-PATH TRIO. The MCP registration

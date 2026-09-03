@@ -4,6 +4,27 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.11 (2026-09-03) — auto-memory: converge under the sync limit, or say so
+
+Live failure: the AI-Ecosystem index reached 27.4 KB with 126 of 180 lines over the cap and the
+harness loaded only part of it in another session. The compactor had run nightly and stamped
+`applied` while leaving the store at 25,219 B (judge-driven shortening converges ~13 lines a
+night, "KEEP is the safe default"), skipped the wake-up catch-up night entirely because dream and
+dedup held the codex lock, and retried three 413-oversized migrations forever; the write-time
+lint was advisory and ignored.
+
+- Shared deterministic **convergence floor** (`Invoke-AmConvergenceFloor`): at/over the sync
+  limit, the longest non-doctrine hooks are truncated to the line cap until the index is under the
+  trigger. Doctrine is never touched.
+- Compactor: floor runs after the judge (with or without it); a held codex lock skips only the
+  judge; bodies over the server cap are never migration candidates; `applied-unconverged` /
+  `unconverged` statuses with **exit 1**; receipt gains `floored`.
+- Write-time gate: `memory-index-write-gate.ps1` (PS 5.1, Windows-native) replaces the bash
+  advisory on PostToolUse — same advisory, plus in-place normalization at the sync limit behind a
+  content-hash CAS, receipted.
+- `Test-MemoryStack`: the maintenance-liveness row is red when any store is at/over the sync limit
+  now or the latest receipt is unconverged; R9 tracks the gate.
+
 ## v1.20.10 (2026-09-02) — SessionStart banner fires on open, not on every resume
 
 A context audit over 76 transcripts found the `[agentic-memory-stack]` / `[heartbeat]` /

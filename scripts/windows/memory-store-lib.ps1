@@ -26,6 +26,7 @@ $script:AmTargetLines      = 140
 $script:AmSyncLimitBytes   = 25000   # harness: per-file sync limit (refuses to sync above)
 $script:AmInjectLimitLines = 200     # harness: index lines injected into context
 $script:AmOversizedFactBytes = 10000 # a single fact body this large is flagged (never edited)
+$script:AmMem0MaxChars      = 4000  # mem0-server MAX_MEMORY_CHARS default: a body over this 413s on migration, forever
 $script:AmEmDash           = [string][char]0x2014
 
 function Get-AmUtf8 { return (New-Object System.Text.UTF8Encoding($false)) }
@@ -533,6 +534,62 @@ function Get-AmTruncatedToBytes {
     $cut = $s.LastIndexOf(' ')
     if ($cut -gt [int]($s.Length * 0.6)) { $s = $s.Substring(0, $cut) }
     return $s.TrimEnd()
+}
+
+function Invoke-AmConvergenceFloor {
+    # 2026-09-03: the deterministic BACKSTOP shared by the nightly compactor and the write-time
+    # gate. The judge-driven shortening ("KEEP is the safe default") converged ~13 lines a night
+    # while live sessions added more, and the compactor still stamped 'applied' at 25,219 B - over
+    # the 25,000 B sync limit, where the harness silently loads only part of the index. Above the
+    # sync limit, convergence beats hook fidelity: every byte past the limit is a whole entry the
+    # next session never sees. Longest non-doctrine lines are truncated on a word boundary to the
+    # line cap until the index is below $StopBelowBytes (the compactor trigger, so the store leaves
+    # the nightly candidate set and the judge keeps first crack at everything else). Doctrine lines
+    # are NEVER touched (the hard rule) - a doctrine-only overflow is reported, not "fixed".
+    # Mutates the records in place (Dirty=$true) exactly like a judge SHORTEN; returns the count and
+    # the projected byte size so the caller decides converged vs unconverged.
+    param(
+        [Parameter(Mandatory)]$Records,
+        [Parameter(Mandatory)][string]$StoreDir,
+        [Parameter(Mandatory)][string]$Newline,
+        [hashtable]$Meta = $null,
+        [int]$StopBelowBytes = $script:AmTriggerBytes
+    )
+    $projected = Get-AmByteCount -Text (ConvertTo-AmIndexText -Records @($Records) -Newline $Newline)
+    $floored = 0
+    if ($projected -lt $script:AmSyncLimitBytes) { return [pscustomobject]@{ Floored = 0; Bytes = $projected } }
+    $long = @($Records | Where-Object { $_.Kind -eq 'entry' -and $_.Bytes -gt $script:AmLineByteCap } | Sort-Object -Property Bytes -Descending)
+    foreach ($rec in $long) {
+        if ($projected -lt $StopBelowBytes) { break }
+        $doctrine = $false
+        if ($Meta -and $Meta.ContainsKey($rec.Slug)) {
+            $doctrine = [bool]$Meta[$rec.Slug].Doctrine
+        } else {
+            $fp = Join-Path $StoreDir $rec.Slug
+            $fm = $null
+            if (Test-Path -LiteralPath $fp) { $fm = Read-AmFrontmatter -Path $fp }
+            $doctrine = Test-AmDoctrine -Record $rec -Frontmatter $fm
+        }
+        if ($doctrine) { continue }
+        $ind = ''
+        if ($rec.PSObject.Properties['Indent'] -and $rec.Indent) { $ind = $rec.Indent }
+        # overhead of "- [Title](slug) - " measured with a 1-byte placeholder hook
+        $overhead = (Get-AmByteCount -Text (New-AmEntryLine -Title $rec.Title -Slug $rec.Slug -Summary 'x' -Indent $ind)) - 1
+        $budget = $script:AmLineByteCap - $overhead
+        if ($budget -lt 24) { continue }   # a title that alone eats the cap cannot be floored
+        $hook = Get-AmTruncatedToBytes -Text $rec.Summary -MaxBytes $budget
+        if (-not $hook) { continue }
+        $cand = New-AmEntryLine -Title $rec.Title -Slug $rec.Slug -Summary $hook -Indent $ind
+        $nb = Get-AmByteCount -Text $cand
+        if ($nb -ge $rec.Bytes) { continue }
+        if (-not (Test-AmLineRoundTrips -Line $cand -ExpectedSlug $rec.Slug)) { continue }
+        $projected -= ($rec.Bytes - $nb)
+        $rec.Summary = $hook
+        $rec.Bytes = $nb
+        $rec | Add-Member -NotePropertyName Dirty -NotePropertyValue $true -Force
+        $floored++
+    }
+    return [pscustomobject]@{ Floored = $floored; Bytes = $projected }
 }
 
 # ---------------------------------------------------------------- git history (out of tree)

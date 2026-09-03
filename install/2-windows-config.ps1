@@ -277,7 +277,7 @@ try {
 # is the shared primitive library; memory-lint.ps1 is the read-only SessionStart child
 # (spawned by memory-maintenance-spawn.ps1); memory-compact.ps1 is the nightly task registered
 # in section 5c. None are R9 hash-tracked.
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'memory-index-write-gate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
 # AMS-16: the copy loop is add-only, so a retired script must be deleted
 # explicitly or it lingers deployed forever (the AMS-50 orphan class).
 foreach ($retired in @('pre-tool-check.ps1')) {
@@ -560,7 +560,7 @@ $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt
 # Auto-memory index write lint (PostToolUse). Same wsl.exe form as the cap-check: Git Bash on
 # Windows cannot resolve /mnt/c from a hook command string. Fail-open by construction - the
 # script always exits 0 - and `|| true` guards the wsl.exe layer itself.
-$bashIndexLint = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "bash /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/memory-index-write-lint.sh || true"'
+$psIndexGate = New-HookCommand 'memory-index-write-gate.ps1'
 
 # H12: v0.17 Phase 0 hooks — UserPromptSubmit (checkpoint + decision-capture + proactive-search)
 # and PreToolUse (audit gate). Previously only registered in the operator's local settings.json;
@@ -615,7 +615,12 @@ $hookEntries = @{
     # 2026-08-26: auto-memory index write-time byte lint. Matcher-scoped to Write|Edit; the
     # script itself exits immediately for any path that is not a workspace MEMORY.md, and
     # ALWAYS exits 0 (advisory only - a hook must never be able to block a memory write).
-    'PostToolUse'        = @(@{ markers = @('memory-index-write-lint.sh'); command = $bashIndexLint; matcher = 'Write|Edit'; timeout = 5 })
+    # 2026-09-03: the bash advisory was ignored live (126 over-cap lines, index 27.4 KB, the
+    # harness loading only part of it). The gate is now the Windows-native memory-index-write-
+    # gate.ps1: same advisory text, and when the index is AT/OVER the sync limit it normalizes the
+    # longest non-doctrine lines in place (receipted) so no session ever leaves an unloadable
+    # index behind for the others. The old marker stays so the previous registration is replaced.
+    'PostToolUse'        = @(@{ markers = @('memory-index-write-lint.sh', 'memory-index-write-gate.ps1'); command = $psIndexGate; matcher = 'Write|Edit'; timeout = 10 })
 }
 
 # AMS-16 (2026-08-09, operator decision): the 0.F PreToolUse contradiction check
