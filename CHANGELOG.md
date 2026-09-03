@@ -10,6 +10,9 @@ in the first entries below — full pre-inversion history lives in the maintaine
   dormant local Qdrant + mem0 (user units installed, disabled) and a 2-minute
   `offline-watcher.timer`. Server module list, Qdrant version and pip line are read from
   `install/1-wsl-services.sh` at run time (one owner). Ends with a first restore as the proof.
+- Qdrant storage is backed by a loop-mounted ext4 image when the home filesystem is not
+  ext4/xfs/btrfs/tmpfs: Qdrant 1.18.2's snapshot restore fails on f2fs (verified live; tmpfs
+  and ext4 restore the same snapshot).
 - New `scripts/travel/restore-replica.sh`: pulls the Brain's newest complete snapshot set over
   SSH (through `wsl.exe` for a Windows+WSL Brain), size-verified and cached, restores it via
   the Qdrant snapshot upload API, replaces the ledgers, requires `/health/deep` through the

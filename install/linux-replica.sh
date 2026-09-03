@@ -20,15 +20,20 @@
 # Usage:
 #   bash install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <ssh-alias> \
 #        [--brain-wsl <distro>:<user>] [--brain-backup-dir <remote dir>] \
-#        [--api-key-file <file>] [--user-id <tenant>] [--dry-run]
+#        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run]
 #   --brain-wsl: the Brain keeps its stack inside WSL on a Windows host; snapshot commands run
 #                through wsl.exe on that host (the usual Windows+WSL install).
+#   --qdrant-storage-gb: size of the ext4 image that backs Qdrant's storage when the home
+#                filesystem cannot host it (default 8). Qdrant 1.18.2's snapshot restore fails
+#                on f2fs ("Failed to load ID tracker mappings"; verified: tmpfs and ext4 restore
+#                the same snapshot fine, f2fs fails with or without compression), so on anything
+#                but ext4/xfs/btrfs/tmpfs the storage directory is a loop-mounted ext4 image.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR='~/.mem0/backups'
-API_KEY_FILE=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0
+API_KEY_FILE=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; QDRANT_STORAGE_GB=8
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -47,6 +52,7 @@ while [ $# -gt 0 ]; do
         --brain-backup-dir) BRAIN_BACKUP_DIR="${2:-}"; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
+        --qdrant-storage-gb) QDRANT_STORAGE_GB="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -72,6 +78,7 @@ AUTHORITY="${AUTHORITY%/}"
 is_local_url "$AUTHORITY" && fail "a replica's authority must be a REMOTE Brain; '$AUTHORITY' is loopback/unspecified/malformed"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$BRAIN_WSL" ] || [[ "$BRAIN_WSL" == *:* ]] || fail "--brain-wsl must be <distro>:<user>"
+[[ "$QDRANT_STORAGE_GB" =~ ^[0-9]+$ ]] && [ "$QDRANT_STORAGE_GB" -ge 1 ] || fail "--qdrant-storage-gb must be a whole number of GiB"
 for t in python3 curl jq ssh systemctl; do command -v "$t" >/dev/null || fail "$t is required"; done
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
 for f in scripts/travel/restore-replica.sh scripts/travel/offline-watcher.py systemd/mem0.service systemd/qdrant.service systemd/offline-watcher.service systemd/offline-watcher.timer scripts/wsl/generate-canonical-key.sh scripts/wsl/dpapi-fetch-key.sh; do
@@ -141,8 +148,28 @@ echo "    server python: $SERVER_PY"
 
 # ---------------------------------------------------------------- 4. qdrant (dormant)
 say "[4] qdrant $QDRANT_VERSION at $QDRANT_DIR (loopback, dormant)"
-if plan "download qdrant, write config.yaml (127.0.0.1:6333)"; then :; else
+qdrant_fs_ok() { case "$(stat -f -c %T "$1" 2>/dev/null)" in ext2/ext3|ext4|xfs|btrfs|tmpfs) return 0 ;; esac; return 1; }
+if plan "download qdrant, write config.yaml (127.0.0.1:6333); back storage with a ${QDRANT_STORAGE_GB} GiB ext4 image unless the filesystem is ext4/xfs/btrfs/tmpfs"; then :; else
     mkdir -p "$QDRANT_DIR/config" "$QDRANT_DIR/storage" "$QDRANT_DIR/snapshots"
+    # Qdrant's snapshot restore fails on f2fs (see the header); give it ext4 via a loop image.
+    if mountpoint -q "$QDRANT_DIR/storage"; then
+        echo "    storage already a mountpoint ($(stat -f -c %T "$QDRANT_DIR/storage"))"
+    elif qdrant_fs_ok "$QDRANT_DIR/storage"; then
+        echo "    storage on $(stat -f -c %T "$QDRANT_DIR/storage") — usable as is"
+    else
+        IMG="$QDRANT_DIR/storage.img"
+        echo "    storage is on $(stat -f -c %T "$QDRANT_DIR/storage"): backing it with an ext4 image ($IMG, ${QDRANT_STORAGE_GB} GiB sparse)"
+        command -v mkfs.ext4 >/dev/null || fail "mkfs.ext4 is required to back Qdrant storage with an ext4 image"
+        if [ ! -s "$IMG" ]; then
+            truncate -s "${QDRANT_STORAGE_GB}G" "$IMG" && mkfs.ext4 -q -F "$IMG" || fail "could not create $IMG"
+        fi
+        FSTAB_LINE="$IMG $QDRANT_DIR/storage ext4 loop,noatime,nofail 0 0"
+        grep -qF "$IMG " /etc/fstab || printf '%s\n' "$FSTAB_LINE" | sudo -n tee -a /etc/fstab >/dev/null || fail "could not add the storage image to /etc/fstab (needs passwordless sudo): $FSTAB_LINE"
+        sudo -n systemctl daemon-reload 2>/dev/null || true
+        sudo -n mount "$QDRANT_DIR/storage" || fail "could not mount $IMG on $QDRANT_DIR/storage"
+        sudo -n chown "$USER:$USER" "$QDRANT_DIR/storage" || fail "could not chown the mounted storage"
+        echo "    mounted: $(df -hT "$QDRANT_DIR/storage" | tail -1)"
+    fi
     if [ ! -x "$QDRANT_DIR/qdrant" ]; then
         curl -fsSL -o /tmp/qdrant.tar.gz "https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz"
         tar -xzf /tmp/qdrant.tar.gz -C "$QDRANT_DIR"; rm -f /tmp/qdrant.tar.gz; chmod +x "$QDRANT_DIR/qdrant"

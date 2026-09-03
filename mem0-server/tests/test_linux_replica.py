@@ -193,6 +193,16 @@ def test_installer_reads_server_lists_from_the_wsl_installer_not_a_copy():
     assert not re.search(r'^MEM0_MODULES="[a-z]', sh, re.M), "the replica installer must not carry its own module list"
 
 
+def test_qdrant_storage_gets_ext4_when_the_home_filesystem_cannot_host_it():
+    """Live finding: Qdrant 1.18.2 restores the brain's snapshot on tmpfs and ext4 but fails on
+    f2fs ('Failed to load ID tracker mappings', with and without compression). The installer must
+    detect the filesystem and back storage with a loop-mounted ext4 image on anything else."""
+    sh = INSTALLER.read_text(encoding="utf-8")
+    assert "qdrant_fs_ok()" in sh and "ext2/ext3|ext4|xfs|btrfs|tmpfs" in sh
+    assert "mkfs.ext4 -q -F" in sh and "loop,noatime,nofail" in sh and "--qdrant-storage-gb" in sh
+    assert sh.index("qdrant_fs_ok()") < sh.index('say "[5] mem0 server'), "the storage decision belongs to the qdrant step"
+
+
 def test_units_and_scripts_ship_together():
     for f in ("systemd/offline-watcher.service", "systemd/offline-watcher.timer", "scripts/travel/restore-replica.sh", "scripts/travel/offline-watcher.py"):
         assert (REPO_ROOT / f).is_file(), f
