@@ -40,6 +40,7 @@ The older `travel-mode.ps1 on`/`off` switch that an operator flipped by hand is 
 - **Outbox** — the operation queue (`~/.mem0/outbox.jsonl`); each line is an op-typed, `uuid4`-keyed record of a mutation made while offline. Defined in [`../glossary.md`](../glossary.md).
 - **Replayed-key ledger** — `~/.mem0/outbox.replayed.jsonl`; the record of which Outbox keys already applied to the authority, which is what makes replay idempotent.
 - **Connect-level failure** — a TCP connect refusal/timeout, distinct from a slow-but-answered request. Only a connect-level failure triggers failover; a read timeout or an HTTP error status does not.
+- **Thin client** — a native-Linux box installed by `install/linux-client.sh` with the shim and the replay driver only: no local replica, no watcher. Offline, its reads return the shim's offline result and its writes queue; the startup drain replays them when the authority is next reachable. See [`installer-and-deploy.md`](installer-and-deploy.md).
 - **Travel Mode** — the **legacy** manual switch (`travel-mode.ps1 on`/`off`). Defined (and marked legacy) in [`../glossary.md`](../glossary.md).
 
 ## How the system works
@@ -52,6 +53,8 @@ The mem0 MCP shim is the client every `memory_*` tool call flows through. It hol
 
 - **Reads** (`_request`) try the authority first with a short **1.5s connect timeout**; on a connect-level failure they fall over to the local replica and tag the result `source: "local-replica"` with a `stale_note`. If *both* are connect-unreachable the call raises `OfflineError`; `memory_recall` and the context bundle catch it and return an empty-but-valid result marked `offline`, while `memory_search` and the raw record reads let it propagate. Crucially, a **read timeout or an HTTP error status is not a failover trigger** — the authority accepted the connection and is merely slow or erroring, and masking a real answer with a stale replica read would be wrong. That answer propagates instead.
 - **Writes and mutations** (`_authority_only`) go to the authority *only*. On a connect-level failure they do **not** touch the replica — they call `_queue_op`, which appends the operation to the Outbox and returns `{event: "QUEUED_OFFLINE", op, key}`. This covers every mutating tool: `add`, `update`, `delete`, `promote`/`demote`, and the goal / open-question mutations.
+
+On a **thin client** the failover target is simply refused (nothing listens on loopback), so an outage there means offline reads and queued writes — the same two rules, with no replica to soften them; `replay-ops.py` refuses to drain a `client` role's Outbox into loopback exactly as it does for a `replica`.
 
 Offline reads additionally surface **queued-but-unsynced adds**: a search or recall merges any Outbox `add` whose text substring-matches the query, marked `pending_sync: true`, so a fact written minutes ago offline is still findable before it has replayed.
 

@@ -10,6 +10,10 @@ The **brain box**: the single machine that hosts the memory authority (Qdrant + 
 
 A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. Installed with `-Role replica`, it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
+## Client
+
+A **thin client**: a native-Linux box that uses a Brain over the network and keeps no store of its own — only the MCP shim, the Outbox replay driver and the per-host authority/role/key files. Installed with `install/linux-client.sh`; its `~/.mem0/role` is `client`. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+
 ## One-Brain Rule
 
 The invariant that exactly one machine — the Brain — holds write authority while replicas stay read-only; mutations made while the authority is unreachable queue to the Outbox and replay on reconnect, so divergence is impossible by construction. Enforced at install by a `brain`/`replica` role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).

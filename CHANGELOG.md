@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.13 (2026-09-03) — Linux thin client
+
+- New `install/linux-client.sh`: a native-Linux box with no WSL and no local store can now use a
+  remote Brain. It deploys the MCP shim and its sibling replay driver into a small venv, writes
+  the per-host authority/role/key files (`role=client`), registers the `mem0` MCP server in
+  Claude Code, appends the CLAUDE.md tier protocol, and proves the install with a real MCP
+  session calling `memory_health` against the authority. A loopback authority is refused.
+- `replay-ops.py`'s One-Brain refusal (never replay an Outbox into loopback) now covers the
+  `client` role as well as `replica`.
+
 ## v1.20.12 (2026-09-03) — hygiene on every store; the liveness row measures live
 
 - Deterministic hygiene (orphan re-index, dangling/duplicate-slug removal) now runs nightly on
