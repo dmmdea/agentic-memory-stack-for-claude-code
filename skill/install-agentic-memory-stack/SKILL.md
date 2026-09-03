@@ -70,7 +70,7 @@ Or via the skills CLI (always `--copy` — the default symlink breaks on Windows
 
 ### Linux thin client (a box with no store of its own)
 
-For a native-Linux machine that should use an existing Brain over the network, run `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file>` from a checkout instead of the 4-phase installer. It installs the MCP shim + outbox replay only and ends with a real `memory_health` call through the shim. `--dry-run` prints the plan.
+For a native-Linux machine that should use an existing Brain over the network, run `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file>` from a checkout instead of the 4-phase installer. It installs the MCP shim + outbox replay only and ends with a real `memory_health` call through the shim. `--dry-run` prints the plan. For a Linux **replica** (dormant local copy for offline reads, refreshed daily from the Brain over SSH) run `bash install/linux-replica.sh --authority ... --brain-ssh <alias> [--brain-wsl <distro>:<user>]` instead; it needs EmbeddingGemma@768 on `:11436` locally and ends with a real restore.
 
 ## One manual step: the llama-swap model entries
 

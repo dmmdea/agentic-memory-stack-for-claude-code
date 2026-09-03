@@ -17,6 +17,7 @@ Both exist to solve the same underlying hazard: production spans multiple roots 
 - How do the operator-neutral **Sentinel** placeholders in the shipped source become real values on a machine?
 - What is the **One-Brain Rule** role gate, and what does a `replica` box skip?
 - What is a Linux **thin client**, what does `install/linux-client.sh` put on the box, and how does it prove itself?
+- What does `install/linux-replica.sh` add to make a Linux box a **replica**, and why is its local store dormant while online?
 - How does `deploy.sh` push a change safely, and what stops a bad change from restarting the service?
 - What is **R9 Parity** and how do the skew/parity checks catch a drifted deploy?
 
@@ -125,6 +126,17 @@ A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses
 7. Writes `~/.mem0/client-receipt.json` (authority, stack version, shim hash) and runs a **real MCP session over stdio** — initialize, then `tools/call memory_health` — which must report `ok:true` from the authority. An install that cannot reach the Brain through the shim fails here, not later in a session.
 
 Offline behaviour on a client is the shim's per-call rule with no replica behind it: reads surface the offline result, writes queue to `~/.mem0/outbox.jsonl`, and the next shim start with the authority reachable drains them ([`offline-travel.md`](offline-travel.md)). The offline-watcher and the nightly tasks never run on a client. Re-run the script to upgrade; `--dry-run` prints the plan and writes nothing.
+
+### Linux replica (`install/linux-replica.sh`)
+
+A **Linux replica** is a thin client plus a dormant, read-only copy of the Brain. `install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <alias> [--brain-wsl <distro>:<user>] [--brain-backup-dir <dir>] [--api-key-file <file>] [--user-id <tenant>]` runs the thin-client install first, then:
+
+1. Writes `~/.mem0/role` = `replica`, `~/.mem0/replica.env` (how `restore-replica.sh` reaches the Brain's snapshot directory over SSH — through `wsl.exe` when the Brain keeps its stack inside WSL on a Windows host) and `~/.mem0/stack.env` (`MEM0_ROLE=replica`, loopback bind), the same receipts the server's liveness code reads on any box.
+2. Provisions Qdrant and the mem0 server exactly as the WSL-side installer does — with one filesystem rule learned live: Qdrant 1.18.2's snapshot restore fails on **f2fs** ("Failed to load ID tracker mappings"; the same snapshot restores on tmpfs and ext4, and f2fs fails with compression on or off), so when the home filesystem is not ext4/xfs/btrfs/tmpfs the installer backs `~/qdrant-server/storage` with a loop-mounted ext4 image (`storage.img`, `--qdrant-storage-gb`, default 8, an `/etc/fstab` `nofail` entry) — — the module list, the Qdrant version and the pip line are **read from `install/1-wsl-services.sh` at run time**, never copied (pinned by a test) — in their own venv (`python3.12`/`3.13` from PATH, else a `uv`-managed 3.12 bootstrapped into the client venv), warming the BM25 cache the unit expects.
+3. Installs `mem0.service` and `qdrant.service` as systemd **user** units but leaves them **disabled and stopped**: while the Brain is reachable there is one live brain. Installs and enables `offline-watcher.timer` (a 2-minute tick of `scripts/travel/offline-watcher.py`), enabling linger so it ticks without a login session. `restore-replica.sh` and `offline-watcher.py` are deployed beside the shim in `~/.claude/scripts`.
+4. Runs the **first restore** as the proof: `restore-replica.sh` pulls the newest complete set (manifest, Qdrant snapshot, episodic and history ledgers; size-verified, cached under `~/.mem0/replica-snapshots`), starts Qdrant, drops and re-uploads the collection through the snapshot upload API, replaces the ledgers, starts mem0, requires `/health/deep` to answer `ok:true` through the **local** embedder on `:11436` (EmbeddingGemma@768, the Brain's model), stamps `~/.mem0/replica-restored`, then stops both services again.
+
+The restore script carries the One-Brain guard itself: it refuses unless `~/.mem0/role` is `replica` **and** the authority is remote, so it can never overwrite a live store. The watcher's behaviour and the one deliberate difference from the PowerShell watcher (refresh while online, not at go_offline) are in [`offline-travel.md`](offline-travel.md).
 
 ### The deploy pipeline
 
@@ -261,6 +273,8 @@ On a `brain` nothing changes: the authority is loopback and every row runs as be
 - [`../../install/2-windows-config.ps1`](../../install/2-windows-config.ps1) — phase 2 receipt, sentinel resolution, distro-agnostic hooks, `brands.json` fallback, role gate.
 - [`../../install/3-verify.ps1`](../../install/3-verify.ps1) — phase 3 smoke test, skew guard, role-aware checks.
 - [`../../install/linux-client.sh`](../../install/linux-client.sh) — the Linux thin-client install (shim + replay driver, per-host files, MCP entry, end-to-end proof).
+- [`../../install/linux-replica.sh`](../../install/linux-replica.sh) — the Linux replica install (dormant Qdrant + mem0, watcher timer, first restore as proof).
+- [`../../scripts/travel/restore-replica.sh`](../../scripts/travel/restore-replica.sh) / [`../../scripts/travel/offline-watcher.py`](../../scripts/travel/offline-watcher.py) — the Linux ports of the replica restore and the offline watcher.
 - [`../../scripts/wsl/deploy.sh`](../../scripts/wsl/deploy.sh) — the single deploy pipeline (rsync → units → import-smoke → restart → health gate).
 - [`../../scripts/windows/Test-MemoryStack.ps1`](../../scripts/windows/Test-MemoryStack.ps1) — the health verifier that hosts the R9 parity check.
 
