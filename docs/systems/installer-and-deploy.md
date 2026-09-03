@@ -16,6 +16,7 @@ Both exist to solve the same underlying hazard: production spans multiple roots 
 - What is the install **Receipt**, what fields does it carry, and who reads it?
 - How do the operator-neutral **Sentinel** placeholders in the shipped source become real values on a machine?
 - What is the **One-Brain Rule** role gate, and what does a `replica` box skip?
+- What is a Linux **thin client**, what does `install/linux-client.sh` put on the box, and how does it prove itself?
 - How does `deploy.sh` push a change safely, and what stops a bad change from restarting the service?
 - What is **R9 Parity** and how do the skew/parity checks catch a drifted deploy?
 
@@ -78,7 +79,7 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 | Field | Meaning |
 |---|---|
 | `WslUser`, `WinUser`, `Distro` | the three identity dimensions |
-| `Role` | `brain` or `replica` (the One-Brain Rule role) |
+| `Role` | `brain` or `replica` (the One-Brain Rule role); a native-Linux thin client writes `client` to `~/.mem0/role` instead (see *Linux thin client*) |
 | `RepoRootWin`, `RepoRootWsl` | the operator-chosen repository path, both views |
 | `EvalRootWsl` | optional checkout carrying the `eval/` harnesses. Omitting `-EvalRootWsl` on a re-run **inherits** the prior receipt's value rather than blanking it (same rule as `AuthorityUrl`) — a plain re-run used to reset it to empty and silently disable the Dream's drift canary. Only an explicit flag, or a first install with no prior receipt, changes it; when genuinely empty the canary falls back to `RepoRootWsl` |
 | `ApiKeyUnc` | UNC path to the WSL-side API key |
@@ -110,6 +111,20 @@ R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-conso
 ### Verify (phase 3)
 
 `3-verify.ps1` runs an end-to-end smoke test and adds two structural guards beyond the service probes (see *Important flows*): the **skew guard** and the **role-aware task checks**.
+
+### Linux thin client (`install/linux-client.sh`)
+
+A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses another machine's Brain over the network. `install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file> [--user-id <tenant>]` installs only what a client needs and then proves it (`--user-id` is the mem0 tenant the Brain stores under — its own install's WSL username; it defaults to the client's login name, which is only right when the two match):
+
+1. **Refuses a loopback authority** with the same fail-closed host rule as `replay-ops.py`: nothing listens locally on a client, and a loopback authority would queue every write forever.
+2. Writes the per-host files the shim resolves at startup — `~/.mem0/authority-url`, `~/.mem0/role` = `client`, and `~/.mem0/api-key` (copied from `--api-key-file`, mode 0600; the key the authority accepts, i.e. the Brain's own `~/.mem0/api-key`).
+3. Probes the authority's `/health`.
+4. Creates a small venv (`~/apps/mem0-client/.venv`, floors `fastmcp>=3` + `httpx`) and deploys the **same two files** the Windows installer puts in WSL — `mem0-mcp-shim.py` and its sibling `replay-ops.py` — into `~/.claude/scripts`, resolving the `__WSL_USER__` tenant sentinel to `--user-id` exactly as the Windows installer's sentinel pass does (a verbatim copy would write every memory under a literal placeholder tenant; the deploy refuses if any sentinel survives). The shim spawns the sibling to drain the Outbox at startup, so they always deploy together (pinned by a test).
+5. Registers the `mem0` MCP server in Claude Code (user scope) as `<venv python> <shim>`, replacing any previous entry.
+6. Appends the CLAUDE.md memory tier protocol section under the same marker the Windows installer uses.
+7. Writes `~/.mem0/client-receipt.json` (authority, stack version, shim hash) and runs a **real MCP session over stdio** — initialize, then `tools/call memory_health` — which must report `ok:true` from the authority. An install that cannot reach the Brain through the shim fails here, not later in a session.
+
+Offline behaviour on a client is the shim's per-call rule with no replica behind it: reads surface the offline result, writes queue to `~/.mem0/outbox.jsonl`, and the next shim start with the authority reachable drains them ([`offline-travel.md`](offline-travel.md)). The offline-watcher and the nightly tasks never run on a client. Re-run the script to upgrade; `--dry-run` prints the plan and writes nothing.
 
 ### The deploy pipeline
 
@@ -245,6 +260,7 @@ On a `brain` nothing changes: the authority is loopback and every row runs as be
 - [`../../install/1-wsl-services.sh`](../../install/1-wsl-services.sh) — phase 1 WSL services (Qdrant, mem0, `MEM0_MODULES`, keys, units, WSL receipt).
 - [`../../install/2-windows-config.ps1`](../../install/2-windows-config.ps1) — phase 2 receipt, sentinel resolution, distro-agnostic hooks, `brands.json` fallback, role gate.
 - [`../../install/3-verify.ps1`](../../install/3-verify.ps1) — phase 3 smoke test, skew guard, role-aware checks.
+- [`../../install/linux-client.sh`](../../install/linux-client.sh) — the Linux thin-client install (shim + replay driver, per-host files, MCP entry, end-to-end proof).
 - [`../../scripts/wsl/deploy.sh`](../../scripts/wsl/deploy.sh) — the single deploy pipeline (rsync → units → import-smoke → restart → health gate).
 - [`../../scripts/windows/Test-MemoryStack.ps1`](../../scripts/windows/Test-MemoryStack.ps1) — the health verifier that hosts the R9 parity check.
 

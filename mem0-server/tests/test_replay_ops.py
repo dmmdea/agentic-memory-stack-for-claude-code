@@ -187,14 +187,16 @@ def test_is_local_url_fails_closed(ro, url, expected_local):
     assert ro._is_local_url(url) is expected_local
 
 
-def test_replica_refuses_to_replay_into_its_own_loopback(ro, tmp_path, monkeypatch):
+@pytest.mark.parametrize("role", ["replica", "client"])
+def test_replica_refuses_to_replay_into_its_own_loopback(ro, tmp_path, monkeypatch, role):
     """One-Brain Rule: replaying a replica's outbox into loopback would write the queued
     mutations to its DISPOSABLE local store and ledger them as delivered — they then vanish on
-    teardown with nothing reporting a loss. The outbox must survive untouched."""
+    teardown with nothing reporting a loss. The outbox must survive untouched. A thin client
+    (no local store) gets the same refusal: loopback is never its authority."""
     ob = tmp_path / "outbox.jsonl"
     rec = {"op": "add", "args": {"text": "x", "user_id": "u"}, "key": "k-1"}
     ob.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-    monkeypatch.setattr(ro, "_role", lambda: "replica")
+    monkeypatch.setattr(ro, "_role", lambda: role)
     called = []
     monkeypatch.setattr(ro, "dispatch", lambda op, args: called.append(op))
     monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
@@ -202,6 +204,7 @@ def test_replica_refuses_to_replay_into_its_own_loopback(ro, tmp_path, monkeypat
     stats = ro.replay(ob, "http://127.0.0.1:18791", "test-key")
 
     assert "refused" in stats and stats["replayed"] == 0
+    assert stats["refused"].startswith(role)
     assert called == []                                   # nothing was dispatched
     assert json.loads(ob.read_text().strip()) == rec      # outbox preserved byte-identical
 

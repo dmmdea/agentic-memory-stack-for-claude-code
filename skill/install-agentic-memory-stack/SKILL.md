@@ -68,6 +68,10 @@ Or via the skills CLI (always `--copy` — the default symlink breaks on Windows
 
 > Your memory **data** (mem0 SQLite, Qdrant, episodic.db) is NOT in the repo, and the DPAPI canonical-key blob is **not portable** (it's bound to the original Windows user's DPAPI chain). On a new PC you provision a fresh key (see `references/troubleshooting.md` → Canonical-key). Data-backup guidance: `docs/data-backup.md`.
 
+### Linux thin client (a box with no store of its own)
+
+For a native-Linux machine that should use an existing Brain over the network, run `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file>` from a checkout instead of the 4-phase installer. It installs the MCP shim + outbox replay only and ends with a real `memory_health` call through the shim. `--dry-run` prints the plan.
+
 ## One manual step: the llama-swap model entries
 
 The installer fetches the EmbeddingGemma GGUF and verifies the `:11436` embed endpoint, but it does **not** rewrite your llama-swap config (external user config). Ensure two models are in your `always_loaded` group, bound to `127.0.0.1`:

@@ -151,8 +151,12 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
     # keys as done, so the real authority never receives them and nothing reports a loss.
     # offline-watcher.ps1 guards its own authority choice for this reason; this guards every
     # caller, including the shim's unattended startup drain. Refuse, keep the outbox intact.
-    if _role() == "replica" and _is_local_url(authority):
-        stats["refused"] = "replica authority is loopback — refusing to replay into the disposable local store (One-Brain Rule)"
+    # A thin CLIENT (install/linux-client.sh) has no local store at all: loopback there is
+    # nothing, and a replay "succeeding" against a stray local server would be the same silent
+    # loss. Same refusal, both roles.
+    role = _role()
+    if role in ("replica", "client") and _is_local_url(authority):
+        stats["refused"] = role + " authority is loopback — refusing to replay into a local store that is not the authority (One-Brain Rule)"
         return stats
     replaying = outbox.with_suffix(".replaying.jsonl")
     tmp = outbox.with_suffix(".rotating.jsonl")
