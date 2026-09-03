@@ -60,6 +60,11 @@ AUTH="$(grep -v '^\s*#' "$MEM0_DIR/authority-url" 2>/dev/null | sed -n '1p' | tr
 BRAIN_BACKUP_DIR="${BRAIN_BACKUP_DIR:-~/.mem0/backups}"
 REPLICA_CACHE="${REPLICA_CACHE:-$MEM0_DIR/replica-snapshots}"
 for t in curl jq ssh python3; do command -v "$t" >/dev/null || fail "$t is required"; done
+# Dormancy on EVERY exit path: a failed upload or health wait must not leave qdrant/mem0 running
+# while the Brain is reachable. --leave-running only survives a successful restore (the success
+# branch flips RESTORED=1); anything else stops both units.
+RESTORED=0
+trap '[ "$LEAVE_RUNNING" = 1 ] && [ "$RESTORED" = 1 ] || systemctl --user stop mem0.service qdrant.service 2>/dev/null || true' EXIT
 
 # remote command runner: plain Linux brain, or a WSL brain behind a Windows sshd
 remote() { # $1 = a simple bash command line (no single quotes)
@@ -130,6 +135,7 @@ printf '%s' "$deep" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || fail "repli
 echo "    replica live: $restored memories, /health/deep ok"
 printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TS" "$restored" > "$STAMP_FILE"
 log_line ok "restored $restored points from $TS"
+RESTORED=1
 if [ "$LEAVE_RUNNING" = 1 ]; then
     echo "    services left running (offline mode)"
 else

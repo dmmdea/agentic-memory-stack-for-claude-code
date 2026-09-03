@@ -77,6 +77,9 @@ def test_plan_actions(ow):
     assert ow.plan_actions({"mode": "online", "transition": "none"}, True, 1.0) == []
     assert ow.plan_actions({"mode": "online", "transition": "none"}, False, 30.0) == []   # unreachable: no refresh
     assert ow.plan_actions({"mode": "offline", "transition": "none"}, False, 30.0) == []
+    # a failed refresh backs off: an attempt 10 minutes ago blocks the retry, one 7 hours ago allows it
+    assert ow.plan_actions({"mode": "online", "transition": "none"}, True, None, attempt_age_h=0.17) == []
+    assert ow.plan_actions({"mode": "online", "transition": "none"}, True, None, attempt_age_h=7.0) == ["refresh_replica"]
 
 
 def test_dry_run_tick_refuses_without_a_remote_authority(tmp_path):
@@ -132,6 +135,20 @@ def test_restore_refuses_on_a_brain_and_on_a_loopback_authority(tmp_path):
     home, env = _scratch_home(tmp_path)   # replica + remote authority but no replica.env yet
     r = subprocess.run([BASH, str(RESTORE), "--dry-run"], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode != 0 and "replica.env" in r.stderr
+
+
+@pytestmark_bash
+def test_restore_stops_services_on_every_failure_path():
+    """The EXIT trap is the dormancy guarantee: a restore that dies after starting qdrant must
+    not leave it running while the Brain is reachable. Pin the trap and its success-only escape."""
+    sh = RESTORE.read_text(encoding="utf-8")
+    assert 'trap \'[ "$LEAVE_RUNNING" = 1 ] && [ "$RESTORED" = 1 ] || systemctl --user stop mem0.service qdrant.service' in sh
+    assert sh.index("trap '") < sh.index("systemctl --user start qdrant.service"), "the trap must be armed before any service starts"
+    assert "
+RESTORED=1
+" in sh and sh.index("log_line ok") < sh.index("
+RESTORED=1
+")
 
 
 @pytestmark_bash

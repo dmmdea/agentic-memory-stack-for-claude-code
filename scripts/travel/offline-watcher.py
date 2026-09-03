@@ -36,6 +36,7 @@ from pathlib import Path
 DOWN_TICKS = 3          # online -> offline after N consecutive unreachable probes
 UP_TICKS = 2            # offline -> online after M consecutive reachable probes
 REFRESH_AFTER_H = 24.0  # refresh the dormant replica when the last restore is older than this
+RETRY_AFTER_H = 6.0     # after a failed/aborted refresh, do not try again sooner than this
 PROBE_TIMEOUT_S = 4.0
 
 
@@ -98,14 +99,19 @@ def step_offline_state(state: dict, reachable: bool, n: int = DOWN_TICKS, m: int
 
 
 def plan_actions(next_state: dict, reachable: bool, restore_age_h: float | None,
-                 refresh_after_h: float = REFRESH_AFTER_H) -> list[str]:
-    """What this tick does, as data. Transitions win; a steady online tick may refresh."""
+                 attempt_age_h: float | None = None, refresh_after_h: float = REFRESH_AFTER_H,
+                 retry_after_h: float = RETRY_AFTER_H) -> list[str]:
+    """What this tick does, as data. Transitions win; a steady online tick may refresh, but a
+    refresh that failed is not retried every 2 minutes: attempt_age_h (age of the last restore
+    attempt, success or not) must exceed retry_after_h first."""
     t = next_state.get("transition")
     if t == "go_offline":
         return ["start_services"]
     if t == "go_online":
         return ["drain_outbox", "stop_services"]
-    if next_state.get("mode") == "online" and reachable and (restore_age_h is None or restore_age_h > refresh_after_h):
+    stale = restore_age_h is None or restore_age_h > refresh_after_h
+    cooled = attempt_age_h is None or attempt_age_h > retry_after_h
+    if next_state.get("mode") == "online" and reachable and stale and cooled:
         return ["refresh_replica"]
     return []
 
@@ -129,12 +135,24 @@ def load_state(path: Path) -> dict:
         return default
 
 
+def _age_hours(iso: str) -> float:
+    ts = _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+    return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() / 3600.0
+
+
 def restore_age_hours(stamp: Path) -> float | None:
     try:
-        first = stamp.read_text(encoding="utf-8").split()[0]
-        ts = _dt.datetime.strptime(first, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
-        return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() / 3600.0
+        return _age_hours(stamp.read_text(encoding="utf-8").split()[0])
     except (OSError, ValueError, IndexError):
+        return None
+
+
+def attempt_age_hours(stamp: Path) -> float | None:
+    """Age of the last refresh ATTEMPT (written by this watcher before it runs the restore), so a
+    failing restore backs off instead of re-running on every tick."""
+    try:
+        return _age_hours(stamp.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
         return None
 
 
@@ -157,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     here = Path(__file__).resolve().parent
     state_file = mem0 / "offline-mode.json"
     stamp = mem0 / "replica-restored"
+    attempt = mem0 / "replica-refresh-attempt"
     log = mem0 / "offline-watcher.log"
 
     authority = resolve_authority(a.authority, os.environ.get("MEM0_URL"), mem0 / "authority-url")
@@ -167,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     prev = load_state(state_file)
     nxt = step_offline_state(prev, reachable)
     age = restore_age_hours(stamp)
-    actions = plan_actions(nxt, reachable, age)
+    actions = plan_actions(nxt, reachable, age, attempt_age_hours(attempt))
     line = {"ts": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "authority": authority,
             "reachable": reachable, "mode": nxt["mode"], "transition": nxt["transition"],
             "restore_age_h": None if age is None else round(age, 2), "actions": actions}
@@ -196,6 +215,11 @@ def main(argv: list[str] | None = None) -> int:
                 results[act] = (1, "replay-ops.py not deployed beside the watcher")
         elif act == "refresh_replica":
             restore = here / "restore-replica.sh"
+            try:
+                mem0.mkdir(parents=True, exist_ok=True)
+                attempt.write_text(line["ts"] + "\n", encoding="utf-8")
+            except OSError:
+                pass
             results[act] = run(["bash", str(restore)], timeout=3600) if restore.exists() else (1, "restore-replica.sh not deployed beside the watcher")
     line["results"] = {k: {"rc": v[0], "out": v[1][-400:]} for k, v in results.items()}
     try:
