@@ -103,11 +103,13 @@ if plan "write $MEM0_DIR/role=replica, replica.env (BRAIN_SSH/BRAIN_BACKUP_DIR/B
     umask 077
     printf 'replica\n' > "$MEM0_DIR/role"
     cat > "$MEM0_DIR/replica.env" <<ENV
-# written by install/linux-replica.sh — how restore-replica.sh reaches the Brain's snapshots
-BRAIN_SSH=$BRAIN_SSH
-BRAIN_BACKUP_DIR=$BRAIN_BACKUP_DIR
-BRAIN_WSL=$BRAIN_WSL
-REPLICA_CACHE=$MEM0_DIR/replica-snapshots
+# written by install/linux-replica.sh — how restore-replica.sh reaches the Brain's snapshots.
+# BRAIN_BACKUP_DIR is a REMOTE path: single-quoted so a leading ~ survives being sourced here
+# and expands on the Brain (unquoted, bash expanded it to this box's own home).
+BRAIN_SSH='$BRAIN_SSH'
+BRAIN_BACKUP_DIR='$BRAIN_BACKUP_DIR'
+BRAIN_WSL='$BRAIN_WSL'
+REPLICA_CACHE='$MEM0_DIR/replica-snapshots'
 ENV
     cat > "$MEM0_DIR/stack.env" <<ENV
 MEM0_WSL_USER=$USER_ID

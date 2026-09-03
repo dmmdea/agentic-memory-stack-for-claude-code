@@ -57,7 +57,9 @@ AUTH="$(grep -v '^\s*#' "$MEM0_DIR/authority-url" 2>/dev/null | sed -n '1p' | tr
 # shellcheck disable=SC1091
 . "$MEM0_DIR/replica.env"
 : "${BRAIN_SSH:?BRAIN_SSH unset in replica.env}"
-BRAIN_BACKUP_DIR="${BRAIN_BACKUP_DIR:-~/.mem0/backups}"
+# Remote path: the tilde must reach the Brain unexpanded (a bare ~ in the default or in an
+# unquoted env value expands to THIS box's home and the restore looks in the wrong place).
+BRAIN_BACKUP_DIR="${BRAIN_BACKUP_DIR:-"~/.mem0/backups"}"
 REPLICA_CACHE="${REPLICA_CACHE:-$MEM0_DIR/replica-snapshots}"
 for t in curl jq ssh python3; do command -v "$t" >/dev/null || fail "$t is required"; done
 # Dormancy on EVERY exit path: a failed upload or health wait must not leave qdrant/mem0 running

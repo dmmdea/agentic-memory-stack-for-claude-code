@@ -148,6 +148,21 @@ def test_restore_stops_services_on_every_failure_path():
 
 
 @pytestmark_bash
+def test_remote_backup_dir_tilde_reaches_the_brain_unexpanded(tmp_path):
+    """The first live restore looked in the REPLICA's home: `BRAIN_BACKUP_DIR=~/.mem0/backups`
+    sourced from replica.env expanded ~ locally. The remote command must carry the literal ~."""
+    home, env = _scratch_home(tmp_path)
+    (home / ".mem0" / "replica.env").write_text("BRAIN_SSH='brain'\nBRAIN_BACKUP_DIR='~/.mem0/backups'\nBRAIN_WSL=''\n", encoding="utf-8")
+    ssh = tmp_path / "bin" / "ssh"   # echo the remote command line so the test can read it
+    ssh.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >> \"$SSH_TRACE\"\nexit 0\n", encoding="utf-8")
+    env["SSH_TRACE"] = str(tmp_path / "ssh.trace")
+    subprocess.run([BASH, str(RESTORE), "--dry-run"], capture_output=True, text=True, env=env, timeout=60)
+    trace = (tmp_path / "ssh.trace").read_text(encoding="utf-8")
+    assert "~/.mem0/backups/manifest-*.json" in trace, trace
+    assert str(home) not in trace, "the replica's own home leaked into the remote command"
+
+
+@pytestmark_bash
 def test_installer_contract_and_dry_run(tmp_path):
     home, env = _scratch_home(tmp_path)
     r = subprocess.run([BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--dry-run"], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
