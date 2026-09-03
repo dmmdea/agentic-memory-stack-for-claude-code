@@ -87,7 +87,7 @@ echo "    stack $STACK_VERSION; authority $AUTHORITY; brain via ssh '$BRAIN_SSH'
 echo "    server: qdrant $QDRANT_VERSION, $(echo "$MEM0_MODULES" | wc -w) modules, specs: $PIP_SPECS"
 if [ "$DRY_RUN" = 0 ]; then
     curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null || fail "no local embedder on :11436 — serve EmbeddingGemma@768 through llama-swap first (see install/llama-swap-setup.md)"
-    ssh -o BatchMode=yes -o ConnectTimeout=15 "$BRAIN_SSH" true >/dev/null 2>&1 || fail "ssh '$BRAIN_SSH' does not accept key auth from this box"
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$BRAIN_SSH" exit 0 >/dev/null 2>&1 || fail "ssh '$BRAIN_SSH' does not accept key auth from this box"
 fi
 
 # ---------------------------------------------------------------- 1. thin client first
