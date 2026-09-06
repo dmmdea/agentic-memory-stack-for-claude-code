@@ -4,6 +4,20 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.15 (2026-09-06) — the compactor runs every night, and converges on lines
+
+- Compactor throttle 23h → 12h: a daytime hand run marked the throttle and the next 05:00 run
+  skipped itself (one silent night, 2026-09-04).
+- `memory-compact.ps1 -CatchUp`, launched by the SessionStart spawner: runs the nightly only
+  when the newest receipt is older than 24h. The box was off at 05:00 on 2026-09-05 and the
+  scheduler's missed-start retry refused ("user not logged on"); nothing re-ran the job.
+- Line floor: when an index is over its line trigger, the oldest pullable facts the judge did
+  not migrate are migrated deterministically (write-then-verify, blast cap, doctrine excluded)
+  until the store is back at its line target; receipts carry `line_floored`. A store had
+  climbed to 174 lines while every nightly migrated 0.
+- Orphan re-index synthesizes the hook from a frontmatter-less file's first line of prose
+  instead of "recovered orphan; no description".
+
 ## v1.20.14 (2026-09-03) — Linux replica role
 
 - New `install/linux-replica.sh`: a native-Linux box becomes a replica — thin client plus a

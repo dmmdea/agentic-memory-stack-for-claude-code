@@ -520,6 +520,25 @@ function Get-AmEntryGhosts {
     return @($ghosts.Keys | Sort-Object)
 }
 
+function Get-AmSynthesizedHook {
+    # A fact file with no frontmatter (a session re-created a migrated slug and appended only
+    # its addendum) still deserves a hook that says what it is: the first real line of prose,
+    # emphasis and links stripped. 'recovered orphan; no description' told the reader nothing.
+    param([Parameter(Mandatory)][string]$Path, $Frontmatter)
+    $text = ''
+    try { $text = if ($Frontmatter -and $null -ne $Frontmatter.Body) { [string]$Frontmatter.Body } else { Read-AmText -Path $Path } } catch { $text = '' }
+    foreach ($line in @($text -split "\r?\n")) {
+        $t = "$line".Trim()
+        if (-not $t) { continue }
+        if ($t.StartsWith('#') -or $t.StartsWith('---') -or $t.StartsWith('|') -or $t.StartsWith('```') -or $t.StartsWith('<')) { continue }
+        $t = $t -replace '\[([^\]]*)\]\([^)]*\)', '$1'   # a link would inject a second slug into the line
+        $t = $t -replace '\*\*', '' -replace '`', '' -replace '^[-*]\s+', '' -replace '\s+', ' '
+        $t = $t.Trim()
+        if ($t) { return $t }
+    }
+    return 'recovered orphan; no description'
+}
+
 function Get-AmTruncatedToBytes {
     # Truncate to a BYTE budget (not a character count) on a word boundary where possible.
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$MaxBytes = 100)

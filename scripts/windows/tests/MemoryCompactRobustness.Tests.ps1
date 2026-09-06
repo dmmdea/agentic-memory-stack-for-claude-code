@@ -378,3 +378,65 @@ Describe 'hygiene runs on every store (2026-09-03): a small store is not exempt 
         Test-Path (Join-Path $sb.Home '.claude\state\throttle-marked') | Should -BeTrue -Because 'a clean pass is a real decision; the throttle is marked'
     }
 }
+
+Describe 'line floor, catch-up and synthesized hooks (2026-09-06)' {
+    BeforeAll { . (Join-Path $PSScriptRoot 'MemoryCompact.Fixture.ps1') }
+
+    It 'migrates the OLDEST pullable facts until the store is back at its line target, never doctrine, when the judge keeps everything' {
+        # 172 short entries (+2 header lines = 174 index lines): ~8 KB, under the byte trigger but over the 160-line trigger.
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $lines = @('# Memory Index', ''); $facts = @{}
+        for ($i = 1; $i -le 169; $i++) {
+            $lines += ('- [Fact ' + $i + '](fact' + $i + '.md) ' + $script:EmDash + ' hook ' + $i)
+            $facts['fact' + $i + '.md'] = (New-FactFile ('fact' + $i) ('desc ' + $i) 'reference' ('body ' + $i))
+        }
+        for ($i = 1; $i -le 3; $i++) {
+            $lines += ('- [Rule ' + $i + '](rule' + $i + '.md) ' + $script:EmDash + ' Daniel: never do thing ' + $i)
+            $facts['rule' + $i + '.md'] = (New-FactFile ('rule' + $i) ('Daniel: never do thing ' + $i) 'feedback' ('the rule ' + $i))
+        }
+        $dir = Add-SandboxStore -Sandbox $sb -Workspace 'tall' -IndexLines $lines -Facts $facts
+        # age: fact1..fact40 are the oldest (100 days back, ascending), the rest are fresh
+        for ($i = 1; $i -le 40; $i++) { (Get-Item (Join-Path $dir ('fact' + $i + '.md'))).LastWriteTime = (Get-Date).AddDays(-100 + $i) }
+        $r = Invoke-Compactor -Sandbox $sb
+        $rc = $r.Receipts | Where-Object { $_.workspace -eq 'tall' } | Select-Object -Last 1
+        $rc.status | Should -Be 'applied'
+        $rc.line_floored | Should -Be 34 -Because '174 index lines -> 140 target = 34 migrations, all from the floor (the judge kept everything); the blast cap is floor(0.2*172) = 34'
+        $rc.migrated | Should -Be 34
+        $rc.after_lines | Should -BeLessOrEqual 142
+        for ($i = 1; $i -le 34; $i++) { Test-Path (Join-Path $dir ('fact' + $i + '.md')) | Should -BeFalse -Because "fact$i is among the 34 oldest" }
+        Test-Path (Join-Path $dir 'fact35.md') | Should -BeTrue
+        Test-Path (Join-Path $dir 'fact169.md') | Should -BeTrue
+        for ($i = 1; $i -le 3; $i++) { Test-Path (Join-Path $dir ('rule' + $i + '.md')) | Should -BeTrue -Because 'doctrine is never migrated by the floor' }
+        (Get-Content (Join-Path $dir 'MEMORY.md') -Raw) | Should -Match '\(rule1\.md\)'
+        $r.ExitCode | Should -Be 0
+    }
+
+    It '-CatchUp exits silently when the newest receipt is under 24h old, and runs when there is none' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'cu' -IndexLines @('# Memory Index', '', ('- [A](a.md) ' + $script:EmDash + ' hook')) -Facts @{ 'a.md' = (New-FactFile 'a' 'd'); 'orphan.md' = (New-FactFile 'orphan' 'x') } | Out-Null
+        $stateDir = Join-Path $sb.Home '.claude\state\automemory'
+        [System.IO.Directory]::CreateDirectory($stateDir) | Out-Null
+        $fresh = '{"ts":"' + (Get-Date).ToUniversalTime().ToString('o') + '","workspace":"cu","status":"applied"}'
+        Set-Content -LiteralPath (Join-Path $stateDir 'compact-receipts.jsonl') -Value $fresh -Encoding UTF8
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
+        $r.Receipts.Count | Should -Be 1 -Because 'a fresh receipt means the nightly ran; a session start must not re-run it'
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw -ErrorAction SilentlyContinue) | Should -Not -Match 'catch-up'
+        Remove-Item -LiteralPath (Join-Path $stateDir 'compact-receipts.jsonl') -Force
+        $r2 = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
+        $r2.Receipts.Count | Should -BeGreaterOrEqual 1 -Because 'no receipt at all = the nightly was missed; catch-up runs it'
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'catch-up: last receipt absent'
+        ($r2.Receipts | Where-Object { $_.workspace -eq 'cu' } | Select-Object -Last 1).reindexed | Should -Be 1
+    }
+
+    It 're-indexes a frontmatter-less orphan with a hook made from its first line of prose' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $addendum = "**2026-09-03 addendum " + $script:EmDash + " orphan engine cores.** vLLM engine cores are setproctitle'd; see [old](x.md).`n`nmore text`n"
+        $dir = Add-SandboxStore -Sandbox $sb -Workspace 'fl' -IndexLines @('# Memory Index', '', ('- [A](a.md) ' + $script:EmDash + ' hook')) -Facts @{ 'a.md' = (New-FactFile 'a' 'd'); 'wsl2-traps.md' = $addendum }
+        $r = Invoke-Compactor -Sandbox $sb
+        ($r.Receipts | Where-Object { $_.workspace -eq 'fl' } | Select-Object -Last 1).reindexed | Should -Be 1
+        $idx = Get-Content (Join-Path $dir 'MEMORY.md') -Raw
+        $idx | Should -Match '\(wsl2-traps\.md\) .* 2026-09-03 addendum'
+        $idx | Should -Not -Match 'no description'
+        $idx | Should -Not -Match '\(x\.md\)' -Because 'a link inside the prose must not become a second slug on the line'
+    }
+}
