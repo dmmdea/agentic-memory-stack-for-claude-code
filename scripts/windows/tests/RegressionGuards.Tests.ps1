@@ -533,10 +533,23 @@ Describe 'Compactor throttle + catch-up (2026-09-06)' {
         $src | Should -Match '-CatchUp'
         foreach ($n in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-lint.ps1')) { $src | Should -Match ([regex]::Escape($n)) }
     }
+    It 'an attributed statement is doctrine; a topic prefix or an all-caps label is not' {
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1')
+        $rec = { param($hook) [pscustomobject]@{ Kind = 'entry'; Slug = 'x.md'; Title = 'x'; Summary = $hook; Bytes = 10 } }
+        $proj = [pscustomobject]@{ Type = 'project'; Description = ''; Body = 'b' }
+        Test-AmDoctrine -Record (& $rec "Owner: the small box = first-class, ABSOLUTE") -Frontmatter $proj | Should -BeTrue
+        Test-AmDoctrine -Record (& $rec "Owner (CANONICAL): the tier xlsx is updated first") -Frontmatter $proj | Should -BeTrue
+        Test-AmDoctrine -Record (& $rec "Owner: don't pin deps into staleness") -Frontmatter $proj | Should -BeTrue
+        Test-AmDoctrine -Record (& $rec "Open for RTL8159 0bda:815a: cdc_ncm binds with Duplex Unknown") -Frontmatter $proj | Should -BeFalse
+        Test-AmDoctrine -Record (& $rec "RECURRING: spacey path silently opens Documents; quote it") -Frontmatter $proj | Should -BeFalse
+        Test-AmDoctrine -Record (& $rec "a fixture keeping only the events your parser consumes cannot falsify it") -Frontmatter $proj | Should -BeFalse
+    }
+
     It 'the compactor exposes -CatchUp and a line floor' {
         $code = script:CodeOf $script:compactPath
         $code | Should -Match '\[switch\]\$CatchUp'
         $code | Should -Match 'AmCatchUpHours\s*=\s*24'
+        $code | Should -Match 'Test-Throttle -Name \$ThrottleName -MinIntervalSeconds \(\$script:AmCatchUpHours' -Because 'the catch-up gate reads the throttle stamp (a quiet night writes no receipt)'
         $code | Should -Match 'lineFloorPlan' -Because 'lines only fall through migration; the floor must exist'
         $code | Should -Match 'line_floored'
     }

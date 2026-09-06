@@ -17,6 +17,9 @@ in the first entries below — full pre-inversion history lives in the maintaine
   climbed to 174 lines while every nightly migrated 0.
 - Orphan re-index synthesizes the hook from a frontmatter-less file's first line of prose
   instead of "recovered orphan; no description".
+- Doctrine now includes attributed statements (`Owner: …`): the first live line-floor run
+  migrated an operator rule typed `project` with no imperative verb. Migration failures log the
+  server's answer instead of a bare "returned no id".
 
 ## v1.20.14 (2026-09-03) — Linux replica role
 

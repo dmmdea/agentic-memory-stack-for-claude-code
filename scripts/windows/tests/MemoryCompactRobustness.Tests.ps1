@@ -411,21 +411,40 @@ Describe 'line floor, catch-up and synthesized hooks (2026-09-06)' {
         $r.ExitCode | Should -Be 0
     }
 
-    It '-CatchUp exits silently when the newest receipt is under 24h old, and runs when there is none' {
+    It '-CatchUp exits silently while the throttle stamp is fresh (a quiet night writes no receipt), and runs once it is stale' {
         $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
         Add-SandboxStore -Sandbox $sb -Workspace 'cu' -IndexLines @('# Memory Index', '', ('- [A](a.md) ' + $script:EmDash + ' hook')) -Facts @{ 'a.md' = (New-FactFile 'a' 'd'); 'orphan.md' = (New-FactFile 'orphan' 'x') } | Out-Null
-        $stateDir = Join-Path $sb.Home '.claude\state\automemory'
-        [System.IO.Directory]::CreateDirectory($stateDir) | Out-Null
-        $fresh = '{"ts":"' + (Get-Date).ToUniversalTime().ToString('o') + '","workspace":"cu","status":"applied"}'
-        Set-Content -LiteralPath (Join-Path $stateDir 'compact-receipts.jsonl') -Value $fresh -Encoding UTF8
+        $marker = Join-Path $sb.Home '.claude\state\throttle-fresh'
+        Set-Content -LiteralPath $marker -Value '1'
         $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
-        $r.Receipts.Count | Should -Be 1 -Because 'a fresh receipt means the nightly ran; a session start must not re-run it'
+        $r.Receipts.Count | Should -Be 0 -Because 'a fresh throttle stamp means last night ran (receipt or not); a session start must not re-run it'
         (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw -ErrorAction SilentlyContinue) | Should -Not -Match 'catch-up'
-        Remove-Item -LiteralPath (Join-Path $stateDir 'compact-receipts.jsonl') -Force
+        Remove-Item -LiteralPath $marker -Force
         $r2 = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
-        $r2.Receipts.Count | Should -BeGreaterOrEqual 1 -Because 'no receipt at all = the nightly was missed; catch-up runs it'
-        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'catch-up: last receipt absent'
+        $r2.Receipts.Count | Should -BeGreaterOrEqual 1 -Because 'a stale stamp = the nightly was missed; catch-up runs it'
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'catch-up: no productive run'
         ($r2.Receipts | Where-Object { $_.workspace -eq 'cu' } | Select-Object -Last 1).reindexed | Should -Be 1
+    }
+
+    It 'the line floor never migrates an ATTRIBUTED statement, even when it is typed project' {
+        # The live run migrated "Owner: X's box = first-class, ABSOLUTE" - no imperative verb, type
+        # project. An attributed statement is doctrine whatever verb follows.
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $lines = @('# Memory Index', ''); $facts = @{}
+        for ($i = 1; $i -le 165; $i++) {
+            $lines += ('- [Fact ' + $i + '](fact' + $i + '.md) ' + $script:EmDash + ' hook ' + $i)
+            $facts['fact' + $i + '.md'] = (New-FactFile ('fact' + $i) ('desc ' + $i) 'reference' ('body ' + $i))
+        }
+        $lines += ('- [Owner priority](owner-priority.md) ' + $script:EmDash + " Owner: the small box = first-class, ABSOLUTE #1 queue priority")
+        $facts['owner-priority.md'] = (New-FactFile 'owner-priority' "Owner 2026-07-23: the small box = first-class, ABSOLUTE #1 priority" 'project' 'the standing order')
+        $dir = Add-SandboxStore -Sandbox $sb -Workspace 'attr' -IndexLines $lines -Facts $facts
+        (Get-Item (Join-Path $dir 'owner-priority.md')).LastWriteTime = (Get-Date).AddDays(-400)   # the oldest file of all
+        $r = Invoke-Compactor -Sandbox $sb
+        $rc = $r.Receipts | Where-Object { $_.workspace -eq 'attr' } | Select-Object -Last 1
+        $rc.status | Should -Be 'applied'
+        $rc.line_floored | Should -BeGreaterThan 0
+        Test-Path (Join-Path $dir 'owner-priority.md') | Should -BeTrue -Because 'the oldest file is an attributed standing order; the floor must skip it'
+        (Get-Content (Join-Path $dir 'MEMORY.md') -Raw) | Should -Match '\(owner-priority\.md\)'
     }
 
     It 're-indexes a frontmatter-less orphan with a hook made from its first line of prose' {

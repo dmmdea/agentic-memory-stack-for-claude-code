@@ -60,21 +60,11 @@ $ReceiptPath = Join-Path (Get-AmStateRoot) 'compact-receipts.jsonl'
 $script:AmCatchUpHours = 24
 
 if ($CatchUp) {
-    $lastReceipt = $null
-    try {
-        if (Test-Path -LiteralPath $ReceiptPath) {
-            foreach ($l in @(Get-Content -LiteralPath $ReceiptPath -Tail 200)) {
-                if (-not $l.Trim()) { continue }
-                $o = $null; try { $o = $l | ConvertFrom-Json } catch { continue }
-                if ($o -and $o.ts) {
-                    $t = ([DateTime]::Parse([string]$o.ts, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)).ToUniversalTime()
-                    if (-not $lastReceipt -or $t -gt $lastReceipt) { $lastReceipt = $t }
-                }
-            }
-        }
-    } catch {}
-    if ($lastReceipt -and (((Get-Date).ToUniversalTime() - $lastReceipt).TotalHours -lt $script:AmCatchUpHours)) { exit 0 }
-    Write-MemoryLog -Component $Component -Message ('catch-up: last receipt ' + $(if ($lastReceipt) { [Math]::Round(((Get-Date).ToUniversalTime() - $lastReceipt).TotalHours, 1).ToString() + 'h old' } else { 'absent' }) + '; the nightly was missed - running it now')
+    # The freshness signal is the throttle stamp, NOT the receipts file: a quiet night (every
+    # store under trigger) is productive and marks the stamp but writes no receipt by design, so
+    # a receipt-based gate would fire on ordinary session starts (review finding, 2026-09-06).
+    if (-not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds ($script:AmCatchUpHours * 3600))) { exit 0 }
+    Write-MemoryLog -Component $Component -Message ('catch-up: no productive run in the last ' + $script:AmCatchUpHours + 'h - the nightly was missed; running it now')
 }
 
 # -Force disarms the throttle, the trigger AND the liveness gate. That combination must never
@@ -261,11 +251,11 @@ function Add-AmMem0Migration {
             -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 20
         $id = $null
         if ($r -and $r.results -and @($r.results).Count -gt 0) { $id = [string]@($r.results)[0].id }
-        if (-not $id) { return $null }
+        if (-not $id) { $script:LastMigrationError = ('server answered without an id: ' + (($r | ConvertTo-Json -Compress -Depth 3) -replace '\s+', ' ').Substring(0, [Math]::Min(200, (($r | ConvertTo-Json -Compress -Depth 3) -replace '\s+', ' ').Length))); return $null }
         $dedup = $false
         if ($r.PSObject.Properties['deduplicated'] -and $r.deduplicated) { $dedup = $true }
         return [pscustomobject]@{ Id = $id; Deduplicated = $dedup }
-    } catch { return $null }
+    } catch { $script:LastMigrationError = $_.Exception.Message; return $null }
 }
 
 function Remove-AmMem0Record {
@@ -594,9 +584,14 @@ foreach ($cand in $candidates) {
     $lineFloorPlan = @()
     if ($lineDebt -gt 0) {
         $judgeMigrates = @(@($plan) | Where-Object { $_ -and $_.slug -and ("" + $_.action).ToUpperInvariant() -eq 'MIGRATE' } | ForEach-Object { [string]$_.slug })
+        # Anything the judge decided (SHORTEN included) stays out of the pool: a line shortened
+        # and then migrated in the same run wastes the judge's edit. Debt is estimated from the
+        # judge's MIGRATEs before they run; one that fails to land leaves the store a line over
+        # target tonight and the floor takes it tomorrow (self-healing, never over-migrating).
+        $judgeDecided = @(@($plan) | Where-Object { $_ -and $_.slug } | ForEach-Object { [string]$_.slug })
         $lineDebtLeft = $lineDebt - [Math]::Min(@($judgeMigrates).Count, $MaxMigrationsPerRun)
         if ($lineDebtLeft -gt 0) {
-            $pool = @($migratable | Where-Object { $judgeMigrates -notcontains $_.Slug } | Sort-Object -Property @{ Expression = { try { (Get-Item -LiteralPath (Join-Path $store.Dir $_.Slug)).LastWriteTimeUtc } catch { [DateTime]::MaxValue } } })
+            $pool = @($migratable | Where-Object { $judgeDecided -notcontains $_.Slug } | Sort-Object -Property @{ Expression = { try { (Get-Item -LiteralPath (Join-Path $store.Dir $_.Slug)).LastWriteTimeUtc } catch { [DateTime]::MaxValue } } })
             $lineFloorPlan = @($pool | Select-Object -First $lineDebtLeft | ForEach-Object { [pscustomobject]@{ slug = $_.Slug; action = 'MIGRATE'; floor = $true } })
             Write-MemoryLog -Component $Component -Message ($ws + ': line floor: ' + $linesAfterHygiene + ' lines > trigger ' + $script:AmTriggerLines + '; migrating the ' + @($lineFloorPlan).Count + ' oldest pullable fact(s) toward the ' + $script:AmTargetLines + '-line target')
         }
@@ -677,8 +672,8 @@ foreach ($cand in $candidates) {
             } else {
                 # No id: the write failed or the server returned nothing usable. A record MAY
                 # still have landed; the retry is hash-idempotent, so nothing to undo.
-                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned no id; line kept')
-                Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' returned no id; line kept')
+                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned no id; line kept: ' + $script:LastMigrationError)
+                Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' returned no id; line kept (' + $script:LastMigrationError + ')')
             }
         }
     }

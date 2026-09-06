@@ -356,6 +356,17 @@ function Read-AmFrontmatter {
 # a Pester fixture that mirrors its documented examples). A sentence-level test: standing
 # orders open with MUST/NEVER/ALWAYS/SHALL/DO NOT/DON'T/RULE:, or say "you must" anywhere.
 $script:AmImperativeRegex = [regex]"(?ix)(?:^\s*(?:MUST|NEVER|ALWAYS|SHALL)\b|^\s*(?:DO\s+NOT|DON'T)\b|^\s*RULE\s*:|\byou\s+must\b)"
+# 2026-09-06: an ATTRIBUTED statement - "Owner: ..." or "Owner (CANONICAL): ..." - is a standing
+# order from a person, whatever verb follows. The line floor migrated one ("Owner: X's box =
+# first-class, ABSOLUTE") because it was typed `project` and did not open with an imperative.
+# One capitalised word (a name), optional parenthetical, colon, then text. "Open for X:" and
+# "RECURRING:" do not match: a space before the colon, or all-caps, is not a name.
+$script:AmAttributedRegex = [regex]"^\s*[A-Z][a-z]+(?:\s*\([^)]*\))?\s*:\s+\S"
+function Test-AmAttributed {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return $script:AmAttributedRegex.IsMatch($Text)
+}
 
 function Test-AmImperative {
     param([AllowEmptyString()][AllowNull()][string]$Text)
@@ -372,6 +383,8 @@ function Test-AmDoctrine {
     if ($Frontmatter -and $Frontmatter.Type -and ($Frontmatter.Type.ToLowerInvariant() -eq 'feedback')) { return $true }
     if (Test-AmImperative -Text $Record.Summary) { return $true }
     if ($Frontmatter -and (Test-AmImperative -Text $Frontmatter.Description)) { return $true }
+    if (Test-AmAttributed -Text $Record.Summary) { return $true }
+    if ($Frontmatter -and (Test-AmAttributed -Text $Frontmatter.Description)) { return $true }
     return $false
 }
 
