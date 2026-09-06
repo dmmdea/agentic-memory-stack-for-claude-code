@@ -27,7 +27,7 @@
 $script:StubDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 function Initialize-MemoryEnv { }
 function Write-MemoryLog { param($Component, $Message) Add-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\logs\compact-test.log') -Value $Message }
-function Test-Throttle { param($Name, $MinIntervalSeconds) return $true }
+function Test-Throttle { param($Name, $MinIntervalSeconds) return (-not (Test-Path (Join-Path $env:USERPROFILE '.claude\state\throttle-fresh'))) }
 function Mark-Throttle { param($Name) Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\throttle-marked') -Value '1' }
 function Acquire-CodexLock { param($Owner, $MaxAgeMinutes) return ($env:STUB_LOCK_HELD -ne '1') }
 function Release-CodexLock { }

@@ -39,6 +39,10 @@ param(
     [switch]$DryRun,
     [switch]$Force,
     [string]$Workspace,          # limit to one workspace (rehearsal / manual run)
+    # -CatchUp: the SessionStart child. Runs the nightly only when the newest receipt is older
+    # than 24h (the 5am task missed a night: box off, or "user not logged on" at the missed-start
+    # retry); otherwise exits silently. A session start is not an event worth a log line.
+    [switch]$CatchUp,
     [int]$MaxMigrationsPerRun = 5,
     [int]$CodexTimeoutSeconds = 240
 )
@@ -53,6 +57,15 @@ Initialize-MemoryEnv
 $Component = 'memory-compact'
 $ThrottleName = 'memory-compact'
 $ReceiptPath = Join-Path (Get-AmStateRoot) 'compact-receipts.jsonl'
+$script:AmCatchUpHours = 24
+
+if ($CatchUp) {
+    # The freshness signal is the throttle stamp, NOT the receipts file: a quiet night (every
+    # store under trigger) is productive and marks the stamp but writes no receipt by design, so
+    # a receipt-based gate would fire on ordinary session starts (review finding, 2026-09-06).
+    if (-not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds ($script:AmCatchUpHours * 3600))) { exit 0 }
+    Write-MemoryLog -Component $Component -Message ('catch-up: no productive run in the last ' + $script:AmCatchUpHours + 'h - the nightly was missed; running it now')
+}
 
 # -Force disarms the throttle, the trigger AND the liveness gate. That combination must never
 # be aimable at the whole fleet while sessions are live: require it to be scoped or read-only.
@@ -85,10 +98,12 @@ function Write-AmReceipt {
     }
 }
 
-# 23h like the dream: the stamp is written at completion, so a strict 24h window would make a
-# fixed 05:00 trigger ineligible by a few seconds every other night.
-if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 82800)) {
-    Write-MemoryLog -Component $Component -Message 'skipping: nightly throttle (23h) not yet elapsed'
+# 12h (2026-09-06; was 23h like the dream). The throttle exists so the SessionStart catch-up and
+# the 5am task cannot both run the same night. At 23h a MANUAL afternoon run (15:43) marked the
+# throttle and the next 05:00 declared itself too early: an operator hand pass cost a night.
+# 12h keeps the double-run guard and lets a daytime run coexist with the nightly.
+if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 43200)) {
+    Write-MemoryLog -Component $Component -Message 'skipping: throttle (12h) not yet elapsed'
     exit 0
 }
 
@@ -236,11 +251,11 @@ function Add-AmMem0Migration {
             -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 20
         $id = $null
         if ($r -and $r.results -and @($r.results).Count -gt 0) { $id = [string]@($r.results)[0].id }
-        if (-not $id) { return $null }
+        if (-not $id) { $script:LastMigrationError = ('server answered without an id: ' + (($r | ConvertTo-Json -Compress -Depth 3) -replace '\s+', ' ').Substring(0, [Math]::Min(200, (($r | ConvertTo-Json -Compress -Depth 3) -replace '\s+', ' ').Length))); return $null }
         $dedup = $false
         if ($r.PSObject.Properties['deduplicated'] -and $r.deduplicated) { $dedup = $true }
         return [pscustomobject]@{ Id = $id; Deduplicated = $dedup }
-    } catch { return $null }
+    } catch { $script:LastMigrationError = $_.Exception.Message; return $null }
 }
 
 function Remove-AmMem0Record {
@@ -266,7 +281,7 @@ foreach ($cand in $candidates) {
     $result = [ordered]@{
         ts = (Get-Date).ToUniversalTime().ToString('o'); workspace = $ws; dry_run = [bool]$DryRun
         before_bytes = $before.Bytes; before_lines = $before.Lines; status = 'unknown'
-        shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0; floored = 0
+        shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0; floored = 0; line_floored = 0
         mem0 = @(); mem0_orphan = @(); after_bytes = $null; after_lines = $null
         commit = $null; snapshot = $null; note = ''
     }
@@ -396,7 +411,9 @@ foreach ($cand in $candidates) {
         if ($linkedNow.ContainsKey($n)) { continue }
         $fm = Read-AmFrontmatter -Path (Join-Path $store.Dir $n)
         $title = if ($fm -and $fm.Name) { $fm.Name } else { [System.IO.Path]::GetFileNameWithoutExtension($n) }
-        $desc = if ($fm -and $fm.Description) { $fm.Description } else { 'recovered orphan; no description' }
+        # No frontmatter (a session re-created a migrated slug with only its addendum): the hook
+        # is the file's first line of prose, never a placeholder that tells the reader nothing.
+        $desc = if ($fm -and $fm.Description) { $fm.Description } else { Get-AmSynthesizedHook -Path (Join-Path $store.Dir $n) -Frontmatter $fm }
         $desc = Get-AmTruncatedToBytes -Text $desc -MaxBytes ($script:AmLineByteCap - 40)
         $newRec = [pscustomobject]@{ Index = -1; Kind = 'entry'; Raw = ''; Title = $title; Slug = $n; Summary = $desc; ExtraSlugs = @(); Bytes = 0; Dirty = $true }
         $line = New-AmEntryLine -Title $title -Slug $n -Summary $desc
@@ -494,6 +511,14 @@ foreach ($cand in $candidates) {
         (-not $fm) -or ((("" + $fm.Description + "`n`n" + $fm.Body).Trim()).Length -le $script:AmMem0MaxChars)
     })
     if ($hygieneOnly) { $shortenable = @(); $migratable = @() }
+    # ---- line budget (2026-09-06) ----------------------------------------------------------
+    # Bytes converge through the floor; LINES only fall through migration, and the judge keeps
+    # by default - the store climbed to 174 lines against a 200-line injection cutoff while
+    # every nightly migrated 0. When the index is over its line trigger, the oldest pullable
+    # facts the judge did not migrate are migrated deterministically (same write-then-verify
+    # path, same blast cap) until the store is back at its line target.
+    $linesAfterHygiene = Get-AmLineCount -Text (ConvertTo-AmIndexText -Records @($keep) -Newline $idx.Newline)
+    $lineDebt = if (-not $hygieneOnly -and $linesAfterHygiene -gt $script:AmTriggerLines) { $linesAfterHygiene - $script:AmTargetLines } else { 0 }
     $judgeNeeded = (@($shortenable).Count -gt 0 -or @($migratable).Count -gt 0)
     $judgeOk = $false
     $plan = $null
@@ -507,6 +532,10 @@ foreach ($cand in $candidates) {
         [void]$sb.AppendLine('  SHORTEN - rewrite the hook to <= 130 bytes. It must still say WHEN to open the file: keep the distinguishing detail (numbers, identifiers, the surprising claim). Never a generic label. Plain text only - no markdown links, no parentheses containing a file name.')
         [void]$sb.AppendLine('  MIGRATE - the fact is a pullable lookup (an endpoint, id, path, version, a finished status) that a session only needs once the topic is already in hand. Migrating removes it from every future session prompt, so if it changes behaviour BEFORE the agent knows to ask, do not migrate.')
         [void]$sb.AppendLine('  KEEP - leave the line exactly as it is. This is the safe default whenever you are unsure.')
+        if ($lineDebt -gt 0) {
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('LINE BUDGET: the index is ' + $linesAfterHygiene + ' lines, over its ' + $script:AmTriggerLines + '-line trigger (target ' + $script:AmTargetLines + '). Prefer MIGRATE for every pullable lookup: whatever pullable fact you KEEP, the compactor still migrates the ' + $lineDebt + ' oldest pullable facts deterministically to get back under budget - your MIGRATE choices are the better-informed ones.')
+        }
         [void]$sb.AppendLine('')
         [void]$sb.AppendLine('Return STRICT JSON, no prose, no code fence: {"plan":[{"slug":"<file.md>","action":"SHORTEN|MIGRATE|KEEP","hook":"<new hook if SHORTEN>"}]}')
         [void]$sb.AppendLine('')
@@ -551,7 +580,24 @@ foreach ($cand in $candidates) {
     $newlySealed = @{}
     $pendingDeletes = @()   # applied only after the new index is on disk and verified
 
-    foreach ($d in @($plan)) {
+    # Line floor plan: appended AFTER the judge's decisions so the judge's MIGRATEs count first.
+    $lineFloorPlan = @()
+    if ($lineDebt -gt 0) {
+        $judgeMigrates = @(@($plan) | Where-Object { $_ -and $_.slug -and ("" + $_.action).ToUpperInvariant() -eq 'MIGRATE' } | ForEach-Object { [string]$_.slug })
+        # Anything the judge decided (SHORTEN included) stays out of the pool: a line shortened
+        # and then migrated in the same run wastes the judge's edit. Debt is estimated from the
+        # judge's MIGRATEs before they run; one that fails to land leaves the store a line over
+        # target tonight and the floor takes it tomorrow (self-healing, never over-migrating).
+        $judgeDecided = @(@($plan) | Where-Object { $_ -and $_.slug } | ForEach-Object { [string]$_.slug })
+        $lineDebtLeft = $lineDebt - [Math]::Min(@($judgeMigrates).Count, $MaxMigrationsPerRun)
+        if ($lineDebtLeft -gt 0) {
+            $pool = @($migratable | Where-Object { $judgeDecided -notcontains $_.Slug } | Sort-Object -Property @{ Expression = { try { (Get-Item -LiteralPath (Join-Path $store.Dir $_.Slug)).LastWriteTimeUtc } catch { [DateTime]::MaxValue } } })
+            $lineFloorPlan = @($pool | Select-Object -First $lineDebtLeft | ForEach-Object { [pscustomobject]@{ slug = $_.Slug; action = 'MIGRATE'; floor = $true } })
+            Write-MemoryLog -Component $Component -Message ($ws + ': line floor: ' + $linesAfterHygiene + ' lines > trigger ' + $script:AmTriggerLines + '; migrating the ' + @($lineFloorPlan).Count + ' oldest pullable fact(s) toward the ' + $script:AmTargetLines + '-line target')
+        }
+    }
+
+    foreach ($d in @(@($plan) + $lineFloorPlan)) {
         if (-not $d -or -not $d.slug) { continue }
         $slug = [string]$d.slug
         if (-not $byslug.ContainsKey($slug)) { continue }
@@ -584,7 +630,8 @@ foreach ($cand in $candidates) {
             $result.shortened++
         }
         elseif ($action -eq 'MIGRATE') {
-            if ($migrationsDone -ge $MaxMigrationsPerRun) { continue }
+            $isFloor = [bool]($d.PSObject.Properties['floor'] -and $d.floor)
+            if ($migrationsDone -ge $MaxMigrationsPerRun -and -not $isFloor) { continue }   # the judge's quota; the line floor has its own (line debt)
             if ($removals -ge $blastCap) { continue }
             $fm = $meta[$slug].Frontmatter
             if (-not $fm -or -not $fm.Body) { continue }
@@ -596,6 +643,7 @@ foreach ($cand in $candidates) {
                 # Project the removal so after_bytes and `migrated` describe the same world.
                 $keep.Remove($rec) | Out-Null
                 $migrationsDone++; $removals++; $result.migrated++
+                if ($isFloor) { $result.line_floored++ }
                 continue
             }
             $mdata = @{ tier = 'evidence'; origin_slug = $slug; workspace = $ws }
@@ -608,6 +656,7 @@ foreach ($cand in $candidates) {
                     # files that were already gone.
                     $pendingDeletes += [pscustomobject]@{ Slug = $slug; Id = $w.Id; Raw = $rec.Raw; Deduplicated = $w.Deduplicated }
                     $migrationsDone++; $removals++; $result.migrated++
+                    if ($isFloor) { $result.line_floored++ }
                 } elseif ($w.Deduplicated) {
                     # The id belongs to a PRE-EXISTING record we did not create. Never delete it.
                     $result.mem0_orphan += ('' + $w.Id + ' | ' + $slug + ' | pre-existing (dedup) record, read-back failed; line kept, record untouched')
@@ -623,8 +672,8 @@ foreach ($cand in $candidates) {
             } else {
                 # No id: the write failed or the server returned nothing usable. A record MAY
                 # still have landed; the retry is hash-idempotent, so nothing to undo.
-                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned no id; line kept')
-                Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' returned no id; line kept')
+                $result.mem0_orphan += ('(no id) | ' + $slug + ' | write returned no id; line kept: ' + $script:LastMigrationError)
+                Write-MemoryLog -Component $Component -Message ($ws + ': migration ' + $slug + ' returned no id; line kept (' + $script:LastMigrationError + ')')
             }
         }
     }
@@ -798,7 +847,7 @@ foreach ($cand in $candidates) {
     }
 
     $postLines = Get-AmLineCount -Text $postText
-    $msg = ('compact ' + $ws + ': ' + $before.Bytes + '->' + (Get-AmByteCount -Text $postText) + ' B, ' + $before.Lines + '->' + $postLines + ' lines; shortened=' + $result.shortened + ' migrated=' + $result.migrated + ' reindexed=' + $result.reindexed + ' dedangled=' + $result.dedangled + ' dedup_slug=' + $result.dedup_slug + ' floored=' + $result.floored)
+    $msg = ('compact ' + $ws + ': ' + $before.Bytes + '->' + (Get-AmByteCount -Text $postText) + ' B, ' + $before.Lines + '->' + $postLines + ' lines; shortened=' + $result.shortened + ' migrated=' + $result.migrated + ' reindexed=' + $result.reindexed + ' dedangled=' + $result.dedangled + ' dedup_slug=' + $result.dedup_slug + ' floored=' + $result.floored + ' line_floored=' + $result.line_floored)
     $commit = $null
     try { $commit = Save-AmHistorySnapshot -Store $store -Message $msg }
     catch {
