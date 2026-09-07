@@ -833,16 +833,19 @@ $action = New-ScheduledTaskAction `
     -Execute 'wscript.exe' `
     -Argument "//nologo `"$hiddenVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\dream-consolidate.ps1`""
 $trigger = New-ScheduledTaskTrigger -Daily -At 3:00am
+# ExecutionTimeLimit 40 min (2026-09-07, was 15): the outer scheduler ceiling must EXCEED the sum
+# of the inner per-call budgets, and the night's worst case is gather 180 + consolidate 240 +
+# promote 240 + gate (3 nominees x 2 attempts x 180) = 1,740s = 29 min. At 15 min Task Scheduler
+# kills the job object, bypassing the finally block that releases the codex lock.
+# NOTE: this comment lives ABOVE the statement on purpose. A comment placed BETWEEN a backtick
+# line-continuation and the next parameter parses cleanly but silently ends the argument list -
+# it broke task registration on 2026-09-07 and is now pinned by an installer lint test.
 $settingsTask = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -WakeToRun `
     -Hidden `
-    # 2026-09-07: 15 -> 40 min. The outer scheduler ceiling must EXCEED the sum of the inner
-    # per-call budgets, and the night's worst case is now gather 180 + consolidate 240 +
-    # promote 240 + gate (3 nominees x 2 attempts x 180) = 1,740s = 29 min. At 15 min Task
-    # Scheduler kills the job object, bypassing the finally block that releases the codex lock.
     -ExecutionTimeLimit (New-TimeSpan -Minutes 40)
 $principal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 

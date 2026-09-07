@@ -472,6 +472,32 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
             Should -Match "'memory-lint\.ps1'" -Because 'lint runs as a detached SessionStart child beside the other two'
     }
 
+    It 'no comment sits between a line-continuation backtick and the next argument' {
+        # 2026-09-07 outage: a comment block was inserted between "-Hidden `" and
+        # "-ExecutionTimeLimit ...". PowerShell PARSES that cleanly - ParseFile and
+        # PSScriptAnalyzer both stayed silent - but the continuation swallows the comment and
+        # every following argument becomes a NEW statement. The installer aborted at
+        # "Registering Task Scheduler entry" with "The term '-ExecutionTimeLimit' is not
+        # recognized", so the 3am dream, 4:30am dedup and 5am compactor tasks were never
+        # registered on a box that had just been deployed to. Syntax checks cannot catch this;
+        # this lint can.
+        $offenders = @()
+        foreach ($f in (Get-ChildItem -Path (Join-Path $script:repoRoot 'install') -Filter '*.ps1' -File)) {
+            $lines = Get-Content -LiteralPath $f.FullName
+            for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+                $cur = $lines[$i]
+                # a real continuation: ends with a backtick that is not itself escaped
+                if ($cur -notmatch '`\s*$') { continue }
+                if ($cur -match '^\s*#') { continue }
+                $next = $lines[$i + 1]
+                if ($next -match '^\s*#') {
+                    $offenders += ('{0}:{1}: continuation followed by a comment -> "{2}"' -f $f.Name, ($i + 2), $next.Trim())
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty -Because 'a comment after a continuation silently truncates the argument list'
+    }
+
     It '3-verify asserts the compactor task' {
         (Get-Content $verifierPath -Raw) | Should -Match 'ClaudeCode-MemoryCompactor-5am' -Because 'a task nobody verifies is a task that silently stops firing'
     }
