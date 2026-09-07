@@ -475,7 +475,13 @@ function Invoke-CodexSubagent {
         # 2026-09-07: an EMPTY model means "inherit ~/.codex/config.toml" - the pre-existing
         # behaviour, kept so an un-migrated call site behaves exactly as before. Every job in
         # this stack now names its model; see $script:AmCodexModel* above.
-        [string]$Model = ''
+        [string]$Model = '',
+        # 2026-09-07: when set, `codex exec -o <file>` writes the agent's LAST MESSAGE to
+        # this file. Scraping it out of stdout depends on a `codex` marker line that is
+        # absent when the run produces no assistant message, and callers then parsed the
+        # metadata header as if it were the answer (5 of 330 live L1a calls). The file is
+        # the authoritative copy; stdout scraping stays as the fallback.
+        [string]$LastMessagePath = ''
     )
     if (-not (Test-Path $script:CodexCmd)) {
         throw "codex.cmd not found at $($script:CodexCmd)"
@@ -521,6 +527,7 @@ $inp = [Console]::In.ReadToEnd()
 # PS 5.1-safe and quote-free - the same reason the effort override travels by env var.
 $cargs = @('exec', '--skip-git-repo-check', '-c', $env:MEM0_CODEX_EFFORT_ARG)
 if (-not [string]::IsNullOrWhiteSpace($env:MEM0_CODEX_MODEL)) { $cargs += @('-m', $env:MEM0_CODEX_MODEL) }
+if (-not [string]::IsNullOrWhiteSpace($env:MEM0_CODEX_LASTMSG)) { $cargs += @('-o', $env:MEM0_CODEX_LASTMSG) }
 $cargs += '-'
 $o = $inp | & $env:MEM0_CODEX_CMD @cargs 2>&1
 [Console]::Out.Write([string]::Join([char]10, @($o | ForEach-Object { [string]$_ })))
@@ -541,6 +548,7 @@ exit $LASTEXITCODE
     $psi.EnvironmentVariables['MEM0_CODEX_CMD'] = $script:CodexCmd
     $psi.EnvironmentVariables['MEM0_CODEX_EFFORT_ARG'] = $effortArg
     $psi.EnvironmentVariables['MEM0_CODEX_MODEL'] = $Model
+    $psi.EnvironmentVariables['MEM0_CODEX_LASTMSG'] = $LastMessagePath
 
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
@@ -569,6 +577,21 @@ exit $LASTEXITCODE
     } finally {
         try { $p.Dispose() } catch {}
     }
+}
+
+function New-CodexLastMessagePath {
+    # A per-call temp path for `codex exec -o`. Windows UnixNano-style collisions are real
+    # (two back-to-back calls can land on the same tick), so the name carries the PID and a
+    # GUID rather than a timestamp alone.
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) 'ams-codex'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return (Join-Path $dir ('lastmsg-' + $PID + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt'))
+}
+
+function Remove-CodexLastMessagePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue } catch { }
 }
 
 function Parse-CodexHeader {
@@ -681,7 +704,22 @@ function Get-CodexResponseText {
     #   tokens used
     #   <token count>
     # Extract just the model response (between the last 'codex' marker and 'tokens used').
-    param([Parameter(Mandatory)][string]$RawOutput)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RawOutput,
+        # When Invoke-CodexSubagent was given -LastMessagePath, pass the SAME path here:
+        # the file is codex's own copy of the final assistant message and does not depend
+        # on locating a marker line in a stream that also carries the metadata header,
+        # the echoed prompt and any reasoning summary.
+        [string]$LastMessagePath = ''
+    )
+    if (-not [string]::IsNullOrWhiteSpace($LastMessagePath)) {
+        try {
+            if (Test-Path -LiteralPath $LastMessagePath) {
+                $fromFile = (Get-Content -LiteralPath $LastMessagePath -Raw -ErrorAction Stop)
+                if (-not [string]::IsNullOrWhiteSpace($fromFile)) { return $fromFile.Trim() }
+            }
+        } catch { }   # unreadable file -> fall through to the stdout scrape, never throw
+    }
     $lines = $RawOutput -split "`r?`n"
     $startIdx = -1
     $endIdx = $lines.Length

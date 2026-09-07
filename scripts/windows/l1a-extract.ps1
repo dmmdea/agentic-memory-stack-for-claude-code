@@ -156,7 +156,8 @@ $turns
         # lane, so it must not silently inherit a synthesis model from config.toml.
         # 60 -> 90s: the observed max over 1,939 logged calls is 62.4s, i.e. 60s has already
         # been breached once; 90s is ~3x p99 (29.6s).
-        $raw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:CodexEffortExtractor -TimeoutSeconds 90 -Model $script:AmCodexModelClassify
+        $lastMsgPath = New-CodexLastMessagePath
+        $raw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:CodexEffortExtractor -TimeoutSeconds 90 -Model $script:AmCodexModelClassify -LastMessagePath $lastMsgPath
     } catch {
         Write-MemoryLog -Component 'l1a' -Message "  codex subagent failed: $_"
         $failOutcome = if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' }
@@ -179,7 +180,8 @@ $turns
     }
 
     # Extract just the model response from Codex's verbose output, then parse JSON
-    $modelText = Get-CodexResponseText -RawOutput $raw
+    $modelText = Get-CodexResponseText -RawOutput $raw -LastMessagePath $lastMsgPath
+    Remove-CodexLastMessagePath -Path $lastMsgPath
     $parsed = Extract-JsonFromText -Text $modelText -ExpectedKey 'facts'
     if ($null -eq $parsed) {
         $preview = if ($raw.Length -gt 200) { $raw.Substring(0, 200) } else { $raw }

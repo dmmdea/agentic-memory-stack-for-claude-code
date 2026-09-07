@@ -187,12 +187,18 @@ if [[ -z "$ACTION" ]]; then
   # ── Tier promotion (v0.19 Phase G: format-2, action="promote") ──────────
   # Phase 2: --actor flag selects the promotion actor label (default: user-direct).
   PROMOTE_ACTOR="${ACTOR:-user-direct}"
+  # judge_model: optional provenance, set via the JUDGE_MODEL env var (e.g.
+  # JUDGE_MODEL=gpt-6-astra mem0-canonize.sh <id> "<why>"). It is NOT part of the
+  # signed material - the HMAC covers <ts>|<nonce>|promote|<mid>|<reason> - so it is an
+  # audit convenience recorded in the tier ledger, never an authorisation input.
   BODY="$(python3 -c "
 import json, sys
 actor = sys.argv[1]
 reason = sys.argv[2]
-print(json.dumps({'tier': 'canonical', 'actor': actor, 'reason': reason}))
-" "$PROMOTE_ACTOR" "$REASON")"
+judge_model = sys.argv[3] if len(sys.argv) > 3 else ''
+print(json.dumps({'tier': 'canonical', 'actor': actor, 'reason': reason,
+                  'judge_model': judge_model or None}))
+" "$PROMOTE_ACTOR" "$REASON" "${JUDGE_MODEL:-}")"
 
   echo "Promoting memory $MID to canonical (action=promote)..."
   echo "  ts=$TS"

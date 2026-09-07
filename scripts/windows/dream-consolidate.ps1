@@ -686,7 +686,8 @@ if ($promoteEvidence.Count -eq 0) {
 } else {
     $codexWasCalled = $true
     try {
-        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis
+        $promoteLastMsg = New-CodexLastMessagePath
+        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis -LastMessagePath $promoteLastMsg
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  autopromote: Codex call failed (non-fatal): $_"
         Write-CodexUsageLog -Component 'dream-promote' -Status 'error' -DurationMs ([int]((Get-Date) - $promoteStart).TotalMilliseconds) `
@@ -705,7 +706,8 @@ $promoteCodexFailed = $false
 $promoteHdr = Parse-CodexHeader -RawOutput $promoteRaw
 if ($codexWasCalled) {
     if ($promoteRaw) {
-        $promoteCodexJson = Get-CodexResponseText -RawOutput $promoteRaw
+        $promoteCodexJson = Get-CodexResponseText -RawOutput $promoteRaw -LastMessagePath $promoteLastMsg
+        Remove-CodexLastMessagePath -Path $promoteLastMsg
         # Get-CodexResponseText now returns $null when codex emitted no answer at all (header
         # only). That is a parse failure, not an empty nomination list - say so explicitly
         # instead of handing $null downstream as if the model had decided nothing.

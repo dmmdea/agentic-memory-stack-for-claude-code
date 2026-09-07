@@ -483,3 +483,54 @@ Describe 'Codex model routing + provenance (2026-09-07)' {
         }
     }
 }
+
+Describe 'codex -o last-message parse hardening (2026-09-07)' {
+    # 5 of 330 live L1a calls produced header-only stdout: no `codex` marker, so the scrape
+    # returned the metadata header and the caller logged "json parse failed" on it. `codex
+    # exec -o <file>` writes the final assistant message to a file, which does not depend on
+    # locating a marker in a stream that also carries the header, the echoed prompt and any
+    # reasoning summary.
+
+    It 'reads the answer from the -o file even when stdout carries NO codex marker' {
+        $f = Join-Path $TestDrive 'last.txt'
+        Set-Content -LiteralPath $f -Value '{"facts":[{"a":1}]}' -Encoding UTF8
+        $headerOnly = "OpenAI Codex v0.153.4`n--------`nmodel: gpt-5.6-terra`n--------"
+        $out = Get-CodexResponseText -RawOutput $headerOnly -LastMessagePath $f
+        $out | Should -Be '{"facts":[{"a":1}]}'
+        # and it parses, which is the whole point
+        @((Extract-JsonFromText -Text $out -ExpectedKey 'facts').facts).Count | Should -Be 1
+    }
+
+    It 'falls back to the stdout scrape when the file is missing or empty' {
+        $missing = Join-Path $TestDrive 'nope.txt'
+        Get-CodexResponseText -RawOutput "hdr`ncodex`nSCRAPED`ntokens used`n5" -LastMessagePath $missing |
+            Should -Be 'SCRAPED' -Because 'a missing -o file must not lose an answer stdout still has'
+        $empty = Join-Path $TestDrive 'empty.txt'
+        Set-Content -LiteralPath $empty -Value '' -Encoding UTF8
+        Get-CodexResponseText -RawOutput "hdr`ncodex`nSCRAPED`ntokens used`n5" -LastMessagePath $empty |
+            Should -Be 'SCRAPED'
+    }
+
+    It 'still returns $null when BOTH the file and the marker are absent' {
+        # The honest outcome: no answer anywhere. The caller records parse_fail rather than
+        # parsing a metadata header as if it were the model talking.
+        $missing = Join-Path $TestDrive 'nope2.txt'
+        Get-CodexResponseText -RawOutput "OpenAI Codex v0.153.4`nmodel: x" -LastMessagePath $missing |
+            Should -BeNullOrEmpty
+    }
+
+    It 'passes -o <file> to codex when -LastMessagePath is given, and omits it otherwise' {
+        $fake = Join-Path $TestDrive 'codex-o.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo ARGS:%*')
+        $script:CodexCmd = $fake
+        $p = Join-Path $TestDrive 'out.txt'
+        (Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30 -LastMessagePath $p) | Should -Match '\-o '
+        (Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30) | Should -Not -Match '\-o '
+    }
+
+    It 'New-CodexLastMessagePath is unique per call (Windows clock collisions are real)' {
+        $a = New-CodexLastMessagePath; $b = New-CodexLastMessagePath
+        $a | Should -Not -Be $b
+        Remove-CodexLastMessagePath -Path $a   # must not throw on a file that never existed
+    }
+}

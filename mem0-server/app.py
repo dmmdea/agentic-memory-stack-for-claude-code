@@ -306,6 +306,18 @@ class TierIn(BaseModel):
     reason: Optional[str] = None
     actor: Optional[str] = None  # no default - audit finding 2026-06-08: hardcoded
                                   # "claude" hid autonomous vs user-direct intent
+    # 2026-09-07: WHICH MODEL judged this promotion. `actor` is a ROLE label
+    # ("dream-autopromote", "user-direct") and never says what did the judging, so a
+    # promoted memory carried no way to answer "which model decided this?" after the
+    # fact. Optional and unvalidated on purpose: a caller that does not know (a hand
+    # PATCH, an older client) records None rather than a guess, and None is honestly
+    # distinguishable from a recorded value.
+    #
+    # NOT part of the HMAC. The canonical-promotion signature covers
+    # <ts>|<nonce>|promote|<mid>|<reason>, so this field is UNSIGNED and must never be
+    # treated as tamper-evident - it is an audit convenience, not an authorisation
+    # input. The signed material was deliberately left alone.
+    judge_model: Optional[str] = None
 
 class MetadataIn(BaseModel):
     metadata: dict   # shallow merge with existing payload
@@ -2108,6 +2120,7 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             "ts": now, "event": "tier-change-intent", "memory_id": mid,
             "tier": b.tier, "actor": actor, "reason": reason or None,
             "transport": transport, "status": "intent",
+            "judge_model": (b.judge_model or None), "schema_version": "v18",
         })
     except Exception as e:
         log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
@@ -2137,6 +2150,7 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             "ts": now, "event": "tier-change", "memory_id": mid,
             "tier": b.tier, "actor": actor, "reason": reason or None,
             "transport": transport, "status": "done",
+            "judge_model": (b.judge_model or None), "schema_version": "v18",
         })
     except Exception:
         log.exception("ledger append failed for tier-change")
