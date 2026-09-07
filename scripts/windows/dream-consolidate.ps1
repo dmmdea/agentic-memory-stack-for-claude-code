@@ -437,6 +437,12 @@ catch {
 }
 $gatherDurationMs = [int]((Get-Date) - $gatherStart).TotalMilliseconds
 $gatherTokens = Parse-CodexTokenUsage -RawOutput $gatherRaw
+# Provenance on the SUCCESS path too, not only the abort: "which model judged this" must be
+# answerable for the runs that produced something, which is the whole point of the ledger.
+$gatherHdr = Parse-CodexHeader -RawOutput $gatherRaw
+Write-CodexUsageLog -Component 'dream-gather' -DurationMs $gatherDurationMs -TokensUsed ([int]$gatherTokens) `
+    -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
+    -ModelResolved $gatherHdr.Model -EffortResolved $gatherHdr.Effort -Status 'ok' -Outcome 'ok'
 
 $gatherText = Get-CodexResponseText -RawOutput $gatherRaw
 $gatherParsed = Extract-JsonFromText -Text $gatherText -ExpectedKey 'signals'
@@ -523,6 +529,12 @@ catch {
 }
 $consolidateMs = [int]((Get-Date) - $consolidateStart).TotalMilliseconds
 $consolidateTokens = Parse-CodexTokenUsage -RawOutput $consolidateRaw
+# The insight-producing call: its provenance row is the record that ties a tier=insight memory
+# to the model that synthesised it.
+$consolidateHdr = Parse-CodexHeader -RawOutput $consolidateRaw
+Write-CodexUsageLog -Component 'dream-consolidate' -DurationMs $consolidateMs -TokensUsed ([int]$consolidateTokens) `
+    -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
+    -ModelResolved $consolidateHdr.Model -EffortResolved $consolidateHdr.Effort -Status 'ok' -Outcome 'ok'
 
 $consolidateText = Get-CodexResponseText -RawOutput $consolidateRaw
 $consolidateParsed = Extract-JsonFromText -Text $consolidateText -ExpectedKey 'insights'

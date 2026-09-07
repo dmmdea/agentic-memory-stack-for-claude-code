@@ -611,6 +611,16 @@ Describe 'Codex model is pinned per job, never inherited (2026-09-07)' {
         }
     }
 
+    It 'every dream phase records provenance on the SUCCESS path, not only on abort' {
+        # The first live run under this routing wrote a row for promote but none for gather or
+        # consolidate: the insight-producing call left no record of which model synthesised it.
+        $dream = Get-Content (Join-Path $script:winRoot 'dream-consolidate.ps1') -Raw
+        foreach ($c in @('dream-gather', 'dream-consolidate', 'dream-promote')) {
+            ([regex]::Matches($dream, [regex]::Escape("-Component '" + $c + "'"))).Count |
+                Should -BeGreaterOrEqual 2 -Because "$c needs a usage row on both the success and the failure path"
+        }
+    }
+
     It 'the shim bumped its version for the request-schema change and validates the model' {
         $shim = Get-Content (Join-Path $script:winRoot 'codex-shim.ps1') -Raw
         $shim | Should -Match "ShimVersion\s*=\s*'0\.28\.0'"
