@@ -554,3 +554,84 @@ Describe 'Compactor throttle + catch-up (2026-09-06)' {
         $code | Should -Match 'line_floored'
     }
 }
+
+Describe 'Codex model is pinned per job, never inherited (2026-09-07)' {
+    BeforeAll {
+        $script:winRoot = Split-Path -Parent $PSScriptRoot
+        $script:repoRoot2 = Split-Path -Parent (Split-Path -Parent $script:winRoot)
+    }
+
+    It 'every shipped Invoke-CodexSubagent call site names a model' {
+        # The whole defect: a config.toml edit moved every judge to a different model and no
+        # call site, receipt or log recorded it. A new call site that forgets -Model fails here.
+        $offenders = @()
+        foreach ($f in (Get-ChildItem -Path $script:winRoot -Filter '*.ps1' -File)) {
+            if ($f.Name -eq 'memory-common.ps1') { continue }   # the definition itself
+            foreach ($line in (Get-Content -LiteralPath $f.FullName)) {
+                if ($line -match 'Invoke-CodexSubagent\s' -and $line -notmatch '^\s*#' -and $line -notmatch '-Model') {
+                    $offenders += ($f.Name + ': ' + $line.Trim())
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty -Because 'each job pins its own model'
+    }
+
+    It 'the routing constants exist and Astra runs at the operator-directed MEDIUM effort' {
+        $code = script:CodeOf (Join-Path $script:winRoot 'memory-common.ps1')
+        $code | Should -Match "AmCodexModelSynthesis\s*=\s*'gpt-6-astra'"
+        $code | Should -Match "AmCodexModelClassify\s*=\s*'gpt-5\.6-terra'"
+        $code | Should -Match "AmCodexEffortSynthesis\s*=\s*'medium'" -Because 'operator directive 2026-09-07: Astra at medium, not high'
+    }
+
+    It 'the high-volume jobs use the classify model and the synthesis jobs use Astra' {
+        # Astra measures 0.60 extraction / 0.50 quick-edit on the operator goldset while the L1a
+        # extractor alone is 92% of logged Codex tokens: routing it to Astra would spend the
+        # shared weekly window on Astra's weakest lanes.
+        (Get-Content (Join-Path $script:winRoot 'l1a-extract.ps1') -Raw) | Should -Match 'Invoke-CodexSubagent[^\r\n]*AmCodexModelClassify'
+        (Get-Content (Join-Path $script:winRoot 'memory-compact.ps1') -Raw) | Should -Match 'Invoke-CodexSubagent[^\r\n]*AmCodexModelClassify'
+        $dream = Get-Content (Join-Path $script:winRoot 'dream-consolidate.ps1') -Raw
+        $dream | Should -Match 'consolidatePrompt[^\r\n]*AmCodexModelSynthesis'
+        $dream | Should -Match 'promotePrompt[^\r\n]*AmCodexModelSynthesis'
+        (Get-Content (Join-Path $script:winRoot 'autopromote-lib.ps1') -Raw) | Should -Match 'Invoke-CodexSubagent[^\r\n]*AmCodexModelSynthesis'
+    }
+
+    It 'the usage ledger carries requested AND resolved model/effort plus a closed outcome enum' {
+        $code = script:CodeOf (Join-Path $script:winRoot 'memory-common.ps1')
+        foreach ($k in @('model_requested', 'effort_requested', 'model_resolved', 'effort_resolved', 'outcome')) {
+            $code | Should -Match ([regex]::Escape($k))
+        }
+        $code | Should -Match "ValidateSet\('ok', 'empty', 'timeout', 'exit_nonzero', 'parse_fail'"
+    }
+
+    It 'the jobs that emitted no telemetry at all now write a usage row' {
+        # memory-compact.ps1 and autopromote-lib.ps1 called Write-CodexUsageLog ZERO times, so
+        # the nightly compactor and every gate verdict were absent from the ledger.
+        foreach ($n in @('memory-compact.ps1', 'autopromote-lib.ps1', 'dream-consolidate.ps1')) {
+            (Get-Content (Join-Path $script:winRoot $n) -Raw) | Should -Match 'Write-CodexUsageLog' -Because "$n was invisible in the usage ledger"
+        }
+    }
+
+    It 'the shim bumped its version for the request-schema change and validates the model' {
+        $shim = Get-Content (Join-Path $script:winRoot 'codex-shim.ps1') -Raw
+        $shim | Should -Match "ShimVersion\s*=\s*'0\.28\.0'"
+        $shim | Should -Match "ShimDefaultModel\s*=\s*'gpt-5\.6-terra'"
+        $shim | Should -Match 'ShimModelAllowlist'
+    }
+
+    It 'the codex verdict cache identity was bumped with the model change' {
+        # A 30-day verdict cache keyed on a hand-maintained identity string: without the bump,
+        # verdicts judged by the previous model keep being served and the routing change has no
+        # observable effect on that path.
+        $client = Get-Content (Join-Path $script:repoRoot2 'mem0-server\codex_shim_client.py') -Raw
+        $client | Should -Not -Match 'CODEX_JUDGE_IDENTITY = "codex-cli:effort-low:v1"'
+        $client | Should -Match 'CODEX_JUDGE_IDENTITY = "codex-cli:terra:effort-low:v2"'
+    }
+
+    It 'the scheduler ceiling exceeds the sum of the inner per-call budgets' {
+        # If Task Scheduler kills the job object the PowerShell finally block never runs and the
+        # codex lock is orphaned. Worst case night = 180 + 240 + 240 + (3 x 2 x 180) = 29 min.
+        $inst = Get-Content (Join-Path $script:repoRoot2 'install\2-windows-config.ps1') -Raw
+        $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 40\)' -Because 'the 3am dream must outlast a 29-minute worst case'
+        $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 30\)' -Because "the compactor's own lock window is 30 minutes"
+    }
+}

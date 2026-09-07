@@ -540,15 +540,20 @@ class _FakeCodex:
         self._out = out
         self.calls = []
         self.super_calls = []
+        self.models = []
 
     # lock_retry_budget_s mirrors the real client interface (judge resilience,
-    # 2026-08-24) — the sweep's _codex_call always passes it.
-    def judge_contradiction(self, a, b, timeout_s=45, lock_retry_budget_s=0.0):
+    # 2026-08-24) — the sweep's _codex_call always passes it. `model` mirrors the
+    # per-job model pin (2026-09-07) and is RECORDED, so these fakes prove the sweep
+    # names its judge model instead of inheriting whatever config.toml holds.
+    def judge_contradiction(self, a, b, timeout_s=45, lock_retry_budget_s=0.0, model=""):
         self.calls.append((a, b, timeout_s))
+        self.models.append(model)
         return dict(self._out)
 
-    def judge_supersession(self, older, newer, timeout_s=45, lock_retry_budget_s=0.0):
+    def judge_supersession(self, older, newer, timeout_s=45, lock_retry_budget_s=0.0, model=""):
         self.super_calls.append((older, newer, timeout_s))
+        self.models.append(model)
         return dict(self._out)
 
 
@@ -852,7 +857,8 @@ def test_supersession_dispatch_cache_is_order_sensitive(monkeypatch, _tmp_pair_c
         def __init__(self, out):
             self.out = out
             self.calls = []
-        def judge_supersession(self, older, newer, timeout_s=0, lock_retry_budget_s=0.0):
+            self.models = []
+        def judge_supersession(self, older, newer, timeout_s=0, lock_retry_budget_s=0.0, model=""):
             self.calls.append((older, newer))
             return dict(self.out)
     fake = _FakeCodexSup({"ok": True, "stale": True, "raw": "STALE"})
@@ -1172,10 +1178,10 @@ class _StubCodex:
         self.calls.append(kwargs)
         return dict(self.script.pop(0))
 
-    def judge_contradiction(self, a, b, timeout_s=30, lock_retry_budget_s=0.0):
+    def judge_contradiction(self, a, b, timeout_s=30, lock_retry_budget_s=0.0, model=""):
         return self._next({"budget": lock_retry_budget_s})
 
-    def judge_supersession(self, a, b, timeout_s=30, lock_retry_budget_s=0.0):
+    def judge_supersession(self, a, b, timeout_s=30, lock_retry_budget_s=0.0, model=""):
         return self._next({"budget": lock_retry_budget_s})
 
 

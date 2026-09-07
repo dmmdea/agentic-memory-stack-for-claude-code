@@ -1,7 +1,8 @@
 # Dream Consolidator - 4-phase pattern (orient -> gather -> consolidate -> prune)
 # Replaces c1-consolidate.ps1 in v0.13. Ported from grandamenium/dream-skill MIT.
 # Fires nightly 3am via Windows Task Scheduler. Throttled to 24h.
-# Codex (gpt-5.5 medium) executes each phase; Fable designed the prompts.
+# Codex executes each phase on a per-job model (gather: gpt-5.6-terra; consolidate and
+# promote-nominate: gpt-6-astra at medium effort). Fable designed the prompts.
 
 param([switch]$DryRun, [switch]$Force)
 
@@ -60,7 +61,10 @@ if ($dlq.drained -gt 0 -or $dlq.remaining -gt 0) {
 }
 
 # Shared Codex mutex (same lock as L1a - if L1a holds it, dream skips this cycle)
-if (-not $DryRun -and -not (Acquire-CodexLock -Owner 'dream' -MaxAgeMinutes 30)) {
+# 2026-09-07: 30 -> 45 min. The night's worst case under per-job routing is gather 180 +
+# consolidate 240 + promote 240 + gate (3 nominees x 2 attempts x 180) = 1,740s = 29 min, which
+# left one minute of margin against a 30-minute staleness window.
+if (-not $DryRun -and -not (Acquire-CodexLock -Owner 'dream' -MaxAgeMinutes 45)) {
     Write-MemoryLog -Component 'dream' -Message 'skipping: codex lock held by another worker'
     exit 0
 }
@@ -419,8 +423,18 @@ $transcripts
 
 $gatherStart = Get-Date
 $gatherRaw = $null
-try { $gatherRaw = Invoke-CodexSubagent -Prompt $gatherPrompt -ReasoningEffort 'medium' -TimeoutSeconds 180 }
-catch { Write-MemoryLog -Component 'dream' -Message "  gather codex failed: $_"; return }
+# Gather is retrieval-and-ranking over recent memories, not synthesis: the CLASSIFY model's band.
+# Measured 18.2-29.2s across the last four runs, so the 180s budget is untouched.
+try { $gatherRaw = Invoke-CodexSubagent -Prompt $gatherPrompt -ReasoningEffort 'medium' -TimeoutSeconds 180 -Model $script:AmCodexModelClassify }
+catch {
+    Write-MemoryLog -Component 'dream' -Message "  gather codex failed: $_"
+    # The bare `return` aborts the whole cycle. That is the right call; the SILENCE was not -
+    # this path wrote no ledger row, so an aborted night looked identical to a quiet one.
+    Write-CodexUsageLog -Component 'dream-gather' -Status 'error' -DurationMs ([int]((Get-Date) - $gatherStart).TotalMilliseconds) `
+        -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
+        -Outcome $(if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
+    return
+}
 $gatherDurationMs = [int]((Get-Date) - $gatherStart).TotalMilliseconds
 $gatherTokens = Parse-CodexTokenUsage -RawOutput $gatherRaw
 
@@ -495,8 +509,18 @@ $evidenceBullets
 "@
 
 $consolidateStart = Get-Date
-try { $consolidateRaw = Invoke-CodexSubagent -Prompt $consolidatePrompt -ReasoningEffort 'medium' -TimeoutSeconds 180 }
-catch { Write-MemoryLog -Component 'dream' -Message "  consolidate codex failed: $_"; return }
+# THE job this upgrade exists for: open-ended synthesis into tier=insight records - Astra's
+# strongest measured lanes (research 0.92, review 1.00). Effort stays MEDIUM per the operator's
+# 2026-09-07 directive. 180 -> 240s because Astra@medium on this prompt is not yet measured here
+# and a truncated consolidation aborts the night.
+try { $consolidateRaw = Invoke-CodexSubagent -Prompt $consolidatePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis }
+catch {
+    Write-MemoryLog -Component 'dream' -Message "  consolidate codex failed: $_"
+    Write-CodexUsageLog -Component 'dream-consolidate' -Status 'error' -DurationMs ([int]((Get-Date) - $consolidateStart).TotalMilliseconds) `
+        -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
+        -Outcome $(if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
+    return
+}
 $consolidateMs = [int]((Get-Date) - $consolidateStart).TotalMilliseconds
 $consolidateTokens = Parse-CodexTokenUsage -RawOutput $consolidateRaw
 
@@ -650,9 +674,12 @@ if ($promoteEvidence.Count -eq 0) {
 } else {
     $codexWasCalled = $true
     try {
-        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort 'medium' -TimeoutSeconds 180
+        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  autopromote: Codex call failed (non-fatal): $_"
+        Write-CodexUsageLog -Component 'dream-promote' -Status 'error' -DurationMs ([int]((Get-Date) - $promoteStart).TotalMilliseconds) `
+            -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
+            -Outcome $(if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
         $promoteRaw = $null
     }
 }
@@ -663,12 +690,26 @@ $promoteDurationMs = if ($codexWasCalled) { [int]((Get-Date) - $promoteStart).To
 # ── Codex JSON text (passed to Invoke-AutopromoteDecision) ───────────────────
 $promoteCodexJson = $null
 $promoteCodexFailed = $false
+$promoteHdr = Parse-CodexHeader -RawOutput $promoteRaw
 if ($codexWasCalled) {
     if ($promoteRaw) {
         $promoteCodexJson = Get-CodexResponseText -RawOutput $promoteRaw
+        # Get-CodexResponseText now returns $null when codex emitted no answer at all (header
+        # only). That is a parse failure, not an empty nomination list - say so explicitly
+        # instead of handing $null downstream as if the model had decided nothing.
+        if ($null -eq $promoteCodexJson) { $promoteCodexFailed = $true }
     } else {
         $promoteCodexFailed = $true
     }
+    Write-CodexUsageLog -Component 'dream-promote' -DurationMs $promoteDurationMs `
+        -TokensUsed ([int](Parse-CodexTokenUsage -RawOutput $promoteRaw)) `
+        -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
+        -ModelResolved $promoteHdr.Model -EffortResolved $promoteHdr.Effort `
+        -Status $(if ($promoteCodexFailed) { 'error' } else { 'ok' }) `
+        -Outcome $(if ($promoteCodexFailed) { 'parse_fail' } else { 'ok' })
+} else {
+    Write-CodexUsageLog -Component 'dream-promote' -Status 'ok' -Outcome 'skipped_no_candidates' `
+        -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis
 }
 
 # ── Complete nomination pipeline (parse → structural-filter → cap → dedup) ───

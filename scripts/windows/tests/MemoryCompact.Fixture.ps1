@@ -33,13 +33,25 @@ function Acquire-CodexLock { param($Owner, $MaxAgeMinutes) return ($env:STUB_LOC
 function Release-CodexLock { }
 function Get-Mem0Key { return 'test-key' }
 function Invoke-CodexSubagent {
-    param($Prompt, $ReasoningEffort, $TimeoutSeconds)
+    # $Model mirrors the 2026-09-07 per-job pin; recorded so a compactor that stops naming its
+    # model fails a test instead of silently inheriting config.toml.
+    param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model)
+    Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-model.txt') -Value ([string]$Model)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-prompt.txt') -Value $Prompt
     if ($env:STUB_CODEX_THROWS -eq '1') { throw 'codex.cmd not found (stub)' }
     if ($env:STUB_MUTATE_INDEX) {
         Add-Content -LiteralPath $env:STUB_MUTATE_TARGET -Value $env:STUB_MUTATE_INDEX
     }
     return ("header`ncodex`n" + $env:STUB_CODEX_PLAN + "`ntokens used`n42")
+}
+function Parse-CodexHeader { param($RawOutput) return @{ Model = 'stub-model'; Effort = 'stub-effort' } }
+function Parse-CodexTokenUsage { param($RawOutput) return 42 }
+function Write-CodexUsageLog {
+    param($Component, $TokensUsed, $DurationMs, $Status, $FactsPosted,
+          $ModelRequested, $EffortRequested, $ModelResolved, $EffortResolved, $Outcome)
+    Add-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\usage-rows.jsonl') `
+        -Value ((@{ component = $Component; status = $Status; outcome = $Outcome
+                    model_requested = $ModelRequested } | ConvertTo-Json -Compress))
 }
 function Get-CodexResponseText {
     param($RawOutput)

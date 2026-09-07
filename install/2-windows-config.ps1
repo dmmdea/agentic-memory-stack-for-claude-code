@@ -839,7 +839,11 @@ $settingsTask = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -WakeToRun `
     -Hidden `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    # 2026-09-07: 15 -> 40 min. The outer scheduler ceiling must EXCEED the sum of the inner
+    # per-call budgets, and the night's worst case is now gather 180 + consolidate 240 +
+    # promote 240 + gate (3 nominees x 2 attempts x 180) = 1,740s = 29 min. At 15 min Task
+    # Scheduler kills the job object, bypassing the finally block that releases the codex lock.
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 40)
 $principal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask `
@@ -906,7 +910,10 @@ $compactVbs = "C:\Users\$env:USERNAME\.claude\scripts\run-hidden.vbs"
 $compactAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
     -Argument ("//nologo `"$compactVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\memory-compact.ps1`"")
 $compactTrigger = New-ScheduledTaskTrigger -Daily -At 5:00am
-$compactSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+# 2026-09-07: 20 -> 30 min, to match memory-compact.ps1's own computed lock window
+# (max(30, ceil(stores x per-call timeout / 60) + 5)). The script sized its lock for 30 minutes
+# of work while the scheduler killed it at 20; a lock window must never outlive its task.
+$compactSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 $compactPrincipal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $compactTaskName -Action $compactAction -Trigger $compactTrigger -Settings $compactSettings -Principal $compactPrincipal -Description 'Daily 5am auto-memory compactor: keeps each workspace MEMORY.md index under the harness sync/injection caps. Archive-free by design - history is an out-of-tree local git repo; doctrine entries are never touched.' | Out-Null
 Write-Host "    Auto-memory compactor registered (next fire: 5:00 AM)"

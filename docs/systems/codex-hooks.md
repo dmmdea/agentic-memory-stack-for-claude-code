@@ -38,7 +38,7 @@ The `settings.json` hook registrations and their Windows-side handlers: the L1a 
 
 Anthropic's Claude Max OAuth enforces a single concurrent session per account. When Claude Code is open in VS Code, subprocess invocations of `claude --print` from hooks fail intermittently with "Not logged in" because the interactive session holds the slot. This was verified with multi-hour debugging: PowerShell-detached invocations, WSL-bridged invocations, explicit `WSLENV` forwarding — all unreliable while the interactive session is active.
 
-Codex CLI authenticates via **ChatGPT subscription OAuth** (separate auth surface, no concurrency block) and runs reliably headless from any Windows shell. `gpt-5.5` quality matches Opus 4.8 for structured extraction tasks. Both the L1a extraction and the nightly consolidation are covered by the existing ChatGPT subscription — zero marginal cost.
+Codex CLI authenticates via **ChatGPT subscription OAuth** (separate auth surface, no concurrency block) and runs reliably headless from any Windows shell. The models it runs are pinned per job (see *Model routing* below), and their measured quality on the operator goldset is what drives that routing tasks. Both the L1a extraction and the nightly consolidation are covered by the existing ChatGPT subscription — zero marginal cost.
 
 ### The registered hooks
 
@@ -72,7 +72,7 @@ l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks C
   ├─ Acquire-CodexLock('l1a')   → skip if the nightly consolidator or another L1a holds the shared mutex
   │
   ▼ Invoke-CodexSubagent (codex.cmd, ChatGPT OAuth, reasoning=low, timeout=60s)
-Codex / gpt-5.5
+Codex / per-job model
   │ prompt: extract ≤5 durable facts as {"facts":[...]} (plus an episode checkpoint)
   │ ~15-30s per call
   ▼
@@ -128,7 +128,28 @@ The entry points are the `settings.json` hook registrations in the table above. 
 
 ## Dependencies
 
-- **Codex CLI** (`codex.cmd`, ChatGPT-subscription OAuth), gpt-5.5.
+- **Codex CLI** (`codex.cmd`, ChatGPT-subscription OAuth); the model is pinned per job, see *Model routing* below.
+
+## Model routing (2026-09-07)
+
+Every Codex call used to inherit whatever `~/.codex/config.toml` named. On 2026-09-07 a config edit moved the entire stack onto `gpt-6-astra` and **no receipt recorded it** — the audit trail could not say which model had judged a memory. Model choice is now a property of the JOB, passed explicitly with `-Model` (`codex exec -m`), and config.toml is only the fallback for a call site that names none.
+
+| job | model | effort | timeout | why |
+|---|---|---|---|---|
+| L1a session extractor | `gpt-5.6-terra` | low | 90s | 92% of all logged Codex tokens; structured extraction is Astra's weakest measured lane (0.60) |
+| dream — gather | `gpt-5.6-terra` | medium | 180s | retrieval and ranking, not synthesis |
+| dream — consolidate | `gpt-6-astra` | medium | 240s | open-ended synthesis into `tier=insight`; Astra's strongest lanes (research 0.92, review 1.00) |
+| dream — promote-nominate | `gpt-6-astra` | medium | 240s | produces nominations that feed a trust-tier promotion |
+| canonical promotion gate | `gpt-6-astra` | medium | 180s | rarest and most consequential call in the stack (12 firings ever) |
+| memory-compact judge | `gpt-5.6-terra` | medium | 240s | KEEP/SHORTEN/MIGRATE routing over ≤30 slugs |
+| shim `/judge` default | `gpt-5.6-terra` | low | ≤180s | bounded classification for every WSL-side judge |
+| contradiction + supersession | `gpt-5.6-terra` | low | 60s | binary NLI; 103 real calls in one weekly sweep |
+
+**Effort is the cost lever, not the model name.** Measured on this box, the same judge prompt cost 263 tokens at `low` and 3,335 at `medium` — about 13x. Astra runs at **medium** by operator directive (2026-09-07); the doctrine is to escalate only on a *measured* failure at the lower setting.
+
+**Provenance.** `Parse-CodexHeader` reads the model and effort Codex prints in its own stdout header, so every usage row carries `model_requested`/`model_resolved` and `effort_requested`/`effort_resolved`. A mismatch is the detectable form of silent drift — which matters because `model_reasoning_effort` is *not* validated at config load, so a typo passes silently. `outcome` is a closed enum (`ok`, `empty`, `timeout`, `exit_nonzero`, `parse_fail`, `lock_unavailable`, `skipped_no_candidates`).
+
+**Adding a call site:** pass `-Model` (a guard test fails the build if you forget), and write a usage row on every exit path including the failure ones.
 - **mem0 REST** on `:18791` (all reads/writes).
 - **PowerShell 7 (pwsh)** preferred for the PS hooks; the daemon runs under Windows PowerShell 5.1 (its `JavaScriptSerializer` + `NamedPipeServerStream` PipeSecurity are .NET Framework).
 - **The compiled-client toolchain:** `build-hook-client.ps1` (framework `csc`) compiles `mem0-hook-client.cs`.

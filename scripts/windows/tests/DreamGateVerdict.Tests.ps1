@@ -11,9 +11,15 @@
 
 BeforeAll {
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'autopromote-lib.ps1')
-    function Invoke-CodexSubagent { param($Prompt, $ReasoningEffort, $TimeoutSeconds) }
+    function Invoke-CodexSubagent { param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model) }
     function Get-CodexResponseText { param($RawOutput) }
     function Parse-CodexTokenUsage { param($RawOutput) }
+    # 2026-09-07: the gate now records provenance on every verdict.
+    function Parse-CodexHeader { param($RawOutput) return @{ Model = 'stub-model'; Effort = 'stub-effort' } }
+    function Write-CodexUsageLog {
+        param($Component, $TokensUsed, $DurationMs, $Status, $FactsPosted,
+              $ModelRequested, $EffortRequested, $ModelResolved, $EffortResolved, $Outcome)
+    }
 
     # v1.12 F1 sends every Qdrant -Body as UTF-8 BYTES (PS 5.1 Latin-1 fix). A mock
     # discriminator doing `$Body -match '...'` therefore never matches (regex vs byte[]).

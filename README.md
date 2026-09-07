@@ -21,7 +21,7 @@ flowchart LR
     A["Claude Code sessions"] -->|"hooks: extract + capture"| B["mem0 server :18791<br/>tiers + admission gate"]
     B --> C["Qdrant :6333<br/>768-d vectors"]
     B -->|"embed / rerank"| D["llama-swap :11436<br/>EmbeddingGemma + bge"]
-    E["Codex CLI (gpt-5.5)"] -->|"extraction / consolidation / judgment"| B
+    E["Codex CLI (per-job model)"] -->|"extraction / consolidation / judgment"| B
     B -->|"top K=1-2 at the 0.30 gate, or abstain"| A
 ```
 

@@ -32,9 +32,32 @@ $script:StateDir = Join-Path $env:USERPROFILE '.claude\state'
 
 # Codex CLI (OpenAI ChatGPT subscription OAuth — separate auth from Claude Max,
 # so no concurrent-session conflict with the interactive Claude Code session).
-# Headless via `codex exec`. Default model gpt-5.5 (current Codex CLI 0.137+).
+# Headless via `codex exec`. The model is PINNED PER JOB (see the routing block below);
+# ~/.codex/config.toml is only the fallback for a call site that names none. Verified against
+# Codex CLI 0.153.4 (2026-09-07).
 $script:CodexCmd = Join-Path $env:USERPROFILE 'AppData\Roaming\npm\codex.cmd'
 $script:CodexEffortExtractor = 'low'      # I1: structured extraction, low effort is enough
+
+# ---------------------------------------------------------------- codex model routing (2026-09-07)
+# Until now NO caller passed a model, so every judge silently inherited whatever
+# ~/.codex/config.toml named. A config edit on 2026-09-07 14:42 moved the entire stack onto
+# gpt-6-astra without a single receipt recording it. Model choice is a PROPERTY OF THE JOB, so it
+# is pinned here per job class and passed explicitly; config.toml is now only the fallback for a
+# call site that names nothing.
+#
+# Routing rationale (operator's measured routing goldset + this box's own usage ledger):
+#   Astra is 0.92 research / 1.00 review but 0.60 extraction / 0.50 quick-edit, and the L1a
+#   extractor alone is 92% of all Codex tokens logged here. Putting Astra on the high-volume
+#   classification jobs would spend the shared 7-day window on its two WEAKEST measured lanes.
+#   So Astra goes where synthesis and consequence live (dream consolidation, promotion), and
+#   gpt-5.6-terra keeps the bounded extraction/classification jobs.
+# Effort: medium for Astra by OPERATOR DIRECTIVE (2026-09-07). OpenAI's own migration note has
+#   Astra@medium beating the prior flagship at max, and the doctrine is escalate only on a
+#   MEASURED failure at the lower setting - so medium is the default everywhere, including the
+#   promotion gate (research argued high there; the operator chose medium and that governs).
+$script:AmCodexModelSynthesis  = 'gpt-6-astra'     # open-ended synthesis + consequential judgment
+$script:AmCodexModelClassify   = 'gpt-5.6-terra'   # bounded extraction / classification / routing
+$script:AmCodexEffortSynthesis = 'medium'          # operator directive 2026-09-07: medium, not high
 $script:CodexEffortConsolidator = 'medium'  # C1: synthesis, medium for better insight quality
 
 function Initialize-MemoryEnv {
@@ -448,7 +471,11 @@ function Invoke-CodexSubagent {
     param(
         [Parameter(Mandatory)][string]$Prompt,
         [string]$ReasoningEffort = 'low',  # low | medium | high
-        [int]$TimeoutSeconds = 120
+        [int]$TimeoutSeconds = 120,
+        # 2026-09-07: an EMPTY model means "inherit ~/.codex/config.toml" - the pre-existing
+        # behaviour, kept so an un-migrated call site behaves exactly as before. Every job in
+        # this stack now names its model; see $script:AmCodexModel* above.
+        [string]$Model = ''
     )
     if (-not (Test-Path $script:CodexCmd)) {
         throw "codex.cmd not found at $($script:CodexCmd)"
@@ -489,7 +516,13 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } 
 try { $OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $inp = [Console]::In.ReadToEnd()
-$o = $inp | & $env:MEM0_CODEX_CMD exec --skip-git-repo-check -c $env:MEM0_CODEX_EFFORT_ARG - 2>&1
+# An ARRAY, not an interpolated string: an empty MEM0_CODEX_MODEL must contribute NO argument
+# (a bare `-m ""` makes codex exit non-zero), and array splatting to a native command is
+# PS 5.1-safe and quote-free - the same reason the effort override travels by env var.
+$cargs = @('exec', '--skip-git-repo-check', '-c', $env:MEM0_CODEX_EFFORT_ARG)
+if (-not [string]::IsNullOrWhiteSpace($env:MEM0_CODEX_MODEL)) { $cargs += @('-m', $env:MEM0_CODEX_MODEL) }
+$cargs += '-'
+$o = $inp | & $env:MEM0_CODEX_CMD @cargs 2>&1
 [Console]::Out.Write([string]::Join([char]10, @($o | ForEach-Object { [string]$_ })))
 exit $LASTEXITCODE
 '@
@@ -507,6 +540,7 @@ exit $LASTEXITCODE
     $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
     $psi.EnvironmentVariables['MEM0_CODEX_CMD'] = $script:CodexCmd
     $psi.EnvironmentVariables['MEM0_CODEX_EFFORT_ARG'] = $effortArg
+    $psi.EnvironmentVariables['MEM0_CODEX_MODEL'] = $Model
 
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
@@ -537,6 +571,30 @@ exit $LASTEXITCODE
     }
 }
 
+function Parse-CodexHeader {
+    # The RESOLVED model and effort, read from Codex's own stdout header - the block it prints
+    # before the second `--------` separator:
+    #     OpenAI Codex v0.153.4 / -------- / workdir: ... / model: gpt-5.6-terra
+    #     provider: openai / approval: never / sandbox: ... / reasoning effort: low
+    # Verified live against codex-cli 0.153.4 on 2026-09-07.
+    #
+    # WHY RESOLVED AND NOT JUST REQUESTED: model_reasoning_effort is not validated at config
+    # load, so a typo passes silently and the run proceeds at the default. Recording what we
+    # ASKED FOR next to what codex actually RAN turns that class of silent drift into a visible
+    # mismatch. Returns @{ Model; Effort } with 'unparsed' (never empty) when the header cannot
+    # be read, so "we could not tell" never looks like "it matched".
+    param([AllowEmptyString()][AllowNull()][string]$RawOutput)
+    $out = @{ Model = 'unparsed'; Effort = 'unparsed' }
+    if ([string]::IsNullOrWhiteSpace($RawOutput)) { return $out }
+    foreach ($line in (($RawOutput -split "`r?`n") | Select-Object -First 40)) {
+        $t = "$line".Trim()
+        if ($t -match '^model:\s*(\S+)') { $out.Model = $Matches[1] }
+        elseif ($t -match '^reasoning effort:\s*(\S+)') { $out.Effort = $Matches[1] }
+        elseif ($t -eq 'user') { break }
+    }
+    return $out
+}
+
 function Parse-CodexTokenUsage {
     # Codex CLI outputs "tokens used\nN" near the end. Parse it for cost accounting.
     # Returns int or $null.
@@ -555,11 +613,20 @@ function Write-CodexUsageLog {
     # Persist per-call usage to ~/.claude/logs/codex-usage.jsonl for budget visibility
     # (audit finding 2026-06-08: no token/call accounting was persisted).
     param(
-        [Parameter(Mandatory)][string]$Component,  # 'l1a' | 'c1'
+        [Parameter(Mandatory)][string]$Component,  # 'l1a' | 'c1' | 'dream-*' | 'compact' | 'dream-gate'
         [int]$TokensUsed = 0,
         [int]$DurationMs = 0,
         [string]$Status = 'ok',
-        [int]$FactsPosted = 0
+        [int]$FactsPosted = 0,
+        # 2026-09-07 provenance. Requested = what the job asked for; Resolved = what codex's own
+        # header said it ran (Parse-CodexHeader). A mismatch is the detectable form of silent
+        # model drift. Outcome is a closed enum so the ledger can be counted, not grepped.
+        [string]$ModelRequested = '',
+        [string]$EffortRequested = '',
+        [string]$ModelResolved = '',
+        [string]$EffortResolved = '',
+        [ValidateSet('ok', 'empty', 'timeout', 'exit_nonzero', 'parse_fail', 'lock_unavailable', 'skipped_no_candidates', '')]
+        [string]$Outcome = ''
     )
     $usageLog = Join-Path $script:LogDir 'codex-usage.jsonl'
     $rec = @{
@@ -569,6 +636,11 @@ function Write-CodexUsageLog {
         duration_ms = $DurationMs
         status = $Status
         items_posted = $FactsPosted
+        model_requested = $ModelRequested
+        effort_requested = $EffortRequested
+        model_resolved = $ModelResolved
+        effort_resolved = $EffortResolved
+        outcome = $Outcome
     } | ConvertTo-Json -Compress
     try { Add-Content -LiteralPath $usageLog -Value $rec -Encoding UTF8 } catch {}
 }
@@ -617,7 +689,11 @@ function Get-CodexResponseText {
         if ($lines[$i].Trim() -eq 'tokens used') { $endIdx = $i }
         if ($lines[$i].Trim() -eq 'codex') { $startIdx = $i + 1; break }
     }
-    if ($startIdx -lt 0) { return $RawOutput }
+    # 2026-09-07: returning $RawOutput when the `codex` marker is ABSENT handed callers the
+    # metadata header as if it were the model's answer; Extract-JsonFromText then failed on it
+    # and the caller logged "json parse failed" with a header preview (5 of 330 live L1a calls).
+    # $null says "there is no answer here" so the caller can record outcome='parse_fail'.
+    if ($startIdx -lt 0) { return $null }
     return (($lines[$startIdx..($endIdx - 1)] -join "`n").Trim())
 }
 
@@ -628,9 +704,27 @@ function Extract-JsonFromText {
     # Strip markdown code fences if present
     $cleaned = $Text -replace '(?s)```(?:json)?\s*', '' -replace '```\s*', ''
     # Try to parse the whole thing first
+    # 2026-09-07: a BARE TOP-LEVEL ARRAY is a legitimate answer this function used to discard.
+    # The nightly promote-nomination phase asks for a list and the model replies `[]` or
+    # `[{...}]`; dream.log recorded "autopromote: bad Codex JSON (promoting nothing): []" on
+    # 09-03 and again on 09-07 - that phase has been silently nominating nothing.
+    # Detected BY SHAPE, before the object parse, because `'[]' | ConvertFrom-Json` yields
+    # NOTHING in PowerShell (an empty pipeline, so $obj is $null) - the empty list, which is the
+    # exact payload observed in the log, is invisible to any `-is [System.Array]` test. @()
+    # around the parse turns both [] and [x] into a real array. Wrapped under the caller's key
+    # so every existing caller keeps its shape.
+    $trimmed = $cleaned.Trim()
+    if ($trimmed.StartsWith('[')) {
+        try {
+            $arr = @($trimmed | ConvertFrom-Json)
+            $wrapped = New-Object psobject
+            $wrapped | Add-Member -NotePropertyName $ExpectedKey -NotePropertyValue $arr -Force
+            return $wrapped
+        } catch { }
+    }
     try {
         $obj = $cleaned | ConvertFrom-Json
-        if ($obj.PSObject.Properties.Name -contains $ExpectedKey) { return $obj }
+        if ($null -ne $obj -and $obj.PSObject.Properties.Name -contains $ExpectedKey) { return $obj }
     } catch { }
     # Fallback: regex for the JSON object containing the expected key
     $pattern = '\{[^{}]*"' + [regex]::Escape($ExpectedKey) + '"\s*:\s*\[[^\]]*\][^{}]*\}'
@@ -708,8 +802,10 @@ function Test-ThrottleAndMark {
 function Acquire-CodexLock {
     # Atomic create-new with PID liveness check (v0.13.1 hardening).
     # Returns $true if lock acquired (caller MUST call Release-CodexLock after), $false
-    # if another LIVE process holds it. Stale locks (holder PID gone OR mtime > MaxAgeMinutes)
-    # are reclaimed.
+    # if another LIVE process holds it. A lock is reclaimed as stale when the holder PID is
+    # GONE, or when no PID could be read from the file AND its mtime exceeds MaxAgeMinutes.
+    # 2026-09-07: age alone no longer reclaims a lock whose holder is ALIVE - a long legitimate
+    # hold (the dream's worst case is ~29 min) was previously stealable mid-call.
     param(
         [Parameter(Mandatory)][string]$Owner,    # 'l1a' | 'c1' | 'dream'
         [int]$MaxAgeMinutes = 30
@@ -739,7 +835,12 @@ function Acquire-CodexLock {
             $proc = Get-Process -Id $holderPid -ErrorAction SilentlyContinue
             if (-not $proc) { $stale = $true }  # PID gone
         }
-        if (-not $stale) {
+        # 2026-09-07: age alone used to reclaim the lock EVEN WITH THE HOLDER ALIVE, so a long
+        # legitimate hold (the dream's worst case is ~29 min against a 30 min default) could be
+        # stolen mid-call by a concurrent L1a run - two codex processes, one corrupted result.
+        # A live holder is never robbed: age only reclaims when the PID is unknown/unreadable.
+        # A genuinely wedged live holder now blocks and is reported (fail loud over recovery).
+        if (-not $stale -and -not $holderPid) {
             try {
                 $age = (Get-Date) - (Get-Item -LiteralPath $lockFile).LastWriteTime
                 if ($age.TotalMinutes -ge $MaxAgeMinutes) { $stale = $true }

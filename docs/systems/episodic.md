@@ -97,7 +97,7 @@ Claude Code session ends
           1. Throttle check (10-min window)
           2. Test mem0 health
           3. Read last 24 transcript turns (12 000 chars max)
-          4. Codex extraction (gpt-5.5, effort=low, timeout=60s)
+          4. Codex extraction (`gpt-5.6-terra`, effort=low, timeout=90s)
              Prompt returns STRICT JSON: { facts: [...], episode: { goal, summary } | null }
           5. POST each fact to mem0 as evidence (existing path)
           6. [NEW v0.15] If episode.goal is non-null:

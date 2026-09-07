@@ -552,14 +552,23 @@ foreach ($cand in $candidates) {
             [void]$sb.AppendLine('  current: ' + $c.Summary)
         }
         $raw = $null
-        try { $raw = Invoke-CodexSubagent -Prompt $sb.ToString() -ReasoningEffort 'medium' -TimeoutSeconds $CodexTimeoutSeconds }
+        # Pinned to the CLASSIFY model: KEEP/SHORTEN/MIGRATE routing over <=30 slugs is bounded
+        # classification, Astra's second-weakest measured lane, and this runs nightly per store.
+        $judgeT0 = Get-Date
+        try { $raw = Invoke-CodexSubagent -Prompt $sb.ToString() -ReasoningEffort 'medium' -TimeoutSeconds $CodexTimeoutSeconds -Model $script:AmCodexModelClassify }
         catch {
             # NO LOCAL FALLBACK: judgment work waits for the judge. Deterministic hygiene from
             # this pass is still applied below, and the throttle is not marked.
             Write-MemoryLog -Component $Component -Message ($ws + ': judge unavailable (' + $_.Exception.Message + '); deterministic hygiene only')
             $result.note = 'judge unavailable; deterministic hygiene only'
+            # 2026-09-07: this file called Write-CodexUsageLog ZERO times, so the nightly
+            # compactor was absent from the usage ledger entirely.
+            Write-CodexUsageLog -Component 'compact' -Status 'error' -DurationMs ([int]((Get-Date) - $judgeT0).TotalMilliseconds) `
+                -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
+                -Outcome $(if ($_.Exception.Message -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
         }
         if ($raw) {
+            $judgeHdr = Parse-CodexHeader -RawOutput $raw
             $text = Get-CodexResponseText -RawOutput $raw
             # The helper matches an OBJECT carrying an expected key; a bare top-level array
             # returns $null (observed in the dream log), hence the {"plan":[...]} wrapper.
@@ -569,6 +578,11 @@ foreach ($cand in $candidates) {
                 Write-MemoryLog -Component $Component -Message ($ws + ': judge returned unparseable JSON; deterministic hygiene only')
                 $result.note = 'judge returned unparseable output; deterministic hygiene only'
             }
+            Write-CodexUsageLog -Component 'compact' -DurationMs ([int]((Get-Date) - $judgeT0).TotalMilliseconds) `
+                -TokensUsed ([int](Parse-CodexTokenUsage -RawOutput $raw)) `
+                -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
+                -ModelResolved $judgeHdr.Model -EffortResolved $judgeHdr.Effort `
+                -Status $(if ($judgeOk) { 'ok' } else { 'error' }) -Outcome $(if ($judgeOk) { 'ok' } else { 'parse_fail' })
         }
     }
 

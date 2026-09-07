@@ -71,7 +71,7 @@ Pull the evidence window and transcript signals that will feed consolidation.
 
 ### Phase 3 — Consolidate
 
-The Codex call (gpt-5.5, reasoning=medium, timeout=180s):
+The Codex call (`gpt-6-astra`, reasoning=medium, timeout=240s):
 
 ```
 prompt: "You are a memory consolidator running once per 24h. Below are recent evidence-tier 
@@ -166,7 +166,7 @@ The canary harness lives in the eval checkout: `<EvalRootWsl>/eval/retrieval-dri
 
 ## Dependencies
 
-- **Codex CLI** (gpt-5.5, ChatGPT-subscription OAuth) for the consolidation and autopromote-nomination calls.
+- **Codex CLI** (`gpt-6-astra` at medium effort, ChatGPT-subscription OAuth) for the consolidation and autopromote-nomination calls; gather runs on `gpt-5.6-terra`.
 - **The shared Codex mutex** (`memory-common.ps1`) — see [`codex-hooks.md`](./codex-hooks.md).
 - **mem0 REST** on `:18791` and **`mem0-canonize.sh`** for the HMAC-signed promotion.
 - **EmbeddingGemma + Qdrant** (via mem0) for the Phase 5 drift canary; the optional **`eval/` harness** for the drift script.
