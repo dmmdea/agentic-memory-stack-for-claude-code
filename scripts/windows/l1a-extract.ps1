@@ -151,10 +151,17 @@ $turns
     $raw = $null
     $codexStart = Get-Date
     try {
-        $raw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:CodexEffortExtractor -TimeoutSeconds 60
+        # 2026-09-07: pinned to the CLASSIFY model. This is the highest-volume job in the stack
+        # (92% of all logged Codex tokens); structured extraction is Astra's weakest measured
+        # lane, so it must not silently inherit a synthesis model from config.toml.
+        # 60 -> 90s: the observed max over 1,939 logged calls is 62.4s, i.e. 60s has already
+        # been breached once; 90s is ~3x p99 (29.6s).
+        $raw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:CodexEffortExtractor -TimeoutSeconds 90 -Model $script:AmCodexModelClassify
     } catch {
         Write-MemoryLog -Component 'l1a' -Message "  codex subagent failed: $_"
-        Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs ([int]((Get-Date) - $codexStart).TotalMilliseconds)
+        $failOutcome = if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' }
+        Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs ([int]((Get-Date) - $codexStart).TotalMilliseconds) `
+            -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor -Outcome $failOutcome
         Release-CodexLock
         exit 0
     }
@@ -162,8 +169,12 @@ $turns
     $codexDurationMs = [int]((Get-Date) - $codexStart).TotalMilliseconds
     $codexTokens = (Parse-CodexTokenUsage -RawOutput $raw)
 
+    $codexHdr = Parse-CodexHeader -RawOutput $raw
     if ([string]::IsNullOrWhiteSpace($raw)) {
         Write-MemoryLog -Component 'l1a' -Message '  codex returned empty'
+        Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs $codexDurationMs -TokensUsed $codexTokens `
+            -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor `
+            -ModelResolved $codexHdr.Model -EffortResolved $codexHdr.Effort -Outcome 'empty'
         exit 0
     }
 
@@ -173,6 +184,12 @@ $turns
     if ($null -eq $parsed) {
         $preview = if ($raw.Length -gt 200) { $raw.Substring(0, 200) } else { $raw }
         Write-MemoryLog -Component 'l1a' -Message "  json parse failed; preview: $preview"
+        # 2026-09-07: this branch was the ONLY exit path that wrote no ledger row, which is why
+        # the 5 observed parse failures never appeared among 1,990 usage rows. A failure the
+        # ledger cannot count is a failure nobody fixes.
+        Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs $codexDurationMs -TokensUsed $codexTokens `
+            -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor `
+            -ModelResolved $codexHdr.Model -EffortResolved $codexHdr.Effort -Outcome 'parse_fail'
         exit 0
     }
 

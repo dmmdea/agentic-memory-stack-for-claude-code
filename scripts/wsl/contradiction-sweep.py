@@ -157,7 +157,13 @@ DEFAULT_MODEL = "offload-e4b"
 # shim, never local). `--judge local` keeps the old offload-e4b path for a cheap/offline pass; its
 # flags are advisory (the admission gate hides them, self-heal re-judges) and NEVER authoritative.
 DEFAULT_JUDGE = "codex"
-CODEX_JUDGE_TIMEOUT_S = 45.0  # Codex low-effort NLI runs ~20-30s
+# 2026-09-07: 45 -> 60s. Modest margin over the code's own stated 20-30s band now that the
+# judge model is pinned per job rather than inherited from whatever config.toml names.
+CODEX_JUDGE_TIMEOUT_S = 60.0  # Codex low-effort NLI runs ~20-30s
+# The judge model for BOTH sweep judges. Bounded binary classification: the classify model.
+# Must move together with CODEX_JUDGE_IDENTITY in codex_shim_client, or cached verdicts from a
+# different model survive the change for the cache TTL.
+CODEX_JUDGE_MODEL = "gpt-5.6-terra"
 ACTOR = "contradiction-sweep-v019"
 SWEEP_LOG = Path.home() / ".mem0" / "contradiction-sweep.jsonl"
 # 2026-06-30: the SAFE rejudge policy routes YES verdicts here (human review) instead of
@@ -526,7 +532,7 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
     out = _codex_call(_codex.judge_contradiction, str(canonical_text), str(candidate_text),
-                      timeout_s=int(timeout_s))
+                      timeout_s=int(timeout_s), model=CODEX_JUDGE_MODEL)
     if not out.get("ok"):
         # Distinct prefix for budget-exhausted contention: the legs abort with
         # degraded:judge-lock-contended instead of miscounting a live co-tenant
@@ -705,7 +711,7 @@ def judge_supersession_codex(older_text: str, newer_text: str,
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
     out = _codex_call(_codex.judge_supersession, str(older_text), str(newer_text),
-                      timeout_s=int(timeout_s))
+                      timeout_s=int(timeout_s), model=CODEX_JUDGE_MODEL)
     if not out.get("ok"):
         if out.get("error_type") in _busy_types():
             consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
@@ -1837,7 +1843,7 @@ def main() -> int:
                              "on this memory via the trusted-actor PATCH "
                              "(prints before/after, then exits; no sweep runs)")
     parser.add_argument("--judge", choices=["codex", "local"], default=DEFAULT_JUDGE,
-                        help=f"judge backend (default {DEFAULT_JUDGE}): 'codex' = gpt-5.5 via the "
+                        help=f"judge backend (default {DEFAULT_JUDGE}): 'codex' = {CODEX_JUDGE_MODEL} via the "
                              "Windows HTTP shim (authoritative; model-routing rule); 'local' = the "
                              "offload-e4b llama-swap model (cheap/advisory, never authoritative)")
     parser.add_argument("--rejudge-stamped", action="store_true",

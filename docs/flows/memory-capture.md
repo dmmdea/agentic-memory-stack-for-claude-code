@@ -117,7 +117,7 @@ When the pipeline succeeds: only genuinely project-specific facts reach mem0 as 
 
 ## External dependencies
 
-- **Codex CLI** (gpt-5.5, ChatGPT-subscription OAuth) — the extraction / consolidation / nomination LLM; one shared Codex lock serializes all three.
+- **Codex CLI** (per-job model, ChatGPT-subscription OAuth) — the extraction / consolidation / nomination LLM; one shared Codex lock serializes all three.
 - **mem0 REST server** on `:18791` — the write authority; `mem0-canonize.sh` for the HMAC-signed canonical promotion.
 - **Windows Task Scheduler** — hosts the nightly dream (`-WakeToRun`).
 - **WSL2** — hosts `precompact_capture.py`, the mem0 server, and the canonize CLI.

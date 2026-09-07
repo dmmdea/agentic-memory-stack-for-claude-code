@@ -4,6 +4,38 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.16 (2026-09-07) — the judge model is pinned per job, and recorded
+
+Every Codex call inherited whatever `~/.codex/config.toml` named. A config edit on 2026-09-07
+moved the whole stack onto `gpt-6-astra` and nothing recorded it: no receipt, log line or ledger
+row could say which model had judged a memory.
+
+- **Per-job model routing.** `Invoke-CodexSubagent -Model` (and a `model` field on the shim's
+  `/judge` request, allowlisted, shim `0.27.1` → `0.28.0`). Synthesis and consequence run on
+  `gpt-6-astra` at **medium** effort (operator directive); bounded extraction, classification and
+  routing run on `gpt-5.6-terra`. A guard test fails the build if a call site forgets `-Model`.
+  Routing table and rationale: `docs/systems/codex-hooks.md`.
+- **Provenance.** New `Parse-CodexHeader` reads the RESOLVED model and effort out of Codex's own
+  stdout header (verified against codex-cli 0.153.4), and the usage ledger gained
+  `model_requested`, `effort_requested`, `model_resolved`, `effort_resolved` and a closed
+  `outcome` enum. `memory-compact.ps1` and `autopromote-lib.ps1` called the usage logger ZERO
+  times and are now instrumented, as are the dream's abort paths and L1a's parse-failure exit.
+- **Fixed: the promotion phase had been nominating nothing.** `Extract-JsonFromText` discarded a
+  bare top-level array, and `'[]' | ConvertFrom-Json` yields nothing in PowerShell, so the empty
+  list was invisible. `dream.log` recorded "autopromote: bad Codex JSON (promoting nothing): []"
+  on 2026-09-03 and 09-07.
+- **Fixed: header-only replies were parsed as answers.** `Get-CodexResponseText` returned the raw
+  metadata header when Codex emitted no assistant message; it now returns `$null` so the caller
+  records `outcome='parse_fail'` (5 of 330 live L1a calls).
+- **Fixed: a live lock holder could be robbed.** `Acquire-CodexLock` reclaimed on age alone even
+  with the holder alive; age now only applies when no PID can be read.
+- Timeouts and ceilings sized to the work: L1a 60→90s (observed max 62.4s), Astra phases →240s,
+  gate 90→180s, sweep 45→60s, dream lock 30→45 min, dream task limit 15→40 min, compactor task
+  20→30 min (its own lock window was already 30).
+- `CODEX_JUDGE_IDENTITY` bumped (`…effort-low:v1` → `codex-cli:terra:effort-low:v2`): the 30-day
+  verdict cache was not bumped when the model changed, so stale verdicts would have survived.
+- Stale `gpt-5.5` references replaced across docs and comments with the job's role.
+
 ## v1.20.15 (2026-09-06) — the compactor runs every night, and converges on lines
 
 - Compactor throttle 23h → 12h: a daytime hand run marked the throttle and the next 05:00 run

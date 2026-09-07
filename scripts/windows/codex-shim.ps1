@@ -3,7 +3,7 @@
 # WHY THIS EXISTS (load-bearing):
 #   The remaining R5 governance items run WSL-side python (the mem0 server add()
 #   write-gate + scripts/wsl/contradiction-sweep.py) but ALL LLM judgment must use
-#   Codex (gpt-5.5 via ChatGPT OAuth), which is Windows-only. Invoking Codex by
+#   Codex (via ChatGPT OAuth), which is Windows-only. Invoking Codex by
 #   spawning powershell.exe FROM WSL is UNRELIABLE: codex runs, but its stdout is
 #   mangled across the WSL->Windows process boundary (a RemoteException stderr
 #   artifact; Get-CodexResponseText returns empty). Verified clean ONLY when run
@@ -51,7 +51,14 @@ $ErrorActionPreference = 'Stop'
 # Invoke-LogRotation, $script:CodexCmd, $script:LogDir, $script:StateDir).
 . (Join-Path $PSScriptRoot 'memory-common.ps1')
 
-$script:ShimVersion       = '0.27.1'
+# 0.28.0 (2026-09-07): the /judge REQUEST SCHEMA gained an optional `model` field and the
+# response now reports the model that actually ran. A schema change, hence the minor bump.
+$script:ShimVersion       = '0.28.0'
+# Every WSL-side judge (contradiction sweep, supersession, retrieval pairs, the NLI write-gate)
+# is bounded classification, so the shim's DEFAULT is the classify model rather than whatever
+# ~/.codex/config.toml happens to name. A request may name another model from the allowlist.
+$script:ShimDefaultModel  = 'gpt-5.6-terra'
+$script:ShimModelAllowlist = @('gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
 $script:ShimMaxBodyBytes  = 65536        # reject prompts larger than 64 KiB (413)
 $script:ShimDefaultPort   = 18792        # loopback HTTP shim port (override via env if it collides)
 $script:ShimMinTimeoutSec = 10
@@ -112,11 +119,15 @@ function New-RealCodexInvoker {
     # extracts the clean response + token usage. Returns @{response; tokens}; throws
     # on timeout ('*timed out*') or non-zero exit ('*exited*') exactly as the lib does.
     return {
-        param([string]$Prompt, [string]$Effort, [int]$TimeoutSec)
-        $raw   = Invoke-CodexSubagent -Prompt $Prompt -ReasoningEffort $Effort -TimeoutSeconds $TimeoutSec
+        param([string]$Prompt, [string]$Effort, [int]$TimeoutSec, [string]$Model)
+        $raw   = Invoke-CodexSubagent -Prompt $Prompt -ReasoningEffort $Effort -TimeoutSeconds $TimeoutSec -Model $Model
         $resp  = Get-CodexResponseText -RawOutput $raw
         $tok   = Parse-CodexTokenUsage -RawOutput $raw
-        return @{ response = $resp; tokens = $tok }
+        $hdr   = Parse-CodexHeader -RawOutput $raw
+        # A $null response means codex emitted no answer at all (header only). Throw rather than
+        # return an empty string the caller would store as a verdict.
+        if ($null -eq $resp) { throw 'codex produced no assistant message (header-only output)' }
+        return @{ response = $resp; tokens = $tok; model_resolved = $hdr.Model; effort_resolved = $hdr.Effort }
     }
 }
 
@@ -189,6 +200,15 @@ function Invoke-CodexShimRequest {
             $e = ([string]$req.effort).ToLowerInvariant()
             if ($e -in @('low', 'medium', 'high')) { $effort = $e }
         }
+        # Optional `model`, validated against the allowlist. An unknown/absent value falls back
+        # to the shim default rather than erroring: a judge must not go down because a caller
+        # named a model this shim has not been taught.
+        $model = $script:ShimDefaultModel
+        if ($req.PSObject.Properties['model'] -and -not [string]::IsNullOrWhiteSpace([string]$req.model)) {
+            $m = ([string]$req.model).ToLowerInvariant()
+            if ($script:ShimModelAllowlist -contains $m) { $model = $m }
+            else { Write-ShimLog "judge: ignoring unknown model '$m'; using $($script:ShimDefaultModel)" }
+        }
         $timeoutSec = 60
         if ($req.PSObject.Properties['timeout_seconds']) {
             $t = 0
@@ -206,7 +226,7 @@ function Invoke-CodexShimRequest {
         }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         try {
-            $result = & $CodexInvoker $prompt $effort $timeoutSec
+            $result = & $CodexInvoker $prompt $effort $timeoutSec $model
             $sw.Stop()
             $respText = ''
             $tokens = 0

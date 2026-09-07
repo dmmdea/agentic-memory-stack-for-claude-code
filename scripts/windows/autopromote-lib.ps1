@@ -449,7 +449,10 @@ function Get-PromotionGateVerdict {
     } elseif ($nearCanonTexts.Count -gt 0) {
         $prompt = New-ContradictionPrompt -CandidateText $CandidateText -CanonicalTexts $nearCanonTexts
         $cdxRaw = $null; $t0 = Get-Date
-        try { $cdxRaw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort 'low' -TimeoutSeconds 90 } catch { $cdxRaw = $null }
+        # 2026-09-07: the rarest and most consequential Codex call in the stack (12 firings ever)
+        # ran at the LOWEST effort on an unrecorded model. Pinned to the SYNTHESIS model; effort
+        # is the operator's 2026-09-07 directive (medium, not high). 90 -> 180s to match.
+        try { $cdxRaw = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 180 -Model $script:AmCodexModelSynthesis } catch { $cdxRaw = $null }
         $codexMs = [int]((Get-Date) - $t0).TotalMilliseconds
         if ($cdxRaw) { try { $codexTokens = [int](Parse-CodexTokenUsage -RawOutput $cdxRaw) } catch { $codexTokens = 0 } }
         $cdxText = $null
@@ -462,7 +465,9 @@ function Get-PromotionGateVerdict {
         # cold-shim hiccup no longer phantom-blocks a good promotion, and both-fail stays fail-safe.
         if (-not $v.parsed) {
             $cdxRaw2 = $null
-            try { $cdxRaw2 = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort 'low' -TimeoutSeconds 90 } catch { $cdxRaw2 = $null }
+            # The retry MUST match the first attempt or the verdict that stands is ambiguous
+            # about which configuration produced it.
+            try { $cdxRaw2 = Invoke-CodexSubagent -Prompt $prompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 180 -Model $script:AmCodexModelSynthesis } catch { $cdxRaw2 = $null }
             if ($cdxRaw2) {
                 try { $codexTokens += [int](Parse-CodexTokenUsage -RawOutput $cdxRaw2) } catch { }
                 $cdxText2 = $null
@@ -471,6 +476,13 @@ function Get-PromotionGateVerdict {
                 if ($v2.parsed) { $v = $v2 }
             }
         }
+        # This file also called Write-CodexUsageLog zero times: gate verdicts were untelemetered
+        # and their tokens only folded into the dream's end-of-run aggregate.
+        $gateHdr = Parse-CodexHeader -RawOutput $cdxRaw
+        Write-CodexUsageLog -Component 'dream-gate' -DurationMs $codexMs -TokensUsed ([int]$codexTokens) `
+            -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
+            -ModelResolved $gateHdr.Model -EffortResolved $gateHdr.Effort `
+            -Status $(if ($v.parsed) { 'ok' } else { 'error' }) -Outcome $(if ($v.parsed) { 'ok' } else { 'parse_fail' })
         $contradicts = [bool]$v.contradicts
         $contradictionParsed = [bool]$v.parsed
         $contradictionCanonical = $v.canonical

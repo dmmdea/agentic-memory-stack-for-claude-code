@@ -394,3 +394,92 @@ Describe 'Split-OversizeFact write-time oversize guard (MEM-10, 2026-07-03)' {
         @(Split-OversizeFact -Fact '').Count | Should -Be 1
     }
 }
+
+Describe 'Codex model routing + provenance (2026-09-07)' {
+    # Until this change NO call site passed a model, so every judge inherited whatever
+    # ~/.codex/config.toml named. A config edit on 2026-09-07 14:42 moved the whole stack onto
+    # gpt-6-astra and not one receipt recorded it.
+
+    It 'puts -m <model> on the codex command line when -Model is given' {
+        $fake = Join-Path $TestDrive 'codex-args.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo ARGS:%*')
+        $script:CodexCmd = $fake
+        $out = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30 -Model 'gpt-6-astra'
+        $out | Should -Match '-m gpt-6-astra'
+    }
+
+    It 'passes NO -m at all when -Model is omitted (an empty model must not become -m "")' {
+        # `codex exec -m ""` exits non-zero; the argument must be absent, not empty. This is
+        # why the child builds an ARRAY instead of interpolating a string.
+        $fake = Join-Path $TestDrive 'codex-args2.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo ARGS:%*')
+        $script:CodexCmd = $fake
+        $out = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30
+        $out | Should -Not -Match '\-m\b'
+        $out | Should -Match 'model_reasoning_effort' -Because 'the effort override is still passed'
+    }
+
+    It 'Parse-CodexHeader reads the RESOLVED model and effort from codex stdout' {
+        # Verified verbatim against codex-cli 0.153.4 on 2026-09-07.
+        $raw = "OpenAI Codex v0.153.4`n--------`nworkdir: D:\x`nmodel: gpt-5.6-terra`nprovider: openai`napproval: never`nreasoning effort: low`n--------`nuser`nhi`ncodex`nOK"
+        $h = Parse-CodexHeader -RawOutput $raw
+        $h.Model | Should -Be 'gpt-5.6-terra'
+        $h.Effort | Should -Be 'low'
+    }
+
+    It 'Parse-CodexHeader reports unparsed (never empty) when the header is unreadable' {
+        # "we could not tell" must never be indistinguishable from "it matched".
+        foreach ($bad in @('', 'total garbage', $null)) {
+            $h = Parse-CodexHeader -RawOutput $bad
+            $h.Model | Should -Be 'unparsed'
+            $h.Effort | Should -Be 'unparsed'
+        }
+    }
+
+    It 'Get-CodexResponseText returns $null when codex emitted no assistant message' {
+        # It used to return the RAW metadata header, which callers then failed to parse and
+        # logged as "json parse failed" with a header preview (5 of 330 live L1a calls).
+        Get-CodexResponseText -RawOutput "OpenAI Codex v0.153.4`nmodel: x`n--------" | Should -BeNullOrEmpty
+        Get-CodexResponseText -RawOutput "hdr`ncodex`nANSWER`ntokens used`n5" | Should -Be 'ANSWER'
+    }
+
+    It 'Extract-JsonFromText accepts a bare top-level array, including the EMPTY one' {
+        # The nightly promote-nomination phase asks for a list; dream.log recorded
+        # "autopromote: bad Codex JSON (promoting nothing): []" on 2026-09-03 and 09-07.
+        # `'[]' | ConvertFrom-Json` yields NOTHING in PowerShell, so the empty list - the exact
+        # payload observed - is invisible to any -is [System.Array] test.
+        $empty = Extract-JsonFromText -Text '[]' -ExpectedKey 'nominations'
+        $empty | Should -Not -BeNullOrEmpty
+        @($empty.nominations).Count | Should -Be 0
+        $two = Extract-JsonFromText -Text '[{"id":1},{"id":2}]' -ExpectedKey 'nominations'
+        @($two.nominations).Count | Should -Be 2
+        # the object path is unchanged
+        @((Extract-JsonFromText -Text '{"facts":[{"a":1}]}' -ExpectedKey 'facts').facts).Count | Should -Be 1
+        Extract-JsonFromText -Text 'not json' -ExpectedKey 'facts' | Should -BeNullOrEmpty
+    }
+
+    It 'never reclaims a codex lock whose holder process is ALIVE, however old the file' {
+        # Age alone used to reclaim even with the holder alive, so a long legitimate hold could
+        # be stolen mid-call by a concurrent L1a run: two codex processes, one corrupted result.
+        $home_ = Join-Path $TestDrive ('lk-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $stateDir = Join-Path $home_ '.claude\state'
+        [System.IO.Directory]::CreateDirectory($stateDir) | Out-Null
+        $lock = Join-Path $stateDir 'codex.lock'
+        $oldUser = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $home_
+            # A LIVE pid (this very process) and a file two hours old.
+            Set-Content -LiteralPath $lock -Value ("other 2020-01-01T00:00:00Z pid=$PID") -Encoding UTF8
+            (Get-Item -LiteralPath $lock).LastWriteTime = (Get-Date).AddHours(-2)
+            Acquire-CodexLock -Owner 'test' -MaxAgeMinutes 30 | Should -BeFalse -Because 'the holder is alive; a 2h-old lock is a long job, not a dead one'
+            Test-Path -LiteralPath $lock | Should -BeTrue -Because 'the live holder keeps its lock'
+
+            # A DEAD pid is still reclaimed, at any age — the deadlock guard must survive.
+            $deadPid = 999999
+            Set-Content -LiteralPath $lock -Value ("other 2020-01-01T00:00:00Z pid=$deadPid") -Encoding UTF8
+            Acquire-CodexLock -Owner 'test' -MaxAgeMinutes 30 | Should -BeTrue -Because 'a dead holder must always be reclaimable'
+        } finally {
+            $env:USERPROFILE = $oldUser
+        }
+    }
+}

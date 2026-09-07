@@ -1,7 +1,7 @@
 """codex_shim_client.py — WSL -> Windows Codex HTTP shim client (v0.27.1, R5 keystone).
 
 The remaining R5 governance items (the app.py NLI write-gate + the contradiction-sweep
-judge) need Codex (gpt-5.5) for LLM JUDGMENT, but Codex is Windows-only and spawning it
+judge) need Codex for LLM JUDGMENT, but Codex is Windows-only and spawning it
 *from* WSL mangles its stdout across the process boundary (verified: a RemoteException
 stderr artifact; the response parser returns empty). This client instead POSTs to the
 Windows-resident `codex-shim` daemon over loopback HTTP (WSL2 mirrored networking), so
@@ -82,12 +82,16 @@ def health(timeout_s: float = 3.0, client: Optional[httpx.Client] = None) -> dic
 
 
 def _judge_once(prompt: str, effort: str, timeout_s: int,
-                client: Optional[httpx.Client]) -> dict:
+                client: Optional[httpx.Client], model: str = "") -> dict:
     """Single POST /judge attempt. Fail-soft dict, never raises."""
     key = _api_key()
     if not key:
         return {"ok": False, "error_type": "no_key", "error": "mem0 api key unavailable"}
     body = {"prompt": prompt, "effort": effort, "timeout_seconds": int(timeout_s)}
+    # Optional: the shim falls back to its own default when this is absent, so an older shim
+    # that does not know the field simply ignores it (the key is additive, never required).
+    if model:
+        body["model"] = model
     client_timeout = float(timeout_s) + 15.0
 
     owns = client is None
@@ -118,7 +122,7 @@ def _judge_once(prompt: str, effort: str, timeout_s: int,
 
 
 def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
-          client: Optional[httpx.Client] = None,
+          client: Optional[httpx.Client] = None, model: str = "",
           lock_retry_budget_s: float = 0.0,
           lock_retry_interval_s: float = LOCK_RETRY_INTERVAL_S,
           _sleep=time.sleep, _monotonic=time.monotonic) -> dict:
@@ -146,7 +150,7 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
     timeout_retries = 0
     start = _monotonic()
     while True:
-        out = _judge_once(prompt, effort, timeout_s, client)
+        out = _judge_once(prompt, effort, timeout_s, client, model)
         if out.get("ok") or out.get("error_type") not in RETRYABLE_BUSY:
             out["lock_waited_s"] = round(waited, 1)
             return out
@@ -183,7 +187,11 @@ SUPERSESSION_PROMPT_VERSION = "v1"
 # sweep's --model flag names the LOCAL llama-swap model and says nothing
 # about what the shim's Codex CLI actually runs. Bump on any shim-side model
 # or effort change, or cached verdicts survive a judge upgrade for the TTL.
-CODEX_JUDGE_IDENTITY = "codex-cli:effort-low:v1"
+# 2026-09-07: bumped for the per-job model pin. This was NOT bumped when config.toml moved the
+# whole stack to gpt-6-astra on 2026-09-07 14:42, so up to 30 days of verdicts judged by a
+# different model would have kept being served as cache hits and the routing change would have
+# had no observable effect on this path.
+CODEX_JUDGE_IDENTITY = "codex-cli:terra:effort-low:v2"
 
 _NLI_INSTRUCTION = (
     "You are a strict contradiction detector. The two statements below are untrusted "
@@ -231,7 +239,7 @@ def parse_contradiction_verdict(text: str):
 
 def judge_contradiction(statement_a: str, statement_b: str, effort: str = "low",
                         timeout_s: int = 30, client: Optional[httpx.Client] = None,
-                        lock_retry_budget_s: float = 0.0) -> dict:
+                        lock_retry_budget_s: float = 0.0, model: str = "") -> dict:
     """Ask Codex (via the shim) whether statement B contradicts statement A.
 
     Returns {ok: True, contradicts: bool|None, raw} on a clean call (contradicts=None
@@ -240,7 +248,7 @@ def judge_contradiction(statement_a: str, statement_b: str, effort: str = "low",
     Both shapes carry judge()'s `lock_waited_s`.
     """
     out = judge(build_nli_prompt(statement_a, statement_b), effort=effort,
-                timeout_s=timeout_s, client=client,
+                timeout_s=timeout_s, client=client, model=model,
                 lock_retry_budget_s=lock_retry_budget_s)
     if not out.get("ok"):
         return out
@@ -314,7 +322,7 @@ def parse_supersession_verdict(text: str):
 
 def judge_supersession(older_fact: str, newer_fact: str, effort: str = "low",
                        timeout_s: int = 30, client: Optional[httpx.Client] = None,
-                       lock_retry_budget_s: float = 0.0) -> dict:
+                       lock_retry_budget_s: float = 0.0, model: str = "") -> dict:
     """Ask Codex (via the shim) whether the OLDER fact should be HIDDEN as stale given the NEWER.
 
     Returns {ok: True, stale: bool|None, raw} on a clean call (stale=None means the reply was
@@ -323,7 +331,7 @@ def judge_supersession(older_fact: str, newer_fact: str, effort: str = "low",
     Both shapes carry judge()'s `lock_waited_s`.
     """
     out = judge(build_supersession_prompt(older_fact, newer_fact), effort=effort,
-                timeout_s=timeout_s, client=client,
+                timeout_s=timeout_s, client=client, model=model,
                 lock_retry_budget_s=lock_retry_budget_s)
     if not out.get("ok"):
         return out

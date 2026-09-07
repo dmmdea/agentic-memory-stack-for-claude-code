@@ -16,7 +16,7 @@ flowchart LR
         CC["Claude Code<br/>(the host being augmented)"]
         HOOKS["Hooks<br/>Stop / PreCompact / UserPromptSubmit / SessionStart"]
         DREAM["Nightly dream consolidator<br/>(Task Scheduler 3am)"]
-        CODEX["Codex CLI (gpt-5.5)<br/>extraction + consolidation + judgment"]
+        CODEX["Codex CLI (per-job model)<br/>extraction + consolidation + judgment"]
         SHIM["Codex HTTP shim :18792<br/>(loopback, API-key)"]
     end
     subgraph WSL["WSL2 (mirrored networking)"]
@@ -69,7 +69,7 @@ Failed writes dead-letter to a retry queue (poison-code quarantine, max 5 attemp
 sequenceDiagram
     participant S as Stop/PreCompact hook
     participant L as l1a-extract.ps1
-    participant X as Codex (gpt-5.5)
+    participant X as Codex (per-job model)
     participant M as mem0 :18791
     participant Q as Qdrant :6333
     S->>L: transcript path (detached spawn)
