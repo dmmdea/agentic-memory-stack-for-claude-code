@@ -4,6 +4,35 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.20 (2026-09-08) — a live session can no longer starve a store past the sync limit
+
+Root cause of "MEMORY.md over its load limit" in a live session. The compactor gets one shot a
+day at 05:00; its liveness guard skipped one store two nights running (legitimately — a session
+wrote memories 33 minutes before the run); the store grew ~3,700 B/day against ~8,000 B of
+headroom and crossed the 25,000 B sync limit, at which point the harness stopped syncing it and
+every new session loaded a partial index. Three watchdogs stayed quiet, each for its own reason.
+
+- **The throttle stamp is per run, so a skipped store was never retried.** A run that skipped
+  this store still marked the stamp because other stores reached a decision, and the SessionStart
+  catch-up — the only other chance in the day — exited at every session start. The catch-up is
+  now **per store** (`Get-AmStoreRunHistory`): a fresh stamp no longer ends it when a store above
+  trigger has reached no decision in 24 h, and the 12 h run throttle no longer re-silences that.
+- **The liveness guard escalates at the sync limit.** A skip protects against a lost update,
+  which is recoverable in one night; an index the harness refuses to load is broken for everyone.
+  At/over the limit the quiet window drops from 30 to 5 minutes, and after two consecutive skips
+  the run proceeds and says so (`liveness_override` in the receipt). Under the limit: unchanged.
+- **Starvation is reported.** Every receipt carries `skip_streak`. `compactor-silent` keys on
+  the receipts *file's* age — and a skip writes a receipt, so a store skipped nightly looked
+  alive; `compactor-unproductive` needs three bad receipts in a row, and this one had `applied,
+  skipped, skipped`. Lint now raises **`compactor-starved`** (actionable; the heartbeat renders it)
+  on two consecutive skips above trigger or one skip at the limit.
+- Found, documented, not changed: the write-time gate never fires on this index because its
+  matcher is `Write|Edit` and the index is written through Bash/python. Probed directly it works
+  (29,630 → 24,906 B, receipted). Widening it costs a `powershell.exe` spawn per shell call.
+- Eight tests, boundaries included: under the limit a live session still skips; at the limit a
+  1-minute-old write still skips while a 10-minute-old one proceeds; the catch-up runs a starved
+  store on a fresh stamp and stays silent when the stamp is backed by a recent decision.
+
 ## v1.20.19 (2026-09-07) — the WSL installer now enforces the One-Brain rule too
 
 - **`install/1-wsl-services.sh` no longer enables canonical-mutation units on a replica.** It

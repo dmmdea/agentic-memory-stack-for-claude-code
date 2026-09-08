@@ -57,6 +57,23 @@ try {
     if (Test-Path -LiteralPath $receiptPath) {
         try { $lastReceiptAgeH = [math]::Round((([DateTime]::UtcNow) - (Get-Item -LiteralPath $receiptPath).LastWriteTimeUtc).TotalHours, 1) } catch {}
     }
+    # 2026-09-08: per-store starvation. compactor-silent below keys on the receipts FILE's age,
+    # and a live-session skip WRITES a receipt - so a store skipped every night looked alive to
+    # it; compactor-unproductive needs three consecutive bad receipts, and the store that went
+    # over the sync limit had applied, skipped, skipped. Two skips on a store above trigger, or
+    # ONE skip on a store already at the sync limit, is actionable now, not next week.
+    foreach ($row in $storeRows) {
+        $h = Get-AmStoreRunHistory -ReceiptPath $receiptPath -Workspace $row.workspace
+        $row | Add-Member -NotePropertyName skip_streak -NotePropertyValue $h.SkipStreak -Force
+        $row | Add-Member -NotePropertyName last_status -NotePropertyValue $h.LastStatus -Force
+        $atLimit = ($row.bytes -ge $script:AmSyncLimitBytes)
+        if ($row.over_trigger -and (($h.SkipStreak -ge 2) -or ($atLimit -and $h.LastStatus -eq 'skipped-live-session'))) {
+            [void]$findings.Add([pscustomobject]@{
+                store = $row.workspace; kind = 'compactor-starved'; file = 'MEMORY.md'
+                detail = ('skipped as live-session ' + $h.SkipStreak + ' run(s) in a row while ' + $row.bytes + ' B' + $(if ($atLimit) { ' >= the ' + $script:AmSyncLimitBytes + ' B sync limit (harness refuses to sync)' } else { ' (above trigger)' }) + ' - the nightly is running, this store is not getting it')
+            })
+        }
+    }
     $overTrigger = @($storeRows | Where-Object { $_.over_trigger })
     $stale = ($overTrigger.Count -gt 0 -and ($null -eq $lastReceiptAgeH -or $lastReceiptAgeH -gt 48))
     if ($stale) {
@@ -119,7 +136,8 @@ try {
             # 'scan-error' and 'compactor-unproductive' MUST be here: the banner renders only
             # actionable kinds, so a finding missing from this list reaches no surface at all -
             # a store that cannot be read would have been completely invisible.
-            actionable  = @($findings | Where-Object { @('orphan', 'dangling', 'dup-slug', 'over-sync-limit', 'over-inject-limit', 'compactor-silent', 'compactor-unproductive', 'history-remote', 'scan-error') -contains $_.kind }).Count
+            starved     = @($findings | Where-Object kind -eq 'compactor-starved').Count
+            actionable  = @($findings | Where-Object { @('orphan', 'dangling', 'dup-slug', 'over-sync-limit', 'over-inject-limit', 'compactor-silent', 'compactor-unproductive', 'compactor-starved', 'history-remote', 'scan-error') -contains $_.kind }).Count
         }
         last_receipt_age_hours = $lastReceiptAgeH
     }

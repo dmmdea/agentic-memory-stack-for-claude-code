@@ -59,12 +59,34 @@ $ThrottleName = 'memory-compact'
 $ReceiptPath = Join-Path (Get-AmStateRoot) 'compact-receipts.jsonl'
 $script:AmCatchUpHours = 24
 
+$script:AmCatchUpStarved = @()
 if ($CatchUp) {
     # The freshness signal is the throttle stamp, NOT the receipts file: a quiet night (every
     # store under trigger) is productive and marks the stamp but writes no receipt by design, so
     # a receipt-based gate would fire on ordinary session starts (review finding, 2026-09-06).
-    if (-not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds ($script:AmCatchUpHours * 3600))) { exit 0 }
-    Write-MemoryLog -Component $Component -Message ('catch-up: no productive run in the last ' + $script:AmCatchUpHours + 'h - the nightly was missed; running it now')
+    if (Test-Throttle -Name $ThrottleName -MinIntervalSeconds ($script:AmCatchUpHours * 3600)) {
+        Write-MemoryLog -Component $Component -Message ('catch-up: no productive run in the last ' + $script:AmCatchUpHours + 'h - the nightly was missed; running it now')
+    } else {
+        # 2026-09-08: the stamp is PER RUN, and a run that skipped this store as live still marks
+        # it when any other store reached a decision. So a store skipped at 05:00 left a stamp
+        # reading "ran tonight", this catch-up - the only other chance in the day - exited here at
+        # every session start, and the next 05:00 found the store live again. Two such nights put
+        # it over the sync limit. A fresh stamp therefore no longer ends the check: a store ABOVE
+        # TRIGGER whose own last decision is older than the catch-up window (or that has never
+        # had one) is starved, and ending starvation is what a catch-up is for. The per-store
+        # liveness guard still applies inside the run.
+        foreach ($s in @(Get-AmStores | Where-Object { -not $_.IsAlias })) {
+            try {
+                $st = Get-AmStoreStats -Store $s
+                if (-not $st.OverTrigger) { continue }
+                $h = Get-AmStoreRunHistory -ReceiptPath $ReceiptPath -Workspace $s.Workspace
+                $ageH = if ($null -eq $h.LastProductiveUtc) { [double]::PositiveInfinity } else { ([DateTime]::UtcNow - $h.LastProductiveUtc).TotalHours }
+                if ($ageH -ge $script:AmCatchUpHours) { $script:AmCatchUpStarved += $s.Workspace }
+            } catch { }
+        }
+        if (@($script:AmCatchUpStarved).Count -eq 0) { exit 0 }
+        Write-MemoryLog -Component $Component -Message ('catch-up: the run stamp is fresh but ' + @($script:AmCatchUpStarved).Count + ' store(s) above trigger reached no decision in ' + $script:AmCatchUpHours + 'h (' + ($script:AmCatchUpStarved -join ', ') + ') - starved by live-session skips; running now')
+    }
 }
 
 # -Force disarms the throttle, the trigger AND the liveness gate. That combination must never
@@ -102,7 +124,9 @@ function Write-AmReceipt {
 # the 5am task cannot both run the same night. At 23h a MANUAL afternoon run (15:43) marked the
 # throttle and the next 05:00 declared itself too early: an operator hand pass cost a night.
 # 12h keeps the double-run guard and lets a daytime run coexist with the nightly.
-if (-not $DryRun -and -not $Force -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 43200)) {
+# A starved-store catch-up (above) has already decided the fresh stamp is not evidence for THAT
+# store; letting the 12h run throttle exit here would re-silence exactly the case it found.
+if (-not $DryRun -and -not $Force -and @($script:AmCatchUpStarved).Count -eq 0 -and -not (Test-Throttle -Name $ThrottleName -MinIntervalSeconds 43200)) {
     Write-MemoryLog -Component $Component -Message 'skipping: throttle (12h) not yet elapsed'
     exit 0
 }
@@ -284,6 +308,7 @@ foreach ($cand in $candidates) {
         shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0; floored = 0; line_floored = 0
         mem0 = @(); mem0_orphan = @(); after_bytes = $null; after_lines = $null
         commit = $null; snapshot = $null; note = ''
+        skip_streak = 0; liveness_override = $false
     }
 
     # Each store is wrapped so one unreadable index cannot kill the run - and its receipt is
@@ -295,12 +320,41 @@ foreach ($cand in $candidates) {
     # ---- GUARD 1: liveness -------------------------------------------------------------
     # Probes every workspace directory that reaches this store, alias paths included: a session
     # running under an alias writes its transcripts there, not under the canonical name.
+    #
+    # 2026-09-08: the skip is no longer unconditional. This store was skipped as "live" on two
+    # consecutive nights - legitimately, a session wrote memories 33 minutes before the run - and
+    # grew straight past the 25,000 B sync limit, at which point the harness stopped syncing it
+    # and every new session loaded a partial index. A skip protects against a LOST UPDATE (a live
+    # session writing the index back whole from its in-context copy), and a lost update is
+    # recoverable in one night from the snapshot and the dedangle pass. An index the harness
+    # refuses to load is not protected, it is broken for everyone. So once the store is AT OR
+    # OVER THE SYNC LIMIT the guard escalates: the quiet window drops from 30 to 5 minutes (a
+    # session between turns is not mid-write), and after two consecutive skips the run proceeds
+    # regardless and says so in the log and the receipt. Under the limit nothing changes.
+    $history = Get-AmStoreRunHistory -ReceiptPath $ReceiptPath -Workspace $ws
+    $overSyncLimit = ($before.Bytes -ge $script:AmSyncLimitBytes)
     if (-not $Force -and (Test-AmWorkspaceLive -Workspace $ws -Dirs $store.ProbeDirs -WithinMinutes 30)) {
-        $result.status = 'skipped-live-session'
-        $result.note = 'a session in this workspace wrote within 30 min (or could not be probed); the harness writes the index whole from an in-context copy'
-        Write-MemoryLog -Component $Component -Message ($ws + ': skipped (live session)')
-        Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
-        continue
+        $override = $false; $why = ''
+        if ($overSyncLimit) {
+            if ($history.SkipStreak -ge 2) {
+                $override = $true; $why = 'already skipped ' + $history.SkipStreak + ' consecutive run(s)'
+            } elseif (-not (Test-AmWorkspaceLive -Workspace $ws -Dirs $store.ProbeDirs -WithinMinutes 5)) {
+                $override = $true; $why = 'no transcript write in the last 5 min'
+            }
+        }
+        if ($override) {
+            $result.liveness_override = $true
+            $result.note = 'LIVENESS OVERRIDDEN: index ' + $before.Bytes + ' B >= the ' + $script:AmSyncLimitBytes + ' B sync limit and ' + $why + ' - an index the harness refuses to load is worse than a recoverable lost update'
+            Write-MemoryLog -Component $Component -Message ($ws + ': ' + $result.note)
+        } else {
+            $result.status = 'skipped-live-session'
+            $result.skip_streak = $history.SkipStreak + 1
+            $result.note = 'a session in this workspace wrote within 30 min (or could not be probed); the harness writes the index whole from an in-context copy'
+            if ($result.skip_streak -ge 2) { $result.note += '; skip streak ' + $result.skip_streak }
+            Write-MemoryLog -Component $Component -Message ($ws + ': skipped (live session; streak ' + $result.skip_streak + ')')
+            Write-AmReceipt -Record ([pscustomobject]$result); $runStatuses += $result.status
+            continue
+        }
     }
 
     $sweep = Clear-AmStoreTempFiles -Dir $store.Dir

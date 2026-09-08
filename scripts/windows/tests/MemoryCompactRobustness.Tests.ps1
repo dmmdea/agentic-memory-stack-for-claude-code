@@ -476,3 +476,138 @@ Describe 'usage ledger completeness (2026-09-07 silent-failure review)' {
             Should -BeGreaterThan 0 -Because 'a successful call that returned nothing is an outcome, not a non-event'
     }
 }
+
+Describe 'starvation (2026-09-08): a live session must not starve a store past the sync limit, and starvation is reported' {
+    # The live incident: skipped as "live" two nights running (legitimately), 19,032 -> 26,424 B
+    # with no pass between, harness stopped syncing, another session loaded a partial index.
+    # Nothing said so. These pin every part of the fix and the exact boundaries it must respect.
+    BeforeAll {
+        $script:LintSrc = Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-lint.ps1'
+        function script:Seed-Receipts {
+            param($Sandbox, [string]$Workspace, [string[]]$Statuses, [double]$HoursAgo = 30)
+            $d = Join-Path $Sandbox.Home '.claude\state\automemory'
+            [System.IO.Directory]::CreateDirectory($d) | Out-Null
+            $i = 0
+            foreach ($st in $Statuses) {
+                $ts = (Get-Date).ToUniversalTime().AddHours(-$HoursAgo + $i).ToString('o'); $i++
+                Add-Content -LiteralPath (Join-Path $d 'compact-receipts.jsonl') -Value ('{"ts":"' + $ts + '","workspace":"' + $Workspace + '","dry_run":false,"status":"' + $st + '"}')
+            }
+        }
+        function script:Make-Live {
+            # a transcript in the workspace dir is what Test-AmWorkspaceLive probes
+            param($Sandbox, [string]$Workspace, [int]$MinutesAgo = 0)
+            $wd = Join-Path $Sandbox.Projects $Workspace
+            [System.IO.Directory]::CreateDirectory($wd) | Out-Null
+            $t = Join-Path $wd 'session.jsonl'
+            Set-Content -LiteralPath $t -Value '{"type":"user"}'
+            (Get-Item -LiteralPath $t).LastWriteTime = (Get-Date).AddMinutes(-1 * $MinutesAgo)
+        }
+        function script:New-OverLimitStore {
+            # 180 pullable facts with ~170 B lines: ~30 KB, comfortably over the 25,000 B limit
+            param($Sandbox, [string]$Workspace)
+            $lines = @('# Memory Index', ''); $facts = @{}
+            for ($i = 1; $i -le 180; $i++) {
+                $lines += ('- [Fact ' + $i + '](fact' + $i + '.md) ' + $script:EmDash + ' ' + ('detail ' * 20) + $i)
+                $facts['fact' + $i + '.md'] = (New-FactFile ('fact' + $i) ('desc ' + $i) 'reference' ('body ' + $i))
+            }
+            return (Add-SandboxStore -Sandbox $Sandbox -Workspace $Workspace -IndexLines $lines -Facts $facts)
+        }
+    }
+
+    It 'UNDER the sync limit a live session still skips - and the receipt now counts the streak' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        script:Seed-Receipts -Sandbox $sb -Workspace 'ws' -Statuses @('skipped-live-session')
+        script:Make-Live -Sandbox $sb -Workspace 'ws'
+        $rc = (Invoke-Compactor -Sandbox $sb).Receipts | Where-Object { $_.workspace -eq 'ws' } | Select-Object -Last 1
+        $rc.status | Should -Be 'skipped-live-session' -Because 'under the limit the lost-update guard is unchanged'
+        $rc.skip_streak | Should -Be 2
+        $rc.liveness_override | Should -BeFalse
+    }
+
+    It 'AT the sync limit after two skips, a live session no longer blocks: the run proceeds and the receipt says why' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        $dir = script:New-OverLimitStore -Sandbox $sb -Workspace 'ws'
+        (Get-Item (Join-Path $dir 'MEMORY.md')).Length | Should -BeGreaterOrEqual 25000
+        script:Seed-Receipts -Sandbox $sb -Workspace 'ws' -Statuses @('skipped-live-session', 'skipped-live-session')
+        script:Make-Live -Sandbox $sb -Workspace 'ws'
+        $rc = (Invoke-Compactor -Sandbox $sb).Receipts | Where-Object { $_.workspace -eq 'ws' } | Select-Object -Last 1
+        $rc.liveness_override | Should -BeTrue
+        $rc.note | Should -Match 'LIVENESS OVERRIDDEN'
+        $rc.status | Should -Be 'applied'
+        $rc.after_bytes | Should -BeLessThan 25000 -Because 'the whole point is to get the harness syncing it again'
+    }
+
+    It 'AT the sync limit with no prior skip, a session quiet for 10 min is not mid-write: the run proceeds' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        script:New-OverLimitStore -Sandbox $sb -Workspace 'ws' | Out-Null
+        script:Make-Live -Sandbox $sb -Workspace 'ws' -MinutesAgo 10
+        $rc = (Invoke-Compactor -Sandbox $sb).Receipts | Where-Object { $_.workspace -eq 'ws' } | Select-Object -Last 1
+        $rc.liveness_override | Should -BeTrue
+        $rc.note | Should -Match 'no transcript write in the last 5 min'
+        $rc.status | Should -Be 'applied'
+    }
+
+    It 'AT the sync limit with no prior skip, a session that wrote 1 min ago STILL skips (the override is a boundary, not a blanket)' {
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        script:New-OverLimitStore -Sandbox $sb -Workspace 'ws' | Out-Null
+        script:Make-Live -Sandbox $sb -Workspace 'ws' -MinutesAgo 1
+        $rc = (Invoke-Compactor -Sandbox $sb).Receipts | Where-Object { $_.workspace -eq 'ws' } | Select-Object -Last 1
+        $rc.status | Should -Be 'skipped-live-session'
+        $rc.skip_streak | Should -Be 1
+        $rc.liveness_override | Should -BeFalse
+    }
+
+    It '-CatchUp runs a store starved by live-session skips even though the RUN stamp is fresh' {
+        # The stamp is per run: another store''s no-op marked it while this one was skipped, so
+        # the catch-up used to exit here at every session start and the store starved for days.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'st' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        Set-Content -LiteralPath (Join-Path $sb.Home '.claude\state\throttle-fresh') -Value '1'
+        script:Seed-Receipts -Sandbox $sb -Workspace 'st' -Statuses @('skipped-live-session', 'skipped-live-session') -HoursAgo 30
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
+        $rc = $r.Receipts | Where-Object { $_.workspace -eq 'st' } | Select-Object -Last 1
+        $rc.status | Should -BeIn @('applied', 'no-op') -Because 'reaching a DECISION is what ends starvation; this store has nothing to fix, so no-op is that decision'
+        $rc.ts | Should -Not -BeNullOrEmpty
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'starved by live-session skips'
+    }
+
+    It '-CatchUp still exits silently when the fresh stamp is backed by a recent decision on the store above trigger' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'st' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        Set-Content -LiteralPath (Join-Path $sb.Home '.claude\state\throttle-fresh') -Value '1'
+        script:Seed-Receipts -Sandbox $sb -Workspace 'st' -Statuses @('applied') -HoursAgo 1
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
+        @($r.Receipts | Where-Object { $_.workspace -eq 'st' }).Count | Should -Be 1 -Because 'only the seeded receipt: a store that reached a decision an hour ago is not starved'
+        (Get-Content (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw -ErrorAction SilentlyContinue) | Should -Not -Match 'catch-up'
+    }
+
+    It 'lint raises compactor-starved (actionable) on two consecutive skips above trigger, and the store row carries the streak' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'lt' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        script:Seed-Receipts -Sandbox $sb -Workspace 'lt' -Statuses @('skipped-live-session', 'skipped-live-session')
+        Copy-Item $script:LintSrc $sb.Bin
+        $cmd = '$env:USERPROFILE=' + "'" + $sb.Home + "'; & '" + (Join-Path $sb.Bin 'memory-lint.ps1') + "' -Quiet"
+        & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1 | Out-Null
+        $j = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\lint-summary.json') -Raw | ConvertFrom-Json
+        ($j.stores | Where-Object { $_.workspace -eq 'lt' }).skip_streak | Should -Be 2
+        @($j.findings | Where-Object { $_.kind -eq 'compactor-starved' }).Count | Should -Be 1
+        $j.counts.actionable | Should -BeGreaterOrEqual 1 -Because 'a finding missing from the actionable list reaches no surface at all'
+    }
+
+    It 'lint does NOT raise compactor-starved for a single skip under the limit (one live night is normal)' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'lt' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        script:Seed-Receipts -Sandbox $sb -Workspace 'lt' -Statuses @('applied', 'skipped-live-session')
+        Copy-Item $script:LintSrc $sb.Bin
+        $cmd = '$env:USERPROFILE=' + "'" + $sb.Home + "'; & '" + (Join-Path $sb.Bin 'memory-lint.ps1') + "' -Quiet"
+        & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1 | Out-Null
+        $j = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\lint-summary.json') -Raw | ConvertFrom-Json
+        @($j.findings | Where-Object { $_.kind -eq 'compactor-starved' }).Count | Should -Be 0
+    }
+}

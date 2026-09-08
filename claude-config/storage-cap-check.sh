@@ -191,7 +191,7 @@ else:
         for f in d.get("findings") or []:
             k = f.get("kind")
             if k in ("orphan", "dangling", "dup-slug", "over-sync-limit", "over-inject-limit",
-                     "compactor-silent", "compactor-unproductive", "history-remote", "scan-error"):
+                     "compactor-silent", "compactor-unproductive", "compactor-starved", "history-remote", "scan-error"):
                 kinds[k] = kinds.get(k, 0) + 1
         detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
         parts.append(f"auto-memory lint: {n} actionable ({detail})")
