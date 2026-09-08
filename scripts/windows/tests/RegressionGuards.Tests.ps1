@@ -645,3 +645,51 @@ Describe 'Codex model is pinned per job, never inherited (2026-09-07)' {
         $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 30\)' -Because "the compactor's own lock window is 30 minutes"
     }
 }
+
+Describe 'codex usage report (2026-09-07)' {
+    BeforeAll { $script:reportPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'codex-usage-report.ps1' }
+
+    It 'exists and parses' {
+        Test-Path -LiteralPath $script:reportPath | Should -BeTrue
+        $err = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($script:reportPath, [ref]$null, [ref]$err)
+        $err | Should -BeNullOrEmpty
+    }
+
+    It 'emits valid JSON over a synthetic ledger and attributes tokens to the right job' {
+        $home_ = Join-Path $TestDrive ('rep-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $logs = Join-Path $home_ '.claude\logs'
+        [System.IO.Directory]::CreateDirectory($logs) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().ToString('o')
+        @(
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":100,"duration_ms":10,"outcome":"ok","model_requested":"gpt-5.6-terra","model_resolved":"gpt-5.6-terra"}')
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":50,"duration_ms":20,"outcome":"parse_fail","model_requested":"gpt-5.6-terra","model_resolved":"gpt-5.6-terra"}')
+            ('{"ts":"' + $ts + '","component":"dream-consolidate","tokens_used":7,"duration_ms":30,"outcome":"ok","model_requested":"gpt-6-astra","model_resolved":"gpt-5.6-luna"}')
+            'this line is torn and must not end the report'
+        ) | Set-Content -LiteralPath (Join-Path $logs 'codex-usage.jsonl') -Encoding UTF8
+        $old = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $home_
+            $out = & pwsh -NoProfile -File $script:reportPath -Days 7 -Json 2>$null | Out-String
+            $j = $out | ConvertFrom-Json
+            $l1a = $j.jobs | Where-Object { $_.job -eq 'l1a' }
+            $l1a.calls | Should -Be 2
+            $l1a.tokens | Should -Be 150
+            $l1a.failed | Should -Be 1 -Because 'a job that is cheap because its calls die is not cheap'
+            $cons = $j.jobs | Where-Object { $_.job -eq 'dream-consolidate' }
+            $cons.drift | Should -Be 1 -Because 'requested astra but resolved luna is silent model drift and must surface'
+        } finally { $env:USERPROFILE = $old }
+    }
+
+    It 'does not throw when the ledger is absent (a reporting tool must not die on a missing optional input)' {
+        $empty = Join-Path $TestDrive ('rep-empty-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        [System.IO.Directory]::CreateDirectory($empty) | Out-Null
+        $old = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $empty
+            $out = & pwsh -NoProfile -File $script:reportPath -Days 7 -Json 2>$null | Out-String
+            $j = $out | ConvertFrom-Json
+            $j.total_calls | Should -Be 0
+        } finally { $env:USERPROFILE = $old }
+    }
+}

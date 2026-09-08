@@ -150,6 +150,25 @@ Every Codex call used to inherit whatever `~/.codex/config.toml` named. On 2026-
 **Provenance.** `Parse-CodexHeader` reads the model and effort Codex prints in its own stdout header, so every usage row carries `model_requested`/`model_resolved` and `effort_requested`/`effort_resolved`. A mismatch is the detectable form of silent drift — which matters because `model_reasoning_effort` is *not* validated at config load, so a typo passes silently. `outcome` is a closed enum (`ok`, `empty`, `timeout`, `exit_nonzero`, `parse_fail`, `lock_unavailable`, `skipped_no_candidates`).
 
 **Adding a call site:** pass `-Model` (a guard test fails the build if you forget), and write a usage row on every exit path including the failure ones.
+
+### Reading the answer: `-o`, not a marker scrape
+
+`codex exec` prints a metadata header, the echoed prompt, any reasoning summary and then the answer after a `codex` marker line. Scraping that marker fails when a run produces **no** assistant message: the scrape returned the header and the caller parsed it as the answer (5 of 330 live extractor calls). The three JSON-parsing call sites now pass `-o <file>`, which is Codex's own copy of the final message, and `Get-CodexResponseText -LastMessagePath` prefers it. Stdout scraping remains the fallback, and `$null` when both are absent stays the honest outcome — the caller records `outcome='parse_fail'` rather than parsing a header.
+
+### What it costs: `codex-usage-report.ps1`
+
+```powershell
+codex-usage-report.ps1            # last 7 days, per job
+codex-usage-report.ps1 -Json      # machine-readable
+```
+
+Per job it reports calls, calls/day, tokens, p50 and max latency, **failed** calls and **drift** (rows where the model requested is not the model Codex resolved — the detectable form of silent model change), plus the plan's 7-day window. Read-only, and every optional input degrades to a stated "unknown" rather than an error.
+
+This exists because the **NLI write-gate is pinned but deliberately OFF**: it would fire an uncached judge on every mem0 write, and no one could say what that costs. Re-run this after a week of telemetry and compare the projected write rate against the extractor row before enabling it.
+
+### Who judged a promotion
+
+The tier ledger records `judge_model` on both the write-ahead intent row and the completion row (`schema_version` v18, additive — pre-v18 rows stay valid). `actor` is a role label and never said what did the judging. The field is deliberately **outside the signed material**: the canonical HMAC covers `<ts>|<nonce>|promote|<mid>|<reason>`, so `judge_model` is an audit convenience, never an authorisation input. `mem0-canonize.sh` passes it via the `JUDGE_MODEL` environment variable.
 - **mem0 REST** on `:18791` (all reads/writes).
 - **PowerShell 7 (pwsh)** preferred for the PS hooks; the daemon runs under Windows PowerShell 5.1 (its `JavaScriptSerializer` + `NamedPipeServerStream` PipeSecurity are .NET Framework).
 - **The compiled-client toolchain:** `build-hook-client.ps1` (framework `csc`) compiles `mem0-hook-client.cs`.

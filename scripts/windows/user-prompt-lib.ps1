@@ -1541,12 +1541,24 @@ function Test-OffloadNoBlockInvariant {
         # actually been evaluated against this config.
         $pre = $null
         try { $pre = $Hooks.PreToolUse } catch { $pre = $null }
+        # 2026-09-07: keep the ENTRY, not just the matcher string. Whether a firing matcher is
+        # an EXPOSURE depends on the command behind it, and the script name frequently lives in
+        # `args` (a hook is routinely {command: "node.exe", args: ["...guard.js"]}), so a lookup
+        # that reads only `command` sees "node.exe" and learns nothing.
         $matchers = @()
+        $preEntries = @()
         foreach ($entry in @($pre)) {
             if ($null -eq $entry) { continue }
             $m = $null
             try { $m = [string]$entry.matcher } catch { $m = $null }
-            if (-not [string]::IsNullOrWhiteSpace($m)) { $matchers += $m }
+            if ([string]::IsNullOrWhiteSpace($m)) { continue }
+            $matchers += $m
+            $cmdText = ''
+            foreach ($h in @($entry.hooks)) {
+                try { $cmdText += ' ' + [string]$h.command } catch { }
+                try { foreach ($a in @($h.args)) { $cmdText += ' ' + [string]$a } } catch { }
+            }
+            $preEntries += [pscustomobject]@{ Matcher = $m; CommandText = $cmdText.Trim() }
         }
         # Test each matcher AS A REGEX against a real offload tool name, rather than substring-
         # searching the matcher text for 'mcp__local-offload'. Review catch 2026-07-14: a substring
@@ -1554,25 +1566,41 @@ function Test-OffloadNoBlockInvariant {
         # offload call at runtime yet contain no such substring, so the hole the check exists to
         # catch would sail through it. Claude Code treats the matcher as a regex, so evaluate it
         # the same way it does.
+        # 2026-09-07 precision fix #2. The rule used to FAIL on ANY matcher that fires for the
+        # harness, on the reasoning that "the harness could receive hook output". That conflates
+        # two different things. The invariant this function is named for is that the
+        # [MEMORY CONTEXT] block never reaches the harness, and that block is produced by exactly
+        # one family of commands: the stack's own hook client / daemon / extractor. A THIRD-PARTY
+        # guard that fires on an offload call and merely denies or logs cannot route the block -
+        # it does not have it. Held as a hard FAIL, that over-broad rule reported the stack
+        # UNHEALTHY for days over another session's deny-only delegate guard, which is how a
+        # standing red light stops being read at all.
+        #
+        # So: FAIL only when a firing matcher is bound to a memory-context PRODUCER (the real
+        # exposure). A firing matcher with an unrelated command is a WARN - visible and named,
+        # never silent, but not a security regression.
         $offloadProbe = 'mcp__local-offload__offload_summarize'
-        foreach ($m in $matchers) {
+        $producerPattern = 'mem0-hook-client|mem0-hook-daemon|user-prompt-extract|pre-tool-check'
+        $foreignFiring = @()
+        foreach ($pe in $preEntries) {
             $firesOnOffload = $false
-            try { $firesOnOffload = ($offloadProbe -match $m) } catch { $firesOnOffload = $false }  # invalid regex = cannot fire
-            if ($firesOnOffload) {
-                return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher fires for the offload harness ('$m') - the harness could receive hook output" }
+            try { $firesOnOffload = ($offloadProbe -match $pe.Matcher) } catch { $firesOnOffload = $false }  # invalid regex = cannot fire
+            if (-not $firesOnOffload) { continue }
+            if ($pe.CommandText -match $producerPattern) {
+                return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher fires for the offload harness ('$($pe.Matcher)') AND runs a memory-context producer ('$($pe.CommandText)') - the harness could receive the [MEMORY CONTEXT] block" }
             }
+            $foreignFiring += ("'" + $pe.Matcher + "' -> " + $pe.CommandText)
+        }
+        if ($foreignFiring.Count -gt 0) {
+            return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = "a foreign PreToolUse hook fires for the offload harness but runs no memory-context producer, so the block cannot reach it: $($foreignFiring -join '; '). Not an exposure; listed so it is never silent." }
         }
         # Find the stack's own pre-tool-check matcher and confirm it is exactly the
         # editing/exec gate (Bash|Edit|MultiEdit|Write), so a future widening to
         # mcp__* would flip this check.
         $stackMatcher = $null
-        foreach ($entry in @($pre)) {
-            $cmdHasCheck = $false
-            foreach ($h in @($entry.hooks)) {
-                $c = $null; try { $c = [string]$h.command } catch { $c = $null }
-                if ($c -match 'pre-tool-check\.ps1') { $cmdHasCheck = $true; break }
-            }
-            if ($cmdHasCheck) { try { $stackMatcher = [string]$entry.matcher } catch { $stackMatcher = $null }; break }
+        foreach ($pe in $preEntries) {
+            # command AND args: the script name is usually an ARG (node.exe / pwsh.exe first).
+            if ($pe.CommandText -match 'pre-tool-check\.ps1') { $stackMatcher = $pe.Matcher; break }
         }
         $matcherNote = if ($stackMatcher) { "pre-tool-check matcher='$stackMatcher'" } else { 'pre-tool-check matcher not found (other PreToolUse matchers checked)' }
 

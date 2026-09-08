@@ -277,7 +277,7 @@ try {
 # is the shared primitive library; memory-lint.ps1 is the read-only SessionStart child
 # (spawned by memory-maintenance-spawn.ps1); memory-compact.ps1 is the nightly task registered
 # in section 5c. None are R9 hash-tracked.
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'memory-index-write-gate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'codex-usage-report.ps1', 'memory-index-write-gate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
 # AMS-16: the copy loop is add-only, so a retired script must be deleted
 # explicitly or it lingers deployed forever (the AMS-50 orphan class).
 foreach ($retired in @('pre-tool-check.ps1')) {

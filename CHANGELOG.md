@@ -4,6 +4,35 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.17 (2026-09-07) — provenance in the store, and a cost meter for the decision
+
+Close-out of the model-routing work.
+
+- **`judge_model` on the tier ledger (schema v18).** `actor` is a role label
+  ("dream-autopromote", "user-direct") and never said WHAT judged a promotion. Both the
+  write-ahead intent row and the completion row now record the model. Additive: the field is
+  OPTIONAL, so every pre-v18 row stays valid. It sits deliberately OUTSIDE the signed
+  material — the canonical HMAC covers `<ts>|<nonce>|promote|<mid>|<reason>` — so it is an
+  audit convenience, never an authorisation input. `mem0-canonize.sh` passes it via
+  `JUDGE_MODEL`.
+- **`codex exec -o <file>` at the three JSON-parsing call sites.** Scraping the answer out of
+  stdout depends on a `codex` marker that is absent when a run produces no assistant message;
+  the scrape then returned the metadata header and the caller parsed it as the answer (5 of
+  330 live extractor calls). The `-o` file is Codex's own copy of the final message. Stdout
+  scraping stays as the fallback and `$null` remains the honest outcome when both are absent.
+- **`codex-usage-report.ps1`** — per-job calls, tokens, latency, failures and requested-vs-
+  resolved model DRIFT, plus the plan's 7-day window. Built because the NLI write-gate is
+  pinned but OFF and the decision to enable it needs measured cost, not a guess.
+- **R-offload invariant narrowed to the real exposure.** It used to FAIL on ANY PreToolUse
+  matcher that fires for the offload harness, which conflates "a hook fires" with "the harness
+  receives the [MEMORY CONTEXT] block". Only a matcher bound to a memory-context PRODUCER can
+  route that block; a third-party deny-only guard cannot. Held as a hard FAIL, the old rule
+  reported the stack UNHEALTHY for days over another session's delegate guard — which is how a
+  standing red light stops being read. A firing foreign matcher is now a WARN that names the
+  offender; a producer on a firing matcher still FAILs (proven by mutation). The same change
+  fixes a blind spot in the hook lookup: a hook is routinely
+  `{command: "node.exe", args: ["…guard.js"]}`, and reading only `command` saw "node.exe".
+
 ## v1.20.16 (2026-09-07) — the judge model is pinned per job, and recorded
 
 Every Codex call inherited whatever `~/.codex/config.toml` named. A config edit on 2026-09-07

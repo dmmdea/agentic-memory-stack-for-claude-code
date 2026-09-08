@@ -35,7 +35,7 @@ function Get-Mem0Key { return 'test-key' }
 function Invoke-CodexSubagent {
     # $Model mirrors the 2026-09-07 per-job pin; recorded so a compactor that stops naming its
     # model fails a test instead of silently inheriting config.toml.
-    param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model)
+    param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model, $LastMessagePath)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-model.txt') -Value ([string]$Model)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-prompt.txt') -Value $Prompt
     if ($env:STUB_CODEX_THROWS -eq '1') { throw 'codex.cmd not found (stub)' }
@@ -45,6 +45,18 @@ function Invoke-CodexSubagent {
     return ("header`ncodex`n" + $env:STUB_CODEX_PLAN + "`ntokens used`n42")
 }
 function Parse-CodexHeader { param($RawOutput) return @{ Model = 'stub-model'; Effort = 'stub-effort' } }
+# 2026-09-07: the compactor now asks codex to write its final message to a file (-o) and
+# cleans it up afterwards. The stubs keep the temp-file dance real (unique path, safe delete)
+# without needing codex, so the fixture exercises the same call shape production does.
+function New-CodexLastMessagePath {
+    $d = Join-Path $env:USERPROFILE '.claude\state'
+    if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    return (Join-Path $d ('lastmsg-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt'))
+}
+function Remove-CodexLastMessagePath {
+    param($Path)
+    if ($Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+}
 function Parse-CodexTokenUsage { param($RawOutput) return 42 }
 function Write-CodexUsageLog {
     param($Component, $TokensUsed, $DurationMs, $Status, $FactsPosted,
@@ -54,7 +66,12 @@ function Write-CodexUsageLog {
                     model_requested = $ModelRequested } | ConvertTo-Json -Compress))
 }
 function Get-CodexResponseText {
-    param($RawOutput)
+    # Mirrors production: the -o file wins when it exists and is non-empty, otherwise scrape.
+    param($RawOutput, $LastMessagePath)
+    if ($LastMessagePath -and (Test-Path -LiteralPath $LastMessagePath)) {
+        $f = Get-Content -LiteralPath $LastMessagePath -Raw -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($f)) { return $f.Trim() }
+    }
     $lines = $RawOutput -split "`r?`n"
     $s = -1; $e = $lines.Length
     for ($i = $lines.Length - 1; $i -ge 0; $i--) {
