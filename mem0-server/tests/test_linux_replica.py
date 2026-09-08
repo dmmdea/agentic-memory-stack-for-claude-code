@@ -310,3 +310,35 @@ def test_enable_brain_unit_behaviour_replica_disables_brain_enables(tmp_path):
             assert "disable --now" in calls, (
                 f"replica must also turn off what an earlier ungated run enabled: {calls!r}"
             )
+
+
+def test_service_status_readout_cannot_abort_the_installer(tmp_path):
+    """The status readout must not kill the install when the units are inactive.
+
+    `systemctl is-active` exits non-zero for an inactive unit, and the installer runs under
+    `set -eo pipefail`. On a replica every unit in that readout is inactive BY DESIGN, so an
+    unguarded pipeline would abort the run immediately after the one-brain gate — units written,
+    health probes and completion message never reached. Runs the real line from the installer
+    against a stub systemctl that reports failure.
+    """
+    sh = WSL_INSTALLER.read_text(encoding="utf-8")
+    line = next(
+        l for l in sh.splitlines()
+        if "is-active" in l and "qdrant.service" in l and not l.strip().startswith("#")
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stub = fake_bin / "systemctl"
+    stub.write_text('#!/bin/bash\necho inactive\nexit 3\n')   # what an inactive unit really does
+    stub.chmod(0o755)
+
+    script = f'set -eo pipefail\n{line}\necho REACHED_END\n'
+    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ.get('PATH','')}")
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+
+    assert "REACHED_END" in r.stdout, (
+        "the installer aborts at the service-status readout when units are inactive — on a "
+        f"replica that is every unit, by design. stdout={r.stdout!r} rc={r.returncode}"
+    )
+    assert r.returncode == 0, f"status readout exited {r.returncode}"

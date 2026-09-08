@@ -18,10 +18,19 @@ in the first entries below — full pre-inversion history lives in the maintaine
   unit either way (promoting a replica stays a one-liner), and on a replica enables nothing and
   disables whatever an earlier ungated run turned on — the same skip-and-remove the Windows
   installer performs.
-- Two guards, both mutation-proven: a static one asserting no brain unit is enabled by an ungated
-  `systemctl` call, and a **behavioural** one that extracts the helper and runs it against a stub
+- **The installer could not finish on a replica either.** Its service-status readout pipes
+  `systemctl is-active` through `sed`, and `is-active` exits non-zero for an inactive unit —
+  under the script's `set -eo pipefail` that aborts the run. On a replica every unit in that
+  readout is inactive by design, so the gate above would have been followed immediately by a
+  failed install: units written, health probes and completion message never reached. The readout
+  is now non-fatal, and the probes report `dormant by design` on a replica instead of sending an
+  operator to `systemctl status` for a unit that is off on purpose.
+- Three guards, all mutation-proven: a static one asserting no brain unit is enabled by an ungated
+  `systemctl` call; a **behavioural** one that extracts the helper and runs it against a stub
   `systemctl`, asserting a replica emits `disable --now` and never `enable --now` while a brain
-  still enables. Wording alone would not have caught a gate that never matches.
+  still enables; and one that runs the real status-readout line against a stub reporting an
+  inactive unit, asserting the script survives it. Wording alone would not have caught a gate that
+  never matches — that is one of the mutations proven red.
 
 ## v1.20.18 (2026-09-07) — a deployed runtime must be able to say which release it is
 

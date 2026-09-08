@@ -432,7 +432,12 @@ enable_brain_unit goals-stale-sweep.timer contradiction-sweep.timer retrieval-pa
 
 sleep 3
 echo "==> Service status:"
-systemctl --user is-active qdrant.service mem0.service l10-audit.timer decay-scan.timer stack-backup.timer 2>&1 | sed 's/^/  /'
+# `is-active` exits NON-ZERO for an inactive unit, and under `set -eo pipefail` (line 17) that
+# aborts the whole installer. On a replica every unit here is inactive BY DESIGN, so without the
+# guard the one-brain gate above would be immediately followed by a failed install: the script
+# would die at this status readout, after the units were written but before the health probes and
+# the completion message. A readout must never be the thing that fails the run.
+systemctl --user is-active qdrant.service mem0.service l10-audit.timer decay-scan.timer stack-backup.timer 2>&1 | sed 's/^/  /' || true
 
 # ----------------------------------------------------------------------
 # 6. Health probes
@@ -443,6 +448,11 @@ for endpoint in "Qdrant http://127.0.0.1:6333/healthz" "mem0 http://127.0.0.1:18
     url="${endpoint#* }"
     if curl -fs -m 5 "$url" >/dev/null 2>&1; then
         echo "  $name: OK ($url)"
+    elif [ "$MEM0_ROLE" = "replica" ]; then
+        # Expected, not a fault: a replica keeps the local services dormant and reads/writes
+        # through the authority. Saying "check systemctl status" here would send an operator
+        # chasing a unit that is off on purpose.
+        echo "  $name: dormant by design (role=replica; authority: ${MEM0_AUTHORITY_URL:-see ~/.mem0/authority-url})"
     else
         echo "  $name: NOT REACHABLE ($url) - check 'systemctl --user status $(echo $name | tr A-Z a-z).service'"
     fi
