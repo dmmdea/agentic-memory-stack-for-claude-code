@@ -475,7 +475,13 @@ function Invoke-CodexSubagent {
         # 2026-09-07: an EMPTY model means "inherit ~/.codex/config.toml" - the pre-existing
         # behaviour, kept so an un-migrated call site behaves exactly as before. Every job in
         # this stack now names its model; see $script:AmCodexModel* above.
-        [string]$Model = ''
+        [string]$Model = '',
+        # 2026-09-07: when set, `codex exec -o <file>` writes the agent's LAST MESSAGE to
+        # this file. Scraping it out of stdout depends on a `codex` marker line that is
+        # absent when the run produces no assistant message, and callers then parsed the
+        # metadata header as if it were the answer (5 of 330 live L1a calls). The file is
+        # the authoritative copy; stdout scraping stays as the fallback.
+        [string]$LastMessagePath = ''
     )
     if (-not (Test-Path $script:CodexCmd)) {
         throw "codex.cmd not found at $($script:CodexCmd)"
@@ -521,6 +527,7 @@ $inp = [Console]::In.ReadToEnd()
 # PS 5.1-safe and quote-free - the same reason the effort override travels by env var.
 $cargs = @('exec', '--skip-git-repo-check', '-c', $env:MEM0_CODEX_EFFORT_ARG)
 if (-not [string]::IsNullOrWhiteSpace($env:MEM0_CODEX_MODEL)) { $cargs += @('-m', $env:MEM0_CODEX_MODEL) }
+if (-not [string]::IsNullOrWhiteSpace($env:MEM0_CODEX_LASTMSG)) { $cargs += @('-o', $env:MEM0_CODEX_LASTMSG) }
 $cargs += '-'
 $o = $inp | & $env:MEM0_CODEX_CMD @cargs 2>&1
 [Console]::Out.Write([string]::Join([char]10, @($o | ForEach-Object { [string]$_ })))
@@ -541,6 +548,7 @@ exit $LASTEXITCODE
     $psi.EnvironmentVariables['MEM0_CODEX_CMD'] = $script:CodexCmd
     $psi.EnvironmentVariables['MEM0_CODEX_EFFORT_ARG'] = $effortArg
     $psi.EnvironmentVariables['MEM0_CODEX_MODEL'] = $Model
+    $psi.EnvironmentVariables['MEM0_CODEX_LASTMSG'] = $LastMessagePath
 
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
@@ -569,6 +577,67 @@ exit $LASTEXITCODE
     } finally {
         try { $p.Dispose() } catch {}
     }
+}
+
+function New-CodexLastMessagePath {
+    # A per-call temp path for `codex exec -o`. Windows UnixNano-style collisions are real
+    # (two back-to-back calls can land on the same tick), so the name carries the PID and a
+    # GUID rather than a timestamp alone.
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) 'ams-codex'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    # Opportunistic sweep, once per process (review 2026-09-07). Every call site now clears its
+    # own file on every exit path, but a caller that is KILLED - and these run under scheduled
+    # tasks with hard time limits - cannot run any cleanup at all, so caller discipline alone
+    # cannot bound this directory. The extractor fires ~1,900 times a week, so an unswept leak
+    # grows without limit. 24h is well past the longest call (240s) plus any retry.
+    if (-not $script:AmCodexTempSwept) {
+        $script:AmCodexTempSwept = $true
+        try {
+            $stale = (Get-Date).AddHours(-24)
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter 'lastmsg-*.txt' -File -ErrorAction SilentlyContinue)) {
+                if ($f.LastWriteTime -lt $stale) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+            }
+        } catch { }   # a sweep failure must never block the call it is housekeeping for
+    }
+    return (Join-Path $dir ('lastmsg-' + $PID + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt'))
+}
+
+function Remove-CodexLastMessagePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+function Get-CodexPlanWindow {
+    # The 7-day plan window from the UNOFFICIAL chatgpt /wham/usage response, or an explicit
+    # unknown. Split out of codex-usage-report.ps1 so the shape check is directly testable
+    # (review 2026-09-07): because the endpoint is unofficial, a renamed or dropped field lets
+    # the CALL succeed, so no try/catch fires; [int]$null is 0 in PowerShell, and the report
+    # would then state "0% used" - maximum headroom - from a response that said nothing. The one
+    # downstream guard is a $null test, which a genuine 0 passes. An unknown must READ as unknown.
+    param([AllowNull()]$Response)
+    $out = [pscustomobject]@{ used_percent = $null; resets_in_days = $null; note = '' }
+    $pw = $null
+    try { $pw = $Response.rate_limit.primary_window } catch { $pw = $null }
+    if ($null -eq $pw -or $null -eq $pw.used_percent -or $null -eq $pw.reset_after_seconds) {
+        $out.note = 'unexpected response shape (rate_limit.primary_window.used_percent / reset_after_seconds missing)'
+        return $out
+    }
+    # Parsed as double, then rounded: used_percent has been observed as an integer, but a float
+    # is just as plausible from this endpoint and rejecting it as "not numeric" would throw away
+    # a figure we can read perfectly well. InvariantCulture because JSON decimals are always '.'.
+    $u = [double]0; $r = [double]0
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $fl = [Globalization.NumberStyles]::Float
+    if (-not [double]::TryParse([string]$pw.used_percent, $fl, $inv, [ref]$u)) {
+        $out.note = 'used_percent is present but not numeric'; return $out
+    }
+    if (-not [double]::TryParse([string]$pw.reset_after_seconds, $fl, $inv, [ref]$r)) {
+        $out.note = 'reset_after_seconds is present but not numeric'; return $out
+    }
+    $out.used_percent = [int][Math]::Round($u)
+    $out.resets_in_days = [Math]::Round($r / 86400.0, 1)
+    return $out
 }
 
 function Parse-CodexHeader {
@@ -681,7 +750,28 @@ function Get-CodexResponseText {
     #   tokens used
     #   <token count>
     # Extract just the model response (between the last 'codex' marker and 'tokens used').
-    param([Parameter(Mandatory)][string]$RawOutput)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RawOutput,
+        # When Invoke-CodexSubagent was given -LastMessagePath, pass the SAME path here:
+        # the file is codex's own copy of the final assistant message and does not depend
+        # on locating a marker line in a stream that also carries the metadata header,
+        # the echoed prompt and any reasoning summary.
+        [string]$LastMessagePath = ''
+    )
+    if (-not [string]::IsNullOrWhiteSpace($LastMessagePath)) {
+        try {
+            if (Test-Path -LiteralPath $LastMessagePath) {
+                $fromFile = (Get-Content -LiteralPath $LastMessagePath -Raw -ErrorAction Stop)
+                if (-not [string]::IsNullOrWhiteSpace($fromFile)) { return $fromFile.Trim() }
+            }
+        } catch {
+            # Fall through to the stdout scrape, never throw - but SAY SO (review 2026-09-07).
+            # Swallowed silently, a systematically unreadable -o file (an AV lock, an ACL change)
+            # would regress every call to the pre-fix stdout scrape with no signal at all that
+            # the mitigation had stopped working.
+            try { Write-MemoryLog -Component 'codex' -Message ("  -o file unreadable, falling back to stdout scrape: " + $_.Exception.Message) } catch { }
+        }
+    }
     $lines = $RawOutput -split "`r?`n"
     $startIdx = -1
     $endIdx = $lines.Length

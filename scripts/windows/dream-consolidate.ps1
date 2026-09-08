@@ -678,6 +678,7 @@ $($canonicalFacts | Select-Object -First 30 | ForEach-Object { "- $_" } | Out-St
 "@
 
 $promoteRaw      = $null
+$promoteLastMsg  = ''
 $promoteStart    = Get-Date
 $codexWasCalled  = $false
 
@@ -686,12 +687,14 @@ if ($promoteEvidence.Count -eq 0) {
 } else {
     $codexWasCalled = $true
     try {
-        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis
+        $promoteLastMsg = New-CodexLastMessagePath
+        $promoteRaw = Invoke-CodexSubagent -Prompt $promotePrompt -ReasoningEffort $script:AmCodexEffortSynthesis -TimeoutSeconds 240 -Model $script:AmCodexModelSynthesis -LastMessagePath $promoteLastMsg
     } catch {
         Write-MemoryLog -Component 'dream' -Message "  autopromote: Codex call failed (non-fatal): $_"
         Write-CodexUsageLog -Component 'dream-promote' -Status 'error' -DurationMs ([int]((Get-Date) - $promoteStart).TotalMilliseconds) `
             -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
             -Outcome $(if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
+        Remove-CodexLastMessagePath -Path $promoteLastMsg   # every exit path clears its own -o file
         $promoteRaw = $null
     }
 }
@@ -705,13 +708,15 @@ $promoteCodexFailed = $false
 $promoteHdr = Parse-CodexHeader -RawOutput $promoteRaw
 if ($codexWasCalled) {
     if ($promoteRaw) {
-        $promoteCodexJson = Get-CodexResponseText -RawOutput $promoteRaw
+        $promoteCodexJson = Get-CodexResponseText -RawOutput $promoteRaw -LastMessagePath $promoteLastMsg
+        Remove-CodexLastMessagePath -Path $promoteLastMsg
         # Get-CodexResponseText now returns $null when codex emitted no answer at all (header
         # only). That is a parse failure, not an empty nomination list - say so explicitly
         # instead of handing $null downstream as if the model had decided nothing.
         if ($null -eq $promoteCodexJson) { $promoteCodexFailed = $true }
     } else {
         $promoteCodexFailed = $true
+        Remove-CodexLastMessagePath -Path $promoteLastMsg
     }
     Write-CodexUsageLog -Component 'dream-promote' -DurationMs $promoteDurationMs `
         -TokensUsed ([int](Parse-CodexTokenUsage -RawOutput $promoteRaw)) `

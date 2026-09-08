@@ -84,7 +84,10 @@ SCHEMA: dict[str, dict] = {
     },
     "tier-change": {
         "required": ["ts", "event", "memory_id", "tier", "actor"],
-        "optional": ["reason", "transport", "status", "schema_version"],
+        # judge_model (v18, 2026-09-07): which MODEL judged the promotion. OPTIONAL so
+        # every pre-v18 row stays valid - this is an additive schema change, and a row
+        # without it is a row written before the field existed, not a defect.
+        "optional": ["reason", "transport", "status", "schema_version", "judge_model"],
     },
     # AMS-22 (2026-08-08): write-ahead intent entries, appended BEFORE the
     # mutation (delete / tier change) so a destructive or authority op can never
@@ -93,7 +96,7 @@ SCHEMA: dict[str, dict] = {
     # fail-soft completion append lost — either way worth a look, never silent.
     "tier-change-intent": {
         "required": ["ts", "event", "memory_id", "tier", "actor"],
-        "optional": ["reason", "transport", "status", "schema_version"],
+        "optional": ["reason", "transport", "status", "schema_version", "judge_model"],
     },
     "metadata-merge": {
         "required": ["ts", "event", "memory_id", "merged_keys", "actor"],

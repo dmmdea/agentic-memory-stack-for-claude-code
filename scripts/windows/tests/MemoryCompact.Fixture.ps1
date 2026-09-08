@@ -10,6 +10,7 @@
         param(
             [string]$CodexPlanJson = '{"plan":[]}',
             [switch]$CodexThrows,
+            [switch]$CodexEmpty,              # exit 0 with EMPTY stdout (not a throw)
             [string]$Mem0Mode = 'ok',        # ok | noid | mismatch | fail
             [string]$MutateIndexDuringCodex,  # text appended to the index while "Codex thinks" (CAS)
             [switch]$LockHeld                 # another worker holds the codex mutex for the whole run
@@ -35,16 +36,31 @@ function Get-Mem0Key { return 'test-key' }
 function Invoke-CodexSubagent {
     # $Model mirrors the 2026-09-07 per-job pin; recorded so a compactor that stops naming its
     # model fails a test instead of silently inheriting config.toml.
-    param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model)
+    param($Prompt, $ReasoningEffort, $TimeoutSeconds, $Model, $LastMessagePath)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-model.txt') -Value ([string]$Model)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-prompt.txt') -Value $Prompt
     if ($env:STUB_CODEX_THROWS -eq '1') { throw 'codex.cmd not found (stub)' }
+    # A SUCCESSFUL call that returned nothing - exit 0, empty stdout. Production must still write
+    # a ledger row for this, or the outcome is invisible to the usage report's `failed` column.
+    if ($env:STUB_CODEX_EMPTY -eq '1') { return '' }
     if ($env:STUB_MUTATE_INDEX) {
         Add-Content -LiteralPath $env:STUB_MUTATE_TARGET -Value $env:STUB_MUTATE_INDEX
     }
     return ("header`ncodex`n" + $env:STUB_CODEX_PLAN + "`ntokens used`n42")
 }
 function Parse-CodexHeader { param($RawOutput) return @{ Model = 'stub-model'; Effort = 'stub-effort' } }
+# 2026-09-07: the compactor now asks codex to write its final message to a file (-o) and
+# cleans it up afterwards. The stubs keep the temp-file dance real (unique path, safe delete)
+# without needing codex, so the fixture exercises the same call shape production does.
+function New-CodexLastMessagePath {
+    $d = Join-Path $env:USERPROFILE '.claude\state'
+    if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    return (Join-Path $d ('lastmsg-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt'))
+}
+function Remove-CodexLastMessagePath {
+    param($Path)
+    if ($Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+}
 function Parse-CodexTokenUsage { param($RawOutput) return 42 }
 function Write-CodexUsageLog {
     param($Component, $TokensUsed, $DurationMs, $Status, $FactsPosted,
@@ -54,7 +70,12 @@ function Write-CodexUsageLog {
                     model_requested = $ModelRequested } | ConvertTo-Json -Compress))
 }
 function Get-CodexResponseText {
-    param($RawOutput)
+    # Mirrors production: the -o file wins when it exists and is non-empty, otherwise scrape.
+    param($RawOutput, $LastMessagePath)
+    if ($LastMessagePath -and (Test-Path -LiteralPath $LastMessagePath)) {
+        $f = Get-Content -LiteralPath $LastMessagePath -Raw -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($f)) { return $f.Trim() }
+    }
     $lines = $RawOutput -split "`r?`n"
     $s = -1; $e = $lines.Length
     for ($i = $lines.Length - 1; $i -ge 0; $i--) {
@@ -97,7 +118,7 @@ function Invoke-RestMethod {
         return [pscustomobject]@{
             Root = $root; Home = $home_; Bin = $bin
             Projects = (Join-Path $home_ '.claude\projects')
-            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex; LockHeld = [bool]$LockHeld
+            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Empty = [bool]$CodexEmpty; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex; LockHeld = [bool]$LockHeld
         }
     }
 
@@ -122,6 +143,7 @@ function Invoke-RestMethod {
             '$env:USERPROFILE=' + "'" + $Sandbox.Home + "'"
             '$env:STUB_CODEX_PLAN=' + "'" + ($Sandbox.Plan -replace "'", "''") + "'"
             '$env:STUB_CODEX_THROWS=' + "'" + $(if ($Sandbox.Throws) { '1' } else { '0' }) + "'"
+            '$env:STUB_CODEX_EMPTY=' + "'" + $(if ($Sandbox.Empty) { '1' } else { '0' }) + "'"
             '$env:STUB_MEM0_MODE=' + "'" + $Sandbox.Mem0 + "'"
             '$env:STUB_LOCK_HELD=' + "'" + $(if ($Sandbox.LockHeld) { '1' } else { '0' }) + "'"
         )

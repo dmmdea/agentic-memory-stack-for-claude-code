@@ -460,7 +460,7 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
 
     It 'deploys the write-time lint script and the three auto-memory scripts' {
         $wins = Get-AstArrayStrings -Path $installerPath -VarName 'winScripts'
-        foreach ($n in @('memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'memory-index-write-gate.ps1')) {
+        foreach ($n in @('memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'memory-index-write-gate.ps1', 'codex-usage-report.ps1')) {
             $wins | Should -Contain $n -Because "$n must be deployed or the SessionStart child and the nightly task launch nothing"
         }
         (Get-Content $installerPath -Raw) | Should -Match 'memory-index-write-lint\.sh' -Because 'the PostToolUse hook script must be deployed from claude-config'

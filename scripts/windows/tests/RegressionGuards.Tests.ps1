@@ -645,3 +645,134 @@ Describe 'Codex model is pinned per job, never inherited (2026-09-07)' {
         $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 30\)' -Because "the compactor's own lock window is 30 minutes"
     }
 }
+
+Describe 'codex usage report (2026-09-07)' {
+    BeforeAll { $script:reportPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'codex-usage-report.ps1' }
+
+    It 'exists and parses' {
+        Test-Path -LiteralPath $script:reportPath | Should -BeTrue
+        $err = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($script:reportPath, [ref]$null, [ref]$err)
+        $err | Should -BeNullOrEmpty
+    }
+
+    It 'emits valid JSON over a synthetic ledger and attributes tokens to the right job' {
+        $home_ = Join-Path $TestDrive ('rep-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $logs = Join-Path $home_ '.claude\logs'
+        [System.IO.Directory]::CreateDirectory($logs) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().ToString('o')
+        @(
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":100,"duration_ms":10,"outcome":"ok","model_requested":"gpt-5.6-terra","model_resolved":"gpt-5.6-terra"}')
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":50,"duration_ms":20,"outcome":"parse_fail","model_requested":"gpt-5.6-terra","model_resolved":"gpt-5.6-terra"}')
+            ('{"ts":"' + $ts + '","component":"dream-consolidate","tokens_used":7,"duration_ms":30,"outcome":"ok","model_requested":"gpt-6-astra","model_resolved":"gpt-5.6-luna"}')
+            'this line is torn and must not end the report'
+        ) | Set-Content -LiteralPath (Join-Path $logs 'codex-usage.jsonl') -Encoding UTF8
+        $old = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $home_
+            $out = & pwsh -NoProfile -File $script:reportPath -Days 7 -Json 2>$null | Out-String
+            $j = $out | ConvertFrom-Json
+            $l1a = $j.jobs | Where-Object { $_.job -eq 'l1a' }
+            $l1a.calls | Should -Be 2
+            $l1a.tokens | Should -Be 150
+            $l1a.failed | Should -Be 1 -Because 'a job that is cheap because its calls die is not cheap'
+            $cons = $j.jobs | Where-Object { $_.job -eq 'dream-consolidate' }
+            $cons.drift | Should -Be 1 -Because 'requested astra but resolved luna is silent model drift and must surface'
+        } finally { $env:USERPROFILE = $old }
+    }
+
+    It 'does not throw when the ledger is absent (a reporting tool must not die on a missing optional input)' {
+        $empty = Join-Path $TestDrive ('rep-empty-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        [System.IO.Directory]::CreateDirectory($empty) | Out-Null
+        $old = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $empty
+            $out = & pwsh -NoProfile -File $script:reportPath -Days 7 -Json 2>$null | Out-String
+            $j = $out | ConvertFrom-Json
+            $j.total_calls | Should -Be 0
+        } finally { $env:USERPROFILE = $old }
+    }
+}
+
+Describe 'plan-window shape check (2026-09-07 silent-failure review)' {
+    BeforeAll {
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-common.ps1')
+        # inside BeforeAll, not the Describe body: the Describe body runs at DISCOVERY, so a
+        # helper defined there is not in scope when the It blocks actually execute.
+        function script:Win($pw) { return ([pscustomobject]@{ rate_limit = [pscustomobject]@{ primary_window = $pw } }) }
+    }
+
+    It 'reads a well-formed response' {
+        $r = Get-CodexPlanWindow -Response (script:Win ([pscustomobject]@{ used_percent = 33; reset_after_seconds = 432000 }))
+        $r.used_percent | Should -Be 33
+        $r.resets_in_days | Should -Be 5
+        $r.note | Should -BeNullOrEmpty
+    }
+
+    It 'says UNKNOWN - never 0% - when the unofficial endpoint RENAMES a field' {
+        # The defect this replaced: the call succeeds, so no catch fires; $pw.used_percent is
+        # $null; [int]$null is 0 in PowerShell; the report then states "0% used" - maximum
+        # headroom - from a response that carried nothing. The only downstream guard is a $null
+        # test, and a genuine 0 sails straight past it.
+        $r = Get-CodexPlanWindow -Response (script:Win ([pscustomobject]@{ percent_used = 33; reset_after_seconds = 432000 }))
+        ($null -eq $r.used_percent) | Should -BeTrue -Because 'an unknown must read as unknown, not as 0% used'
+        $r.note | Should -Match 'shape'
+    }
+
+    It 'says UNKNOWN when primary_window is absent entirely' {
+        $r = Get-CodexPlanWindow -Response ([pscustomobject]@{ rate_limit = [pscustomobject]@{} })
+        ($null -eq $r.used_percent) | Should -BeTrue
+        $r.note | Should -Match 'shape'
+    }
+
+    It 'says UNKNOWN on a null response rather than throwing' {
+        $r = Get-CodexPlanWindow -Response $null
+        ($null -eq $r.used_percent) | Should -BeTrue
+    }
+
+    It 'says UNKNOWN when used_percent is present but not numeric' {
+        $r = Get-CodexPlanWindow -Response (script:Win ([pscustomobject]@{ used_percent = 'n/a'; reset_after_seconds = 432000 }))
+        ($null -eq $r.used_percent) | Should -BeTrue
+        $r.note | Should -Match 'not numeric'
+    }
+
+    It 'accepts a FRACTIONAL used_percent instead of discarding a figure it can read' {
+        $r = Get-CodexPlanWindow -Response (script:Win ([pscustomobject]@{ used_percent = 32.6; reset_after_seconds = 43200 }))
+        $r.used_percent | Should -Be 33
+        $r.resets_in_days | Should -Be 0.5
+    }
+}
+
+Describe 'codex usage report robustness (2026-09-07 silent-failure review)' {
+    BeforeAll { $script:reportPath2 = Join-Path (Split-Path -Parent $PSScriptRoot) 'codex-usage-report.ps1' }
+
+    It 'reports a malformed duration_ms instead of dropping it silently, and counts unparsed rows SEPARATELY from drift' {
+        # MEASURED, correcting the review that raised this: a bad [int] cast here is only
+        # STATEMENT-terminating, so the report never died - the row was just skipped. That is the
+        # quieter defect: it disappears from the latency sample while still counting in `calls`,
+        # so p50/max silently describe a smaller population. It has to be counted, not dropped.
+        # And 'unparsed' is excluded from drift by design (an unknown is not a mismatch), so it
+        # needs its own column: a codex header-format change would otherwise turn every row
+        # unparsed while drift reported a clean 0.
+        $home_ = Join-Path $TestDrive ('rep2-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $logs = Join-Path $home_ '.claude\logs'
+        [System.IO.Directory]::CreateDirectory($logs) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().ToString('o')
+        @(
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":10,"duration_ms":10,"outcome":"ok","model_requested":"gpt-5.6-terra","model_resolved":"gpt-5.6-terra"}')
+            ('{"ts":"' + $ts + '","component":"l1a","tokens_used":10,"duration_ms":"N/A","outcome":"ok","model_requested":"gpt-5.6-terra","model_resolved":"unparsed"}')
+        ) | Set-Content -LiteralPath (Join-Path $logs 'codex-usage.jsonl') -Encoding UTF8
+        $old = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $home_
+            $out = & pwsh -NoProfile -File $script:reportPath2 -Days 7 -Json 2>$null | Out-String
+            $j = $out | ConvertFrom-Json
+            $j | Should -Not -BeNullOrEmpty -Because 'one malformed field must not kill the whole report'
+            $l1a = $j.jobs | Where-Object { $_.job -eq 'l1a' }
+            $l1a.calls | Should -Be 2
+            $l1a.unparsed | Should -Be 1 -Because '"we could not tell" must never look like "it matched"'
+            $l1a.drift | Should -Be 0
+            $l1a.bad_duration | Should -Be 1 -Because 'a sample silently dropped from p50/max makes those latencies describe fewer calls than the calls column'
+        } finally { $env:USERPROFILE = $old }
+    }
+}

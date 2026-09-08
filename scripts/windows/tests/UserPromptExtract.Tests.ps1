@@ -1353,3 +1353,88 @@ Describe 'v0.22 Phase E R-budget (Measure-MemoryContextBudget)' {
         $m.WithinBudget | Should -BeTrue
     }
 }
+
+Describe 'R-offload invariant: exposure is the COMMAND, not merely a firing matcher (2026-09-07)' {
+    # The rule used to FAIL on ANY PreToolUse matcher that fires for the harness. That conflates
+    # "a hook fires" with "the harness receives the [MEMORY CONTEXT] block", and only the second
+    # is what this invariant is named for. Held as a hard FAIL it reported the stack UNHEALTHY
+    # for days over another session's deny-only delegate guard - which is how a standing red
+    # light stops being read at all.
+    BeforeAll {
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'user-prompt-lib.ps1')
+        function script:Hooks([string]$json) { return ($json | ConvertFrom-Json) }
+        $script:ups = '"UserPromptSubmit":[{"hooks":[{"command":"C:/x/mem0-hook-client.exe"}]}]'
+    }
+
+    It 'WARNs (not FAILs) when a FOREIGN hook fires for the harness with no memory-context producer' {
+        # The exact live shape: matcher carries mcp__local-offload__.*, command is node.exe with
+        # the guard script in ARGS.
+        $cfg = script:Hooks ('{' + $script:ups + ',"PreToolUse":[{"matcher":"Agent|mcp__local-offload__.*","hooks":[{"command":"node.exe","args":["C:/h/delegate-mode-guard.js"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'WARN'
+        $r.Ok | Should -BeTrue
+        $r.Detail | Should -Match 'delegate-mode-guard' -Because 'the offender is named, never silent'
+    }
+
+    It 'still FAILs when the firing matcher runs a memory-context PRODUCER (the real exposure)' {
+        # The guard must be able to go red, or its green means nothing. Note the producer is in
+        # ARGS, not command - a lookup reading only `command` would see "pwsh.exe" and miss it.
+        $cfg = script:Hooks ('{' + $script:ups + ',"PreToolUse":[{"matcher":"Agent|mcp__local-offload__.*","hooks":[{"command":"pwsh.exe","args":["C:/h/user-prompt-extract.ps1"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'FAIL'
+        $r.Ok | Should -BeFalse
+        $r.Detail | Should -Match 'memory-context producer'
+    }
+
+    It 'returns OK for a clean config that gates only the editing/exec tools' {
+        $cfg = script:Hooks ('{' + $script:ups + ',"PreToolUse":[{"matcher":"Bash|Edit|Write","hooks":[{"command":"pwsh.exe","args":["C:/h/pre-tool-check.ps1"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'OK'
+        $r.Detail | Should -Match "pre-tool-check matcher='Bash\|Edit\|Write'" -Because 'the stack matcher is found via args, not just command'
+    }
+
+    It 'a catch-all matcher bound to a producer is caught (mcp__ need not appear literally)' {
+        $cfg = script:Hooks ('{' + $script:ups + ',"PreToolUse":[{"matcher":".*","hooks":[{"command":"pwsh.exe","args":["C:/h/mem0-hook-daemon.ps1"]}]}]}')
+        (Test-OffloadNoBlockInvariant -Hooks $cfg).Status | Should -Be 'FAIL'
+    }
+}
+
+Describe 'R-offload invariant: indirection and honesty (2026-09-07 silent-failure review)' {
+    BeforeAll {
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'user-prompt-lib.ps1')
+        function script:Hooks2([string]$json) { return ($json | ConvertFrom-Json) }
+        $script:ups2 = '"UserPromptSubmit":[{"hooks":[{"command":"C:/x/mem0-hook-client.exe"}]}]'
+    }
+
+    It 'FAILs when the firing hook runs a WRAPPER whose own body invokes a producer' {
+        # Classification by literal command/args text alone cannot see through a wrapper, a shim
+        # or a dispatcher - and a wrapper that reaches a producer IS the exposure this invariant
+        # is named for. One hop is resolved by reading the script the hook actually names.
+        $wrap = Join-Path $TestDrive 'wrap-guard.js'
+        Set-Content -LiteralPath $wrap -Value 'execFileSync("pwsh", ["C:/h/user-prompt-extract.ps1"]);' -Encoding UTF8
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__local-offload__.*","hooks":[{"command":"node.exe","args":["' + ($wrap -replace '\\', '/') + '"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'FAIL'
+        $r.Ok | Should -BeFalse
+        $r.Detail | Should -Match 'wrap-guard\.js'
+    }
+
+    It 'still WARNs for a wrapper that reaches no producer, and hedges the claim it makes' {
+        $wrap = Join-Path $TestDrive 'clean-guard.js'
+        Set-Content -LiteralPath $wrap -Value 'process.exit(0); // denies delegation, touches no memory' -Encoding UTF8
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__local-offload__.*","hooks":[{"command":"node.exe","args":["' + ($wrap -replace '\\', '/') + '"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'WARN'
+        $r.Ok | Should -BeTrue
+        $r.Detail | Should -Match 'INFERRED' -Because 'absence of four substrings plus one hop is not proof the block cannot reach it'
+    }
+
+    It 'reports a matcher it could not evaluate instead of silently treating it as harmless' {
+        # PowerShell calls an unparseable matcher "cannot fire". That is an assumption about
+        # Claude Code's own regex engine, not a verified fact.
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__[local","hooks":[{"command":"node.exe"}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'WARN'
+        $r.Detail | Should -Match 'NOT VERIFIED'
+    }
+}

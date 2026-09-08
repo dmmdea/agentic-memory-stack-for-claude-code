@@ -4,6 +4,64 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.17 (2026-09-07) — provenance in the store, and a cost meter for the decision
+
+Close-out of the model-routing work.
+
+- **`judge_model` on the tier ledger (schema v18).** `actor` is a role label
+  ("dream-autopromote", "user-direct") and never said WHAT judged a promotion. Both the
+  write-ahead intent row and the completion row now record the model. Additive: the field is
+  OPTIONAL, so every pre-v18 row stays valid. It sits deliberately OUTSIDE the signed
+  material — the canonical HMAC covers `<ts>|<nonce>|promote|<mid>|<reason>` — so it is an
+  audit convenience, never an authorisation input. `mem0-canonize.sh` passes it via
+  `JUDGE_MODEL`.
+- **`codex exec -o <file>` at the three JSON-parsing call sites.** Scraping the answer out of
+  stdout depends on a `codex` marker that is absent when a run produces no assistant message;
+  the scrape then returned the metadata header and the caller parsed it as the answer (5 of
+  330 live extractor calls). The `-o` file is Codex's own copy of the final message. Stdout
+  scraping stays as the fallback and `$null` remains the honest outcome when both are absent.
+- **`codex-usage-report.ps1`** — per-job calls, tokens, latency, failures and requested-vs-
+  resolved model DRIFT, plus the plan's 7-day window. Built because the NLI write-gate is
+  pinned but OFF and the decision to enable it needs measured cost, not a guess.
+- **Silent-failure review fixes (folded in before merge).** The reviewer found that the new
+  code repeated, in four new places, the very anti-pattern this release exists to remove.
+  - The plan-window read cast an unvalidated field to `[int]`. This endpoint is UNOFFICIAL, so
+    a renamed field lets the CALL succeed; `[int]$null` is `0`; the report would have stated
+    "0% used" - maximum headroom - from a response that carried nothing, and the only
+    downstream guard is a `$null` test that a genuine `0` passes. The shape check now lives in
+    `Get-CodexPlanWindow`, where it is directly testable, and an unknown reads as unknown.
+  - `unparsed` rows got their own column. They are excluded from DRIFT on purpose (an unknown
+    is not a mismatch), but folding them into "not drift" meant a codex header-format change
+    would turn every row unparsed while drift reported a clean `0` - invisible in the one
+    report built to catch silent model change.
+  - The compactor wrote NO ledger row when the judge succeeded and returned nothing: `''` is
+    falsy, so `if ($raw)` skipped the write entirely. Fixed the same way `l1a-extract.ps1`
+    already did it, with `outcome='empty'`.
+  - The R-offload producer check could only see literal command/args text, so a wrapper script
+    that reaches a producer - the real exposure - downgraded to a WARN. It now follows one hop
+    into the script the hook names, says INFERRED rather than claiming proof, and names any
+    matcher or file it could not evaluate.
+  - A malformed `duration_ms` is now COUNTED (`bad_duration`) rather than dropped. The review
+    said such a row would kill the whole report; measuring it showed otherwise — the cast is
+    only statement-terminating, so the row is skipped and the run continues. The real defect was
+    quieter and worse for being quiet: that row left the latency sample while still counting in
+    `calls`, so p50/max described a smaller population than the column beside them claimed.
+  - Also: `-o` temp files are cleared on every exit path and swept after 24h (a KILLED task can
+    run no cleanup at all, so caller discipline alone cannot bound that directory);
+    `New-CodexLastMessagePath` moved inside the compactor's try, so a failure there degrades to
+    deterministic hygiene instead of failing the whole store; and the `-o` unreadable-file
+    fallback now logs instead of silently reverting every call to the stdout scrape it was built
+    to replace.
+- **R-offload invariant narrowed to the real exposure.** It used to FAIL on ANY PreToolUse
+  matcher that fires for the offload harness, which conflates "a hook fires" with "the harness
+  receives the [MEMORY CONTEXT] block". Only a matcher bound to a memory-context PRODUCER can
+  route that block; a third-party deny-only guard cannot. Held as a hard FAIL, the old rule
+  reported the stack UNHEALTHY for days over another session's delegate guard — which is how a
+  standing red light stops being read. A firing foreign matcher is now a WARN that names the
+  offender; a producer on a firing matcher still FAILs (proven by mutation). The same change
+  fixes a blind spot in the hook lookup: a hook is routinely
+  `{command: "node.exe", args: ["…guard.js"]}`, and reading only `command` saw "node.exe".
+
 ## v1.20.16 (2026-09-07) — the judge model is pinned per job, and recorded
 
 Every Codex call inherited whatever `~/.codex/config.toml` named. A config edit on 2026-09-07

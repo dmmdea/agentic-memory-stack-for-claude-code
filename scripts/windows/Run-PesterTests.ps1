@@ -32,7 +32,13 @@ param(
     [string]$PesterVersion = '5.7.1',
     [switch]$Detailed,
     [switch]$Refresh,            # force re-stage the repo-local Pester copy
-    [int]$PerFileTimeoutSec = 180
+    # 180 -> 300 (2026-09-07). MEASURED: MemoryCompactRobustness.Tests.ps1 runs ~120s on its own
+    # and every one of its cases spawns a REAL compactor child process, so the file's cost grows
+    # with each case added; under the runner's per-file process overhead it crossed 180s and the
+    # whole file was reported as one timeout - 28 passing assertions silently stopped being
+    # checked. The budget was sized when the file was smaller; this restores headroom rather than
+    # thinning the coverage that outgrew it.
+    [int]$PerFileTimeoutSec = 300
 )
 $ErrorActionPreference = 'Stop'
 
