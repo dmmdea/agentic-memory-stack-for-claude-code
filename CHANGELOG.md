@@ -4,6 +4,34 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.19 (2026-09-07) — the WSL installer now enforces the One-Brain rule too
+
+- **`install/1-wsl-services.sh` no longer enables canonical-mutation units on a replica.** It
+  enabled every unit unconditionally, so running it on a replica silently created a SECOND write
+  authority: a local `mem0` + `qdrant`, plus the `l10-audit`, `decay-scan` (its `ExecStartPost`
+  runs semantic-dedup), `stack-backup`, `goals-stale-sweep`, `contradiction-sweep`,
+  `retrieval-pairs`, `episodic-reconcile` and `goal-recurrence-promote` timers — all mutating
+  canonical state in a store that box does not own.
+  `install/2-windows-config.ps1` has gated its half since v1.16, and the health check already
+  reported WSL timers on a replica as brain-only machinery "by design", so the installer
+  contradicted both. Every brain unit now goes through `enable_brain_unit`, which installs the
+  unit either way (promoting a replica stays a one-liner), and on a replica enables nothing and
+  disables whatever an earlier ungated run turned on — the same skip-and-remove the Windows
+  installer performs.
+- **The installer could not finish on a replica either.** Its service-status readout pipes
+  `systemctl is-active` through `sed`, and `is-active` exits non-zero for an inactive unit —
+  under the script's `set -eo pipefail` that aborts the run. On a replica every unit in that
+  readout is inactive by design, so the gate above would have been followed immediately by a
+  failed install: units written, health probes and completion message never reached. The readout
+  is now non-fatal, and the probes report `dormant by design` on a replica instead of sending an
+  operator to `systemctl status` for a unit that is off on purpose.
+- Three guards, all mutation-proven: a static one asserting no brain unit is enabled by an ungated
+  `systemctl` call; a **behavioural** one that extracts the helper and runs it against a stub
+  `systemctl`, asserting a replica emits `disable --now` and never `enable --now` while a brain
+  still enables; and one that runs the real status-readout line against a stub reporting an
+  inactive unit, asserting the script survives it. Wording alone would not have caught a gate that
+  never matches — that is one of the mutations proven red.
+
 ## v1.20.18 (2026-09-07) — a deployed runtime must be able to say which release it is
 
 - **Every installer that deploys the server modules now stamps `VERSION` beside `app.py`.**

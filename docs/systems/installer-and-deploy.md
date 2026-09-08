@@ -169,6 +169,16 @@ Verify reads `Role` from the Receipt. On a `brain` box it asserts **both** night
 - `ClaudeCode-DreamConsolidator-3am` — the nightly 4-phase consolidator.
 - `ClaudeCode-SemanticDedup-430am` — the tier-sensitive semantic dedup (offset from the 3am run so the per-machine `dedup.lock` never blocks the Dream).
 
+### Role-aware unit enablement (install time)
+
+`install/1-wsl-services.sh` resolves `MEM0_ROLE` (from `stack.env`, then `~/.mem0/role`,
+defaulting to `brain`) and routes every canonical-mutation unit through `enable_brain_unit`. On a
+`brain` the behaviour is unchanged. On a `replica` the units are still installed — promoting the
+box is a one-liner — but none is enabled, and any left enabled by an earlier ungated run is
+disabled. That is the same skip-and-remove `2-windows-config.ps1 -Role replica` performs for the
+Windows tasks; before this the two installers disagreed, and only the Windows half enforced the
+One-Brain rule.
+
 ### Role-aware health rows (health-check time)
 
 `Test-MemoryStack.ps1` reads the same `Role` and resolves the **memory authority** the way `3-verify.ps1` does — the live `~/.mem0/authority-url` inside WSL, then the Receipt's `AuthorityUrl`, then loopback. Every row that reads the shared store (`/health`, `/health/deep`, list/search, episodes, goals, open questions) targets that authority, so on a replica the rows describe the brain it actually uses instead of the loopback services a replica deliberately keeps dormant (the first replica this ran on reported 14 permanent FAILs, every one a loopback probe). Three further rules apply on a `replica`:

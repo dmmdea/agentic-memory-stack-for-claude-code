@@ -235,3 +235,110 @@ def test_every_installer_that_deploys_app_py_also_stamps_VERSION():
             f"VERSION stamp(s) — a runtime deployed by the unstamped path reports "
             f'stack "unknown" and cannot say which release it runs'
         )
+
+
+def test_wsl_installer_never_enables_a_brain_job_on_a_replica():
+    """The one-brain rule must be enforced by the WSL installer, not just the Windows one.
+
+    Consolidation, dedup, decay, the contradiction sweep, goal promotion, the L10 audit and
+    the backup pipeline are canonical-mutation operations. install/2-windows-config.ps1 has
+    skipped them on a replica since v1.16; install/1-wsl-services.sh enabled every unit
+    unconditionally, so running it on a replica stood up a SECOND write authority against a
+    store that box does not own. Every brain unit must go through the role-gated helper.
+    """
+    sh = WSL_INSTALLER.read_text(encoding="utf-8")
+
+    assert "enable_brain_unit()" in sh, "the role-gated helper is missing"
+    # the helper must actually gate on the replica role, and must also turn OFF anything an
+    # earlier ungated run left enabled (parity with the Windows installer's removal step).
+    helper = sh.split("enable_brain_unit()", 1)[1].split("\n}", 1)[0]
+    assert 'MEM0_ROLE" = "replica"' in helper, "helper does not gate on the replica role"
+    assert "disable --now" in helper, "helper does not disable units a previous ungated run enabled"
+
+    # No brain unit may be enabled by a raw, ungated systemctl call.
+    BRAIN_UNITS = (
+        "qdrant.service", "mem0.service", "l10-audit.timer", "decay-scan.timer",
+        "stack-backup.timer", "goals-stale-sweep.timer", "contradiction-sweep.timer",
+        "retrieval-pairs.timer", "episodic-reconcile.timer", "goal-recurrence-promote.timer",
+    )
+    offenders = []
+    for line in sh.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "enable --now" not in stripped:
+            continue
+        if stripped.startswith("systemctl --user enable --now") and any(u in stripped for u in BRAIN_UNITS):
+            offenders.append(stripped)
+    assert not offenders, (
+        "brain unit(s) enabled by an ungated systemctl call — a replica install would become a "
+        f"second write authority: {offenders}"
+    )
+
+
+def test_enable_brain_unit_behaviour_replica_disables_brain_enables(tmp_path):
+    """Run the real helper against a fake systemctl — text matching proves wording, not behaviour.
+
+    Extracts enable_brain_unit() from the installer verbatim and executes it with a stub
+    `systemctl` on PATH that records its arguments. A replica must never emit `enable --now`
+    for a canonical-mutation unit, and must emit `disable --now` so an earlier ungated run is
+    corrected. A brain must still enable exactly as before.
+    """
+    sh = WSL_INSTALLER.read_text(encoding="utf-8")
+    start = sh.index("enable_brain_unit() {")
+    end = sh.index("\n}", start) + 2
+    func = sh[start:end]
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "systemctl.trace"
+    stub = fake_bin / "systemctl"
+    stub.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "' + str(trace) + '"\nexit 0\n')
+    stub.chmod(0o755)
+
+    for role, expect_enable in (("replica", False), ("brain", True)):
+        trace.write_text("")
+        script = f'MEM0_ROLE={role}\n{func}\nenable_brain_unit contradiction-sweep.timer\n'
+        env = dict(os.environ, PATH=f"{fake_bin}:{os.environ.get('PATH','')}")
+        r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0, f"{role}: helper exited {r.returncode}: {r.stderr}"
+        calls = trace.read_text(encoding="utf-8")
+        if expect_enable:
+            assert "enable --now" in calls, f"brain must still enable: {calls!r}"
+        else:
+            assert "enable --now" not in calls, (
+                f"REPLICA ENABLED A CANONICAL-MUTATION UNIT — second write authority: {calls!r}"
+            )
+            assert "disable --now" in calls, (
+                f"replica must also turn off what an earlier ungated run enabled: {calls!r}"
+            )
+
+
+def test_service_status_readout_cannot_abort_the_installer(tmp_path):
+    """The status readout must not kill the install when the units are inactive.
+
+    `systemctl is-active` exits non-zero for an inactive unit, and the installer runs under
+    `set -eo pipefail`. On a replica every unit in that readout is inactive BY DESIGN, so an
+    unguarded pipeline would abort the run immediately after the one-brain gate — units written,
+    health probes and completion message never reached. Runs the real line from the installer
+    against a stub systemctl that reports failure.
+    """
+    sh = WSL_INSTALLER.read_text(encoding="utf-8")
+    line = next(
+        l for l in sh.splitlines()
+        if "is-active" in l and "qdrant.service" in l and not l.strip().startswith("#")
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stub = fake_bin / "systemctl"
+    stub.write_text('#!/bin/bash\necho inactive\nexit 3\n')   # what an inactive unit really does
+    stub.chmod(0o755)
+
+    script = f'set -eo pipefail\n{line}\necho REACHED_END\n'
+    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ.get('PATH','')}")
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+
+    assert "REACHED_END" in r.stdout, (
+        "the installer aborts at the service-status readout when units are inactive — on a "
+        f"replica that is every unit, by design. stdout={r.stdout!r} rc={r.returncode}"
+    )
+    assert r.returncode == 0, f"status readout exited {r.returncode}"
