@@ -485,6 +485,46 @@ function Test-AmWorkspaceLive {
     return $false
 }
 
+function Get-AmStoreRunHistory {
+    # What the receipts say about ONE store: how many consecutive runs ended in a live-session
+    # skip, what the last real outcome was, and when it last reached a decision.
+    #
+    # WHY (2026-09-08): a store was skipped as "live" two nights running - legitimately - and
+    # grew straight past the 25,000 B sync limit, and nothing said so. Both watchdogs missed it:
+    # compactor-silent keys on the receipts FILE's age, and a skip writes a receipt, so a store
+    # skipped every night looks alive to it; compactor-unproductive needs three consecutive bad
+    # receipts, and this store had applied, skipped, skipped - one more night before anyone would
+    # hear, while the harness had already stopped syncing it. The skip streak is the per-store
+    # signal both of them lacked, and the compactor itself needs it to know when a skip has
+    # stopped being the safe choice. Never throws, never returns $null.
+    param([Parameter(Mandatory)][string]$ReceiptPath, [Parameter(Mandatory)][string]$Workspace)
+    $out = [pscustomobject]@{ SkipStreak = 0; LastStatus = $null; LastProductiveUtc = $null }
+    if (-not (Test-Path -LiteralPath $ReceiptPath)) { return $out }
+    $mine = @()
+    try {
+        foreach ($l in (Get-Content -LiteralPath $ReceiptPath -Tail 600 -ErrorAction Stop)) {
+            if (-not $l.Trim()) { continue }
+            $o = $null
+            try { $o = $l | ConvertFrom-Json } catch { continue }
+            if ($o.workspace -ne $Workspace -or $o.dry_run) { continue }
+            $mine += $o
+        }
+    } catch { return $out }
+    if ($mine.Count -eq 0) { return $out }
+    $out.LastStatus = [string]$mine[-1].status
+    for ($i = $mine.Count - 1; $i -ge 0; $i--) {
+        if ($mine[$i].status -eq 'skipped-live-session') { $out.SkipStreak++ } else { break }
+    }
+    $productive = @('applied', 'applied-unrecorded', 'no-op', 'protected-set-overflow')
+    for ($i = $mine.Count - 1; $i -ge 0; $i--) {
+        if ($productive -contains $mine[$i].status) {
+            try { $out.LastProductiveUtc = ([DateTime]::Parse([string]$mine[$i].ts, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)).ToUniversalTime() } catch {}
+            break
+        }
+    }
+    return $out
+}
+
 function Test-AmLineRoundTrips {
     # A line the job CONSTRUCTS must parse back to exactly the entry it intended: same slug, no
     # extra links, and recognised as an entry at all.
