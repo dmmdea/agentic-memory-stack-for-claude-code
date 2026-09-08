@@ -19,6 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'memory-common.ps1')   # Get-CodexPlanWindow (definitions only on load)
 $ledger = Join-Path $env:USERPROFILE '.claude\logs\codex-usage.jsonl'
 $cutoff = (Get-Date).ToUniversalTime().AddDays(-1 * [Math]::Abs($Days))
 
@@ -42,7 +43,26 @@ if (Test-Path -LiteralPath $ledger) {
 $byJob = @()
 foreach ($g in ($rows | Group-Object -Property component)) {
     $tok = ($g.Group | Measure-Object -Property tokens_used -Sum).Sum
-    $durs = @($g.Group | ForEach-Object { [int]$_.duration_ms } | Where-Object { $_ -gt 0 } | Sort-Object)
+    # A duration_ms that is present but not a number - a hand-edited row, a future schema
+    # writing "N/A" - does NOT kill the report. MEASURED 2026-09-07, correcting the review that
+    # raised this: the cast failure is only STATEMENT-terminating, so under -EA Continue the bad
+    # row is skipped and the pipeline runs on. The real defect is quieter, and worse for being
+    # quiet: that row silently vanishes from the latency sample while still counting in `calls`,
+    # so p50/max describe a smaller population than the column beside them claims. TryParse makes
+    # the skip deliberate instead of an error-stream accident, and $badDur makes it VISIBLE.
+    $durs = @($g.Group | ForEach-Object {
+        $v = 0
+        if ([int]::TryParse([string]$_.duration_ms, [ref]$v)) { $v } else { 0 }
+    } | Where-Object { $_ -gt 0 } | Sort-Object)
+    # ABSENT is not MALFORMED: a row that legitimately carries no duration (an outcome like
+    # skipped_no_candidates) must not be reported as a bad row.
+    $badDur = 0
+    foreach ($row in $g.Group) {
+        $rawDur = $row.duration_ms
+        if ($null -eq $rawDur -or [string]$rawDur -eq '') { continue }
+        $tmp = 0
+        if (-not [int]::TryParse([string]$rawDur, [ref]$tmp)) { $badDur++ }
+    }
     $p50 = if ($durs.Count) { $durs[[int][Math]::Floor($durs.Count * 0.5)] } else { 0 }
     $mx = if ($durs.Count) { $durs[-1] } else { 0 }
     $bad = @($g.Group | Where-Object { $_.outcome -and $_.outcome -ne 'ok' -and $_.outcome -ne 'skipped_no_candidates' }).Count
@@ -51,6 +71,12 @@ foreach ($g in ($rows | Group-Object -Property component)) {
     $drift = @($g.Group | Where-Object {
         $_.model_requested -and $_.model_resolved -and
         $_.model_resolved -ne 'unparsed' -and $_.model_requested -ne $_.model_resolved }).Count
+    # 'unparsed' is the deliberate sentinel for "the header could not be read", and drift above
+    # excludes it because an unknown is not a mismatch. Counted SEPARATELY rather than folded
+    # into "not drift" (review 2026-09-07): if codex's header format ever changes, every row
+    # goes unparsed, drift reads a clean 0, and the one report built to catch silent model
+    # change reports health while knowing nothing. An unknown has to look like an unknown.
+    $unparsed = @($g.Group | Where-Object { $_.model_resolved -eq 'unparsed' }).Count
     $byJob += [pscustomobject]@{
         job = $g.Name
         calls = $g.Count
@@ -60,24 +86,28 @@ foreach ($g in ($rows | Group-Object -Property component)) {
         max_ms = $mx
         failed = $bad
         drift = $drift
+        unparsed = $unparsed
+        bad_duration = $badDur
         model = ($models -join ',')
     }
 }
 $byJob = @($byJob | Sort-Object -Property tokens -Descending)
 
 # --- the plan window: the only figure that converts calls into headroom ----------------------
-$window = [pscustomobject]@{ used_percent = $null; resets_in_days = $null; note = '' }
+$window = [pscustomobject]@{ used_percent = $null; resets_in_days = $null; note = 'window not read' }
 try {
     $auth = Get-Content -LiteralPath (Join-Path $env:USERPROFILE '.codex\auth.json') -Raw -ErrorAction Stop | ConvertFrom-Json
     $tokv = $auth.tokens.access_token
     if ([string]::IsNullOrWhiteSpace($tokv)) { throw 'no access_token' }
     $resp = Invoke-RestMethod -Uri 'https://chatgpt.com/backend-api/wham/usage' -Headers @{ Authorization = "Bearer $tokv" } -TimeoutSec 20
-    $pw = $resp.rate_limit.primary_window
-    $window.used_percent = [int]$pw.used_percent
-    $window.resets_in_days = [Math]::Round(([double]$pw.reset_after_seconds) / 86400.0, 1)
+    # The shape check lives in Get-CodexPlanWindow so it is directly testable: a renamed field
+    # on this UNOFFICIAL endpoint lets the call SUCCEED, and an unvalidated [int]$null would
+    # render a confident "0% used" from a response that carried nothing.
+    $window = Get-CodexPlanWindow -Response $resp
 } catch {
-    # UNOFFICIAL endpoint: say it is unknown rather than invent a number.
-    $window.note = "window unavailable ($($_.Exception.Message))"
+    # UNREACHABLE endpoint / unreadable token: say it is unknown rather than invent a number.
+    $window = [pscustomobject]@{ used_percent = $null; resets_in_days = $null
+                                 note = "window unavailable ($($_.Exception.Message))" }
 }
 
 # [int] on purpose: Measure-Object -Sum over an EMPTY set returns $null, not 0, so a box with
@@ -93,15 +123,21 @@ if ($Json) {
 
 Write-Host ''
 Write-Host "Codex judge usage - last $Days day(s)" -ForegroundColor Cyan
-Write-Host ('{0,-20} {1,6} {2,8} {3,10} {4,8} {5,8} {6,6} {7,5}  {8}' -f 'job', 'calls', '/day', 'tokens', 'p50 ms', 'max ms', 'fail', 'drift', 'model')
-Write-Host ('-' * 108)
+Write-Host ('{0,-20} {1,6} {2,8} {3,10} {4,8} {5,8} {6,6} {7,5} {8,8}  {9}' -f 'job', 'calls', '/day', 'tokens', 'p50 ms', 'max ms', 'fail', 'drift', 'unparsed', 'model')
+Write-Host ('-' * 118)
 foreach ($r in $byJob) {
-    Write-Host ('{0,-20} {1,6} {2,8} {3,10} {4,8} {5,8} {6,6} {7,5}  {8}' -f `
-        $r.job, $r.calls, $r.per_day, $r.tokens, $r.p50_ms, $r.max_ms, $r.failed, $r.drift, $r.model)
+    Write-Host ('{0,-20} {1,6} {2,8} {3,10} {4,8} {5,8} {6,6} {7,5} {8,8}  {9}' -f `
+        $r.job, $r.calls, $r.per_day, $r.tokens, $r.p50_ms, $r.max_ms, $r.failed, $r.drift, $r.unparsed, $r.model)
 }
-Write-Host ('-' * 108)
+Write-Host ('-' * 118)
 Write-Host ('{0,-20} {1,6} {2,8} {3,10}' -f 'TOTAL', $totalCalls, [Math]::Round($totalCalls / [Math]::Max(1, $Days), 1), $totalTokens)
-Write-Host ''
+# Never let a dropped sample pass as a complete one: p50/max over a smaller population than
+# `calls` is exactly the kind of quiet skew this report exists to expose in other jobs.
+$badTotal = [int](($byJob | Measure-Object -Property bad_duration -Sum).Sum)
+if ($badTotal -gt 0) {
+    Write-Host ("NOTE: {0} row(s) carry a duration_ms that is present but not a number. They are excluded from p50/max, so those latencies describe fewer calls than the calls column." -f $badTotal) -ForegroundColor Yellow
+    Write-Host ''
+}
 if ($null -ne $window.used_percent) {
     Write-Host ("7-day plan window: {0}% used, resets in {1} day(s)" -f $window.used_percent, $window.resets_in_days)
 } else {

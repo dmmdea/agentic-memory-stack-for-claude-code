@@ -103,10 +103,29 @@ that would expose the harness is caught:
 
 - **R-offload** (INVARIANTS I13): parses the deployed `~/.claude/settings.json` hooks and
   asserts (a) `UserPromptSubmit` binds only to the human-prompt client with no `mcp__`
-  matcher/command, and (b) no `PreToolUse` matcher names `mcp__`. Fail-**open** WARN if the
-  config/helper is absent; **FAIL** only on a real violation (an `mcp__` matcher or command
-  on either path). Logic lives in `Test-OffloadNoBlockInvariant` (`user-prompt-lib.ps1`),
-  Pester-covered.
+  matcher/command, and (b) no `PreToolUse` hook that fires for an offload call can route the
+  memory block to it.
+
+  (b) is evaluated the way Claude Code evaluates it: each matcher is run as a **regex** against
+  a real offload tool name, not substring-searched for `mcp__local-offload` — `mcp__.*`, `mcp__`
+  and `.*` all fire at runtime while containing no such substring, so a substring test would
+  miss precisely the holes that matter. A firing matcher is an **exposure** only when the
+  command behind it is a memory-context **producer** (the stack's own hook client, daemon or
+  extractor, listed authoritatively in `$script:AmMemoryContextProducers`); a third-party guard
+  that fires on an offload call and merely denies or logs cannot route a block it never had.
+  The check reads the hook's `command` **and** its `args` — a hook is routinely
+  `{command: "node.exe", args: ["…guard.js"]}`, where reading `command` alone sees only
+  "node.exe" — and follows **one hop** into the script the hook names, because a wrapper hides
+  the producer from the literal text.
+
+  Past that one hop it says so rather than implying proof: a firing foreign hook is a WARN whose
+  wording is explicitly *inferred*, and anything that could not be evaluated — an unparseable
+  matcher, an unreadable file — is reported as `NOT VERIFIED` instead of passing quietly.
+  Fail-**open** WARN if the config/helper is absent; **FAIL** only on a real violation. Held as
+  a hard FAIL, the older and broader "any matcher that fires" rule reported the stack UNHEALTHY
+  for days over an unrelated deny-only delegate guard — which is how a standing red light stops
+  being read at all. Logic lives in `Test-OffloadNoBlockInvariant` (`user-prompt-lib.ps1`),
+  Pester-covered including the wrapper-indirection case.
 - **R-budget** (INVARIANTS I14): renders a worst-case (cap-filling) block per tier and
   asserts each is within a char-proxy ceiling derived from that tier's caps (small is
   tighter by caps). Optional precise leg: with `$env:ANTHROPIC_API_KEY` set it calls the

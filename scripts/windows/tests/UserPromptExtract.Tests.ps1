@@ -1398,3 +1398,43 @@ Describe 'R-offload invariant: exposure is the COMMAND, not merely a firing matc
         (Test-OffloadNoBlockInvariant -Hooks $cfg).Status | Should -Be 'FAIL'
     }
 }
+
+Describe 'R-offload invariant: indirection and honesty (2026-09-07 silent-failure review)' {
+    BeforeAll {
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'user-prompt-lib.ps1')
+        function script:Hooks2([string]$json) { return ($json | ConvertFrom-Json) }
+        $script:ups2 = '"UserPromptSubmit":[{"hooks":[{"command":"C:/x/mem0-hook-client.exe"}]}]'
+    }
+
+    It 'FAILs when the firing hook runs a WRAPPER whose own body invokes a producer' {
+        # Classification by literal command/args text alone cannot see through a wrapper, a shim
+        # or a dispatcher - and a wrapper that reaches a producer IS the exposure this invariant
+        # is named for. One hop is resolved by reading the script the hook actually names.
+        $wrap = Join-Path $TestDrive 'wrap-guard.js'
+        Set-Content -LiteralPath $wrap -Value 'execFileSync("pwsh", ["C:/h/user-prompt-extract.ps1"]);' -Encoding UTF8
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__local-offload__.*","hooks":[{"command":"node.exe","args":["' + ($wrap -replace '\\', '/') + '"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'FAIL'
+        $r.Ok | Should -BeFalse
+        $r.Detail | Should -Match 'wrap-guard\.js'
+    }
+
+    It 'still WARNs for a wrapper that reaches no producer, and hedges the claim it makes' {
+        $wrap = Join-Path $TestDrive 'clean-guard.js'
+        Set-Content -LiteralPath $wrap -Value 'process.exit(0); // denies delegation, touches no memory' -Encoding UTF8
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__local-offload__.*","hooks":[{"command":"node.exe","args":["' + ($wrap -replace '\\', '/') + '"]}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'WARN'
+        $r.Ok | Should -BeTrue
+        $r.Detail | Should -Match 'INFERRED' -Because 'absence of four substrings plus one hop is not proof the block cannot reach it'
+    }
+
+    It 'reports a matcher it could not evaluate instead of silently treating it as harmless' {
+        # PowerShell calls an unparseable matcher "cannot fire". That is an assumption about
+        # Claude Code's own regex engine, not a verified fact.
+        $cfg = script:Hooks2 ('{' + $script:ups2 + ',"PreToolUse":[{"matcher":"mcp__[local","hooks":[{"command":"node.exe"}]}]}')
+        $r = Test-OffloadNoBlockInvariant -Hooks $cfg
+        $r.Status | Should -Be 'WARN'
+        $r.Detail | Should -Match 'NOT VERIFIED'
+    }
+}

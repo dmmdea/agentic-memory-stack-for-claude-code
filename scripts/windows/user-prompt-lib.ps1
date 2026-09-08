@@ -1437,6 +1437,41 @@ function Invoke-DaemonRawTransaction {
 #     against a worst-case (cap-filling) fixture and char-proxy budget it.
 # ===========================================================================
 
+# The AUTHORITATIVE list of memory-context PRODUCERS: the commands that can put a
+# [MEMORY CONTEXT] block into a hook response. Test-OffloadNoBlockInvariant classifies a firing
+# PreToolUse hook against this list, so a NEW producer must be added HERE or the invariant will
+# not see it. `pre-tool-check` is retained deliberately although it never emitted the block (it
+# was a warn-only canonical-contradiction check, retired 2026-08-09): this list gates a security
+# FAIL, where a surplus name fails closed and a missing one fails open.
+$script:AmMemoryContextProducers = 'mem0-hook-client|mem0-hook-daemon|user-prompt-extract|pre-tool-check'
+
+function Resolve-HookProducerIndirect {
+    # ONE hop of indirection, and no more. A hook is routinely a wrapper - `node.exe guard.js`,
+    # `pwsh.exe wrapper.ps1` - whose own body invokes a producer. Literal command/args text
+    # cannot see that, so read the script the hook names and look inside it. Bounded on purpose:
+    # existing local files only, script extensions only, size-capped, and every failure to read a
+    # candidate is REPORTED rather than swallowed, because "I could not check" and "I checked and
+    # it was clean" must not look the same. Returns @{ Found; File; Unresolved }.
+    param([string]$CommandText, [string]$ProducerPattern)
+    $found = ''
+    $unresolved = @()
+    if (-not [string]::IsNullOrWhiteSpace($CommandText)) {
+        foreach ($tok in ($CommandText -split '\s+')) {
+            $t = $tok.Trim().Trim('"').Trim("'")
+            if ([string]::IsNullOrWhiteSpace($t)) { continue }
+            if ($t -notmatch '\.(ps1|psm1|js|cjs|mjs|cmd|bat|sh|py)$') { continue }
+            try {
+                if (-not (Test-Path -LiteralPath $t -PathType Leaf)) { continue }
+                $fi = Get-Item -LiteralPath $t -ErrorAction Stop
+                if ($fi.Length -gt 512KB) { $unresolved += $t; continue }
+                $body = Get-Content -LiteralPath $t -Raw -ErrorAction Stop
+                if ($body -match $ProducerPattern) { $found = $t; break }
+            } catch { $unresolved += $t }
+        }
+    }
+    return [pscustomobject]@{ Found = [bool]$found; File = $found; Unresolved = @($unresolved) }
+}
+
 function Test-OffloadNoBlockInvariant {
     <#
     .SYNOPSIS
@@ -1580,19 +1615,44 @@ function Test-OffloadNoBlockInvariant {
         # exposure). A firing matcher with an unrelated command is a WARN - visible and named,
         # never silent, but not a security regression.
         $offloadProbe = 'mcp__local-offload__offload_summarize'
-        $producerPattern = 'mem0-hook-client|mem0-hook-daemon|user-prompt-extract|pre-tool-check'
+        $producerPattern = $script:AmMemoryContextProducers
         $foreignFiring = @()
+        $unreadable = @()
         foreach ($pe in $preEntries) {
             $firesOnOffload = $false
-            try { $firesOnOffload = ($offloadProbe -match $pe.Matcher) } catch { $firesOnOffload = $false }  # invalid regex = cannot fire
+            $matcherReadable = $true
+            try { $firesOnOffload = ($offloadProbe -match $pe.Matcher) } catch { $firesOnOffload = $false; $matcherReadable = $false }
+            if (-not $matcherReadable) {
+                # PowerShell's -match calls an unparseable matcher "cannot fire". That is an
+                # ASSUMPTION about Claude Code's own regex engine, not a verified fact, so name it
+                # instead of dropping the entry on the floor (review 2026-09-07).
+                $unreadable += ("matcher '" + $pe.Matcher + "' is not parseable as a regex here, so it was NOT evaluated")
+                continue
+            }
             if (-not $firesOnOffload) { continue }
             if ($pe.CommandText -match $producerPattern) {
                 return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher fires for the offload harness ('$($pe.Matcher)') AND runs a memory-context producer ('$($pe.CommandText)') - the harness could receive the [MEMORY CONTEXT] block" }
             }
+            # A wrapper hides the producer from the literal text, so follow one hop into the
+            # script the hook actually names.
+            $ind = Resolve-HookProducerIndirect -CommandText $pe.CommandText -ProducerPattern $producerPattern
+            if ($ind.Found) {
+                return [pscustomobject]@{ Ok = $false; Status = 'FAIL'; Detail = "PreToolUse matcher fires for the offload harness ('$($pe.Matcher)') AND the script it runs ('$($ind.File)') invokes a memory-context producer - the harness could receive the [MEMORY CONTEXT] block" }
+            }
+            if ($ind.Unresolved.Count -gt 0) { $unreadable += ("could not read " + ($ind.Unresolved -join ', ') + " behind matcher '" + $pe.Matcher + "'") }
             $foreignFiring += ("'" + $pe.Matcher + "' -> " + $pe.CommandText)
         }
-        if ($foreignFiring.Count -gt 0) {
-            return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = "a foreign PreToolUse hook fires for the offload harness but runs no memory-context producer, so the block cannot reach it: $($foreignFiring -join '; '). Not an exposure; listed so it is never silent." }
+        if ($foreignFiring.Count -gt 0 -or $unreadable.Count -gt 0) {
+            $parts = @()
+            if ($foreignFiring.Count -gt 0) {
+                # Deliberately hedged wording (review 2026-09-07): what was actually checked is
+                # the literal command/args text plus ONE hop into the script it names. Deeper
+                # indirection - a dispatcher, a renamed copy - is NOT resolved, so this says
+                # "none found", never the stronger "the block cannot reach it".
+                $parts += ("a foreign PreToolUse hook fires for the offload harness; no memory-context producer was found in its command, its args, or one hop into the script it names, so it is not treated as an exposure - INFERRED from that text, not proven, and deeper indirection is not resolved: " + ($foreignFiring -join '; '))
+            }
+            if ($unreadable.Count -gt 0) { $parts += ('NOT VERIFIED: ' + ($unreadable -join '; ')) }
+            return [pscustomobject]@{ Ok = $true; Status = 'WARN'; Detail = ($parts -join ' | ') }
         }
         # Find the stack's own pre-tool-check matcher and confirm it is exactly the
         # editing/exec gate (Bash|Edit|MultiEdit|Write), so a future widening to

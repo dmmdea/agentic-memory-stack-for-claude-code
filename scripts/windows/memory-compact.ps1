@@ -555,9 +555,18 @@ foreach ($cand in $candidates) {
         # Pinned to the CLASSIFY model: KEEP/SHORTEN/MIGRATE routing over <=30 slugs is bounded
         # classification, Astra's second-weakest measured lane, and this runs nightly per store.
         $judgeT0 = Get-Date
-        $judgeLastMsg = New-CodexLastMessagePath
-        try { $raw = Invoke-CodexSubagent -Prompt $sb.ToString() -ReasoningEffort 'medium' -TimeoutSeconds $CodexTimeoutSeconds -Model $script:AmCodexModelClassify -LastMessagePath $judgeLastMsg }
+        $judgeLastMsg = ''
+        $judgeThrew = $false
+        try {
+            # INSIDE the try (review 2026-09-07): New-CodexLastMessagePath creates a directory,
+            # and a throw from out here would bypass this catch entirely, escaping to the
+            # per-store handler that marks the whole store 'error-store' - skipping exactly the
+            # deterministic hygiene this catch exists to preserve.
+            $judgeLastMsg = New-CodexLastMessagePath
+            $raw = Invoke-CodexSubagent -Prompt $sb.ToString() -ReasoningEffort 'medium' -TimeoutSeconds $CodexTimeoutSeconds -Model $script:AmCodexModelClassify -LastMessagePath $judgeLastMsg
+        }
         catch {
+            $judgeThrew = $true
             # NO LOCAL FALLBACK: judgment work waits for the judge. Deterministic hygiene from
             # this pass is still applied below, and the throttle is not marked.
             Write-MemoryLog -Component $Component -Message ($ws + ': judge unavailable (' + $_.Exception.Message + '); deterministic hygiene only')
@@ -568,7 +577,24 @@ foreach ($cand in $candidates) {
                 -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
                 -Outcome $(if ($_.Exception.Message -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
         }
-        if ($raw) {
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            # A SUCCESSFUL call that returned nothing. '' is falsy in PowerShell, so the old
+            # `if ($raw)` skipped the ledger write outright and this outcome was invisible to the
+            # usage report's `failed` column - the same hole the catch above was just fixed for.
+            # $judgeThrew separates it from the throw path, which has written its own row already.
+            if (-not $judgeThrew) {
+                $emptyHdr = Parse-CodexHeader -RawOutput $raw
+                Write-MemoryLog -Component $Component -Message ($ws + ': judge returned empty; deterministic hygiene only')
+                $result.note = 'judge returned empty; deterministic hygiene only'
+                Write-CodexUsageLog -Component 'compact' -Status 'error' -DurationMs ([int]((Get-Date) - $judgeT0).TotalMilliseconds) `
+                    -ModelRequested $script:AmCodexModelClassify -EffortRequested 'medium' `
+                    -ModelResolved $emptyHdr.Model -EffortResolved $emptyHdr.Effort -Outcome 'empty'
+            }
+            # every exit path clears its own -o file; a killed process cannot, which is why
+            # New-CodexLastMessagePath also sweeps stale ones.
+            Remove-CodexLastMessagePath -Path $judgeLastMsg
+        }
+        else {
             $judgeHdr = Parse-CodexHeader -RawOutput $raw
             $text = Get-CodexResponseText -RawOutput $raw -LastMessagePath $judgeLastMsg
             # The helper matches an OBJECT carrying an expected key; a bare top-level array

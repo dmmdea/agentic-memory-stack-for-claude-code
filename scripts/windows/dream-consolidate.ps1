@@ -678,6 +678,7 @@ $($canonicalFacts | Select-Object -First 30 | ForEach-Object { "- $_" } | Out-St
 "@
 
 $promoteRaw      = $null
+$promoteLastMsg  = ''
 $promoteStart    = Get-Date
 $codexWasCalled  = $false
 
@@ -693,6 +694,7 @@ if ($promoteEvidence.Count -eq 0) {
         Write-CodexUsageLog -Component 'dream-promote' -Status 'error' -DurationMs ([int]((Get-Date) - $promoteStart).TotalMilliseconds) `
             -ModelRequested $script:AmCodexModelSynthesis -EffortRequested $script:AmCodexEffortSynthesis `
             -Outcome $(if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' })
+        Remove-CodexLastMessagePath -Path $promoteLastMsg   # every exit path clears its own -o file
         $promoteRaw = $null
     }
 }
@@ -714,6 +716,7 @@ if ($codexWasCalled) {
         if ($null -eq $promoteCodexJson) { $promoteCodexFailed = $true }
     } else {
         $promoteCodexFailed = $true
+        Remove-CodexLastMessagePath -Path $promoteLastMsg
     }
     Write-CodexUsageLog -Component 'dream-promote' -DurationMs $promoteDurationMs `
         -TokensUsed ([int](Parse-CodexTokenUsage -RawOutput $promoteRaw)) `

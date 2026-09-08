@@ -150,6 +150,7 @@ $turns
     Write-MemoryLog -Component 'l1a' -Message '  calling codex subagent for extraction'
     $raw = $null
     $codexStart = Get-Date
+    $lastMsgPath = ''
     try {
         # 2026-09-07: pinned to the CLASSIFY model. This is the highest-volume job in the stack
         # (92% of all logged Codex tokens); structured extraction is Astra's weakest measured
@@ -163,6 +164,7 @@ $turns
         $failOutcome = if ("$_" -like '*timed out*') { 'timeout' } else { 'exit_nonzero' }
         Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs ([int]((Get-Date) - $codexStart).TotalMilliseconds) `
             -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor -Outcome $failOutcome
+        Remove-CodexLastMessagePath -Path $lastMsgPath   # every exit path clears its own -o file
         Release-CodexLock
         exit 0
     }
@@ -176,6 +178,7 @@ $turns
         Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs $codexDurationMs -TokensUsed $codexTokens `
             -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor `
             -ModelResolved $codexHdr.Model -EffortResolved $codexHdr.Effort -Outcome 'empty'
+        Remove-CodexLastMessagePath -Path $lastMsgPath
         exit 0
     }
 

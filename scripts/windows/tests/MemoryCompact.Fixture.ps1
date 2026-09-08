@@ -10,6 +10,7 @@
         param(
             [string]$CodexPlanJson = '{"plan":[]}',
             [switch]$CodexThrows,
+            [switch]$CodexEmpty,              # exit 0 with EMPTY stdout (not a throw)
             [string]$Mem0Mode = 'ok',        # ok | noid | mismatch | fail
             [string]$MutateIndexDuringCodex,  # text appended to the index while "Codex thinks" (CAS)
             [switch]$LockHeld                 # another worker holds the codex mutex for the whole run
@@ -39,6 +40,9 @@ function Invoke-CodexSubagent {
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-model.txt') -Value ([string]$Model)
     Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude\state\last-codex-prompt.txt') -Value $Prompt
     if ($env:STUB_CODEX_THROWS -eq '1') { throw 'codex.cmd not found (stub)' }
+    # A SUCCESSFUL call that returned nothing - exit 0, empty stdout. Production must still write
+    # a ledger row for this, or the outcome is invisible to the usage report's `failed` column.
+    if ($env:STUB_CODEX_EMPTY -eq '1') { return '' }
     if ($env:STUB_MUTATE_INDEX) {
         Add-Content -LiteralPath $env:STUB_MUTATE_TARGET -Value $env:STUB_MUTATE_INDEX
     }
@@ -114,7 +118,7 @@ function Invoke-RestMethod {
         return [pscustomobject]@{
             Root = $root; Home = $home_; Bin = $bin
             Projects = (Join-Path $home_ '.claude\projects')
-            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex; LockHeld = [bool]$LockHeld
+            Plan = $CodexPlanJson; Throws = [bool]$CodexThrows; Empty = [bool]$CodexEmpty; Mem0 = $Mem0Mode; Mutate = $MutateIndexDuringCodex; LockHeld = [bool]$LockHeld
         }
     }
 
@@ -139,6 +143,7 @@ function Invoke-RestMethod {
             '$env:USERPROFILE=' + "'" + $Sandbox.Home + "'"
             '$env:STUB_CODEX_PLAN=' + "'" + ($Sandbox.Plan -replace "'", "''") + "'"
             '$env:STUB_CODEX_THROWS=' + "'" + $(if ($Sandbox.Throws) { '1' } else { '0' }) + "'"
+            '$env:STUB_CODEX_EMPTY=' + "'" + $(if ($Sandbox.Empty) { '1' } else { '0' }) + "'"
             '$env:STUB_MEM0_MODE=' + "'" + $Sandbox.Mem0 + "'"
             '$env:STUB_LOCK_HELD=' + "'" + $(if ($Sandbox.LockHeld) { '1' } else { '0' }) + "'"
         )

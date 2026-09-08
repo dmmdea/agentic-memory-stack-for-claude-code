@@ -162,7 +162,19 @@ codex-usage-report.ps1            # last 7 days, per job
 codex-usage-report.ps1 -Json      # machine-readable
 ```
 
-Per job it reports calls, calls/day, tokens, p50 and max latency, **failed** calls and **drift** (rows where the model requested is not the model Codex resolved — the detectable form of silent model change), plus the plan's 7-day window. Read-only, and every optional input degrades to a stated "unknown" rather than an error.
+Per job it reports calls, calls/day, tokens, p50 and max latency, **failed** calls, **drift**
+(rows where the model requested is not the model Codex resolved — the detectable form of silent
+model change) and **unparsed** (rows where the header could not be read at all), plus the plan's
+7-day window. Drift deliberately excludes unparsed rows, since an unknown is not a mismatch —
+which is exactly why unparsed gets its own column: if Codex's header format ever changes, every
+row goes unparsed and drift would otherwise report a clean `0` from a report that knew nothing.
+
+Read-only, and every optional input degrades to a stated "unknown" rather than an error — a
+reporting tool that dies on a missing optional input teaches you nothing. That includes the plan
+window itself: the `/wham/usage` endpoint is UNOFFICIAL, so its shape is validated in
+`Get-CodexPlanWindow` before any cast. A renamed field would let the call succeed while
+`[int]$null` quietly produced a confident "0% used" — maximum headroom — from a response that
+carried nothing.
 
 This exists because the **NLI write-gate is pinned but deliberately OFF**: it would fire an uncached judge on every mem0 write, and no one could say what that costs. Re-run this after a week of telemetry and compare the projected write rate against the extractor row before enabling it.
 

@@ -459,3 +459,20 @@ Describe 'line floor, catch-up and synthesized hooks (2026-09-06)' {
         $idx | Should -Not -Match '\(x\.md\)' -Because 'a link inside the prose must not become a second slug on the line'
     }
 }
+
+Describe 'usage ledger completeness (2026-09-07 silent-failure review)' {
+    It 'writes an outcome=empty row when the judge SUCCEEDS but returns nothing' {
+        # '' is falsy in PowerShell, so `if ($raw)` skipped the ledger write entirely and this
+        # outcome was invisible to codex-usage-report's `failed` column. A failure the ledger
+        # cannot count is a failure nobody fixes.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexEmpty
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $null = Invoke-Compactor -Sandbox $sb
+        $rowsFile = Join-Path $sb.Home '.claude\state\usage-rows.jsonl'
+        Test-Path -LiteralPath $rowsFile | Should -BeTrue -Because 'the empty-success path wrote no row at all before this fix'
+        $rows = @(Get-Content -LiteralPath $rowsFile | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+        @($rows | Where-Object { $_.component -eq 'compact' -and $_.outcome -eq 'empty' }).Count |
+            Should -BeGreaterThan 0 -Because 'a successful call that returned nothing is an outcome, not a non-event'
+    }
+}
