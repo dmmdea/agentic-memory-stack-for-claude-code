@@ -393,11 +393,32 @@ cp "$REPO_ROOT/scripts/wsl/l10-audit.py" "$MEM0_DIR/l10-audit.py" 2>/dev/null ||
 
 # Reload + enable
 systemctl --user daemon-reload
-systemctl --user enable --now qdrant.service
-systemctl --user enable --now mem0.service
-systemctl --user enable --now l10-audit.timer
-systemctl --user enable --now decay-scan.timer
-systemctl --user enable --now stack-backup.timer
+
+# ONE-BRAIN RULE (2026-09-07). Consolidation, dedup, decay, the contradiction sweep, goal
+# promotion, the L10 audit and the backup pipeline are CANONICAL-MUTATION operations: they
+# belong to the single write authority. install/2-windows-config.ps1 has enforced this since
+# v1.16 for the Windows-side scheduled tasks — it skips registration on a replica AND removes
+# any previously-registered task. This installer enabled every unit unconditionally, so running
+# it on a replica silently stood up a SECOND write authority: a local mem0+qdrant plus timers
+# that mutate canonical state, against a store this box does not own. MEM0_ROLE is already
+# resolved above (stack.env -> ~/.mem0/role -> brain), so gate on it and mirror the Windows
+# behaviour exactly: install the units either way — promoting a replica to brain stays a
+# one-liner — but on a replica never enable them, and turn off any that a previous ungated run
+# already switched on.
+enable_brain_unit() {
+    if [ "$MEM0_ROLE" = "replica" ]; then
+        echo "  one-brain rule: NOT enabled on a replica: $*"
+        systemctl --user disable --now "$@" >/dev/null 2>&1 || true
+        return 0
+    fi
+    systemctl --user enable --now "$@"
+}
+
+enable_brain_unit qdrant.service
+enable_brain_unit mem0.service
+enable_brain_unit l10-audit.timer
+enable_brain_unit decay-scan.timer
+enable_brain_unit stack-backup.timer
 
 # v0.22 Phase G: auto-enable the weekly hygiene sweep timers (previously a
 # manual step). enable --now is idempotent (safe to re-run). Fail-soft: if
@@ -406,7 +427,7 @@ systemctl --user enable --now stack-backup.timer
 # defaults: goals-stale-sweep stays REPORT-ONLY (its ExecStart passes no
 # --auto-abandon, so no destructive goal-status flips on the unattended
 # schedule); contradiction-sweep runs its normal judge-stamp mode.
-systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer \
+enable_brain_unit goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer \
     || echo "  WARN: could not enable sweep timers (systemd-user unavailable?) — enable manually: systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer"
 
 sleep 3

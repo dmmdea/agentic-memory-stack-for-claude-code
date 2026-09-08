@@ -21,6 +21,18 @@ box**: read-only, and it can *never* absorb a write. Two independent mechanisms 
   in the install receipt. A `brain` install registers the two nightly canonical-mutation scheduled
   tasks (the dream consolidator and the semantic dedup); a `replica` install registers *neither* and
   removes any it finds. Verify asserts the tasks are present on a brain and absent on a replica.
+
+  **Both installers gate, not just the Windows one (2026-09-07).** The rule above describes the
+  Windows scheduled tasks. `install/1-wsl-services.sh` enabled its units unconditionally, so
+  running it on a replica stood up a SECOND write authority: a local `mem0` + `qdrant` plus the
+  `l10-audit`, `decay-scan` (whose `ExecStartPost` runs semantic-dedup), `stack-backup`,
+  `goals-stale-sweep`, `contradiction-sweep`, `retrieval-pairs`, `episodic-reconcile` and
+  `goal-recurrence-promote` timers — canonical-mutation jobs against a store that box does not
+  own. The health check already expected the opposite ("brain-only machinery reports by design"
+  on a replica), so the installer and the verifier disagreed. It now routes every brain unit
+  through a role-gated helper that installs the unit either way — promoting a replica to brain
+  stays a one-liner — but on a replica never enables it and disables anything an earlier
+  ungated run switched on, mirroring the Windows installer's skip-and-remove exactly.
 - **Offline write path.** When the authority is unreachable, mutations queue to an on-disk Outbox
   and replay to the authority on reconnect; they are never redirected to the local replica, which is
   restored read-only and torn down on reconnect.
