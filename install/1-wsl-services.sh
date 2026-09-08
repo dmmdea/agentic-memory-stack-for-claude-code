@@ -112,6 +112,13 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     for mod in $MEM0_MODULES; do
         cp "$REPO_ROOT/mem0-server/$mod" "$MEM0_DIR/$mod"
     done
+    # Stamp the release beside app.py. _resolve_stack_version() reads ./VERSION at import,
+    # so without this a deployed runtime reports stack "unknown" (MEM-17) and cannot say which
+    # release it is actually running. That is not cosmetic: on 2026-09-07 a STALE copy of this
+    # file made a Brain report 1.20.16 after a 1.20.17 deploy, and the wrong-version signal was
+    # the only reason the missed step was found at all. deploy.sh already stamps it; every path
+    # that deploys the modules must, or the runtimes it installs are born unable to answer.
+    cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
     cd "$MEM0_DIR"
     python3 -m venv .venv
     ./.venv/bin/pip install --quiet --upgrade pip
@@ -136,6 +143,9 @@ else
     for mod in $MEM0_MODULES; do
         cp "$REPO_ROOT/mem0-server/$mod" "$MEM0_DIR/$mod"
     done
+    # A REFRESH must restamp too: an upgrade that leaves the old VERSION in place is exactly
+    # how a runtime ends up reporting a release it is no longer running.
+    cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
     # v0.29.1: enforce the security floors on existing installs too (idempotent —
     # a no-op when already satisfied). Without this, a re-run only refreshes code
     # and an existing venv stays on a CVE-vulnerable starlette/cryptography.

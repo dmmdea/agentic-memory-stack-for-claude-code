@@ -211,3 +211,27 @@ def test_units_and_scripts_ship_together():
     sh = INSTALLER.read_text(encoding="utf-8")
     assert "systemctl --user disable mem0.service qdrant.service" in sh, "the local store must be dormant while online"
     assert "systemctl --user enable --now offline-watcher.timer" in sh
+
+
+def test_every_installer_that_deploys_app_py_also_stamps_VERSION():
+    """A deployed runtime must be able to say which release it is.
+
+    app.py's _resolve_stack_version() reads ./VERSION beside app.py and falls back to the
+    string "unknown". An installer that copies the modules but not the stamp therefore
+    produces a runtime whose /health cannot answer "is the fix live?" — which is the whole
+    question a deploy exists to settle. 2026-09-07: the Linux replica shipped exactly that
+    way (both candidate paths absent -> "unknown"), and separately a stale stamp on the Brain
+    masked a missed deploy step until /health disagreed with the repo.
+    """
+    for installer in (INSTALLER, WSL_INSTALLER):
+        sh = installer.read_text(encoding="utf-8")
+        # every place that copies app.py into a runtime dir...
+        copies_modules = sh.count("$REPO_ROOT/mem0-server/$mod")
+        # ...must be matched by a VERSION stamp into that same dir.
+        stamps = sh.count('cp "$REPO_ROOT/VERSION"')
+        assert copies_modules > 0, f"{installer.name}: expected to deploy the server modules"
+        assert stamps >= copies_modules, (
+            f"{installer.name}: {copies_modules} module-deploy site(s) but only {stamps} "
+            f"VERSION stamp(s) — a runtime deployed by the unstamped path reports "
+            f'stack "unknown" and cannot say which release it runs'
+        )

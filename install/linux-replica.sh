@@ -191,6 +191,13 @@ say "[5] mem0 server at $MEM0_APP"
 if plan "venv with $SERVER_PY; pip install $PIP_SPECS; deploy $(echo "$MEM0_MODULES" | wc -w) modules + dpapi-fetch-key.sh; warm the BM25 cache"; then :; else
     mkdir -p "$MEM0_APP"
     for mod in $MEM0_MODULES; do cp "$REPO_ROOT/mem0-server/$mod" "$MEM0_APP/$mod"; done
+    # Stamp the release beside app.py. _resolve_stack_version() reads ./VERSION at import,
+    # so without this a deployed runtime reports stack "unknown" (MEM-17) and cannot say which
+    # release it is actually running. That is not cosmetic: on 2026-09-07 a STALE copy of this
+    # file made a Brain report 1.20.16 after a 1.20.17 deploy, and the wrong-version signal was
+    # the only reason the missed step was found at all. deploy.sh already stamps it; every path
+    # that deploys the modules must, or the runtimes it installs are born unable to answer.
+    cp "$REPO_ROOT/VERSION" "$MEM0_APP/VERSION"
     tr -d "\r" < "$REPO_ROOT/scripts/wsl/dpapi-fetch-key.sh" > "$MEM0_APP/dpapi-fetch-key.sh"; chmod +x "$MEM0_APP/dpapi-fetch-key.sh"
     [ -x "$MEM0_APP/.venv/bin/python" ] || "$SERVER_PY" -m venv "$MEM0_APP/.venv"
     "$MEM0_APP/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip

@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.18 (2026-09-07) — a deployed runtime must be able to say which release it is
+
+- **Every installer that deploys the server modules now stamps `VERSION` beside `app.py`.**
+  `_resolve_stack_version()` reads that file at import and falls back to the string
+  `"unknown"`, so an installer that copied the modules without the stamp produced a runtime
+  whose `/health` could not answer the one question a deploy exists to settle. The Linux
+  replica shipped exactly that way — both candidate paths absent, `stack: "unknown"` — and the
+  WSL installer's fresh-install AND refresh paths had the same gap (only `deploy.sh`, the
+  Brain's normal path, stamped it).
+  This is not cosmetic. During the v1.20.17 deploy a STALE stamp was the only signal that a
+  step had been missed: the server reported 1.20.16 while the repo said 1.20.17, which is what
+  led to finding that the installer had never copied the file at all. A runtime that reports
+  "unknown" cannot even lie usefully — it just removes the check.
+- A guard test asserts the invariant per installer: every module-deploy site must be matched by
+  a `VERSION` stamp, so a future deploy path cannot reintroduce an unstamped runtime.
+
 ## v1.20.17 (2026-09-07) — provenance in the store, and a cost meter for the decision
 
 Close-out of the model-routing work.
