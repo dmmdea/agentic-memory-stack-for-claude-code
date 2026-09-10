@@ -35,6 +35,13 @@ it), and **compaction** (the nightly maintainer).
   reported and left alone; splitting one is a semantic judgment left to a human.
 - Anything the agent writes during a session. Maintenance never runs against a live workspace.
 
+> **v2 direction (decided 2026-09-10, ADR [`fleet-store-sync-and-linux-authority.md`](../architecture/decisions/fleet-store-sync-and-linux-authority.md)).**
+> The stores gain a cross-machine replica through a git hub on the always-on authority, the Index
+> becomes a function of the fact files after a one-time harvest of every authored hook into
+> frontmatter, deterministic maintenance moves to session boundaries on every machine, and the
+> judge runs once per night on the hub's checkout. The sections below describe the shipped v1
+> behaviour until those phases land; the ADR records what changes and why.
+
 ## Key concepts
 
 **Index** — `MEMORY.md`: one pointer line per memory, written as a Markdown list item whose
@@ -51,9 +58,11 @@ moment, so it must keep the distinguishing detail, not merely name the topic.
 **Doctrine Entry** — a memory carrying `metadata.type: feedback` (nested, never top-level) or
 imperative standing-order phrasing. Untouchable by every job here.
 
-**The two budgets** — a store breaches at 25,000 bytes per file (the store stops syncing, which
-is loud) or at 200 Index lines (entries past the cap are not injected, which is silent). They
-nearly coincide for a dense index, so both are enforced.
+**The two budgets** — the harness loads the first 25,000 bytes or the first 200 Index lines,
+whichever comes first, and drops the rest at the next session start; a write over the limit
+still succeeds and only returns a warning to the agent that wrote it. (Earlier revisions of this
+doc said the store "stops syncing": the harness's auto-memory is machine-local and never syncs;
+the breach is a silent load truncation.) Both budgets are enforced.
 
 **Trigger and target** — compaction fires at 20,000 bytes *or* 160 lines and aims below 17,000
 bytes *and* 140 lines. The gap is hysteresis: a just-compacted store is not re-processed the

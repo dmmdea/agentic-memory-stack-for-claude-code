@@ -21,6 +21,7 @@ and keep existing ADRs aligned with code, but they do not make the decisions.
 | [Switch-Based Travel Mode](switch-based-travel-mode.md) | Superseded → [Offline-First Emergent](offline-first-emergent.md) |
 | [Public Repo Primary](public-repo-primary.md) | Accepted |
 | [Harness auto-memory and the memory corpus are harmonized, not merged](auto-memory-system-a-vs-b.md) | Accepted |
+| [Fleet store sync and a native-Linux authority](fleet-store-sync-and-linux-authority.md) | Accepted |
 
 ## When to write one
 

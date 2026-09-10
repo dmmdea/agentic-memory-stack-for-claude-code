@@ -218,5 +218,5 @@ v0.16 work is prompt extension + endpoint reads — no schema migration needed b
 - **Schema migration path (M3):** v0.15 is schema_version 15.0 (first version). v0.16 additive changes (ADD COLUMN) will work via `IF NOT EXISTS`; destructive changes require explicit ALTER TABLE migration logic in `init_schema()`. Undocumented pattern — see the episodic.py comment block for v0.16.
 - **Goal/summary length (M4):** no server-side cap on `goal_text`/`summary_text`. Practical cap comes from the Codex prompt ("1-2 sentences"/"2-4 sentences"). v0.15.1 patch: add `max_length=2000` validators to `EpisodeIn`.
 - **No UI dashboard:** deferred; query via sqlite3 CLI or MCP tools.
-- **Cross-PC sync:** episodic.db lives in `~/.mem0/`, which is covered by Syncthing. No conflict-resolution story if two PCs write episodes simultaneously (unlikely in practice — one primary workstation).
+- **Cross-PC sync:** none. `episodic.db` lives in `~/.mem0/` on the authority only; replicas receive it through the snapshot restore path. (An earlier revision claimed Syncthing covered `~/.mem0/`; verified 2026-09-10: no Syncthing folder is paired to it on any box.)
 - **L5 WARN masking:** `Test-MemoryStack WARN: empty` persists indefinitely on broken Stop hook. If you see this > 2 days after active work sessions, check `l1a.log`.
