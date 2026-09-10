@@ -4,6 +4,32 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.20.21 (2026-09-10) — one compactor per PC, one judge attempt per store per night
+
+The SessionStart catch-up added in v1.20.20 ran once per session start with no cross-instance
+lock: four instances hit one store in the same second, `history.git/index.lock` failed, 243
+receipts landed in nine hours, and the judge was called 32 times on one store with every result
+rejected. Interim relief ahead of the AMS v2 design (ADR fleet-store-sync-and-linux-authority).
+
+- **GUARD 0 — one compactor instance per PC.** A session-local named mutex
+  (`Local\ams-memory-compact`) makes every concurrent instance exit at once with a log line and
+  no receipt; the survivor does the whole run. The OS releases it if the holder dies.
+- **One judge attempt per store per 20 h.** Every receipt now records `judge_called`;
+  `Get-AmStoreRunHistory` exposes `LastJudgeUtc`. A store whose judge was called in the last
+  20 h gets deterministic hygiene and the floors as before, but the judge call is withheld and a
+  store with nothing else to do receipts `skipped-judge-attempted-today` (not productive, does
+  not extend `skip_streak`). `-Force` bypasses the window for a hand run. The `-CatchUp` starved
+  check applies the same window, so a session start no longer re-runs a store the judge already
+  decided today — the sequential half of the storm.
+- **Receipt ages under pwsh 7 were skewed by the UTC offset.** `ConvertFrom-Json` in pwsh 7
+  already yields a `[DateTime]` for `ts`; the `[string]` re-parse dropped the `Z` and read it as
+  local time, so `LastProductiveUtc` was 5 h young on this fleet whenever the lib ran under pwsh 7
+  (tests, installer). PS 5.1 — the scheduled task — was unaffected. `ConvertTo-AmUtc` handles both.
+
+Tests: GUARD 0 held/free, judge withheld inside the window and called outside it, the catch-up
+exclusion, `LastJudgeUtc`/`LastProductiveUtc` under pwsh 7 typing. The seal test ages its
+first-run receipt past the window so the second run still calls the judge.
+
 ## v1.20.20 (2026-09-08) — a live session can no longer starve a store past the sync limit
 
 Root cause of "MEMORY.md over its load limit" in a live session. The compactor gets one shot a

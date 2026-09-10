@@ -108,6 +108,12 @@ Describe 'GUARD 4: strict decrease, anchors, seal, blast cap' {
         $r1.Receipts[0].shortened | Should -Be 1 -Because 'the rewrite must actually apply for the seal to mean anything'
         $line1 = (Get-Content -LiteralPath (Join-Path $sb.Projects 'ws\memory\MEMORY.md') | Where-Object { $_ -match '\(fact1\.md\)' })
         ([System.Text.Encoding]::UTF8.GetByteCount($line1)) | Should -BeGreaterThan 130 -Because 'the sealed line must remain a byte-cap candidate, else the byte filter (not the seal) is what excludes it'
+        # 2026-09-10: one judge attempt per store per day - age run 1's receipt past the window so
+        # run 2 calls the judge again; otherwise the prompt file read below is run 1's, stale.
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        $aged = (Get-Date).ToUniversalTime().AddHours(-30).ToString('o')
+        @(Get-Content -LiteralPath $rp) | ForEach-Object { $_ -replace '"ts":"[^"]+"', ('"ts":"' + $aged + '"') } | Set-Content -LiteralPath $rp
+        Remove-Item -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') -Force
         Invoke-Compactor -Sandbox $sb | Out-Null
         $prompt = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt') -Raw
         # A sealed line may still appear as a MIGRATE candidate; what must never recur is its
@@ -214,3 +220,68 @@ Describe 'feasibility: protected-set overflow fails loud' {
     }
 }
 
+
+Describe 'GUARD 0: one compactor instance per PC' {
+    It 'exits 0 with no receipt and a log line when another instance holds the per-PC mutex' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $created = $false
+        $m = New-Object System.Threading.Mutex($true, 'Local\ams-memory-compact', [ref]$created)
+        try {
+            $r = Invoke-Compactor -Sandbox $sb
+        } finally { $m.ReleaseMutex(); $m.Dispose() }
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 0
+        (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'another compactor instance holds the per-PC lock'
+    }
+    It 'runs and writes a receipt when the mutex is free' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $r = Invoke-Compactor -Sandbox $sb
+        @($r.Receipts).Count | Should -BeGreaterThan 0
+    }
+}
+
+Describe 'one judge attempt per store per day' {
+    It 'skips the judge with status skipped-judge-attempted-today when a receipt from the last 20h called it' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        [System.IO.Directory]::CreateDirectory((Split-Path $rp)) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
+        ('{"ts":"' + $ts + '","workspace":"ws","status":"rejected-no-shrink","judge_called":true}') | Set-Content -LiteralPath $rp
+        $r = Invoke-Compactor -Sandbox $sb
+        ($r.Receipts | Select-Object -Last 1).status | Should -Be 'skipped-judge-attempted-today'
+        ($r.Receipts | Select-Object -Last 1).judge_called | Should -BeFalse
+        (Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt')) | Should -BeFalse
+    }
+    It 'calls the judge when the last attempt is older than 20h' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        [System.IO.Directory]::CreateDirectory((Split-Path $rp)) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().AddHours(-30).ToString('o')
+        ('{"ts":"' + $ts + '","workspace":"ws","status":"rejected-no-shrink","judge_called":true}') | Set-Content -LiteralPath $rp
+        $r = Invoke-Compactor -Sandbox $sb
+        (Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt')) | Should -BeTrue
+        ($r.Receipts | Select-Object -Last 1).judge_called | Should -BeTrue
+    }
+    It 'a -CatchUp with a fresh run stamp does not re-run a store whose judge was attempted in the last 20h' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        Set-Content -LiteralPath (Join-Path $sb.Home '.claude\state\throttle-fresh') -Value '1'
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        [System.IO.Directory]::CreateDirectory((Split-Path $rp)) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
+        ('{"ts":"' + $ts + '","workspace":"ws","status":"rejected-no-shrink","judge_called":true}') | Set-Content -LiteralPath $rp
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp')
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 1 -Because 'only the seeded receipt; the catch-up must exit before the run'
+        (Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt')) | Should -BeFalse
+    }
+}

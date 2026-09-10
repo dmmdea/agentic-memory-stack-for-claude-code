@@ -485,6 +485,21 @@ function Test-AmWorkspaceLive {
     return $false
 }
 
+function ConvertTo-AmUtc {
+    # A receipt timestamp as a UTC [DateTime], or $null. Under pwsh 7, ConvertFrom-Json has
+    # ALREADY turned the ISO string into a [DateTime] (Kind=Utc); casting that back to [string]
+    # drops the 'Z', and a re-parse then reads it as local time: every receipt age was skewed by
+    # the UTC offset (5 h here) whenever the lib ran under pwsh 7 (found 2026-09-10 by the
+    # LastJudgeUtc test; the same path fed LastProductiveUtc). PS 5.1 hands back the string.
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
+        return $Value.ToUniversalTime()
+    }
+    try { return ([DateTime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)).ToUniversalTime() } catch { return $null }
+}
+
 function Get-AmStoreRunHistory {
     # What the receipts say about ONE store: how many consecutive runs ended in a live-session
     # skip, what the last real outcome was, and when it last reached a decision.
@@ -498,7 +513,9 @@ function Get-AmStoreRunHistory {
     # signal both of them lacked, and the compactor itself needs it to know when a skip has
     # stopped being the safe choice. Never throws, never returns $null.
     param([Parameter(Mandatory)][string]$ReceiptPath, [Parameter(Mandatory)][string]$Workspace)
-    $out = [pscustomobject]@{ SkipStreak = 0; LastStatus = $null; LastProductiveUtc = $null }
+    # LastJudgeUtc (2026-09-10): when this store last had a judge CALL, whatever the outcome. The
+    # compactor allows one attempt per store per day; a rejected result is a receipt, not a retry.
+    $out = [pscustomobject]@{ SkipStreak = 0; LastStatus = $null; LastProductiveUtc = $null; LastJudgeUtc = $null }
     if (-not (Test-Path -LiteralPath $ReceiptPath)) { return $out }
     $mine = @()
     try {
@@ -518,7 +535,13 @@ function Get-AmStoreRunHistory {
     $productive = @('applied', 'applied-unrecorded', 'no-op', 'protected-set-overflow')
     for ($i = $mine.Count - 1; $i -ge 0; $i--) {
         if ($productive -contains $mine[$i].status) {
-            try { $out.LastProductiveUtc = ([DateTime]::Parse([string]$mine[$i].ts, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)).ToUniversalTime() } catch {}
+            $out.LastProductiveUtc = ConvertTo-AmUtc -Value $mine[$i].ts
+            break
+        }
+    }
+    for ($i = $mine.Count - 1; $i -ge 0; $i--) {
+        if ($mine[$i].judge_called -eq $true) {
+            $out.LastJudgeUtc = ConvertTo-AmUtc -Value $mine[$i].ts
             break
         }
     }

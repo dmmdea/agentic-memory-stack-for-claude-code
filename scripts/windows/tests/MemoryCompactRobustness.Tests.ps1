@@ -248,6 +248,12 @@ Describe 'history and receipts' {
         Invoke-Compactor -Sandbox $sb | Out-Null
         $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
         $mid = [System.IO.File]::ReadAllBytes($idx)
+        # 2026-09-10: one judge attempt per store per day - age run 1's receipt past the window so
+        # run 2 exercises the full judge path again (the property under test is that the same
+        # judge answer over a compacted store changes nothing, not that the judge is withheld).
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        $aged = (Get-Date).ToUniversalTime().AddHours(-30).ToString('o')
+        @(Get-Content -LiteralPath $rp) | ForEach-Object { $_ -replace '"ts":"[^"]+"', ('"ts":"' + $aged + '"') } | Set-Content -LiteralPath $rp
         $r2 = Invoke-Compactor -Sandbox $sb
         $after = [System.IO.File]::ReadAllBytes($idx)
         [System.BitConverter]::ToString($after) | Should -Be ([System.BitConverter]::ToString($mid))
