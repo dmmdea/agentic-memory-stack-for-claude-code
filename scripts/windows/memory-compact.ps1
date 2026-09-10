@@ -56,8 +56,30 @@ Initialize-MemoryEnv
 
 $Component = 'memory-compact'
 $ThrottleName = 'memory-compact'
+
+# ---- GUARD 0: one compactor instance per PC ---------------------------------------------------
+# 2026-09-10: the SessionStart catch-up ran once per session start with no cross-instance lock.
+# Four instances hit one store in the same second, history.git/index.lock failed, and 243
+# receipts landed in nine hours. A named mutex (session-local, released by the OS if the holder
+# dies) makes every concurrent instance exit at once; the survivor does the whole run.
+$script:AmInstanceMutex = $null
+try {
+    $createdNew = $false
+    $script:AmInstanceMutex = New-Object System.Threading.Mutex($false, 'Local\ams-memory-compact', [ref]$createdNew)
+    if (-not $script:AmInstanceMutex.WaitOne(0)) {
+        Write-MemoryLog -Component $Component -Message ('another compactor instance holds the per-PC lock; exiting (pid ' + $PID + ')')
+        $script:AmInstanceMutex.Dispose(); $script:AmInstanceMutex = $null
+        exit 0
+    }
+} catch [System.Threading.AbandonedMutexException] {
+    # The previous holder died without releasing; WaitOne threw but this process now owns it.
+    Write-MemoryLog -Component $Component -Message 'per-PC lock was abandoned by a dead instance; taking it over'
+}
 $ReceiptPath = Join-Path (Get-AmStateRoot) 'compact-receipts.jsonl'
 $script:AmCatchUpHours = 24
+# One judge attempt per store per day (spec: one attempt per store per night). 20 h, not 24: the
+# nightly must not find yesterday's attempt still "today" because it ran a few minutes earlier.
+$script:AmJudgeOnceHours = 20
 
 $script:AmCatchUpStarved = @()
 if ($CatchUp) {
@@ -81,6 +103,10 @@ if ($CatchUp) {
                 if (-not $st.OverTrigger) { continue }
                 $h = Get-AmStoreRunHistory -ReceiptPath $ReceiptPath -Workspace $s.Workspace
                 $ageH = if ($null -eq $h.LastProductiveUtc) { [double]::PositiveInfinity } else { ([DateTime]::UtcNow - $h.LastProductiveUtc).TotalHours }
+                # 2026-09-10: a store whose judge already ran today is not starved, it is decided
+                # (rejected counts). Re-running it can only skip the judge again and write another
+                # receipt - the sequential half of the 243-receipt storm GUARD 0 stops the parallel half of.
+                if (-not $Force -and $h.LastJudgeUtc -and ($h.LastJudgeUtc -gt [DateTime]::UtcNow.AddHours(-$script:AmJudgeOnceHours))) { continue }
                 if ($ageH -ge $script:AmCatchUpHours) { $script:AmCatchUpStarved += $s.Workspace }
             } catch { }
         }
@@ -308,7 +334,7 @@ foreach ($cand in $candidates) {
         shortened = 0; migrated = 0; reindexed = 0; dedangled = 0; dedup_slug = 0; floored = 0; line_floored = 0
         mem0 = @(); mem0_orphan = @(); after_bytes = $null; after_lines = $null
         commit = $null; snapshot = $null; note = ''
-        skip_streak = 0; liveness_override = $false
+        skip_streak = 0; liveness_override = $false; judge_called = $false
     }
 
     # Each store is wrapped so one unreadable index cannot kill the run - and its receipt is
@@ -577,8 +603,18 @@ foreach ($cand in $candidates) {
     $judgeOk = $false
     $plan = $null
 
+    # 2026-09-10: 32 judge calls on one store in a day, every result rejected. One attempt per
+    # store per day; a rejected result is a receipt, not a retry. Deterministic hygiene and the
+    # floors still run below - only the judge call is withheld. -Force (an operator hand run)
+    # bypasses it.
+    $judgeAttemptedToday = $false
+    if ($judgeNeeded -and -not $script:JudgeDisabled -and -not $Force -and $history.LastJudgeUtc -and ($history.LastJudgeUtc -gt [DateTime]::UtcNow.AddHours(-$script:AmJudgeOnceHours))) {
+        $judgeAttemptedToday = $true
+        $result.note = 'judge already attempted at ' + $history.LastJudgeUtc.ToString('o') + '; next attempt after ' + $script:AmJudgeOnceHours + 'h'
+        Write-MemoryLog -Component $Component -Message ($ws + ': judge attempted today; skipped (deterministic hygiene only)')
+    }
     if ($judgeNeeded -and $script:JudgeDisabled) { $result.note = 'codex lock held; judge skipped' }
-    if ($judgeNeeded -and -not $script:JudgeDisabled) {
+    if ($judgeNeeded -and -not $script:JudgeDisabled -and -not $judgeAttemptedToday) {
         $sb = New-Object System.Text.StringBuilder
         [void]$sb.AppendLine('You are compacting one workspace index of an agent memory system. Only the index is loaded into every session; each entry points at a fact file that is loaded on demand.')
         [void]$sb.AppendLine('')
@@ -617,6 +653,7 @@ foreach ($cand in $candidates) {
             # per-store handler that marks the whole store 'error-store' - skipping exactly the
             # deterministic hygiene this catch exists to preserve.
             $judgeLastMsg = New-CodexLastMessagePath
+            $result.judge_called = $true
             $raw = Invoke-CodexSubagent -Prompt $sb.ToString() -ReasoningEffort 'medium' -TimeoutSeconds $CodexTimeoutSeconds -Model $script:AmCodexModelClassify -LastMessagePath $judgeLastMsg
         }
         catch {
@@ -816,7 +853,7 @@ foreach ($cand in $candidates) {
     # `status=no-op` (found by the receipt-fidelity test).
     if ($newText -eq $preText -and @($pendingDeletes).Count -eq 0) {
         # Distinguish "there was nothing to do" from "the judge never answered".
-        $result.status = if ($unconverged) { 'unconverged' } elseif ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
+        $result.status = if ($unconverged) { 'unconverged' } elseif ($judgeNeeded -and $judgeAttemptedToday) { 'skipped-judge-attempted-today' } elseif ($judgeNeeded -and -not $judgeOk) { 'skipped-judge-unavailable' } else { 'no-op' }
         $result.after_bytes = $before.Bytes; $result.after_lines = $before.Lines
         # A clean below-trigger store is the common nightly case: no log line, no receipt (a
         # receipt per store per night would bury the ones that matter).
@@ -986,6 +1023,7 @@ if (-not $DryRun -and -not $Force -and @($productive).Count -gt 0) { Mark-Thrott
 
 } finally {
     if ($lockTaken) { Release-CodexLock }
+    if ($script:AmInstanceMutex) { try { $script:AmInstanceMutex.ReleaseMutex() } catch {}; $script:AmInstanceMutex.Dispose() }
 }
 # 2026-09-03: an unconverged store is a FAILED run - the scheduled task's LastTaskResult must
 # say so, not 0. ('applied-unconverged' / 'unconverged' are absent from $productive: the

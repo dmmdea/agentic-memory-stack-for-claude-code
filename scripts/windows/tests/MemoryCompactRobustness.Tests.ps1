@@ -248,6 +248,12 @@ Describe 'history and receipts' {
         Invoke-Compactor -Sandbox $sb | Out-Null
         $idx = Join-Path $sb.Projects 'ws\memory\MEMORY.md'
         $mid = [System.IO.File]::ReadAllBytes($idx)
+        # 2026-09-10: one judge attempt per store per day - age run 1's receipt past the window so
+        # run 2 exercises the full judge path again (the property under test is that the same
+        # judge answer over a compacted store changes nothing, not that the judge is withheld).
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        $aged = (Get-Date).ToUniversalTime().AddHours(-30).ToString('o')
+        @(Get-Content -LiteralPath $rp) | ForEach-Object { $_ -replace '"ts":"[^"]+"', ('"ts":"' + $aged + '"') } | Set-Content -LiteralPath $rp
         $r2 = Invoke-Compactor -Sandbox $sb
         $after = [System.IO.File]::ReadAllBytes($idx)
         [System.BitConverter]::ToString($after) | Should -Be ([System.BitConverter]::ToString($mid))
@@ -609,5 +615,32 @@ Describe 'starvation (2026-09-08): a live session must not starve a store past t
         & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1 | Out-Null
         $j = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\lint-summary.json') -Raw | ConvertFrom-Json
         @($j.findings | Where-Object { $_.kind -eq 'compactor-starved' }).Count | Should -Be 0
+    }
+
+    It 'lint treats skipped-judge-attempted-today as neutral: three of them after an applied run are not compactor-unproductive' {
+        # 2026-09-10: a catch-up sweep re-visits every over-trigger store while any store is starved,
+        # so a store whose judge already ran today collects one of these per session start. They
+        # say "waiting", not "stuck"; counting them as bad receipts would page on a working store.
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'lt' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        script:Seed-Receipts -Sandbox $sb -Workspace 'lt' -Statuses @('applied', 'skipped-judge-attempted-today', 'skipped-judge-attempted-today', 'skipped-judge-attempted-today')
+        Copy-Item $script:LintSrc $sb.Bin
+        $cmd = '$env:USERPROFILE=' + "'" + $sb.Home + "'; & '" + (Join-Path $sb.Bin 'memory-lint.ps1') + "' -Quiet"
+        & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1 | Out-Null
+        $j = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\lint-summary.json') -Raw | ConvertFrom-Json
+        @($j.findings | Where-Object { $_.kind -eq 'compactor-unproductive' }).Count | Should -Be 0
+    }
+
+    It 'lint still raises compactor-unproductive when three rejected runs are interleaved with neutral judge skips' {
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        $sb = New-Sandbox -CodexPlanJson '{"plan":[]}'
+        Add-SandboxStore -Sandbox $sb -Workspace 'lt' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        script:Seed-Receipts -Sandbox $sb -Workspace 'lt' -Statuses @('rejected-no-shrink', 'skipped-judge-attempted-today', 'rejected-no-shrink', 'skipped-judge-attempted-today', 'rejected-no-shrink')
+        Copy-Item $script:LintSrc $sb.Bin
+        $cmd = '$env:USERPROFILE=' + "'" + $sb.Home + "'; & '" + (Join-Path $sb.Bin 'memory-lint.ps1') + "' -Quiet"
+        & pwsh -NoProfile -NonInteractive -Command $cmd 2>&1 | Out-Null
+        $j = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\lint-summary.json') -Raw | ConvertFrom-Json
+        @($j.findings | Where-Object { $_.kind -eq 'compactor-unproductive' }).Count | Should -Be 1 -Because 'neutral receipts are excluded from the window, not counted as good'
     }
 }

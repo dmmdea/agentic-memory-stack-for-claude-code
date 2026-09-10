@@ -340,3 +340,25 @@ Describe 'out-of-tree git history' {
         (Get-AmHistoryDiff -FromSha $sha1 -ToSha $sha2 -RelPath 'ws/memory' -GitDir $script:hGit -WorkTree $script:hRoot) | Should -Match 'b\.md'
     }
 }
+
+Describe 'Get-AmStoreRunHistory.LastJudgeUtc' {
+    It 'is the timestamp of the newest receipt whose judge_called is true' {
+        $p = Join-Path $TestDrive 'receipts.jsonl'
+        @(
+            '{"ts":"2026-09-09T03:00:00.0000000Z","workspace":"ws","status":"applied","judge_called":true}'
+            '{"ts":"2026-09-10T03:00:00.0000000Z","workspace":"ws","status":"rejected-no-shrink","judge_called":true}'
+            '{"ts":"2026-09-10T08:00:00.0000000Z","workspace":"ws","status":"skipped-live-session","judge_called":false}'
+        ) | Set-Content -LiteralPath $p
+        $h = Get-AmStoreRunHistory -ReceiptPath $p -Workspace 'ws'
+        $h.LastJudgeUtc | Should -Be ([DateTime]::Parse('2026-09-10T03:00:00.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal))
+        $h.LastJudgeUtc.Kind | Should -Be ([DateTimeKind]::Utc)
+        # pwsh 7's ConvertFrom-Json yields a [DateTime] for ts; PS 5.1 yields the string. Both must
+        # read as 03:00Z, not 03:00 local re-labelled UTC (the 5 h skew found 2026-09-10).
+        $h.LastProductiveUtc | Should -Be ([DateTime]::Parse('2026-09-09T03:00:00.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal))
+    }
+    It 'is null when no receipt called the judge' {
+        $p = Join-Path $TestDrive 'r2.jsonl'
+        '{"ts":"2026-09-10T03:00:00.0000000Z","workspace":"ws","status":"no-op"}' | Set-Content -LiteralPath $p
+        (Get-AmStoreRunHistory -ReceiptPath $p -Workspace 'ws').LastJudgeUtc | Should -BeNullOrEmpty
+    }
+}
