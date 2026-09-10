@@ -106,7 +106,7 @@ if ($CatchUp) {
                 # 2026-09-10: a store whose judge already ran today is not starved, it is decided
                 # (rejected counts). Re-running it can only skip the judge again and write another
                 # receipt - the sequential half of the 243-receipt storm GUARD 0 stops the parallel half of.
-                if ($h.LastJudgeUtc -and ($h.LastJudgeUtc -gt [DateTime]::UtcNow.AddHours(-$script:AmJudgeOnceHours))) { continue }
+                if (-not $Force -and $h.LastJudgeUtc -and ($h.LastJudgeUtc -gt [DateTime]::UtcNow.AddHours(-$script:AmJudgeOnceHours))) { continue }
                 if ($ageH -ge $script:AmCatchUpHours) { $script:AmCatchUpStarved += $s.Workspace }
             } catch { }
         }

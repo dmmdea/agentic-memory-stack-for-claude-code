@@ -20,7 +20,9 @@ rejected. Interim relief ahead of the AMS v2 design (ADR fleet-store-sync-and-li
   store with nothing else to do receipts `skipped-judge-attempted-today` (not productive, does
   not extend `skip_streak`). `-Force` bypasses the window for a hand run. The `-CatchUp` starved
   check applies the same window, so a session start no longer re-runs a store the judge already
-  decided today — the sequential half of the storm.
+  decided today — the sequential half of the storm. `memory-lint` treats the new status as neutral
+  (excluded from the `compactor-unproductive` window, never counted as good), so a store that is
+  waiting for tomorrow's attempt is not reported as stuck.
 - **Receipt ages under pwsh 7 were skewed by the UTC offset.** `ConvertFrom-Json` in pwsh 7
   already yields a `[DateTime]` for `ts`; the `[string]` re-parse dropped the `Z` and read it as
   local time, so `LastProductiveUtc` was 5 h young on this fleet whenever the lib ran under pwsh 7

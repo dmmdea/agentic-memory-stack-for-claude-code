@@ -98,6 +98,12 @@ try {
                     try { $o = $l | ConvertFrom-Json } catch { continue }
                     if ($o.workspace -eq $row.workspace -and -not $o.dry_run) { $mine += $o }
                 }
+                # 2026-09-10: 'skipped-judge-attempted-today' is NEUTRAL - the compactor withheld the judge
+                # because it already ran inside the 20 h window, and a catch-up sweep re-visits every
+                # over-trigger store while any store is starved, so one lands per session start. It says
+                # "waiting", not "stuck": excluded from the window rather than counted as good, so three
+                # rejected runs with these between them still fire.
+                $mine = @($mine | Where-Object { $_.status -ne 'skipped-judge-attempted-today' })
                 $recent = @($mine | Select-Object -Last 3)
                 if (@($recent).Count -ge 3) {
                     $good = @($recent | Where-Object { @('applied', 'applied-unrecorded', 'no-op') -contains $_.status })

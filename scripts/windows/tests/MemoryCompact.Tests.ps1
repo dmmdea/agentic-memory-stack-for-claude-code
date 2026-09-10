@@ -284,4 +284,17 @@ Describe 'one judge attempt per store per day' {
         @($r.Receipts).Count | Should -Be 1 -Because 'only the seeded receipt; the catch-up must exit before the run'
         (Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt')) | Should -BeFalse
     }
+    It '-CatchUp -Force -Workspace bypasses the window in the starved pre-filter too (a rehearsal must not silently no-op)' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        Set-Content -LiteralPath (Join-Path $sb.Home '.claude\state\throttle-fresh') -Value '1'
+        $rp = Join-Path $sb.Home '.claude\state\automemory\compact-receipts.jsonl'
+        [System.IO.Directory]::CreateDirectory((Split-Path $rp)) | Out-Null
+        $ts = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
+        ('{"ts":"' + $ts + '","workspace":"ws","status":"rejected-no-shrink","judge_called":true}') | Set-Content -LiteralPath $rp
+        $r = Invoke-Compactor -Sandbox $sb -ExtraArgs @('-CatchUp', '-Force', '-Workspace', 'ws')
+        (Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\last-codex-prompt.txt')) | Should -BeTrue -Because '-Force is the operator saying: judge it now'
+        ($r.Receipts | Select-Object -Last 1).judge_called | Should -BeTrue
+    }
 }
