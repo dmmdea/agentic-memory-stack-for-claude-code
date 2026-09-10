@@ -48,6 +48,12 @@ impossible **by construction**, not by policy.
 - The offline-watcher must never run on the brain box (its reconnect transition stops the live
   services); its installer refuses registration there.
 
+**Amendment 2026-09-10** (ADR [`fleet-store-sync-and-linux-authority.md`](./fleet-store-sync-and-linux-authority.md)):
+the brain box may be a native-Linux always-on server rather than a Windows+WSL workstation, and
+the rule extends to the harness's own per-workspace stores: their history repositories may carry
+exactly one remote, the hub on the brain box, and no other. The single-writer invariant for the
+memory corpus is unchanged.
+
 ## Alternatives considered
 
 Not recorded. The record states the single-writer invariant and its two enforcement points, not a
