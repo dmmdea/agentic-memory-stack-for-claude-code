@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from mem0 import Memory
 
-from config import build_config
+from config import build_config, EMBEDDER_CONFIG
 from reranker import rerank as bge_rerank
 # W4 (F11): PASSIVE rerank counters. There is deliberately NO active rerank
 # probe on /health/deep — deploy.sh gates on this endpoint right after a
@@ -919,6 +919,11 @@ def health_morning_summary() -> dict:
 
 
 @app.get("/health/embedder")
+def _embed_model() -> str:
+    """The llama-swap model name the store is bound to (config.EMBEDDER_CONFIG["model"])."""
+    return str(EMBEDDER_CONFIG.get("model") or "embeddinggemma")
+
+
 def health_embedder() -> dict:
     """Spec §4 (P1-6 PC half): the SessionStart pre-warm target. The embedder unloads after
     5 idle minutes (ttl 300, every engine) and takes ~3.4 s to come back, so the first prompt's
@@ -935,7 +940,7 @@ def health_embedder() -> dict:
         r = _httpx.get("http://127.0.0.1:11436/v1/models", timeout=3.0)
         r.raise_for_status()
         for entry in (r.json().get("data") or []):
-            if "embeddinggemma" not in str(entry.get("id", "")):
+            if str(entry.get("id", "")) != _embed_model():
                 continue
             state = entry.get("state", entry.get("status"))
             if state is not None:
@@ -945,7 +950,7 @@ def health_embedder() -> dict:
         loaded = None
     t0 = _time.perf_counter()
     r = _httpx.post("http://127.0.0.1:11436/v1/embeddings",
-                    json={"model": "embeddinggemma", "input": "warm"},
+                    json={"model": _embed_model(), "input": "warm"},
                     timeout=10.0)
     r.raise_for_status()
     return {"ok": True, "loaded": loaded, "warm_ms": int((_time.perf_counter() - t0) * 1000)}
@@ -984,7 +989,7 @@ def health_deep() -> dict:
     # Replaced the nomic-via-Ollama :11435 probe when Ollama was decommissioned.)
     try:
         r = _httpx.post("http://127.0.0.1:11436/v1/embeddings",
-                       json={"model": "embeddinggemma", "input": "title: none | text: health"},
+                       json={"model": _embed_model(), "input": "title: none | text: health"},
                        timeout=10.0)
         r.raise_for_status()
         dim = len(r.json().get("data", [{}])[0].get("embedding", []))
