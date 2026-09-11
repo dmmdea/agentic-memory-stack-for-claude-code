@@ -26,7 +26,10 @@ if [ "$GUARD" = 1 ] && [ -f "$stamp" ]; then
 fi
 t0=$(date +%s%3N)
 err="$(mktemp)"
-"$@" 2> >(tee "$err" >&2); rc=$?
+# stderr is captured synchronously, then echoed: a `2> >(tee …)` substitution is not waited
+# for and the receipt read raced it (review 2026-09-10: 2 of 5000 lines landed in the note).
+"$@" 2>"$err"; rc=$?
+cat "$err" >&2
 ms=$(( $(date +%s%3N) - t0 ))
 if [ "$rc" -eq 0 ]; then
     receipt true 0 "$ms" ""

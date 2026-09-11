@@ -178,10 +178,6 @@ class CanonicalKeyProvider:
                     tmp_prefixes.append(Path(_cd_guard).resolve())
                 except (OSError, RuntimeError):
                     pass
-            try:
-                tmp_prefixes.append(Path("/run/credentials").resolve())
-            except (OSError, RuntimeError):
-                pass
             tmp_prefixes = [t for t in tmp_prefixes if t is not None]
             under_home = str(resolved).startswith(str(home))
             under_tmp = any(str(resolved).startswith(str(t)) for t in tmp_prefixes)

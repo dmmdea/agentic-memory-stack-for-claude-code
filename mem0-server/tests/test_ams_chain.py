@@ -57,6 +57,15 @@ def test_step_writes_a_receipt_with_duration_and_exit(tmp_path):
     assert rows[-1]["ok"] is False and "bad" in rows[-1]["note"] and rows[-1]["exit"] == 23
 
 
+def test_receipt_note_keeps_the_tail_of_a_long_stderr(tmp_path):
+    """The receipt note is the only diagnostic of an unattended 3 am failure; a stderr of
+    thousands of lines must still leave its last 400 bytes in the note (no substitution race)."""
+    r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "for i in $(seq 1 5000); do echo line-$i >&2; done; exit 7"])
+    assert r.returncode == 7
+    assert "line-5000" in rows[-1]["note"] and rows[-1]["ok"] is False
+    assert "line-5000" in r.stderr, "stderr is still echoed to the caller (the journal)"
+
+
 def test_guard_skips_a_second_run_inside_20h(tmp_path):
     r, rows, home = _step(tmp_path, ["--guard", "demo", "true"])
     assert r.returncode == 0 and rows[-1]["ok"] is True

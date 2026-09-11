@@ -98,7 +98,7 @@ def _judge_once_native(prompt: str, effort: str, timeout_s: int, model: str, _ru
         with tempfile.TemporaryDirectory(prefix="codex-judge-") as td:
             last = os.path.join(td, "last.txt")
             cmd = [codex, "exec", "--skip-git-repo-check", "-m", model or NATIVE_DEFAULT_MODEL,
-                   "-c", f'model_reasoning_effort="{effort}"', "--output-last-message", last, prompt]
+                   "-c", f'model_reasoning_effort="{effort}"', "--output-last-message", last, "--", prompt]
             t0 = time.monotonic()
             try:
                 cp = _run(cmd, capture_output=True, text=True, timeout=int(timeout_s), cwd=td, env=dict(os.environ))

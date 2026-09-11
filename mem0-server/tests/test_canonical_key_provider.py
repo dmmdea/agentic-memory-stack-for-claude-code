@@ -445,6 +445,17 @@ def test_credential_default_path_comes_from_env(tmp_path, monkeypatch):
     assert p.key_source == "credential"
 
 
+def test_credential_guard_is_scoped_to_the_env_directory(tmp_path, monkeypatch):
+    """The traversal guard admits $CREDENTIALS_DIRECTORY only; an arbitrary /run/credentials/<other-unit>
+    path is not a valid key location on a host that never set the variable."""
+    from canonical_key_provider import CanonicalKeyProvider
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    with pytest.raises(ValueError):
+        CanonicalKeyProvider(dpapi_path=tmp_path / "a", plaintext_path=tmp_path / "b",
+                             runtime_key_path=tmp_path / "c",
+                             credential_key_path=Path("/run/credentials/other.service/ams-canonical-key"))
+
+
 def test_api_key_path_honours_env(tmp_path, monkeypatch):
     from canonical_key_provider import api_key_path
     monkeypatch.delenv("MEM0_API_KEY_FILE", raising=False)

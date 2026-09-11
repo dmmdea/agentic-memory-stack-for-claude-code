@@ -56,7 +56,19 @@ def test_native_success_reads_last_message_and_tokens():
     assert "exec" in cmd and "--skip-git-repo-check" in cmd
     assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
     assert 'model_reasoning_effort="medium"' in cmd
-    assert cmd[-1] == "p"
+    assert cmd[-1] == "p" and cmd[-2] == "--", "the prompt is positional after --, so a prompt starting with - is never parsed as a flag"
+
+
+def test_native_prompt_starting_with_dash_is_passed_verbatim():
+    seen = {}
+
+    def run(cmd, **kw):
+        seen["cmd"] = cmd
+        return _cp(0, out="tokens used\n1\n")
+
+    out = csc.judge("-not a flag", _run=run)
+    assert out["ok"] is True
+    assert seen["cmd"][-1] == "-not a flag" and seen["cmd"][-2] == "--"
 
 
 def test_native_usage_limit_is_its_own_error_type():
