@@ -204,6 +204,11 @@ if [ "$(loginctl show-user "$USER" --property=Linger 2>/dev/null)" != "Linger=ye
 fi
 systemctl --user enable --now qdrant.service mem0.service l10-audit.timer
 systemctl --user enable --now ams-nightly.timer 2>/dev/null || echo "    (ams-nightly.timer not present in this checkout)"
+# The step services attach to the target through their [Install] WantedBy=; that symlink only
+# exists once each step is ENABLED (not started). The first live chain run started the target
+# and pulled in nothing because only the timer had been enabled.
+for u in "$SYSTEMD_USER_DIR"/ams-step-*.service; do [ -f "$u" ] && systemctl --user enable "$(basename "$u")" >/dev/null 2>&1; done
+echo "    chain steps enabled: $(ls "$SYSTEMD_USER_DIR"/ams-nightly.target.wants/ 2>/dev/null | tr "\n" " ")"
 for i in $(seq 1 60); do curl -sf -m 2 "http://$BIND_IP:18791/health" >/dev/null && break; sleep 2; done
 curl -sf -m 5 "http://$BIND_IP:18791/health" | jq -c . || fail "mem0 did not answer on http://$BIND_IP:18791/health (journalctl --user -u mem0)"
 curl -sf -m 60 "http://$BIND_IP:18791/health/deep" | jq -c '{ok, stack, canonical_key: .checks.canonical_key, embedder: .checks.embedder, judge_transport: .checks.judge_transport}' \

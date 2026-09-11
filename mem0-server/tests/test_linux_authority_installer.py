@@ -95,6 +95,14 @@ def test_render_only_includes_the_chain_and_no_per_job_timers(tmp_path):
     assert names == {"l10-audit.timer", "ams-nightly.timer"}, names
 
 
+def test_installer_enables_every_chain_step():
+    """WantedBy=ams-nightly.target only binds a step once it is enabled; the first live run
+    started the target and pulled in nothing because only the timer was enabled."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert re.search(r'systemctl --user enable "\$\(basename "\$u"\)"', text)
+    assert "ams-step-*.service" in text
+
+
 def test_wait_for_bind_parses_and_refuses_wildcard():
     script = REPO_ROOT / "scripts" / "wsl" / "wait-for-bind.sh"
     r = subprocess.run([BASH, "-n", str(script)], capture_output=True, text=True, timeout=60)

@@ -50,7 +50,8 @@ def _step(tmp_path, args):
 def test_step_writes_a_receipt_with_duration_and_exit(tmp_path):
     r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "sleep 0.2; echo hi"])
     assert r.returncode == 0, r.stderr
-    assert rows[-1]["step"] == "demo" and rows[-1]["ok"] is True and rows[-1]["duration_ms"] >= 150
+    assert rows[-1]["step"] == "demo" and rows[-1]["ok"] is True
+    assert 150 <= rows[-1]["duration_ms"] < 5000, "milliseconds, on GNU and uutils date alike (uutils prints ns for %3N)"
     assert re.fullmatch(r"demo-\d{8}T\d{6}Z-[0-9a-f]{6}", rows[-1]["receipt_id"])
     r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "echo bad >&2; exit 23"])
     assert r.returncode == 23

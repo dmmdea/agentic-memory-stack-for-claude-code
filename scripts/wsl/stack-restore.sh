@@ -439,6 +439,11 @@ if [ "$integrity" != "ok" ]; then
 fi
 echo "episodic.db integrity_check: ok"
 
+# A live or previously-initialised episodic.db leaves -wal/-shm files beside the target; SQLite
+# replays that foreign WAL onto the freshly restored file and reports "database disk image is
+# malformed" (2026-09-10, first restore onto a native authority whose server had already
+# created an empty store). Remove them before the atomic rename.
+rm -f "$TARGET_EPISODIC-wal" "$TARGET_EPISODIC-shm"
 mv "$TARGET_EPISODIC.tmp" "$TARGET_EPISODIC"
 echo "episodic.db restored to: $TARGET_EPISODIC"
 

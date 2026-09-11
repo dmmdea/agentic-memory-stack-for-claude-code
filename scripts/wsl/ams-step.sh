@@ -24,13 +24,16 @@ if [ "$GUARD" = 1 ] && [ -f "$stamp" ]; then
         exit 0
     fi
 fi
-t0=$(date +%s%3N)
+# $EPOCHREALTIME (bash >= 5) in microseconds: `date +%s%3N` is GNU-only; the uutils coreutils
+# shipped on Ubuntu 26.04 ignores the width and prints nanoseconds (first live chain run
+# receipted 1,834,879,975 ms for a 2 s step).
+t0=${EPOCHREALTIME/./}
 err="$(mktemp)"
 # stderr is captured synchronously, then echoed: a `2> >(tee …)` substitution is not waited
 # for and the receipt read raced it (review 2026-09-10: 2 of 5000 lines landed in the note).
 "$@" 2>"$err"; rc=$?
 cat "$err" >&2
-ms=$(( $(date +%s%3N) - t0 ))
+ms=$(( (${EPOCHREALTIME/./} - t0) / 1000 ))
 if [ "$rc" -eq 0 ]; then
     receipt true 0 "$ms" ""
     [ "$GUARD" = 1 ] && date +%s > "$stamp"

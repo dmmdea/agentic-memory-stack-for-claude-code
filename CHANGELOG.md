@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.21.2 (2026-09-10) — first live chain run: steps enabled, receipt clock, restore WAL hygiene
+
+Three findings from the first chain run on the native authority. (1) `systemctl start
+ams-nightly.target` pulled in no step: `WantedBy=` binds a step only once it is enabled, and the
+installer enabled only the timer; it now enables every `ams-step-*.service`. (2) Receipts carried
+`duration_ms` in nanoseconds: the uutils `date` on Ubuntu 26.04 ignores `%3N`'s width; `ams-step.sh`
+now uses bash's `$EPOCHREALTIME`. (3) `stack-restore.sh` restored `episodic.db` beside a foreign
+`-wal`/`-shm` pair left by the already-started server, and SQLite reported the file malformed; the
+stale pair is removed before the atomic rename.
+
 ## v1.21.1 (2026-09-10) — the key guard accepts a symlinked `~/.mem0`
 
 The first native install refused its own `~/.mem0/canonical-key.dpapi`: the path-traversal guard
