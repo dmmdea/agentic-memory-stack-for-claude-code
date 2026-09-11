@@ -4,6 +4,42 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.21.0 (2026-09-10) — native Linux authority: installer, judge transport, health, nightly chain (Phase 1, staging)
+
+The memory authority can now be installed natively on an always-on Linux box (no WSL anywhere),
+ahead of the cutover described in the ADR `fleet-store-sync-and-linux-authority`. Nothing is
+removed and no workstation changes role: this release is proven on a staging copy first.
+
+- **`install/linux-authority.sh`** — mirrors the Linux replica installer (same module / pip /
+  Qdrant lists read from the WSL installer, uv-managed Python 3.12), binds the server to the
+  tailnet address only (`--bind-ip`, never `0.0.0.0`; `wait-for-bind.sh` as `ExecStartPre`),
+  loads both secrets through `systemd-creds` (`LoadCredentialEncrypted` in a native drop-in
+  `mem0.service.d/native.conf`, `MEM0_API_KEY_FILE=%d/ams-api-key`), accepts ZFS for Qdrant
+  storage, enables only `l10-audit.timer` and `ams-nightly.timer`, and turns every per-job timer
+  off. `--render-only <dir>` writes the resolved unit set for inspection; a test greps it for
+  `/mnt/c`, `cmd.exe`, `powershell.exe` and the DPAPI fetch.
+- **`canonical_key_provider`** gains the `credential` source (`$CREDENTIALS_DIRECTORY`, first in
+  the chain) and `api_key_path()`; `app.py` reads the API key through it.
+- **Native Codex judge transport** — `MEM0_CODEX_TRANSPORT = shim | native | auto`. The native
+  path runs `codex exec` as a subprocess behind the shim client's fail-soft dict and retry loop,
+  with a file lock as the single-flight mutex; `usage_limit`, `client_timeout`, `exit_nonzero`,
+  `lock_contended` and `no_codex` are its error types. `/health/deep` reports
+  `checks.judge_transport`. Every judge consumer inherits it unchanged.
+- **One nightly chain** — `ams-nightly.timer` (03:00, `Persistent`, `OnBootSec=15min`) starts
+  `ams-nightly.target`; steps attach with `WantedBy=`/`After=` (never `Requires=`) through
+  `ams-step.sh`, which receipts every run (`{ts, step, ok, exit, duration_ms, receipt_id, note}`)
+  and carries the 20 h boot guard. Steps in this release: stack backup, health stamp, RTC re-arm
+  (`ams-rtcwake-arm.sh`; the dream, dedup and index steps follow with their Python ports).
+- **`GET /health/maintenance`** — per-step last success / duration / receipt id, stale steps
+  (48 h), `judge_transport`, pool usage (`zfs list` when `MEM0_ZFS_DATASET` is set) with the
+  85 % alarm, boot ids of the last 7 days. Readers fail soft.
+- **Embedder outages are 503 + `Retry-After: 10`** with `reason: cold-embedder` (`embedder_503`),
+  so the shim queues the write instead of failing it; 4xx from the embedder is left alone.
+
+Tests: installer (bash in a scratch HOME), key provider, native transport (injected runner), chain
+step/guard/rtcwake, maintenance health, 503 classifier and handler — each red first, each with a
+mutation proven red. Windows-side scripts are untouched.
+
 ## v1.20.21 (2026-09-10) — one compactor per PC, one judge attempt per store per night
 
 The SessionStart catch-up added in v1.20.20 ran once per session start with no cross-instance

@@ -92,7 +92,8 @@ from episode_embeddings import (
 )
 
 # Read API key (file mode 600)
-API_KEY_PATH = Path.home() / ".mem0" / "api-key"
+from canonical_key_provider import api_key_path as _api_key_path  # spec §4: MEM0_API_KEY_FILE on the native authority
+API_KEY_PATH = _api_key_path()
 if not API_KEY_PATH.exists():
     raise SystemExit(f"FAIL: API key not found at {API_KEY_PATH}. Run: python -c \"import secrets; print(secrets.token_urlsafe(32))\" > {API_KEY_PATH} && chmod 600 {API_KEY_PATH}")
 API_KEY = API_KEY_PATH.read_text(encoding="utf-8").strip()
@@ -203,6 +204,8 @@ def _resolve_stack_version(app_dir: Optional[Path] = None) -> str:
 STACK_VERSION = _resolve_stack_version()
 
 app = FastAPI(title="mem0 WSL", version="2.0.4-v012")
+import embedder_503 as _embedder_503  # spec §4 P1-6: embedder outages -> 503 + Retry-After (reason cold-embedder)
+_embedder_503.install(app)
 
 def auth(x_api_key: Optional[str] = Header(None)):
     if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
@@ -885,6 +888,21 @@ def health() -> dict:
     return {"ok": True, "version": "2.0.4-v012", "stack": STACK_VERSION,
             "store": "qdrant", "embedder": "embeddinggemma-300m"}
 
+@app.get("/health/maintenance")
+def health_maintenance() -> dict:
+    """Spec §9 (P1-5): the nightly chain's last successes, the judge transport, pool usage
+    (alarm at 85 %) and the box's boot ids for 7 days. Gatus probes it; the session-start
+    line reads it with a 1.5 s budget and falls back to local numbers. Never raises on a
+    reader: an unreadable pool/journal reads as unknown, not as an error."""
+    import os as _os
+    import maintenance_health as _mh
+    ds = _os.environ.get("MEM0_ZFS_DATASET", "").strip()
+    pool = _mh.zfs_pool_reader(ds) if ds else _mh.disk_usage_reader(str(Path.home()))
+    return _mh.build(Path.home() / ".mem0" / "maintenance" / "receipts.jsonl",
+                     _dt.datetime.now(_dt.timezone.utc), pool, _mh.journal_boots_reader(),
+                     codex_shim_client.judge_transport)
+
+
 @app.get("/health/deep")
 def health_deep() -> dict:
     """Deeper liveness probe (audit finding 2026-06-08: shallow /health was green-lighting
@@ -960,6 +978,10 @@ def health_deep() -> dict:
     out["checks"]["canonical_key"] = _canonical_key_health(_APP_KEY_PROVIDER)
     if not out["checks"]["canonical_key"]["ok"]:
         out["ok"] = False
+    # Spec §4 (P1-2): which judge transport this host uses — native codex exec on the Linux
+    # authority, the Windows HTTP shim on WSL boxes, none when neither is available.
+    # Informational — never flips ok.
+    out["checks"]["judge_transport"] = codex_shim_client.judge_transport()
     # AMS-09 (2026-08-07): BM25 sparse-leg liveness — GATING. The lexical leg
     # died silently for 33 days behind mem0's fastembed ImportError fail-soft
     # while this endpoint stayed green (the exact 'shallow health green-lighting

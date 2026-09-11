@@ -138,6 +138,21 @@ A **Linux replica** is a thin client plus a dormant, read-only copy of the Brain
 
 The restore script carries the One-Brain guard itself: it refuses unless `~/.mem0/role` is `replica` **and** the authority is remote, so it can never overwrite a live store. The watcher's behaviour and the one deliberate difference from the PowerShell watcher (refresh while online, not at go_offline) are in [`offline-travel.md`](offline-travel.md).
 
+### Linux authority, native (`install/linux-authority.sh`)
+
+The **native authority** is the Brain installed on a plain Linux box — no WSL, no Windows user,
+no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh --bind-ip <tailnet ipv4> --secrets-dir <dir> [--user-id <tenant>] [--dry-run] [--render-only <dir>]`:
+
+1. **Refuses** a wildcard, loopback or malformed bind (the authority listens on its tailnet address only), a missing `ams-api-key.cred` / `ams-canonical-key.cred` (made once on that box with `systemd-creds --user encrypt --with-key=host+tpm2`), and an install whose `~/apps/mem0-server`, `~/apps/mem0-scripts`, `~/qdrant-server`, `~/.mem0` are not symlinks into the data dataset (nothing on the root disk).
+2. Writes `~/.mem0/role` = `brain`, `~/.mem0/stack.env` with **`MEM0_HOST_KIND=native`**, `MEM0_BIND=<ip>`, `MEM0_ROLE=brain`, `MEM0_SECRETS_DIR`, and `~/.mem0/authority-url`.
+3. Provisions Python 3.12 through `uv`, Qdrant on loopback `6333` (ZFS is an accepted storage filesystem here; the restore drill is its proof) and the mem0 venv exactly as the replica installer does — module list, Qdrant version and pip line are read from `install/1-wsl-services.sh` at run time.
+4. Renders the shared units with the usual sentinels, **drops the WSL `ExecStartPre` DPAPI fetch from the rendered `mem0.service`**, and adds the drop-in `mem0.service.d/native.conf` (template `systemd/mem0-native.conf`): `ExecStartPre=` cleared, then `wait-for-bind.sh <ip> 120` (exit 75 = retry, 78 = wildcard refused), `LoadCredentialEncrypted=` for both keys, `MEM0_API_KEY_FILE=%d/ams-api-key`, `MEM0_HOST_KIND=native`, `MEM0_CODEX_TRANSPORT=native`, `MEM0_ZFS_DATASET`. The key provider reads the canonical key from `$CREDENTIALS_DIRECTORY` first (`source: credential` in `/health/deep`).
+5. Enables **only** `qdrant.service`, `mem0.service`, `l10-audit.timer` and `ams-nightly.timer`; every per-job timer a previous install may have enabled is turned off (one chain, see below). `--render-only <dir>` writes the resolved unit set and exits without touching `$HOME`; the test suite greps that set for `/mnt/c`, `cmd.exe`, `powershell.exe` and the DPAPI fetch.
+
+**One nightly chain.** `ams-nightly.timer` (`OnCalendar=03:00`, `Persistent=true`, `OnBootSec=15min`) starts `ams-nightly.target`; each step is an `ams-step-<name>.service` attached with `WantedBy=ams-nightly.target` + `After=<previous step>` — never `Requires=`, so a failed step never stops the backup. Every step runs through `scripts/wsl/ams-step.sh [--guard] <step> <cmd…>`, which appends one receipt line to `~/.mem0/maintenance/receipts.jsonl` (`{ts, step, ok, exit, duration_ms, receipt_id, note}`); `--guard` makes the step a receipted no-op when `last-chain-success` is younger than 20 h (the boot-time re-run of a night that already completed). The last step re-arms the RTC wake for 02:45 (`ams-rtcwake-arm.sh`; each wake consumes the alarm). `GET /health/maintenance` folds those receipts into per-step last success / duration / receipt id, flags steps stale after 48 h, reports the judge transport, pool usage with the 85 % alarm and the boot ids of the last 7 days.
+
+**Judge transport.** `MEM0_CODEX_TRANSPORT = shim | native | auto` (default `auto`: a host with `MEM0_HOST_KIND=native` and `codex` on PATH judges natively; everything else keeps the Windows HTTP shim). The native path runs `codex exec` as a subprocess behind the shim client's fail-soft contract and single-flight lock (`~/.mem0/codex-native.lock`); `/health/deep` reports `checks.judge_transport`.
+
 ### The deploy pipeline
 
 `deploy.sh` is the single path from repo to live runtime. It sources `~/.mem0/stack.env` for the sentinel values (`WSL_USER` is always `$USER`) and runs the pipeline in a fixed order with a hard gate before any restart (see *Important flows*).

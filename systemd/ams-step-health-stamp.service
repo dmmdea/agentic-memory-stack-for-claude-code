@@ -1,0 +1,11 @@
+[Unit]
+Description=AMS chain step: pull /health/maintenance and keep the answer beside the receipts
+PartOf=ams-nightly.target
+After=ams-step-stack-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh health-stamp /bin/bash %h/apps/mem0-scripts/ams-health-stamp.sh
+
+[Install]
+WantedBy=ams-nightly.target
