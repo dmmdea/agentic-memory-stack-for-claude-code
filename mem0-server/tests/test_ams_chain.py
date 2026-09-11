@@ -25,7 +25,9 @@ WEEKLY = {"decay-scan", "goals-stale-sweep", "contradiction-sweep", "episodic-re
 PYTHON = {"dream", "semantic-dedup", "index-refresh", "goal-recurrence-promote", "decay-scan", "goals-stale-sweep",
           "contradiction-sweep", "episodic-reconcile", "retrieval-pairs"}
 CODEX = {"dream", "contradiction-sweep", "retrieval-pairs"}
-UNGUARDED = {"health-stamp", "rtcwake"}
+# Every step AFTER the stamping stack-backup step runs unguarded: the first v1.22.1 chain no-op'd
+# syncoid, pcloud-copy and morning-summary because their predecessor had just stamped the night.
+UNGUARDED = {"syncoid", "pcloud-copy", "morning-summary", "health-stamp", "rtcwake"}
 
 
 def test_every_step_is_a_unit_in_chain_order():
@@ -46,6 +48,7 @@ def test_every_step_is_a_unit_in_chain_order():
             assert "--guard stack-backup" in t, "the backup is the step that stamps last-chain-success"
         elif s in UNGUARDED:
             assert "--guard" not in t
+            assert ORDER.index(s) > ORDER.index("stack-backup"), "only steps after the stamping step may run unguarded"
         else:
             assert f"--guarded {s}" in t or f"--guarded --weekly Sun {s}" in t, f"{s} must be check-only guarded"
         if s in PYTHON:

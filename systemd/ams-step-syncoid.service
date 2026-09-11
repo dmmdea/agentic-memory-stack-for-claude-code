@@ -6,7 +6,7 @@ ConditionPathExists=%h/.mem0/scripts/syncoid.sh
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded syncoid /bin/bash %h/.mem0/scripts/syncoid.sh
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh syncoid /bin/bash %h/.mem0/scripts/syncoid.sh
 
 [Install]
 WantedBy=ams-nightly.target

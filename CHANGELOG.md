@@ -4,6 +4,12 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.22.2 (2026-09-11) — the steps after the backup run unguarded
+
+The first v1.22.1 chain run receipted `syncoid`, `pcloud-copy` and `morning-summary` as guard no-ops: they
+carried `--guarded` and their predecessor, `stack-backup`, had just stamped the night. Every step after the
+stamping step now runs unguarded (all three are idempotent).
+
 ## v1.22.1 (2026-09-11) — the first v1.22 deploy on the authority: l10-audit's key, the pool figure
 
 Two findings from the live re-install. (1) `l10-audit.service` runs on its own timer outside the
