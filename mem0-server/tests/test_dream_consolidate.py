@@ -246,6 +246,45 @@ def test_drift_canary_before_after_and_alarm(home, monkeypatch):
     assert rec["kind"] == "drift"
 
 
+def test_orient_read_failure_degrades_to_empty(home):
+    m = _mod()
+    fm = FakeMem0(EV)
+    fm.goals = lambda status, limit: (_ for _ in ()).throw(RuntimeError("blip"))
+    out = _run(m, [], mem0=fm, judge=_judge('{"signals":[]}'))
+    assert out["phase"] == "gather", "a transient orient read failure is logged, not a traceback"
+
+
+def test_failed_phases_exit_5_and_skips_exit_0(home, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (2, "boom"))
+    with pytest.raises(SystemExit) as e:
+        m.main([], mem0=FakeMem0(EV), judge=_judge(SIG, '{"insights":[]}', "[]"), qdrant_http=None, eval_runner=lambda c: (0, ""))
+    assert e.value.code == 5, "an index build failure must receipt ok:false"
+    with pytest.raises(SystemExit) as e:
+        m.main([], mem0=FakeMem0(EV), judge=_judge({"ok": False, "error_type": "usage_limit", "error": "x"}), qdrant_http=None, eval_runner=lambda c: (0, ""))
+    assert e.value.code == 5
+    (home / ".mem0" / "dedup.lock").write_text("x")
+    with pytest.raises(SystemExit) as e:
+        m.main([], mem0=FakeMem0(EV), judge=_judge(SIG), qdrant_http=None, eval_runner=lambda c: (0, ""))
+    assert e.value.code == 0, "a deliberate skip is a quiet night"
+
+
+def test_promotion_summary_append_failure_is_non_fatal(home, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, ""))
+    orig = m.Dream._append_morning
+    calls = []
+
+    def flaky(self, section):
+        calls.append(section)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return orig(self, section)
+    monkeypatch.setattr(m.Dream, "_append_morning", flaky)
+    out = _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, '{"insights":[]}', "[]"))
+    assert out["phase"] == "done" and (home / ".mem0" / "maintenance" / "last-dream").exists()
+
+
 def test_unreachable_authority_exits_4(home):
     m = _mod()
     with pytest.raises(SystemExit) as e:

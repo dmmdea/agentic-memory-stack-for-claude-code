@@ -22,8 +22,10 @@ What differs on the authority, and why:
 - NOTHING UNDER /tmp: the drift snapshots and every receipt live under ~/.mem0/maintenance/dream
   (a symlink into the dataset; the root disk carries no AMS state).
 
-Exit codes: 0 for every completed OR deliberately skipped cycle (the receipt note says which);
-4 when the authority is unreachable (that is a failed step, not a quiet night).
+Exit codes: 0 for every completed OR deliberately skipped cycle (throttle, quota, dedup mutex, no
+signals; the receipt note says which); 4 when the authority is unreachable; 5 when a phase
+FAILED (judge call failed, malformed judge JSON, index build failed). A failed phase must
+receipt ok:false, or /health/maintenance could never report a dream that breaks every night.
 """
 from __future__ import annotations
 
@@ -575,13 +577,15 @@ class Dream:
         # ---- phase 1: orient
         log("=== phase 1: orient ===")
         memorymd = self.mem0.read_memory_md()
-        all_ev = list(self.mem0.evidence(200))
+        # Every orient read degrades to empty on a transient error (the PS helpers each
+        # try/catch to ''); the explicit health gate below decides whether to abort.
+        all_ev = list(self._soft("evidence", lambda: self.mem0.evidence(200)))
         insights = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in all_ev if _tier(e) == "insight")
-        episodes = self.mem0.episodes(7)
+        episodes = self._soft("episodes", lambda: self.mem0.episodes(7))
         ep_lines = _lines(f"- [{_clip(e.get('ended_at') or '?', 10)}] {e.get('brand') or 'unknown'}: {_clip(e.get('goal_text') or e.get('summary_text') or '', 130)}" for e in episodes)
-        open_goals = _lines(f"- [{g.get('brand') or 'unknown'}] [P{g.get('priority') or 3}] {g.get('title')}" for g in self.mem0.goals("open", 5))
-        blocked = _lines(f"- [{g.get('brand') or 'unknown'}] {g.get('title')}" for g in self.mem0.goals("blocked", 3))
-        oqs = _lines(f"- [{q.get('brand') or 'cross-brand'}] {_clip(q.get('question_text') or '', 120)}" for q in self.mem0.open_questions("open", 5))
+        open_goals = _lines(f"- [{g.get('brand') or 'unknown'}] [P{g.get('priority') or 3}] {g.get('title')}" for g in self._soft("goals", lambda: self.mem0.goals("open", 5)))
+        blocked = _lines(f"- [{g.get('brand') or 'unknown'}] {g.get('title')}" for g in self._soft("blocked goals", lambda: self.mem0.goals("blocked", 3)))
+        oqs = _lines(f"- [{q.get('brand') or 'cross-brand'}] {_clip(q.get('question_text') or '', 120)}" for q in self._soft("open questions", lambda: self.mem0.open_questions("open", 5)))
         self.save_phase("orient", {"memorymd_chars": len(memorymd), "existing_insights_count": len(insights.splitlines()),
                                    "recent_episodes_count": len(episodes), "open_goals_count": len(open_goals.splitlines()),
                                    "blocked_goals_count": len(blocked.splitlines()), "open_questions_count": len(oqs.splitlines()),
@@ -613,7 +617,7 @@ class Dream:
         self.ms["gather"], self.tokens["gather"] = g["duration_ms"], int(g.get("tokens_used") or 0)
         if not g.get("ok"):
             log(f"  gather codex failed: {g.get('error_type')} {g.get('error', '')}")
-            return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}"}
+            return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}", "failed": True}
         parsed = extract_json(g.get("response", ""), "signals")
         signals = list(parsed.get("signals") or []) if parsed else []
         self.save_phase("gather", {"signals": signals, "codex_ms": self.ms["gather"], "tokens": self.tokens["gather"], "dry_run": self.dry})
@@ -646,12 +650,12 @@ class Dream:
         self.ms["consolidate"], self.tokens["consolidate"] = c["duration_ms"], int(c.get("tokens_used") or 0)
         if not c.get("ok"):
             log(f"  consolidate codex failed: {c.get('error_type')} {c.get('error', '')}")
-            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate codex failed: {c.get('error_type')}"}
+            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate codex failed: {c.get('error_type')}", "failed": True}
         parsed = extract_json(c.get("response", ""), "insights")
         if parsed is None:
             log("  consolidate: malformed JSON from codex; skipping throttle mark")
             log(f"  preview: {_clip(c.get('response', ''), 300)}")
-            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from codex; throttle NOT marked"}
+            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from codex; throttle NOT marked", "failed": True}
         ins_list = list(parsed.get("insights") or [])
         self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
 
@@ -774,7 +778,10 @@ class Dream:
         if not self.dry:
             stamp = self.now.strftime("%Y-%m-%d %H:%M")
             body = _lines(summary) if summary else "- (none promoted this cycle)"
-            self._append_morning(f"\n## Autonomous canonical promotions -- {stamp} (review/demote as needed)\n{body}\n")
+            try:
+                self._append_morning(f"\n## Autonomous canonical promotions -- {stamp} (review/demote as needed)\n{body}\n")
+            except OSError as e:
+                log(f"  autopromote: morning-summary append failed (non-fatal): {e}")
         log(f"  autopromote done: promoted={self.promoted} failed={failed} gate_blocked={blocked_n} deduped={len(deduped)} over_cap={len(over_cap)} gate_codex_tokens={self.tokens['gate']} (DryRun={self.dry}, {promote_ms if promote_ms is not None else 'skipped'})")
 
         # ---- phase 4: prune & index (deployed builder; the throttle marks only after a good build)
@@ -785,7 +792,7 @@ class Dream:
             log(f"  {out}")
             if index_exit != 0:
                 log(f"  index build failed (exit={index_exit}); throttle NOT marked")
-                return {"phase": "prune", "posted": self.posted, "promoted": self.promoted, "note": f"index build failed (exit={index_exit}); throttle NOT marked"}
+                return {"phase": "prune", "posted": self.posted, "promoted": self.promoted, "note": f"index build failed (exit={index_exit}); throttle NOT marked", "failed": True}
             ams_env.mark_throttle("dream")
             ams_env.mark_throttle("index-refresh")   # the decoupled refresh step need not rebuild what this just built
             self.save_phase("prune", {"posted_insights": self.posted, "index_rebuilt": True, "index_exit_code": 0,
@@ -842,6 +849,14 @@ class Dream:
                             duration_ms=self.ms["gather"] + self.ms["consolidate"], status="ok", items_posted=self.posted, outcome="ok")
         log(f"=== dream cycle done (DryRun={self.dry}) ===")
         return {"phase": "done", "posted": self.posted, "promoted": self.promoted, "note": "dream cycle done"}
+
+    def _soft(self, what: str, call):
+        """One orient read; a failure is logged and reads as empty (never a traceback at 3 am)."""
+        try:
+            return list(call() or [])
+        except Exception as e:  # noqa: BLE001
+            log(f"  {what} read failed (non-fatal): {e}")
+            return []
 
     def _gate_log(self, v: dict, mode: str) -> None:
         """One pg-v1 line per gated nominee (the calibration log the enforce flip is read from)."""
@@ -901,6 +916,8 @@ def main(argv=None, **injected) -> None:
     print(f"dream: {out['note']} (posted={out['posted']} promoted={out['promoted']})", flush=True)
     if out.get("unreachable"):
         sys.exit(4)
+    if out.get("failed"):
+        sys.exit(5)
     sys.exit(0)
 
 

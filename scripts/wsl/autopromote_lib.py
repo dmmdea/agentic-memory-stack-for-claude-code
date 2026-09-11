@@ -527,8 +527,10 @@ def promotion_gate_verdict(memory_id: str, candidate_text: str, evidence_record,
             try:
                 ams_env.write_usage("dream-gate", tokens_used=codex_tokens, duration_ms=codex_ms,
                                     model_requested=ams_env.MODEL_SYNTHESIS, effort_requested=ams_env.EFFORT_SYNTHESIS,
-                                    model_resolved=str((res or {}).get("model_resolved") or ""),
-                                    effort_resolved=str((res or {}).get("effort_resolved") or ""),
+                                    # resolved model/effort: the native transport does not parse the codex header
+                                    # (Parse-CodexHeader has no Python twin yet), so the fields stay empty rather
+                                    # than claim a value; codex-usage-report counts them as unparsed, never as drift.
+                                    model_resolved="", effort_resolved="",
                                     status="ok" if v["parsed"] else "error",
                                     outcome="ok" if v["parsed"] else "parse_fail")
             except Exception:  # noqa: BLE001 — telemetry must never fail the verdict

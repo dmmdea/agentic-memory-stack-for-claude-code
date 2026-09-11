@@ -111,3 +111,13 @@ def test_health_embedder_cold_embedder_answers_503_with_retry_after(health_clien
     assert r.status_code == 503
     assert r.headers["Retry-After"] == "10"
     assert r.json()["reason"] == "cold-embedder"
+
+
+def test_http_5xx_from_the_embedder_is_an_outage_4xx_is_not():
+    import httpx as _h
+    import embedder_503 as e5mod
+    req = _h.Request("POST", "http://127.0.0.1:11436/v1/embeddings")
+    e5 = _h.HTTPStatusError("boom", request=req, response=_h.Response(503, request=req))
+    e4 = _h.HTTPStatusError("bad", request=req, response=_h.Response(400, request=req))
+    assert e5mod.classify(e5) == e5mod.RETRY_AFTER_S
+    assert e5mod.classify(e4) is None
