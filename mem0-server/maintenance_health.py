@@ -52,20 +52,27 @@ def parse_zfs_list(text: str) -> tuple[int, int]:
     return int(used), int(avail)
 
 
+def parse_zpool_list(text: str) -> tuple[int, int]:
+    """`zpool list -Hp -o allocated,size <pool>` -> (used_bytes, avail_bytes) = (alloc, size-alloc).
+    The POOL figure is zpool's capacity, the number every receipt and the operator quote; the root
+    dataset's used/avail subtracts slop space and reservations and read 85.9 % against a 76 % pool."""
+    alloc, size = text.strip().split()[:2]
+    return int(alloc), max(0, int(size) - int(alloc))
+
+
 def zfs_pool_reader(dataset: str) -> Callable[[], tuple[int, int, int, int]]:
     """(pool_used, pool_avail, dataset_used, dataset_avail). The POOL is the alarm subject
     (spec §9: pool usage, alarm at 85 %); a quota-bearing dataset reports its quota headroom
     as avail, which read 2 % while the pool stood at 78 % (first staging night)."""
     pool = dataset.split("/", 1)[0]
 
-    def one(name: str) -> tuple[int, int]:
-        cp = subprocess.run(["zfs", "list", "-Hp", "-o", "used,avail", name],
-                            capture_output=True, text=True, timeout=5, check=True)
-        return parse_zfs_list(cp.stdout)
-
     def read() -> tuple[int, int, int, int]:
-        pu, pa = one(pool)
-        du, da = one(dataset) if dataset != pool else (pu, pa)
+        cp = subprocess.run(["zpool", "list", "-Hp", "-o", "allocated,size", pool],
+                            capture_output=True, text=True, timeout=5, check=True)
+        pu, pa = parse_zpool_list(cp.stdout)
+        cp = subprocess.run(["zfs", "list", "-Hp", "-o", "used,avail", dataset],
+                            capture_output=True, text=True, timeout=5, check=True)
+        du, da = parse_zfs_list(cp.stdout)
         return pu, pa, du, da
     return read
 

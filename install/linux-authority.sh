@@ -93,9 +93,13 @@ render_units() {  # $1 = destination dir
         "$REPO_ROOT/systemd/mem0-native.conf" > "$dst/mem0.service.d/native.conf"
     # no dataset given: the endpoint falls back to the disk usage of the home filesystem
     [ -n "$ZFS_DATASET" ] || sed -i '/^Environment=MEM0_ZFS_DATASET=$/d' "$dst/mem0.service.d/native.conf"
+    # l10-audit runs on its own timer outside the chain and needs the key credential itself.
+    mkdir -p "$dst/l10-audit.service.d"
+    sed -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" "$REPO_ROOT/systemd/l10-audit-native.conf" > "$dst/l10-audit.service.d/native.conf"
+    grep -q "__[A-Z_]*__" "$dst/l10-audit.service.d/native.conf" && fail "unresolved sentinel in l10-audit native.conf"
     grep -q "__[A-Z_]*__" "$dst/mem0.service.d/native.conf" && fail "unresolved sentinel in native.conf"
     local bad
-    bad="$(grep -lE '/mnt/c|cmd\.exe|powershell\.exe|dpapi-fetch-key\.sh|/run/WSL' "$dst"/* "$dst"/mem0.service.d/native.conf 2>/dev/null || true)"
+    bad="$(grep -lE '/mnt/c|cmd\.exe|powershell\.exe|dpapi-fetch-key\.sh|/run/WSL' "$dst"/* "$dst"/mem0.service.d/native.conf "$dst"/l10-audit.service.d/native.conf 2>/dev/null || true)"
     [ -z "$bad" ] || fail "a rendered unit still carries a WSL-only line: $bad"
     return 0
 }

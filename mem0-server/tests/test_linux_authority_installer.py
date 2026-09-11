@@ -153,3 +153,14 @@ def test_nft_persistence_unit_is_a_root_oneshot():
     sh = SCRIPT.read_text(encoding="utf-8")
     assert "ams-nft.service" in sh and "sudo -n" in sh
     assert "enable --now nftables.service" not in sh, "nftables.service would flush the iptables-nft tables"
+
+
+def test_l10_audit_gets_its_own_credential_dropin(tmp_path):
+    """l10-audit runs on its own timer outside the chain; on v1.22.0 it exited 1 with
+    'no mem0 API key' because only mem0.service and the chain steps loaded the credential."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    conf = (out / "l10-audit.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert f"LoadCredentialEncrypted=ams-api-key:{tmp_path / 'secrets'}/ams-api-key.cred" in conf
+    assert "Environment=MEM0_API_KEY_FILE=%d/ams-api-key" in conf and "__SECRETS_DIR__" not in conf

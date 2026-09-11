@@ -96,7 +96,7 @@ Five more added by W3 and W4 (the alarm-mouth + revive-or-bury tracks — all in
 
 ### `GET /health/maintenance`
 
-The authority's nightly chain, folded from `~/.mem0/maintenance/receipts.jsonl` (v1.21; v1.22 adds `dataset` and `usage`): `steps.<name>` = `{last_success, last_run, duration_ms, receipt_id, ok}`; `stale_steps` = steps without a success in 48 h; `judge_transport` = `native|shim|none`; `pool` = `{used_pct, alarm, threshold_pct}` of the **pool** (alarm at 85 %); `dataset` = `{used_bytes, avail_bytes, used_pct}` of the AMS dataset (quota headroom, informational; present only with `MEM0_ZFS_DATASET`); `usage` = the newest Codex plan-window probe `{used_percent, resets_in_days, probed_at, note}`; `boots_7d` = boot ids of the last seven days. `ok` is false on a pool alarm or a stale step. Never raises on a reader: an unreadable pool/journal/ledger reads as unknown.
+The authority's nightly chain, folded from `~/.mem0/maintenance/receipts.jsonl` (v1.21; v1.22 adds `dataset` and `usage`): `steps.<name>` = `{last_success, last_run, duration_ms, receipt_id, ok}`; `stale_steps` = steps without a success in 48 h; `judge_transport` = `native|shim|none`; `pool` = `{used_pct, alarm, threshold_pct}` of the **pool** as `zpool list` reports capacity (alarm at 85 %); `dataset` = `{used_bytes, avail_bytes, used_pct}` of the AMS dataset (quota headroom, informational; present only with `MEM0_ZFS_DATASET`); `usage` = the newest Codex plan-window probe `{used_percent, resets_in_days, probed_at, note}`; `boots_7d` = boot ids of the last seven days. `ok` is false on a pool alarm or a stale step. Never raises on a reader: an unreadable pool/journal/ledger reads as unknown.
 
 ### `GET /health/morning-summary`
 

@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.22.1 (2026-09-11) — the first v1.22 deploy on the authority: l10-audit's key, the pool figure
+
+Two findings from the live re-install. (1) `l10-audit.service` runs on its own timer outside the
+chain and had no key credential of its own, so on a native box it exited 1 with "no mem0 API key";
+the installer now renders `l10-audit.service.d/native.conf` (`LoadCredentialEncrypted` +
+`MEM0_API_KEY_FILE`). (2) `/health/maintenance` read the pool as the root dataset's used/avail,
+which subtracts slop space and reservations and reported 85.9 % (alarm) against a `zpool` capacity
+of 76 %; the pool figure is now `zpool list -Hp -o allocated,size`, the number every receipt quotes,
+and the dataset block keeps the `zfs` view.
+
 ## v1.22.0 (2026-09-11) — Phase 1 second half: the nightly jobs in Python on the authority, the whole chain, `cold-embedder`, and the first-nights fixes
 
 The native authority now runs every nightly job itself. Nothing is removed: the PowerShell
