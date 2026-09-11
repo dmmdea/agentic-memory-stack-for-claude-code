@@ -114,9 +114,9 @@ def test_usage_from_newest_window_probe(tmp_path):
 
 def test_morning_summary_endpoint(tmp_path, monkeypatch):
     from pathlib import Path as _P
-    monkeypatch.setattr(_P, "home", classmethod(lambda cls: tmp_path))
     from fastapi.testclient import TestClient
-    import app as appmod
+    import app as appmod  # import under the real HOME (app.py reads the key at import); sandbox the route only
+    monkeypatch.setattr(_P, "home", classmethod(lambda cls: tmp_path))
     c = TestClient(appmod.app)
     assert c.get("/health/morning-summary").status_code == 404
     d = tmp_path / ".mem0" / "maintenance"

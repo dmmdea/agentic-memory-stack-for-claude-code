@@ -13,7 +13,12 @@ if [ -z "$dst" ] && [ -f "$HOME/.mem0/stack.env" ]; then
 fi
 [ -n "$dst" ] || dst="$HOME/pCloudDrive/memory-backups/$(hostname)"
 [ -d "$src" ] || { echo "pcloud-copy: no backup dir $src" >&2; exit 2; }
-[ -d "$dst" ] || { echo "pcloud-copy: destination $dst is not a directory (mount missing?)" >&2; exit 3; }
+# The leaf (memory-backups/<host>) is ours to create; its PARENT must already exist — that is
+# what proves the cloud drive is mounted (an unmounted mount point has no memory-backups dir).
+if [ ! -d "$dst" ]; then
+    [ -d "$(dirname "$dst")" ] || { echo "pcloud-copy: destination parent $(dirname "$dst") is not a directory (mount missing?)" >&2; exit 3; }
+    mkdir -p "$dst"
+fi
 newest="$(ls -1 "$src"/manifest-*.json 2>/dev/null | sort | tail -n1 || true)"
 [ -n "$newest" ] || { echo "pcloud-copy: no manifest-*.json in $src" >&2; exit 4; }
 stamp="$(basename "$newest" .json)"; stamp="${stamp#manifest-}"

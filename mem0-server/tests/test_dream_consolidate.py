@@ -35,6 +35,9 @@ class FakeMem0:
     def evidence(self, limit=100):
         return self.ev[:limit]
 
+    def all_points(self, **kw):
+        return sorted(self.ev, key=lambda e: e.get("created_at", ""), reverse=True)
+
     def search_canonical(self):
         return self.canon
 
@@ -304,3 +307,25 @@ def test_no_powershell_or_wsl_paths_in_the_port():
     t = (SCRIPTS / "dream-consolidate.py").read_text(encoding="utf-8")
     for bad in ("wsl.exe", "powershell", "/mnt/c", "USERPROFILE", "\\\\wsl.localhost", "/tmp/dream-drift"):
         assert bad not in t
+
+
+def test_all_points_scrolls_qdrant_newest_first(home):
+    import httpx
+    m = _mod()
+    pages = {None: ({"points": [{"id": "a", "payload": {"data": "old", "user_id": "u", "created_at": "2026-09-01T00:00:00Z", "tier": "evidence", "source": "l1a"}},
+                                {"id": "hidden", "payload": {"data": "x", "user_id": "u", "created_at": "2026-09-11T00:00:00Z", "retrievable": False}}],
+                     "next_page_offset": "p2"}),
+             "p2": ({"points": [{"id": "b", "payload": {"data": "new", "user_id": "u", "created_at": "2026-09-11T06:00:00Z", "tier": "evidence"}}],
+                     "next_page_offset": None})}
+    seen = []
+
+    def h(req):
+        body = json.loads(req.content)
+        seen.append(body.get("offset"))
+        assert body["filter"]["must"][0]["match"]["value"] == "u"
+        return httpx.Response(200, json={"result": pages[body.get("offset")]})
+    c = m.Mem0Client("http://x", "k", "u", http=httpx.Client(transport=httpx.MockTransport(h)))
+    pts = c.all_points()
+    assert seen == [None, "p2"]
+    assert [p["id"] for p in pts] == ["b", "a"], "newest first, unretrievable points dropped"
+    assert pts[1]["metadata"]["source"] == "l1a" and pts[0]["memory"] == "new"
