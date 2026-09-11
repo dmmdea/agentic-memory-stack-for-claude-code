@@ -9,6 +9,8 @@ in the first entries below — full pre-inversion history lives in the maintaine
 The first v1.22.1 chain run receipted `syncoid`, `pcloud-copy` and `morning-summary` as guard no-ops: they
 carried `--guarded` and their predecessor, `stack-backup`, had just stamped the night. Every step after the
 stamping step now runs unguarded (all three are idempotent).
+The native Codex transport also parses the single-line `tokens used N` that codex 0.154 prints (the
+first live native dream had recorded 0 tokens for three real calls).
 
 ## v1.22.1 (2026-09-11) — the first v1.22 deploy on the authority: l10-audit's key, the pool figure
 
