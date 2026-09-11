@@ -146,6 +146,37 @@ To catch a consolidation that silently degrades retrieval, the dream takes a **b
 
 The canary harness lives in the eval checkout: `<EvalRootWsl>/eval/retrieval-drift/retrieval_drift.py`. **`EvalRootWsl` fallback:** the eval tree is optional (it lives with the private moat checkout after the repo split). The consolidator resolves `EvalRootWsl` from the operator receipt; if absent, it falls back to `RepoRootWsl`, and if that is also absent, to an empty string — in which case the drift snapshot **no-ops and the compare is skipped, never raising a false alarm**. A snapshot that fails for any reason also skips the compare for that cycle.
 
+## On a native Linux authority (v1.22, Phase 1)
+
+On the native authority the same cycle runs as the first step of the single nightly chain
+(`ams-step-dream.service` → `scripts/wsl/dream-consolidate.py`), not from a scheduler of its own.
+What is the same: the four phases and their prompts, the 23 h throttle, the 4C gate with the same
+`shadow`/`enforce` modes (`MEM0_PROMOTION_GATE_MODE` env, else `stack.env`), the cap of three
+promotions, the drift canary before/after, the morning summary and the usage ledger rows
+(`dream-gather`, `dream-consolidate`, `dream-promote`, `dream-gate`, `dream`). What differs:
+
+- **Judge transport.** Every Codex call is `codex_shim_client.judge` on the native transport; its
+  file lock is the single-flight mutex, and the whole cycle additionally holds
+  `~/.mem0/maintenance/dream.lock` so a chain re-entry is a receipted skip.
+- **Quota gate (spec §4).** Before the first judge call the newest plan-window probe
+  (`codex-usage-report.py --probe`, run by the unit's `ExecStartPre`) is read; below the 25 %
+  reserve the night is skipped with usage outcome `skipped_quota` and the throttle is not marked. An
+  unknown window allows: the rule protects a reserve it can see.
+- **Gather input is the store.** Workstation transcripts never reach the authority (the
+  transcript-ingest endpoint was cut in review): the corpus is the last 36 h of evidence, each line
+  tagged with its `source`, plus the recent episodes; transcripts that exist locally under
+  `~/.claude/projects` are appended exactly as the PowerShell does.
+- **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
+  drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
+  throttle stamp is `~/.mem0/maintenance/last-dream`, written by Python only.
+- **Secrets.** The API key arrives as `MEM0_API_KEY_FILE` and the canonical key under
+  `$CREDENTIALS_DIRECTORY` (both `LoadCredentialEncrypted=` lines of the step unit);
+  `mem0-canonize.sh --actor dream-autopromote` reads the credential first.
+- **No catch-up script.** `ams-nightly.timer` is `Persistent=` and the chain carries a boot guard;
+  a missed night runs at the next boot and a completed one is not re-run.
+- **Index refresh** is its own chain step (`memory-index-refresh.py`, 6 h throttle, mkdir mutex);
+  a successful dream stamps that throttle too, so on a full-dream night the step is a no-op.
+
 ## Data and state
 
 | File | Role |
@@ -213,6 +244,7 @@ The pure decision logic in `autopromote-lib.ps1` (`Invoke-PromotionGate`, `Resol
 - [`../../scripts/windows/dream-catchup.ps1`](../../scripts/windows/dream-catchup.ps1) — the debt-based missed-run catch-up.
 - [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the shared Codex lock and throttle helpers.
 - [`../../scripts/wsl/mem0-canonize.sh`](../../scripts/wsl/mem0-canonize.sh) — the HMAC-signed canonical promotion the dream calls.
+- [`../../scripts/wsl/dream-consolidate.py`](../../scripts/wsl/dream-consolidate.py), [`autopromote_lib.py`](../../scripts/wsl/autopromote_lib.py), [`memory-index-refresh.py`](../../scripts/wsl/memory-index-refresh.py), [`codex_usage.py`](../../scripts/wsl/codex_usage.py) — the Python ports that run on a native Linux authority (v1.22).
 
 ## Related docs
 

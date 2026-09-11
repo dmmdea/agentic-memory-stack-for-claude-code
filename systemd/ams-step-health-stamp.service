@@ -1,7 +1,7 @@
 [Unit]
-Description=AMS chain step: pull /health/maintenance and keep the answer beside the receipts
+Description=AMS chain step: health stamp
 PartOf=ams-nightly.target
-After=ams-step-stack-backup.service
+After=mem0.service ams-step-morning-summary.service
 
 [Service]
 Type=oneshot

@@ -17,11 +17,13 @@ import os
 import sys
 from pathlib import Path
 import httpx
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
+import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
-MEM0 = "http://127.0.0.1:18791"
-KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
+MEM0 = ams_env.mem0_url()
+KEY = ams_env.api_key()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 EVIDENCE_AGE_DAYS = 90
 REPORT = Path.home() / ".mem0" / "decay-report.jsonl"

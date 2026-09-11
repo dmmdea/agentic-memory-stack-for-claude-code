@@ -1,7 +1,7 @@
 [Unit]
-Description=AMS chain step: re-arm the RTC wake for 02:45 (each wake consumes the alarm)
+Description=AMS chain step: arm the RTC wake for the next 02:45
 PartOf=ams-nightly.target
-After=ams-step-health-stamp.service
+After=mem0.service ams-step-health-stamp.service
 
 [Service]
 Type=oneshot

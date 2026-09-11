@@ -109,3 +109,47 @@ def test_wait_for_bind_parses_and_refuses_wildcard():
     assert r.returncode == 0, r.stderr
     r = subprocess.run([BASH, str(script), "0.0.0.0", "1"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 78
+
+
+def test_rendered_units_never_hardcode_the_tenant_home(tmp_path):
+    """The Linux user and the mem0 tenant differ on a native box: the first live l10-audit run died
+    203/EXEC on /home/<tenant>/apps/... . Every home-relative path must render as %h."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--user-id", "tenantx", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    for f in out.rglob("*"):
+        if f.is_file():
+            t = f.read_text(encoding="utf-8")
+            assert "/home/tenantx" not in t, f"{f.name} resolves a path through the tenant name"
+            assert "/home/__WSL_USER__" not in t
+    assert "Environment=MEM0_DEFAULT_USER_ID=tenantx" in (out / "mem0.service").read_text(encoding="utf-8")
+    assert "%h/apps/mem0-server/.venv/bin/python" in (out / "l10-audit.service").read_text(encoding="utf-8")
+
+
+def test_native_conf_pins_codex_home_to_the_secrets_dir(tmp_path):
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    conf = (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert f"Environment=CODEX_HOME={tmp_path / 'secrets'}/codex" in conf
+
+
+def test_eval_root_is_validated_and_pcloud_dir_accepted(tmp_path):
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--eval-root", str(tmp_path / "nope"), "--dry-run"], tmp_path)
+    assert r.returncode != 0 and "retrieval_drift.py" in r.stderr
+    ev = tmp_path / "eval" / "eval" / "retrieval-drift"
+    ev.mkdir(parents=True)
+    (ev / "retrieval_drift.py").write_text("", encoding="utf-8")
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--eval-root", str(tmp_path / "eval"), "--pcloud-dir", "/x/y", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "MEM0_EVAL_ROOT=%s" in text and "MEM0_PCLOUD_DIR=%s" in text
+
+
+def test_nft_persistence_unit_is_a_root_oneshot():
+    t = (REPO_ROOT / "systemd" / "ams-nft.service").read_text(encoding="utf-8")
+    assert "Type=oneshot" in t and "ExecStart=/usr/sbin/nft -f /etc/nftables.d/ams.nft" in t
+    assert "After=network-pre.target" in t and "WantedBy=multi-user.target" in t
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "ams-nft.service" in sh and "sudo -n" in sh
+    assert "enable --now nftables.service" not in sh, "nftables.service would flush the iptables-nft tables"

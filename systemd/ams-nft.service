@@ -1,0 +1,18 @@
+# AMS authority bind belt (spec §4, Phase 0 P0-5 design note). The authority binds its tailnet
+# address only; this table drops :18791/:6333 arriving on any other interface. It is its OWN
+# nftables table loaded from its own file, never nftables.service: that unit's conf starts with
+# `flush ruleset`, which would destroy the iptables-nft tables tailscale and docker manage.
+# A ROOT system unit (installed by install/linux-authority.sh with sudo when the rule file
+# exists) so the belt survives a reboot — the first live reboot lost it.
+[Unit]
+Description=AMS authority bind belt: load the inet ams nftables table (mem0/qdrant reachable over tailscale0 + lo only)
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/ams.nft
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

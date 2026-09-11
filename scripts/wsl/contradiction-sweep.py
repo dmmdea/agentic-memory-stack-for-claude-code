@@ -81,6 +81,9 @@ from typing import Optional
 
 import httpx
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
+import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
+
 # v0.27.3: reuse the shared Codex bridge (judge_contradiction) so the sweep judges with Codex
 # via the Windows HTTP shim — the model-routing rule (all LLM judgment uses Codex, never a local
 # model; the v0.21.1 offload-e4b judge was the audited misrouting). The bridge lives in
@@ -131,7 +134,16 @@ QDRANT = "http://127.0.0.1:6333"
 # DISCOVERY (scroll_canonicals + query_similar) ran on dead vectors while stamps wrote to the live
 # collection via the mem0 API. mem0_egemma_768 is the live collection (config.py collection_name).
 COLLECTION = "mem0_egemma_768"
-MEM0 = "http://127.0.0.1:18791"
+MEM0 = ams_env.mem0_url()
+
+
+def _api_key_or_raise() -> str:
+    """The API key through ams_env; an unresolved key raises OSError so every caller's existing
+    except-branch keeps its truthful message (the native authority has no ~/.mem0/api-key)."""
+    key = ams_env.api_key()
+    if not key:
+        raise OSError("api key unresolved (MEM0_API_KEY_FILE / ~/.mem0/api-key)")
+    return key
 LLAMA_SWAP = "http://127.0.0.1:11436"
 # Local instruct judge model on llama-swap (NOT the reranker — rerankers
 # cannot chat).
@@ -1161,7 +1173,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
     api_key = ""
     if not dry_run:
         try:
-            api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+            api_key = _api_key_or_raise()
             httpx.get(f"{MEM0}/health", timeout=5.0).raise_for_status()
         except (httpx.HTTPError, OSError) as e:
             print(f"contradiction-sweep: FAIL preflight - mem0 unreachable (needed for --apply): {e}", flush=True)
@@ -1520,7 +1532,7 @@ def run_resolve_supersede(args, dry_run: bool) -> int:
     from default retrieval (v0.19 I.1) while forensic reads keep it."""
     loser, winner = str(args.resolve_supersede), str(args.winner)
     try:
-        api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+        api_key = _api_key_or_raise()
     except OSError as e:
         print(f"contradiction-sweep: resolve-supersede FAIL — api-key unreadable: {e}", flush=True)
         return 1
@@ -1963,7 +1975,7 @@ def main() -> int:
         # (the run log is the SWEEP's health signal; an operator unstamp must
         # not overwrite the last sweep outcome R6c reads).
         try:
-            api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+            api_key = _api_key_or_raise()
         except OSError as e:
             print(f"contradiction-sweep: --unstamp needs ~/.mem0/api-key: {e}",
                   flush=True)
@@ -1975,7 +1987,7 @@ def main() -> int:
     if args.promote:
         # human-confirmed enforce from the review queue — no sweep, no judging, no shim needed.
         try:
-            api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+            api_key = _api_key_or_raise()
         except OSError as e:
             print(f"contradiction-sweep: --promote needs ~/.mem0/api-key: {e}", flush=True)
             return 1
@@ -2033,7 +2045,7 @@ def main() -> int:
     api_key = None
     if not dry_run:
         try:
-            api_key = (Path.home() / ".mem0" / "api-key").read_text().strip()
+            api_key = _api_key_or_raise()
             httpx.get(f"{MEM0}/health", timeout=5.0).raise_for_status()
         except (httpx.HTTPError, OSError) as e:
             print(f"contradiction-sweep: FAIL preflight - mem0 unreachable (needed for "

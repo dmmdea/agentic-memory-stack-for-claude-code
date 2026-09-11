@@ -4,6 +4,42 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.22.0 (2026-09-11) — Phase 1 second half: the nightly jobs in Python on the authority, the whole chain, `cold-embedder`, and the first-nights fixes
+
+The native authority now runs every nightly job itself. Nothing is removed: the PowerShell
+originals and the workstation tasks stay until the Phase 5 gate; the staging copy is still discarded
+at the end of Phase 1.
+
+- **Python ports (register P1-3).** `scripts/wsl/dream-consolidate.py` (orient → gather →
+  consolidate → autopromote → prune → drift canary), `autopromote_lib.py` (the 4C promotion gate and
+  the nomination pipeline, with 1:1 twins of the three Pester files), `memory-index-refresh.py`
+  (the decoupled index refresh) and `codex_usage.py` + `codex-usage-report.py` (usage report,
+  plan-window probe, 25 % reserve gate). Every Codex call goes through the native transport and its
+  single-flight lock. On the authority the dream's gather input is the store — the last 36 h of
+  evidence plus the recent episodes — because workstation transcripts never reach it by design;
+  transcripts that exist locally are appended as before. No catch-up script: the timer's
+  `Persistent=` and the boot guard cover a missed night.
+- **The whole chain (P1-4).** Fifteen `ams-step-*.service` units in spec order (dream → semantic
+  dedup → index refresh → goal recurrence → the five Sunday jobs → stack backup → syncoid → pCloud
+  copy → morning summary → health stamp → rtcwake). Each Python step loads the API key as its own
+  systemd credential; the codex steps pin `CODEX_HOME` to the secrets dataset; the dream also loads
+  the canonical credential so autopromotion signs natively. `ams-step.sh --weekly <Day>` gates the
+  weekly jobs; `--guarded` (check-only) sits on every step between the first and the stamping
+  stack-backup step, so a boot re-run of a completed night is a chain of receipted no-ops.
+  `GET /health/morning-summary` serves the chain's summary to session starts.
+- **`cold-embedder` on the workstation side (P1-6).** The bundle daemon names a 503 carrying
+  `reason: cold-embedder`, waits the server's `Retry-After` (capped) and retries once; the
+  SessionStart hook pre-warms the embedder through the new `GET /health/embedder`.
+- **First-nights fixes.** Units render every home-relative path as `%h` (the Linux user and the
+  tenant differ on a native box: `l10-audit.service` had failed 203/EXEC); the nftables bind belt
+  persists through a root oneshot (`ams-nft.service`); `/health/maintenance` reports the POOL
+  (the dataset's quota headroom read 2 % while the pool stood at 78 %) plus a `dataset` block and
+  the Codex `usage` window; the boot guard is calendar-aware (an evening hand run no longer voids
+  the 03:00 night); `mem0.service` gets `CODEX_HOME`; every chain job resolves the authority URL and
+  the key through `ams_env.py` (no `~/.mem0/api-key` exists on the authority);
+  `mem0-canonize.sh` signs with the systemd credential first. Installer flags `--eval-root`
+  (drift canaries) and `--pcloud-dir`.
+
 ## v1.21.2 (2026-09-10) — first live chain run: steps enabled, receipt clock, restore WAL hygiene
 
 Three findings from the first chain run on the native authority. (1) `systemctl start

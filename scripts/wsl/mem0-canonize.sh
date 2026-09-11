@@ -14,6 +14,8 @@
 # Requires:
 #   ~/.mem0/api-key — regular mem0 API key
 #   HMAC signing key from ONE of (v0.19 Phase H resolution order):
+#     0. $CREDENTIALS_DIRECTORY/ams-canonical-key (systemd LoadCredentialEncrypted — the
+#        native authority hands the key to mem0.service / the dream step this way)
 #     1. $XDG_RUNTIME_DIR/mem0/canonical-key (tmpfs — present while mem0.service
 #        runs; injected by dpapi-fetch-key.sh)
 #     2. ~/.mem0/canonical-key (plaintext — dev/recovery only)
@@ -133,9 +135,12 @@ fi
 
 # ─── Read keys ───────────────────────────────────────────────────────────────
 
-API_KEY="$(cat "$HOME/.mem0/api-key")"
+# Native authority (spec §4): the API key is a systemd credential handed to the calling unit as
+# $MEM0_API_KEY_FILE; the WSL brain keeps ~/.mem0/api-key.
+API_KEY="$(cat "${MEM0_API_KEY_FILE:-$HOME/.mem0/api-key}")"
 
 # v0.19 Phase H: canonical key resolution (mirrors canonical_key_provider.py):
+#   0. $CREDENTIALS_DIRECTORY/ams-canonical-key (systemd LoadCredentialEncrypted, native authority)
 #   1. runtime tmpfs key — $XDG_RUNTIME_DIR/mem0/canonical-key, injected by
 #      dpapi-fetch-key.sh (ExecStartPre on mem0.service) while mem0 runs
 #   2. plaintext ~/.mem0/canonical-key — dev/recovery fallback (removed from
@@ -143,6 +148,10 @@ API_KEY="$(cat "$HOME/.mem0/api-key")"
 #   3. inline DPAPI decrypt of ~/.mem0/canonical-key.dpapi via WSL interop
 #      (last resort — key bytes stay in memory, never written to disk)
 resolve_canon_key() {
+  # 0. systemd LoadCredentialEncrypted on the native authority (spec §4): the calling unit
+  #    (mem0.service, ams-step-dream.service) receives the key under $CREDENTIALS_DIRECTORY.
+  local cred="${CREDENTIALS_DIRECTORY:-}/ams-canonical-key"
+  if [[ -n "${CREDENTIALS_DIRECTORY:-}" && -r "$cred" ]]; then cat "$cred"; return 0; fi
   local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mem0/canonical-key"
   if [[ -r "$runtime" ]]; then cat "$runtime"; return 0; fi
   if [[ -r "$HOME/.mem0/canonical-key" ]]; then cat "$HOME/.mem0/canonical-key"; return 0; fi

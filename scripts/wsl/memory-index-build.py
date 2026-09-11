@@ -16,6 +16,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 import httpx
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
+import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 
 def get_open_questions(n=5):
     """Read top N open questions from episodic.db for the MEMORY.md Open frontier section."""
@@ -79,7 +81,7 @@ QDRANT = "http://127.0.0.1:6333"
 # episodic-reconcile.py / brand-scope-audit.py. The dead pre-EmbeddingGemma "memories" collection
 # was removed -> scroll 404'd -> the nightly dream's phase-4 index build failed every run.
 COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
-KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
+KEY = ams_env.api_key()
 OUT = Path.home() / ".mem0" / "MEMORY.md"
 MAX_LINES = 200
 LEAD_N = 7  # cognitive working-memory anchor (Miller 7+/-2)

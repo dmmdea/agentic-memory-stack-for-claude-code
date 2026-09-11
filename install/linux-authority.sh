@@ -17,27 +17,34 @@
 #
 # Usage:
 #   bash install/linux-authority.sh --bind-ip <tailscale0 ipv4> --secrets-dir <dir with *.cred> \
-#        [--zfs-dataset <pool/dataset>] [--user-id <tenant>] [--dry-run] [--render-only <dir>]
+#        [--zfs-dataset <pool/dataset>] [--user-id <tenant>] [--eval-root <dir>] [--pcloud-dir <dir>]
+#        [--dry-run] [--render-only <dir>]
 #   --zfs-dataset: the dataset /health/maintenance reads pool usage from (omit on a non-ZFS box).
+#   --eval-root:   checkout holding eval/retrieval-drift/retrieval_drift.py (the dream's drift
+#                  canary); written to stack.env as MEM0_EVAL_ROOT. Omit -> the canary no-ops.
+#   --pcloud-dir:  where the chain's pcloud-copy step mirrors the newest backup set
+#                  (stack.env MEM0_PCLOUD_DIR; default ~/pCloudDrive/memory-backups/<hostname>).
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIND_IP=""; SECRETS_DIR=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""
+BIND_IP=""; SECRETS_DIR=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
 UV="${UV:-$HOME/.local/bin/uv}"
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --bind-ip) BIND_IP="${2:-}"; shift 2 ;;
         --secrets-dir) SECRETS_DIR="${2:-}"; shift 2 ;;
         --zfs-dataset) ZFS_DATASET="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
+        --eval-root) EVAL_ROOT="${2:-}"; shift 2 ;;
+        --pcloud-dir) PCLOUD_DIR="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -57,6 +64,7 @@ case "$BIND_IP" in 0.0.0.0|127.*) fail "--bind-ip '$BIND_IP' is a wildcard/loopb
 [ -n "$SECRETS_DIR" ] || fail "--secrets-dir <dir> is required (holds ams-api-key.cred and ams-canonical-key.cred from systemd-creds)"
 for c in ams-api-key.cred ams-canonical-key.cred; do [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c (Phase 0 P0-3: systemd-creds --user encrypt --with-key=host+tpm2)"; done
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
+[ -z "$EVAL_ROOT" ] || [ -f "$EVAL_ROOT/eval/retrieval-drift/retrieval_drift.py" ] || fail "--eval-root $EVAL_ROOT has no eval/retrieval-drift/retrieval_drift.py"
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
 MEM0_MODULES="$(grep -E '^MEM0_MODULES=' "$WSL_INSTALLER" | head -1 | sed -E 's/^MEM0_MODULES="(.*)"$/\1/')"
 QDRANT_VERSION="$(grep -E '^QDRANT_VERSION=' "$WSL_INSTALLER" | head -1 | cut -d= -f2 | tr -d '[:space:]')"
@@ -71,8 +79,11 @@ echo "    units: $UNITS"
 render_units() {  # $1 = destination dir
     local dst="$1"; mkdir -p "$dst/mem0.service.d"
     for unit in $UNITS; do
-        sed -e "s|__WSL_USER__|$USER_ID|g" -e "s|__WIN_USER__||g" -e "s|__WSL_DISTRO__|native|g" \
-            -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" "$REPO_ROOT/systemd/$unit" > "$dst/$unit"
+        # /home/__WSL_USER__ is the WSL layout, where the Linux user IS the tenant. On a native box
+        # they differ (the first live l10-audit run failed 203/EXEC on /home/<tenant>/...), so every
+        # home-relative path renders as %h FIRST; the bare sentinel then becomes the tenant id.
+        sed -e "s|/home/__WSL_USER__|%h|g" -e "s|__WSL_USER__|$USER_ID|g" -e "s|__WIN_USER__||g" -e "s|__WSL_DISTRO__|native|g" \
+            -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" "$REPO_ROOT/systemd/$unit" > "$dst/$unit"
         # The shared mem0.service keeps its WSL ExecStartPre (the DPAPI fetch) so the WSL install is
         # untouched; a native box must not carry it. The drop-in below supplies the native pre-start.
         sed -i '/dpapi-fetch-key\.sh/d' "$dst/$unit"
@@ -118,6 +129,8 @@ MEM0_BIND=$BIND_IP
 MEM0_ROLE=brain
 MEM0_SECRETS_DIR=$SECRETS_DIR
 ENV
+    [ -z "$EVAL_ROOT" ] || printf 'MEM0_EVAL_ROOT=%s\n' "$EVAL_ROOT" >> "$MEM0_DIR/stack.env"
+    [ -z "$PCLOUD_DIR" ] || printf 'MEM0_PCLOUD_DIR=%s\n' "$PCLOUD_DIR" >> "$MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi
@@ -194,6 +207,16 @@ if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; depl
         systemctl --user disable --now "$t.timer" >/dev/null 2>&1 || true
     done
     echo "    units rendered; per-job timers off"
+    # Bind belt persistence (P0-5 design note): a ROOT oneshot loading the AMS table from its own
+    # file. Never nftables.service (its conf flushes the iptables-nft tables tailscale/docker own).
+    if [ -s /etc/nftables.d/ams.nft ] && sudo -n true 2>/dev/null; then
+        sudo -n install -m 0644 "$REPO_ROOT/systemd/ams-nft.service" /etc/systemd/system/ams-nft.service \
+            && sudo -n systemctl daemon-reload && sudo -n systemctl enable --now ams-nft.service >/dev/null 2>&1 \
+            && echo "    nft belt: $(sudo -n nft list table inet ams 2>/dev/null | grep -c dport) rule(s) live, ams-nft.service enabled" \
+            || echo "    WARN: ams-nft.service install failed; run: sudo install -m 0644 systemd/ams-nft.service /etc/systemd/system/ && sudo systemctl enable --now ams-nft.service"
+    else
+        echo "    WARN: nft belt not persisted (no /etc/nftables.d/ams.nft or no passwordless sudo); run: sudo install -m 0644 systemd/ams-nft.service /etc/systemd/system/ && sudo systemctl enable --now ams-nft.service"
+    fi
 fi
 
 # ---------------------------------------------------------------- 6. enable + probes

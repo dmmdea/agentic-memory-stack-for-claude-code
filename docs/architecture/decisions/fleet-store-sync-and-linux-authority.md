@@ -103,8 +103,17 @@ in below.
 replication, secrets under `systemd-creds`, native Codex login, bind rule staged, embedder and
 reranker latency measured, RTC wake proven) closed on 2026-09-10. Phase 1 shipped its first half in
 v1.21.0: `install/linux-authority.sh`, the native judge transport, `/health/maintenance`, the
-nightly chain skeleton and the 503 mapping — proven on a staging copy, no cutover. The Python
-ports of the remaining nightly jobs and the workstation-side hook changes follow.
+nightly chain skeleton and the 503 mapping — proven on a staging copy, no cutover. v1.22.0 shipped
+the second half: the nightly jobs ported to Python on the authority (dream, autopromote, index
+refresh, usage report and its quota gate), every nightly job as a receipted step of the one chain,
+and the workstation-side `cold-embedder` handling. The Phase 1 gate (seven complete staging nights,
+canaries retrievable after each) counts from the first full-chain night. Cutover (Phase 2) has not
+begun.
+
+**Gather input on the authority.** The consolidator's gather phase reads the store — the last
+36 hours of evidence and the recent episodes — rather than workstation transcripts, which never
+reach the authority (transcript extraction stays per workstation, see Alternatives). Transcripts
+that exist locally on the authority are appended as before.
 
 ## Alternatives considered
 

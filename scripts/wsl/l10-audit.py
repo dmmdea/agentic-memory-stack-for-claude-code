@@ -26,11 +26,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
+import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 
-MEM0_URL = "http://127.0.0.1:18791"
+MEM0_URL = ams_env.mem0_url()
 QDRANT_URL = "http://127.0.0.1:6333"
 QDRANT_COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
-KEY_FILE = Path.home() / ".mem0" / "api-key"
 STATE_FILE = Path.home() / ".mem0" / "l10-state.json"
 FLAGS_FILE = Path.home() / ".mem0" / "audit-flags.jsonl"
 PROMOTE_LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"
@@ -59,9 +60,10 @@ SLOWDRIP_PERSISTENCE_DAYS = 7       # days a flag may remain unreviewed before a
 
 
 def load_key() -> str:
-    if not KEY_FILE.exists():
-        sys.exit("FAIL: no mem0 API key")
-    return KEY_FILE.read_text(encoding="utf-8").strip()
+    key = ams_env.api_key()
+    if not key:
+        sys.exit("FAIL: no mem0 API key (MEM0_API_KEY_FILE / ~/.mem0/api-key)")
+    return key
 
 
 def load_state() -> dict:

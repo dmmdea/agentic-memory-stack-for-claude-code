@@ -1,7 +1,7 @@
 [Unit]
-Description=AMS chain step: stack backup (snapshot set for the replicas' refresh path)
+Description=AMS chain step: stack backup (snapshot set for the replicas' refresh path; stamps last-chain-success)
 PartOf=ams-nightly.target
-After=mem0.service
+After=mem0.service ams-step-retrieval-pairs.service
 
 [Service]
 Type=oneshot

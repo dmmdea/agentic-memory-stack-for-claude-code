@@ -52,11 +52,41 @@ def parse_zfs_list(text: str) -> tuple[int, int]:
     return int(used), int(avail)
 
 
-def zfs_pool_reader(dataset: str) -> Callable[[], tuple[int, int]]:
-    def read() -> tuple[int, int]:
-        cp = subprocess.run(["zfs", "list", "-Hp", "-o", "used,avail", dataset],
+def zfs_pool_reader(dataset: str) -> Callable[[], tuple[int, int, int, int]]:
+    """(pool_used, pool_avail, dataset_used, dataset_avail). The POOL is the alarm subject
+    (spec §9: pool usage, alarm at 85 %); a quota-bearing dataset reports its quota headroom
+    as avail, which read 2 % while the pool stood at 78 % (first staging night)."""
+    pool = dataset.split("/", 1)[0]
+
+    def one(name: str) -> tuple[int, int]:
+        cp = subprocess.run(["zfs", "list", "-Hp", "-o", "used,avail", name],
                             capture_output=True, text=True, timeout=5, check=True)
         return parse_zfs_list(cp.stdout)
+
+    def read() -> tuple[int, int, int, int]:
+        pu, pa = one(pool)
+        du, da = one(dataset) if dataset != pool else (pu, pa)
+        return pu, pa, du, da
+    return read
+
+
+def usage_window_reader(path: Path) -> Callable[[], dict]:
+    """The newest `codex-window` row of the usage ledger (written by codex-usage-report.py
+    --probe, which the dream step runs first): the Codex plan window spec §9 reports."""
+    def read() -> dict:
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {"used_percent": None, "resets_in_days": None, "probed_at": None, "note": "no probe yet"}
+        for ln in reversed(lines[-MAX_RECEIPT_LINES:]):
+            try:
+                o = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(o, dict) and o.get("component") == "codex-window":
+                return {"used_percent": o.get("used_percent"), "resets_in_days": o.get("resets_in_days"),
+                        "probed_at": o.get("ts"), "note": o.get("note", "")}
+        return {"used_percent": None, "resets_in_days": None, "probed_at": None, "note": "no probe yet"}
     return read
 
 
@@ -85,8 +115,9 @@ def journal_boots_reader(now_fn=lambda: dt.datetime.now(dt.timezone.utc)) -> Cal
     return read
 
 
-def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple[int, int]],
-          boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str]) -> dict:
+def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple],
+          boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
+          usage_reader: Optional[Callable[[], dict]] = None) -> dict:
     steps: dict[str, dict] = {}
     for r in read_receipts(Path(receipts_path)):
         s = steps.setdefault(r["step"], {"last_success": None, "last_run": None, "duration_ms": None,
@@ -102,12 +133,23 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
     stale = sorted(n for n, s in steps.items()
                    if s["last_success"] is None
                    or (now - _parse_ts(s["last_success"])) > dt.timedelta(hours=STALE_AFTER_H))
+    dataset: Optional[dict] = None
     try:
-        used, avail = pool_reader()
+        used, avail, *ds = pool_reader()   # 2-tuple (disk usage) or 4-tuple (pool + dataset)
         pct = round(100.0 * used / (used + avail), 1) if (used + avail) > 0 else None
+        if len(ds) == 2:
+            du, da = ds
+            dataset = {"used_bytes": du, "avail_bytes": da,
+                       "used_pct": round(100.0 * du / (du + da), 1) if (du + da) > 0 else None}
     except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
         pct = None
     pool = {"used_pct": pct, "alarm": bool(pct is not None and pct >= POOL_ALARM_PCT), "threshold_pct": POOL_ALARM_PCT}
+    usage: dict = {"used_percent": None, "resets_in_days": None, "probed_at": None, "note": "no probe yet"}
+    if usage_reader is not None:
+        try:
+            usage = dict(usage_reader())
+        except Exception:  # noqa: BLE001
+            usage["note"] = "usage reader failed"
     try:
         boots = list(boots_reader())
     except Exception:  # noqa: BLE001
@@ -117,5 +159,8 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
     except Exception:  # noqa: BLE001
         jt = "none"
     ok = not pool["alarm"] and not stale
-    return {"ok": ok, "steps": steps, "stale_steps": stale, "judge_transport": jt, "pool": pool,
-            "boots_7d": boots, "generated": now.isoformat()}
+    out = {"ok": ok, "steps": steps, "stale_steps": stale, "judge_transport": jt, "pool": pool,
+           "usage": usage, "boots_7d": boots, "generated": now.isoformat()}
+    if dataset is not None:
+        out["dataset"] = dataset
+    return out

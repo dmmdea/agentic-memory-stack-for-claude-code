@@ -580,3 +580,124 @@ Describe 'Daemon protocol dispatch (Invoke-DaemonRequest via -DefineOnly)' {
         $r.error | Should -Match 'bundle_failed'
     }
 }
+
+Describe 'cold-embedder: a 503 with reason cold-embedder is retried once and named in diag' {
+    # P1-6 PC half. The authority answers an embedder outage with
+    # 503 {"reason":"cold-embedder"} + Retry-After (embedder_503.py). The lib surfaces
+    # that as a prefixed error message; the daemon names it, waits min(Retry-After, 3) s,
+    # retries the SAME POST once, and reports `cold-embedder retried=1 ok=<bool>` in diag.
+    # Every OTHER failure keeps the fail-open `bundle_failed:` behaviour with ONE call.
+
+    BeforeEach {
+        $script:LibHash = 'test-lib-hash'
+        $script:BaseUrl = 'http://127.0.0.1:1'   # never reached: Invoke-Mem0Post is mocked
+        $script:HookContractVersion = '20.0'
+        $script:StaleExitRequested = $false
+        # Sandbox USERPROFILE for the raw-pipeline wiring test (same reason as the raw Describe).
+        $script:sandboxHome = Join-Path $TestDrive ("home-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $script:stateDir = Join-Path $script:sandboxHome '.claude\state'
+        $script:fixDir = Join-Path $script:stateDir 'hook-fixtures'
+        New-Item -ItemType Directory -Path $script:stateDir -Force | Out-Null
+        $script:savedUserProfile = $env:USERPROFILE
+        $env:USERPROFILE = $script:sandboxHome
+        $script:coldBundleJson = '{"ok":true,"checkpoint":{"ok":true,"episode_id":11,"action":"updated"},"memories":[{"id":"m1","memory":"warm again memory","metadata":{"tier":"evidence","brand":null}}],"goals":[],"open_questions":[]}'
+        $script:coldMsg = New-Mem0PostErrorMessage -Failure @{ status = 503; reason = 'cold-embedder'; retry_after = 1 } -Detail 'embedder unavailable (cold start or down); retry'
+    }
+
+    AfterEach {
+        if ($null -ne $script:savedUserProfile) { $env:USERPROFILE = $script:savedUserProfile }
+    }
+
+    It 'Get-Mem0PostFailure / ConvertFrom-Mem0PostError round-trip status, reason and Retry-After' {
+        $f = Get-Mem0PostFailure -Status 503 -Body '{"detail":"embedder unavailable (cold start or down); retry","reason":"cold-embedder","retry_after_s":10}' -RetryAfter '10'
+        $f.status | Should -Be 503
+        $f.reason | Should -Be 'cold-embedder'
+        $f.retry_after | Should -Be 10
+        $msg = New-Mem0PostErrorMessage -Failure $f -Detail 'embedder unavailable'
+        $msg | Should -Match '^mem0-post status=503 reason=cold-embedder retry_after=10'
+        $back = ConvertFrom-Mem0PostError -Message $msg
+        $back.status | Should -Be 503
+        $back.reason | Should -Be 'cold-embedder'
+        $back.retry_after | Should -Be 10
+        # unparseable / absent inputs degrade to zero, never throw
+        (Get-Mem0PostFailure -Status 500 -Body 'Internal Server Error' -RetryAfter '').retry_after | Should -Be 0
+        (Get-Mem0PostFailure -Status 500 -Body 'Internal Server Error' -RetryAfter '').reason | Should -Be ''
+        (Get-Mem0PostFailure -Status 503 -Body '{"reason":"cold-embedder"}' -RetryAfter 'soon').retry_after | Should -Be 0
+        $plain = ConvertFrom-Mem0PostError -Message 'connection refused'
+        $plain.status | Should -Be 0
+        $plain.reason | Should -Be ''
+        $plain.retry_after | Should -Be 0
+    }
+
+    It 'Invoke-BundlePostWithColdRetry: cold-embedder on the first call -> ONE retry, ok=True, named in diag_prefix' {
+        $script:coldCalls = 0
+        Mock Invoke-Mem0Post {
+            $script:coldCalls++
+            if ($script:coldCalls -eq 1) { throw $script:coldMsg }
+            return '{"memories":[],"goals":[],"open_questions":[],"checkpoint":{}}'
+        }
+        $r = Invoke-BundlePostWithColdRetry -Uri 'http://127.0.0.1:1/v1/context/bundle' -Body '{}' -ApiKey 'k' -TimeoutMs 3000
+        Should -Invoke Invoke-Mem0Post -Times 2 -Exactly
+        $r.retried | Should -Be 1
+        $r.ok | Should -BeTrue
+        $r.text | Should -Match '"memories"'
+        $r.diag_prefix | Should -Match '^cold-embedder retried=1 ok=True daemon_ms=\d+'
+    }
+
+    It 'Invoke-BundlePostWithColdRetry: a non-cold failure is NOT retried (fail-open unchanged)' {
+        Mock Invoke-Mem0Post { throw 'boom' }
+        $r = Invoke-BundlePostWithColdRetry -Uri 'http://127.0.0.1:1/v1/context/bundle' -Body '{}' -ApiKey 'k' -TimeoutMs 3000
+        Should -Invoke Invoke-Mem0Post -Times 1 -Exactly
+        $r.ok | Should -BeFalse
+        $r.retried | Should -Be 0
+        $r.diag_prefix | Should -Match '^bundle_failed: boom'
+    }
+
+    It 'Invoke-BundlePostWithColdRetry: cold twice -> retried=1 ok=False (still fail-open, still one retry)' {
+        Mock Invoke-Mem0Post { throw $script:coldMsg }
+        $r = Invoke-BundlePostWithColdRetry -Uri 'http://127.0.0.1:1/v1/context/bundle' -Body '{}' -ApiKey 'k' -TimeoutMs 3000
+        Should -Invoke Invoke-Mem0Post -Times 2 -Exactly
+        $r.ok | Should -BeFalse
+        $r.retried | Should -Be 1
+        $r.diag_prefix | Should -Match '^cold-embedder retried=1 ok=False daemon_ms=\d+'
+    }
+
+    It 'op=bundle dispatch: retry success renders the context block exactly like the success path and names the retry' {
+        Mock Get-Mem0ApiKeyCached { 'test-key' }
+        $script:coldCalls = 0
+        Mock Invoke-Mem0Post {
+            $script:coldCalls++
+            if ($script:coldCalls -eq 1) { throw $script:coldMsg }
+            return $script:coldBundleJson
+        }
+        $req = [pscustomobject]@{ op = 'bundle'; session_id = 's1'; prompt = 'p'; brand = $null;
+                                  workspace = 'ai-ecosystem'; project = $null; transcript_path = 't'; hook_contract_version = '20.0' }
+        $r = Invoke-DaemonRequest -Req $req
+        Should -Invoke Invoke-Mem0Post -Times 2 -Exactly
+        $r.ok | Should -BeTrue
+        $r.context_block | Should -Match '\[MEMORY CONTEXT'
+        $r.context_block | Should -Match 'warm again memory'
+        $r.diag.episode_id | Should -Be 11
+        $r.diag.memories | Should -Be 1
+        $r.diag.cold | Should -Match '^cold-embedder retried=1 ok=True daemon_ms=\d+'
+    }
+
+    It 'raw pipeline: retry success renders the block and the diag line starts with cold-embedder retried=1 ok=True' {
+        Mock Get-Mem0ApiKeyCached { 'k' }
+        $script:coldCalls = 0
+        Mock Invoke-Mem0Post {
+            $script:coldCalls++
+            if ($script:coldCalls -eq 1) { throw $script:coldMsg }
+            return $script:coldBundleJson
+        }
+        $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"what is the state of the admission gate","transcript_path":"C:\\x\\agentic-memory-stack\\aaaaaaaa-bbbb-cccc-dddd-eeeeffff0001.jsonl"}'
+        $r = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
+        Should -Invoke Invoke-Mem0Post -Times 2 -Exactly
+        $r.ok | Should -BeTrue
+        $r.served | Should -BeTrue
+        [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($r.context_b64)) | Should -Match 'warm again memory'
+        $diag = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($r.diag_b64))
+        $diag | Should -Match '^cold-embedder retried=1 ok=True daemon_ms=\d+'
+        $diag | Should -Match 'episode_id=11'
+    }
+}
