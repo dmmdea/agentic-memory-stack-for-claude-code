@@ -22,7 +22,10 @@ from pathlib import Path
 # Embedder transport config, shared by build_config() (for schema validation) and
 # build_embedder() (the actual prefix-shim instance app.py installs on the Memory).
 EMBEDDER_CONFIG = {
-    "model": "embeddinggemma",
+    # MEM0_EMBED_MODEL (2026-09-11): the llama-swap model name. The store is bound to the exact GGUF
+    # it was embedded with; a box whose stock "embeddinggemma" is a different conversion serves the
+    # matching file under another name (the native authority: embeddinggemma-ams).
+    "model": __import__("os").environ.get("MEM0_EMBED_MODEL", "embeddinggemma").strip() or "embeddinggemma",
     "openai_base_url": "http://localhost:11436/v1",
     "api_key": "sk-noop",
     "embedding_dims": 768,

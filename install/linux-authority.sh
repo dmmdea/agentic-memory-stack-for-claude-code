@@ -24,19 +24,22 @@
 #                  canary); written to stack.env as MEM0_EVAL_ROOT. Omit -> the canary no-ops.
 #   --pcloud-dir:  where the chain's pcloud-copy step mirrors the newest backup set
 #                  (stack.env MEM0_PCLOUD_DIR; default ~/pCloudDrive/memory-backups/<hostname>).
+#   --embed-model: the llama-swap model name whose GGUF the store was embedded with (default
+#                  embeddinggemma). A different conversion of the same model is a different vector
+#                  space: the restore looked healthy while every search scored noise.
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIND_IP=""; SECRETS_DIR=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""
+BIND_IP=""; SECRETS_DIR=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL="embeddinggemma"
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
 UV="${UV:-$HOME/.local/bin/uv}"
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --bind-ip) BIND_IP="${2:-}"; shift 2 ;;
@@ -45,6 +48,7 @@ while [ $# -gt 0 ]; do
         --user-id) USER_ID="${2:-}"; shift 2 ;;
         --eval-root) EVAL_ROOT="${2:-}"; shift 2 ;;
         --pcloud-dir) PCLOUD_DIR="${2:-}"; shift 2 ;;
+        --embed-model) EMBED_MODEL="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -89,7 +93,7 @@ render_units() {  # $1 = destination dir
         sed -i '/dpapi-fetch-key\.sh/d' "$dst/$unit"
         grep -q "__[A-Z_]*__" "$dst/$unit" && fail "unresolved sentinel in $unit"
     done
-    sed -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" -e "s|__ZFS_DATASET__|$ZFS_DATASET|g" \
+    sed -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" -e "s|__ZFS_DATASET__|$ZFS_DATASET|g" -e "s|__EMBED_MODEL__|$EMBED_MODEL|g" \
         "$REPO_ROOT/systemd/mem0-native.conf" > "$dst/mem0.service.d/native.conf"
     # no dataset given: the endpoint falls back to the disk usage of the home filesystem
     [ -n "$ZFS_DATASET" ] || sed -i '/^Environment=MEM0_ZFS_DATASET=$/d' "$dst/mem0.service.d/native.conf"
@@ -115,7 +119,7 @@ if [ "$DRY_RUN" = 0 ]; then
         [ -L "$p" ] || fail "$p is not a symlink into the AMS dataset (Phase 0 P0-2 symlink set; spec §4: nothing on the root disk)"
     done
     ip -4 -o addr show | grep -q " inet ${BIND_IP}/" || fail "$BIND_IP is not present on any interface (is tailscaled up?)"
-    curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null || fail "no local embedder on :11436 (llama-swap)"
+    curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (--embed-model)"
 fi
 
 # ---------------------------------------------------------------- 1. role + receipts
@@ -132,6 +136,7 @@ MEM0_REPO_ROOT_WSL=$REPO_ROOT
 MEM0_BIND=$BIND_IP
 MEM0_ROLE=brain
 MEM0_SECRETS_DIR=$SECRETS_DIR
+MEM0_EMBED_MODEL=$EMBED_MODEL
 ENV
     [ -z "$EVAL_ROOT" ] || printf 'MEM0_EVAL_ROOT=%s\n' "$EVAL_ROOT" >> "$MEM0_DIR/stack.env"
     [ -z "$PCLOUD_DIR" ] || printf 'MEM0_PCLOUD_DIR=%s\n' "$PCLOUD_DIR" >> "$MEM0_DIR/stack.env"

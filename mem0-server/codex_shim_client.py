@@ -63,7 +63,9 @@ def shim_url() -> str:
 NATIVE_LOCK_PATH = os.path.expanduser("~/.mem0/codex-native.lock")
 NATIVE_DEFAULT_MODEL = "gpt-5.6-terra"  # the CLASSIFY pin (memory-common.ps1 AmCodexModelClassify)
 _USAGE_LIMIT_RE = re.compile(r"rate.?limit|usage.?limit", re.I)
-_TOKENS_RE = re.compile(r"tokens used\s*\n\s*([\d,]+)", re.I)
+# codex 0.153 printed "tokens used" and the count on the next line; 0.154 prints them on ONE line
+# ("tokens used 4,037") — the first live native dream recorded tokens_used 0 for three real calls.
+_TOKENS_RE = re.compile(r"tokens used[:\s]*([\d,]+)", re.I)
 
 
 def judge_transport() -> str:

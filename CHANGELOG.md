@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.22.2 (2026-09-11) — the steps after the backup run unguarded
+
+The first v1.22.1 chain run receipted `syncoid`, `pcloud-copy` and `morning-summary` as guard no-ops: they
+carried `--guarded` and their predecessor, `stack-backup`, had just stamped the night. Every step after the
+stamping step now runs unguarded (all three are idempotent).
+The native Codex transport also parses the single-line `tokens used N` that codex 0.154 prints (the
+first live native dream had recorded 0 tokens for three real calls).
+
+**`MEM0_EMBED_MODEL` / `--embed-model`.** The staging authority's canaries scored noise (0.05, against
+0.65–0.84 on the workstation) because its stock `embeddinggemma` GGUF is a different conversion of
+the model than the one the store was embedded with; the two builds' vectors have a cross-box cosine of
+0.01–0.06. The design's "reuse the offload stack's copy" assumption was wrong: the authority keeps the
+exact GGUF in its dataset, llama-swap serves it under its own name, and mem0 asks for that name
+(`config.EMBEDDER_CONFIG["model"]` from `MEM0_EMBED_MODEL`; `/health/embedder` and `/health/deep` follow it).
+The installer refuses when llama-swap does not list the model.
+
 ## v1.22.1 (2026-09-11) — the first v1.22 deploy on the authority: l10-audit's key, the pool figure
 
 Two findings from the live re-install. (1) `l10-audit.service` runs on its own timer outside the

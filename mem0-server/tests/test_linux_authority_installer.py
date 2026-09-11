@@ -164,3 +164,16 @@ def test_l10_audit_gets_its_own_credential_dropin(tmp_path):
     conf = (out / "l10-audit.service.d" / "native.conf").read_text(encoding="utf-8")
     assert f"LoadCredentialEncrypted=ams-api-key:{tmp_path / 'secrets'}/ams-api-key.cred" in conf
     assert "Environment=MEM0_API_KEY_FILE=%d/ams-api-key" in conf and "__SECRETS_DIR__" not in conf
+
+
+def test_embed_model_is_rendered_into_the_drop_in(tmp_path):
+    """The store is bound to the exact GGUF it was embedded with; the authority names the llama-swap
+    model that serves that file (a stock 'embeddinggemma' of another conversion scored noise)."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma\n" in (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-model", "embeddinggemma-ams", "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-ams\n" in (out2 / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")

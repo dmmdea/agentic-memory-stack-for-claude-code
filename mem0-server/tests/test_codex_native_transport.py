@@ -124,3 +124,10 @@ def test_shim_path_is_untouched_when_transport_is_shim(monkeypatch):
     with httpx.Client(transport=httpx.MockTransport(handler)) as c:
         out = csc.judge("p", client=c)
     assert out["ok"] is True and out["response"] == "YES"
+
+
+def test_native_parses_the_inline_token_line_of_codex_0154():
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="codex\nok\ntokens used 4,037\n"))
+    assert out["ok"] and out["tokens_used"] == 4037
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="codex\nok\ntokens used\n12\n"))
+    assert out["tokens_used"] == 12, "the 0.153 two-line form still parses"
