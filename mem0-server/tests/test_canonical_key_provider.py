@@ -462,3 +462,35 @@ def test_api_key_path_honours_env(tmp_path, monkeypatch):
     assert api_key_path() == Path.home() / ".mem0" / "api-key"
     monkeypatch.setenv("MEM0_API_KEY_FILE", str(tmp_path / "k"))
     assert api_key_path() == tmp_path / "k"
+
+
+def test_default_paths_under_a_symlinked_home_dir_are_accepted(tmp_path, monkeypatch):
+    """Native authority (spec §4): ~/.mem0 is a symlink into a data dataset outside $HOME. The
+    guard must accept the default paths by their lexical location under home even though they
+    resolve elsewhere — the live install refused its own ~/.mem0/canonical-key.dpapi (2026-09-10)."""
+    import os
+    import sys
+    import tempfile
+    from canonical_key_provider import CanonicalKeyProvider
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlink semantics")
+    outside_root = "/var/tmp" if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK) else None
+    if outside_root is None:
+        pytest.skip("no writable directory outside the guard's tmp prefixes")
+    target = tempfile.mkdtemp(prefix="ams-dataset-", dir=outside_root)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".mem0").symlink_to(target)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setenv("TEMP", str(home))
+    monkeypatch.setenv("TMP", str(home))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    (home / ".mem0" / "canonical-key").write_text("k")
+    p = CanonicalKeyProvider(runtime_key_path=home / ".mem0" / "absent-rt")
+    assert p.get_key() == "k"
+    # a traversal through the symlinked dir is still refused
+    with pytest.raises(ValueError):
+        CanonicalKeyProvider(dpapi_path=home / ".mem0" / ".." / ".." / "etc" / "shadow",
+                             plaintext_path=home / ".mem0" / "canonical-key",
+                             runtime_key_path=home / ".mem0" / "absent-rt")

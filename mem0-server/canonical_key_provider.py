@@ -180,8 +180,19 @@ class CanonicalKeyProvider:
                     pass
             tmp_prefixes = [t for t in tmp_prefixes if t is not None]
             under_home = str(resolved).startswith(str(home))
+            # 2026-09-10 (native authority): the operator keeps ~/.mem0 as a SYMLINK into a data
+            # dataset (nothing on the root disk), so the resolved target is outside $HOME while
+            # the path the server was given is the default one under it. Judge the lexical
+            # (normalised, symlink-preserving) path too: ".." is still collapsed by abspath, so
+            # a traversal cannot hide behind this branch, and only what was placed under $HOME
+            # by the owner passes.
+            lexical = Path(os.path.abspath(os.path.expanduser(str(p))))
+            try:
+                under_home_lexical = lexical.is_relative_to(Path.home())
+            except (ValueError, OSError, RuntimeError):
+                under_home_lexical = False
             under_tmp = any(str(resolved).startswith(str(t)) for t in tmp_prefixes)
-            if not (under_home or under_tmp):
+            if not (under_home or under_home_lexical or under_tmp):
                 raise ValueError(f"canonical-key path {resolved} outside user home, tmp, or runtime dir")
         self._cached_key: Optional[str] = None
         self._cache_loaded = False
