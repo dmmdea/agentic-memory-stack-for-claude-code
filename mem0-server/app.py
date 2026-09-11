@@ -918,12 +918,12 @@ def health_morning_summary() -> dict:
             "sections": [s.rstrip("\n") for s in sections[-3:]]}
 
 
-@app.get("/health/embedder")
 def _embed_model() -> str:
     """The llama-swap model name the store is bound to (config.EMBEDDER_CONFIG["model"])."""
     return str(EMBEDDER_CONFIG.get("model") or "embeddinggemma")
 
 
+@app.get("/health/embedder")
 def health_embedder() -> dict:
     """Spec §4 (P1-6 PC half): the SessionStart pre-warm target. The embedder unloads after
     5 idle minutes (ttl 300, every engine) and takes ~3.4 s to come back, so the first prompt's

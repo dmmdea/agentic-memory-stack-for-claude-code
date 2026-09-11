@@ -131,7 +131,7 @@ def test_health_embedder_asks_for_the_configured_model(health_client, monkeypatc
     def post(url, json=None, timeout=None, **kw):
         seen["model"] = json["model"]
         return _llama_swap(200, {"data": [{"embedding": [0.0] * 768}]}, method="POST", path="/v1/embeddings")
-    monkeypatch.setattr(appmod._httpx, "get", lambda url, timeout=None, **kw: _llama_swap(200, {"data": [{"id": "embeddinggemma-ams", "state": "ready"}]}))
-    monkeypatch.setattr(appmod._httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", lambda url, timeout=None, **kw: _llama_swap(200, {"data": [{"id": "embeddinggemma-ams", "state": "ready"}]}))
+    monkeypatch.setattr(httpx, "post", post)
     r = health_client.get("/health/embedder")
     assert r.status_code == 200 and seen["model"] == "embeddinggemma-ams" and r.json()["loaded"] is True
