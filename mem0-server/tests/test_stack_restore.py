@@ -90,6 +90,14 @@ def test_stack_restore_dry_run_output_structure(tmp_path):
     )
 
 
+def test_stack_restore_drops_stale_wal_before_the_rename():
+    """A foreign -wal/-shm beside the target corrupts the restored episodic.db (2026-09-10)."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    rm_idx = text.index('rm -f "$TARGET_EPISODIC-wal" "$TARGET_EPISODIC-shm"')
+    mv_idx = text.index('mv "$TARGET_EPISODIC.tmp" "$TARGET_EPISODIC"')
+    assert rm_idx < mv_idx
+
+
 def test_stack_restore_unknown_snapshot_fails_loudly(tmp_path):
     """A bogus snapshot TS must exit non-zero with a clear manifest-not-found error
     (also non-mutating: fails at manifest validation before any restore action).
