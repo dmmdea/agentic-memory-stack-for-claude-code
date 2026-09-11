@@ -1,6 +1,6 @@
 """1:1 counterparts of PromotionGate.Tests.ps1, DreamAutopromote.Tests.ps1, DreamGateVerdict.Tests.ps1
 (spec Phase 5 gate: every Pester scenario has a Python twin before the .ps1 can be retired)."""
-import importlib.util, json, sys
+import json, sys
 from pathlib import Path
 import httpx, pytest
 

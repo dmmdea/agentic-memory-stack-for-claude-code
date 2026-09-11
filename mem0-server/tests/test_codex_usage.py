@@ -1,4 +1,4 @@
-import importlib.util, json, sys
+import json, sys
 from pathlib import Path
 import httpx, pytest
 
