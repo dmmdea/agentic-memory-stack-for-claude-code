@@ -33,6 +33,14 @@ from pathlib import Path
 from typing import Optional
 
 
+def api_key_path() -> Path:
+    """Where the server reads its X-API-Key secret. The native authority (spec §4) receives it
+    through systemd LoadCredentialEncrypted and points MEM0_API_KEY_FILE at %d/ams-api-key;
+    every other host keeps ~/.mem0/api-key."""
+    p = os.environ.get("MEM0_API_KEY_FILE", "").strip()
+    return Path(p) if p else Path.home() / ".mem0" / "api-key"
+
+
 def _is_windows() -> bool:
     return platform.system() == "Windows" or os.name == "nt"
 
@@ -90,6 +98,8 @@ class CanonicalKeyProvider:
     """Single point of canonical-key access.
 
     Order of preference:
+    0. $CREDENTIALS_DIRECTORY/ams-canonical-key (systemd LoadCredentialEncrypted on the
+       native authority, spec §4; source 'credential')
     1. $XDG_RUNTIME_DIR/mem0/canonical-key (tmpfs, injected by ExecStartPre
        dpapi-fetch-key.sh — v0.19 Phase H; skipped when path unresolvable)
     2. ~/.mem0/canonical-key.dpapi (DPAPI-encrypted blob, Windows only)
@@ -102,6 +112,7 @@ class CanonicalKeyProvider:
         dpapi_path: Optional[Path] = None,
         plaintext_path: Optional[Path] = None,
         runtime_key_path: Optional[Path] = None,
+        credential_key_path: Optional[Path] = None,
     ):
         default_dir = Path.home() / ".mem0"
         self.dpapi_path = dpapi_path if dpapi_path is not None else default_dir / "canonical-key.dpapi"
@@ -113,10 +124,19 @@ class CanonicalKeyProvider:
             # systemd sets XDG_RUNTIME_DIR for user services; without it (plain
             # Windows process, bare cron) the runtime branch is simply disabled.
             self.runtime_key_path = Path(xdg) / "mem0" / "canonical-key" if xdg else None
+        # Spec §4 (native authority): systemd LoadCredentialEncrypted delivers the key under
+        # $CREDENTIALS_DIRECTORY (tmpfs, 0700, removed on stop). Explicit path wins; else the env.
+        if credential_key_path is not None:
+            self.credential_key_path: Optional[Path] = credential_key_path
+        else:
+            _cd = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+            self.credential_key_path = Path(_cd) / "ams-canonical-key" if _cd else None
         # Path-traversal guard: paths must resolve under user home OR be under tmp (for tests)
         guarded = [self.dpapi_path, self.plaintext_path]
         if self.runtime_key_path is not None:
             guarded.append(self.runtime_key_path)
+        if self.credential_key_path is not None:
+            guarded.append(self.credential_key_path)
         for p in guarded:
             try:
                 resolved = p.resolve(strict=False)
@@ -150,6 +170,14 @@ class CanonicalKeyProvider:
                 tmp_prefixes.append(Path("/run/user").resolve())
             except (OSError, RuntimeError):
                 pass
+            # native authority: systemd's credential directory ($CREDENTIALS_DIRECTORY,
+            # conventionally under /run/credentials/<unit>)
+            _cd_guard = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+            if _cd_guard:
+                try:
+                    tmp_prefixes.append(Path(_cd_guard).resolve())
+                except (OSError, RuntimeError):
+                    pass
             tmp_prefixes = [t for t in tmp_prefixes if t is not None]
             under_home = str(resolved).startswith(str(home))
             under_tmp = any(str(resolved).startswith(str(t)) for t in tmp_prefixes)
@@ -158,7 +186,7 @@ class CanonicalKeyProvider:
         self._cached_key: Optional[str] = None
         self._cache_loaded = False
         # v0.20 Phase D (M6): which source served the cached key —
-        # 'runtime' | 'dpapi' | 'plaintext' | 'none'. Exposed via key_source
+        # 'credential' | 'runtime' | 'dpapi' | 'plaintext' | 'none'. Exposed via key_source
         # so /health/deep can report canonical_key.source.
         self._cached_source: str = "none"
 
@@ -173,6 +201,28 @@ class CanonicalKeyProvider:
     def get_key(self) -> Optional[str]:
         if self._cache_loaded:
             return self._cached_key
+        # Spec §4 (native authority): systemd-creds delivers the key under $CREDENTIALS_DIRECTORY.
+        # It is the decrypted TPM-bound blob, so it wins over the WSL runtime key and the plaintext
+        # file. Empty == absent (the same L1 rule as the runtime key below).
+        if self.credential_key_path is not None and self.credential_key_path.exists():
+            try:
+                _ck = self.credential_key_path.read_text(encoding="utf-8").strip()
+                if _ck:
+                    self._cached_key = _ck
+                    self._cached_source = "credential"
+                    self._cache_loaded = True
+                    return self._cached_key
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"credential canonical-key at {self.credential_key_path} is empty/whitespace, "
+                    "falling back to runtime/dpapi/plaintext"
+                )
+            except OSError as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"credential canonical-key at {self.credential_key_path} unreadable, "
+                    f"falling back to runtime/dpapi/plaintext: {e}"
+                )
         # v0.19 Phase H: runtime-injected key (tmpfs, ExecStartPre DPAPI fetch)
         # wins over everything — it IS the decrypted DPAPI blob on the WSL box.
         if self.runtime_key_path is not None and self.runtime_key_path.exists():

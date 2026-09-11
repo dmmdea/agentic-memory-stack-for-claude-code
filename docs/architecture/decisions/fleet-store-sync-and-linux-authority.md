@@ -98,6 +98,14 @@ in below.
   is discarded on reconnect. Every hook now resolves the authority from the role file and queues to
   the Outbox on failure.
 
+
+**Phase status.** Phase 0 (readiness of the Linux box: dataset with reservation and quota, off-box
+replication, secrets under `systemd-creds`, native Codex login, bind rule staged, embedder and
+reranker latency measured, RTC wake proven) closed on 2026-09-10. Phase 1 shipped its first half in
+v1.21.0: `install/linux-authority.sh`, the native judge transport, `/health/maintenance`, the
+nightly chain skeleton and the 503 mapping — proven on a staging copy, no cutover. The Python
+ports of the remaining nightly jobs and the workstation-side hook changes follow.
+
 ## Alternatives considered
 
 - **Keep the authority on the workstation and only run the nightly on the server.** Rejected:
@@ -119,6 +127,10 @@ in below.
 
 - [`install/1-wsl-services.sh`](../../../install/1-wsl-services.sh) — the WSL install path the native path is derived from.
 - [`install/linux-replica.sh`](../../../install/linux-replica.sh) — the interpreter selection and unit pattern the native authority reuses.
+- [`install/linux-authority.sh`](../../../install/linux-authority.sh) — the native authority install path (Phase 1).
+- [`systemd/mem0-native.conf`](../../../systemd/mem0-native.conf) — the drop-in that replaces the WSL pre-start with `LoadCredentialEncrypted` and the bind wait.
+- [`scripts/wsl/ams-step.sh`](../../../scripts/wsl/ams-step.sh) — the receipted step wrapper of the single nightly chain.
+- [`mem0-server/maintenance_health.py`](../../../mem0-server/maintenance_health.py) — `GET /health/maintenance`.
 - [`scripts/windows/memory-store-lib.ps1`](../../../scripts/windows/memory-store-lib.ps1) — the store invariants the store client must carry 1:1.
 - [`scripts/windows/memory-compact.ps1`](../../../scripts/windows/memory-compact.ps1) — the v1 nightly compactor this design retires from workstations.
 - [`scripts/windows/memory-index-write-gate.ps1`](../../../scripts/windows/memory-index-write-gate.ps1) — the write-time gate that becomes derive-and-commit.

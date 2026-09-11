@@ -1,0 +1,12 @@
+[Unit]
+Description=AMS nightly maintenance chain (spec §4: one chain, one timer on the authority)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+OnBootSec=15min
+Unit=ams-nightly.target
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -404,3 +404,61 @@ def test_dpapi_orphan_error_mentions_runtime_path(tmp_path, caplog):
         "dpapi-fetch-key" in r.getMessage() and "runtime" in r.getMessage()
         for r in error_records
     ), f"expected runtime-path guidance in error, got: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_credential_key_beats_runtime_and_plaintext(tmp_path):
+    """Native authority (spec §4): systemd LoadCredentialEncrypted lands the key under
+    $CREDENTIALS_DIRECTORY; it must win over the WSL runtime tmpfs key and the plaintext file."""
+    from canonical_key_provider import CanonicalKeyProvider
+    cred = tmp_path / "creds" / "ams-canonical-key"
+    cred.parent.mkdir()
+    cred.write_text("from-systemd-creds\n")
+    rt = tmp_path / "runtime-key"
+    rt.write_text("from-runtime")
+    pt = tmp_path / "canonical-key"
+    pt.write_text("from-plaintext")
+    p = CanonicalKeyProvider(dpapi_path=tmp_path / "absent.dpapi", plaintext_path=pt,
+                             runtime_key_path=rt, credential_key_path=cred)
+    assert p.get_key() == "from-systemd-creds"
+    assert p.key_source == "credential"
+
+
+def test_empty_credential_falls_through(tmp_path):
+    from canonical_key_provider import CanonicalKeyProvider
+    cred = tmp_path / "ams-canonical-key"
+    cred.write_text("  \n")
+    pt = tmp_path / "canonical-key"
+    pt.write_text("from-plaintext")
+    p = CanonicalKeyProvider(dpapi_path=tmp_path / "absent.dpapi", plaintext_path=pt,
+                             runtime_key_path=tmp_path / "absent-rt", credential_key_path=cred)
+    assert p.get_key() == "from-plaintext"
+    assert p.key_source == "plaintext"
+
+
+def test_credential_default_path_comes_from_env(tmp_path, monkeypatch):
+    from canonical_key_provider import CanonicalKeyProvider
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
+    (tmp_path / "ams-canonical-key").write_text("env-cred")
+    p = CanonicalKeyProvider(dpapi_path=tmp_path / "absent.dpapi", plaintext_path=tmp_path / "absent-pt",
+                             runtime_key_path=tmp_path / "absent-rt")
+    assert p.get_key() == "env-cred"
+    assert p.key_source == "credential"
+
+
+def test_credential_guard_is_scoped_to_the_env_directory(tmp_path, monkeypatch):
+    """The traversal guard admits $CREDENTIALS_DIRECTORY only; an arbitrary /run/credentials/<other-unit>
+    path is not a valid key location on a host that never set the variable."""
+    from canonical_key_provider import CanonicalKeyProvider
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    with pytest.raises(ValueError):
+        CanonicalKeyProvider(dpapi_path=tmp_path / "a", plaintext_path=tmp_path / "b",
+                             runtime_key_path=tmp_path / "c",
+                             credential_key_path=Path("/run/credentials/other.service/ams-canonical-key"))
+
+
+def test_api_key_path_honours_env(tmp_path, monkeypatch):
+    from canonical_key_provider import api_key_path
+    monkeypatch.delenv("MEM0_API_KEY_FILE", raising=False)
+    assert api_key_path() == Path.home() / ".mem0" / "api-key"
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(tmp_path / "k"))
+    assert api_key_path() == tmp_path / "k"

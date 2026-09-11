@@ -1,0 +1,11 @@
+[Unit]
+Description=AMS chain step: re-arm the RTC wake for 02:45 (each wake consumes the alarm)
+PartOf=ams-nightly.target
+After=ams-step-health-stamp.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh rtcwake /bin/bash %h/apps/mem0-scripts/ams-rtcwake-arm.sh 02:45
+
+[Install]
+WantedBy=ams-nightly.target

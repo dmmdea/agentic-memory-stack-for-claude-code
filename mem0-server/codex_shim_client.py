@@ -19,6 +19,10 @@ returns HTTP 400. The shim binds both, but localhost is the verified-clean path.
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 from typing import Optional
 
@@ -49,6 +53,79 @@ def shim_url() -> str:
     return os.environ.get("MEM0_CODEX_SHIM_URL", DEFAULT_URL).rstrip("/")
 
 
+# ---------------------------------------------------------------------------
+# Native transport (spec §4, judge transport). On the Linux authority there is no Windows shim:
+# `codex exec` runs as a subprocess behind the SAME fail-soft dict, the same `judge()` retry
+# loop and the same error vocabulary, so every consumer (the app.py NLI write-gate,
+# contradiction-sweep, retrieval pairs, and the Python ports of dream/autopromote) inherits
+# it with no change. A file lock is the shim's single-flight mutex in native form.
+# ---------------------------------------------------------------------------
+NATIVE_LOCK_PATH = os.path.expanduser("~/.mem0/codex-native.lock")
+NATIVE_DEFAULT_MODEL = "gpt-5.6-terra"  # the CLASSIFY pin (memory-common.ps1 AmCodexModelClassify)
+_USAGE_LIMIT_RE = re.compile(r"rate.?limit|usage.?limit", re.I)
+_TOKENS_RE = re.compile(r"tokens used\s*\n\s*([\d,]+)", re.I)
+
+
+def judge_transport() -> str:
+    """'native' (codex exec subprocess), 'shim' (Windows HTTP shim), or 'none'.
+    MEM0_CODEX_TRANSPORT = shim | native | auto (default). auto: a native host
+    (MEM0_HOST_KIND=native) with codex on PATH judges natively; everything else keeps the shim."""
+    mode = os.environ.get("MEM0_CODEX_TRANSPORT", "auto").strip().lower()
+    if mode == "shim":
+        return "shim"
+    if mode != "native" and os.environ.get("MEM0_HOST_KIND", "").strip().lower() != "native":
+        return "shim"
+    # Only a host that asked for native judging pays for the PATH lookup: under WSL the Windows
+    # PATH entries make shutil.which() cost tens of ms, which the shim's retry loop measures.
+    return "native" if shutil.which("codex") is not None else "none"
+
+
+def _judge_once_native(prompt: str, effort: str, timeout_s: int, model: str, _run=subprocess.run) -> dict:
+    """One `codex exec` call. Fail-soft dict, never raises. Single-flight through a file lock:
+    a held lock is `lock_contended`, which judge() waits out exactly like a shim 503."""
+    codex = shutil.which("codex")
+    if not codex:
+        return {"ok": False, "error_type": "no_codex", "error": "codex CLI not on PATH", "transport": "native"}
+    import fcntl  # POSIX-only; imported here so the module still loads on Windows
+    lock_path = NATIVE_LOCK_PATH
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock = open(lock_path, "w")
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"ok": False, "error_type": "lock_contended", "error": "another native judge call is running", "transport": "native"}
+        with tempfile.TemporaryDirectory(prefix="codex-judge-") as td:
+            last = os.path.join(td, "last.txt")
+            cmd = [codex, "exec", "--skip-git-repo-check", "-m", model or NATIVE_DEFAULT_MODEL,
+                   "-c", f'model_reasoning_effort="{effort}"', "--output-last-message", last, "--", prompt]
+            t0 = time.monotonic()
+            try:
+                cp = _run(cmd, capture_output=True, text=True, timeout=int(timeout_s), cwd=td, env=dict(os.environ))
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error_type": "client_timeout", "error": f"codex exec exceeded {timeout_s}s", "transport": "native"}
+            except Exception as e:  # noqa: BLE001 — fail-soft by contract
+                return {"ok": False, "error_type": "unreachable", "error": str(e)[:200], "transport": "native"}
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            if cp.returncode != 0:
+                et = "usage_limit" if _USAGE_LIMIT_RE.search(cp.stderr or "") else "exit_nonzero"
+                return {"ok": False, "error_type": et, "error": (cp.stderr or cp.stdout or "")[-400:],
+                        "duration_ms": duration_ms, "transport": "native"}
+            response = ""
+            try:
+                with open(last, "r", encoding="utf-8") as f:
+                    response = f.read().strip()
+            except OSError:
+                response = ""
+            if not response:
+                response = (cp.stdout or "").strip()
+            m = _TOKENS_RE.search(cp.stdout or "")
+            tokens = int(m.group(1).replace(",", "")) if m else 0
+            return {"ok": True, "response": response, "tokens_used": tokens, "duration_ms": duration_ms, "transport": "native"}
+    finally:
+        lock.close()
+
+
 def _api_key() -> str:
     """Same key/trust-domain as the mem0 server. Prefer MEM0_KEY env, else ~/.mem0/api-key."""
     k = os.environ.get("MEM0_KEY")
@@ -61,8 +138,17 @@ def _api_key() -> str:
         return ""
 
 
-def health(timeout_s: float = 3.0, client: Optional[httpx.Client] = None) -> dict:
+def health(timeout_s: float = 3.0, client: Optional[httpx.Client] = None, _run=subprocess.run) -> dict:
     """GET /health. Returns {ok, service?, version?, codex_present?} or a fail-soft error dict."""
+    if judge_transport() == "native":
+        try:
+            cp = _run([shutil.which("codex") or "codex", "login", "status"], capture_output=True, text=True, timeout=timeout_s + 5)
+            text = (cp.stdout or "").lower()
+            logged = cp.returncode == 0 and "logged in" in text and "not logged in" not in text
+            return {"ok": logged, "transport": "native", "logged_in": logged,
+                    "detail": (cp.stdout or cp.stderr or "").strip()[:120]}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "transport": "native", "logged_in": False, "error": str(e)[:200]}
     owns = client is None
     if owns:
         client = httpx.Client(timeout=timeout_s)
@@ -125,7 +211,7 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
           client: Optional[httpx.Client] = None, model: str = "",
           lock_retry_budget_s: float = 0.0,
           lock_retry_interval_s: float = LOCK_RETRY_INTERVAL_S,
-          _sleep=time.sleep, _monotonic=time.monotonic) -> dict:
+          _sleep=time.sleep, _monotonic=time.monotonic, _run=subprocess.run) -> dict:
     """POST /judge — run a Codex judgment via the shim.
 
     Returns {ok: True, response, tokens_used, duration_ms} on success, else a fail-soft
@@ -150,7 +236,11 @@ def judge(prompt: str, effort: str = "low", timeout_s: int = 60,
     timeout_retries = 0
     start = _monotonic()
     while True:
-        out = _judge_once(prompt, effort, timeout_s, client, model)
+        # 'shim' keeps the HTTP path byte-for-byte; 'native' AND 'none' go to the native path, whose
+        # first check answers `no_codex` — a host that asked for native judging must never fall
+        # back to a shim it does not have (that would report 'unreachable'/'auth' for a missing CLI).
+        out = (_judge_once(prompt, effort, timeout_s, client, model) if judge_transport() == "shim"
+               else _judge_once_native(prompt, effort, timeout_s, model, _run))
         if out.get("ok") or out.get("error_type") not in RETRYABLE_BUSY:
             out["lock_waited_s"] = round(waited, 1)
             return out
