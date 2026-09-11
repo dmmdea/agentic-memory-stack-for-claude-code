@@ -156,9 +156,14 @@ else
 fi
 
 # --- 3. systemd units (same sentinel resolution as the installer) ---
+# The ams-* units (the native authority's chain, its nft belt) carry LoadCredentialEncrypted lines and
+# __SECRETS_DIR__ sentinels only install/linux-authority.sh resolves; on a WSL brain or replica they
+# are not part of the install (1-wsl-services.sh keeps a fixed list) and must not land here.
+HOST_KIND="${MEM0_HOST_KIND:-wsl}"
 for src in "$REPO_ROOT"/systemd/*.service "$REPO_ROOT"/systemd/*.timer; do
     [ -f "$src" ] || continue
     unit="$(basename "$src")"
+    case "$unit" in ams-*) [ "$HOST_KIND" = "native" ] || continue ;; esac
     resolved="$(sed -e "s|__WSL_USER__|$WSL_USER|g" \
                     -e "s|__WIN_USER__|$WIN_USER|g" \
                     -e "s|__WSL_DISTRO__|$DISTRO|g" \

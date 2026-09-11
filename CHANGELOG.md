@@ -4,6 +4,14 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.22.3 (2026-09-11) — deploy.sh keeps the native chain units off WSL hosts
+
+`scripts/wsl/deploy.sh` copied every `systemd/*.service|*.timer` — including the `ams-*` units of the
+native authority, whose `LoadCredentialEncrypted` lines carry a `__SECRETS_DIR__` sentinel only
+`install/linux-authority.sh` resolves — onto whatever host ran it. They are now skipped unless
+`MEM0_HOST_KIND=native`; the first workstation deploy of v1.22 would otherwise have left inert,
+unresolved units on the WSL brain and the replica.
+
 ## v1.22.2 (2026-09-11) — the steps after the backup run unguarded
 
 The first v1.22.1 chain run receipted `syncoid`, `pcloud-copy` and `morning-summary` as guard no-ops: they
