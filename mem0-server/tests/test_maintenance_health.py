@@ -90,11 +90,13 @@ def test_zfs_pool_reader_reads_pool_root_and_dataset(monkeypatch):
     calls = []
 
     def run(cmd, **kw):
-        calls.append(cmd[-1])
-        return subprocess.CompletedProcess(cmd, 0, stdout="10\t90\n" if cmd[-1] == "tank" else "2\t38\n", stderr="")
+        calls.append((cmd[0], cmd[-1]))
+        # zpool: allocated,size ; zfs: used,avail
+        return subprocess.CompletedProcess(cmd, 0, stdout="76\t100\n" if cmd[0] == "zpool" else "2\t38\n", stderr="")
     monkeypatch.setattr(mh.subprocess, "run", run)
-    assert mh.zfs_pool_reader("tank/apps/ams")() == (10, 90, 2, 38)
-    assert calls == ["tank", "tank/apps/ams"]
+    assert mh.zfs_pool_reader("tank/apps/ams")() == (76, 24, 2, 38)
+    assert calls == [("zpool", "tank"), ("zfs", "tank/apps/ams")], "the pool figure is zpool capacity, the dataset figure is zfs"
+    assert mh.parse_zpool_list("278728622080\t362924736512\n") == (278728622080, 84196114432)
 
 
 def test_usage_from_newest_window_probe(tmp_path):
@@ -112,9 +114,9 @@ def test_usage_from_newest_window_probe(tmp_path):
 
 def test_morning_summary_endpoint(tmp_path, monkeypatch):
     from pathlib import Path as _P
-    monkeypatch.setattr(_P, "home", classmethod(lambda cls: tmp_path))
     from fastapi.testclient import TestClient
-    import app as appmod
+    import app as appmod  # import under the real HOME (app.py reads the key at import); sandbox the route only
+    monkeypatch.setattr(_P, "home", classmethod(lambda cls: tmp_path))
     c = TestClient(appmod.app)
     assert c.get("/health/morning-summary").status_code == 404
     d = tmp_path / ".mem0" / "maintenance"

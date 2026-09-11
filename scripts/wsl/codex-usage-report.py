@@ -70,6 +70,10 @@ def main(argv=None) -> int:
     window = None
     if args.probe:
         window = cu.probe_window(ams_env.codex_home())
+        if not (args.gate or args.json):
+            # a bare --probe (the dream step's ExecStartPre) prints one line, not the whole table
+            print(f"codex-window: used_percent={window.get('used_percent')} resets_in_days={window.get('resets_in_days')} {window.get('note') or ''}".rstrip(), flush=True)
+            return 0
 
     if args.gate:
         w = window if window is not None else cu.last_window()

@@ -95,9 +95,13 @@ def test_pcloud_copy_copies_the_newest_set_only(tmp_path):
     assert sorted(p.name for p in dst.iterdir()) == ["history-20260911-031903.db", "manifest-20260911-031903.json", "qdrant-20260911-031903.snapshot"]
     r = subprocess.run([BASH, str(SCRIPTS / "ams-pcloud-copy.sh")], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0 and "3 file(s)" in r.stdout, "idempotent re-run"
-    env["MEM0_PCLOUD_DIR"] = str(tmp_path / "absent")
+    env["MEM0_PCLOUD_DIR"] = str(tmp_path / "absent" / "host")
     r = subprocess.run([BASH, str(SCRIPTS / "ams-pcloud-copy.sh")], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 3 and "not a directory" in r.stderr, "an unmounted destination is a FAILED step"
+    (tmp_path / "mounted").mkdir()
+    env["MEM0_PCLOUD_DIR"] = str(tmp_path / "mounted" / "host")
+    r = subprocess.run([BASH, str(SCRIPTS / "ams-pcloud-copy.sh")], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0 and (tmp_path / "mounted" / "host" / "manifest-20260911-031903.json").exists(), "the leaf under a mounted parent is created"
 
 
 def test_morning_summary_section_from_receipts(tmp_path):
@@ -216,3 +220,20 @@ def test_rtcwake_arm_computes_next_0245():
     assert r.returncode == 0, r.stderr
     epoch = int(r.stdout.strip().split()[-1])
     assert 0 < epoch - int(time.time()) <= 24 * 3600
+
+
+def test_step_is_locale_proof(tmp_path):
+    """The authority's user manager exports a Spanish LC_NUMERIC: $EPOCHREALTIME then carries a comma
+    and the first live chain died with 'value too great for base' and NO receipt; `date +%a` printed
+    'dom', so --weekly Sun could never fire. The step pins LC_ALL=C and strips non-digits."""
+    text = (SCRIPTS / "ams-step.sh").read_text(encoding="utf-8")
+    assert "export LC_ALL=C" in text and "${EPOCHREALTIME//[!0-9]/}" in text and "${EPOCHREALTIME/./}" not in text
+    comma_locale = None
+    try:
+        avail = subprocess.run(["locale", "-a"], capture_output=True, text=True, timeout=30).stdout.split()
+        comma_locale = next((l for l in avail if l.split(".")[0] in ("es_CO", "es_ES", "de_DE", "fr_FR")), None)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    env_extra = {"LC_ALL": "", "LANG": "en_US.UTF-8", "LC_NUMERIC": comma_locale, "LC_TIME": comma_locale} if comma_locale else {}
+    r, rows, _ = _step(tmp_path, ["--weekly", time.strftime("%a"), "demo", "bash", "-c", "sleep 0.2; exit 0"], env_extra=env_extra)
+    assert r.returncode == 0 and rows[-1]["ok"] is True and 150 <= rows[-1]["duration_ms"] < 5000

@@ -134,6 +134,36 @@ class Mem0Client:
         d = self._get(f"/v1/memories?user_id={self.user_id}&limit={limit}", timeout=30.0)
         return list(d.get("results", d) if isinstance(d, dict) else d) or []
 
+    def all_points(self, qdrant_url: str = "http://127.0.0.1:6333", collection: str | None = None) -> list[dict]:
+        """Every point of the live collection, NEWEST FIRST, in the /v1/memories record shape
+        ({id, memory, created_at, updated_at, metadata:{tier, source, ...}}). GET /v1/memories is
+        mem0 get_all — an unordered top_k over a 13k-point store — so "the last 36 h" cannot be
+        read from it (the first live run saw no recent evidence in a store that had plenty).
+        The nightly index build scrolls the same way; the tenant filter is applied here."""
+        col = collection or os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
+        pts, off = [], None
+        while True:
+            body = {"limit": 256, "with_payload": True, "with_vector": False,
+                    "filter": {"must": [{"key": "user_id", "match": {"value": self.user_id}}]}}
+            if off is not None:
+                body["offset"] = off
+            r = self.http.post(f"{qdrant_url.rstrip('/')}/collections/{col}/points/scroll", json=body, timeout=30.0)
+            r.raise_for_status()
+            res = r.json().get("result") or {}
+            for p in res.get("points") or []:
+                pl = p.get("payload") or {}
+                if pl.get("retrievable") is False:
+                    continue
+                meta = {k: v for k, v in pl.items() if k not in ("data", "memory", "hash", "user_id")}
+                pts.append({"id": str(p.get("id")), "memory": pl.get("data") or pl.get("memory") or "",
+                            "created_at": pl.get("created_at") or "", "updated_at": pl.get("updated_at") or "",
+                            "user_id": pl.get("user_id"), "metadata": meta})
+            off = res.get("next_page_offset")
+            if not off:
+                break
+        pts.sort(key=lambda e: str(e.get("created_at") or ""), reverse=True)
+        return pts
+
     def search_canonical(self) -> list[dict]:
         # FIX 6 + A4a: filter-only fetch so the COMPLETE canonical set comes back; the server
         # requires a scope key in filters (user_id) or it 500s.
@@ -579,7 +609,9 @@ class Dream:
         memorymd = self.mem0.read_memory_md()
         # Every orient read degrades to empty on a transient error (the PS helpers each
         # try/catch to ''); the explicit health gate below decides whether to abort.
-        all_ev = list(self._soft("evidence", lambda: self.mem0.evidence(200)))
+        # The whole tenant scroll, newest first: the 36 h window, the 30 newest evidence records for
+        # the consolidator and the 200 newest promotion candidates are all slices of it.
+        all_ev = list(self._soft("store scroll", lambda: self.mem0.all_points()))
         insights = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in all_ev if _tier(e) == "insight")
         episodes = self._soft("episodes", lambda: self.mem0.episodes(7))
         ep_lines = _lines(f"- [{_clip(e.get('ended_at') or '?', 10)}] {e.get('brand') or 'unknown'}: {_clip(e.get('goal_text') or e.get('summary_text') or '', 130)}" for e in episodes)
@@ -702,7 +734,7 @@ class Dream:
 
         # ---- phase 3.5: autonomous canonical promotion
         log("=== phase 3.5: autonomous canonical promotion ===")
-        candidates = [e for e in all_ev if _tier(e) not in ("canonical", "insight") and _mem_text(e).strip()]
+        candidates = [e for e in all_ev if _tier(e) not in ("canonical", "insight") and _mem_text(e).strip()][:200]
         canonical_facts, canonical_norm = [], []
         try:
             canonical_facts = [_mem_text(e) for e in self.mem0.search_canonical()]
