@@ -94,6 +94,18 @@ Five more added by W3 and W4 (the alarm-mouth + revive-or-bury tracks — all in
 - **`retrieval_drift`**: passthrough of the retrieval-drift guard's state sidecar (`~/.mem0/retrieval-drift-state.json`; the guard itself lives in a private evaluation repo). Shape: `{"state_present": bool, "last_compare_ts": ts|null, "age_hours": h|null, "before_retrievable": N|null, "n_total": N|null, "hwm": N|null, "hwm_seeded": bool|null, "consecutive_below_hwm": N|null, "consecutive_snapshot_failures": N|null, "alarm": bool|null, "missing": [...]|null, "compat_fallback": bool|null, "error"?: "..."}`. An absent file is `state_present: false` with everything null and **no** error (a not-yet-deployed guard is a fact, not a fault); a present-but-malformed file is `state_present: true` plus an `error` note.
 - **`capabilities`**: the capability-manifest verdict — a pure fold of the checks above against the `CAPABILITIES` literal. Shape: `{"role": "brain"|"replica"|null, "states": {"<id>": "alive"|"degraded"|"dead"|"unknown"|"retired"}, "dead_required": ["<id>", ...], "unknown": ["<id>", ...], "evaluated_at": "<iso>"}`. `dead_required` lists dead rows required for this box's role (unknown role never convicts role-scoped rows; zero-signal activity counters are `unknown`, never `alive`). Row table and verdict rules: [../capability-manifest.md](../capability-manifest.md). The verifier FAILs on a non-empty `dead_required`.
 
+### `GET /health/maintenance`
+
+The authority's nightly chain, folded from `~/.mem0/maintenance/receipts.jsonl` (v1.21; v1.22 adds `dataset` and `usage`): `steps.<name>` = `{last_success, last_run, duration_ms, receipt_id, ok}`; `stale_steps` = steps without a success in 48 h; `judge_transport` = `native|shim|none`; `pool` = `{used_pct, alarm, threshold_pct}` of the **pool** (alarm at 85 %); `dataset` = `{used_bytes, avail_bytes, used_pct}` of the AMS dataset (quota headroom, informational; present only with `MEM0_ZFS_DATASET`); `usage` = the newest Codex plan-window probe `{used_percent, resets_in_days, probed_at, note}`; `boots_7d` = boot ids of the last seven days. `ok` is false on a pool alarm or a stale step. Never raises on a reader: an unreadable pool/journal/ledger reads as unknown.
+
+### `GET /health/morning-summary`
+
+`{path, mtime, sections: [...]}` — the last three `## ` sections of the chain's morning summary (`~/.mem0/maintenance/morning-summary.md`), for the session-start line; `404 {"detail": "no summary yet"}` before the first chain night.
+
+### `GET /health/embedder`
+
+Warms and reports the embedder: `{"ok": true, "loaded": bool|null, "warm_ms": int}` after one embedding through llama-swap (`loaded` from `/v1/models` when the server reports a state, else `null`). A cold or down embedder answers `503` + `Retry-After: 10` with `reason: cold-embedder`, the same body every embedder outage gets (`embedder_503.py`); the SessionStart hook calls this endpoint detached so the first prompt finds the embedder warm.
+
 ### `POST /v1/memories`
 
 Add one or more memories.

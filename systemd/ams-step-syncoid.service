@@ -1,0 +1,12 @@
+[Unit]
+Description=AMS chain step: off-box ZFS replication of the dataset (the P0-7 script, linked at ~/.mem0/scripts/syncoid.sh)
+PartOf=ams-nightly.target
+After=mem0.service ams-step-stack-backup.service
+ConditionPathExists=%h/.mem0/scripts/syncoid.sh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded syncoid /bin/bash %h/.mem0/scripts/syncoid.sh
+
+[Install]
+WantedBy=ams-nightly.target

@@ -41,6 +41,7 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 | daily 4:30 (Task Scheduler) | semantic dedup | `~/.mem0/tier-ledger-YYYY-MM.jsonl` (deletes are logged; monthly segments) |
 | Sun 02:00 / 04:00 / 05:00 / 05:30 | decay-scan / goals-stale-sweep / contradiction-sweep / episodic-reconcile | `systemctl --user list-timers` in WSL |
 | every 6 h | L10 heuristic audit | `~/.mem0/audit-flags.jsonl` |
+| **native Linux authority:** daily 03:00 (`ams-nightly.timer`, `Persistent=`, RTC wake armed 02:45) | the one chain: dream → dedup → index refresh → goal recurrence → Sunday jobs → stack backup → syncoid → pCloud copy → morning summary → health stamp → rtcwake | `systemctl --user list-timers ams-nightly.timer`; `tail ~/.mem0/maintenance/receipts.jsonl`; `curl -s http://<authority>:18791/health/maintenance` |
 
 ```bash
 # WSL: are the timers armed?
@@ -164,6 +165,19 @@ Get-Content "$env:USERPROFILE\.claude\logs\dream.log" -Tail 40
 - **Task missing/broken** → re-register idempotently: rerun `install\2-windows-config.ps1`.
 - **Ran but 0 insights** → often correct (no consolidation-worthy evidence). Check the log's Codex output preview.
 - The MEMORY.md index refresh is decoupled (`memory-index-refresh.ps1`, 6-h throttle) — a down dream no longer freezes the index.
+
+**On the native Linux authority** the dream is the first step of the nightly chain and there is no catch-up script (the timer is `Persistent=`; the boot guard skips a completed night):
+
+```bash
+journalctl --user -u ams-step-dream --no-pager -n 60          # the phase log (also ~/.mem0/maintenance/logs/dream.log)
+tail -20 ~/.mem0/maintenance/receipts.jsonl                    # one line per step: ok / exit / duration / note
+cat ~/.mem0/maintenance/dream/gather.json | jq '.signals|length'
+curl -s http://<authority>:18791/health/maintenance | jq '{stale_steps, usage, judge_transport}'
+~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/codex-usage-report.py --gate   # the 25 % reserve verdict the dream read
+systemctl --user start ams-step-dream.service                 # a hand run (its own 23 h throttle still applies; --force only by hand)
+```
+
+A receipt with `note: "skipping: codex quota gate ..."` is the reserve rule, not a failure; `"guard: chain succeeded since the last 03:00 boundary"` is the boot re-run of a completed night; `"weekly: not Sun; no-op"` is a weekday. A step with `ok:false` names its exit code and the tail of its stderr in `note`.
 
 ---
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=AMS chain step: morning summary section from the night's receipts
+PartOf=ams-nightly.target
+After=mem0.service ams-step-pcloud-copy.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded morning-summary /bin/bash %h/apps/mem0-scripts/ams-morning-summary.sh
+
+[Install]
+WantedBy=ams-nightly.target

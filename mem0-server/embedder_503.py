@@ -33,6 +33,10 @@ def classify(exc: BaseException) -> Optional[int]:
     """Seconds to wait when `exc` is an embedder outage, else None."""
     if isinstance(exc, _HTTPX_OUTAGES):
         return RETRY_AFTER_S
+    # A direct llama-swap call (GET /health/embedder) raising on a 5xx while the seat loads is the
+    # same outage as a refused connection; a 4xx is a real error and stays one.
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code >= 500:
+        return RETRY_AFTER_S
     ot = _openai_types()
     if ot:
         conn, timeout, status = ot

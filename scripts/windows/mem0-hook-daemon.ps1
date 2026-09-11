@@ -278,16 +278,26 @@ function Invoke-DaemonRawBundle {
                 transcript_path       = $transcriptPath
                 hook_contract_version = $script:HookContractVersion
             }
-            $bundleText = Invoke-Mem0Post -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
-            $bundleR = ConvertFrom-HookJson $bundleText
-            $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId $sessionId   # v1.12 HK-5
-            # v0.22 D: render per tier (resolved above from sidecar/transcript).
-            # frontier/mid = full format; small = flat + legend. Fail-open frontier.
-            $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier
-            $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
-            $resp.diag_b64 = ConvertTo-DaemonB64 ("episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)")
+            # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
+            # retried ONCE; every other failure is the same fail-open as before.
+            $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            if ($post.ok) {
+                $bundleR = ConvertFrom-HookJson $post.text
+                $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId $sessionId   # v1.12 HK-5
+                # v0.22 D: render per tier (resolved above from sidecar/transcript).
+                # frontier/mid = full format; small = flat + legend. Fail-open frontier.
+                $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier
+                $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
+                $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
+                if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
+                $resp.diag_b64 = ConvertTo-DaemonB64 $diagLine
+            } else {
+                # inline equivalent: "0.A/0.D bundle FAILED" -> no block, 0.B still runs.
+                # diag = 'bundle_failed: <msg>' or 'cold-embedder retried=1 ok=False daemon_ms=N'.
+                $resp.diag_b64 = ConvertTo-DaemonB64 $post.diag_prefix
+            }
         } catch {
-            # inline equivalent: "0.A/0.D bundle FAILED" -> no block, 0.B still runs
+            # parse/render failure AFTER a successful POST -> same fail-open, named
             $resp.diag_b64 = ConvertTo-DaemonB64 ('bundle_failed: ' + $_.Exception.Message)
         }
     } else {
@@ -385,8 +395,14 @@ function Invoke-DaemonRequest {
             transcript_path       = $Req.transcript_path
             hook_contract_version = $Req.hook_contract_version
         }
-        $bundleText = Invoke-Mem0Post -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
-        $bundleR = ConvertFrom-HookJson $bundleText
+        # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
+        # retried ONCE; every other failure is the same fail-open as before.
+        $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+        if (-not $post.ok) {
+            # error = 'bundle_failed: <msg>' or 'cold-embedder retried=1 ok=False daemon_ms=N'
+            return @{ ok = $false; error = $post.diag_prefix; lib_hash = $script:LibHash }
+        }
+        $bundleR = ConvertFrom-HookJson $post.text
         $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId ([string]$Req.session_id)   # v1.12 HK-5
 
         # Identical rendering to the inline path: lib Format-MemoryContextBlock
@@ -394,22 +410,73 @@ function Invoke-DaemonRequest {
         # audit file defaults. Tier-aware (v1.0 R2), fail-open frontier.
         $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier
 
+        $diag = @{
+            episode_id = $bundleR.checkpoint.episode_id
+            action     = $bundleR.checkpoint.action
+            memories   = @($bundleR.memories).Count
+            goals      = @($bundleR.goals).Count
+            oq         = @($bundleR.open_questions).Count
+            ms         = $swReq.ElapsedMilliseconds
+        }
+        if ($post.diag_prefix) { $diag.cold = $post.diag_prefix }   # 'cold-embedder retried=1 ok=True daemon_ms=N'
         return @{
             ok            = $true
             context_block = $contextBlock
             lib_hash      = $script:LibHash
-            diag          = @{
-                episode_id = $bundleR.checkpoint.episode_id
-                action     = $bundleR.checkpoint.action
-                memories   = @($bundleR.memories).Count
-                goals      = @($bundleR.goals).Count
-                oq         = @($bundleR.open_questions).Count
-                ms         = $swReq.ElapsedMilliseconds
-            }
+            diag          = $diag
         }
     } catch {
         return @{ ok = $false; error = ('bundle_failed: ' + $_.Exception.Message); lib_hash = $script:LibHash }
     }
+}
+
+function Invoke-BundlePostWithColdRetry {
+    <#
+    .SYNOPSIS
+    P1-6 (cold-embedder): POST /v1/context/bundle, naming and retrying a cold
+    embedder ONCE. Shared by both bundle call sites (op=bundle_raw and op=bundle)
+    and testable with `Mock Invoke-Mem0Post`.
+
+    .DESCRIPTION
+    The authority's embedder unloads after 5 idle minutes and takes ~3.4 s to come
+    back; while cold the server answers 503 {"reason":"cold-embedder"} + Retry-After
+    (embedder_503.py), which the lib's Invoke-Mem0Post re-throws as the prefixed
+    `mem0-post status=503 reason=cold-embedder retry_after=<s>` message. Here:
+      first POST ok                      -> @{ ok=$true;  retried=0; text; diag_prefix='' }
+      any OTHER failure (socket, 4xx..)  -> @{ ok=$false; retried=0; diag_prefix='bundle_failed: <msg>' }  (one call, fail-open as before)
+      cold-embedder                      -> sleep min(retry_after, 3) s, retry the SAME POST once ->
+                                            @{ ok=<bool>; retried=1; diag_prefix='cold-embedder retried=1 ok=<True|False> daemon_ms=<ms>' }
+    daemon_ms spans both attempts and the wait. Never throws.
+    #>
+    param([string]$Uri, [string]$Body, [string]$ApiKey, [int]$TimeoutMs = 3000)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $out = @{ text = $null; retried = 0; ok = $false; diag_prefix = '' }
+    $failure = $null
+    try {
+        $out.text = Invoke-Mem0Post -Uri $Uri -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
+        $out.ok = $true
+        return $out
+    } catch {
+        $firstMsg = [string]$_.Exception.Message
+        $failure = ConvertFrom-Mem0PostError -Message $firstMsg
+        if (-not (($failure.status -eq 503) -and ($failure.reason -eq 'cold-embedder'))) {
+            $out.diag_prefix = 'bundle_failed: ' + $firstMsg
+            return $out
+        }
+    }
+    # cold-embedder: the seat is loading. Wait at most 3 s (the hook's budget), then retry once.
+    $waitS = [Math]::Min([int]$failure.retry_after, 3)
+    if ($waitS -gt 0) { Start-Sleep -Seconds $waitS }
+    $out.retried = 1
+    try {
+        $out.text = Invoke-Mem0Post -Uri $Uri -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
+        $out.ok = $true
+    } catch {
+        $out.ok = $false
+        $out.text = $null
+    }
+    $out.diag_prefix = 'cold-embedder retried=1 ok=' + [string]$out.ok + ' daemon_ms=' + [string]$sw.ElapsedMilliseconds
+    return $out
 }
 
 if ($DefineOnly) { return }

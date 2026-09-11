@@ -1,0 +1,16 @@
+[Unit]
+Description=AMS chain step: retrieval pairs, Codex judge (weekly)
+PartOf=ams-nightly.target
+After=mem0.service ams-step-episodic-reconcile.service
+
+[Service]
+Type=oneshot
+LoadCredentialEncrypted=ams-api-key:__SECRETS_DIR__/ams-api-key.cred
+Environment=MEM0_API_KEY_FILE=%d/ams-api-key
+Environment=MEM0_HOST_KIND=native
+Environment=MEM0_CODEX_TRANSPORT=native
+Environment=CODEX_HOME=__SECRETS_DIR__/codex
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded --weekly Sun retrieval-pairs %h/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/jobs.py run retrieval-pairs --receipt %h/.mem0/contradiction-sweep.jsonl --stale-after 10800 -- %h/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/contradiction-sweep.py --retrieval-pairs --apply --judge codex
+
+[Install]
+WantedBy=ams-nightly.target

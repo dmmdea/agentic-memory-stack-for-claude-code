@@ -1073,6 +1073,74 @@ function ConvertFrom-HookJson {
     return ($Json | ConvertFrom-Json)
 }
 
+function Get-Mem0PostFailure {
+    <#
+    .SYNOPSIS
+    P1-6 (cold-embedder): pure classifier for an HTTP failure of Invoke-Mem0Post.
+    Status + the JSON body's `reason` + the Retry-After header -> @{ status; reason;
+    retry_after } (retry_after is an int, 0 when absent/unparseable; reason '' when
+    the body carries none). Never throws: a non-JSON body reads as reason ''.
+    The authority answers an embedder outage with 503 {"reason":"cold-embedder"}
+    + Retry-After: 10 (mem0-server/embedder_503.py); this is how the daemon tells
+    that condition apart from every other failure it fails open on.
+    #>
+    param([int]$Status = 0, [string]$Body = '', [string]$RetryAfter = '')
+    $reason = ''
+    if ($Body) {
+        try {
+            $o = ConvertFrom-HookJson $Body
+            if (($null -ne $o) -and ($null -ne $o.reason)) { $reason = [string]$o.reason }
+        } catch { $reason = '' }
+        if (-not $reason) {
+            $m = [regex]::Match($Body, '"reason"\s*:\s*"([^"]*)"')
+            if ($m.Success) { $reason = $m.Groups[1].Value }
+        }
+    }
+    $ra = 0
+    $parsed = 0
+    if ($RetryAfter -and [int]::TryParse($RetryAfter.Trim(), [ref]$parsed)) { $ra = $parsed }
+    if ($ra -lt 0) { $ra = 0 }
+    return @{ status = [int]$Status; reason = [string]$reason; retry_after = [int]$ra }
+}
+
+function New-Mem0PostErrorMessage {
+    <#
+    .SYNOPSIS
+    The ONE place the prefixed failure message is formatted:
+    `mem0-post status=<n> reason=<reason> retry_after=<s>: <detail>`.
+    Plain-string carrier (no PS class: user-prompt-lib.ps1 is dot-sourced under
+    powershell.exe 5.1 by the hooks and the daemon, and the tests throw the same
+    string), parsed back by ConvertFrom-Mem0PostError.
+    #>
+    param($Failure, [string]$Detail = '')
+    $reason = ([string]$Failure.reason) -replace '\s+', '_'
+    $d = ''
+    if ($Detail) {
+        $d = $Detail -replace '[\r\n]+', ' '
+        if ($d.Length -gt 200) { $d = $d.Substring(0, 200) }
+    }
+    return ('mem0-post status=' + [int]$Failure.status + ' reason=' + $reason + ' retry_after=' + [int]$Failure.retry_after + ': ' + $d)
+}
+
+function ConvertFrom-Mem0PostError {
+    <#
+    .SYNOPSIS
+    Inverse of New-Mem0PostErrorMessage: parse an exception message back into
+    @{ status; reason; retry_after }. A message without the prefix (a socket
+    error, a mocked `throw 'boom'`) parses to status 0 / reason '' / retry_after 0
+    so callers can branch on it without a second try/catch.
+    #>
+    param([string]$Message = '')
+    $r = @{ status = 0; reason = ''; retry_after = 0 }
+    if (-not $Message) { return $r }
+    $m = [regex]::Match($Message, '^mem0-post status=(\d+) reason=(\S*) retry_after=(\d+)')
+    if (-not $m.Success) { return $r }
+    $r.status = [int]$m.Groups[1].Value
+    $r.reason = [string]$m.Groups[2].Value
+    $r.retry_after = [int]$m.Groups[3].Value
+    return $r
+}
+
 function Invoke-Mem0Post {
     # Raw POST -> response text. No proxy lookup, explicit timeout. Throws on
     # HTTP/network errors (callers wrap in try/catch). KEEP IN SYNC with the
@@ -1080,6 +1148,13 @@ function Invoke-Mem0Post {
     # missing lib deploy cannot break the 0.A checkpoint; identical body, the
     # lib's definition harmlessly overrides at dot-source). The daemon uses
     # THIS definition.
+    # P1-6 (cold-embedder): an HTTP error response (a WebException that carries a
+    # Response) is re-thrown as a WebException whose message is the prefixed
+    # `mem0-post status=<n> reason=<reason> retry_after=<s>: <body>` line
+    # (New-Mem0PostErrorMessage), so callers can name a 503 cold-embedder and
+    # retry once. Socket/timeout failures (no Response) propagate unchanged.
+    # The extract's local copy stays the plain version on purpose: it only ever
+    # wraps this in try/catch and logs the message.
     param([string]$Uri, [string]$Body, [string]$ApiKey, [int]$TimeoutMs = 3000)
     $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Uri)
     $req.Method = 'POST'
@@ -1092,7 +1167,26 @@ function Invoke-Mem0Post {
     $req.ContentLength = $bytes.Length
     $rs = $req.GetRequestStream()
     try { $rs.Write($bytes, 0, $bytes.Length) } finally { $rs.Close() }
-    $resp = $req.GetResponse()
+    $resp = $null
+    try {
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        $we = $_.Exception
+        $hr = $null
+        try { $hr = [System.Net.HttpWebResponse]$we.Response } catch { $hr = $null }
+        if ($null -eq $hr) { throw }
+        $status = 0; $retryAfter = ''; $bodyText = ''
+        try { $status = [int]$hr.StatusCode } catch { $status = 0 }
+        try { $retryAfter = [string]$hr.Headers['Retry-After'] } catch { $retryAfter = '' }
+        try {
+            $es = [System.IO.StreamReader]::new($hr.GetResponseStream())
+            try { $bodyText = $es.ReadToEnd() } finally { $es.Close() }
+        } catch { $bodyText = '' }
+        try { $hr.Close() } catch { }
+        $failure = Get-Mem0PostFailure -Status $status -Body $bodyText -RetryAfter $retryAfter
+        $detail = if ($bodyText) { $bodyText } else { $we.Message }
+        throw (New-Object System.Net.WebException((New-Mem0PostErrorMessage -Failure $failure -Detail $detail), $we))
+    }
     try {
         $sr = [System.IO.StreamReader]::new($resp.GetResponseStream())
         try { return $sr.ReadToEnd() } finally { $sr.Close() }

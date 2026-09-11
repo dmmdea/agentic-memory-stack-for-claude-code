@@ -1,0 +1,12 @@
+[Unit]
+Description=AMS chain step: newest backup set mirrored to the pCloud path (after the rclone/pCloud mount)
+PartOf=ams-nightly.target
+After=mem0.service ams-step-syncoid.service
+RequiresMountsFor=%h/pCloudDrive
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded pcloud-copy /bin/bash %h/apps/mem0-scripts/ams-pcloud-copy.sh
+
+[Install]
+WantedBy=ams-nightly.target
