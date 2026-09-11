@@ -4,6 +4,14 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.21.1 (2026-09-10) — the key guard accepts a symlinked `~/.mem0`
+
+The first native install refused its own `~/.mem0/canonical-key.dpapi`: the path-traversal guard
+resolved the symlink into the data dataset and saw a path outside `$HOME`. The guard now also
+judges the lexical (normalised, symlink-preserving) path, so the defaults placed under `$HOME`
+by the owner pass while `..` traversals are still collapsed and refused. Test pins a symlinked
+home directory. Stamps only otherwise.
+
 ## v1.21.0 (2026-09-10) — native Linux authority: installer, judge transport, health, nightly chain (Phase 1, staging)
 
 The memory authority can now be installed natively on an always-on Linux box (no WSL anywhere),
