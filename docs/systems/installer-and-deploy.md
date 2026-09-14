@@ -5,7 +5,7 @@
 This system is how the memory stack gets *onto* a machine and how code changes reach the *running* runtime afterward. Two distinct paths live here:
 
 - **Install** (`install.ps1` and its four phases) — the one-time, operator-facing bring-up that provisions WSL services, deploys Windows-side hook scripts, registers Claude Code hooks and scheduled tasks, and verifies the result.
-- **Deploy** (`scripts/wsl/deploy.sh`) — the single, ongoing path that pushes updated server modules, maintenance scripts, and systemd units from the repository into the live WSL runtime, gated so a broken change never reaches a restart.
+- **Deploy** (`scripts/wsl/deploy.sh`) — the single, ongoing path that pushes updated server modules, maintenance scripts, and systemd units from the repository into the live WSL runtime, gated so a broken change never reaches a restart. Since v1.23.2 the script honours the box's role: on a replica whose local mem0 is dormant it syncs the files and stops (no restart, no health gate); a live travel-mode replica is restarted on the new code and skips the retrieval-families gate, which judges the authority's store. Its probes follow `MEM0_BIND`.
 
 Both exist to solve the same underlying hazard: production spans multiple roots (a WSL app directory, systemd timers, a Windows `~/.claude/scripts` deploy layer) that can silently drift apart. The install path builds them consistently; the deploy path keeps them in sync through one gated pipeline; and a set of parity/skew checks make any remaining drift *visible* rather than silent.
 
@@ -116,7 +116,7 @@ R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-conso
 
 ### Linux thin client (`install/linux-client.sh`)
 
-A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses another machine's Brain over the network. `install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file> [--user-id <tenant>]` installs only what a client needs and then proves it (`--user-id` is the mem0 tenant the Brain stores under — its own install's WSL username; it defaults to the client's login name, which is only right when the two match):
+A **thin client** is a native-Linux box (no WSL, no local mem0/Qdrant) that uses another machine's Brain over the network. `install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <file> [--user-id <tenant>]` installs only what a client needs and then proves it (`--user-id` is the mem0 tenant the Brain stores under — its own install's WSL username; since v1.23.2 an omitted flag inherits the tenant from the previous `~/.mem0/client-receipt.json`, and only a first install falls back to the client's login name, which is only right when the two match):
 
 1. **Refuses a loopback authority** with the same fail-closed host rule as `replay-ops.py`: nothing listens locally on a client, and a loopback authority would queue every write forever.
 2. Writes the per-host files the shim resolves at startup — `~/.mem0/authority-url`, `~/.mem0/role` = `client`, and `~/.mem0/api-key` (copied from `--api-key-file`, mode 0600; the key the authority accepts, i.e. the Brain's own `~/.mem0/api-key`).
@@ -130,7 +130,7 @@ Offline behaviour on a client is the shim's per-call rule with no replica behind
 
 ### Linux replica (`install/linux-replica.sh`)
 
-A **Linux replica** is a thin client plus a dormant, read-only copy of the Brain. `install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <alias> [--brain-wsl <distro>:<user>] [--brain-backup-dir <dir>] [--api-key-file <file>] [--user-id <tenant>]` runs the thin-client install first, then:
+A **Linux replica** is a thin client plus a dormant, read-only copy of the Brain. `install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <alias> [--brain-wsl <distro>:<user>] [--brain-backup-dir <dir>] [--api-key-file <file>] [--user-id <tenant>]` runs the thin-client install first (since v1.23.2 an omitted `--user-id` inherits the tenant from `~/.mem0/stack.env`, else the client receipt), then:
 
 1. Writes `~/.mem0/role` = `replica`, `~/.mem0/replica.env` (how `restore-replica.sh` reaches the Brain's snapshot directory over SSH — through `wsl.exe` when the Brain keeps its stack inside WSL on a Windows host) and `~/.mem0/stack.env` (`MEM0_ROLE=replica`, loopback bind), the same receipts the server's liveness code reads on any box.
 2. Provisions Qdrant and the mem0 server exactly as the WSL-side installer does — with one filesystem rule learned live: Qdrant 1.18.2's snapshot restore fails on **f2fs** ("Failed to load ID tracker mappings"; the same snapshot restores on tmpfs and ext4, and f2fs fails with compression on or off), so when the home filesystem is not ext4/xfs/btrfs/tmpfs the installer backs `~/qdrant-server/storage` with a loop-mounted ext4 image (`storage.img`, `--qdrant-storage-gb`, default 8, an `/etc/fstab` `nofail` entry) — — the module list, the Qdrant version and the pip line are **read from `install/1-wsl-services.sh` at run time**, never copied (pinned by a test) — in their own venv (`python3.12`/`3.13` from PATH, else a `uv`-managed 3.12 bootstrapped into the client venv), warming the BM25 cache the unit expects.
@@ -142,7 +142,7 @@ The restore script carries the One-Brain guard itself: it refuses unless `~/.mem
 ### Linux authority, native (`install/linux-authority.sh`)
 
 The **native authority** is the Brain installed on a plain Linux box — no WSL, no Windows user,
-no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh --bind-ip <tailnet ipv4> --secrets-dir <dir> [--user-id <tenant>] [--dry-run] [--render-only <dir>]` (since v1.23.1 an omitted `--user-id` inherits the tenant already in `~/.mem0/stack.env`; only a first install falls back to the login name — the Linux user and the mem0 tenant usually differ on a native box):
+no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh --bind-ip <tailnet ipv4> --secrets-dir <dir> [--user-id <tenant>] [--dry-run] [--render-only <dir>]` (**re-runs inherit**: since v1.23.1 an omitted `--user-id` keeps the tenant already in `~/.mem0/stack.env`, and since v1.23.2 so do `--embed-model`, `--eval-root`, `--pcloud-dir` and `--zfs-dataset` — only a first install with no `stack.env` applies the defaults; the Linux user and the mem0 tenant usually differ on a native box, and a re-run that reverted the embed model would re-create the wrong-conversion defect while `/health/deep` stayed green):
 
 1. **Refuses** a wildcard, loopback or malformed bind (the authority listens on its tailnet address only), a missing `ams-api-key.cred` / `ams-canonical-key.cred` (made once on that box with `systemd-creds --user encrypt --with-key=host+tpm2`), and an install whose `~/apps/mem0-server`, `~/apps/mem0-scripts`, `~/qdrant-server`, `~/.mem0` are not symlinks into the data dataset (nothing on the root disk).
 2. Writes `~/.mem0/role` = `brain`, `~/.mem0/stack.env` with **`MEM0_HOST_KIND=native`**, `MEM0_BIND=<ip>`, `MEM0_ROLE=brain`, `MEM0_SECRETS_DIR`, and `~/.mem0/authority-url`.

@@ -4,6 +4,36 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.2 (2026-09-14) — re-runs inherit every flag; no probe hard-codes loopback
+
+The v1.23.1 tenant fix was one instance of two classes; this release closes both classes.
+
+- **`linux-authority.sh` inherits every optional flag on a re-run**, not only `--user-id`: an
+  omitted `--embed-model`, `--eval-root`, `--pcloud-dir` or `--zfs-dataset` keeps the value in
+  `~/.mem0/stack.env` (the dataset is now recorded there too; a pre-v1.23.2 box inherits it from
+  the installed drop-in). A re-run without `--embed-model` used to revert the embed model to the
+  stock name — the exact wrong-conversion defect of Session 3 (searches score noise while
+  `/health/deep` stays green) re-created by the installer itself; an omitted `--eval-root` silently
+  dropped the drift canary, an omitted `--zfs-dataset` the pool-usage check.
+- **`linux-replica.sh` and `linux-client.sh` inherit the tenant** (`stack.env`, else the client
+  receipt); only a first install falls back to the login name, which differs from the tenant on
+  every native box in this stack.
+- **`memory-compact.ps1` posts, reads back and deletes through `Get-Mem0AuthorityUrl`.** Its three
+  mem0 calls were the last hard-coded loopback probes under `scripts/windows`: on a replica they
+  hit the dormant local store, and during an outage would have migrated facts INTO the disposable
+  replica.
+- **`deploy.sh` honours the role:** on a replica whose local mem0 is dormant it syncs the files and
+  stops — the v1.23.1 deploy on the first demoted box restarted (started) that dormant mem0 and
+  health-gated a store nobody reads; a live travel-mode replica is restarted on the new code and
+  skips the retrieval-families gate, which judges the authority's store.
+- **`deploy.sh`'s health gate and retrieval gate follow `MEM0_BIND`** (same rule as
+  `stack-promote.sh` since v1.23.1); **`mem0-canonize.sh`** resolves `MEM0_URL` >
+  `~/.mem0/authority-url` > loopback like every chain job, so a hand run on the native authority
+  reaches the server.
+- **`2-windows-config.ps1` removes a stale loopback user-scope `MEM0_URL` on a replica** (the
+  residue of the pre-v1.23 offline watcher, and the second fallback of every hook resolver).
+  A remote value is an operator's choice and stays.
+
 ## v1.23.1 (2026-09-14) — five defects found live during the first workstation cutover
 
 - **`linux-authority.sh` inherits the tenant on a re-run.** An omitted `--user-id` now takes the

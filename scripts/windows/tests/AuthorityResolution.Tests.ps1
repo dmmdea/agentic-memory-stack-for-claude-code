@@ -186,6 +186,23 @@ Describe 'Regression guards for the authority contract' {
         $code | Should -Match "AuthoritySsh = '\`$eAuthoritySsh'"
         $code | Should -Match '\(Import-PowerShellDataFile \$receiptPath\)\.AuthoritySsh'
     }
+    It 'memory-compact.ps1 posts, reads back and deletes through Get-Mem0AuthorityUrl, never loopback (v1.23.2)' {
+        # The compactor runs on EVERY box (brain and replicas). Its three mem0 calls were the last
+        # hard-coded loopback probes in scripts/windows: on a replica they hit the dormant local
+        # store — or, during an outage, wrote migrations INTO the disposable replica.
+        $code = script:Get-CodeLines (Join-Path $script:winDir 'memory-compact.ps1')
+        $code | Should -Not -Match '127\.0\.0\.1:18791'
+        ([regex]::Matches($code, "\(Get-Mem0AuthorityUrl\) \+ '/v1/memories")).Count | Should -Be 3
+        $code | Should -Match "memory-common\.ps1" -Because 'the resolver comes from the shared lib the compactor dot-sources'
+    }
+    It 'the installer removes a stale loopback user-scope MEM0_URL on a replica and only there (v1.23.2)' {
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'install\2-windows-config.ps1')
+        $i = $code.IndexOf("[Environment]::SetEnvironmentVariable('MEM0_URL', `$null, 'User')")
+        $i | Should -BeGreaterThan 0
+        $gate = $code.LastIndexOf("if (`$Role -eq 'replica')", $i)
+        $gate | Should -BeGreaterThan 0 -Because 'a brain keeps whatever the operator set'
+        $code.Substring($gate, $i - $gate) | Should -Match '127\\\.0\\\.0\\\.1\|localhost' -Because 'only a LOOPBACK value is residue; a remote value is a choice'
+    }
     It 'Add-Mem0Memory writes the dead-letter file only on the outbox-unwritable branch' {
         $body = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') 'Add-Mem0Memory'
         $body | Should -Not -BeNullOrEmpty

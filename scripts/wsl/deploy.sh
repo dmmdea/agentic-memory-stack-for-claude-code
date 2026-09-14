@@ -34,6 +34,13 @@ WIN_USER="${MEM0_WIN_USER:-$USER}"
 # 'Ubuntu', mis-resolving __WSL_DISTRO__ in unit sentinels on any other distro name.
 # Read both, preferring the receipt's own spelling.
 DISTRO="${MEM0_DISTRO:-${MEM0_WSL_DISTRO:-Ubuntu}}"
+# v1.23.2: the health gate probes the address the server BINDS (stack.env MEM0_BIND); a
+# wildcard or unset bind answers on loopback, a native authority bound to its tailnet address
+# does not (the same rule stack-promote.sh gained in v1.23.1).
+case "${MEM0_BIND:-}" in
+    ""|0.0.0.0) MEM0_HEALTH_URL="http://127.0.0.1:18791" ;;
+    *)          MEM0_HEALTH_URL="http://${MEM0_BIND}:18791" ;;
+esac
 
 echo "==> deploy: $REPO_ROOT -> live runtime ${DRY:+(DRY RUN)}"
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- mem0-server scripts/wsl systemd 2>/dev/null)" ]; then
@@ -217,10 +224,28 @@ if ! FASTEMBED_CACHE_PATH="$FASTEMBED_CACHE" "$APP_DIR/.venv/bin/python" -c \
 fi
 echo "    fastembed durable cache seeded OK ($FASTEMBED_CACHE)"
 
+# --- 4c. v1.23.2: the one-brain rule on the deploy path ---
+# A replica's local mem0 is DORMANT by design (the offline watcher starts it only during an
+# outage). The restart below would START it — the v1.23.1 deploy on the first demoted box did
+# exactly that (started 10:38, stopped by hand at 10:41) — and then health-gate a store nobody
+# reads. Files are synced; a dormant replica stops here. A replica whose mem0 is up (travel
+# mode) is restarted so it serves the new code and health-checked on its loopback bind, but
+# skips the retrieval-families gate, which judges the AUTHORITY's store.
+if [ "${MEM0_ROLE:-brain}" = "replica" ]; then
+    if ! systemctl --user is-active --quiet mem0.service; then
+        git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
+        echo "==> replica with a dormant local mem0: files synced, NO restart, no health gate (this box reads the authority)"
+        echo "==> deploy complete (replica, local mem0 left dormant)."
+        exit 0
+    fi
+    echo "    replica: local mem0 is UP (travel mode) — restarting it on the new code; retrieval gate skipped (it judges the authority's store)"
+    MEM0_SKIP_RETRIEVAL_GATE=1
+fi
+
 # --- 5. restart + health gate ---
 systemctl --user restart mem0.service
 for i in $(seq 1 30); do
-    curl -sf http://127.0.0.1:18791/health >/dev/null 2>&1 && break
+    curl -sf "$MEM0_HEALTH_URL/health" >/dev/null 2>&1 && break
     sleep 1
     [ "$i" = 30 ] && { echo "==> HEALTH GATE FAILED after 30s — check: journalctl --user -u mem0.service -n 50"; exit 1; }
 done
@@ -231,7 +256,7 @@ done
 # endpoint, so a merely-cold box still passes; a wedged one now ABORTS the deploy
 # (curl exits non-zero and `set -o pipefail` propagates it) instead of hanging forever.
 # (It is also why no ACTIVE reranker probe may ever be added to /health/deep.)
-curl -sf --max-time 60 http://127.0.0.1:18791/health/deep | python3 -c "
+curl -sf --max-time 60 "$MEM0_HEALTH_URL/health/deep" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert d.get('ok'), f'/health/deep not ok: {d}'
@@ -255,7 +280,7 @@ else
     _gate_out="$(mktemp)"
     _gate_red=0
     (cd "$REPO_ROOT/mem0-server" && MEM0_KEY="$(cat "$HOME/.mem0/api-key")" \
-          MEM0_URL="http://127.0.0.1:18791" \
+          MEM0_URL="$MEM0_HEALTH_URL" \
           timeout 300 "$APP_DIR/.venv/bin/python" -m pytest -q tests/test_retrieval_families.py) \
           > "$_gate_out" 2>&1 || _gate_red=1
     tail -20 "$_gate_out"
@@ -278,4 +303,4 @@ else
 fi
 git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
 
-echo "==> deploy complete. Full gate: cd $REPO_ROOT/mem0-server && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=http://127.0.0.1:18791 $APP_DIR/.venv/bin/python -m pytest -q"
+echo "==> deploy complete. Full gate: cd $REPO_ROOT/mem0-server && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=$MEM0_HEALTH_URL $APP_DIR/.venv/bin/python -m pytest -q"

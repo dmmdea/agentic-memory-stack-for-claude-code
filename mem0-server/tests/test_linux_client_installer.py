@@ -120,3 +120,19 @@ def test_role_file_and_protocol_marker_match_the_shared_contract():
     assert "## Memory tier protocol (agentic-memory-stack)" in sh
     assert "claude-config/claude-md-memory-protocol.md" in sh
     assert (REPO_ROOT / "claude-config" / "claude-md-memory-protocol.md").is_file()
+
+
+def test_tenant_inherits_from_the_client_receipt_on_a_rerun(tmp_path):
+    """v1.23.2: an omitted --user-id takes the tenant in the previous client-receipt.json; only a
+    first install falls back to the login name (a re-run used to rewrite the shim under the login)."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    (home / ".mem0" / "client-receipt.json").write_text(
+        '{"role":"client","authority":"http://brain-host:18791","user_id":"tenant-old"}\n', encoding="utf-8")
+    r, _ = _run(["--authority", "http://brain-host:18791", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "tenant inherited from" in r.stdout
+    assert "user_id (mem0 tenant): tenant-old" in r.stdout
+    r, _ = _run(["--authority", "http://brain-host:18791", "--user-id", "tenant-new", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "user_id (mem0 tenant): tenant-new" in r.stdout and "tenant inherited" not in r.stdout

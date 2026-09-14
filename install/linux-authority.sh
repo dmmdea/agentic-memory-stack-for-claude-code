@@ -29,11 +29,14 @@
 #                  space: the restore looked healthy while every search scored noise.
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
+#   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
+#                  --pcloud-dir, --zfs-dataset) keeps the value already in ~/.mem0/stack.env;
+#                  only a first install with no stack.env applies the defaults above.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL="embeddinggemma"
+BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
@@ -80,6 +83,30 @@ if [ -z "$USER_ID" ]; then
     fi
     [ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
 fi
+# v1.23.2: the SAME rule for every other optional flag that lands in stack.env or the drop-in.
+# The tenant was only the first flag caught: a re-run without --embed-model reverted the embed
+# model to the stock name — the D13 wrong-conversion defect (every search scored noise while
+# /health/deep stayed green) re-created by the installer itself; an omitted --eval-root silently
+# dropped the drift canary, an omitted --zfs-dataset the pool-usage check, an omitted
+# --pcloud-dir a custom mirror path. Explicit flag > stack.env > default.
+inherit_from_stack_env() {  # $1 = variable, $2 = stack.env key, $3 = flag (for the message)
+    local prev=""
+    [ -z "${!1}" ] || return 0
+    [ -f "$HOME/.mem0/stack.env" ] && prev="$(sed -n "s/^$2=//p" "$HOME/.mem0/stack.env" | head -n1)"
+    [ -n "$prev" ] || return 0
+    printf -v "$1" '%s' "$prev"
+    echo "    $3 inherited from ~/.mem0/stack.env: $prev"
+}
+inherit_from_stack_env EMBED_MODEL MEM0_EMBED_MODEL --embed-model
+inherit_from_stack_env EVAL_ROOT   MEM0_EVAL_ROOT   --eval-root
+inherit_from_stack_env PCLOUD_DIR  MEM0_PCLOUD_DIR  --pcloud-dir
+inherit_from_stack_env ZFS_DATASET MEM0_ZFS_DATASET --zfs-dataset
+# a box installed before v1.23.2 carries the dataset only in the rendered drop-in
+if [ -z "$ZFS_DATASET" ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
+    ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
+    [ -z "$ZFS_DATASET" ] || echo "    --zfs-dataset inherited from the installed drop-in: $ZFS_DATASET"
+fi
+[ -n "$EMBED_MODEL" ] || EMBED_MODEL="embeddinggemma"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$EVAL_ROOT" ] || [ -f "$EVAL_ROOT/eval/retrieval-drift/retrieval_drift.py" ] || fail "--eval-root $EVAL_ROOT has no eval/retrieval-drift/retrieval_drift.py"
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
@@ -153,6 +180,8 @@ MEM0_EMBED_MODEL=$EMBED_MODEL
 ENV
     [ -z "$EVAL_ROOT" ] || printf 'MEM0_EVAL_ROOT=%s\n' "$EVAL_ROOT" >> "$MEM0_DIR/stack.env"
     [ -z "$PCLOUD_DIR" ] || printf 'MEM0_PCLOUD_DIR=%s\n' "$PCLOUD_DIR" >> "$MEM0_DIR/stack.env"
+    # v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
+    [ -z "$ZFS_DATASET" ] || printf 'MEM0_ZFS_DATASET=%s\n' "$ZFS_DATASET" >> "$MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi

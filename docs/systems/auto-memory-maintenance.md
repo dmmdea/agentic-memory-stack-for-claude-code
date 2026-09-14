@@ -127,6 +127,7 @@ the shared judge mutex is free. Per store, in order:
 
 Decisions available to the judge are `SHORTEN` (rewrite the hook shorter), `MIGRATE` (move a
 pullable lookup fact into the mem0 corpus and drop its line), and `KEEP` — the safe default
+(the migration posts, the by-id read-back and the undo delete all go to the box's resolved authority — `Get-Mem0AuthorityUrl`, i.e. `~\.mem0\authority-url` — never loopback, so a replica migrates into the Brain, not into its dormant local store; v1.23.2)
 whenever the call is unclear, because a wrongly-kept line costs bytes while a wrongly-migrated
 one removes steering the agent needed before it knew to ask.
 
