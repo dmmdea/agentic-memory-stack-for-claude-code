@@ -67,7 +67,8 @@ Client-side consumers resolve the same chain:
 
 | Consumer | Resolution |
 |---|---|
-| `scripts/wsl/mem0-canonize.sh` | runtime tmpfs → plaintext → inline interop DPAPI decrypt |
+| `scripts/wsl/mem0-canonize.sh` | `$CREDENTIALS_DIRECTORY` (native authority) → runtime tmpfs → plaintext → inline interop DPAPI decrypt. **v1.23: runs only where the key lives** — with `~/.mem0/role` ≠ `brain` it forwards its argv over SSH (`BRAIN_SSH` in `~/.mem0/replica.env`) to the authority's `ams-canonize.sh`, and when the authority is unreachable it queues a `canonize` Outbox op that `replay-ops.py` executes there later with a token minted at execution time |
+| `scripts/wsl/ams-canonize.sh` | the authority-side executor: refuses unless `role=brain`; on a native box runs the script inside a transient user unit that loads both `systemd-creds` credentials |
 | pytest suite (`conftest.py`, `test_security_invariants.py`, `test_tier_policy.py`, `test_actor_auth.py`, `test_h_fixes.py`, `test_episodic.py`) | `CanonicalKeyProvider().get_key()` |
 | `scripts/wsl/test-debris-purge.py` | `CanonicalKeyProvider().get_key()` |
 | `scripts/windows/Test-MemoryStack.ps1` (I3 probe) | runtime tmpfs via `\\wsl.localhost\Ubuntu\run\user\1000\mem0\canonical-key` → plaintext → native `ProtectedData::Unprotect` |

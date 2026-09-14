@@ -30,7 +30,7 @@ The `settings.json` hook registrations and their Windows-side handlers: the L1a 
 - **The resident daemon:** `mem0-hook-daemon.ps1` — an accelerator that keeps the bundle pipeline warm over a named pipe; it is *never a dependency*.
 - **The compiled client:** `mem0-hook-client.exe` (from `mem0-hook-client.cs`) — the registered UserPromptSubmit command; a thin exe that talks to the daemon and falls back to the inline PowerShell path on any failure.
 - **The shared Codex mutex:** one lock file that the extractor and the consolidator contend for, so Codex is never invoked concurrently.
-- **The dead-letter queue (DLQ):** failed mem0 POSTs are queued and retried on the next run, so transient backend outages self-heal.
+- **Failed POSTs queue to the Outbox (v1.23):** a connection failure or a retryable status appends an `add` op to the WSL Outbox (`~/.mem0/outbox.jsonl`, the shim's record shape) and the replay driver delivers it when the authority answers; a deterministic 4xx goes to `~/.claude/state/mem0-post-poison.jsonl` for a human. The pre-v1.23 dead-letter file is drained once if present and no longer written.
 
 ## How the system works
 
@@ -82,7 +82,7 @@ Codex / per-job model
 mem0 :18791
   │
   ├─ Success → Mark-Throttle('l1a'); log to ~/.claude/logs/l1a.log
-  └─ Failure → dead-letter to ~/.claude/state/mem0-post-failures.jsonl (drained next run)
+  └─ Failure → connection/retryable: `add` op appended to the WSL Outbox (replay-ops.py delivers it); deterministic 4xx → ~/.claude/state/mem0-post-poison.jsonl
 ```
 
 **Key files:**
@@ -118,7 +118,9 @@ The nightly consolidation is **not** an L1a hook — it runs from the Task Sched
 | File / resource | Role |
 |---|---|
 | `~/.claude/state/codex.lock` | The shared Codex mutex (30-min stale reclaim). |
-| `~/.claude/state/mem0-post-failures.jsonl` | The dead-letter queue of failed mem0 POSTs. |
+| `~/.mem0/outbox.jsonl` (WSL) | Where a failed hook POST queues since v1.23 — the same Outbox the MCP shim uses; `replay-ops.py` drains it. |
+| `~/.claude/state/mem0-post-poison.jsonl` | Deterministic 4xx failures (400/401/413/422) set aside for a human. |
+| `~/.claude/state/mem0-post-failures.jsonl` | The pre-v1.23 dead-letter queue; drained once if still present, no longer written. |
 | `~/.claude/state/hook-fixtures/` | Sampled stdin fixtures (byte-faithful) for wire-contract regression. |
 | `~/.mem0/hook-daemon.log` | Daemon log — op names/counts/durations/hashes only, **no payload**. |
 | `~/.claude/logs/l1a.log`, `codex-usage.jsonl` | Extractor + per-call Codex usage logs. |
@@ -204,11 +206,11 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 
 | Condition | Behavior |
 |---|---|
-| mem0 unreachable on L1a start | Skip extraction; drain DLQ on next run |
+| mem0 unreachable on L1a start | Skip extraction; drain the legacy DLQ on next run |
 | Codex unauthenticated / exits non-zero | Log error; release lock; exit 0 (best-effort) |
 | Lock held by other component | Log "skipping: lock held"; exit 0 |
 | JSON parse fails on Codex output | Log preview of raw output; exit 0 (no partial write) |
-| mem0 POST fails per-fact | Write to DLQ; continue to next fact |
+| mem0 POST fails per-fact | Queue an `add` op to the WSL Outbox (deterministic 4xx → poison file); continue to next fact |
 | Daemon pipe absent / timeout / stale `lib_hash` | Fall back to the inline PS path; respawn the daemon detached |
 | Unknown `hook_contract_version` | Server logs a WARN (drift signal); never rejects |
 
@@ -244,7 +246,7 @@ The compiled client's fail-open matrix (missing lib, absent pipe, timeouts, garb
 - [`../../scripts/windows/mem0-hook-daemon.ps1`](../../scripts/windows/mem0-hook-daemon.ps1) — the resident UserPromptSubmit bundle accelerator.
 - [`../../scripts/windows/mem0-hook-client.cs`](../../scripts/windows/mem0-hook-client.cs) — the compiled thin client (fail-open exit-code contract).
 - [`../../scripts/windows/build-hook-client.ps1`](../../scripts/windows/build-hook-client.ps1) — compiles + smoke-gates the client exe.
-- [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the shared Codex lock, throttle, and DLQ helpers.
+- [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the shared Codex lock, throttle, authority resolver (`Get-Mem0AuthorityUrl`) and Outbox helpers.
 - [`../../mem0-server/hook_contract.py`](../../mem0-server/hook_contract.py) — the WARN-only hook-contract drift detector.
 - [`../../claude-config/settings.example.json`](../../claude-config/settings.example.json) — the scrubbed hook registrations reference.
 

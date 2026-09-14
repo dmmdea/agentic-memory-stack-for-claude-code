@@ -232,3 +232,44 @@ def test_unmarked_box_defaults_to_brain(ro, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".mem0").mkdir()
     assert ro._role() == "brain"
+
+def test_canonize_op_runs_over_ssh_and_confirms(ro, tmp_path, monkeypatch):
+    # v1.23 P2-8: a queued canonization executes on the authority over SSH (token minted there)
+    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
+    calls = []
+    class P:  # fake CompletedProcess
+        def __init__(self, rc): self.returncode = rc; self.stdout = "ok\n"; self.stderr = ""
+    monkeypatch.setattr(ro.subprocess, "run", lambda argv, **kw: (calls.append(argv) or P(0)))
+    ro.dispatch("canonize", {"argv": ["m1", "why"], "requester": "pc1", "requested_ts": "2026-09-14T00:00:00Z"})
+    assert calls and calls[0][:5] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] and calls[0][5] == "fakebrain"
+    assert calls[0][6:8] == ["bash", "~/apps/mem0-scripts/ams-canonize.sh"] and calls[0][-2:] == ["m1", "why"]
+    conf = json.loads((tmp_path / ".mem0" / "canonize-confirmations.jsonl").read_text(encoding="utf-8").strip())
+    assert conf["argv"] == ["m1", "why"] and conf["requester"] == "pc1" and conf["confirmed_ts"].endswith("Z")
+
+def test_canonize_op_unreachable_is_kept_not_conflicted(ro, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
+    class P:
+        returncode = 255; stdout = ""; stderr = "unreachable"
+    monkeypatch.setattr(ro.subprocess, "run", lambda argv, **kw: P())
+    monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
+    ob = tmp_path / "outbox.jsonl"
+    ob.write_text(json.dumps({"op": "canonize", "args": {"argv": ["m1", "w"]}, "key": "k1"}) + "\n", encoding="utf-8")
+    stats = ro.replay(ob, "http://authority.invalid", "k")
+    assert stats["kept"] == 1 and stats["conflicts"] == 0 and stats["replayed"] == 0
+    assert (tmp_path / "outbox.replaying.jsonl").exists()
+    assert not (tmp_path / ".mem0" / "canonize-confirmations.jsonl").exists()
+
+def test_canonize_op_refused_by_authority_is_a_conflict(ro, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
+    class P:
+        returncode = 4; stdout = ""; stderr = "Error: memory not found"
+    monkeypatch.setattr(ro.subprocess, "run", lambda argv, **kw: P())
+    monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
+    ob = tmp_path / "outbox.jsonl"
+    ob.write_text(json.dumps({"op": "canonize", "args": {"argv": ["m1", "w"]}, "key": "k1"}) + "\n", encoding="utf-8")
+    stats = ro.replay(ob, "http://authority.invalid", "k")
+    assert stats["conflicts"] == 1 and stats["replayed"] == 0
+    assert "authority refused rc=4" in (tmp_path / "mutation-conflicts.jsonl").read_text(encoding="utf-8")

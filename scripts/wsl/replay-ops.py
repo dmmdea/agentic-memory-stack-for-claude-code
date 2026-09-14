@@ -4,9 +4,11 @@ Idempotent (replayed-key ledger); failures -> mutation-conflicts.jsonl (never dr
 Only runs when the authority is reachable; atomic rotation closes the concurrent-writer race."""
 from __future__ import annotations
 import argparse
+import datetime as _dt
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -46,8 +48,56 @@ def _authority_reachable(url: str) -> bool:
     except Exception:
         return False
 
+class TransientSSH(Exception):
+    """The authority's ssh endpoint did not answer (exit 255): keep the op, exactly like a 503."""
+
+
+def brain_ssh() -> str:
+    """BRAIN_SSH from ~/.mem0/replica.env (written by linux-replica.sh / install.ps1 -AuthoritySsh)."""
+    try:
+        for line in (Path.home() / ".mem0" / "replica.env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("BRAIN_SSH="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+class _StubResponse:
+    status_code = 200
+    def raise_for_status(self): pass
+    def json(self): return {}
+
+
+def _dispatch_canonize(args: dict) -> _StubResponse:
+    """v1.23 P2-8 (spec §7 Y7): a queued canonization executes ON THE AUTHORITY over SSH; the HMAC
+    token is minted there at execution time, so nothing stale is ever replayed and nothing runs
+    on a replica. Confirmed per fact in ~/.mem0/canonize-confirmations.jsonl (the banner's source)."""
+    alias = brain_ssh()
+    if not alias:
+        raise ValueError("canonize: ~/.mem0/replica.env has no BRAIN_SSH")
+    argv = [str(a) for a in (args.get("argv") or [])]
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", alias,
+                        "bash", "~/apps/mem0-scripts/ams-canonize.sh", *argv],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode == 255:
+        raise TransientSSH(p.stderr[-300:])
+    if p.returncode != 0:
+        raise ValueError(f"authority refused rc={p.returncode}: {p.stderr[-300:]}")
+    conf = Path.home() / ".mem0" / "canonize-confirmations.jsonl"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    with conf.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"argv": argv, "requester": args.get("requester", ""),
+                             "requested_ts": args.get("requested_ts", ""),
+                             "confirmed_ts": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                             "stdout_tail": p.stdout[-300:]}) + "\n")
+    return _StubResponse()
+
+
 def dispatch(op: str, args: dict) -> httpx.Response:
     """Map a queued op to its authority call. Raises httpx.HTTPStatusError on 4xx/5xx."""
+    if op == "canonize":
+        return _dispatch_canonize(args)
     t = httpx.Timeout(connect=1.5, read=30.0, write=30.0, pool=1.5)
     h = _headers()
     if op == "add":
@@ -215,6 +265,15 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
                 lf.write(json.dumps({"key": k, "op": rec["op"]}) + "\n")
             done_keys.add(k)  # in-batch dedup: a duplicated key later in this batch must skip
             stats["replayed"] += 1
+        except TransientSSH:
+            # v1.23 P2-8: the authority's ssh did not answer — same shape as a retryable 503:
+            # keep this op and everything after it, in order, for the next run.
+            kept.append(rec)
+            stats["kept"] += 1
+            stats["stopped_retryable"] = {"status": "ssh-255", "op": rec["op"], "retry_after": None}
+            kept.extend(recs[recs.index(rec) + 1:])
+            stats["kept"] += len(recs) - recs.index(rec) - 1
+            break
         except httpx.HTTPStatusError as e:
             # AMS-28 (2026-08-08): a RETRYABLE status is not a conflict. The
             # drainer treated every HTTP error as terminal, so a 503 (the

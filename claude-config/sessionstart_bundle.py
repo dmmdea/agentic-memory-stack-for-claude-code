@@ -75,11 +75,29 @@ def select_facts(memories, k: int = DEFAULT_K) -> list:
     return out
 
 
-def format_block(facts) -> str:
-    """The advisory banner block, or '' when there is nothing to show (silent)."""
+def format_block(facts, source: str = "") -> str:
+    """The advisory banner block, or '' when there is nothing to show (silent). `source` (v1.23
+    P2-3) names where the facts came from — 'authority:<host:port>' — so a session can see which
+    box answered; '' keeps the legacy header byte-for-byte."""
     if not facts:
         return ""
-    return HEADER + "\n" + "\n".join(f"  - [recall] {f}" for f in facts)
+    header = HEADER[:-2] + f"; source={source}):" if source else HEADER
+    return header + "\n" + "\n".join(f"  - [recall] {f}" for f in facts)
+
+
+def resolve_authority_url(home: str) -> str:
+    """~/.mem0/authority-url (per-host file) > MEM0_URL > loopback (v1.23 P2-3, spec §7): the file
+    is the truth on a replica; the env var is only a fallback for a box that has no file."""
+    try:
+        with open(os.path.join(home, ".mem0", "authority-url"), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line.rstrip("/")
+    except OSError:
+        pass
+    env = os.environ.get("MEM0_URL", "").strip()
+    return (env or "http://127.0.0.1:18791").rstrip("/")
 
 
 def choose_query_and_params(marker_query, recency_query):
@@ -190,23 +208,13 @@ def main(argv=None) -> int:
         if not query:
             return 0  # no signal -> inject nothing
 
-        # Same precedence as the MCP shim and replay-ops: MEM0_URL env > ~/.mem0/authority-url
-        # (per-host file) > loopback. Env-only resolution left this silently injecting NOTHING on
-        # a replica — the whole function is wrapped in `except: pass`, so a connection refusal to
-        # a dead loopback looks identical to "no memories matched".
-        url = os.environ.get("MEM0_URL", "").strip()
-        if not url:
-            try:
-                for line in open(os.path.join(home, ".mem0", "authority-url"), encoding="utf-8"):
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        url = line
-                        break
-            except OSError:
-                pass
-        url = (url or "http://127.0.0.1:18791").rstrip("/")
+        # v1.23 P2-3: the per-host file first (the shim's precedence), MEM0_URL only as fallback.
+        # Env-only resolution left this silently injecting NOTHING on a replica — the whole function
+        # is wrapped in `except: pass`, so a connection refusal to a dead loopback looks identical
+        # to "no memories matched".
+        url = resolve_authority_url(home)
         memories = fetch_bundle(url, key, query, brand, initiative, tier=tier)
-        block = format_block(select_facts(memories, k=k))
+        block = format_block(select_facts(memories, k=k), source="authority:" + url.split("://", 1)[-1])
         if block:
             print(block)
     except Exception:

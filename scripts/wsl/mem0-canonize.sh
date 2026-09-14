@@ -51,6 +51,40 @@ set -euo pipefail
 
 MEM0="${MEM0_URL:-http://127.0.0.1:18791}"
 
+# ─── v1.23 P2-8 (spec §7 Y7): canonization runs ONLY where the canonical key lives ──────────
+# role=brain → this box is the authority, continue below. Any other role → forward the exact
+# argv to the authority over SSH (BRAIN_SSH from ~/.mem0/replica.env, written by the installer)
+# where ams-canonize.sh runs the real thing; unreachable (ssh exit 255) → queue a `canonize`
+# Outbox op that replay-ops.py executes on the authority when the link returns (the HMAC token
+# is minted THERE, at execution time). Never mint a token on a replica; never drop a request.
+# The session-start banner reports queued / drained counts until each has its confirmation.
+ROLE="$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null || true)"
+ROLE="${ROLE:-brain}"
+if [[ "$ROLE" != "brain" && "${MEM0_CANONIZE_NO_FORWARD:-0}" != "1" ]]; then
+  BRAIN_SSH=""
+  if [[ -r "$HOME/.mem0/replica.env" ]]; then
+    BRAIN_SSH="$(sed -n "s/^BRAIN_SSH='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$HOME/.mem0/replica.env" | head -n1)"
+  fi
+  [[ -n "$BRAIN_SSH" ]] || { echo "Error: role=$ROLE is not the authority and ~/.mem0/replica.env has no BRAIN_SSH (re-run the installer with the authority's ssh alias: install.ps1 -AuthoritySsh <alias> / linux-replica.sh --brain-ssh <alias>)" >&2; exit 2; }
+  QUOTED=""
+  for a in "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
+  set +e
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$BRAIN_SSH" "bash ~/apps/mem0-scripts/ams-canonize.sh$QUOTED"
+  rc=$?
+  set -e
+  if [[ $rc -eq 255 ]]; then
+    ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")"
+    KEY="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')"
+    NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$HOME/.mem0"
+    printf '{"op":"canonize","args":{"argv":%s,"requester":"%s","requested_ts":"%s"},"queued_ts":"%s","key":"%s"}\n' \
+      "$ARGV_JSON" "$(hostname)" "$NOW" "$NOW" "$KEY" >> "$HOME/.mem0/outbox.jsonl"
+    echo "QUEUED_OFFLINE key=$KEY — the authority ($BRAIN_SSH) is unreachable; replay-ops.py will execute this canonization there when the link returns (the session-start line reports it until confirmed)."
+    exit 0
+  fi
+  exit $rc
+fi
+
 # ─── Argument parsing ────────────────────────────────────────────────────────
 
 ACTION=""        # empty → tier-promotion (v0.14 compat), or one of: put, delete, patch_metadata

@@ -108,8 +108,13 @@ the second half: the nightly jobs ported to Python on the authority (dream, auto
 refresh, usage report and its quota gate), every nightly job as a receipted step of the one chain,
 and the workstation-side `cold-embedder` handling. The Phase 1 gate (three complete staging nights,
 canaries retrievable after each; shortened from seven by the operator on 2026-09-11) counts from the first
-full-chain night. Cutover (Phase 2) has not
-begun.
+full-chain night; it closed on 2026-09-14 (three complete chain nights; the canaries were re-read 7/7 the same
+morning after a serving defect in the authority's embedder placement was fixed — the dream had nothing to
+consolidate on a store that receives no live writes, so its own drift phase never ran). Phase 2 (cutover) began
+2026-09-14: v1.23.0 ships its workstation half — every hook resolves the per-host authority file, failed hook
+posts queue to the Outbox, replica reads fail over with a `source=` stamp, and canonization runs only on the
+authority (forwarded or queued from a replica). The first workstation is cut over in the same session; the
+remaining workstations follow when they are online.
 
 **Gather input on the authority.** The consolidator's gather phase reads the store — the last
 36 hours of evidence and the recent episodes — rather than workstation transcripts, which never

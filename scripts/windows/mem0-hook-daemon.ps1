@@ -280,13 +280,15 @@ function Invoke-DaemonRawBundle {
             }
             # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
             # retried ONCE; every other failure is the same fail-open as before.
+            $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
             $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            if (-not $post.ok) { $post = Invoke-BundleReplicaFailover -Body $bundleBody -ApiKey $apiKey -Failed $post }   # v1.23 P2-7
             if ($post.ok) {
                 $bundleR = ConvertFrom-HookJson $post.text
                 $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId $sessionId   # v1.12 HK-5
                 # v0.22 D: render per tier (resolved above from sidecar/transcript).
                 # frontier/mid = full format; small = flat + legend. Fail-open frontier.
-                $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier
+                $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource
                 $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
                 $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
                 if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
@@ -397,7 +399,9 @@ function Invoke-DaemonRequest {
         }
         # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
         # retried ONCE; every other failure is the same fail-open as before.
+        $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
         $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+        if (-not $post.ok) { $post = Invoke-BundleReplicaFailover -Body $bundleBody -ApiKey $apiKey -Failed $post }   # v1.23 P2-7
         if (-not $post.ok) {
             # error = 'bundle_failed: <msg>' or 'cold-embedder retried=1 ok=False daemon_ms=N'
             return @{ ok = $false; error = $post.diag_prefix; lib_hash = $script:LibHash }
@@ -408,7 +412,7 @@ function Invoke-DaemonRequest {
         # Identical rendering to the inline path: lib Format-MemoryContextBlock
         # incl. client-side admission Layers 1/2/3 + the same rejected-candidate
         # audit file defaults. Tier-aware (v1.0 R2), fail-open frontier.
-        $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier
+        $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource
 
         $diag = @{
             episode_id = $bundleR.checkpoint.episode_id
@@ -428,6 +432,23 @@ function Invoke-DaemonRequest {
     } catch {
         return @{ ok = $false; error = ('bundle_failed: ' + $_.Exception.Message); lib_hash = $script:LibHash }
     }
+}
+
+function Invoke-BundleReplicaFailover {
+    # v1.23 P2-7 (spec §8): the authority did not answer. On a REPLICA retry the SAME bundle POST
+    # against the dormant local store (offline-watcher / travel-mode start it) and stamp
+    # source=local-replica; anywhere else hand the failure back unchanged.
+    param([string]$Body, [string]$ApiKey, $Failed, [int]$TimeoutMs = 3000)
+    $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
+    $fo = Get-Mem0BundleFailoverUrl -AuthorityUrl $script:BaseUrl
+    if (-not $fo) { return $Failed }
+    $local = Invoke-BundlePostWithColdRetry -Uri ($fo + '/v1/context/bundle') -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
+    if ($local.ok) {
+        $script:BundleSource = 'local-replica'
+        $local.diag_prefix = 'failover=local-replica (' + $Failed.diag_prefix + ')'
+        return $local
+    }
+    return $Failed
 }
 
 function Invoke-BundlePostWithColdRetry {
@@ -503,7 +524,9 @@ $script:Jss.MaxJsonLength = 16MB
 # MEM0_URL override (2026-07-14): the daemon is the pipe server behind mem0-hook-client.exe — it
 # produces the [MEMORY CONTEXT] block. When the brain lives on another node (replica -> brain), this
 # MUST follow MEM0_URL or the laptop's memory injection silently talks to a dead local port.
-$script:BaseUrl = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+# v1.23 P2-3: resolved from ~\.mem0\authority-url by the lib's Get-Mem0AuthorityUrl, right after
+# the lib dot-source below (the resolver lives in user-prompt-lib.ps1).
+$script:BaseUrl = 'http://127.0.0.1:18791'
 # Stamped on daemon-side bundle/checkpoint POSTs + fixture filenames. MUST
 # match $HookContractVersion in user-prompt-extract.ps1 (deployed together;
 # R9 hash-checks both).
@@ -520,6 +543,9 @@ try { . $libPath } catch {
     Write-DaemonLog "ERROR: lib dot-source failed: $($_.Exception.Message) - exiting (hooks keep working inline)"
     exit 1
 }
+# v1.23 P2-3 (spec §7 defect 1): the authority this daemon talks to is the per-host file.
+$script:BaseUrl = Get-Mem0AuthorityUrl
+$script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
 # v0.21 Phase B (M3/M6): combined digest = SHA256( Sha256Hex(lib) +
 # Sha256Hex(this daemon script) ). A daemon-only redeploy changes the daemon
 # hash and therefore the digest, forcing the same mismatch->shutdown->fresh-daemon

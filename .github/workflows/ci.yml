@@ -98,6 +98,9 @@ jobs:
             mem0-server/tests/test_systemd_parity.py \
             mem0-server/tests/test_tier_parity.py \
             mem0-server/tests/test_w7_outbox_drain.py \
+            mem0-server/tests/test_canonize_forwarding.py \
+            mem0-server/tests/test_sessionstart_bundle_authority.py \
+            mem0-server/tests/test_storage_cap_authority.py \
             mem0-server/tests/test_w7_server_smalls.py \
             claude-config/tests \
             scripts/wsl/test_ship_log_classifier.py \

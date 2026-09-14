@@ -42,7 +42,12 @@ param(
     # the authority already on the box (~/.mem0/authority-url, else the previous receipt) so a
     # plain re-run cannot silently revert a replica to loopback. Only a first install with no
     # prior state falls back to loopback. Passing a value explicitly always wins.
-    [string]$AuthorityUrl = ''
+    [string]$AuthorityUrl = '',
+    # v1.23 P2-8 (spec §7 Y7): the ssh alias, as WSL's ~/.ssh/config knows it, of the box that
+    # holds the canonical key. Written to ~/.mem0/replica.env as BRAIN_SSH on a replica —
+    # mem0-canonize.sh forwards there, replay-ops.py executes queued canonizations there.
+    # Empty inherits the existing line (same rule as -AuthorityUrl: a re-run never blanks it).
+    [string]$AuthoritySsh = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -240,6 +245,24 @@ try {
     # outbox into a loopback authority — see its _refuse_local_authority guard).
     $bRole = $Role.Replace("'", "'\''")
     wsl.exe -d $Distro -e bash -lc "printf '%s\n' '$bRole' > ~/.mem0/role && chmod 600 ~/.mem0/role" 2>&1 | Out-Null
+    # v1.23 P2-3 (spec §7 defect 1): the Windows hooks read the SAME per-host files from the
+    # Windows side (%USERPROFILE%\.mem0\authority-url + role) — mirrors of the WSL files, written
+    # together. Before this, $env:MEM0_URL was the hooks' only source and nothing ever set it.
+    $winMem0 = Join-Path $env:USERPROFILE '.mem0'
+    New-Item -ItemType Directory -Force -Path $winMem0 | Out-Null
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Join-Path $winMem0 'authority-url'), "$AuthorityUrl`n", $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $winMem0 'role'), "$Role`n", $utf8NoBom)
+    Write-Host "    memory authority (Windows side): $AuthorityUrl (~\.mem0\authority-url, role $Role)"
+    if ($Role -eq 'replica' -and $AuthoritySsh) {
+        if ($AuthoritySsh -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw "-AuthoritySsh '$AuthoritySsh' is not a plain ssh alias" }
+        # single-quoted PowerShell string: '' is a literal quote; the alias passed the whitelist above
+        $sshCmd = 'touch ~/.mem0/replica.env && { grep -v ''^BRAIN_SSH='' ~/.mem0/replica.env; printf "BRAIN_SSH=''%s''\n" ''' + $AuthoritySsh + '''; } > ~/.mem0/replica.env.tmp && mv ~/.mem0/replica.env.tmp ~/.mem0/replica.env && chmod 600 ~/.mem0/replica.env'
+        wsl.exe -d $Distro -e bash -lc $sshCmd 2>&1 | Out-Null
+        $sshBack = (wsl.exe -d $Distro -e bash -lc 'sed -n "s/^BRAIN_SSH=''\(.*\)''$/\1/p" ~/.mem0/replica.env' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1)
+        if ("$sshBack".Trim() -eq $AuthoritySsh) { Write-Host "    canonize forwarding: BRAIN_SSH='$AuthoritySsh' (~/.mem0/replica.env)" }
+        else { Write-Host "    WARN: replica.env BRAIN_SSH readback mismatch (wrote '$AuthoritySsh', read '$sshBack')" -ForegroundColor Yellow }
+    }
     $authBack = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null | Where-Object { "$_".Trim() } | Select-Object -First 1)
     if ("$authBack".Trim() -eq $AuthorityUrl) {
         Write-Host "    memory authority: $AuthorityUrl (~/.mem0/authority-url)"

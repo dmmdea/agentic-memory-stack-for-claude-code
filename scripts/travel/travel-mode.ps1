@@ -310,10 +310,11 @@ switch ($Mode) {
       Wsl "cat > ~/.mem0/travel.json <<'EOF'
 $state
 EOF"
-      # Windows-side env for the PowerShell hooks (reads hit the replica; their episodic
-      # checkpoints are ephemeral session banners and are NOT replayed — accepted loss).
-      [Environment]::SetEnvironmentVariable('MEM0_URL', $Replica, 'User')
-      $env:MEM0_URL = $Replica
+      # v1.23 P2-7 (spec §7 defect 2): the Windows hooks read ~\.mem0\authority-url and it stays
+      # pointed at the AUTHORITY. Reads fail over to the replica inside the hooks
+      # (source=local-replica); failed writes queue to the Outbox. Nothing rewrites MEM0_URL any
+      # more, so no hook can ever post into the disposable store.
+      Write-Host "    hooks keep the authority in ~\.mem0\authority-url; reads fail over to the replica, writes queue to the Outbox"
 
       Write-Host "    shim -> replica reads + outbox writes (live for ALL sessions, no restart needed)"
       Write-Host "    NOTE: PowerShell memory hooks in already-running sessions keep the old URL until those sessions restart."
@@ -342,10 +343,9 @@ EOF"
           }
       }
 
-      # Point back at the authority: remove the state file the shim reads, restore hook env.
+      # Point back at the authority: remove the state file the shim reads. (v1.23: the hooks'
+      # authority file was never changed, so there is no env var to restore.)
       Wsl 'rm -f ~/.mem0/travel.json' | Out-Null
-      [Environment]::SetEnvironmentVariable('MEM0_URL', $Authority, 'User')
-      $env:MEM0_URL = $Authority
 
       # Stop + disable the local replica — one live brain, always
       Wsl 'systemctl --user stop mem0.service qdrant.service 2>/dev/null; systemctl --user disable mem0.service qdrant.service 2>/dev/null; true' | Out-Null
