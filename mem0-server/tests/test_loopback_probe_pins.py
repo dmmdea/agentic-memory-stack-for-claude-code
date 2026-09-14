@@ -35,13 +35,28 @@ def test_deploy_sh_never_starts_a_dormant_replica_mem0():
     gate (which judges the authority's store) when a live travel-mode replica is restarted."""
     code = _code(REPO_ROOT / "scripts" / "wsl" / "deploy.sh")
     gate = code.index('if [ "${MEM0_ROLE:-brain}" = "replica" ]; then')
+    smoke = code.index('python -c "import app"')
     restart = code.index("systemctl --user restart mem0.service")
-    assert gate < restart, "the role gate must run before the restart"
-    block = code[gate:restart]
+    # v1.23.3: `import app` opens the Qdrant connection at import time, so the smoke can never pass
+    # on a dormant replica — the gate must come BEFORE it (v1.23.2 had it after, and both replicas
+    # stopped at the smoke with their files already synced).
+    assert gate < smoke < restart, "the role gate must run before the import smoke and the restart"
+    block = code[gate:smoke]
     assert "systemctl --user is-active --quiet mem0.service" in block
+    assert "py_compile" in block, "a dormant replica still gets a byte-compile of the synced modules"
     assert "exit 0" in block, "a dormant replica stops after the file sync"
     assert "MEM0_SKIP_RETRIEVAL_GATE=1" in block
     assert code.index(". \"$HOME/.mem0/stack.env\"") < gate, "MEM0_ROLE comes from the sourced stack.env"
+
+
+def test_authority_installer_restarts_a_running_server_on_a_rerun():
+    """v1.23.3: `enable --now` does not restart an active unit; a re-run that stamps a new VERSION
+    and syncs new modules must restart mem0 or the old code keeps serving under the new stamp."""
+    sh = (REPO_ROOT / "install" / "linux-authority.sh").read_text(encoding="utf-8")
+    stamp = sh.index('cp "$REPO_ROOT/VERSION" "$MEM0_APP/VERSION"')
+    restart = sh.index("systemctl --user restart mem0.service")
+    assert stamp < restart, "the restart must follow the VERSION stamp and module sync"
+    assert "enable --now qdrant.service mem0.service" not in sh, "mem0 must not be started via enable --now (no restart on re-run)"
 
 
 def test_stack_promote_follows_mem0_bind():

@@ -193,6 +193,35 @@ fi
 chmod +x "$SCRIPTS_DIR"/*.sh "$APP_DIR/dpapi-fetch-key.sh" 2>/dev/null || true
 systemctl --user daemon-reload
 
+# --- 3b. v1.23.2/v1.23.3: the one-brain rule on the deploy path ---
+# A replica's local mem0 is DORMANT by design (the offline watcher starts it only during an
+# outage). The restart in step 5 would START it — the v1.23.1 deploy on the first demoted box did
+# exactly that (started 10:38, stopped by hand at 10:41) — and then health-gate a store nobody
+# reads. The import smoke below opens the Qdrant connection at import time, so it can never pass
+# while the replica's stack is dormant either (v1.23.2 put this gate AFTER the smoke and both
+# replicas stopped there with their files already synced). A dormant replica therefore gets a
+# byte-compile of the synced modules here and stops; its real smoke is the /health/deep gate
+# restore-replica runs when the watcher brings it up. A replica whose mem0 is UP (travel mode)
+# goes through the smoke and the restart like a brain, on its loopback bind, but skips the
+# retrieval-families gate, which judges the AUTHORITY's store.
+if [ "${MEM0_ROLE:-brain}" = "replica" ]; then
+    if ! systemctl --user is-active --quiet mem0.service; then
+        _cerr="$(mktemp)"
+        if ! "$APP_DIR/.venv/bin/python" -m py_compile "$APP_DIR"/*.py 2>"$_cerr"; then
+            echo "==> BYTE-COMPILE FAILED for the synced server modules (files are on disk; nothing is running them):"
+            cat "$_cerr"; rm -f "$_cerr"; exit 1
+        fi
+        rm -f "$_cerr"
+        git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
+        echo "    replica (dormant): server modules byte-compile OK; import smoke deferred to the watcher's /health/deep gate"
+        echo "==> replica with a dormant local mem0: files synced, NO restart, no health gate (this box reads the authority)"
+        echo "==> deploy complete (replica, local mem0 left dormant)."
+        exit 0
+    fi
+    echo "    replica: local mem0 is UP (travel mode) — restarting it on the new code; retrieval gate skipped (it judges the authority's store)"
+    MEM0_SKIP_RETRIEVAL_GATE=1
+fi
+
 # --- 4. import smoke in the LIVE venv — a bad module never reaches a restart ---
 if ! (cd "$APP_DIR" && ./.venv/bin/python -c "import app" >/dev/null 2>&1); then
     echo "==> IMPORT SMOKE FAILED — mem0.service NOT restarted. Runtime still running the previous code."
@@ -223,24 +252,6 @@ if ! FASTEMBED_CACHE_PATH="$FASTEMBED_CACHE" "$APP_DIR/.venv/bin/python" -c \
     exit 1
 fi
 echo "    fastembed durable cache seeded OK ($FASTEMBED_CACHE)"
-
-# --- 4c. v1.23.2: the one-brain rule on the deploy path ---
-# A replica's local mem0 is DORMANT by design (the offline watcher starts it only during an
-# outage). The restart below would START it — the v1.23.1 deploy on the first demoted box did
-# exactly that (started 10:38, stopped by hand at 10:41) — and then health-gate a store nobody
-# reads. Files are synced; a dormant replica stops here. A replica whose mem0 is up (travel
-# mode) is restarted so it serves the new code and health-checked on its loopback bind, but
-# skips the retrieval-families gate, which judges the AUTHORITY's store.
-if [ "${MEM0_ROLE:-brain}" = "replica" ]; then
-    if ! systemctl --user is-active --quiet mem0.service; then
-        git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
-        echo "==> replica with a dormant local mem0: files synced, NO restart, no health gate (this box reads the authority)"
-        echo "==> deploy complete (replica, local mem0 left dormant)."
-        exit 0
-    fi
-    echo "    replica: local mem0 is UP (travel mode) — restarting it on the new code; retrieval gate skipped (it judges the authority's store)"
-    MEM0_SKIP_RETRIEVAL_GATE=1
-fi
 
 # --- 5. restart + health gate ---
 systemctl --user restart mem0.service

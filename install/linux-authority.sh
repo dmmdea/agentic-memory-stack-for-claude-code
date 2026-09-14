@@ -276,7 +276,12 @@ if plan "systemctl --user enable --now qdrant mem0 l10-audit.timer ams-nightly.t
 if [ "$(loginctl show-user "$USER" --property=Linger 2>/dev/null)" != "Linger=yes" ]; then
     sudo -n loginctl enable-linger "$USER" 2>/dev/null || echo "    WARN: linger not enabled (run once: sudo loginctl enable-linger $USER)"
 fi
-systemctl --user enable --now qdrant.service mem0.service l10-audit.timer
+systemctl --user enable qdrant.service mem0.service l10-audit.timer
+systemctl --user start qdrant.service l10-audit.timer
+# v1.23.3: a re-run ships new server modules and a new VERSION stamp, and `enable --now` leaves
+# an already-running server on the OLD code (the v1.23.2 re-run left /health reporting 1.23.1).
+# restart starts an inactive unit too, so the first install is unchanged.
+systemctl --user restart mem0.service
 systemctl --user enable --now ams-nightly.timer 2>/dev/null || echo "    (ams-nightly.timer not present in this checkout)"
 # The step services attach to the target through their [Install] WantedBy=; that symlink only
 # exists once each step is ENABLED (not started). The first live chain run started the target
