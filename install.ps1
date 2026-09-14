@@ -18,7 +18,12 @@ param(
     # authority and runs the nightly dream/dedup scheduled tasks; 'replica' = a
     # read-replica box where those canonical-mutation tasks must never run (and
     # any previously-registered ones are removed).
-    [ValidateSet('brain','replica')][string]$Role = 'brain'
+    [ValidateSet('brain','replica')][string]$Role = 'brain',
+    # v1.23 P2-5: forwarded to 2-windows-config.ps1. Empty = inherit what is on the box
+    # (a plain re-run never re-points a replica); a replica needs its brain's URL once.
+    [string]$AuthorityUrl = '',
+    # v1.23 P2-8: the brain's ssh alias (as WSL knows it) for canonize forwarding on a replica.
+    [string]$AuthoritySsh = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,11 +79,18 @@ try {
     $repoWsl = (wsl.exe -d $Distro wslpath -u "$rrFwd" 2>$null)
     if ($repoWsl) { $repoWsl = ([string]$repoWsl).Trim() }
     if (-not $repoWsl) { $repoWsl = "/mnt/" + $RepoRoot.Substring(0,1).ToLower() + "/" + ($RepoRoot.Substring(3) -replace '\\', '/') }
-    wsl.exe -d $Distro -e bash "$repoWsl/install/1-wsl-services.sh" "$wslUser" "$env:USERNAME" "$Distro"
+    # v1.23 P2-5: an EXPLICIT -Role reaches the WSL phase as MEM0_ROLE (wsl.exe -e passes no
+    # environment), so `install.ps1 -Role replica` also disables the brain-only units there. With
+    # no -Role the WSL side keeps its inherit-never-revert rule (stack.env -> ~/.mem0/role).
+    if ($PSBoundParameters.ContainsKey('Role')) {
+        wsl.exe -d $Distro -e bash -c "MEM0_ROLE='$Role' exec bash '$repoWsl/install/1-wsl-services.sh' '$wslUser' '$env:USERNAME' '$Distro'"
+    } else {
+        wsl.exe -d $Distro -e bash "$repoWsl/install/1-wsl-services.sh" "$wslUser" "$env:USERNAME" "$Distro"
+    }
     if ($LASTEXITCODE -ne 0) { throw "WSL services install failed." }
 
     Write-Phase "[2/4] Windows config (hooks, Task Scheduler, MCP registrations, CLAUDE.md patch)"
-    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro -Role $Role
+    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro -Role $Role -AuthorityUrl $AuthorityUrl -AuthoritySsh $AuthoritySsh
     if ($LASTEXITCODE -ne 0) { throw "Windows config failed." }
 
     Write-Phase "[3/4] Verify (end-to-end smoke test)"

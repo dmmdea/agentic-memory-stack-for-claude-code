@@ -100,7 +100,7 @@ Release-note narrative ("shipped X, fixed Y, merged Z") — the largest class of
 
 ## Dead-Letter Queue (DLQ)
 
-The retry queue (`~/.claude/state/mem0-post-failures.jsonl`) that a failed mem0 write dead-letters to; it retries on the next extractor run, quarantines poison codes (413/401/422) immediately, and gives up after 5 attempts. See [memory-capture.md](flows/memory-capture.md).
+The retry queue (`~/.claude/state/mem0-post-failures.jsonl`). Since v1.23 a failed hook write queues to the Outbox (`~/.mem0/outbox.jsonl` in WSL) and replays with everything else; the DLQ is written only when the Outbox itself is unreachable (WSL asleep) and is drained on the next extractor run as before. Deterministic 4xx (400/401/413/422) go to `~/.claude/state/mem0-post-poison.jsonl` for a human. See [memory-capture.md](flows/memory-capture.md).
 
 ## Episodic Ledger
 

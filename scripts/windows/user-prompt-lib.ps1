@@ -597,7 +597,10 @@ function Format-MemoryContextBlock {
         # (byte-identical); small = flat (drop redundant [brand] tag when brand is
         # known, highest-tier-first, prepend a one-line legend). Unknown/empty ->
         # frontier (fail-open: a tier-resolution slip never degrades the block).
-        [string]$Tier = 'frontier'
+        [string]$Tier = 'frontier',
+        # v1.23 P2-7: where the bundle came from ('authority:<host:port>' | 'local-replica');
+        # '' renders the legacy header byte-for-byte.
+        [string]$Source = ''
     )
     if (-not $Bundle) { return $null }
 
@@ -611,7 +614,9 @@ function Format-MemoryContextBlock {
     $tierRank = @{ canonical = 5; insight = 4; stable = 3; evidence = 2; temporal = 1 }
 
     $contextLines = [System.Collections.Generic.List[string]]::new()
-    $contextLines.Add('[MEMORY CONTEXT - auto-surfaced by user-prompt-extract.ps1 v0.17 Phase 0.D]')
+    $hdr = '[MEMORY CONTEXT - auto-surfaced by user-prompt-extract.ps1 v0.17 Phase 0.D'
+    if ($Source) { $hdr += " source=$Source" }
+    $contextLines.Add($hdr + ']')
     $contextLines.Add('')
 
     # v0.22 D (small tier): one-line legend right after the header so a small
@@ -1139,6 +1144,55 @@ function ConvertFrom-Mem0PostError {
     $r.reason = [string]$m.Groups[2].Value
     $r.retry_after = [int]$m.Groups[3].Value
     return $r
+}
+
+function Get-Mem0AuthorityUrl {
+    # v1.23 (P2-3, spec §7): the per-host file ~\.mem0\authority-url is the source of truth, exactly
+    # as the WSL shim reads its ~/.mem0/authority-url. $env:MEM0_URL is only the fallback for a box
+    # that has no file yet; nothing in this repo writes the user-scope variable any more. The value
+    # reaches command lines, so it is whitelisted, not escaped. KEEP IN SYNC: the same function lives
+    # in memory-common.ps1 and user-prompt-lib.ps1 (AuthorityResolution.Tests.ps1 pins them identical).
+    $pattern = '^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+    $candidates = @()
+    try {
+        $f = Join-Path $env:USERPROFILE '.mem0\authority-url'
+        if (Test-Path -LiteralPath $f) {
+            foreach ($line in @([System.IO.File]::ReadAllLines($f))) {
+                $t = "$line".Trim()
+                if ($t -and -not $t.StartsWith('#')) { $candidates += $t; break }
+            }
+        }
+    } catch {}
+    if ($env:MEM0_URL) { $candidates += "$($env:MEM0_URL)".Trim() }
+    foreach ($c in $candidates) {
+        $u = $c.TrimEnd('/')
+        if ($u -match $pattern) { return $u }
+    }
+    return 'http://127.0.0.1:18791'
+}
+function Get-Mem0Role {
+    # ~\.mem0\role (written by the installer beside authority-url) > receipt Role > brain.
+    try {
+        $f = Join-Path $env:USERPROFILE '.mem0\role'
+        if (Test-Path -LiteralPath $f) {
+            $r = ([System.IO.File]::ReadAllText($f)).Trim().ToLowerInvariant()
+            if ($r) { return $r }
+        }
+    } catch {}
+    try {
+        $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+        if (Test-Path $rcpt) { $r = (Import-PowerShellDataFile $rcpt).Role; if ($r) { return "$r".ToLowerInvariant() } }
+    } catch {}
+    return 'brain'
+}
+function Get-Mem0BundleFailoverUrl {
+    # v1.23 P2-7 (spec §8): on a REPLICA whose authority is remote and silent, bundle reads may come
+    # from the dormant local store (offline-watcher / travel-mode start it); the block then says
+    # source=local-replica. Never on the brain, never when the authority already IS loopback.
+    param([string]$AuthorityUrl)
+    if ((Get-Mem0Role) -ne 'replica') { return $null }
+    if ($AuthorityUrl -match '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)') { return $null }
+    return 'http://127.0.0.1:18791'
 }
 
 function Invoke-Mem0Post {

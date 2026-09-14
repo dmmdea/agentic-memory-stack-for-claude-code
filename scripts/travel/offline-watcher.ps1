@@ -136,11 +136,8 @@ elseif ($next.transition -eq 'go_online') {
     # the redesigned shim no longer reads travel.json; clear the flag travel-mode.ps1 on
     # wrote so 'travel-mode.ps1 status' doesn't report travel mode forever (mirrors 'off')
     Wsl 'rm -f ~/.mem0/travel.json' | Out-Null
-    # travel-mode.ps1 on points the Windows-side hooks at the replica via a User-scope
-    # MEM0_URL — that env side effect must be undone on auto-reconnect too, or every hook
-    # keeps writing to a stopped replica forever (mirrors travel-mode.ps1 off's restore).
-    [Environment]::SetEnvironmentVariable('MEM0_URL', $Authority, 'User')
-    $env:MEM0_URL = $Authority
+    # v1.23 P2-7: the Windows hooks resolve the authority from ~\.mem0\authority-url, which travel
+    # mode never changes any more — nothing to restore on reconnect.
 }
 
 # 5. persist

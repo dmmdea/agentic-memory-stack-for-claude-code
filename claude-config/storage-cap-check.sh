@@ -239,6 +239,36 @@ PY
   [ -n "$ep" ] && echo "$ep"
 fi
 
+# v1.23 P2-8 (spec §7 Y7): canonizations queued for the authority (outbox `canonize` ops) and
+# drained since the last banner (per-fact confirmations written by replay-ops.py). A queued
+# request is never silently dropped: it stays on this line until it has its confirmation.
+_cq=0
+for _f in "$HOME/.mem0/outbox.jsonl" "$HOME/.mem0/outbox.replaying.jsonl"; do
+  [ -f "$_f" ] && _cq=$(( _cq + $(grep -c '"op": *"canonize"' "$_f" 2>/dev/null || echo 0) ))
+done
+_cd=0; _stamp="$HOME/.mem0/canonize-shown.stamp"; _conf="$HOME/.mem0/canonize-confirmations.jsonl"
+if [ -f "$_conf" ]; then
+  _since="$(cat "$_stamp" 2>/dev/null || echo 0)"
+  _cd=$(python3 - "$_conf" "$_since" <<'PY' 2>/dev/null || echo 0
+import sys, json, datetime
+n = 0
+for ln in open(sys.argv[1], encoding="utf-8"):
+    try:
+        t = json.loads(ln).get("confirmed_ts", "")
+        e = int(datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp())
+    except Exception:
+        continue
+    if e > int(float(sys.argv[2] or 0)):
+        n += 1
+print(n)
+PY
+)
+  date +%s > "$_stamp" 2>/dev/null || true
+fi
+if [ "${_cq:-0}" -gt 0 ] || [ "${_cd:-0}" -gt 0 ]; then
+  echo "[agentic-memory-stack] canonizations: $_cq queued for the authority, $_cd drained since the last session (per-fact confirmations: ~/.mem0/canonize-confirmations.jsonl)"
+fi
+
 # v0.17 Phase 0.E: brand context auto-load
 SESSION_CWD="${CLAUDE_CWD:-$PWD}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
@@ -248,13 +278,28 @@ CAMPAIGN="$(infer_campaign_from_cwd "$SESSION_CWD")"
 # v0.22 Pillar 1: initiative axis for goal scoping (same cwd source as brand).
 INITIATIVE="$(infer_initiative_from_cwd "$SESSION_CWD")"
 KEY="$(cat "$HOME/.mem0/api-key" 2>/dev/null)"
+# v1.23 P2-3: the banner probes the AUTHORITY this box talks to (per-host file, the shim's
+# precedence), never loopback — on a replica loopback is the dormant local store and this
+# banner read "still starting" forever.
+ams_authority_url() {
+  local f="$HOME/.mem0/authority-url" line
+  if [ -r "$f" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+      case "$line" in ''|'#'*) continue ;; esac
+      printf '%s\n' "${line%/}"; return 0
+    done < "$f"
+  fi
+  printf '%s\n' "${MEM0_URL:-http://127.0.0.1:18791}"
+}
+AMS_URL="$(ams_authority_url)"
 # v1.12 F3 (HK-4): cold-morning guard. This hook runs SYNCHRONOUSLY at SessionStart;
 # when the mem0 server isn't up yet (WSL just booted, services starting) every curl
 # below burns its full --max-time SERIALLY and the session start blocks 15-30s+.
 # Probe once for 1s; when cold, print the local-file blocks only (episodic recents,
 # storage warnings — no server needed) and skip every server-dependent section.
 MEM0_UP=1
-curl -sf --max-time 1 http://127.0.0.1:18791/health >/dev/null 2>&1 || MEM0_UP=0
+curl -sf --max-time 1 $AMS_URL/health >/dev/null 2>&1 || MEM0_UP=0
 if [ "$MEM0_UP" = 0 ]; then
   echo "[agentic-memory-stack] memory server still starting — brand facts/goals skipped this session (they return next session)"
 fi
@@ -275,7 +320,7 @@ print(json.dumps({
     'filters': {'tier': 'canonical', 'user_id': '__WSL_USER__', 'brand': sys.argv[1]},
 }))
 " "$BRAND" 2>/dev/null)
-  canon=$(curl -fsS --max-time 3 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" "http://127.0.0.1:18791/v1/memories/search" -d "$canon_body" 2>/dev/null \
+  canon=$(curl -fsS --max-time 3 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" "$AMS_URL/v1/memories/search" -d "$canon_body" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -309,7 +354,7 @@ except Exception:
     INIT_ENC=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$INITIATIVE" 2>/dev/null)
     [ -n "$INIT_ENC" ] && INIT_Q="&initiative=$INIT_ENC"
   fi
-  goals=$(curl -fsS --max-time 2 -H "X-API-Key: $KEY" "http://127.0.0.1:18791/v1/goals?status=open&brand=$BRAND&limit=3${INIT_Q}" 2>/dev/null \
+  goals=$(curl -fsS --max-time 2 -H "X-API-Key: $KEY" "$AMS_URL/v1/goals?status=open&brand=$BRAND&limit=3${INIT_Q}" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:

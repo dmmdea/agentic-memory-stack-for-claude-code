@@ -4,6 +4,40 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.0 (2026-09-14) — Phase 2 code: hooks resolve the per-host authority, queue to the Outbox, canonize on the authority
+
+The workstation half of the System B cutover (register P2-3, P2-7, P2-8; spec §7). Nothing here
+moves the authority by itself — the installer run that re-points a box does — but after this
+every hook on every box follows that file.
+
+- **Every Windows hook resolves its authority from `~\.mem0\authority-url`** (`Get-Mem0AuthorityUrl`
+  in both libraries: file > `MEM0_URL` > loopback, whitelisted), and `2-windows-config.ps1` writes
+  that file plus `~\.mem0\role` on the Windows side as mirrors of the WSL files. The SessionStart
+  bundle and the session banner follow the same precedence — the banner probed loopback and read
+  "still starting" forever on a replica, and the hooks read an env var nothing ever set.
+- **A failed hook post is queued, never dead-lettered:** connection failures and retryable
+  statuses append an `add` op to the WSL Outbox (the shim's record shape; `replay-ops.py` delivers
+  it); deterministic 4xx go to `mem0-post-poison.jsonl`. `mem0-post-failures.jsonl` remains only
+  as the fallback for the moment the Outbox itself is unreachable (WSL asleep) and is drained on the
+  next run as before.
+- **Replica reads fail over to the dormant local store and say so:** the `[MEMORY CONTEXT …]`
+  header carries `source=authority:<host:port>` or `source=local-replica` (daemon and inline
+  path alike); the SessionStart banner block names its source too.
+- **`install.ps1` forwards `-AuthorityUrl` / `-AuthoritySsh` to phase 2 and an explicit `-Role` to the
+  WSL phase** (as `MEM0_ROLE`; `wsl.exe -e` passes no environment), so one `install.ps1 -Role replica
+  -AuthorityUrl … -AuthoritySsh …` demotes a box on both sides. Without `-Role` the WSL side keeps its
+  inherit-never-revert rule.
+- **`travel-mode.ps1` / `offline-watcher.ps1` no longer rewrite the user-scope `MEM0_URL`.** The
+  hooks' authority file stays pointed at the authority in travel mode, so no hook can post into
+  the disposable store.
+- **Canonization runs only on the authority (Y7).** `mem0-canonize.sh` refuses to mint a token
+  unless `role=brain`; from a replica it forwards its argv over SSH (`BRAIN_SSH` in
+  `~/.mem0/replica.env`, written by `install.ps1 -AuthoritySsh` / `linux-replica.sh --brain-ssh`)
+  to the new authority-side `ams-canonize.sh` (a transient unit loading both `systemd-creds`
+  credentials on a native box); unreachable → a `canonize` Outbox op, executed over SSH at replay
+  time with a token minted on the authority and confirmed per fact in
+  `canonize-confirmations.jsonl`; the session banner reports queued/drained counts.
+
 ## v1.22.3 (2026-09-11) — deploy.sh keeps the native chain units off WSL hosts
 
 `scripts/wsl/deploy.sh` copied every `systemd/*.service|*.timer` — including the `ams-*` units of the

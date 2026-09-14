@@ -115,7 +115,7 @@ function Invoke-Mem0Post {
 # the deployed copies are committed to a repo shared with the other machine, so nothing
 # machine-specific may be baked in, and a User-scope env var is invisible to hook children of an
 # already-running host process (which is how this hook silently lost its API key on one box).
-$BaseUrl = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+$BaseUrl = 'http://127.0.0.1:18791'   # placeholder: resolved from ~\.mem0\authority-url once the lib is loaded (v1.23 P2-3)
 $Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     $rcptDistro = $null
     try {
@@ -159,6 +159,11 @@ function Test-FunctionAvailable {
     param([string]$Name)
     return $null -ne $ExecutionContext.SessionState.InvokeCommand.GetCommand($Name, 'Function')
 }
+
+# v1.23 P2-3 (spec §7 defect 1): the authority is the per-host file ~\.mem0\authority-url (lib
+# resolver, MEM0_URL only as fallback); loopback stays only when the lib itself is missing.
+if (Test-FunctionAvailable 'Get-Mem0AuthorityUrl') { $BaseUrl = Get-Mem0AuthorityUrl }
+$BundleSource = 'authority:' + ([uri]$BaseUrl).Authority
 
 # ---------------------------------------------------------------------------
 # 0.5 v0.20 A.5 FAST PATH: hand VERBATIM stdin to the resident daemon.
@@ -473,7 +478,16 @@ if ((-not $isTrivial) -and (-not $rateLimited)) {
             hook_contract_version = $HookContractVersion
         })
 
-        $bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+        try {
+            $bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+        } catch {
+            # v1.23 P2-7 (spec §8): on a REPLICA whose authority is silent, read the same bundle
+            # from the dormant local store and say so in the header (source=local-replica).
+            $fo = if (Test-FunctionAvailable 'Get-Mem0BundleFailoverUrl') { Get-Mem0BundleFailoverUrl -AuthorityUrl $BaseUrl } else { $null }
+            if (-not $fo) { throw }
+            $bundleText = Invoke-Mem0Post -Uri "$fo/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            $BundleSource = 'local-replica'
+        }
         $bundleR = $script:Jss.DeserializeObject($bundleText)
 
         Write-Log "0.A+0.D bundle: session=$sessionId episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count)"
@@ -483,7 +497,7 @@ if ((-not $isTrivial) -and (-not $rateLimited)) {
         if (Test-FunctionAvailable 'Format-MemoryContextBlock') {
             # v0.22 D: render per tier (resolved above: sidecar -> transcript ->
             # frontier). frontier/mid = full format; small = flat + legend.
-            $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier
+            $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource
         }
     } catch {
         Write-Log "0.A/0.D bundle FAILED for session=$sessionId : $($_.Exception.Message)"

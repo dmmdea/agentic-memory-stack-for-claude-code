@@ -11,7 +11,46 @@
 #                     because a User-scope env var is INVISIBLE to hook children of a host process
 #                     that started before the var was set -- that is exactly why the L1a extractor
 #                     silently failed on one box (it resolved 'Ubuntu' and never found the API key).
-$script:Mem0Url = if ($env:MEM0_URL) { $env:MEM0_URL } else { 'http://127.0.0.1:18791' }
+function Get-Mem0AuthorityUrl {
+    # v1.23 (P2-3, spec §7): the per-host file ~\.mem0\authority-url is the source of truth, exactly
+    # as the WSL shim reads its ~/.mem0/authority-url. $env:MEM0_URL is only the fallback for a box
+    # that has no file yet; nothing in this repo writes the user-scope variable any more. The value
+    # reaches command lines, so it is whitelisted, not escaped. KEEP IN SYNC: the same function lives
+    # in memory-common.ps1 and user-prompt-lib.ps1 (AuthorityResolution.Tests.ps1 pins them identical).
+    $pattern = '^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+    $candidates = @()
+    try {
+        $f = Join-Path $env:USERPROFILE '.mem0\authority-url'
+        if (Test-Path -LiteralPath $f) {
+            foreach ($line in @([System.IO.File]::ReadAllLines($f))) {
+                $t = "$line".Trim()
+                if ($t -and -not $t.StartsWith('#')) { $candidates += $t; break }
+            }
+        }
+    } catch {}
+    if ($env:MEM0_URL) { $candidates += "$($env:MEM0_URL)".Trim() }
+    foreach ($c in $candidates) {
+        $u = $c.TrimEnd('/')
+        if ($u -match $pattern) { return $u }
+    }
+    return 'http://127.0.0.1:18791'
+}
+function Get-Mem0Role {
+    # ~\.mem0\role (written by the installer beside authority-url) > receipt Role > brain.
+    try {
+        $f = Join-Path $env:USERPROFILE '.mem0\role'
+        if (Test-Path -LiteralPath $f) {
+            $r = ([System.IO.File]::ReadAllText($f)).Trim().ToLowerInvariant()
+            if ($r) { return $r }
+        }
+    } catch {}
+    try {
+        $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+        if (Test-Path $rcpt) { $r = (Import-PowerShellDataFile $rcpt).Role; if ($r) { return "$r".ToLowerInvariant() } }
+    } catch {}
+    return 'brain'
+}
+$script:Mem0Url = Get-Mem0AuthorityUrl
 $script:Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     $rcptDistro = $null
     try {
@@ -283,6 +322,21 @@ function Get-Mem0Evidence {
         -TimeoutSec 30
 }
 
+function Add-Mem0OutboxOp {
+    # v1.23 P2-7 (spec §7 defect 2): a failed hook post is QUEUED in the same Outbox the MCP shim
+    # uses (~/.mem0/outbox.jsonl in WSL, replayed by replay-ops.py) instead of a Windows-side
+    # dead-letter file nothing drained on a replica. Same record shape as the shim's _queue_op.
+    # $script:OutboxPath is a test seam; production resolves the \\wsl.localhost path.
+    param([Parameter(Mandatory)][string]$Op, [Parameter(Mandatory)][hashtable]$Args)
+    $path = if ($script:OutboxPath) { $script:OutboxPath } else { "\\wsl.localhost\$($script:Mem0WslDistro)\home\__WSL_USER__\.mem0\outbox.jsonl" }
+    $key = [guid]::NewGuid().ToString()
+    $rec = @{ op = $Op; args = $Args; queued_ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); key = $key } | ConvertTo-Json -Depth 6 -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($rec + "`n")
+    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+    return $key
+}
+
 function Add-Mem0Memory {
     param(
         [string]$Text,
@@ -317,25 +371,36 @@ function Add-Mem0Memory {
         if ($r -and $r.results -and $r.results.Count -gt 0) { $newId = $r.results[0].id }
         if ($newId) { return $newId } else { return $true }
     } catch {
-        # Dead-letter the failed write so it can be retried later (audit finding
-        # 2026-06-08: per-fact POST failures were silently dropped, undermining the
-        # whole point of the hook).
-        # v0.14 C: preserve original metadata + status_code + initialize attempts=1
-        $dlq = Join-Path $script:StateDir 'mem0-post-failures.jsonl'
+        # v1.23 P2-7 (spec §7 defect 2): a failed write is never dropped and never dead-lettered.
+        # Deterministic 4xx (will never succeed on retry) -> the poison file for a human;
+        # everything else (connection refused, timeout, 429/5xx) -> the WSL Outbox, which
+        # replay-ops.py delivers to the authority when the link returns.
+        $errMsg = $_.Exception.Message
         $statusCode = 0
         try {
             if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
         } catch {}
-        $rec = @{
-            text     = $Text
-            source   = $Source
-            metadata = $Metadata    # preserve original; restored on drain
-            attempts = 1
-            error    = $_.Exception.Message
-            status_code = $statusCode
-            timestamp   = (Get-Date).ToString('o')
-        } | ConvertTo-Json -Depth 5 -Compress
-        try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
+        # (PowerShell variable names are case-insensitive: never pair $POISON with $poison.)
+        $poisonCodes = @(400, 401, 413, 422)
+        $poisonPath = Join-Path $script:StateDir 'mem0-post-poison.jsonl'
+        if ($poisonCodes -contains $statusCode) {
+            $rec = @{ text = $Text; source = $Source; metadata = $Metadata; status_code = $statusCode
+                      error = $errMsg; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
+            try { Add-Content -LiteralPath $poisonPath -Value $rec -Encoding UTF8 } catch {}
+            return $false
+        }
+        try {
+            Add-Mem0OutboxOp -Op 'add' -Args @{ text = $Text; user_id = '__WSL_USER__'; infer = $false; metadata = $Metadata } | Out-Null
+        } catch {
+            # The Outbox itself is unreachable (WSL asleep, \\wsl.localhost not mounted): a TRANSIENT
+            # condition, so the fact goes to the legacy dead-letter file, which Drain-Mem0DeadLetter
+            # re-posts through this function on the next run (and then queues it to the Outbox once
+            # that is back). Never the poison file — that one is for payloads that can never succeed.
+            $dlq = Join-Path $script:StateDir 'mem0-post-failures.jsonl'
+            $rec = @{ text = $Text; source = $Source; metadata = $Metadata; attempts = 1; status_code = 0
+                      error = "outbox-unwritable: $($_.Exception.Message); original: $errMsg"; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
+            try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
+        }
         return $false
     }
 }
