@@ -38,7 +38,7 @@ The through-line is that **the code is reinstalled, never transported.** The ins
 
 ### Role selection — `brain` vs `replica`
 
-`install.ps1 -Role brain|replica` (default **`brain`**) sets the machine's place under the **One-Brain Rule**:
+`install.ps1 -Role brain|replica` (default **`brain`**) sets the machine's place under the **One-Brain Rule**. Since v1.23 an explicit `-Role` also reaches the WSL phase (as `MEM0_ROLE`), and `-AuthorityUrl http://<brain-host>:18791` / `-AuthoritySsh <alias>` are forwarded to phase 2 — a replica needs both once; omitting them on a re-run inherits what is on the box.
 
 - **`brain`** — this box is the sole memory write authority; phase 2 registers the two nightly canonical-mutation scheduled tasks (`ClaudeCode-DreamConsolidator-3am`, `ClaudeCode-SemanticDedup-430am`).
 - **`replica`** — a read-only consumer; phase 2 registers *neither* task **and removes any previously-registered ones**, because consolidation and dedup mutate the one shared brain and there is no cross-machine lock. The role is recorded in the Receipt and re-asserted by verify: a `brain` must have both tasks, a `replica` must have neither.

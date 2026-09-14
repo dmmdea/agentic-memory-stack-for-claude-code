@@ -23,6 +23,10 @@ every hook on every box follows that file.
 - **Replica reads fail over to the dormant local store and say so:** the `[MEMORY CONTEXT …]`
   header carries `source=authority:<host:port>` or `source=local-replica` (daemon and inline
   path alike); the SessionStart banner block names its source too.
+- **`install.ps1` forwards `-AuthorityUrl` / `-AuthoritySsh` to phase 2 and an explicit `-Role` to the
+  WSL phase** (as `MEM0_ROLE`; `wsl.exe -e` passes no environment), so one `install.ps1 -Role replica
+  -AuthorityUrl … -AuthoritySsh …` demotes a box on both sides. Without `-Role` the WSL side keeps its
+  inherit-never-revert rule.
 - **`travel-mode.ps1` / `offline-watcher.ps1` no longer rewrite the user-scope `MEM0_URL`.** The
   hooks' authority file stays pointed at the authority in travel mode, so no hook can post into
   the disposable store.
