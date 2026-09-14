@@ -248,9 +248,13 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
                 stats["conflicts"] += 1
     recs.sort(key=lambda r: _ADD_ORDER if r.get("op") == "add" else _MUTATION_ORDER)  # stable: adds first
     kept = []
+    ssh_down = False   # v1.23 P2-8: one ssh exit 255 parks every LATER canonize op without trying it
     for rec in recs:
         k = rec.get("key") or str(uuid.uuid4())
         if k in done_keys:
+            continue
+        if ssh_down and rec.get("op") == "canonize":
+            kept.append(rec); stats["kept"] += 1
             continue
         try:
             if rec.get("op") == "update" and update_superseded(rec.get("args") or {}, rec.get("queued_ts") or ""):
@@ -266,14 +270,14 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
             done_keys.add(k)  # in-batch dedup: a duplicated key later in this batch must skip
             stats["replayed"] += 1
         except TransientSSH:
-            # v1.23 P2-8: the authority's ssh did not answer — same shape as a retryable 503:
-            # keep this op and everything after it, in order, for the next run.
+            # v1.23 P2-8: the authority's ssh did not answer. Unlike a 503 this says nothing about
+            # the HTTP authority, so only the canonize ops are parked (this one and every later one,
+            # untried — each attempt would burn the 5 s connect timeout); adds, updates, deletes and
+            # goal ops queued behind it still drain over HTTP in this run.
             kept.append(rec)
             stats["kept"] += 1
-            stats["stopped_retryable"] = {"status": "ssh-255", "op": rec["op"], "retry_after": None}
-            kept.extend(recs[recs.index(rec) + 1:])
-            stats["kept"] += len(recs) - recs.index(rec) - 1
-            break
+            stats["ssh_unreachable"] = {"status": "ssh-255", "op": rec["op"]}
+            ssh_down = True
         except httpx.HTTPStatusError as e:
             # AMS-28 (2026-08-08): a RETRYABLE status is not a conflict. The
             # drainer treated every HTTP error as terminal, so a 503 (the

@@ -255,10 +255,31 @@ def test_canonize_op_unreachable_is_kept_not_conflicted(ro, tmp_path, monkeypatc
     monkeypatch.setattr(ro.subprocess, "run", lambda argv, **kw: P())
     monkeypatch.setattr(ro, "_authority_reachable", lambda url: True)
     ob = tmp_path / "outbox.jsonl"
-    ob.write_text(json.dumps({"op": "canonize", "args": {"argv": ["m1", "w"]}, "key": "k1"}) + "\n", encoding="utf-8")
+    # an HTTP op queued BEHIND the canonize must still drain: ssh being down says nothing about HTTP,
+    # and a second canonize is parked untried (no 5 s connect timeout burned per op)
+    order = []
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {}
+    real_dispatch = ro.dispatch
+    def fake_dispatch(op, args):
+        if op == "canonize":
+            return real_dispatch(op, args)   # -> the fake subprocess -> TransientSSH
+        order.append(op); return R()
+    monkeypatch.setattr(ro, "dispatch", fake_dispatch)
+    entries = [
+        {"op": "canonize", "args": {"argv": ["m1", "w"]}, "key": "k1"},
+        {"op": "delete", "args": {"memory_id": "m9"}, "key": "k2"},
+        {"op": "canonize", "args": {"argv": ["m2", "w"]}, "key": "k3"},
+    ]
+    ob.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
     stats = ro.replay(ob, "http://authority.invalid", "k")
-    assert stats["kept"] == 1 and stats["conflicts"] == 0 and stats["replayed"] == 0
-    assert (tmp_path / "outbox.replaying.jsonl").exists()
+    assert stats["kept"] == 2 and stats["conflicts"] == 0 and stats["replayed"] == 1
+    assert order == ["delete"]
+    assert stats["ssh_unreachable"]["status"] == "ssh-255"
+    kept = [json.loads(l)["key"] for l in (tmp_path / "outbox.replaying.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert kept == ["k1", "k3"]
     assert not (tmp_path / ".mem0" / "canonize-confirmations.jsonl").exists()
 
 def test_canonize_op_refused_by_authority_is_a_conflict(ro, tmp_path, monkeypatch):

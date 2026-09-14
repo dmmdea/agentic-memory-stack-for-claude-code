@@ -66,6 +66,8 @@ if [[ "$ROLE" != "brain" && "${MEM0_CANONIZE_NO_FORWARD:-0}" != "1" ]]; then
     BRAIN_SSH="$(sed -n "s/^BRAIN_SSH='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$HOME/.mem0/replica.env" | head -n1)"
   fi
   [[ -n "$BRAIN_SSH" ]] || { echo "Error: role=$ROLE is not the authority and ~/.mem0/replica.env has no BRAIN_SSH (re-run the installer with the authority's ssh alias: install.ps1 -AuthoritySsh <alias> / linux-replica.sh --brain-ssh <alias>)" >&2; exit 2; }
+  # printf %q is bash quoting, re-parsed once by the authority user's LOGIN shell — which must be
+  # bash (it is on every Ubuntu box in this stack; a dash login shell would not decode $'…').
   QUOTED=""
   for a in "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
   set +e

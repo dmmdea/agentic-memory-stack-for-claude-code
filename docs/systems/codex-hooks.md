@@ -30,7 +30,7 @@ The `settings.json` hook registrations and their Windows-side handlers: the L1a 
 - **The resident daemon:** `mem0-hook-daemon.ps1` — an accelerator that keeps the bundle pipeline warm over a named pipe; it is *never a dependency*.
 - **The compiled client:** `mem0-hook-client.exe` (from `mem0-hook-client.cs`) — the registered UserPromptSubmit command; a thin exe that talks to the daemon and falls back to the inline PowerShell path on any failure.
 - **The shared Codex mutex:** one lock file that the extractor and the consolidator contend for, so Codex is never invoked concurrently.
-- **Failed POSTs queue to the Outbox (v1.23):** a connection failure or a retryable status appends an `add` op to the WSL Outbox (`~/.mem0/outbox.jsonl`, the shim's record shape) and the replay driver delivers it when the authority answers; a deterministic 4xx goes to `~/.claude/state/mem0-post-poison.jsonl` for a human. The pre-v1.23 dead-letter file is drained once if present and no longer written.
+- **Failed POSTs queue to the Outbox (v1.23):** a connection failure or a retryable status appends an `add` op to the WSL Outbox (`~/.mem0/outbox.jsonl`, the shim's record shape) and the replay driver delivers it when the authority answers; a deterministic 4xx goes to `~/.claude/state/mem0-post-poison.jsonl` for a human. The dead-letter file is written only when the Outbox itself is unreachable (WSL asleep) and is drained on the next run as before.
 
 ## How the system works
 
@@ -120,7 +120,7 @@ The nightly consolidation is **not** an L1a hook — it runs from the Task Sched
 | `~/.claude/state/codex.lock` | The shared Codex mutex (30-min stale reclaim). |
 | `~/.mem0/outbox.jsonl` (WSL) | Where a failed hook POST queues since v1.23 — the same Outbox the MCP shim uses; `replay-ops.py` drains it. |
 | `~/.claude/state/mem0-post-poison.jsonl` | Deterministic 4xx failures (400/401/413/422) set aside for a human. |
-| `~/.claude/state/mem0-post-failures.jsonl` | The pre-v1.23 dead-letter queue; drained once if still present, no longer written. |
+| `~/.claude/state/mem0-post-failures.jsonl` | The dead-letter queue: since v1.23 written only when the Outbox itself is unreachable; drained on the next run. |
 | `~/.claude/state/hook-fixtures/` | Sampled stdin fixtures (byte-faithful) for wire-contract regression. |
 | `~/.mem0/hook-daemon.log` | Daemon log — op names/counts/durations/hashes only, **no payload**. |
 | `~/.claude/logs/l1a.log`, `codex-usage.jsonl` | Extractor + per-call Codex usage logs. |

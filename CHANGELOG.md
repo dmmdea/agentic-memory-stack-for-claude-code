@@ -17,8 +17,9 @@ every hook on every box follows that file.
   "still starting" forever on a replica, and the hooks read an env var nothing ever set.
 - **A failed hook post is queued, never dead-lettered:** connection failures and retryable
   statuses append an `add` op to the WSL Outbox (the shim's record shape; `replay-ops.py` delivers
-  it); deterministic 4xx go to `mem0-post-poison.jsonl`. `mem0-post-failures.jsonl` is still drained
-  once when present, and no longer written.
+  it); deterministic 4xx go to `mem0-post-poison.jsonl`. `mem0-post-failures.jsonl` remains only
+  as the fallback for the moment the Outbox itself is unreachable (WSL asleep) and is drained on the
+  next run as before.
 - **Replica reads fail over to the dormant local store and say so:** the `[MEMORY CONTEXT …]`
   header carries `source=authority:<host:port>` or `source=local-replica` (daemon and inline
   path alike); the SessionStart banner block names its source too.

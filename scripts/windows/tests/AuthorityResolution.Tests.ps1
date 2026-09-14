@@ -130,6 +130,15 @@ Describe 'Add-Mem0Memory failure path: Outbox, not DLQ' {
         Test-Path $script:OutboxPath | Should -Be $false
         (Get-Content (Join-Path $script:StateDir 'mem0-post-poison.jsonl') | ConvertFrom-Json).status_code | Should -Be 422
     }
+    It 'falls back to the legacy dead-letter file (drained next run) when the Outbox itself is unwritable — never the poison file' {
+        $script:OutboxPath = Join-Path $env:USERPROFILE 'no-such-dir\outbox.jsonl'   # WSL asleep / UNC unmounted
+        Mock Invoke-RestMethod { throw [System.Net.WebException]::new('connect refused') }
+        Add-Mem0Memory -Text 'stranded' -Source 'l1a' | Should -Be $false
+        Test-Path (Join-Path $script:StateDir 'mem0-post-poison.jsonl') | Should -Be $false
+        $rec = Get-Content (Join-Path $script:StateDir 'mem0-post-failures.jsonl') | ConvertFrom-Json
+        $rec.text | Should -Be 'stranded'; $rec.attempts | Should -Be 1; $rec.status_code | Should -Be 0
+        $rec.error | Should -Match '^outbox-unwritable:'
+    }
     It 'appends, never truncates, when the outbox already holds records' {
         Set-Content -Path $script:OutboxPath -Value '{"op":"add","args":{"text":"earlier"},"key":"k0"}' -Encoding UTF8
         Mock Invoke-RestMethod { throw [System.Net.WebException]::new('timeout') }
@@ -158,10 +167,11 @@ Describe 'Regression guards for the authority contract' {
         $code | Should -Match "Join-Path \`$winMem0 'authority-url'"
         $code | Should -Match "Join-Path \`$winMem0 'role'"
     }
-    It 'Add-Mem0Memory no longer names the dead-letter file (only the legacy drain reads it)' {
+    It 'Add-Mem0Memory writes the dead-letter file only on the outbox-unwritable branch' {
         $body = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') 'Add-Mem0Memory'
         $body | Should -Not -BeNullOrEmpty
-        $body | Should -Not -Match 'mem0-post-failures'
         $body | Should -Match 'Add-Mem0OutboxOp'
+        ([regex]::Matches($body, 'mem0-post-failures')).Count | Should -Be 1
+        $body.IndexOf('mem0-post-failures') | Should -BeGreaterThan $body.IndexOf('Add-Mem0OutboxOp') -Because 'the DLQ is the fallback AFTER the Outbox write fails, never the first choice'
     }
 }

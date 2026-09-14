@@ -392,9 +392,14 @@ function Add-Mem0Memory {
         try {
             Add-Mem0OutboxOp -Op 'add' -Args @{ text = $Text; user_id = '__WSL_USER__'; infer = $false; metadata = $Metadata } | Out-Null
         } catch {
-            $rec = @{ text = $Text; source = $Source; metadata = $Metadata; status_code = $statusCode
+            # The Outbox itself is unreachable (WSL asleep, \\wsl.localhost not mounted): a TRANSIENT
+            # condition, so the fact goes to the legacy dead-letter file, which Drain-Mem0DeadLetter
+            # re-posts through this function on the next run (and then queues it to the Outbox once
+            # that is back). Never the poison file — that one is for payloads that can never succeed.
+            $dlq = Join-Path $script:StateDir 'mem0-post-failures.jsonl'
+            $rec = @{ text = $Text; source = $Source; metadata = $Metadata; attempts = 1; status_code = 0
                       error = "outbox-unwritable: $($_.Exception.Message); original: $errMsg"; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
-            try { Add-Content -LiteralPath $poisonPath -Value $rec -Encoding UTF8 } catch {}
+            try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
         }
         return $false
     }
