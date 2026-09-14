@@ -102,6 +102,9 @@ jobs:
             mem0-server/tests/test_sessionstart_bundle_authority.py \
             mem0-server/tests/test_storage_cap_authority.py \
             mem0-server/tests/test_loopback_probe_pins.py \
+            mem0-server/tests/test_linux_authority_installer.py \
+            mem0-server/tests/test_linux_client_installer.py \
+            mem0-server/tests/test_linux_replica.py \
             mem0-server/tests/test_w7_server_smalls.py \
             claude-config/tests \
             scripts/wsl/test_ship_log_classifier.py \
