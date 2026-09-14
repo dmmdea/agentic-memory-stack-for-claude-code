@@ -49,7 +49,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-MEM0="${MEM0_URL:-http://127.0.0.1:18791}"
+# v1.23.2: MEM0_URL env > ~/.mem0/authority-url > loopback — the precedence every chain job uses
+# (ams_env.py). On the native authority the file names the tailnet bind, where the server
+# actually listens; a hand run there used to probe loopback and fail.
+MEM0="${MEM0_URL:-}"
+[ -n "$MEM0" ] || MEM0="$(grep -v '^[[:space:]]*#' "$HOME/.mem0/authority-url" 2>/dev/null | grep -m1 . || true)"
+MEM0="${MEM0:-http://127.0.0.1:18791}"; MEM0="${MEM0%/}"
 
 # ─── v1.23 P2-8 (spec §7 Y7): canonization runs ONLY where the canonical key lives ──────────
 # role=brain → this box is the authority, continue below. Any other role → forward the exact

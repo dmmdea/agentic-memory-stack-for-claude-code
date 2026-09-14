@@ -33,6 +33,7 @@ function Mark-Throttle { param($Name) Set-Content -LiteralPath (Join-Path $env:U
 function Acquire-CodexLock { param($Owner, $MaxAgeMinutes) return ($env:STUB_LOCK_HELD -ne '1') }
 function Release-CodexLock { }
 function Get-Mem0Key { return 'test-key' }
+function Get-Mem0AuthorityUrl { return 'http://127.0.0.1:18791' }
 function Invoke-CodexSubagent {
     # $Model mirrors the 2026-09-07 per-job pin; recorded so a compactor that stops naming its
     # model fails a test instead of silently inheriting config.toml.

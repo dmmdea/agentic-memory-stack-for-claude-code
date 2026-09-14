@@ -261,6 +261,17 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $winMem0 'authority-url'), "$AuthorityUrl`n", $utf8NoBom)
     [System.IO.File]::WriteAllText((Join-Path $winMem0 'role'), "$Role`n", $utf8NoBom)
     Write-Host "    memory authority (Windows side): $AuthorityUrl (~\.mem0\authority-url, role $Role)"
+    # v1.23.2: a user-scope MEM0_URL naming loopback is the residue of the pre-v1.23 offline
+    # watcher, which rewrote that variable to the local replica. On a replica it is the second
+    # fallback of every hook resolver and it names the disposable store — remove it and say so.
+    # A remote value is an operator's choice and stays.
+    if ($Role -eq 'replica') {
+        $staleUrl = [Environment]::GetEnvironmentVariable('MEM0_URL', 'User')
+        if ($staleUrl -and $staleUrl -match '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)') {
+            [Environment]::SetEnvironmentVariable('MEM0_URL', $null, 'User')
+            Write-Host "    removed stale user-scope MEM0_URL=$staleUrl (loopback on a replica; the hooks read ~\.mem0\authority-url)"
+        }
+    }
     if ($Role -eq 'replica' -and $AuthoritySsh) {
         if ($AuthoritySsh -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw "-AuthoritySsh '$AuthoritySsh' is not a plain ssh alias" }
         # single-quoted PowerShell string: '' is a literal quote; the alias passed the whitelist above

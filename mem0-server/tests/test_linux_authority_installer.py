@@ -203,3 +203,82 @@ def test_first_install_without_a_receipt_falls_back_to_the_login_name(tmp_path):
     assert r.returncode == 0, r.stderr
     login = os.environ.get("USER") or os.getlogin()
     assert f"Environment=MEM0_DEFAULT_USER_ID={login}" in (out / "mem0.service").read_text(encoding="utf-8")
+
+
+def _stack_env(home, extra=""):
+    (home / ".mem0").mkdir(parents=True, exist_ok=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_WSL_USER=oldtenant\nMEM0_HOST_KIND=native\n" + extra, encoding="utf-8")
+
+
+def test_every_optional_flag_inherits_from_stack_env_on_a_rerun(tmp_path):
+    """v1.23.2: the tenant was only the first flag caught. A re-run without --embed-model reverted
+    the embed model to the stock name (the D13 wrong-conversion defect: searches score noise while
+    /health/deep stays green), an omitted --eval-root dropped the drift canary, an omitted
+    --zfs-dataset the pool-usage check, an omitted --pcloud-dir a custom mirror path."""
+    home = tmp_path / "home"
+    eval_root = tmp_path / "eval-root"
+    (eval_root / "eval" / "retrieval-drift").mkdir(parents=True)
+    (eval_root / "eval" / "retrieval-drift" / "retrieval_drift.py").write_text("# stub\n", encoding="utf-8")
+    _stack_env(home, "MEM0_EMBED_MODEL=embeddinggemma-custom\n"
+                     f"MEM0_EVAL_ROOT={eval_root}\n"
+                     "MEM0_PCLOUD_DIR=/srv/mirror/memory-backups\n"
+                     "MEM0_ZFS_DATASET=pool/apps/ams\n")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    for line in ("--embed-model inherited from ~/.mem0/stack.env: embeddinggemma-custom",
+                 f"--eval-root inherited from ~/.mem0/stack.env: {eval_root}",
+                 "--pcloud-dir inherited from ~/.mem0/stack.env: /srv/mirror/memory-backups",
+                 "--zfs-dataset inherited from ~/.mem0/stack.env: pool/apps/ams"):
+        assert line in r.stdout, (line, r.stdout)
+    conf = (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-custom\n" in conf
+    assert "Environment=MEM0_ZFS_DATASET=pool/apps/ams\n" in conf
+    # an explicit flag still wins over the receipt
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-model", "other-model", "--zfs-dataset", "other/ds",
+                 "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    conf2 = (out2 / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert "Environment=MEM0_EMBED_MODEL=other-model\n" in conf2
+    assert "Environment=MEM0_ZFS_DATASET=other/ds\n" in conf2
+    assert "--embed-model inherited" not in r.stdout and "--zfs-dataset inherited" not in r.stdout
+
+
+def test_an_inherited_eval_root_is_still_validated(tmp_path):
+    """Inheriting must not smuggle a stale value past the check an explicit flag gets."""
+    home = tmp_path / "home"
+    _stack_env(home, f"MEM0_EVAL_ROOT={tmp_path / 'gone'}\n")
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(tmp_path / "render")], tmp_path)
+    assert r.returncode != 0
+    assert "retrieval_drift.py" in r.stderr
+
+
+def test_zfs_dataset_inherits_from_a_pre_v1232_drop_in(tmp_path):
+    """Boxes installed before v1.23.2 recorded the dataset only in the rendered drop-in."""
+    home = tmp_path / "home"
+    _stack_env(home)
+    d = home / ".config" / "systemd" / "user" / "mem0.service.d"
+    d.mkdir(parents=True)
+    (d / "native.conf").write_text("[Service]\nEnvironment=MEM0_ZFS_DATASET=legacy/apps/ams\n", encoding="utf-8")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "--zfs-dataset inherited from the installed drop-in: legacy/apps/ams" in r.stdout
+    assert "Environment=MEM0_ZFS_DATASET=legacy/apps/ams\n" in (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+
+
+def test_first_install_applies_the_defaults(tmp_path):
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    conf = (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma\n" in conf
+    assert "MEM0_ZFS_DATASET" not in conf
+    assert "inherited" not in r.stdout
+
+
+def test_stack_env_records_the_zfs_dataset():
+    """The installer writes what a re-run must be able to read back."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "printf 'MEM0_ZFS_DATASET=%s\\n' \"$ZFS_DATASET\" >> \"$MEM0_DIR/stack.env\"" in sh

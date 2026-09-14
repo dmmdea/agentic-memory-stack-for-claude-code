@@ -33,7 +33,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR='~/.mem0/backups'
-API_KEY_FILE=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; QDRANT_STORAGE_GB=8
+API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -76,6 +76,18 @@ say "[0] prerequisites"
 [ -n "$BRAIN_SSH" ] || fail "--brain-ssh <ssh alias of the Brain> is required (the replica pulls snapshots over SSH)"
 AUTHORITY="${AUTHORITY%/}"
 is_local_url "$AUTHORITY" && fail "a replica's authority must be a REMOTE Brain; '$AUTHORITY' is loopback/unspecified/malformed"
+# v1.23.2: the tenant INHERITS on a re-run (the rule linux-authority.sh gained in v1.23.1 after a
+# re-run without --user-id rewrote the authority's tenant to the Linux login): an omitted
+# --user-id takes the tenant already in ~/.mem0/stack.env (else the thin-client receipt); only a
+# first install falls back to the login name. The Linux user and the mem0 tenant usually differ.
+if [ -z "$USER_ID" ]; then
+    [ -f "$MEM0_DIR/stack.env" ] && USER_ID="$(sed -n 's/^MEM0_WSL_USER=//p' "$MEM0_DIR/stack.env" | head -n1)"
+    if [ -z "$USER_ID" ] && [ -f "$MEM0_DIR/client-receipt.json" ]; then
+        USER_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("user_id",""))' "$MEM0_DIR/client-receipt.json" 2>/dev/null || true)"
+    fi
+    [ -z "$USER_ID" ] || echo "    tenant inherited from the existing install: $USER_ID"
+    [ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
+fi
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$BRAIN_WSL" ] || [[ "$BRAIN_WSL" == *:* ]] || fail "--brain-wsl must be <distro>:<user>"
 [[ "$QDRANT_STORAGE_GB" =~ ^[0-9]+$ ]] && [ "$QDRANT_STORAGE_GB" -ge 1 ] || fail "--qdrant-storage-gb must be a whole number of GiB"

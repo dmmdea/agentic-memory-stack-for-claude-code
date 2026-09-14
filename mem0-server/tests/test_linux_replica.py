@@ -342,3 +342,26 @@ def test_service_status_readout_cannot_abort_the_installer(tmp_path):
         f"replica that is every unit, by design. stdout={r.stdout!r} rc={r.returncode}"
     )
     assert r.returncode == 0, f"status readout exited {r.returncode}"
+
+
+def test_installer_tenant_inherits_on_a_rerun(tmp_path):
+    """v1.23.2: an omitted --user-id takes the tenant already on the box (stack.env, else the
+    thin-client receipt); only a first install falls back to the login name. The Linux user and
+    the mem0 tenant differ on every native box in this stack."""
+    home, env = _scratch_home(tmp_path)
+    (home / ".mem0" / "stack.env").write_text("MEM0_WSL_USER=tenant-old\nMEM0_ROLE=replica\n", encoding="utf-8")
+    base = [BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--brain-ssh", "brain", "--dry-run"]
+    r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "tenant inherited from the existing install: tenant-old" in r.stdout
+    assert "tenant tenant-old" in r.stdout
+    # the explicit flag still wins
+    r = subprocess.run(base + ["--user-id", "tenant-new"], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "tenant tenant-new" in r.stdout and "tenant inherited" not in r.stdout
+    # no stack.env yet, but a thin-client receipt: that tenant is the one
+    (home / ".mem0" / "stack.env").unlink()
+    (home / ".mem0" / "client-receipt.json").write_text('{"role":"client","authority":"http://brain-host:18791","user_id":"tenant-client"}\n', encoding="utf-8")
+    r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "tenant inherited from the existing install: tenant-client" in r.stdout

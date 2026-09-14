@@ -31,7 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUTHORITY=""
 API_KEY_FILE=""
-USER_ID="${USER:-$(id -un)}"
+USER_ID=""
 DRY_RUN=0
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -76,6 +76,14 @@ AUTHORITY="${AUTHORITY%/}"
 if is_local_url "$AUTHORITY"; then
     fail "a thin client must point at a REMOTE authority; '$AUTHORITY' is loopback/unspecified/malformed (nothing listens locally on a client, and the One-Brain Rule forbids replaying into loopback)"
 fi
+# v1.23.2: the tenant INHERITS on a re-run — an omitted --user-id takes the tenant in the previous
+# ~/.mem0/client-receipt.json; only a first install falls back to the login name (the Linux user
+# and the mem0 tenant usually differ; a re-run used to rewrite the shim under the wrong tenant).
+if [ -z "$USER_ID" ] && [ -f "$MEM0_DIR/client-receipt.json" ]; then
+    USER_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("user_id",""))' "$MEM0_DIR/client-receipt.json" 2>/dev/null || true)"
+    [ -z "$USER_ID" ] || echo "    tenant inherited from $MEM0_DIR/client-receipt.json: $USER_ID"
+fi
+[ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 command -v python3 >/dev/null || fail "python3 is required"
 PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"

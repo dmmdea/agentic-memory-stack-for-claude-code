@@ -262,7 +262,7 @@ function Get-AmMem0Record {
     param([Parameter(Mandatory)][string]$Id)
     try {
         $key = Get-Mem0Key
-        return (Invoke-RestMethod -Uri ('http://127.0.0.1:18791/v1/memories/' + $Id) -Headers @{ 'X-API-Key' = $key } -TimeoutSec 15)
+        return (Invoke-RestMethod -Uri ((Get-Mem0AuthorityUrl) + '/v1/memories/' + $Id) -Headers @{ 'X-API-Key' = $key } -TimeoutSec 15)
     } catch { return $null }
 }
 
@@ -296,7 +296,7 @@ function Add-AmMem0Migration {
     $body = @{ messages = $Text; user_id = '__WSL_USER__'; infer = $false; metadata = $Metadata } | ConvertTo-Json -Depth 5 -Compress
     try {
         $key = Get-Mem0Key
-        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/v1/memories' -Method Post `
+        $r = Invoke-RestMethod -Uri ((Get-Mem0AuthorityUrl) + '/v1/memories') -Method Post `
             -Headers @{ 'X-API-Key' = $key; 'Content-Type' = 'application/json' } `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 20
         $id = $null
@@ -316,7 +316,7 @@ function Remove-AmMem0Record {
     param([Parameter(Mandatory)][string]$Id)
     try {
         $key = Get-Mem0Key
-        Invoke-RestMethod -Uri ('http://127.0.0.1:18791/v1/memories/' + $Id) -Method Delete -Headers @{ 'X-API-Key' = $key } -TimeoutSec 15 | Out-Null
+        Invoke-RestMethod -Uri ((Get-Mem0AuthorityUrl) + '/v1/memories/' + $Id) -Method Delete -Headers @{ 'X-API-Key' = $key } -TimeoutSec 15 | Out-Null
         return $true
     } catch { return $false }
 }
