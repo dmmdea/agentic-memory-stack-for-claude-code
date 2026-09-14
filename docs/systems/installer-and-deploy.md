@@ -85,7 +85,7 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 | `EvalRootWsl` | optional checkout carrying the `eval/` harnesses. Omitting `-EvalRootWsl` on a re-run **inherits** the prior receipt's value rather than blanking it (same rule as `AuthorityUrl`) — a plain re-run used to reset it to empty and silently disable the Dream's drift canary. Only an explicit flag, or a first install with no prior receipt, changes it; when genuinely empty the canary falls back to `RepoRootWsl` |
 | `ApiKeyUnc` | UNC path to the WSL-side API key |
 | `AuthorityUrl` | the memory authority this box talks to, mirrored into `~/.mem0/authority-url` inside WSL (what the shim reads) and, since v1.23, into `%USERPROFILE%\.mem0\authority-url` (what the Windows hooks read) |
-| `AuthoritySsh` | (v1.23, replicas) the ssh alias of the box holding the canonical key, written as `BRAIN_SSH` into `~/.mem0/replica.env` so `mem0-canonize.sh` forwards there and queued canonizations replay there; empty inherits the existing line |
+| `AuthoritySsh` | (v1.23, replicas) the ssh alias of the box holding the canonical key, written as `BRAIN_SSH` into `~/.mem0/replica.env` so `mem0-canonize.sh` forwards there and queued canonizations replay there; recorded in the receipt since v1.23.1 and inherited from it when omitted |
 | `PromotionGateMode` | ships `shadow` |
 
 **The memory authority (`-AuthorityUrl`).** Phase 2 also writes `~/.mem0/authority-url` **inside WSL** — the per-host file the MCP shim, `replay-ops.py`, and the SessionStart bundle resolve their authority from (`MEM0_URL` env → this file → loopback) — plus `~/.mem0/role`, so WSL-side code can enforce the One-Brain Rule without reading back into the Windows receipt. Since v1.23 it also writes the Windows-side mirrors `%USERPROFILE%\.mem0\authority-url` and `%USERPROFILE%\.mem0\role`, which every PowerShell hook resolves **first** (`Get-Mem0AuthorityUrl`: file → `MEM0_URL` → loopback) — before that the hooks read an environment variable the installer never set, so a demoted box's hooks would have posted to loopback.
@@ -142,7 +142,7 @@ The restore script carries the One-Brain guard itself: it refuses unless `~/.mem
 ### Linux authority, native (`install/linux-authority.sh`)
 
 The **native authority** is the Brain installed on a plain Linux box — no WSL, no Windows user,
-no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh --bind-ip <tailnet ipv4> --secrets-dir <dir> [--user-id <tenant>] [--dry-run] [--render-only <dir>]`:
+no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh --bind-ip <tailnet ipv4> --secrets-dir <dir> [--user-id <tenant>] [--dry-run] [--render-only <dir>]` (since v1.23.1 an omitted `--user-id` inherits the tenant already in `~/.mem0/stack.env`; only a first install falls back to the login name — the Linux user and the mem0 tenant usually differ on a native box):
 
 1. **Refuses** a wildcard, loopback or malformed bind (the authority listens on its tailnet address only), a missing `ams-api-key.cred` / `ams-canonical-key.cred` (made once on that box with `systemd-creds --user encrypt --with-key=host+tpm2`), and an install whose `~/apps/mem0-server`, `~/apps/mem0-scripts`, `~/qdrant-server`, `~/.mem0` are not symlinks into the data dataset (nothing on the root disk).
 2. Writes `~/.mem0/role` = `brain`, `~/.mem0/stack.env` with **`MEM0_HOST_KIND=native`**, `MEM0_BIND=<ip>`, `MEM0_ROLE=brain`, `MEM0_SECRETS_DIR`, and `~/.mem0/authority-url`.

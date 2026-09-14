@@ -32,7 +32,10 @@ MEM0_DB="$MEM0_DIR/episodic.db"
 # (tier-ledger-YYYY-MM.jsonl, same naming as app.py _append_ledger); the legacy
 # tier-ledger.jsonl is a frozen historical archive.
 LEDGER="$MEM0_DIR/tier-ledger-$(date -u +%Y-%m).jsonl"
-MEM0_URL="http://127.0.0.1:18791"
+# v1.23.1: the server binds the tailnet address on a native authority (stack.env MEM0_BIND), so the
+# post-promote health check follows that bind; MEM0_URL env still wins; loopback stays the default.
+_bind="$(sed -n 's/^MEM0_BIND=//p' "$HOME/.mem0/stack.env" 2>/dev/null | head -n1)"
+MEM0_URL="${MEM0_URL:-http://${_bind:-127.0.0.1}:18791}"
 SNAPSHOT_TS=""
 
 # --- arg parsing ---

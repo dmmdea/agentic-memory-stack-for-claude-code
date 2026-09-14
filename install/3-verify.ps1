@@ -232,14 +232,24 @@ Check "canonical-key exists (DPAPI blob or plaintext mode 600)" {
     $result = wsl.exe -d $Distro -e bash -lc "if [ -f ~/.mem0/canonical-key.dpapi ]; then echo dpapi; elif [ -f ~/.mem0/canonical-key ]; then stat -c '%a' ~/.mem0/canonical-key 2>/dev/null; else echo missing; fi"
     @('dpapi','600') -contains (($result -as [string]).Trim())
 } "No DPAPI blob: in WSL run bash scripts/wsl/generate-canonical-key.sh. DPAPI box (canonical-key.dpapi exists): systemctl --user restart mem0 (re-runs dpapi-fetch-key ExecStartPre) or follow docs/systems/dpapi-canonical-key.md Recovery - do NOT generate a fresh key next to the blob"
-Check "decay-scan.timer enabled" {
-    $r = wsl.exe -d $Distro -e bash -lc "systemctl --user is-enabled decay-scan.timer 2>/dev/null || echo disabled"
-    ($r -as [string]).Trim() -eq 'enabled'
-} "In WSL: systemctl --user enable --now decay-scan.timer"
-Check "stack-backup.timer enabled" {
-    $r = wsl.exe -d $Distro -e bash -lc "systemctl --user is-enabled stack-backup.timer 2>/dev/null || echo disabled"
-    ($r -as [string]).Trim() -eq 'enabled'
-} "In WSL: systemctl --user enable --now stack-backup.timer"
+# v1.23.1: role-aware. The WSL installer's one-brain gate enables these timers on a brain and
+# DISABLES them on a replica (they mutate/back up a store the replica does not own), so on a
+# replica the healthy state is "disabled" — the first demoted box read two false MISSING here.
+if ($stackRole -eq 'brain') {
+    Check "decay-scan.timer enabled (brain)" {
+        $r = wsl.exe -d $Distro -e bash -lc "systemctl --user is-enabled decay-scan.timer 2>/dev/null || echo disabled"
+        ($r -as [string]).Trim() -eq 'enabled'
+    } "In WSL: systemctl --user enable --now decay-scan.timer"
+    Check "stack-backup.timer enabled (brain)" {
+        $r = wsl.exe -d $Distro -e bash -lc "systemctl --user is-enabled stack-backup.timer 2>/dev/null || echo disabled"
+        ($r -as [string]).Trim() -eq 'enabled'
+    } "In WSL: systemctl --user enable --now stack-backup.timer"
+} else {
+    Check "decay-scan.timer + stack-backup.timer NOT enabled (replica, one-brain rule)" {
+        $r = wsl.exe -d $Distro -e bash -lc "for t in decay-scan.timer stack-backup.timer; do systemctl --user is-enabled `$t 2>/dev/null || echo disabled; done"
+        -not ((($r -as [string]) -split "`r?`n" | ForEach-Object { $_.Trim() }) -contains 'enabled')
+    } "A replica must not run the brain's timers: in WSL systemctl --user disable --now decay-scan.timer stack-backup.timer (or re-run install/1-wsl-services.sh with MEM0_ROLE=replica)"
+}
 
 Write-Host ""
 Write-Host "Codex CLI (subagent LLM) smoke test:"

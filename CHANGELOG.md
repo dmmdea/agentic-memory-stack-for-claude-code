@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.1 (2026-09-14) — five defects found live during the first workstation cutover
+
+- **`linux-authority.sh` inherits the tenant on a re-run.** An omitted `--user-id` now takes the
+  tenant already in `~/.mem0/stack.env`; only a first install falls back to the login name. The
+  cutover re-run without the flag rewrote the tenant to the Linux login and every search ran as
+  the wrong user (canaries 0/7 against a healthy store).
+- **`3-verify.ps1` timer checks are role-aware.** The WSL installer disables `decay-scan.timer` /
+  `stack-backup.timer` on a replica by design; verify now expects that instead of reporting MISSING.
+- **`restore-replica.ps1` fails loudly.** Every artifact must be readable from WSL (a streaming
+  drive such as pCloud's `P:` passes `Test-Path` but is not mounted in WSL — the script had
+  announced the old collection's count as "restored" with nothing restored), and the restored
+  point count must equal the set's manifest.
+- **The Windows receipt records `AuthoritySsh`** and an omitted flag inherits it, like `AuthorityUrl`.
+- **`stack-promote.sh`'s post-promote health check follows `MEM0_BIND`** (the native authority does
+  not listen on loopback; the check read "inconclusive" on every rehearsal).
+
 ## v1.23.0 (2026-09-14) — Phase 2 code: hooks resolve the per-host authority, queue to the Outbox, canonize on the authority
 
 The workstation half of the System B cutover (register P2-3, P2-7, P2-8; spec §7). Nothing here

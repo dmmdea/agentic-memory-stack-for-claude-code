@@ -202,6 +202,11 @@ if ($Role -eq 'replica' -and $AuthorityUrl -match '^https?://(127\.0\.0\.1|local
     throw "-Role replica with a loopback authority ('$AuthorityUrl') violates the One-Brain Rule: queued writes would replay into this box's disposable store and be lost. Pass -AuthorityUrl http://<brain-host>:18791"
 }
 $eAuthorityUrl = $AuthorityUrl.Replace("'", "''")
+# v1.23.1: an omitted -AuthoritySsh inherits the previous receipt's value (same rule as -AuthorityUrl)
+if (-not $AuthoritySsh -and (Test-Path $receiptPath)) {
+    try { $p = (Import-PowerShellDataFile $receiptPath).AuthoritySsh; if ($p) { $AuthoritySsh = "$p".Trim() } } catch {}
+}
+$eAuthoritySsh = $AuthoritySsh.Replace("'", "''")
 $receipt = @"
 @{
     WslUser     = '$eWslUser'
@@ -219,6 +224,8 @@ $receipt = @"
     # which is what the shim actually reads). Loopback on the brain; the brain's address
     # on a replica. Recorded here so verify/diagnostics can report it without guessing.
     AuthorityUrl = '$eAuthorityUrl'
+    # v1.23.1: the brain's ssh alias for canonize forwarding (replicas; mirrors ~/.mem0/replica.env BRAIN_SSH)
+    AuthoritySsh = '$eAuthoritySsh'
     # 4C autonomous-canonical-promotion gate (E/T4): off | shadow | enforce.
     # Ships 'shadow' (compute + log, never blocks). Flip to 'enforce' only after the
     # contradiction judge is calibrated (eval/promotion-gate/CALIBRATION.md). Reversible.

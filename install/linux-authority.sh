@@ -33,7 +33,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIND_IP=""; SECRETS_DIR=""; USER_ID="${USER:-$(id -un)}"; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL="embeddinggemma"
+BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL="embeddinggemma"
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
@@ -67,6 +67,19 @@ say "[0] prerequisites"
 case "$BIND_IP" in 0.0.0.0|127.*) fail "--bind-ip '$BIND_IP' is a wildcard/loopback bind; the authority binds the tailscale0 address only" ;; esac
 [ -n "$SECRETS_DIR" ] || fail "--secrets-dir <dir> is required (holds ams-api-key.cred and ams-canonical-key.cred from systemd-creds)"
 for c in ams-api-key.cred ams-canonical-key.cred; do [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c (Phase 0 P0-3: systemd-creds --user encrypt --with-key=host+tpm2)"; done
+# v1.23.1: the tenant INHERITS on a re-run (same rule as the Windows installer's AuthorityUrl /
+# EvalRootWsl): an omitted --user-id takes the tenant already in ~/.mem0/stack.env, and only a
+# first install with no receipt falls back to the login name. The 2026-09-14 cutover re-ran this
+# installer without the flag and silently rewrote the tenant to the Linux login: every search
+# ran as the wrong user and the canaries read 0/7 against a healthy store.
+if [ -z "$USER_ID" ]; then
+    if [ -f "$HOME/.mem0/stack.env" ]; then
+        USER_ID="$(sed -n 's/^MEM0_DEFAULT_USER_ID=//p' "$HOME/.mem0/stack.env" | head -n1)"
+        [ -n "$USER_ID" ] || USER_ID="$(sed -n 's/^MEM0_WSL_USER=//p' "$HOME/.mem0/stack.env" | head -n1)"
+        [ -z "$USER_ID" ] || echo "    tenant inherited from ~/.mem0/stack.env: $USER_ID"
+    fi
+    [ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
+fi
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$EVAL_ROOT" ] || [ -f "$EVAL_ROOT/eval/retrieval-drift/retrieval_drift.py" ] || fail "--eval-root $EVAL_ROOT has no eval/retrieval-drift/retrieval_drift.py"
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
