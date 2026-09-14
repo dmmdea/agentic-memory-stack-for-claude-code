@@ -5,7 +5,7 @@
 This system is how the memory stack gets *onto* a machine and how code changes reach the *running* runtime afterward. Two distinct paths live here:
 
 - **Install** (`install.ps1` and its four phases) — the one-time, operator-facing bring-up that provisions WSL services, deploys Windows-side hook scripts, registers Claude Code hooks and scheduled tasks, and verifies the result.
-- **Deploy** (`scripts/wsl/deploy.sh`) — the single, ongoing path that pushes updated server modules, maintenance scripts, and systemd units from the repository into the live WSL runtime, gated so a broken change never reaches a restart.
+- **Deploy** (`scripts/wsl/deploy.sh`) — the single, ongoing path that pushes updated server modules, maintenance scripts, and systemd units from the repository into the live WSL runtime, gated so a broken change never reaches a restart. Since v1.23.2 the script honours the box's role: on a replica whose local mem0 is dormant it syncs the files and stops (no restart, no health gate); a live travel-mode replica is restarted on the new code and skips the retrieval-families gate, which judges the authority's store. Its probes follow `MEM0_BIND`.
 
 Both exist to solve the same underlying hazard: production spans multiple roots (a WSL app directory, systemd timers, a Windows `~/.claude/scripts` deploy layer) that can silently drift apart. The install path builds them consistently; the deploy path keeps them in sync through one gated pipeline; and a set of parity/skew checks make any remaining drift *visible* rather than silent.
 

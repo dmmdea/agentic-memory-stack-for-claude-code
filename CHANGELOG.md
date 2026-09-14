@@ -22,6 +22,10 @@ The v1.23.1 tenant fix was one instance of two classes; this release closes both
   mem0 calls were the last hard-coded loopback probes under `scripts/windows`: on a replica they
   hit the dormant local store, and during an outage would have migrated facts INTO the disposable
   replica.
+- **`deploy.sh` honours the role:** on a replica whose local mem0 is dormant it syncs the files and
+  stops — the v1.23.1 deploy on the first demoted box restarted (started) that dormant mem0 and
+  health-gated a store nobody reads; a live travel-mode replica is restarted on the new code and
+  skips the retrieval-families gate, which judges the authority's store.
 - **`deploy.sh`'s health gate and retrieval gate follow `MEM0_BIND`** (same rule as
   `stack-promote.sh` since v1.23.1); **`mem0-canonize.sh`** resolves `MEM0_URL` >
   `~/.mem0/authority-url` > loopback like every chain job, so a hand run on the native authority

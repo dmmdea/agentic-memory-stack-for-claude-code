@@ -28,6 +28,22 @@ def test_deploy_sh_probes_the_bind_address():
     assert 'MEM0_URL="$MEM0_HEALTH_URL"' in code, "the retrieval gate targets the same address"
 
 
+def test_deploy_sh_never_starts_a_dormant_replica_mem0():
+    """v1.23.2: the v1.23.1 deploy on the first demoted box restarted (= started) the replica's
+    dormant mem0 and health-gated a store nobody reads. The role gate must sit BEFORE the restart,
+    exit without restarting when the replica's mem0 is inactive, and skip the retrieval-families
+    gate (which judges the authority's store) when a live travel-mode replica is restarted."""
+    code = _code(REPO_ROOT / "scripts" / "wsl" / "deploy.sh")
+    gate = code.index('if [ "${MEM0_ROLE:-brain}" = "replica" ]; then')
+    restart = code.index("systemctl --user restart mem0.service")
+    assert gate < restart, "the role gate must run before the restart"
+    block = code[gate:restart]
+    assert "systemctl --user is-active --quiet mem0.service" in block
+    assert "exit 0" in block, "a dormant replica stops after the file sync"
+    assert "MEM0_SKIP_RETRIEVAL_GATE=1" in block
+    assert code.index(". \"$HOME/.mem0/stack.env\"") < gate, "MEM0_ROLE comes from the sourced stack.env"
+
+
 def test_stack_promote_follows_mem0_bind():
     code = _code(REPO_ROOT / "scripts" / "wsl" / "stack-promote.sh")
     assert LOOPBACK not in code
