@@ -167,6 +167,25 @@ Describe 'Regression guards for the authority contract' {
         $code | Should -Match "Join-Path \`$winMem0 'authority-url'"
         $code | Should -Match "Join-Path \`$winMem0 'role'"
     }
+    It '3-verify gates the brain-only WSL timer checks on the role (v1.23.1)' {
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'install\3-verify.ps1')
+        $i = $code.IndexOf('Check "decay-scan.timer enabled (brain)"')
+        $i | Should -BeGreaterThan 0
+        $gate = $code.LastIndexOf("if (`$stackRole -eq 'brain')", $i)
+        $gate | Should -BeGreaterThan 0 -Because 'the enabled-timer checks must sit inside a brain-role gate'
+        $code | Should -Match 'NOT enabled \(replica, one-brain rule\)'
+    }
+    It 'restore-replica refuses artifacts WSL cannot read and asserts the manifest count (v1.23.1)' {
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'scripts\travel\restore-replica.ps1')
+        $code | Should -Match "test -r '\`$\(\`$pair\[1\]\)'"
+        $code | Should -Match 'manifest-\$Stamp\.json'
+        $code | Should -Match 'replica point count .* != manifest qdrant_points'
+    }
+    It 'the Windows receipt records AuthoritySsh and inherits it on a re-run (v1.23.1)' {
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'install\2-windows-config.ps1')
+        $code | Should -Match "AuthoritySsh = '\`$eAuthoritySsh'"
+        $code | Should -Match '\(Import-PowerShellDataFile \$receiptPath\)\.AuthoritySsh'
+    }
     It 'Add-Mem0Memory writes the dead-letter file only on the outbox-unwritable branch' {
         $body = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') 'Add-Mem0Memory'
         $body | Should -Not -BeNullOrEmpty

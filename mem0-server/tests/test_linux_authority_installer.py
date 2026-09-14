@@ -177,3 +177,29 @@ def test_embed_model_is_rendered_into_the_drop_in(tmp_path):
     r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-model", "embeddinggemma-ams", "--render-only", str(out2)], tmp_path)
     assert r.returncode == 0, r.stderr
     assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-ams\n" in (out2 / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+
+
+def test_tenant_inherits_from_the_existing_receipt_on_a_rerun(tmp_path):
+    """v1.23.1: an omitted --user-id must take the tenant already in ~/.mem0/stack.env. The
+    2026-09-14 cutover re-ran the installer without the flag and it rewrote the tenant to the Linux
+    login: every search ran as the wrong user and the canaries read 0/7 against a healthy store."""
+    home = tmp_path / "home"; (home / ".mem0").mkdir(parents=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_WSL_USER=oldtenant\nMEM0_HOST_KIND=native\n", encoding="utf-8")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "tenant inherited from ~/.mem0/stack.env: oldtenant" in r.stdout
+    assert "Environment=MEM0_DEFAULT_USER_ID=oldtenant" in (out / "mem0.service").read_text(encoding="utf-8")
+    # an explicit flag still wins
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--user-id", "newtenant", "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "Environment=MEM0_DEFAULT_USER_ID=newtenant" in (out2 / "mem0.service").read_text(encoding="utf-8")
+
+
+def test_first_install_without_a_receipt_falls_back_to_the_login_name(tmp_path):
+    out = tmp_path / "render"
+    r, home = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    login = os.environ.get("USER") or os.getlogin()
+    assert f"Environment=MEM0_DEFAULT_USER_ID={login}" in (out / "mem0.service").read_text(encoding="utf-8")
