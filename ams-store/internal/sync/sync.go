@@ -140,6 +140,18 @@ func Once(ctx context.Context, opt Options) Result {
 			fmt.Fprintf(logw, "sync: %s: %v\n", ws, err)
 		}
 	}
+	// The shared over-trigger stamp is the one tracked path outside every store.
+	if err := repo.StageShared(ctx); err != nil {
+		fmt.Fprintf(logw, "sync: %v\n", err)
+	}
+	// A store whose whole workspace is gone stays tracked forever unless its deletion is
+	// staged: it is never enumerated, so nothing ever notices its files are missing.
+	if removed, err := repo.StageVanishedStores(ctx, workspaces); err != nil {
+		fmt.Fprintf(logw, "sync: %v\n", err)
+	} else if len(removed) > 0 {
+		res.Receipt.Removed = removed
+		fmt.Fprintf(logw, "sync: staged the removal of %d vanished store(s): %v\n", len(removed), removed)
+	}
 	msg := fmt.Sprintf("sync %s: %d store(s)", machineID, len(workspaces))
 	localCommit, err := repo.Commit(ctx, msg, machineID, "local")
 	if err != nil {

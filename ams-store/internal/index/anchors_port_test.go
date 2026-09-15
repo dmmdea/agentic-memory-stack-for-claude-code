@@ -1,4 +1,4 @@
-package derive
+package index
 
 import (
 	"strings"
@@ -8,6 +8,11 @@ import (
 // winPath is the Windows-path anchor the Pester scenario uses: C:\Users\x\.mem0.
 const winPath = `C:\Users\x\.mem0`
 
+// These two carry the 1:1 counterpart NAMES of the Pester scenarios. They live beside the
+// implementation rather than in internal/derive, because there is one anchor rule in this
+// binary and a second copy would drift from it until the floor and the judge disagreed
+// about which rewrites keep the trigger.
+//
 // MemoryStoreLib.Tests.ps1:188 - anchor tokens: numbers, paths, backticked identifiers
 // and ALL-CAPS words. They are what tells the reader WHEN to open the file, so a rewrite
 // that keeps none of them has lost the detail even when it reads well.
@@ -42,11 +47,11 @@ func TestAnchors_NoWildcardFalseAccept(t *testing.T) {
 	}
 
 	// The rewrite drops the anchor: cfg0.name is not cfg[0].name.
-	if AnchorsRetained(original, "the cfg0.name knob matters") {
+	if KeepsAnAnchor(original, "the cfg0.name knob matters") {
 		t.Error("a rewrite that dropped cfg[0].name was accepted - the character class matched anything")
 	}
 	// The rewrite keeps it: accepted.
-	if !AnchorsRetained(original, "the `cfg[0].name` knob") {
+	if !KeepsAnAnchor(original, "the `cfg[0].name` knob") {
 		t.Error("a rewrite that kept cfg[0].name verbatim was rejected")
 	}
 }
@@ -54,7 +59,7 @@ func TestAnchors_NoWildcardFalseAccept(t *testing.T) {
 // A hook with no anchors at all cannot lose one, so the guard must not block a rewrite of
 // it - otherwise every prose-only hook becomes unshortenable.
 func TestAnchors_NoAnchorsMeansNothingToLose(t *testing.T) {
-	if !AnchorsRetained("a plain prose hook", "a shorter hook") {
+	if !KeepsAnAnchor("a plain prose hook", "a shorter hook") {
 		t.Error("a hook with no anchors must be shortenable")
 	}
 }

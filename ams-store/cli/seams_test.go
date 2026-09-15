@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/cli"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lint"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
@@ -286,6 +287,79 @@ func TestSeam_JudgeApplyWritesTheDerivedIndex(t *testing.T) {
 		t.Fatalf("judge-apply wrote a VERBATIM index (doctrine still last):\n%s\n"+
 			"It must render through derive's renderer, or its strict-decrease guard"+
 			" measures a file derive will never write", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the maintenance path -> the G7 over-trigger clock (decision Q13)
+// ---------------------------------------------------------------------------
+
+// TestSeam_DeriveStampsTheOverTriggerClock.
+//
+// G7 is "hours over trigger without an applied decision", and it is the one number a skip
+// cannot satisfy: receipt age says the maintainer RAN, this says the store got BETTER.
+// It is computed from a stamp that lint only reads. Nothing on the maintenance path wrote
+// it, so stores[].over_trigger_hours was null on every PC and the 24 h alarm could not
+// fire in production at all.
+func TestSeam_DeriveStampsTheOverTriggerClock(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	// Over the 20,000 B trigger but under the 25,000 B sync limit, so the Phase 3 floor
+	// leaves it alone and the store STAYS over the trigger - which is the state the clock
+	// is about.
+	sb.AddStore("ws", testutil.BigIndex(62), testutil.BigIndexFacts(62))
+
+	code, _, stderr := run(t, "derive", "--all",
+		"--projects-root", sb.ProjectsRoot, "--state-root", sb.StateRoot,
+		"--now", "2026-09-15T12:00:00Z")
+	if code != cli.ExitOK {
+		t.Fatalf("derive exit = %d: %s", code, stderr)
+	}
+
+	stamps, err := lint.ReadStamps(sb.ProjectsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	since, ok := stamps.OverTriggerSince["ws"]
+	if !ok {
+		t.Fatalf("no over-trigger stamp was written; G7 cannot fire on this PC")
+	}
+	if !since.Equal(time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)) {
+		t.Errorf("stamp = %s, want the injected clock", since)
+	}
+
+	// A second run a day later must NOT reset the clock: the earliest crossing is the
+	// truth, or a store that is checked daily isnever more than a day over trigger.
+	code, _, stderr = run(t, "derive", "--all",
+		"--projects-root", sb.ProjectsRoot, "--state-root", sb.StateRoot,
+		"--now", "2026-09-16T12:00:00Z")
+	if code != cli.ExitOK {
+		t.Fatalf("second derive exit = %d: %s", code, stderr)
+	}
+	stamps, err = lint.ReadStamps(sb.ProjectsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stamps.OverTriggerSince["ws"]; !got.Equal(since) {
+		t.Errorf("the clock was reset to %s; the earliest crossing is the truth", got)
+	}
+
+	// Once the store is back under the trigger the stamp goes, so the next crossing
+	// starts a fresh clock rather than reporting a debt that was already paid.
+	small := sb.AddStore("ws", []string{"# Memory Index", "", "- [A](a.md) " + emDash + " small"},
+		map[string]string{"a.md": testutil.FactFile("a", "a", "project", "body")})
+	_ = small
+	code, _, stderr = run(t, "derive", "--all",
+		"--projects-root", sb.ProjectsRoot, "--state-root", sb.StateRoot,
+		"--now", "2026-09-17T12:00:00Z")
+	if code != cli.ExitOK {
+		t.Fatalf("third derive exit = %d: %s", code, stderr)
+	}
+	stamps, err = lint.ReadStamps(sb.ProjectsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, still := stamps.OverTriggerSince["ws"]; still {
+		t.Errorf("the stamp survived the store falling back under the trigger")
 	}
 }
 

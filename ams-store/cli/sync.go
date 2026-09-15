@@ -113,6 +113,12 @@ func runSyncOnce(env Env, g globalOpts, opt amsync.Options) int {
 	defer func() { _ = l.Release() }()
 
 	res := amsync.Once(context.Background(), opt)
+	// The G7 clock, from the same maintenance path that derived the index. sync cannot
+	// write it itself: internal/lint imports internal/sync for the remote policy, so the
+	// stamp is recorded here, where every package may be imported.
+	for _, d := range res.Derived {
+		recordOverTrigger(opt.Roots, d.Workspace, d.AfterBytes, false, opt.Now, env.Stderr)
+	}
 	if res.Err != nil {
 		fmt.Fprintf(env.Stderr, "ams-store sync: %v\n", res.Err)
 	}

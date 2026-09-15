@@ -3,7 +3,6 @@ package cli
 import (
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/derive"
@@ -50,7 +49,7 @@ type deriveReport struct {
 
 func runDerive(env Env, args []string) int {
 	var (
-		g         globals
+		g         globalOpts
 		storeDir  string
 		workspace string
 		all       bool
@@ -58,17 +57,16 @@ func runDerive(env Env, args []string) int {
 		noHarvest bool
 		stopBelow int
 	)
-	fs := flag.NewFlagSet("derive", flag.ContinueOnError)
-	fs.SetOutput(env.Stderr)
+	fs := newFlagSet("derive")
 	fs.StringVar(&storeDir, "store", "", "one store (the memory directory)")
 	fs.BoolVar(&all, "all", false, "every populated store under the projects root")
 	fs.StringVar(&workspace, "workspace", "", "restrict to one workspace slug")
 	fs.BoolVar(&dryRun, "dry-run", false, "report what would change; write nothing")
 	fs.BoolVar(&noHarvest, "no-harvest", false, "skip the frontmatter harvest step")
 	fs.IntVar(&stopBelow, "stop-below", 0, "floor stop threshold in bytes")
-	g.register(fs)
-	if err := fs.Parse(args); err != nil {
-		return ExitUsage
+	g.bind(fs)
+	if _, err := parseArgs(fs, args); err != nil {
+		return usageError(env, fs.Name(), err)
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(env.Stderr, "ams-store derive: unexpected argument %q\n", fs.Arg(0))
@@ -89,7 +87,7 @@ func runDerive(env Env, args []string) int {
 		fmt.Fprintf(env.Stderr, "ams-store derive: %v\n", err)
 		return ExitUsage
 	}
-	now, err := g.clock()
+	now, err := g.now()
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "ams-store derive: %v\n", err)
 		return ExitUsage
@@ -106,7 +104,7 @@ func runDerive(env Env, args []string) int {
 	// second corpus record, no committer means offline history is never kept.
 	dlock := deriveLock{path: LockPath(roots.StateRoot), now: now}
 	migrated := newMigratedLookup(roots)
-	committer := deriveCommitter{roots: roots, machineID: g.MachineID}
+	committer := deriveCommitter{roots: roots, machineID: g.machineID}
 	report := deriveReport{Verb: "derive", Stores: make([]*derive.Result, 0, len(stores))}
 	exit := ExitOK
 
@@ -132,6 +130,9 @@ func runDerive(env Env, args []string) int {
 			if res.Unconverged {
 				report.Unconverged++
 			}
+			// The G7 clock: this is the maintenance path, and the maintenance path is the
+			// only writer of the over-trigger stamp.
+			recordOverTrigger(roots, res.Workspace, resultBytes(res.BeforeBytes, res.AfterBytes), dryRun, now, env.Stderr)
 		}
 		if err != nil {
 			// One unreadable store must not kill the run: every other store still gets
@@ -145,14 +146,14 @@ func runDerive(env Env, args []string) int {
 		}
 	}
 
-	if g.JSON {
+	if g.json {
 		b, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			fmt.Fprintf(env.Stderr, "ams-store derive: %v\n", err)
 			return worseExit(exit, ExitUsage)
 		}
 		fmt.Fprintln(env.Stdout, string(b))
-	} else if g.Verbose {
+	} else if g.verbose {
 		for _, r := range report.Stores {
 			fmt.Fprintf(env.Stderr, "%s: %s\n", r.Workspace, r.Status)
 		}

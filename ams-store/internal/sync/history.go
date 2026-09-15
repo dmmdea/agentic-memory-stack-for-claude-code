@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -23,21 +25,6 @@ const HubRemote = "hub"
 
 // Branch is the single branch the fleet shares.
 const Branch = "main"
-
-// excludeContent is what info/exclude is rewritten to on every Initialize.
-//
-// Everything is excluded by default and fact files are re-included, rather than the
-// reverse: a new file type dropped into a store (a transcript, an editor backup, a
-// .git from a mistaken clone) is then ignored by construction instead of tracked until
-// someone notices. MEMORY.md is excluded LAST and stays excluded - it is derived from
-// the fact files on every PC and re-derived after every merge, so it never conflicts
-// because it is never merged.
-const excludeContent = "# ams-store: everything is excluded; fact files are re-included below.\n" +
-	"# MEMORY.md is DERIVED, never merged - it must stay untracked on every PC and on the hub.\n" +
-	"*\n" +
-	"!*/\n" +
-	"!*/memory/*.md\n" +
-	"MEMORY.md\n"
 
 // Repo is the local history repository.
 type Repo struct {
@@ -63,45 +50,85 @@ func (r Repo) Exists() bool {
 // Initialize creates the repository if needed and pins its config. It is idempotent and
 // rewrites the config and info/exclude on every call, so a hand-edited repo converges
 // back the next time any verb runs.
+//
+// The SHAPE - the config pairs, the empty repo-local hooks directory and info/exclude -
+// belongs to internal/merge and is applied from there, not written a second time here.
+// Both packages initialize this repo, sync on every pass and the engine on every round;
+// two spellings of "what is tracked" means whichever ran last wins, and the loser's rule
+// is undone without a word. That is not hypothetical: the two spellings disagreed about
+// the shared over-trigger stamp, and sync's would have made decision Q13's transport
+// untrackable on every PC.
 func (r Repo) Initialize(ctx context.Context) error {
-	if !r.Exists() {
-		if err := os.MkdirAll(filepath.Dir(r.GitDir), 0o755); err != nil {
-			return fmt.Errorf("sync: create state dir: %w", err)
-		}
-		if _, err := gitx.Run(ctx, r.opts(), "init", "-q", "-b", Branch); err != nil {
-			return fmt.Errorf("sync: git init: %w", err)
-		}
+	if err := os.MkdirAll(filepath.Dir(r.GitDir), 0o755); err != nil {
+		return fmt.Errorf("sync: create state dir: %w", err)
 	}
-	for _, kv := range [][2]string{
-		// An identity is required to commit at all, and the operator's global config may
-		// demand signing - which no unattended maintainer can satisfy.
-		{"user.name", "automemory"},
-		{"user.email", "automemory@localhost"},
-		{"commit.gpgsign", "false"},
-		// Byte-exact handling. Line endings are the merge engine's business, not git's:
-		// git rewriting them would make a CRLF-only difference look like a real change on
-		// one PC and not on another.
-		{"core.autocrlf", "false"},
-		{"core.safecrlf", "false"},
-		{"core.quotepath", "false"},
-		// Renames OFF so a judge migration - which is a deletion - is never paired with
-		// an unrelated new fact file and silently turned into a rename, losing the
-		// deletion.
-		{"merge.renames", "false"},
-		{"diff.renames", "false"},
-	} {
-		if _, err := gitx.Run(ctx, r.opts(), "config", kv[0], kv[1]); err != nil {
-			return fmt.Errorf("sync: git config %s: %w", kv[0], err)
-		}
-	}
-	info := filepath.Join(r.GitDir, "info")
-	if err := os.MkdirAll(info, 0o755); err != nil {
-		return fmt.Errorf("sync: create %s: %w", info, err)
-	}
-	if err := os.WriteFile(filepath.Join(info, "exclude"), []byte(excludeContent), 0o644); err != nil {
-		return fmt.Errorf("sync: write info/exclude: %w", err)
+	eng := &merge.Engine{GitDir: r.GitDir, WorkTree: r.WorkTree}
+	if err := eng.Initialize(ctx); err != nil {
+		return fmt.Errorf("sync: initialize the history repo: %w", err)
 	}
 	return nil
+}
+
+// StageShared stages the one tracked path outside every store: the shared over-trigger
+// stamp of decision Q13. It is a no-op until some PC first crosses the trigger.
+func (r Repo) StageShared(ctx context.Context) error {
+	p := filepath.Join(r.WorkTree, filepath.FromSlash(merge.OverTriggerPath))
+	if _, err := os.Stat(p); err != nil {
+		return nil
+	}
+	if _, err := gitx.Run(ctx, r.opts(), "add", "-A", "-f", "--", merge.OverTriggerPath); err != nil {
+		return fmt.Errorf("sync: stage %s: %w", merge.OverTriggerPath, err)
+	}
+	return nil
+}
+
+// StageVanishedStores stages the deletion of every tracked store whose WORKSPACE
+// directory is gone, and returns the workspaces it removed.
+//
+// Without it a store that was deleted on this PC stays tracked forever: staging is
+// per-enumerated-workspace, and a workspace that no longer exists is never enumerated, so
+// its files are never seen as deleted. A live sync on 2026-09-15 reported "5 store(s)"
+// and left 61 deletions of exactly such a store unstaged.
+//
+// The guard is the whole WORKSPACE directory, not just its memory folder. A store folder
+// that vanished while its workspace is still there is far more likely a transient stat
+// failure than a decision, and propagating that would carry a fleet-wide removal off one
+// bad read - the merge's modify/delete rule would resurrect edited files, but untouched
+// ones would simply go. The caller passes the workspaces enumeration actually found, so a
+// failed enumeration (which fails closed upstream) never reaches this.
+func (r Repo) StageVanishedStores(ctx context.Context, live []string) ([]string, error) {
+	res, err := gitx.Run(ctx, r.opts(), "ls-files")
+	if err != nil {
+		return nil, fmt.Errorf("sync: ls-files: %w", err)
+	}
+	liveSet := make(map[string]bool, len(live))
+	for _, ws := range live {
+		liveSet[ws] = true
+	}
+	seen := map[string]bool{}
+	var gone []string
+	for _, line := range strings.Split(strings.ReplaceAll(res.Stdout, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.Split(line, "/")
+		if len(parts) < 3 || parts[1] != "memory" {
+			continue
+		}
+		ws := parts[0]
+		if liveSet[ws] || seen[ws] {
+			continue
+		}
+		seen[ws] = true
+		if _, statErr := os.Stat(filepath.Join(r.WorkTree, ws)); statErr == nil {
+			continue // the workspace is still there; this is not a removal
+		}
+		if _, err := gitx.Run(ctx, r.opts(), "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+			"--", RelPath(ws)); err != nil {
+			return gone, fmt.Errorf("sync: stage the removal of %s: %w", ws, err)
+		}
+		gone = append(gone, ws)
+	}
+	sort.Strings(gone)
+	return gone, nil
 }
 
 // RelPath is a store's path relative to the work tree, in git's forward-slash spelling.

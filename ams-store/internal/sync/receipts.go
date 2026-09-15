@@ -59,8 +59,12 @@ type Receipt struct {
 	ConflictsInHistory []ConflictRef `json:"conflict_in_history,omitempty"`
 	// Deferred lists paths materialization queued because a session was live.
 	Deferred []string `json:"deferred,omitempty"`
-	Note     string   `json:"note,omitempty"`
-	Version  string   `json:"ams_store_version,omitempty"`
+	// Removed lists workspaces whose whole directory is gone and whose tracked files
+	// this pass staged for deletion. It is a receipt field rather than a log line
+	// because a store leaving the fleet is the kind of change a human reads back later.
+	Removed []string `json:"removed,omitempty"`
+	Note    string   `json:"note,omitempty"`
+	Version string   `json:"ams_store_version,omitempty"`
 }
 
 // ReceiptPath is the receipts file under a state root.

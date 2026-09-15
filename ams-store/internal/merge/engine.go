@@ -58,11 +58,47 @@ func (e *Engine) opt() gitx.Options {
 // never merged and never in conflict.
 const excludeContent = "" +
 	"# ams-store: nothing is tracked except fact files and the shared state stamp.\n" +
+	"# MEMORY.md is DERIVED, never merged - it must stay untracked on every PC and on the hub.\n" +
 	"*\n" +
 	"!*/\n" +
 	"!*/memory/*.md\n" +
 	"*/memory/" + store.IndexName + "\n" +
 	"!/" + OverTriggerPath + "\n"
+
+// HooksDirName is the empty directory core.hooksPath is pinned at, under the git dir.
+//
+// A global core.hooksPath - the operator's account-separation and leak-scan hooks - applies
+// to EVERY repository on the box, this one included. Those hooks guard pushes to GitHub;
+// this repo's only remote is the private hub on the tailnet, and its content is exactly the
+// private material the scanner is right to refuse in a public-facing repo. Without a
+// repo-LOCAL override the hub push is blocked by a hook that was never aimed at it. Local,
+// so every other repo on the box stays guarded.
+const HooksDirName = "ams-hooks"
+
+// RepoConfig is the config every history repo carries, in one place because sync and the
+// merge engine both initialize it and two spellings mean whichever ran last decides.
+func RepoConfig(hooksDir string) [][2]string {
+	return [][2]string{
+		// An identity is required to commit at all, and a global config may demand signing,
+		// which no unattended maintainer can satisfy.
+		{"user.name", "automemory"},
+		{"user.email", "automemory@localhost"},
+		{"commit.gpgsign", "false"},
+		// Byte-exact handling. Line endings are the merge engine's business, not git's:
+		// git rewriting them makes a CRLF-only difference a real change on one PC and not
+		// on another.
+		{"core.autocrlf", "false"},
+		{"core.safecrlf", "false"},
+		{"core.quotepath", "false"},
+		{"core.hooksPath", hooksDir},
+		// Renames OFF: a judge migration is a deletion, and pairing it with an unrelated
+		// new fact file reads as a rename and loses the deletion. Measured caveat: git
+		// honours this unevenly across versions, which is why internal/merge audits every
+		// path the two sides disagree about rather than trusting the setting.
+		{"merge.renames", "false"},
+		{"diff.renames", "false"},
+	}
+}
 
 // Initialize creates (idempotently) the history repo and pins the config the merge
 // engine depends on.
@@ -83,15 +119,11 @@ func (e *Engine) Initialize(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, kv := range [][2]string{
-		{"user.name", "automemory"},
-		{"user.email", "automemory@localhost"},
-		{"commit.gpgsign", "false"},
-		{"core.autocrlf", "false"},
-		{"core.safecrlf", "false"},
-		{"core.quotepath", "false"},
-		{"merge.renames", "false"},
-	} {
+	hooks := filepath.Join(e.GitDir, HooksDirName)
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		return fmt.Errorf("history repo hooks dir: %w", err)
+	}
+	for _, kv := range RepoConfig(hooks) {
 		if _, err := gitx.Run(ctx, e.opt(), "config", kv[0], kv[1]); err != nil {
 			return err
 		}

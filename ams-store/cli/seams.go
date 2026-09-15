@@ -13,6 +13,7 @@ import (
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gate"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/judge"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lint"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
@@ -405,4 +406,36 @@ func judgeRenderIndex(roots store.Roots, storeDir string, now time.Time) func([]
 			now,
 		)(records, newline)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the maintenance path -> the G7 over-trigger clock (decision Q13)
+// ---------------------------------------------------------------------------
+
+// recordOverTrigger stamps, or clears, one store's over-trigger clock.
+//
+// The stamp is written by the MAINTENANCE path and only read by lint, which is read-only
+// by contract. It is the input to G7 - "hours over trigger without an applied decision" -
+// which is the one metric a skip cannot satisfy: receipt age proves the maintainer ran,
+// this proves the store got better. Nothing wrote it before the engines met here, so
+// stores[].over_trigger_hours was null on every PC and the 24 h alarm could not fire.
+//
+// A dry run never stamps: a rehearsal that started the clock would report a debt the
+// operator never incurred.
+func recordOverTrigger(roots store.Roots, workspace string, bytes int, dryRun bool, now time.Time, log io.Writer) {
+	if dryRun || workspace == "" {
+		return
+	}
+	if _, err := lint.RecordOverTrigger(roots.ProjectsRoot, workspace, bytes >= store.TriggerBytes, now); err != nil && log != nil {
+		fmt.Fprintf(log, "ams-store: over-trigger stamp for %s: %v\n", workspace, err)
+	}
+}
+
+// resultBytes is the size the clock is judged on: what the index IS after the run, or what
+// it was when the run wrote nothing.
+func resultBytes(before int, after *int) int {
+	if after != nil {
+		return *after
+	}
+	return before
 }

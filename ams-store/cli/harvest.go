@@ -2,7 +2,6 @@ package cli
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/derive"
@@ -45,19 +44,18 @@ type harvestReport struct {
 
 func runHarvest(env Env, args []string) int {
 	var (
-		g         globals
+		g         globalOpts
 		storeDir  string
 		workspace string
 		all       bool
 	)
-	fs := flag.NewFlagSet("harvest", flag.ContinueOnError)
-	fs.SetOutput(env.Stderr)
+	fs := newFlagSet("harvest")
 	fs.StringVar(&storeDir, "store", "", "the store (memory directory) to harvest")
 	fs.BoolVar(&all, "all", false, "every populated store under the projects root")
 	fs.StringVar(&workspace, "workspace", "", "restrict to one workspace slug")
-	g.register(fs)
-	if err := fs.Parse(args); err != nil {
-		return ExitUsage
+	g.bind(fs)
+	if _, err := parseArgs(fs, args); err != nil {
+		return usageError(env, fs.Name(), err)
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(env.Stderr, "ams-store harvest: unexpected argument %q\n", fs.Arg(0))
@@ -73,7 +71,7 @@ func runHarvest(env Env, args []string) int {
 		fmt.Fprintf(env.Stderr, "ams-store harvest: %v\n", err)
 		return ExitUsage
 	}
-	now, err := g.clock()
+	now, err := g.now()
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "ams-store harvest: %v\n", err)
 		return ExitUsage
@@ -106,7 +104,7 @@ func runHarvest(env Env, args []string) int {
 		}
 	}
 
-	if g.JSON {
+	if g.json {
 		b, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			fmt.Fprintf(env.Stderr, "ams-store harvest: %v\n", err)
