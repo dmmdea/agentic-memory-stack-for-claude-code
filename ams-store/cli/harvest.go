@@ -19,5 +19,6 @@ func harvestCommand() command {
 		Summary: "copy index hook text into fact-file frontmatter",
 		Usage:   harvestUsage,
 		Run:     notImplemented("harvest"),
+		Stub:    true,
 	}
 }

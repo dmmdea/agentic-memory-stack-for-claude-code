@@ -42,6 +42,22 @@ func SelfStartTimeUnix() int64 {
 	return v
 }
 
+// StartTimeUnix is the start time of an ARBITRARY process, or 0 when it cannot be read.
+//
+// SelfStartTimeUnix answers it for this process; a lock written on behalf of another
+// process - and the tests that stage one - need it for that process. 0 means "existence
+// only", which is how ProcessAlive already degrades.
+func StartTimeUnix(pid int) int64 {
+	if pid <= 0 {
+		return 0
+	}
+	v, ok := procStartUnix(pid)
+	if !ok {
+		return 0
+	}
+	return v
+}
+
 // clockTicks is the kernel's USER_HZ. It is 100 on every Linux ams-store targets;
 // sysconf(_SC_CLK_TCK) needs cgo, and this file must build with CGO_ENABLED=0.
 const clockTicks = 100

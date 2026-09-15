@@ -77,9 +77,17 @@ func Run(ctx context.Context, opt Options) (Summary, error) {
 	rows := []StoreRow{}
 	overTriggerCount := 0
 
+	want := map[string]bool{}
+	for _, w := range opt.Workspaces {
+		want[w] = true
+	}
+
 	for _, s := range stores {
 		if s.IsAlias {
 			continue // an alias is the same physical store; reporting it twice doubles every finding
+		}
+		if len(want) > 0 && !want[s.Workspace] {
+			continue
 		}
 		stats, err := MeasureStore(s)
 		if err != nil {

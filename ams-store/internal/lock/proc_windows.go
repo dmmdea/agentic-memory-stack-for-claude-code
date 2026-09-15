@@ -56,3 +56,24 @@ func processStartUnix(h windows.Handle) (int64, error) {
 	}
 	return time.Unix(0, creation.Nanoseconds()).Unix(), nil
 }
+
+// StartTimeUnix is the start time of an ARBITRARY process, or 0 when it cannot be read.
+//
+// SelfStartTimeUnix answers it for this process; a lock written on behalf of another
+// process - and the tests that stage one - need it for that process. 0 means "existence
+// only", which is how ProcessAlive already degrades.
+func StartTimeUnix(pid int) int64 {
+	if pid <= 0 {
+		return 0
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(h)
+	v, err := processStartUnix(h)
+	if err != nil {
+		return 0
+	}
+	return v
+}

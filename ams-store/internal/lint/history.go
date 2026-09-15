@@ -29,10 +29,10 @@ const UnproductiveTailLines = 400
 
 // Receipt statuses that count as reaching a decision (LIB:535).
 var productiveStatuses = map[string]bool{
-	"applied":                  true,
-	"applied-unrecorded":       true,
-	"no-op":                    true,
-	"protected-set-overflow":   true,
+	"applied":                true,
+	"applied-unrecorded":     true,
+	"no-op":                  true,
+	"protected-set-overflow": true,
 }
 
 // goodStatuses is the narrower set compactor-unproductive accepts (LINT:109). It does

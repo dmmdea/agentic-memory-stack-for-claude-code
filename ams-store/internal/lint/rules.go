@@ -84,6 +84,13 @@ type Options struct {
 	NightlyUnit string
 	// Policy is the remote policy the history-remote rule applies (the Y3 amendment).
 	Policy amsync.RemotePolicy
+	// Workspaces narrows the scan to these slugs. Empty means every populated store.
+	//
+	// It narrows the STORES, never the fleet-wide rules: history-remote and
+	// compactor-silent are about the PC, not about one workspace, and dropping them
+	// when an operator asks about a single store would hide the finding that explains
+	// why that store is stuck.
+	Workspaces []string
 	// Now is the injected clock.
 	Now time.Time
 }

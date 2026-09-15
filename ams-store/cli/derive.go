@@ -27,5 +27,6 @@ func deriveCommand() command {
 		Summary: "re-derive MEMORY.md from the fact files",
 		Usage:   deriveUsage,
 		Run:     notImplemented("derive"),
+		Stub:    true,
 	}
 }

@@ -24,3 +24,10 @@ func ProcessAlive(pid int, _ int64) bool {
 
 // SelfStartTimeUnix is unavailable here; 0 means "existence only".
 func SelfStartTimeUnix() int64 { return 0 }
+
+// StartTimeUnix is the start time of an ARBITRARY process, or 0 when it cannot be read.
+//
+// SelfStartTimeUnix answers it for this process; a lock written on behalf of another
+// process - and the tests that stage one - need it for that process. 0 means "existence
+// only", which is how ProcessAlive already degrades.
+func StartTimeUnix(int) int64 { return 0 }
