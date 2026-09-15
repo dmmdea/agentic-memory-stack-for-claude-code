@@ -30,11 +30,19 @@ func TestCLI_MandatedVerbsArePresent(t *testing.T) {
 	}
 }
 
+// TestCLI_StubVerbsExitNotImplementedWithSilentStdout covers the verbs whose engines have
+// not landed yet.
+//
+// It iterates cli.StubVerbs, NOT cli.Verbs. Iterating every verb meant that the moment a
+// verb was wired this test invoked it for real with no roots - which on 2026-09-15 ran
+// sync against the operator's live history repo and committed 5 live stores. A test that
+// asserts "not implemented" must be told which verbs those are, not guess.
 func TestCLI_StubVerbsExitNotImplementedWithSilentStdout(t *testing.T) {
-	// Only the verbs whose engine has not landed. A verb whose engine IS built must never
-	// appear here: running it bare is how the scaffold's all-verbs loop wrote into every
-	// live store on the machine.
-	for _, v := range []string{"lint", "gate", "sync", "lock", "judge-apply"} {
+	stubs := cli.StubVerbs()
+	if len(stubs) == 0 {
+		t.Skip("every verb is wired")
+	}
+	for _, v := range stubs {
 		code, stdout, stderr := run(t, v)
 		if code != cli.ExitNotImplemented {
 			t.Errorf("%s: exit = %d, want %d", v, code, cli.ExitNotImplemented)

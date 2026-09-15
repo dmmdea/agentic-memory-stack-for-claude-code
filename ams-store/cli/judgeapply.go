@@ -23,5 +23,6 @@ func judgeApplyCommand() command {
 		Summary: "apply a judge plan under every apply-guard (hub-only)",
 		Usage:   judgeApplyUsage,
 		Run:     notImplemented("judge-apply"),
+		Stub:    true,
 	}
 }
