@@ -32,9 +32,15 @@ const (
 // AlarmHours is where G7 raises the alarm.
 const AlarmHours = 24.0
 
-// Stamps maps a workspace slug to when it first crossed the trigger.
+// Stamps maps a workspace slug to when it first crossed the trigger, and carries the
+// tombstone that says when it was last seen back under it.
+//
+// ClearedAt exists because a clear is an ABSENCE, and an absence is exactly what a union
+// reducer cannot distinguish from "that PC has not re-derived yet". Without it the cleared
+// stamp came straight back from the first PC that still carried it.
 type Stamps struct {
 	OverTriggerSince map[string]time.Time `json:"over_trigger_since"`
+	ClearedAt        map[string]time.Time `json:"cleared_at"`
 }
 
 // StampPath is the stamp file under a projects root.
@@ -46,15 +52,38 @@ func StampPath(projectsRoot string) string {
 // that exists but does not parse IS an error, because "absent" and "corrupt" must not
 // collapse into the same answer.
 func ReadStamps(projectsRoot string) (Stamps, error) {
-	s := Stamps{OverTriggerSince: map[string]time.Time{}}
+	s := emptyStamps()
 	found, err := atomic.ReadJSONFile(StampPath(projectsRoot), &s)
 	if err != nil {
-		return Stamps{OverTriggerSince: map[string]time.Time{}}, err
+		return emptyStamps(), err
 	}
 	if !found || s.OverTriggerSince == nil {
 		s.OverTriggerSince = map[string]time.Time{}
 	}
+	if s.ClearedAt == nil {
+		s.ClearedAt = map[string]time.Time{}
+	}
 	return s, nil
+}
+
+func emptyStamps() Stamps {
+	return Stamps{OverTriggerSince: map[string]time.Time{}, ClearedAt: map[string]time.Time{}}
+}
+
+// IsLive reports whether a workspace's crossing stamp is still the current clock rather
+// than one a later clear already resolved. It is the typed twin of merge.StampIsLive and
+// must answer the same question the reducer does, or lint and the merge would disagree
+// about the same file.
+func (s Stamps) IsLive(workspace string) bool {
+	since, ok := s.OverTriggerSince[workspace]
+	if !ok {
+		return false
+	}
+	cleared, ok := s.ClearedAt[workspace]
+	if !ok {
+		return true
+	}
+	return since.UTC().After(cleared.UTC())
 }
 
 // RecordOverTrigger updates the stamp for one workspace and returns the stamps as they
@@ -69,16 +98,24 @@ func RecordOverTrigger(projectsRoot, workspace string, overTrigger bool, now tim
 	if err != nil {
 		// A corrupt stamp file must not stop maintenance. Start a clean one and carry on:
 		// losing the clock costs one alarm, refusing to maintain costs the store.
-		s = Stamps{OverTriggerSince: map[string]time.Time{}}
+		s = emptyStamps()
 	}
 	prev, had := s.OverTriggerSince[workspace]
+	live := s.IsLive(workspace)
 	switch {
 	case !overTrigger:
-		if !had {
-			return s, nil
+		// The clear is a WRITE, not a deletion: the tombstone is what carries it to the
+		// other PCs, which still have the stamp and would otherwise hand it back.
+		if !had && s.clearedNotBefore(workspace, now) {
+			return s, nil // already cleared at or after this instant; nothing new to say
 		}
 		delete(s.OverTriggerSince, workspace)
-	case !had:
+		if !s.clearedNotBefore(workspace, now) {
+			s.ClearedAt[workspace] = now.UTC()
+		}
+	case !live:
+		// No live stamp - either none at all, or one a clear already resolved. Either way
+		// this is a FRESH crossing and it gets today's clock, never the dead one back.
 		s.OverTriggerSince[workspace] = now.UTC()
 	case now.UTC().Before(prev):
 		s.OverTriggerSince[workspace] = now.UTC()
@@ -89,6 +126,17 @@ func RecordOverTrigger(projectsRoot, workspace string, overTrigger bool, now tim
 		return s, err
 	}
 	return s, nil
+}
+
+// clearedNotBefore reports whether this workspace already carries a tombstone at or after
+// now. Re-stamping the same clear on every maintenance pass would rewrite a tracked file
+// - and cost a commit - for a store nobody touched.
+func (s Stamps) clearedNotBefore(workspace string, now time.Time) bool {
+	c, ok := s.ClearedAt[workspace]
+	if !ok {
+		return false
+	}
+	return !c.UTC().Before(now.UTC())
 }
 
 // WriteStamps writes the stamp file through the ONE renderer that owns those bytes,
@@ -110,27 +158,54 @@ func WriteStamps(projectsRoot string, s Stamps) error {
 // that is what the reducer parses, and a nanosecond tail no PC can reproduce would make
 // the same crossing render differently on two machines.
 func (s Stamps) toMerge() merge.OverTrigger {
-	out := merge.OverTrigger{OverTriggerSince: make(map[string]string, len(s.OverTriggerSince))}
-	keys := make([]string, 0, len(s.OverTriggerSince))
-	for k := range s.OverTriggerSince {
-		keys = append(keys, k)
+	out := merge.OverTrigger{
+		OverTriggerSince: rfc3339Map(s.OverTriggerSince),
+		ClearedAt:        rfc3339Map(s.ClearedAt),
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out.OverTriggerSince[k] = s.OverTriggerSince[k].UTC().Format(time.RFC3339)
+	// A stamp a clear already resolved must never be written back out: the reducer would
+	// drop it on the next merge anyway, and leaving it in the file makes the producer's
+	// bytes differ from the reducer's for the same content.
+	for k := range out.OverTriggerSince {
+		if !merge.StampIsLive(out.OverTriggerSince[k], out.ClearedAt[k]) {
+			delete(out.OverTriggerSince, k)
+		}
 	}
 	return out
 }
 
-// MergeStamps is the min reducer the synced stamp file is merged with.
-func MergeStamps(a, b Stamps) Stamps {
-	out := Stamps{OverTriggerSince: map[string]time.Time{}}
-	for k, v := range a.OverTriggerSince {
-		out.OverTriggerSince[k] = v.UTC()
+func rfc3339Map(m map[string]time.Time) map[string]string {
+	out := make(map[string]string, len(m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	for k, v := range b.OverTriggerSince {
-		if cur, ok := out.OverTriggerSince[k]; !ok || v.UTC().Before(cur) {
-			out.OverTriggerSince[k] = v.UTC()
+	sort.Strings(keys)
+	for _, k := range keys {
+		out[k] = m[k].UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// MergeStamps is the typed twin of merge.MergeOverTrigger: the latest clear wins, then
+// MIN over the stamps that survive it. It must answer exactly what the byte reducer
+// answers - a second rule here is a second rule the fleet would have to agree with.
+func MergeStamps(a, b Stamps) Stamps {
+	out := emptyStamps()
+	for _, src := range []Stamps{a, b} {
+		for k, v := range src.ClearedAt {
+			if cur, ok := out.ClearedAt[k]; !ok || v.UTC().After(cur) {
+				out.ClearedAt[k] = v.UTC()
+			}
+		}
+	}
+	for _, src := range []Stamps{a, b} {
+		for k, v := range src.OverTriggerSince {
+			if c, ok := out.ClearedAt[k]; ok && !v.UTC().After(c) {
+				continue // a crossing the clear already resolved
+			}
+			if cur, ok := out.OverTriggerSince[k]; !ok || v.UTC().Before(cur) {
+				out.OverTriggerSince[k] = v.UTC()
+			}
 		}
 	}
 	return out
@@ -140,7 +215,7 @@ func MergeStamps(a, b Stamps) Stamps {
 // no stamp.
 func (s Stamps) HoursOverTrigger(workspace string, now time.Time) *float64 {
 	since, ok := s.OverTriggerSince[workspace]
-	if !ok {
+	if !ok || !s.IsLive(workspace) {
 		return nil
 	}
 	h := now.UTC().Sub(since.UTC()).Hours()
