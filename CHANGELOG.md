@@ -4,6 +4,20 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.3 (2026-09-14) — the deploy path on a dormant replica; the authority re-run restarts its server
+
+Both found by the v1.23.2 live deploy, both members of the same brain-assumption class.
+
+- **`deploy.sh` on a dormant replica byte-compiles and stops before the import smoke.** `import app`
+  opens the Qdrant connection at import time, so the smoke can never pass while a replica's stack
+  is dormant; v1.23.2 placed the role gate after it and both replicas stopped there with their
+  files already synced. The gate now runs first: a dormant replica gets `py_compile` of the synced
+  modules and exits (its real smoke is the `/health/deep` gate `restore-replica` runs when the
+  watcher brings it up); a live travel-mode replica still goes through the smoke and restart.
+- **`linux-authority.sh` restarts `mem0.service` on every run.** `enable --now` leaves an
+  already-running server on the old code: the v1.23.2 re-run stamped `VERSION` 1.23.2 and `/health`
+  kept reporting 1.23.1. `restart` also starts an inactive unit, so a first install is unchanged.
+
 ## v1.23.2 (2026-09-14) — re-runs inherit every flag; no probe hard-codes loopback
 
 The v1.23.1 tenant fix was one instance of two classes; this release closes both classes.
