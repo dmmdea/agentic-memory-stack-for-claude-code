@@ -27,6 +27,8 @@ package merge_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -218,7 +220,21 @@ func TestMerge_TwoPCsAddTheSameSlugWithIdenticalBytes_KeptOnceAsLF(t *testing.T)
 	b.tick(2 * time.Minute)
 	b.write(ws, "twin.md", twin)
 	// B's copy carries the exec bit: same content, different mode, which is what makes
-	// git conflict on a path neither side disagrees about.
+	// git conflict on a path neither side disagrees about (measured on both installed
+	// gits: 2.43 and 2.55 each report CONFLICT (add/add) for identical blobs at 100644
+	// vs 100755).
+	//
+	// The bit has to be set in BOTH places, and that is not belt and braces. On a
+	// Windows checkout `core.filemode` is false, the file system has no exec bit to
+	// read and only the INDEX carries the mode, so `update-index --chmod=+x` is the
+	// only way to record it. On Linux `core.filemode` is true and the staging pass that
+	// runs inside syncOnce re-stats the file, so an index mode with no bit on disk is
+	// reset to 100644 before the commit is made - the fixture then produces no conflict
+	// at all and the row it exists to reach is never entered. Setting it on disk first
+	// and in the index second is what makes the fixture mean the same thing on both.
+	if err := os.Chmod(filepath.Join(b.storeDir(ws), "twin.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	b.git("update-index", "--add", "--chmod=+x", ws+"/memory/twin.md")
 	rep := b.syncOnce("b harvests the same twin", b.mo(), ws)
 
