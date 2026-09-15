@@ -381,15 +381,15 @@ type racingFloor struct {
 
 const racingFloorContent = "# Memory Index\n\n- [Written by a live session](x.md)\n"
 
-func (r *racingFloor) Floor(records []*index.Record, storeDir, newline string, stopBelow int) (FloorResult, error) {
-	res, err := r.inner.Floor(records, storeDir, newline, stopBelow)
+func (r *racingFloor) Floor(records []*index.Record, storeDir, newline string, engageAt, stopBelow int) (FloorResult, error) {
+	res, err := r.inner.Floor(records, storeDir, newline, engageAt, stopBelow)
 	_ = os.WriteFile(r.path, []byte(racingFloorContent), 0o644)
 	return res, err
 }
 
 type panicFloor struct{}
 
-func (panicFloor) Floor([]*index.Record, string, string, int) (FloorResult, error) {
+func (panicFloor) Floor([]*index.Record, string, string, int, int) (FloorResult, error) {
 	panic("the floor blew up")
 }
 

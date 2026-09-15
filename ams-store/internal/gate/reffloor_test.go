@@ -21,7 +21,7 @@ import (
 // tests (TestFloor_*) are the authority, not this file.
 type refFloor struct{ calls int }
 
-func (f *refFloor) Floor(records []*index.Record, storeDir, newline string, stopBelow int) (FloorResult, error) {
+func (f *refFloor) Floor(records []*index.Record, storeDir, newline string, engageAt, stopBelow int) (FloorResult, error) {
 	f.calls++
 	projected := len(index.RenderVerbatim(records, newline))
 

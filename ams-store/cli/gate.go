@@ -24,7 +24,13 @@ has crossed the sync limit, commits the store locally and marks the tree dirty. 
 advisory block is the product on stdout.
 
   --stdin-payload        read the hook payload from stdin (the default)
+  --engage-at <bytes>    floor engage threshold (default: the harness sync limit)
   --stop-below <bytes>   floor stop threshold (default: the compactor trigger)
+
+The two floor thresholds are decision Q2's hysteresis: the gate advises below
+--engage-at and normalizes at or above it, down to --stop-below. The Phase 4 flip to
+an unconditional-to-trigger floor is a change of this flag's DEFAULT, so it can be
+rehearsed on one PC before it is decided for the fleet.
 
 NETWORK IS NEVER ON A HOOK'S CRITICAL PATH. This verb commits locally and touches the
 dirty marker; the watcher is what carries the change to the hub.
@@ -65,8 +71,10 @@ func runGate(env Env, args []string) (code int) {
 	g.bind(fs)
 	var stdinPayload bool
 	var stopBelow int
+	var engageAt int
 	fs.BoolVar(&stdinPayload, "stdin-payload", true, "read the hook payload from stdin")
 	fs.IntVar(&stopBelow, "stop-below", 0, "floor stop threshold in bytes")
+	fs.IntVar(&engageAt, "engage-at", 0, "floor engage threshold in bytes")
 	if _, err := parseArgs(fs, args); err != nil {
 		// Even a bad invocation is a zero here: the harness spawned us, and refusing its
 		// argv would surface as a failed Write to the operator.
@@ -97,6 +105,7 @@ func runGate(env Env, args []string) (code int) {
 	gate.Run(ctx, gate.Options{
 		Roots:     roots,
 		StopBelow: stopBelow,
+		EngageAt:  engageAt,
 		// The ONE floor in this binary (blueprint 12.1). A nil here leaves the gate an
 		// advisory printer: it says the index is over the limit and does nothing about it.
 		Floor: floorAdapter{},

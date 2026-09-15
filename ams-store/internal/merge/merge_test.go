@@ -4,6 +4,7 @@ package merge_test
 // a real git in a temp fleet.
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lint"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
@@ -753,5 +755,127 @@ func TestMerge_UnrelatedHistoriesMergeOnEverySupportedGit(t *testing.T) {
 	}
 	if r := b.push(); !r.OK {
 		t.Fatalf("B could not push the merge: %s", r.Stderr)
+	}
+}
+
+// TestOverTrigger_ProducerAndReducerRenderTheSameBytes pins the two halves of the Q13
+// stamp to ONE renderer.
+//
+// The producer (lint.RecordOverTrigger, the maintenance path) and the reducer
+// (merge.MergeOverTrigger, every sync that sees the path on both sides) write the same
+// logical content to the same tracked file. Two renderers means the file flips format on
+// every change: each stamp costs an extra commit, and no two PCs agree on the bytes until
+// a merge has run. Byte-identity is the only assertion that cannot be satisfied by a
+// second implementation that happens to be equivalent today.
+func TestOverTrigger_ProducerAndReducerRenderTheSameBytes(t *testing.T) {
+	root := t.TempDir()
+	crossed := time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)
+	if _, err := lint.RecordOverTrigger(root, ws, true, crossed); err != nil {
+		t.Fatalf("record the crossing: %v", err)
+	}
+	produced, err := os.ReadFile(lint.StampPath(root))
+	if err != nil {
+		t.Fatalf("the producer wrote no stamp file: %v", err)
+	}
+	reduced, err := merge.MergeOverTrigger(produced, produced)
+	if err != nil {
+		t.Fatalf("reduce the produced bytes with themselves: %v", err)
+	}
+	if !bytes.Equal(produced, reduced) {
+		t.Fatalf("two renderers for one file: producer wrote %d B %q, the reducer rewrites it as %d B %q",
+			len(produced), produced, len(reduced), reduced)
+	}
+}
+
+// mustRecord drives the MAINTENANCE path's stamp writer, which is the only producer of
+// the Q13 clock. Tests that hand-build the file with writeRaw cannot see a clear at all:
+// a clear is an ABSENCE in the producer's output, and an absence is exactly what a union
+// reducer cannot distinguish from "this side has not heard yet".
+func mustRecord(t *testing.T, projectsRoot, workspace string, overTrigger bool, now time.Time) {
+	t.Helper()
+	if _, err := lint.RecordOverTrigger(projectsRoot, workspace, overTrigger, now); err != nil {
+		t.Fatalf("record over-trigger=%v at %s: %v", overTrigger, now.Format(time.RFC3339), err)
+	}
+}
+
+// hoursOverTrigger is what G7 reads: nil when the store has no live clock.
+func hoursOverTrigger(t *testing.T, projectsRoot, workspace string, now time.Time) *float64 {
+	t.Helper()
+	s, err := lint.ReadStamps(projectsRoot)
+	if err != nil {
+		t.Fatalf("read the stamp file at %s: %v", projectsRoot, err)
+	}
+	return s.HoursOverTrigger(workspace, now)
+}
+
+// TestMerge_OverTriggerJSON_ClearSurvivesAPCThatStillCarriesTheStamp is the other half of
+// decision Q13, and the half the min reducer got wrong.
+//
+// MIN is right for two PCs that both crossed: the earliest crossing is what the G7
+// starvation metric measures. But a store that converges back under the trigger CLEARS
+// its stamp, and a clear is an absence. A union over keys cannot tell "this store is
+// fixed" from "this PC has not re-derived yet", so the stamp came straight back from the
+// PC that still had it and the clock could never reset once any PC had started it - the
+// 24 h alarm would fire forever on a store that was fixed hours ago.
+//
+// The clear therefore has to be representable in the merged state, and a re-cross after
+// a clear has to start a NEW clock rather than resurrect the old one.
+func TestMerge_OverTriggerJSON_ClearSurvivesAPCThatStillCarriesTheStamp(t *testing.T) {
+	f := newFleet(t, "a", "b")
+	a, b := f.pcs["a"], f.pcs["b"]
+
+	crossed := time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)
+	cleared := crossed.Add(6 * time.Hour)
+	recrossed := cleared.Add(6 * time.Hour)
+
+	// A's store crosses the trigger and the fleet learns when.
+	a.write(ws, "anchor.md", fact("Anchor", "d", "h", "anchor\n"))
+	mustRecord(t, a.projects, ws, true, crossed)
+	a.syncOnce("a stamps", a.mo(), ws)
+
+	b.fetch()
+	if err := b.eng.Adopt(context.Background(), "refs/remotes/"+hubRemote+"/main", b.mo()); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if hoursOverTrigger(t, b.projects, ws, cleared) == nil {
+		t.Fatal("B never received A's stamp; nothing after this point would prove anything")
+	}
+
+	// The store converges. A's maintenance pass clears the clock.
+	a.tick(time.Hour)
+	mustRecord(t, a.projects, ws, false, cleared)
+	a.syncOnce("a clears", a.mo(), ws)
+
+	// B has not re-derived, so it still carries the stamp. Its next sync merges the two.
+	b.tick(2 * time.Hour)
+	b.write(ws, "b.md", fact("B", "d", "h", "b body\n"))
+	b.syncOnce("b syncs", b.mo(), ws)
+	if h := hoursOverTrigger(t, b.projects, ws, recrossed); h != nil {
+		t.Fatalf("the clear was undone on B: the merge restored the old clock at %.1f h", *h)
+	}
+
+	// And it must not come back to A on the return trip either.
+	a.tick(time.Hour)
+	a.syncOnce("a catches up", a.mo(), ws)
+	if h := hoursOverTrigger(t, a.projects, ws, recrossed); h != nil {
+		t.Fatalf("the clear was undone on A: B's stale stamp came back at %.1f h", *h)
+	}
+
+	// A re-cross after the clear is a NEW clock, not a resumption of the old one.
+	b.tick(time.Hour)
+	mustRecord(t, b.projects, ws, true, recrossed)
+	b.write(ws, "b2.md", fact("B2", "d", "h", "b2 body\n"))
+	b.syncOnce("b re-crosses", b.mo(), ws)
+
+	a.tick(time.Hour)
+	a.write(ws, "a2.md", fact("A2", "d", "h", "a2 body\n"))
+	a.syncOnce("a catches up again", a.mo(), ws)
+	h := hoursOverTrigger(t, a.projects, ws, recrossed.Add(time.Hour))
+	if h == nil {
+		t.Fatal("the re-cross after the clear never reached A; a cleared store can never be stamped again")
+	}
+	if *h != 1.0 {
+		t.Fatalf("the re-cross must start a fresh clock: G7 reads %.1f h, want 1.0 - the old crossing at %s is dead",
+			*h, crossed.Format(time.RFC3339))
 	}
 }
