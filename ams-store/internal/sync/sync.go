@@ -165,7 +165,7 @@ func Once(ctx context.Context, opt Options) Result {
 	if err := repo.StageShared(ctx); err != nil {
 		fmt.Fprintf(logw, "sync: %v\n", err)
 	}
-	// A store whose whole workspace is gone stays tracked forever unless its deletion is
+	// A store whose directory is gone stays tracked forever unless its deletion is
 	// staged: it is never enumerated, so nothing ever notices its files are missing.
 	if removed, err := repo.StageVanishedStores(ctx, workspaces); err != nil {
 		fmt.Fprintf(logw, "sync: %v\n", err)
