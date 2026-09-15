@@ -89,6 +89,43 @@ type MergeResult struct {
 	TouchedWorkspaces []string
 }
 
+// Drainer applies a workspace's deferred queue, declared here for the same reason as
+// Merger: sync drives the merge engine, it does not contain it.
+//
+// The queue is a PENDING MERGE RESULT - changes another PC (or the judge) already
+// committed to history, which this PC withheld from disk because a session was live. It
+// is drained at the top of every pass: blueprint 4.8 says "applied at SessionEnd and at
+// the next SessionStart", and both of those hooks run `sync --once`.
+//
+// The drain is a re-check, not a replay: an entry whose session is still live stays
+// queued, and one whose file was edited after the merge is reconciled rather than
+// overwritten. That judgement belongs to the engine; sync only reports what it decided.
+type Drainer interface {
+	ApplyDeferred(ctx context.Context, opts DrainOptions) (DrainResult, error)
+}
+
+// DrainOptions is one workspace's drain.
+type DrainOptions struct {
+	Workspace string
+	// Now is the injected clock. It is what the liveness probe reads, so it decides
+	// whether the session that queued the entries is still running.
+	Now time.Time
+}
+
+// DrainResult is what the drain decided, path by path.
+type DrainResult struct {
+	// Applied is what reached the work tree.
+	Applied []string
+	// Merged is the subset of Applied that was reconciled with a later edit instead of
+	// overwriting it.
+	Merged []string
+	// Resurrected is a queued deletion abandoned because the file was edited after the
+	// merge - the modify/delete rule, a pass late.
+	Resurrected []string
+	// StillQueued is what a live session still blocks.
+	StillQueued []string
+}
+
 // Deriver is the derive engine, declared here for the same reason as Merger: derive is
 // built in parallel and sync drives it.
 //

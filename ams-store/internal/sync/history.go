@@ -30,11 +30,19 @@ const Branch = "main"
 type Repo struct {
 	GitDir   string
 	WorkTree string
+	// StateRoot is where the per-workspace deferred queues live. Staging consults them,
+	// so a Repo built without it would re-commit every change a live session is being
+	// protected from.
+	StateRoot string
 }
 
 // NewRepo builds a Repo from the resolved roots.
 func NewRepo(roots store.Roots) Repo {
-	return Repo{GitDir: roots.HistoryGitDir(), WorkTree: roots.ProjectsRoot}
+	return Repo{
+		GitDir:    roots.HistoryGitDir(),
+		WorkTree:  roots.ProjectsRoot,
+		StateRoot: roots.StateRoot,
+	}
 }
 
 func (r Repo) opts() gitx.Options {
@@ -90,12 +98,19 @@ func (r Repo) StageShared(ctx context.Context) error {
 // its files are never seen as deleted. A live sync on 2026-09-15 reported "5 store(s)"
 // and left 61 deletions of exactly such a store unstaged.
 //
-// The guard is the whole WORKSPACE directory, not just its memory folder. A store folder
-// that vanished while its workspace is still there is far more likely a transient stat
-// failure than a decision, and propagating that would carry a fleet-wide removal off one
-// bad read - the merge's modify/delete rule would resurrect edited files, but untouched
-// ones would simply go. The caller passes the workspaces enumeration actually found, so a
-// failed enumeration (which fails closed upstream) never reaches this.
+// The guard is the STORE directory, because the store is what is tracked. Guarding the
+// whole workspace directory instead missed the ordinary shape of a removal: a project
+// folder outlives its store - the transcripts stay behind - and enumeration recognises a
+// store by its index, so such a workspace is never enumerated and its files stayed
+// tracked with stale bytes forever, pushed on every sync and materialized back onto every
+// other PC.
+//
+// The original caution stands and is spelled out instead of approximated: only a stat
+// that says NOT FOUND is a removal. Any other stat error - a permission fault, a
+// disconnected share - leaves the store tracked, because propagating a fleet-wide removal
+// off one bad read is the failure worth being careful about. The caller passes the
+// workspaces enumeration actually found, so a failed enumeration (which fails closed
+// upstream) never reaches this.
 func (r Repo) StageVanishedStores(ctx context.Context, live []string) ([]string, error) {
 	res, err := gitx.Run(ctx, r.opts(), "ls-files")
 	if err != nil {
@@ -118,8 +133,8 @@ func (r Repo) StageVanishedStores(ctx context.Context, live []string) ([]string,
 			continue
 		}
 		seen[ws] = true
-		if _, statErr := os.Stat(filepath.Join(r.WorkTree, ws)); statErr == nil {
-			continue // the workspace is still there; this is not a removal
+		if _, statErr := os.Stat(filepath.Join(r.WorkTree, filepath.FromSlash(RelPath(ws)))); !os.IsNotExist(statErr) {
+			continue // the store is there, or we cannot tell: either way, not a removal
 		}
 		if _, err := gitx.Run(ctx, r.opts(), "rm", "-r", "-q", "--cached", "--ignore-unmatch",
 			"--", RelPath(ws)); err != nil {
@@ -148,12 +163,34 @@ func IndexRelPath(workspace string) string { return RelPath(workspace) + "/" + s
 // fact files may live in a store, because the store is globbed by agents on every PC that
 // receives it. The explicit :(exclude) then keeps the index itself out, since MEMORY.md
 // matches *.md and is DERIVED, never merged.
+//
+// Every path on the workspace's DEFERRED QUEUE is excluded: the merge committed those
+// changes to history and withheld them from disk because a session is live, so what is on
+// disk is deliberately older than what is committed. Staging it would resurrect a deleted
+// fact on every PC and revert another PC's edit. A queue that cannot be read stages
+// NOTHING - see LoadDeferred's fail-closed contract.
 func (r Repo) Stage(ctx context.Context, workspace string) error {
 	rel := RelPath(workspace)
-	if err := gitx.AddFactFiles(ctx, r.opts(), rel, store.IndexName); err != nil {
+	hold, err := r.deferredHold(workspace)
+	if err != nil {
+		return err
+	}
+	if err := gitx.AddFactFiles(ctx, r.opts(), rel, store.IndexName, hold); err != nil {
 		return fmt.Errorf("sync: stage %s: %w", rel, err)
 	}
 	return nil
+}
+
+// deferredHold is the workspace's pending merge result, which staging must not touch.
+func (r Repo) deferredHold(workspace string) ([]string, error) {
+	if r.StateRoot == "" {
+		return nil, nil
+	}
+	hold, err := merge.QueuedPaths(r.StateRoot, workspace)
+	if err != nil {
+		return nil, fmt.Errorf("sync: the deferred queue of %s cannot be read, so nothing of it may be staged: %w", workspace, err)
+	}
+	return hold, nil
 }
 
 // HasStagedChanges reports whether anything is staged for a workspace.

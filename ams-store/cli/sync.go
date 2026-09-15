@@ -87,6 +87,10 @@ func runSync(env Env, args []string) int {
 	logw := g.logWriter(env)
 	opt.Deriver = deriverAdapter{roots: roots, machineID: g.machineID, log: logw}
 	opt.Merger = mergerAdapter{roots: roots, machineID: g.machineID, log: logw}
+	// The queue drain. A nil Drainer makes a pass with queued changes REFUSE, so this
+	// wiring is not optional decoration: it is the only production caller of
+	// ApplyDeferred, and without it the deferred queue is written and never read.
+	opt.Drainer = drainerAdapter{roots: roots, machineID: g.machineID, log: logw}
 
 	if watch {
 		return runSyncWatch(env, g, opt)

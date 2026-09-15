@@ -27,6 +27,14 @@ const (
 	StatusConflict  = "conflict-in-history"
 )
 
+// DeferredRef names one change materialization withheld and what it was going to do.
+// The op is not decoration: a withheld DELETION is the entry an operator most needs to
+// recognise, and under a bare path it reads like a postponed edit.
+type DeferredRef struct {
+	Path string `json:"path"`
+	Op   string `json:"op"`
+}
+
 // ConflictRef names a body conflict's losing commit, so the loser is recoverable.
 type ConflictRef struct {
 	Path   string `json:"path"`
@@ -57,8 +65,12 @@ type Receipt struct {
 	Resurrected []string `json:"resurrected,omitempty"`
 	// ConflictsInHistory carries one entry per real body conflict.
 	ConflictsInHistory []ConflictRef `json:"conflict_in_history,omitempty"`
-	// Deferred lists paths materialization queued because a session was live.
-	Deferred []string `json:"deferred,omitempty"`
+	// Deferred lists the changes materialization queued because a session was live.
+	Deferred []DeferredRef `json:"deferred,omitempty"`
+	// DeferredApplied lists paths a previously queued change landed on in this pass. It
+	// is the other end of Deferred: without it the audit trail shows changes going into
+	// the queue and nothing ever coming out.
+	DeferredApplied []string `json:"deferred_applied,omitempty"`
 	// Removed lists workspaces whose whole directory is gone and whose tracked files
 	// this pass staged for deletion. It is a receipt field rather than a log line
 	// because a store leaving the fleet is the kind of change a human reads back later.

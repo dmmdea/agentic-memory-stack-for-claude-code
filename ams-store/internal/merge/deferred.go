@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,10 +16,17 @@ import (
 const DeferredFile = "deferred.json"
 
 // DeferredEntry is one change materialize would not apply under a live session.
+//
+// Blob is the MERGED blob - what the work tree would have got. OursBlob is what was on
+// disk when the entry was queued, and it is what makes the drain a RE-CHECK instead of a
+// blind write: if the file still holds those bytes, nothing of the session's is at risk
+// and the merged result lands; if it does not, the session edited the file AFTER the
+// merge, and the later edit is the one thing the queue exists to protect.
 type DeferredEntry struct {
 	Path     string `json:"path"`
 	Op       Op     `json:"op"`
 	Blob     string `json:"blob,omitempty"`
+	OursBlob string `json:"ours_blob,omitempty"`
 	QueuedAt string `json:"queued_at"`
 }
 
@@ -47,6 +55,24 @@ func LoadDeferred(stateRoot, workspace string) (Deferred, error) {
 		return Deferred{}, nil
 	}
 	return d, nil
+}
+
+// QueuedPaths is the queue as a pathspec-ready list: every path whose materialization is
+// still pending for a workspace.
+//
+// It is what the staging pass must EXCLUDE. The error is never swallowed into an empty
+// list by design - "I could not read the queue" and "nothing is queued" lead to opposite
+// actions, and collapsing them is how a withheld deletion gets re-committed.
+func QueuedPaths(stateRoot, workspace string) ([]string, error) {
+	d, err := LoadDeferred(stateRoot, workspace)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(d.Entries))
+	for _, e := range d.Entries {
+		out = append(out, e.Path)
+	}
+	return out, nil
 }
 
 // SaveDeferred writes the queue atomically.
@@ -83,62 +109,149 @@ func queueDeferred(stateRoot, workspace, tree string, entries []DeferredEntry) e
 	return SaveDeferred(stateRoot, workspace, Deferred{Tree: tree, Entries: merged})
 }
 
-// ApplyDeferred drains a workspace's queue, re-checking the live/mtime condition for
-// every entry. It is called at SessionEnd and at the next SessionStart.
+// DrainReport is what one drain did. Every path lands in exactly one list, so a receipt
+// can say what happened to each queued change rather than only how many there were.
+type DrainReport struct {
+	// Applied is what reached the work tree: a replacement written or a file removed.
+	Applied []string
+	// Merged is the subset of Applied whose file had been edited AFTER the merge and was
+	// reconciled three-way rather than overwritten.
+	Merged []string
+	// Resurrected is a queued DELETION whose file the session edited afterwards. The
+	// edit is the later decision and the file stays - deletion table row 3, one pass
+	// late. The deleted side is still reachable in history.
+	Resurrected []string
+	// StillQueued is what a live session still blocks.
+	StillQueued []string
+}
+
+// ApplyDeferred drains a workspace's queue, re-checking BOTH guards for every entry: the
+// live/mtime condition that queued it, and whether the file on disk is still the file the
+// merge deferred against.
+//
+// It is a re-check and not a replay. Between the merge and the drain the session went on
+// working, and the entry carries what the file looked like when it was queued. If the
+// bytes still match, the merged result lands - that is the ordinary case. If they do not,
+// the session wrote something later than the merge, and a blind write would silently
+// revert it: a replacement is merged three-way against the queued bytes with the DISK
+// side winning any real body conflict (it is the later edit, and the merged side is
+// already reachable in history), and a deletion is abandoned and reported `resurrected`,
+// which is exactly the modify-vs-delete row of the deletion table arriving a pass late.
 //
 // An entry that is still blocked STAYS QUEUED. Dropping it would silently discard the
 // judge's deletion or another PC's edit, which is the failure the queue exists to
 // prevent in the first place.
-func (e *Engine) ApplyDeferred(ctx context.Context, workspace string, mo MaterializeOptions) (applied, stillQueued []string, err error) {
+func (e *Engine) ApplyDeferred(ctx context.Context, workspace string, mo MaterializeOptions) (DrainReport, error) {
+	var rep DrainReport
 	d, err := LoadDeferred(mo.StateRoot, workspace)
 	if err != nil {
-		return nil, nil, err
+		return rep, err
 	}
 	if len(d.Entries) == 0 {
-		return nil, nil, nil
+		return rep, nil
 	}
 	live, sessionStart := mo.Live.Probe(workspace)
 
 	var keep []DeferredEntry
 	var deletions []DeferredEntry
 	for _, ent := range d.Entries {
-		if blocked(ent, live, sessionStart, mo.workTreePath(e, ent.Path)) {
+		full := mo.workTreePath(e, ent.Path)
+		if blocked(ent, live, sessionStart, full) {
 			keep = append(keep, ent)
-			stillQueued = append(stillQueued, ent.Path)
+			rep.StillQueued = append(rep.StillQueued, ent.Path)
 			continue
 		}
+		disk, diskErr := os.ReadFile(full)
+		untouched, err := e.diskStillHoldsQueuedBytes(ctx, ent, disk, diskErr)
+		if err != nil {
+			return rep, err
+		}
 		if ent.Op == OpDelete {
-			deletions = append(deletions, ent)
+			switch {
+			case diskErr != nil:
+				rep.Applied = append(rep.Applied, ent.Path) // already gone
+			case untouched:
+				deletions = append(deletions, ent)
+			default:
+				rep.Resurrected = append(rep.Resurrected, ent.Path)
+			}
 			continue
 		}
 		data, readErr := gitx.CatBlob(ctx, e.opt(), ent.Blob)
 		if readErr != nil {
-			return applied, stillQueued, readErr
+			return rep, readErr
+		}
+		if !untouched && diskErr == nil {
+			data, err = e.reconcileLaterEdit(ctx, ent, disk, data)
+			if err != nil {
+				return rep, err
+			}
+			rep.Merged = append(rep.Merged, ent.Path)
 		}
 		if writeErr := e.writeWorkTree(ent.Path, data, mo); writeErr != nil {
-			return applied, stillQueued, writeErr
+			return rep, writeErr
 		}
-		applied = append(applied, ent.Path)
+		rep.Applied = append(rep.Applied, ent.Path)
 	}
 	// Deletions last, mirroring materialize: a reader that catches the store mid-apply
 	// sees a superset of the fact set, never a pointer to a file already gone.
 	for _, ent := range deletions {
 		full := filepath.Join(e.WorkTree, filepath.FromSlash(ent.Path))
 		if rmErr := os.Remove(full); rmErr != nil && !os.IsNotExist(rmErr) {
-			return applied, stillQueued, fmt.Errorf("apply deferred deletion %s: %w", ent.Path, rmErr)
+			return rep, fmt.Errorf("apply deferred deletion %s: %w", ent.Path, rmErr)
 		}
-		applied = append(applied, ent.Path)
+		rep.Applied = append(rep.Applied, ent.Path)
 	}
 
 	if err := SaveDeferred(mo.StateRoot, workspace, Deferred{Tree: d.Tree, Entries: keep}); err != nil {
-		return applied, stillQueued, err
+		return rep, err
 	}
-	if len(applied) > 0 && mo.Derive != nil {
+	if (len(rep.Applied) > 0 || len(rep.Resurrected) > 0) && mo.Derive != nil {
 		if err := mo.Derive(workspace); err != nil {
-			return applied, stillQueued, err
+			return rep, err
 		}
 	}
-	return applied, stillQueued, nil
+	return rep, nil
+}
+
+// diskStillHoldsQueuedBytes answers "is this the file the merge deferred against".
+//
+// It fails CLOSED in both directions that matter: an entry with no recorded ours-blob
+// (queued by an older build, or queued for a path that was not on disk) is treated as
+// CHANGED, because "I do not know what was there" must never authorise an overwrite.
+func (e *Engine) diskStillHoldsQueuedBytes(ctx context.Context, ent DeferredEntry, disk []byte, diskErr error) (bool, error) {
+	if diskErr != nil || ent.OursBlob == "" {
+		return false, nil
+	}
+	queued, err := gitx.CatBlob(ctx, e.opt(), ent.OursBlob)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(queued, disk), nil
+}
+
+// reconcileLaterEdit merges the session's later edit with the merged blob the queue was
+// holding: base = what was on disk when it was queued, ours = what is on disk now,
+// theirs = the merged result. The DISK side wins a real body conflict.
+func (e *Engine) reconcileLaterEdit(ctx context.Context, ent DeferredEntry, disk, merged []byte) ([]byte, error) {
+	var base []byte
+	basePresent := false
+	if ent.OursBlob != "" {
+		b, err := gitx.CatBlob(ctx, e.opt(), ent.OursBlob)
+		if err != nil {
+			return nil, err
+		}
+		base, basePresent = b, true
+	}
+	// hasOurs without hasTheirs is the deterministic "ours is newer" answer: there is no
+	// commit on either side to compare here, and the disk IS the later write by
+	// construction - the merged side was computed before it.
+	out, _, err := e.mergeContent(ctx, ent.Path,
+		sideBlob{present: basePresent, data: base},
+		sideBlob{present: true, data: disk},
+		sideBlob{present: true, data: merged},
+		resolveContext{hasOurs: true})
+	return out, err
 }
 
 // blocked re-applies the section 4.8 guard to one entry.

@@ -146,6 +146,11 @@ type CommitOptions struct {
 	// Workspaces limits staging to these workspaces' stores. Empty means every
 	// workspace directory under the work tree.
 	Workspaces []string
+	// StateRoot is where the per-workspace deferred queues live. It is REQUIRED on any
+	// engine whose merges can defer - which is every engine a PC runs - because a queued
+	// path must not be staged. Empty means "this engine has no queue" and is only true
+	// of a fixture that never materializes.
+	StateRoot string
 	// Date pins the author and committer time. Zero means the engine clock.
 	Date time.Time
 }
@@ -177,7 +182,15 @@ func (e *Engine) Commit(ctx context.Context, co CommitOptions) (oid string, chan
 		// nothing but MEMORY.md and fact files may live in a store). The exclude pathspec
 		// then keeps MEMORY.md out even under -f, since it matches *.md too and forcing
 		// it in would track the one file the design requires to stay untracked.
-		if err := gitx.AddFactFiles(ctx, e.opt(), rel, store.IndexName); err != nil {
+		//
+		// The deferred queue is excluded on top of that: those paths are a merge result
+		// this PC has already committed and has NOT put on disk yet, so staging what is
+		// on disk would undo the merge.
+		hold, err := deferredHold(co.StateRoot, ws)
+		if err != nil {
+			return "", false, err
+		}
+		if err := gitx.AddFactFiles(ctx, e.opt(), rel, store.IndexName, hold); err != nil {
 			return "", false, err
 		}
 	}
@@ -210,6 +223,16 @@ func (e *Engine) Commit(ctx context.Context, co CommitOptions) (oid string, chan
 		return "", false, fmt.Errorf("commit produced no HEAD: %w", err)
 	}
 	return head, true, nil
+}
+
+// deferredHold reads one workspace's queue for the staging pass. A state root that was
+// never configured yields no hold, and a queue that cannot be read is an ERROR: staging
+// on a guess is exactly the resurrection this exclusion exists to stop.
+func deferredHold(stateRoot, workspace string) ([]string, error) {
+	if stateRoot == "" {
+		return nil, nil
+	}
+	return QueuedPaths(stateRoot, workspace)
 }
 
 func dateEnv(when time.Time) []string {

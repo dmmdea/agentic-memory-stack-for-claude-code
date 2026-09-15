@@ -36,9 +36,12 @@ func (mo MaterializeOptions) workTreePath(e *Engine, rel string) string {
 
 // MaterializeReport is what one materialize did.
 type MaterializeReport struct {
-	Written  []string
-	Deleted  []string
-	Deferred []string
+	Written []string
+	Deleted []string
+	// Deferred carries the ENTRIES, not just their paths: what a change was going to do
+	// is the whole point of reporting it, and "deferred: x.md" for a withheld deletion
+	// reads as a postponed edit.
+	Deferred []DeferredEntry
 }
 
 // materialize brings the work tree to the merged tree, file by file.
@@ -48,6 +51,18 @@ type MaterializeReport struct {
 // session's work. Fact files land first and the derived index last.
 func (e *Engine) materialize(ctx context.Context, prevTree, newTree string, mo MaterializeOptions) (MaterializeReport, error) {
 	var rep MaterializeReport
+
+	// The merge is computed out of tree, so the repository's INDEX still describes the
+	// pre-merge state after update-ref. For every path the work tree ends up matching,
+	// the next `git add` corrects the index by itself - but a DEFERRED path is excluded
+	// from that add on purpose, and a stale index entry for it is committed verbatim by
+	// the next `git commit`, which re-adds the file whose deletion was withheld and
+	// re-commits the session's older bytes over the merged blob. Reading the merged tree
+	// into the index is what makes the deferral hold: it touches no file (no -u), it only
+	// tells git what the branch now says.
+	if err := e.readIndexFromTree(ctx, newTree); err != nil {
+		return rep, err
+	}
 
 	want, err := gitx.LsTree(ctx, e.opt(), newTree)
 	if err != nil {
@@ -131,10 +146,18 @@ func (e *Engine) materialize(ctx context.Context, prevTree, newTree string, mo M
 		ws := workspaceOf(c.path)
 		live, start := probe(ws)
 		if blocked(DeferredEntry{Path: c.path, Op: c.op}, live, start, mo.workTreePath(e, c.path)) {
+			// What is on disk RIGHT NOW is written to the object database and recorded
+			// with the entry. It is what turns the drain into a re-check: without it the
+			// drain cannot tell "the session never touched this again" from "the session
+			// rewrote it after the merge", and has to either clobber or give up.
+			ours, err := e.hashWorkTreeFile(ctx, c.path, mo)
+			if err != nil {
+				return rep, err
+			}
 			queued[ws] = append(queued[ws], DeferredEntry{
-				Path: c.path, Op: c.op, Blob: c.oid, QueuedAt: now,
+				Path: c.path, Op: c.op, Blob: c.oid, OursBlob: ours, QueuedAt: now,
 			})
-			rep.Deferred = append(rep.Deferred, c.path)
+			rep.Deferred = append(rep.Deferred, queued[ws][len(queued[ws])-1])
 			continue
 		}
 		if c.op == OpDelete {
@@ -188,6 +211,33 @@ func (e *Engine) materialize(ctx context.Context, prevTree, newTree string, mo M
 		}
 	}
 	return rep, nil
+}
+
+// hashWorkTreeFile writes the current bytes of one work-tree file into the object
+// database and returns the blob id. A file that is not there has no id, which the drain
+// reads as "nothing of the session's can be at risk here".
+func (e *Engine) hashWorkTreeFile(ctx context.Context, rel string, mo MaterializeOptions) (string, error) {
+	data, err := os.ReadFile(mo.workTreePath(e, rel))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read %s to record what the deferral is holding: %w", rel, err)
+	}
+	return gitx.HashObject(ctx, e.opt(), data)
+}
+
+// readIndexFromTree brings the repository index to a tree WITHOUT touching the work
+// tree. Plumbing on purpose: `git reset` and `git checkout` are both forbidden here, and
+// only `read-tree` (with no -u) is guaranteed to leave every file on disk alone.
+func (e *Engine) readIndexFromTree(ctx context.Context, tree string) error {
+	if tree == "" {
+		return nil
+	}
+	if _, err := gitx.Run(ctx, e.opt(), "read-tree", tree); err != nil {
+		return fmt.Errorf("materialize: read the merged tree into the index: %w", err)
+	}
+	return nil
 }
 
 // writeWorkTree writes one file through the atomic door, creating its store directory if

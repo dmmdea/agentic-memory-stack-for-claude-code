@@ -152,6 +152,7 @@ func (p *pc) commit(message string, workspaces ...string) string {
 		Kind:       "local",
 		Workspaces: workspaces,
 		Date:       p.clock,
+		StateRoot:  p.stateDir,
 	})
 	if err != nil {
 		p.t.Fatalf("%s: commit: %v", p.name, err)
