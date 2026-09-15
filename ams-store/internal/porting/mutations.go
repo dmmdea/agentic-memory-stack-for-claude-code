@@ -235,12 +235,16 @@ var Mutations = []Mutation{
 				// The second guard is the STAGING pathspec, and it lives in gitx: the
 				// merge engine and sync stage the same thing, so the exclusion was
 				// collapsed into AddFactFiles (3cde555) and this hunk moved with it.
+				// The deferred-queue work then hoisted that pathspec out of the add's
+				// argument list into the `exclude` slice both staging passes share, so
+				// the anchor moved again and rides the slice now - neutering it neuters
+				// BOTH passes, which is the same one guard it always was.
 				// It is neutered rather than deleted so every identifier stays
 				// referenced: an unused import or parameter is a BUILD failure, and a
 				// build failure reads as a red test while proving nothing about the rule.
 				File: "internal/gitx/plumbing.go",
-				Old:  "\t\t\":(glob)\"+storeRel+\"/*.md\", \":(exclude)\"+storeRel+\"/\"+indexName)\n",
-				New:  "\t\t\":(glob)\"+storeRel+\"/*.md\", \":(exclude)\"+storeRel+\"/not-\"+indexName)\n",
+				Old:  "\texclude := append([]string{\":(exclude)\" + storeRel + \"/\" + indexName}, ExcludePathspecs(hold)...)\n",
+				New:  "\texclude := append([]string{\":(exclude)\" + storeRel + \"/not-\" + indexName}, ExcludePathspecs(hold)...)\n",
 			},
 		},
 	},
