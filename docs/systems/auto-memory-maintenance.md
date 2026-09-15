@@ -97,6 +97,30 @@ unless the path is a workspace Index, then reports any line over the hook budget
 fixes it in the same turn, while the material is still in context. It is advisory and always
 exits 0: a hook must never be able to block a memory write.
 
+### SessionStart hook order, measured 2026-09-15
+
+The harness docs never stated whether SessionStart hooks run BEFORE or AFTER `MEMORY.md`
+is read into context, and the v2 design (`fleet-store-sync-and-linux-authority`) left it as
+a measurement rather than an assumption. It was measured with a sentinel entry written into
+a test workspace's index by a temporary SessionStart hook, across cold, warm and resumed
+starts, cross-checked against the stamp file's mtime and the transcript's first write.
+
+**The answer is that there is no fixed order.** Some sessions carry the sentinel, so the
+hook's write landed before the read; others answer and exit before the hook has finished,
+so it did not. Both happen on the same machine, and which one you get is a race with how
+long the hook takes.
+
+What that means operationally: **the SessionStart derive cannot be relied on to protect the
+session it runs in.** It protects the NEXT one. The defenses that keep the on-disk index
+under cap before a session reads it are the derive at **SessionEnd** and the derive **after
+every merge** - those run when nothing is competing with them, and they are what make the
+index correct at the moment the next session opens it. The SessionStart derive stays as a
+fixed step, but as belt-and-braces rather than a guarantee.
+
+This also raises the value of closing the Bash blind spot: the write gate's matcher is
+`Write|Edit` and never sees an index written through Bash or python, so for those writes the
+SessionEnd and after-merge derives are the only defense, not a second chance.
+
 ### Pillar 3 — compaction (nightly)
 
 **2026-09-10 revision — one compactor per PC, one judge attempt per store per night.** The per-store catch-up below ran at every session start with no cross-instance lock: four instances hit one store in the same second, the history repo's `index.lock` failed, 243 receipts landed in nine hours, and the judge was called 32 times on one store with every result rejected. Two changes, both interim relief ahead of the fleet-store design (ADR `fleet-store-sync-and-linux-authority`): (1) **GUARD 0** — a session-local named mutex (`Local\ams-memory-compact`) taken before anything else; a second instance logs `another compactor instance holds the per-PC lock` and exits 0 with no receipt, and the OS releases the mutex if the holder dies. (2) **One judge attempt per store per 20 h** — every receipt records `judge_called`, `Get-AmStoreRunHistory` exposes `LastJudgeUtc`, and a store whose judge was called inside the window still gets deterministic hygiene and the floors but no judge call; with nothing else to do it receipts `skipped-judge-attempted-today` (not productive, not a skip-streak entry). The window is 20 h, not 24, so a nightly a few minutes earlier than yesterday's does not find that attempt still "today". `-Force` bypasses it. The `-CatchUp` starved check applies the same window, so a session start no longer re-runs a store the judge already decided today. Lint treats the status as neutral: excluded from the `compactor-unproductive` window rather than counted as good, so a store waiting for tomorrow's attempt is not reported as stuck while three rejected runs with such skips between them still are. Found on the way: under pwsh 7 `ConvertFrom-Json` already yields a `[DateTime]` for a receipt's `ts`, and the `[string]` re-parse read it as local time — every receipt age was skewed by the UTC offset whenever the lib ran under pwsh 7; PS 5.1, the scheduled task's runtime, was unaffected. `ConvertTo-AmUtc` handles both.

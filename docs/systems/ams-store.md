@@ -19,21 +19,31 @@ register rows P3-* / P4-* / P5-*.
 
 ## Status
 
-**Scaffold + the derive engine (this change).** The scaffold carries store
-enumeration (fail-closed, reparse-point/junction dedup, OS-gated case folding),
-the atomic writer (temp + rename + hash read-back), the git wrapper (`gitx`, with
-a `git >= 2.38` check for `merge-tree --write-tree` and a kill-tree timeout on
-every call), frontmatter parsing, the doctrine rule and the index parse/render
-core.
+**Engines implemented; every verb is real.** There are no stubs left: `derive`,
+`harvest`, `lint`, `gate`, `sync`, `sync --watch`, `lock` and the hub-only
+`judge-apply` all do their work. Phase 3 is code complete and waits on the hub
+(P3-3) and the seed (P3-4) before it runs a fleet.
 
-`derive` and `harvest` are now real: harvest, the four hygiene passes, the
-planned-ghost abort, the blast cap, the derived render with its injection stop,
-the convergence floor, the compare-and-swap write and the post-write invariants.
-`lint`, `gate`, `sync`, `lock` and `judge-apply` still print `not implemented`
-and exit 64; their engines land in the register rows that follow. The 1:1
-Pester-counterpart table is seeded so the parity gate is enumerable from day one,
-and the scenarios derive owns have moved out of the placeholder package into
-`internal/derive`.
+What that covers: store enumeration (fail-closed, reparse-point/junction dedup,
+OS-gated case folding); the atomic writer; `gitx` as the single git surface, with
+a `git >= 2.38` check and a kill-tree timeout on every call; the derive engine
+(harvest, four hygiene passes, planned-ghost abort, blast cap, derived render
+with its injection stop, convergence floor, compare-and-swap write); the merge
+engine (out-of-tree three-way merge, deletion table, field-aware frontmatter,
+commit-time winner, deferred materialization); sync with the bounded push loop
+and the remote policy; the write gate; lint; and the judge's apply-guards.
+
+The engines were built in parallel against one-method interfaces, each unit-tested
+against a fake. `cli/seams.go` is the one place they meet, and every adapter there
+carries an end-to-end test that drives the real pair rather than the fake - a
+disconnected seam compiles, ships and passes every unit test while the verb
+silently degrades (`gate.Options{Floor: nil}` prints the same advisory block and
+never rewrites a thing).
+
+Open for Phase 4, deliberately: the floor's engage threshold stays on the legacy
+hysteresis, `<STATE_ROOT>/role` is not seeded on any machine, `dream-consolidate.py`
+does not emit a plan file yet, and `VERSION` is unchanged - the installer wires the
+binary in and bumps it.
 
 ## Why Go, not the PowerShell library
 
@@ -73,10 +83,26 @@ ams-store/
     frontmatter/     parse, harvest, doctrine rule
     atomic/          temp + rename + hash read-back writer
     gitx/            every git exec (argv, env, timeout, exit classifier, version check)
+    derive/          harvest, hygiene, the floor, truncation
+    merge/           merge-tree, deletion table, body merge, winner, materialize, deferred
+    sync/            the history repo, the once pass, the watcher, the remote policy
+    lock/            the per-PC file lock (pid + start time) and the named mutexes
+    gate/            the PostToolUse payload, the advisory block, the receipt
+    lint/            the rules, the summary artifact, the over-trigger clock
+    live/            the liveness probe
     judge/           the hub-only apply path: plan schema, apply-guards, migration
-    porting/         the 1:1 Pester-counterpart table
+    porting/         the counterpart table, the mutation table, and the repo-wide gates
     testutil/        sandbox (temp projects root + state root + optional history repo)
+  scripts/           the mutation gate (local only, never CI)
 ```
+
+`cmd/` holds no logic. Every git invocation goes through `gitx`, every file write
+through `atomic`, and there is exactly ONE floor, ONE doctrine rule, ONE anchor
+rule and ONE history-repo shape in the binary - each of those had two
+implementations at some point during the parallel build, and each duplication
+decided behaviour rather than merely repeating it. The sync and merge packages
+both initialize the history repo; they disagreed about whether the shared
+over-trigger stamp was trackable, and whichever ran last won.
 
 ## Verbs
 
@@ -85,8 +111,10 @@ ams-store derive   [--store <dir>|--all] [--workspace <slug>] [--dry-run] [--jso
                    [--no-harvest] [--stop-below <bytes>] [--projects-root <dir>]
 ams-store lint     [--all] [--workspace <slug>] [--json] [--quiet] [--summary-out <path>]
 ams-store gate     [--stdin-payload]
-ams-store sync     [--once] [--watch] [--timeout <dur>] [--remote <name>]
+ams-store sync     [--once] [--watch] [--timeout <dur>] [--hub-host <name>]
+                   [--workspace <slug>] [--allow-local-path] [--json]
 ams-store lock     status | acquire --for <dur> --reason <s> | release | break
+ams-store harvest  --store <dir> | --all [--workspace <slug>] [--json]
 ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-run]
                       [--max-migrations 5] [--force] [--hub] [--candidates]
                       [--mem0-url <url>] [--mem0-user <id>] [--json]   # hub-only
@@ -148,6 +176,63 @@ disappears from the index is a standing order nobody obeys.
 `MEMORY.md` - and an implicit "every populated store on this PC" turned one stray
 bare invocation into a fleet-wide write. `TestCLI_WritingVerbsRefuseAnImplicitScope`
 is the guard.
+
+## sync, watch, gate, lint
+
+**`sync --once`** is one pass, and its ORDER is the design: derive every store,
+commit LOCALLY, clear the dirty marker, and only then fetch, merge and push. The
+local commit happens before the fetch so a PC that worked all day offline keeps
+its history whatever the network did; every other ordering makes offline work
+invisible until connectivity returns, and the box that has been offline for a week
+is exactly the one whose history matters most when it comes back. Having no hub
+configured is a fully successful pass, not a failure.
+
+The push loop is bounded at three attempts. A non-fast-forward rejection is the
+loop's signal that another PC pushed first, so it re-merges and retries; anything
+else is a real error and is never retried. The merge itself never runs `git merge`,
+`git checkout` or `git stash` - it computes the merge out of tree, resolves every
+path in memory, commits it, and only then materializes file by file, fact files
+first and the derived index last, so no index ever points at a file that has not
+landed. A file a live session has touched since that session started is DEFERRED
+rather than replaced, and the queue is applied at the next session boundary.
+
+`MEMORY.md` is never tracked and never merged. Two guards hold that: the
+`info/exclude` entry and the `:(exclude)` pathspec on the forced add, because
+either one alone would still keep it out and a mutation that removes only one
+would look tested. Staging is narrowed to `*.md` for the same reason the exclude
+is a deny-list: the force that gets fact files past the exclude would otherwise
+track whatever else is in the directory, and the PowerShell compactor leaves
+`.bak-<date>-<kind>` files beside the index.
+
+A store whose whole workspace directory is gone has its deletion staged, which is
+the one way a store leaves the fleet. The guard is the WORKSPACE directory rather
+than the memory folder: a store folder that vanished while its workspace is still
+there is far more likely a bad stat than a decision, and propagating that would
+carry a fleet-wide removal off one bad read.
+
+**`sync --watch`** is one singleton watcher per PC, not one per session. It holds
+`watch.lock`, wakes on the dirty marker through a filesystem watch, and holds no
+timer and does no network while idle. A second instance exits 0 silently, because
+a session starting while the watcher already runs is the normal case.
+
+**`gate`** is the PostToolUse hook and it returns 0, always - a hook that can fail
+a `Write` is a hook that can stop the operator working, so every error path is
+swallowed and the worst case is silence. It advises under the caps, normalizes an
+index that has crossed the sync limit through the same floor `derive` uses, commits
+locally and marks the tree dirty. It never touches the network: the watcher is what
+carries the change to the hub.
+
+**`lint`** is read-only by contract and never writes inside a store. It carries the
+shipped rules (orphan, dangling, dup-slug, long-line, oversized-file, budget
+findings, `compactor-starved`, `compactor-unproductive`) and adds `resurrected` and
+`conflict-in-history`, which it reads from the sync receipts and reports with the
+losing commit id so the loser is recoverable. `compactor-silent` is parameterised:
+on a PC the finding does not exist, because there is no local nightly to be silent;
+on the hub `--nightly-unit` names the systemd timer. The G7 clock - hours over
+trigger without an applied decision - comes from `.ams/over-trigger.json`, which
+rides in the synced tree outside every store and merges with a `min` reducer, so
+the earliest crossing any PC saw is the truth. `derive` and `sync` write it; lint
+only reads it.
 
 ## judge-apply
 
@@ -223,5 +308,57 @@ From `ams-store/`: `go build ./...`, `go vet ./...`, `go test ./...` are the
 gates (the same three the sibling Go project uses). CI runs the Go suite on
 `ubuntu-latest` with `-race` and builds + tests on `windows-latest` (no `-race`,
 which needs a C toolchain) so the Windows reparse/path code is exercised. The
-binary cross-compiles for `windows/amd64` and `linux/amd64`; mutation runs (each
-merge rule flipped to turn a named test red) are local, never a CI job.
+binary cross-compiles for `windows/amd64` and `linux/amd64`.
+
+Running BOTH jobs is not redundancy. The Linux job runs a different git, and that
+is what caught a merge that worked on git 2.55 and failed outright on 2.43: the
+unrelated-histories path - the first sync between two PCs that each ran `git init`
+before either had pushed - handed `merge-tree` the empty TREE as its merge base,
+which 2.55 accepts and 2.43 refuses. The design's floor is git 2.38, so the version
+that refuses is inside the supported range and the version that accepts is the one
+the engine was written on.
+
+### The gates that check the tests
+
+Four checks in `internal/porting` guard the suite itself, because each of them
+covers a failure that a green suite cannot see:
+
+- **the counterpart gate** reads the four Pester files, extracts all 95 `It`
+  blocks, maps each through `counterparts.go` and asserts a Go test of that name
+  exists (`go test -list`). Exactly one scenario is exempt and carries its reason
+  inline: `MemoryCompactRobustness.Tests.ps1:420`, the `-CatchUp` fresh-then-stale
+  run, whose spawn the design removes from the PCs. A second exemption fails the
+  gate, as does a table row whose `It` moved, or an `It` with no row.
+- **the placeholder check** refuses any remaining `ported in task N` skip. A
+  skipped test is still a test to `go test -list`, so the counterpart gate alone
+  would pass over a suite that asserts nothing.
+- **the home-sandbox check** fails when a package whose source calls
+  `store.DefaultRoots` has tests without a `TestMain` that moves `HOME` and
+  `USERPROFILE` to a temp directory. Two live incidents hours apart on 2026-09-15
+  came from a test that did not inject its roots: one harvested a `hook:` line into
+  248 live fact files, the other committed five live stores into the real history
+  repo. In both the code was correct and the TEST reached production.
+- **the ASCII check** keeps non-ASCII out of Go source. Inherited from the
+  PowerShell library it replaces: a BOM-less UTF-8 file read as ANSI by PowerShell
+  5.1 tokenises an em-dash as a smart quote, so the separator is built from its code
+  point (`"\u2014"`) and never typed. Goldens under `testdata/` are exempt - they are
+  the product, and an ASCII golden could not prove the em-dash survives.
+
+### The mutation gate
+
+`ams-store/scripts/mutation-gate.sh` is LOCAL only, never a CI job: it is N+1
+times the suite. It exists because a passing suite proves the tests run, not that
+they would NOTICE if a rule were lost.
+
+For each of the 25 rules in blueprint 10.2 it copies the target file aside, applies
+one minimal change that breaks that rule, **builds**, runs the named test alone
+expecting it to FAIL, and restores the file with a byte compare against the
+pre-image. The build step is not ceremony: a mutation that does not compile reads
+as a red test while proving nothing. Neither is the byte-verified restore - the
+gate's first ever run used WSL git against a Windows worktree checkout, every
+`git checkout --` failed silently, fifteen mutations stacked on each other, and it
+reported four rules SURVIVED that had never been tested in isolation.
+
+Current state: **red 25, survived 0, broken 0, pending 0**. A SURVIVED rule means
+nothing tests it; a NOCOMPILE entry means the mutation is broken. Both were hit
+while arming the last ten and both are reported separately for that reason.

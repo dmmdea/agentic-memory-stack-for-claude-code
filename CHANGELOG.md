@@ -4,7 +4,7 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## Unreleased — ams-store scaffold (System A store client, register P3-1 start)
+## Unreleased — ams-store (System A store client, register P3-1/P3-2)
 
 The Go rewrite of the auto-memory store library, write gate and nightly compactor begins
 here. This change adds the `ams-store/` module: store enumeration (fail-closed, reparse-point
@@ -19,6 +19,56 @@ exemption). Two Go CI jobs added (linux with `-race`, windows build+test). Measu
 ~397 ms p50); the SessionStart hook order is not a fixed before/after. New system doc
 `docs/systems/ams-store.md`. No runtime/version change to the mem0 stack — `VERSION` is
 unchanged.
+
+**The engines (this change).** No verb is a stub any more. `derive` and `harvest` (harvest,
+the four hygiene passes, planned-ghost abort, blast cap, derived render with the injection
+stop, convergence floor, compare-and-swap write); the merge engine (out-of-tree three-way
+merge, deletion table, field-aware frontmatter merge, commit-time winner with the machine-id
+tiebreak, CRLF normalization, materialize order, deferred queue, liveness); `sync` /
+`sync --watch` / `lock` / `gate` / `lint`; and the hub-only `judge-apply` with every
+apply-guard and the `Migrated:` trailer.
+
+- **The seams are connected and tested as pairs.** Each engine was built against a one-method
+  interface and a fake, which is what keeps the packages independent and also what makes a
+  disconnected seam invisible: `gate.Options{Floor: nil}` compiles, ships and passes every
+  unit test while the write gate silently becomes an advisory printer. `cli/seams.go` is the
+  one place they meet and each adapter carries an end-to-end test driving the real pair.
+- **Three duplications collapsed, each of which decided behaviour.** `internal/sync` and
+  `internal/merge` both wrote the history repo's `info/exclude` and config, and disagreed
+  about whether the shared over-trigger stamp was trackable — whichever ran last won.
+  `internal/derive` carried a second copy of the anchor rule. `cli` had two global-flag
+  structs, one of which left the state root empty when the home could not be resolved. One
+  floor, one doctrine rule, one anchor rule, one repo shape.
+- **The empty merge base must be a commit, not a tree.** The first sync between two PCs that
+  each ran `git init` before either had pushed works on git 2.55 and fails outright on git
+  2.43 (`object ... is a tree, not a commit`). The design's floor is 2.38, so the version
+  that refuses is inside the supported range; found by the mandatory Linux `-race` run, which
+  is the only place the other git version is exercised.
+- **Staging is narrowed to fact files.** The forced pathspec that gets fact files past the
+  blanket exclude also tracked whatever else was in the store directory, and the PowerShell
+  compactor leaves `.bak-<date>-<kind>` files there; a live sync put several into history on
+  their way to the hub and from there into every agent's glob. Nothing is untracked or
+  deleted — that is a decision for a human.
+- **A store whose whole workspace directory is gone now has its deletion staged**, which is
+  the one way a store leaves the fleet; and the history repo pins a repo-local empty
+  `core.hooksPath` so a global hooks path aimed at GitHub pushes does not refuse the hub push.
+- **The G7 over-trigger clock is written.** `derive` and `sync` stamp
+  `.ams/over-trigger.json`; nothing wrote it before, so `over_trigger_hours` was null on every
+  PC and the 24 h alarm was inert.
+- **The parity gate is a test, not a table in a plan.** It reads the four Pester files,
+  extracts all 95 `It` blocks and asserts a Go test of the mapped name exists, with exactly
+  one exemption carrying its reason inline. A companion check refuses any remaining
+  placeholder skip, because a skipped test is still a test to `go test -list`. Two more repo
+  gates: every package that can resolve the operator's home runs its tests with the home
+  moved (two live incidents on 2026-09-15 came from tests that did not), and Go source stays
+  ASCII.
+- **The mutation gate is complete: red 25, survived 0, broken 0, pending 0.** Ten rules
+  carried a name but no mutation and were reported rather than checked. Arming them caught
+  one mutation that did not compile (a build failure reads as a red test while proving
+  nothing) and one that SURVIVED (it added a fetch before the local commit but ignored the
+  error, so the rule was never actually broken).
+
+`VERSION` is still unchanged: Phase 4 wires the binary into the installer and bumps it.
 
 ## v1.23.5 (2026-09-15) — an explicit empty flag clears an inherited value; prerequisites read correctly over ssh
 
