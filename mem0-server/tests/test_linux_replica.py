@@ -387,3 +387,22 @@ def test_installer_backup_dir_and_brain_wsl_inherit_on_a_rerun(tmp_path):
     r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     assert r.returncode == 0, r.stderr + r.stdout
     assert "inherited from ~/.mem0/replica.env" not in r.stdout
+
+
+def test_installer_explicit_empty_flag_clears_the_inherited_value(tmp_path):
+    """v1.23.5: `--brain-wsl ""` must CLEAR an inherited BRAIN_WSL (re-pointing a replica from a
+    WSL-hosted brain to a native one), never inherit over it; same for --brain-backup-dir."""
+    home, env = _scratch_home(tmp_path)
+    (home / ".mem0" / "replica.env").write_text(
+        "BRAIN_SSH='brain'\nBRAIN_BACKUP_DIR='/srv/ams/mem0/backups'\nBRAIN_WSL='Ubuntu-X:tenant'\n", encoding="utf-8")
+    base = [BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--brain-ssh", "brain", "--user-id", "t", "--dry-run"]
+    r = subprocess.run(base + ["--brain-wsl", ""], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "--brain-wsl cleared (explicit empty value; not inherited)" in r.stdout
+    assert "--brain-wsl inherited" not in r.stdout
+    assert "WSL Ubuntu-X:tenant" not in r.stdout
+    assert "--brain-backup-dir inherited from ~/.mem0/replica.env: /srv/ams/mem0/backups" in r.stdout, "the other flag still inherits"
+    r = subprocess.run(base + ["--brain-backup-dir", ""], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "--brain-backup-dir cleared (explicit empty value; not inherited)" in r.stdout
+    assert "--brain-backup-dir inherited" not in r.stdout
