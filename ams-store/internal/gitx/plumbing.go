@@ -79,16 +79,27 @@ func EmptyTree(ctx context.Context, opt Options) (string, error) {
 // both stage the same thing, and a narrowing applied in one place only is a narrowing
 // that whichever code path ran last undoes.
 //
+// hold is the DEFERRED QUEUE: paths a merge resolved in history but deliberately did not
+// write to disk, because a session is live in that workspace. Every one of them is
+// excluded from the staging, and that exclusion is not cosmetic. History has already
+// moved past those paths; a blanket add re-adds the file whose deletion was withheld
+// (resurrecting a judge migration fleet-wide) and re-commits the session's older bytes
+// over the merged blob (reverting another PC's edit). The queue is drained by
+// merge.Engine.ApplyDeferred, and until it is, these paths belong to the merge and not to
+// the staging pass.
+//
 // An unmatched pathspec is NOT an error here. git add exits 128 with "did not match any
 // files" when a store holds no fact file at all - a workspace whose facts were all
 // migrated, or one created empty - and that is a store with nothing to stage, not a
 // failure. The message is checked rather than the code alone, so a genuine bad pathspec
 // still surfaces.
-func AddFactFiles(ctx context.Context, opt Options, storeRel, indexName string) error {
+func AddFactFiles(ctx context.Context, opt Options, storeRel, indexName string, hold []string) error {
 	o := opt
 	o.OkExit = OkExitCodes(0, 128)
-	res, err := Run(ctx, o, "add", "-A", "-f", "--",
-		":(glob)"+storeRel+"/*.md", ":(exclude)"+storeRel+"/"+indexName)
+	args := []string{"add", "-A", "-f", "--",
+		":(glob)" + storeRel + "/*.md", ":(exclude)" + storeRel + "/" + indexName}
+	args = append(args, ExcludePathspecs(hold)...)
+	res, err := Run(ctx, o, args...)
 	if err != nil {
 		return err
 	}
@@ -96,6 +107,21 @@ func AddFactFiles(ctx context.Context, opt Options, storeRel, indexName string) 
 		return nil
 	}
 	return fmt.Errorf("git add %s: exit %d: %s", storeRel, res.Code, strings.TrimSpace(res.Stderr))
+}
+
+// ExcludePathspecs turns paths into LITERAL exclude pathspecs.
+//
+// Literal, not glob: a fact file's name is a slug the model chose, and a bracket or a
+// star in one would otherwise silently widen or narrow what the exclusion covers.
+func ExcludePathspecs(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		out = append(out, ":(exclude,literal)"+p)
+	}
+	return out
 }
 
 // HashObject writes data as a blob and returns its id. data may be empty.

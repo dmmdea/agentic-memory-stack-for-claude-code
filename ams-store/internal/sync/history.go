@@ -30,11 +30,19 @@ const Branch = "main"
 type Repo struct {
 	GitDir   string
 	WorkTree string
+	// StateRoot is where the per-workspace deferred queues live. Staging consults them,
+	// so a Repo built without it would re-commit every change a live session is being
+	// protected from.
+	StateRoot string
 }
 
 // NewRepo builds a Repo from the resolved roots.
 func NewRepo(roots store.Roots) Repo {
-	return Repo{GitDir: roots.HistoryGitDir(), WorkTree: roots.ProjectsRoot}
+	return Repo{
+		GitDir:    roots.HistoryGitDir(),
+		WorkTree:  roots.ProjectsRoot,
+		StateRoot: roots.StateRoot,
+	}
 }
 
 func (r Repo) opts() gitx.Options {
@@ -148,12 +156,34 @@ func IndexRelPath(workspace string) string { return RelPath(workspace) + "/" + s
 // fact files may live in a store, because the store is globbed by agents on every PC that
 // receives it. The explicit :(exclude) then keeps the index itself out, since MEMORY.md
 // matches *.md and is DERIVED, never merged.
+//
+// Every path on the workspace's DEFERRED QUEUE is excluded: the merge committed those
+// changes to history and withheld them from disk because a session is live, so what is on
+// disk is deliberately older than what is committed. Staging it would resurrect a deleted
+// fact on every PC and revert another PC's edit. A queue that cannot be read stages
+// NOTHING - see LoadDeferred's fail-closed contract.
 func (r Repo) Stage(ctx context.Context, workspace string) error {
 	rel := RelPath(workspace)
-	if err := gitx.AddFactFiles(ctx, r.opts(), rel, store.IndexName); err != nil {
+	hold, err := r.deferredHold(workspace)
+	if err != nil {
+		return err
+	}
+	if err := gitx.AddFactFiles(ctx, r.opts(), rel, store.IndexName, hold); err != nil {
 		return fmt.Errorf("sync: stage %s: %w", rel, err)
 	}
 	return nil
+}
+
+// deferredHold is the workspace's pending merge result, which staging must not touch.
+func (r Repo) deferredHold(workspace string) ([]string, error) {
+	if r.StateRoot == "" {
+		return nil, nil
+	}
+	hold, err := merge.DeferredPaths(r.StateRoot, workspace)
+	if err != nil {
+		return nil, fmt.Errorf("sync: the deferred queue of %s cannot be read, so nothing of it may be staged: %w", workspace, err)
+	}
+	return hold, nil
 }
 
 // HasStagedChanges reports whether anything is staged for a workspace.

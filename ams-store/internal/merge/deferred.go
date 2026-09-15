@@ -49,6 +49,24 @@ func LoadDeferred(stateRoot, workspace string) (Deferred, error) {
 	return d, nil
 }
 
+// DeferredPaths is the queue as a pathspec-ready list: every path whose materialization
+// is still pending for a workspace.
+//
+// It is what the staging pass must EXCLUDE. The error is never swallowed into an empty
+// list by design - "I could not read the queue" and "nothing is queued" lead to opposite
+// actions, and collapsing them is how a withheld deletion gets re-committed.
+func DeferredPaths(stateRoot, workspace string) ([]string, error) {
+	d, err := LoadDeferred(stateRoot, workspace)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(d.Entries))
+	for _, e := range d.Entries {
+		out = append(out, e.Path)
+	}
+	return out, nil
+}
+
 // SaveDeferred writes the queue atomically.
 func SaveDeferred(stateRoot, workspace string, d Deferred) error {
 	p := DeferredPath(stateRoot, workspace)
