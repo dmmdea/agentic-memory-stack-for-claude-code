@@ -353,7 +353,7 @@ func TestNightly_HubOnceNightly(t *testing.T) {
 	}
 }
 
-// MemoryCompact.Tests.ps1:287 - the operator's explicit bypass. -Force is Daniel saying
+// MemoryCompact.Tests.ps1:287 - the operator's explicit bypass. --force is the operator saying
 // "judge it now"; it lifts the window and nothing else.
 func TestJudge_ForceBypassesWindow(t *testing.T) {
 	lines, facts := bigStore(60)

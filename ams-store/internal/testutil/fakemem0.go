@@ -28,6 +28,12 @@ const (
 	// the id belongs to a pre-existing record this run did not create, so it must be
 	// left alone even though the read-back failed.
 	Mem0DedupMismatch Mem0Mode = "dedup-mismatch"
+	// Mem0DedupOK reads back byte-identically AND reports the id as deduplicated: the
+	// migration verifies against a PRE-EXISTING record whose text happens to match -
+	// the same fact migrated on an earlier night, or an L1a extraction of it. The
+	// migration is legitimate, but the record is not this run's to remove, so an undo
+	// must leave it in place and say so.
+	Mem0DedupOK Mem0Mode = "dedup-ok"
 	// Mem0NotRetrievable stores the right text but reports it as unreachable.
 	Mem0NotRetrievable Mem0Mode = "not-retrievable"
 )
@@ -139,7 +145,7 @@ func (f *FakeMem0) handleCollection(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{
 		"results":      []map[string]string{{"id": id}},
-		"deduplicated": mode == Mem0DedupMismatch,
+		"deduplicated": mode == Mem0DedupMismatch || mode == Mem0DedupOK,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }

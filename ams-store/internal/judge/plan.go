@@ -1,5 +1,5 @@
 // Package judge applies a judge plan to a store under every apply-guard the PowerShell
-// compactor carries. It is HUB-ONLY: the Lenovo judges its own checkout of the hub,
+// compactor carries. It is HUB-ONLY: the Linux authority judges its own checkout of the hub,
 // never a live store, and a PC that tried to apply a plan would be a second judge on the
 // same store - the concurrency bug of v1 in another form.
 //

@@ -28,7 +28,7 @@ func ReadRole(stateRoot string) string {
 
 // RequireHub is the hub-only guard on judge-apply.
 //
-// The design gives exactly one judge, on the Lenovo, against its own checkout of the hub
+// The design gives exactly one judge, on the Linux authority, against its own checkout of the hub
 // - never a live store (DESIGN:261) - because "no local fallback judge: a second judge on
 // the same store was the concurrency bug in another form". Two PCs applying the same
 // nightly plan to their own copies would each migrate the same fact, each delete its own

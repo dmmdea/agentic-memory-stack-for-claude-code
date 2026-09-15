@@ -214,8 +214,8 @@ func TestLineFloor_MigratesOldestToTarget(t *testing.T) {
 	}
 	for i := 1; i <= 3; i++ {
 		slug := "rule" + itoa(i) + ".md"
-		lines = append(lines, entryLine("Rule "+itoa(i), slug, "Daniel: never do thing "+itoa(i)))
-		facts[slug] = factFile("rule"+itoa(i), "Daniel: never do thing "+itoa(i), "feedback", "the rule "+itoa(i))
+		lines = append(lines, entryLine("Rule "+itoa(i), slug, "Owner: never do thing "+itoa(i)))
+		facts[slug] = factFile("rule"+itoa(i), "Owner: never do thing "+itoa(i), "feedback", "the rule "+itoa(i))
 	}
 	f := newFixture(t, "tall", lines, facts, testutil.Mem0OK)
 	// fact1..fact40 are the oldest, ascending; everything else keeps its fresh mtime.
