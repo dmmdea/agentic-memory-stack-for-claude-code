@@ -97,9 +97,9 @@ func runGate(env Env, args []string) (code int) {
 	gate.Run(ctx, gate.Options{
 		Roots:     roots,
 		StopBelow: stopBelow,
-		// Floor is nil until the derive engine lands: with no floorer the gate advises
-		// and never mutates, which is a safe degradation rather than a broken one.
-		Floor: nil,
+		// The ONE floor in this binary (blueprint 12.1). A nil here leaves the gate an
+		// advisory printer: it says the index is over the limit and does nothing about it.
+		Floor: floorAdapter{},
 		TryLock: func() (func(), bool) {
 			l, err := lock.Acquire(lock.Options{Path: LockPath(roots.StateRoot), Reason: "gate", Now: now})
 			if err != nil {

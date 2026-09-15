@@ -71,18 +71,22 @@ func runSync(env Env, args []string) int {
 	}
 
 	opt := amsync.Options{
-		Roots:     roots,
-		MachineID: g.machineID,
-		Policy:    amsync.RemotePolicy{ExpectedHost: hubHost, AllowLocalPath: allowLocal},
-		Now:       now,
-		Timeout:   timeout,
-		// Deriver and Merger stay nil until those engines land. A nil Deriver skips the
-		// derive steps; a nil Merger makes a fetch that finds new commits an ERROR
-		// rather than silently pushing over the other side's work.
+		Roots:      roots,
+		MachineID:  g.machineID,
+		Policy:     amsync.RemotePolicy{ExpectedHost: hubHost, AllowLocalPath: allowLocal},
+		Now:        now,
+		Timeout:    timeout,
 		Workspaces: workspaces,
 		Version:    BuildInfo.Version,
 		Log:        g.logWriter(env),
 	}
+
+	// The engines (cli/seams.go). A nil Deriver silently skips every derive step and a
+	// nil Merger turns "the hub has new commits" into a refusal, so both are wired here
+	// and nowhere else.
+	logw := g.logWriter(env)
+	opt.Deriver = deriverAdapter{roots: roots, machineID: g.machineID, log: logw}
+	opt.Merger = mergerAdapter{roots: roots, machineID: g.machineID, log: logw}
 
 	if watch {
 		return runSyncWatch(env, g, opt)

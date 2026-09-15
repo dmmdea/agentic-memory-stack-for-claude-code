@@ -100,6 +100,13 @@ func runDerive(env Env, args []string) int {
 	}
 
 	commits := derive.NewHistoryCommitTimes(roots)
+	// The seams (cli/seams.go). Every one of these is an engine derive drives through a
+	// one-method interface, and a nil here is a silent degradation, not a failure: no
+	// lock means two derives on one PC race, no lookup means a re-created slug becomes a
+	// second corpus record, no committer means offline history is never kept.
+	dlock := deriveLock{path: LockPath(roots.StateRoot), now: now}
+	migrated := newMigratedLookup(roots)
+	committer := deriveCommitter{roots: roots, machineID: g.MachineID}
 	report := deriveReport{Verb: "derive", Stores: make([]*derive.Result, 0, len(stores))}
 	exit := ExitOK
 
@@ -112,10 +119,10 @@ func runDerive(env Env, args []string) int {
 			StopBelowBytes: stopBelow,
 			Now:            now,
 			Commits:        commits,
-			// The per-PC lock lands with sync (blueprint 5.5); until then derive runs
-			// unlocked and the exit-code mapping below is already correct for the day it
-			// is wired, rather than being invented then.
-			Log: env.Stderr,
+			Lock:           dlock,
+			Migrated:       migrated,
+			Committer:      committer,
+			Log:            env.Stderr,
 		})
 		if res != nil {
 			report.Stores = append(report.Stores, res)

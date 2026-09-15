@@ -32,11 +32,9 @@ func TestCLI_CrossPlatformIdenticalOutput(t *testing.T) { t.Skip("ported in task
 // materialization instead of gating maintenance) is ported in internal/merge as
 // TestMaterialize_LiveSessionDeferred_NoIndexChange. Task 4.
 
-
 // --------------------------------------------------------------------------------
 // MemoryCompactRobustness.Tests.ps1
 // --------------------------------------------------------------------------------
-
 
 // --------------------------------------------------------------------------------
 // MemoryIndexWriteGate.Tests.ps1 - the production hook runtime changes from

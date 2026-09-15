@@ -178,3 +178,11 @@ func TestCLI_ExitCodeContract(t *testing.T) {
 		}
 	}
 }
+
+// runStdin is run with a hook payload on stdin, for the gate.
+func runStdin(t *testing.T, stdin string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	code = cli.RunWith(cli.Env{Stdout: &out, Stderr: &errb, Stdin: strings.NewReader(stdin)}, args)
+	return code, out.String(), errb.String()
+}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/judge"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -163,6 +164,23 @@ func runJudgeApply(env Env, args []string) int {
 		fmt.Fprintf(env.Stderr, "ams-store judge-apply: the plan names no decisions for %q; running the deterministic work only\n", workspace)
 	}
 
+	// Decision Q9: judge-apply takes the SAME per-PC lock every other writer takes, plus
+	// the legacy compactor mutex, for as long as both exist. The hub runs this from a
+	// timer while the same checkout may be syncing; without the lock a nightly apply and
+	// a merge materialize can be inside one store at the same moment.
+	l, lockErr := lock.Acquire(lock.Options{Path: LockPath(roots.StateRoot), Reason: "judge-apply", Now: now})
+	if lockErr != nil {
+		if isHeld(lockErr) {
+			fmt.Fprintln(env.Stderr, "ams-store judge-apply: the per-PC lock is held; skipping")
+			return ExitLocked
+		}
+		fmt.Fprintf(env.Stderr, "ams-store judge-apply: %v\n", lockErr)
+		return ExitRefused
+	}
+	defer func() { _ = l.Release() }()
+
+	st := storeAt(storeDir)
+	st.Workspace = workspace
 	opt := judge.Options{
 		Roots:         roots,
 		Dir:           storeDir,
@@ -174,6 +192,12 @@ func runJudgeApply(env Env, args []string) int {
 		Now:           now,
 		Mem0:          mem0Client(env, f),
 		History:       judge.HistoryRepo{GitDir: roots.HistoryGitDir(), WorkTree: roots.ProjectsRoot},
+		// The judge's projected-index guard asserts the index STRICTLY shrinks, so it has
+		// to measure the bytes derive will write - the derived order, doctrine first, with
+		// the injection stop - not a verbatim re-render. Left unwired, the guard passes a
+		// run that grows the file derive then produces, and the index the judge leaves
+		// behind is a whole-file diff away from the next derive's output.
+		RenderIndex: judgeRenderIndex(roots, storeDir, now),
 	}
 	if f.verbose {
 		opt.Log = env.Stderr
