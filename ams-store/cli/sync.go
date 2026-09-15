@@ -101,7 +101,7 @@ func runSync(env Env, args []string) int {
 // runSyncOnce takes the per-PC lock for the whole pass. sync.Once deliberately does NOT
 // take it: the lock covers derive AND sync together, and the verb is what owns both.
 func runSyncOnce(env Env, g globalOpts, opt amsync.Options) int {
-	l, err := lock.Acquire(lock.Options{Path: LockPath(opt.Roots.StateRoot), Reason: "sync", Now: opt.Now})
+	l, err := lock.Acquire(lockOptions(LockPath(opt.Roots.StateRoot), "sync", opt.Now))
 	if err != nil {
 		if errors.Is(err, lock.ErrHeld) {
 			if h, rErr := lock.ReadHolder(LockPath(opt.Roots.StateRoot)); rErr == nil && h != nil {

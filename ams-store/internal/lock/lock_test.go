@@ -26,28 +26,83 @@ func isolate(t *testing.T, o Options) Options {
 // The Pester original holds the mutex from the test process and asserts the compactor
 // wrote no receipt. The Go form asserts the primitive directly AND that it does not
 // wait: a lock that queues is a lock that hands the work to a live session.
+//
+// The contender is driven through the LOCK FILE, not through a second Acquire in this
+// process. On Windows a same-process second Acquire is refused by the named mutex at the
+// top of Acquire and never reaches the holder-liveness branch at all, so the whole
+// file-lock half of the rule had no coverage on the one OS the fleet's PCs run - the
+// mutation "never see a holder as live" survived there while it went red off Windows.
+// A seeded file naming a genuinely live holder (this process: a real pid with its real
+// start time, which is the only holder a test can prove is alive) reaches that branch on
+// every OS.
 func TestLock_ContenderSkipsImmediately(t *testing.T) {
 	opt := isolate(t, Options{Reason: "derive"})
 
-	held, err := Acquire(opt)
-	if err != nil {
-		t.Fatalf("first Acquire: %v", err)
+	// The holder is live on two counts, and both matter: the pid is running with the
+	// recorded start time, and the lock is far younger than StaleAfter. A dead-pid or an
+	// aged fixture would be broken and taken by design, and the test would pass with the
+	// liveness check deleted.
+	held := Holder{
+		PID:           os.Getpid(),
+		StartTimeUnix: SelfStartTimeUnix(),
+		Host:          "test",
+		AcquiredAt:    time.Now().UTC(),
+		Reason:        "sync",
 	}
-	defer held.Release()
+	writeHolder(t, opt.Path, held)
+	before, err := os.ReadFile(opt.Path)
+	if err != nil {
+		t.Fatalf("read the seeded lock: %v", err)
+	}
 
 	start := time.Now()
 	second, err := Acquire(opt)
 	elapsed := time.Since(start)
 	if err != ErrHeld {
+		if second != nil {
+			_ = second.Release()
+		}
 		t.Fatalf("contender got err=%v, want ErrHeld", err)
 	}
 	if second != nil {
-		t.Fatal("contender got a lock while the first was held")
+		t.Fatal("contender got a lock while a live holder held it")
+	}
+	// Refused is not enough: a contender that removed the file and then failed to take
+	// it would have destroyed the holder's lock on its way past.
+	after, err := os.ReadFile(opt.Path)
+	if err != nil {
+		t.Fatalf("the live holder's lock file is gone after a refused Acquire: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("the contender rewrote a live holder's lock file: before %s, after %s", before, after)
 	}
 	// The budget is generous on purpose: what must fail here is a retry LOOP, not a
 	// slow filesystem. A blocking implementation with any backoff at all overshoots it.
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("the contender waited %v; it must skip immediately", elapsed)
+	}
+
+	// The same-desktop path, which is what actually refuses a second ams-store on
+	// Windows: with the lock genuinely held by this process, the named mutex is the
+	// first gate and it is just as immediate.
+	if err := os.Remove(opt.Path); err != nil {
+		t.Fatal(err)
+	}
+	mine, err := Acquire(opt)
+	if err != nil {
+		t.Fatalf("Acquire on a free lock: %v", err)
+	}
+	defer mine.Release()
+	start = time.Now()
+	third, err := Acquire(opt)
+	if err != ErrHeld {
+		if third != nil {
+			_ = third.Release()
+		}
+		t.Fatalf("second in-process Acquire got err=%v, want ErrHeld", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("the second in-process contender waited %v; it must skip immediately", d)
 	}
 }
 

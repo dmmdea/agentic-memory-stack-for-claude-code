@@ -2,10 +2,14 @@ package porting
 
 import (
 	"bufio"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -148,6 +152,21 @@ func TestPorting_EveryPesterScenarioHasANamedGoCounterpart(t *testing.T) {
 // "ported in task N". A placeholder satisfies the counterpart gate above - `go test -list`
 // reports it, because a skipped test is still a test - so the parity claim would pass over
 // a suite that asserts nothing. This is the check that makes the other one mean something.
+//
+// It matches the FILE, not the line. A line-by-line search was the obvious form and it
+// had a hole wide enough to walk through: gofmt is perfectly happy with
+//
+//	t.Skip(
+//	    "<mark> 5: reserved counterpart name, the real assertions land later")
+//
+// and that splits `t.Skip(` from its reason so neither substring ever co-occurs on one
+// line. Measured against the branch this was written on: the wrapped form was gofmt-clean
+// and both porting gates PASSED. Any reason string long enough for gofmt to wrap - which
+// is one sentence - would have done it, and the next placeholder only has to be a
+// sentence longer than the last.
+//
+// The parse also catches what no text search can: a mark split across concatenated
+// literals, which is exactly how this file writes its own needle.
 func TestPorting_NoPlaceholderSkipsRemain(t *testing.T) {
 	root := moduleRoot(t)
 	var offenders []string
@@ -164,20 +183,33 @@ func TestPorting_NoPlaceholderSkipsRemain(t *testing.T) {
 		if !strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		b, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if parseErr != nil {
+			// A test file that does not parse is not a pass. Reporting it is the whole
+			// point: a checker that skipped what it could not read would be silenced by
+			// the one file worth reading.
+			return parseErr
 		}
-		for i, line := range strings.Split(string(b), "\n") {
-			// The match is the SKIP CALL, not the prose. The needle is assembled from
-			// pieces because a checker that spells its own needle matches itself, and the
-			// obvious fix - skipping this file by name - is a loophole the next
-			// placeholder could be written through.
-			if strings.Contains(line, "t.Skip") && strings.Contains(line, placeholderMark) {
-				rel, _ := filepath.Rel(root, path)
-				offenders = append(offenders, rel+":"+itoa(i+1))
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
 			}
-		}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !isSkipName(sel.Sel.Name) {
+				return true
+			}
+			for _, arg := range call.Args {
+				if lit, ok := stringConst(arg); ok && strings.Contains(lit, placeholderMark) {
+					rel, _ := filepath.Rel(root, path)
+					pos := fset.Position(call.Pos())
+					offenders = append(offenders, rel+":"+itoa(pos.Line))
+					return true
+				}
+			}
+			return true
+		})
 		return nil
 	})
 	if err != nil {
@@ -188,6 +220,45 @@ func TestPorting_NoPlaceholderSkipsRemain(t *testing.T) {
 			"Every one of them is a reserved counterpart name that reports as a test and"+
 			" asserts nothing.", len(offenders), offenders)
 	}
+}
+
+// isSkipName reports whether a selector names one of testing's skip calls. SkipNow takes
+// no arguments and so can never carry a mark; it is listed anyway because the set is the
+// rule ("a test that deactivates itself"), and a set that omits a member because today's
+// signature makes it harmless is a set that is wrong the day the signature changes.
+func isSkipName(name string) bool {
+	return name == "Skip" || name == "Skipf" || name == "SkipNow"
+}
+
+// stringConst folds an expression that is a string constant: a literal, or any tree of
+// literals joined by +. Anything else - a variable, a call, a format verb's value - is
+// not something this check can read, and it says so by returning false rather than
+// guessing.
+func stringConst(e ast.Expr) (string, bool) {
+	switch x := e.(type) {
+	case *ast.BasicLit:
+		if x.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(x.Value)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	case *ast.ParenExpr:
+		return stringConst(x.X)
+	case *ast.BinaryExpr:
+		if x.Op != token.ADD {
+			return "", false
+		}
+		l, lok := stringConst(x.X)
+		r, rok := stringConst(x.Y)
+		if !lok || !rok {
+			return "", false
+		}
+		return l + r, true
+	}
+	return "", false
 }
 
 // goTestNames is every top-level test in the module, from `go test -list`.
