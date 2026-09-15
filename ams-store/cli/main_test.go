@@ -1,56 +1,18 @@
 package cli_test
 
 import (
-	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
 )
 
 // TestMain pins every home-directory source at a throwaway directory before a single
-// test runs.
-//
-// This is not belt-and-braces. On 2026-09-15 the scaffold's stub-verb test invoked every
-// verb with no --state-root, and the moment `sync` stopped being a stub it resolved the
-// REAL profile, opened the operator's live history repo and committed 5 live stores into
-// it. A test that forgets its roots must land in a temp directory, not in production, and
-// the only way to guarantee that for code whose whole job is to find the user's home is
-// to move the home.
-//
-// store.HomeDir reads USERPROFILE on Windows and falls back to os.UserHomeDir, which
-// reads HOME on unix. Both are pinned, on both platforms, because the fallback order is
-// an implementation detail that is allowed to change.
-func TestMain(m *testing.M) {
-	sandbox, err := os.MkdirTemp("", "ams-cli-home-")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cli tests: cannot create the home sandbox: %v\n", err)
-		os.Exit(1)
-	}
-	for _, key := range []string{"USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH"} {
-		os.Unsetenv(key)
-	}
-	// USERPROFILE and HOME both point at the sandbox; HOMEDRIVE/HOMEPATH are cleared so
-	// no Windows fallback can reconstruct the real profile behind our back.
-	if err := os.Setenv("USERPROFILE", sandbox); err != nil {
-		fmt.Fprintf(os.Stderr, "cli tests: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.Setenv("HOME", sandbox); err != nil {
-		fmt.Fprintf(os.Stderr, "cli tests: %v\n", err)
-		os.Exit(1)
-	}
-	for _, sub := range []string{
-		filepath.Join(".claude", "projects"),
-		filepath.Join(".claude", "state", "automemory"),
-	} {
-		_ = os.MkdirAll(filepath.Join(sandbox, sub), 0o755)
-	}
-
-	code := m.Run()
-	_ = os.RemoveAll(sandbox)
-	os.Exit(code)
-}
+// test runs. The reasoning, and the two live incidents behind it, are in
+// testutil.RunWithSandboxHome - one implementation, so a package that adds a TestMain
+// later cannot get a weaker version of it.
+func TestMain(m *testing.M) { os.Exit(testutil.RunWithSandboxHome(m)) }
 
 // sleeperEnv makes a re-executed test binary block instead of running the suite, which is
 // how these tests get a REAL live process id that is not their own.
