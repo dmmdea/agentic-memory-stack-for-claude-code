@@ -168,7 +168,7 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 		return nil, err
 	}
 
-	paths := append([]string(nil), mt.Conflicted...)
+	paths := auditPaths(trees, baseTree, oursTree, theirsTree, mt)
 	// The shared state stamp is reduced with MIN whatever git made of it: git's own
 	// three-way would happily take "the side that changed it", which is not the same
 	// answer as "the earliest crossing".

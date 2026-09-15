@@ -21,8 +21,12 @@ package porting
 // file or the mutation is refused - a substitution that silently hit the wrong occurrence
 // would report a green rule that was never mutated.
 type Hunk struct {
-	Old string
-	New string
+	// File overrides the Mutation's File for this hunk. It is set only when a rule is
+	// defended in more than one place, and mutating one of them would leave the other
+	// still holding the line.
+	File string
+	Old  string
+	New  string
 }
 
 // Mutation is one rule, its mutation, and the test that must go red.
@@ -33,10 +37,11 @@ type Mutation struct {
 	Rule string
 	// Task is the plan task that owns the code this mutation edits.
 	Task int
-	// File is relative to the ams-store module root.
+	// File is relative to the ams-store module root, and is the default for every hunk.
 	File string
 	// Hunks is the change. A one-line rule is one hunk; a rule whose mutation MOVES a
-	// call (the materialize ordering) needs two.
+	// call (the materialize ordering) needs two; a rule with two independent guards
+	// mutates both, because either one alone would still hold.
 	Hunks []Hunk
 	// Test is the exact Go test name that must fail.
 	Test string
@@ -85,13 +90,20 @@ var Mutations = []Mutation{
 		}},
 	},
 	{
-		ID: "renames-off", Rule: "rename detection is off in the history repo", Task: 4,
-		File: "internal/merge/engine.go", Test: "TestMerge_RenamesOff_MigrationNotPairedWithNewFile", Package: "./internal/merge",
-		Why: "with renames on, a judge deletion and an unrelated new fact file are silently paired and the deletion is lost.",
-		Hunks: []Hunk{{
-			Old: "\t\t{\"merge.renames\", \"false\"},\n",
-			New: "\t\t{\"merge.renames\", \"true\"},\n",
-		}},
+		ID: "renames-off", Rule: "rename detection never decides whether a path exists", Task: 4,
+		File: "internal/merge/audit.go", Test: "TestMerge_RenamesOff_MigrationNotPairedWithNewFile", Package: "./internal/merge",
+		Why: "with renames deciding presence, a judge's rework of a fact is folded into whatever new slug a PC re-homed it to and the old path vanishes with no conflict and no report. BOTH guards are mutated together because the config alone is not portable: measured while building this, git 2.55 honours merge.renames=false for merge-tree and git 2.43 honours nothing at all, so the audit is the guard that holds on every PC and the config only shortens its work.",
+		Hunks: []Hunk{
+			{
+				File: "internal/merge/engine.go",
+				Old:  "\t\t{\"merge.renames\", \"false\"},\n",
+				New:  "\t\t{\"merge.renames\", \"true\"},\n",
+			},
+			{
+				Old: "\tconflicted := make(map[string]bool, len(mt.Conflicted))\n",
+				New: "\treturn append([]string(nil), mt.Conflicted...)\n\tconflicted := make(map[string]bool, len(mt.Conflicted))\n",
+			},
+		},
 	},
 	{
 		ID: "hook-field-rule", Rule: "hook: takes the judge's value unless the local side changed hook: itself", Task: 4,

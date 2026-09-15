@@ -83,16 +83,40 @@ func find(id string) (porting.Mutation, error) {
 	return porting.Mutation{}, fmt.Errorf("no mutation with id %q", id)
 }
 
-// files prints the distinct files a mutation touches. Today every mutation is confined to
-// one file, but the driver asks rather than assumes, so a future multi-file rule does not
-// leave half a mutation in the tree.
+// hunkFiles lists the distinct files a mutation touches, in the order its hunks name
+// them. A rule defended in two places mutates both, so the driver has to restore both.
+func hunkFiles(m porting.Mutation) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(f string) {
+		if f != "" && !seen[f] {
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
+	if len(m.Hunks) == 0 {
+		add(m.File)
+	}
+	for _, h := range m.Hunks {
+		if h.File != "" {
+			add(h.File)
+			continue
+		}
+		add(m.File)
+	}
+	return out
+}
+
+// files prints what the driver must restore afterwards. It asks rather than assumes,
+// because a mutation that touches two files and is restored in one leaves the other in
+// the tree and poisons every result after it.
 func files(id string) error {
 	m, err := find(id)
 	if err != nil {
 		return err
 	}
-	if m.File != "" {
-		fmt.Println(m.File)
+	for _, f := range hunkFiles(m) {
+		fmt.Println(f)
 	}
 	return nil
 }
@@ -105,25 +129,40 @@ func apply(id string) error {
 	if m.Pending() {
 		return fmt.Errorf("mutation %q is pending: its target is not built yet", id)
 	}
-	p := filepath.FromSlash(m.File)
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", m.File, err)
+	// Every hunk is checked and staged in memory before a single byte is written, so a
+	// mutation with one stale hunk never leaves half of itself on disk.
+	edited := map[string]string{}
+	read := func(f string) (string, error) {
+		if text, ok := edited[f]; ok {
+			return text, nil
+		}
+		raw, err := os.ReadFile(filepath.FromSlash(f))
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", f, err)
+		}
+		edited[f] = string(raw)
+		return edited[f], nil
 	}
-	text := string(raw)
 	for i, h := range m.Hunks {
+		f := h.File
+		if f == "" {
+			f = m.File
+		}
+		text, err := read(f)
+		if err != nil {
+			return err
+		}
 		n := strings.Count(text, h.Old)
 		if n != 1 {
 			return fmt.Errorf("hunk %d of %s: its Old text occurs %d times in %s, want exactly 1 - the table is stale",
-				i+1, id, n, m.File)
+				i+1, id, n, f)
 		}
-		text = strings.Replace(text, h.Old, h.New, 1)
+		edited[f] = strings.Replace(text, h.Old, h.New, 1)
 	}
-	if text == string(raw) {
-		return fmt.Errorf("mutation %s changed nothing in %s", id, m.File)
-	}
-	if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", m.File, err)
+	for f, text := range edited {
+		if err := os.WriteFile(filepath.FromSlash(f), []byte(text), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", f, err)
+		}
 	}
 	return nil
 }

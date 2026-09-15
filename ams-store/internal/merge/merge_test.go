@@ -66,11 +66,25 @@ func TestMerge_ThreeWriters_AllChangesRetained(t *testing.T) {
 // TestMerge_DeleteOnA_UntouchedOnB_Absent is the deletion table's first row: deleted on
 // one side, untouched on the other, means deleted - not resurrected, which is what the
 // union rule this replaces did to every deliberate deletion forever.
+//
+// It covers the row TWICE on purpose, because only the second form reaches our code.
+// When B genuinely has not touched the file, git resolves the deletion itself and the
+// path never appears in merge-tree's conflicted list - so a version of this test that
+// only did that would pass with the whole deletion table deleted. The row that lands on
+// `resolvePath` is the one where B's copy DIFFERS but only in an advisory line: that is
+// a modify/delete conflict as far as git is concerned, and it is our table, reading the
+// difference as "not a modification", that has to decide it.
+//
+// The advisory-line case is not a contrivance. It is what every PC does every day: derive
+// harvests the index's hook back into the fact file, so a store nobody edited still has
+// `hook:` churn waiting for the next sync.
 func TestMerge_DeleteOnA_UntouchedOnB_Absent(t *testing.T) {
 	f := newFleet(t, "a", "b")
 	a, b := f.pcs["a"], f.pcs["b"]
 
+	harvested := fact("Harvested", "hook churn only", "the hook as A wrote it", "harvested body\n")
 	a.write(ws, "doomed.md", fact("Doomed", "to be deleted", "doomed hook", "doomed body\n"))
+	a.write(ws, "harvested.md", harvested)
 	a.write(ws, "keep.md", fact("Keep", "kept", "keep hook", "keep body\n"))
 	a.syncOnce("seed", a.mo(), ws)
 
@@ -78,20 +92,26 @@ func TestMerge_DeleteOnA_UntouchedOnB_Absent(t *testing.T) {
 	if err := b.eng.Adopt(context.Background(), "refs/remotes/"+hubRemote+"/main", b.mo()); err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
-	if !b.exists(ws, "doomed.md") {
+	if !b.exists(ws, "doomed.md") || !b.exists(ws, "harvested.md") {
 		t.Fatal("B did not receive the seed")
 	}
 
-	// A deletes. B touches nothing.
+	// A deletes both. B touches doomed.md not at all, and rewrites ONLY harvested.md's
+	// hook line - a derive harvest, not an edit.
 	a.tick(time.Minute)
 	a.remove(ws, "doomed.md")
+	a.remove(ws, "harvested.md")
 	a.syncOnce("a deletes", a.mo(), ws)
 
 	b.tick(2 * time.Minute)
+	b.write(ws, "harvested.md", withHook(harvested, "the hook as B harvested it"))
 	rep := b.syncOnce("b syncs", b.mo(), ws)
 
 	if b.exists(ws, "doomed.md") {
 		t.Fatal("a deletion on A with no change on B must leave the file ABSENT on B; it was resurrected")
+	}
+	if text, ok := b.read(ws, "harvested.md"); ok {
+		t.Fatalf("a hook-only difference is not a modification: the deletion must still win, got %q", text)
 	}
 	if !b.exists(ws, "keep.md") {
 		t.Fatal("the untouched file was lost")
@@ -103,10 +123,18 @@ func TestMerge_DeleteOnA_UntouchedOnB_Absent(t *testing.T) {
 	// And it must stay deleted on A after B's push comes back.
 	a.tick(3 * time.Minute)
 	a.syncOnce("a syncs", a.mo(), ws)
-	if a.exists(ws, "doomed.md") {
+	if a.exists(ws, "doomed.md") || a.exists(ws, "harvested.md") {
 		t.Fatal("the deletion came back to A on the next round trip")
 	}
 }
+
+// withHook rewrites a fact file's `hook:` line and nothing else, which is exactly the
+// shape of the churn derive's harvest step leaves behind.
+func withHook(file, hook string) string {
+	return reHookLine.ReplaceAllString(file, "hook: \""+hook+"\"\n")
+}
+
+var reHookLine = regexp.MustCompile(`(?m)^hook:.*\n`)
 
 // TestMerge_ModifyOnA_DeleteOnB_Resurrected is the deletion table's modify/delete row: a
 // local edit since the merge base keeps the file, and the keep is REPORTED.
@@ -316,12 +344,25 @@ func TestMerge_BodyConflict_EqualCommitTime_MachineIDTiebreak(t *testing.T) {
 // TestMerge_CRLFOnlyDifference_Identical: git reports a content conflict for a
 // CRLF-versus-LF pair (measured), so the engine normalizes before it compares. A side
 // whose only difference is line endings has not modified the file.
+//
+// Two files carry the claim, because the normalization has two jobs and only one of them
+// is visible in the merged bytes:
+//
+//   - e.md is the WRITE side: whatever arrives, what lands on disk is LF, so a CRLF
+//     rewrite and a real edit merge without a conflict and without churn.
+//   - crlfdel.md is the COMPARE side, the half that would otherwise go untested. Ten live
+//     fact files are CRLF today. When one of them meets a deliberate deletion, the
+//     deletion table asks whether the CRLF side counts as a modification - and if the
+//     comparison is byte-exact, every one of those ten resurrects a fact the judge
+//     migrated away, on the first sync after this ships.
 func TestMerge_CRLFOnlyDifference_Identical(t *testing.T) {
 	f := newFleet(t, "a", "b")
 	a, b := f.pcs["a"], f.pcs["b"]
 
 	lf := fact("E", "desc", "hook", longBody("STABLE"))
+	doomedLF := fact("Doomed", "desc", "hook", longBody("DOOMED"))
 	a.write(ws, "e.md", lf)
+	a.write(ws, "crlfdel.md", doomedLF)
 	a.syncOnce("seed", a.mo(), ws)
 	b.fetch()
 	if err := b.eng.Adopt(context.Background(), "refs/remotes/"+hubRemote+"/main", b.mo()); err != nil {
@@ -331,12 +372,14 @@ func TestMerge_CRLFOnlyDifference_Identical(t *testing.T) {
 	// A rewrites the same text with CRLF and nothing else.
 	a.tick(time.Minute)
 	a.write(ws, "e.md", strings.ReplaceAll(lf, "\n", "\r\n"))
+	a.write(ws, "crlfdel.md", strings.ReplaceAll(doomedLF, "\n", "\r\n"))
 	a.syncOnce("a rewrites with CRLF", a.mo(), ws)
 
-	// B makes a real body edit.
+	// B makes a real body edit to one file and deletes the other.
 	b.tick(2 * time.Minute)
 	b.write(ws, "e.md", fact("E", "desc", "hook", longBody("B-EDIT")))
-	rep := b.syncOnce("b edits", b.mo(), ws)
+	b.remove(ws, "crlfdel.md")
+	rep := b.syncOnce("b edits one and deletes the other", b.mo(), ws)
 
 	text, ok := b.read(ws, "e.md")
 	if !ok {
@@ -350,6 +393,12 @@ func TestMerge_CRLFOnlyDifference_Identical(t *testing.T) {
 	}
 	if strings.Contains(text, "\r\n") {
 		t.Fatalf("the merge engine writes LF, got CRLF in %q", text)
+	}
+	if got, ok := b.read(ws, "crlfdel.md"); ok {
+		t.Fatalf("A's CRLF rewrite is not a modification, so B's deletion stands; the file came back as %q", got)
+	}
+	if len(rep.Resurrected) != 0 {
+		t.Fatalf("a CRLF-only difference must not resurrect a deleted file: %v", rep.Resurrected)
 	}
 }
 
@@ -429,9 +478,25 @@ func TestMerge_NoConflictMarkersOrOrigFilesInStore(t *testing.T) {
 	}
 }
 
-// TestMerge_RenamesOff_MigrationNotPairedWithNewFile: with rename detection ON, git pairs
-// a local rename with the judge's deletion and the deletion is lost behind a
-// rename/delete conflict. Renames are off so the two stay unrelated.
+// TestMerge_RenamesOff_MigrationNotPairedWithNewFile: a PC re-homing a fact under a new
+// slug must not let git's similarity heuristic decide what happens to the old one.
+//
+// Both branches of this fixture were measured against two installed gits before it was
+// written. Let rename detection run and ort reads A's remove+add as a rename
+// old.md -> new.md, carries B's rework onto new.md, and drops old.md from the merged tree
+// with NO conflicted path at all: the deletion table is never consulted, nothing is
+// reported, and the judge's version of old.md is simply gone. That is DESIGN's "a
+// migration is silently paired with a new file and the deletion is lost", exactly.
+//
+// This test runs green on git 2.55, where `merge.renames=false` is honoured, AND on git
+// 2.43, where nothing turns rename detection off at all - because the guard that decides
+// it is not the config. It is the audit in audit.go, which rules on every path the two
+// sides disagree about rather than only the ones merge-tree calls conflicted. A rule that
+// held on one PC's git and not another's would not be a rule.
+//
+// So old.md comes back as an ordinary modify/delete, the table keeps the modified side,
+// and the keep is REPORTED. The report is the point: a fact two PCs disagreed about must
+// never disappear quietly.
 func TestMerge_RenamesOff_MigrationNotPairedWithNewFile(t *testing.T) {
 	f := newFleet(t, "a", "b")
 	a, b := f.pcs["a"], f.pcs["b"]
@@ -445,28 +510,41 @@ func TestMerge_RenamesOff_MigrationNotPairedWithNewFile(t *testing.T) {
 		t.Fatalf("adopt: %v", err)
 	}
 
-	// The judge (B) migrates old.md away.
+	// B (the hub-side judge) reworks old.md in place.
 	b.tick(time.Minute)
-	b.remove(ws, "old.md")
-	b.syncOnce("judge migrates old.md", b.mo(), ws)
+	b.write(ws, "old.md", fact("Old", "d", "h", longBody("JUDGE-REWORKED")))
+	b.syncOnce("judge reworks old.md", b.mo(), ws)
 
-	// A locally re-homed the same content under a new slug.
+	// A, meanwhile, re-homes the same content under a new slug: a remove plus an add,
+	// which is a rename to any similarity heuristic.
 	a.tick(2 * time.Minute)
 	a.remove(ws, "old.md")
 	a.write(ws, "new.md", fact("New", "d", "h", body))
 	rep := a.syncOnce("a re-homes", a.mo(), ws)
 
-	if a.exists(ws, "old.md") {
-		t.Fatal("the judge's migration was lost: old.md came back")
+	got, ok := a.read(ws, "old.md")
+	if !ok {
+		t.Fatal("old.md was paired with new.md and vanished: with renames on the judge's rework is never even offered to the deletion table")
 	}
-	if !a.exists(ws, "new.md") {
+	if !strings.Contains(got, "JUDGE-REWORKED") {
+		t.Fatalf("the surviving old.md must be the judge's reworked version, got %q", got)
+	}
+	newText, ok := a.read(ws, "new.md")
+	if !ok {
 		t.Fatal("the local new file was lost")
 	}
-	if len(rep.Resurrected) != 0 {
-		t.Fatalf("with renames off nothing is paired, so nothing is resurrected: %v", rep.Resurrected)
+	if strings.Contains(newText, "JUDGE-REWORKED") {
+		t.Fatalf("the judge's edit was carried onto the new slug, which is the pairing renames are off to prevent: %q", newText)
+	}
+	if !a.exists(ws, "keep.md") {
+		t.Fatal("the untouched file was lost")
+	}
+	want := ws + "/memory/old.md"
+	if !contains(rep.Resurrected, want) {
+		t.Fatalf("the keep must be reported as resurrected, got %v", rep.Resurrected)
 	}
 	if len(rep.Conflicts) != 0 {
-		t.Fatalf("with renames off there is no rename/delete conflict: %+v", rep.Conflicts)
+		t.Fatalf("a modify/delete is decided by the table, not by a body merge: %+v", rep.Conflicts)
 	}
 }
 

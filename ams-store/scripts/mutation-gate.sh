@@ -7,18 +7,27 @@
 #
 # For each mutation in internal/porting/mutations.go it:
 #
-#   1. applies the mutation to the work tree   (scripts/mutationgate apply <id>)
-#   2. BUILDS the module - a mutation that does not compile is NOT a red test, it is a
+#   1. copies the target file aside (the pre-image)
+#   2. applies the mutation                    (scripts/mutationgate apply <id>)
+#   3. BUILDS the module - a mutation that does not compile is NOT a red test, it is a
 #      broken mutation, and reporting it as red is exactly the lie this gate exists to
 #      catch
-#   3. runs the named test alone and requires it to FAIL
-#   4. restores the file from git
+#   4. runs the named test alone and requires it to FAIL
+#   5. restores the file with `git checkout --` and VERIFIES the bytes came back
 #
 # A mutation whose test stays green is a rule nothing tests: the assertion was written
 # against a seam, or against a value the mutated code happens to produce anyway.
 #
 # Before any of that it runs each named test UNMUTATED and requires it to PASS, because a
 # test that was already failing would report every mutation red for the wrong reason.
+#
+# Step 5 verifies rather than trusts because the first run of this gate did not. Under WSL
+# a Windows `git worktree` checkout carries a `.git` FILE holding a `D:\...` gitdir path,
+# which Linux git cannot follow: every `git checkout --` failed silently, every mutation
+# stayed in the tree, and the run stacked fifteen mutations on top of each other and
+# reported four rules SURVIVED that had never been tested in isolation. A restore that can
+# fail quietly is worse than no restore. Now git is still the restore - and the pre-image
+# is the proof it worked, with a byte compare after every single one.
 #
 # This is a LOCAL gate, never a CI job: it is N+1 times the suite.
 #
@@ -28,7 +37,7 @@
 #   scripts/mutation-gate.sh --task 4        only the mutations owned by plan task 4
 #   scripts/mutation-gate.sh --no-baseline   skip the unmutated pre-check (faster, weaker)
 #
-# Runs from anywhere; it locates the module itself. Needs bash, git and go on PATH.
+# Runs from anywhere; it locates the module itself. Needs bash and go on PATH.
 
 set -u -o pipefail
 
@@ -45,37 +54,85 @@ while [ $# -gt 0 ]; do
     --only) ONLY+=("${2:?--only needs a mutation id}"); shift 2 ;;
     --task) TASK="${2:?--task needs a task number}"; shift 2 ;;
     --no-baseline) BASELINE=0; shift ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "mutation-gate: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 
-command -v go  >/dev/null 2>&1 || { echo "mutation-gate: go is not on PATH" >&2; exit 2; }
-command -v git >/dev/null 2>&1 || { echo "mutation-gate: git is not on PATH" >&2; exit 2; }
+command -v go >/dev/null 2>&1 || { echo "mutation-gate: go is not on PATH" >&2; exit 2; }
 
-# The gate restores mutated files with git, so it refuses to start on a dirty tree: it
-# must never be the thing that discarded uncommitted work.
-DIRTY="$(git -C "$MODULE_ROOT" status --porcelain -- . | grep -v '^?? ' || true)"
-if [ -n "$DIRTY" ]; then
-  echo "mutation-gate: the ams-store work tree has uncommitted changes." >&2
-  echo "This gate restores every file it mutates from git, so it refuses to run" >&2
-  echo "while there is work here it could destroy. Commit or stash first." >&2
-  echo "$DIRTY" >&2
-  exit 2
+# Is git usable on THIS tree from THIS shell? A Windows worktree read from WSL is the case
+# that is not, and the gate has to know before it starts, not after it has mutated a file.
+GIT_OK=0
+if command -v git >/dev/null 2>&1 && git -C "$MODULE_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  GIT_OK=1
+fi
+
+if [ "$GIT_OK" = "1" ]; then
+  DIRTY="$(git -C "$MODULE_ROOT" status --porcelain -- . | grep -v '^?? ' || true)"
+  if [ -n "$DIRTY" ]; then
+    echo "mutation-gate: the ams-store work tree has uncommitted changes." >&2
+    echo "This gate mutates tracked files in place, so it refuses to run while there is" >&2
+    echo "work here it could be confused with. Commit or stash first." >&2
+    echo "$DIRTY" >&2
+    exit 2
+  fi
+else
+  echo "mutation-gate: WARNING - git cannot read this tree from this shell." >&2
+  echo "  (a Windows 'git worktree' checkout read from WSL is the usual cause: its .git" >&2
+  echo "   file names a D:\\... gitdir Linux git will not follow)" >&2
+  echo "  Every restore falls back to the pre-image copy and is still byte-verified," >&2
+  echo "  but the uncommitted-changes pre-check could not run. Check 'git status' after." >&2
+  echo >&2
 fi
 
 TABLE="$(go run ./scripts/mutationgate list)" || {
   echo "mutation-gate: could not read the mutation table" >&2; exit 2; }
 
-LOG_DIR="$(mktemp -d)"
-RESTORE_LIST=""
+WORK_DIR="$(mktemp -d)"
+LOG_DIR="$WORK_DIR/logs"
+PRE_DIR="$WORK_DIR/pre"
+mkdir -p "$LOG_DIR" "$PRE_DIR"
 
-restore_all() {
-  # shellcheck disable=SC2086
-  [ -n "$RESTORE_LIST" ] && git -C "$MODULE_ROOT" checkout -- $RESTORE_LIST 2>/dev/null
-  RESTORE_LIST=""
+CURRENT_FILES=""
+
+# save_pre copies the files a mutation is about to touch. The copy is the ONLY thing that
+# can prove the restore worked, so it is taken before anything is written.
+save_pre() {
+  local f
+  for f in $1; do
+    mkdir -p "$PRE_DIR/$(dirname "$f")"
+    cp -p -- "$MODULE_ROOT/$f" "$PRE_DIR/$f" || return 1
+  done
+  return 0
 }
-on_exit() { restore_all; }
+
+# restore_verified puts the files back and PROVES it. git is the restore; the pre-image is
+# the proof, and the fallback when git is not usable here. A restore that cannot be proved
+# aborts the whole run: continuing would test a tree nobody can describe.
+restore_verified() {
+  local f failed=0
+  [ -z "$CURRENT_FILES" ] && return 0
+  if [ "$GIT_OK" = "1" ]; then
+    # shellcheck disable=SC2086
+    git -C "$MODULE_ROOT" checkout -- $CURRENT_FILES 2>/dev/null
+  fi
+  for f in $CURRENT_FILES; do
+    if ! cmp -s -- "$MODULE_ROOT/$f" "$PRE_DIR/$f"; then
+      cp -p -- "$PRE_DIR/$f" "$MODULE_ROOT/$f" || failed=1
+      cmp -s -- "$MODULE_ROOT/$f" "$PRE_DIR/$f" || failed=1
+    fi
+  done
+  CURRENT_FILES=""
+  if [ "$failed" = "1" ]; then
+    echo "mutation-gate: FATAL - could not restore a mutated file." >&2
+    echo "The tree is left mutated. Pre-images: $PRE_DIR" >&2
+    return 1
+  fi
+  return 0
+}
+
+on_exit() { restore_verified || true; }
 trap on_exit EXIT INT TERM
 
 # ---------------------------------------------------------------- selection
@@ -94,9 +151,9 @@ selected() {
 
 # ---------------------------------------------------------------- baseline
 
-BASELINE_FAILED=0
 if [ "$BASELINE" = "1" ]; then
   echo "== baseline: the named tests must PASS unmutated =="
+  BASELINE_FAILED=0
   SEEN=""
   while IFS=$'\t' read -r id task state pkg test file rule; do
     selected "$id" "$task" "$state" || continue
@@ -124,55 +181,60 @@ COUNT_SURVIVED=0
 COUNT_BROKEN=0
 COUNT_PENDING=0
 
+record() { RESULTS="$RESULTS$1|$2|$3|$4"$'\n'; }
+
 echo "== mutations =="
 while IFS=$'\t' read -r id task state pkg test file rule; do
   if [ "$state" = "pending" ]; then
-    if [ -z "$TASK" ] || [ "$task" = "$TASK" ]; then
+    if [ -z "$TASK" ] && [ ${#ONLY[@]} -eq 0 ]; then
       COUNT_PENDING=$((COUNT_PENDING + 1))
-      RESULTS="$RESULTS$id|$task|PENDING|$test|$rule"$'\n'
+      record "$id" "$task" "PENDING" "$test"
+    elif [ -n "$TASK" ] && [ "$task" = "$TASK" ]; then
+      COUNT_PENDING=$((COUNT_PENDING + 1))
+      record "$id" "$task" "PENDING" "$test"
     fi
     continue
   fi
   selected "$id" "$task" "$state" || continue
 
-  FILES="$(go run ./scripts/mutationgate files "$id")" || { echo "  !! $id: cannot list files" >&2; exit 2; }
-  RESTORE_LIST="$FILES"
+  FILES="$(go run ./scripts/mutationgate files "$id")" || {
+    echo "mutation-gate: cannot list the files of $id" >&2; exit 2; }
+  save_pre "$FILES" || { echo "mutation-gate: cannot save the pre-image of $id" >&2; exit 2; }
+  CURRENT_FILES="$FILES"
 
   if ! go run ./scripts/mutationgate apply "$id" 2>"$LOG_DIR/apply.$id.log"; then
     printf '  %-26s STALE      %s\n' "$id" "$(cat "$LOG_DIR/apply.$id.log")"
-    RESULTS="$RESULTS$id|$task|STALE|$test|$rule"$'\n'
+    record "$id" "$task" "STALE" "$test"
     COUNT_BROKEN=$((COUNT_BROKEN + 1))
-    restore_all
+    restore_verified || exit 3
     continue
   fi
 
   # A mutation that does not compile proves nothing: the test binary never ran.
   if ! go build ./... >"$LOG_DIR/build.$id.log" 2>&1; then
     printf '  %-26s NOCOMPILE  %s\n' "$id" "$LOG_DIR/build.$id.log"
-    RESULTS="$RESULTS$id|$task|NOCOMPILE|$test|$rule"$'\n'
+    record "$id" "$task" "NOCOMPILE" "$test"
     COUNT_BROKEN=$((COUNT_BROKEN + 1))
-    restore_all
+    restore_verified || exit 3
     continue
   fi
 
   if go test "$pkg" -run "^${test}\$" -count=1 >"$LOG_DIR/test.$id.log" 2>&1; then
     printf '  %-26s SURVIVED   %s (%s)\n' "$id" "$test" "$pkg"
-    RESULTS="$RESULTS$id|$task|SURVIVED|$test|$rule"$'\n'
+    record "$id" "$task" "SURVIVED" "$test"
     COUNT_SURVIVED=$((COUNT_SURVIVED + 1))
-  else
+  elif grep -q "warning: no tests to run" "$LOG_DIR/test.$id.log"; then
     # `go test` also exits non-zero when it ran NOTHING. A -run that matches no test is
     # not a red test, it is a typo in the table.
-    if grep -q "warning: no tests to run" "$LOG_DIR/test.$id.log"; then
-      printf '  %-26s NOTEST     %s matches nothing in %s\n' "$id" "$test" "$pkg"
-      RESULTS="$RESULTS$id|$task|NOTEST|$test|$rule"$'\n'
-      COUNT_BROKEN=$((COUNT_BROKEN + 1))
-    else
-      printf '  %-26s red        %s\n' "$id" "$test"
-      RESULTS="$RESULTS$id|$task|RED|$test|$rule"$'\n'
-      COUNT_RED=$((COUNT_RED + 1))
-    fi
+    printf '  %-26s NOTEST     %s matches nothing in %s\n' "$id" "$test" "$pkg"
+    record "$id" "$task" "NOTEST" "$test"
+    COUNT_BROKEN=$((COUNT_BROKEN + 1))
+  else
+    printf '  %-26s red        %s\n' "$id" "$test"
+    record "$id" "$task" "RED" "$test"
+    COUNT_RED=$((COUNT_RED + 1))
   fi
-  restore_all
+  restore_verified || exit 3
 done <<< "$TABLE"
 
 # ---------------------------------------------------------------- the table
@@ -181,7 +243,7 @@ echo
 echo "== mutation gate =="
 printf '%-26s %-4s %-10s %s\n' "MUTATION" "TASK" "RESULT" "TEST"
 printf '%-26s %-4s %-10s %s\n' "--------------------------" "----" "----------" "----"
-while IFS='|' read -r id task result test rule; do
+while IFS='|' read -r id task result test; do
   [ -z "$id" ] && continue
   printf '%-26s %-4s %-10s %s\n' "$id" "$task" "$result" "$test"
 done <<< "$RESULTS"
@@ -195,5 +257,5 @@ if [ "$COUNT_SURVIVED" -gt 0 ] || [ "$COUNT_BROKEN" -gt 0 ]; then
   echo "Logs: $LOG_DIR"
   exit 1
 fi
-rm -rf "$LOG_DIR"
+rm -rf "$WORK_DIR"
 exit 0
