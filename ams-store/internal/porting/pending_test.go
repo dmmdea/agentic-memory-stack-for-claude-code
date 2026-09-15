@@ -50,9 +50,12 @@ func TestReceipts_LastJudgeUtcNilWhenNoCall(t *testing.T) { t.Skip("ported in ta
 // MemoryCompact.Tests.ps1
 // --------------------------------------------------------------------------------
 
-// MemoryCompact.Tests.ps1:28 - the v2 form of the liveness skip: a live session defers
-// materialization instead of gating maintenance.
-func TestMaterialize_LiveSessionDeferred_NoIndexChange(t *testing.T) { t.Skip("ported in task 4") }
+// MemoryCompact.Tests.ps1:15 - below trigger does nothing: ported in internal/derive as
+// TestDerive_BelowTriggerNoChange. Task 3.
+//
+// MemoryCompact.Tests.ps1:28 - the v2 form of the liveness skip (a live session defers
+// materialization instead of gating maintenance) is ported in internal/merge as
+// TestMaterialize_LiveSessionDeferred_NoIndexChange. Task 4.
 
 // MemoryCompact.Tests.ps1:56 - doctrine is untouchable and never even offered.
 func TestJudge_DoctrineNeverOfferedNeverEdited(t *testing.T) { t.Skip("ported in task 6") }
