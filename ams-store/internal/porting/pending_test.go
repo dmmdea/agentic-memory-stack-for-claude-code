@@ -66,41 +66,11 @@ func TestMaterialize_LiveSessionDeferred_NoIndexChange(t *testing.T) { t.Skip("p
 // MemoryCompact.Tests.ps1:41 - compare-and-swap abort on a mid-run write.
 func TestDerive_AbortsOnConcurrentIndexWrite(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompact.Tests.ps1:56 - doctrine is untouchable and never even offered.
-func TestJudge_DoctrineNeverOfferedNeverEdited(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:72 - applies a genuine shortening.
-func TestJudge_AppliesGenuineShorten(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:86 - rejects not-shorter and anchor-dropping rewrites.
-func TestJudge_RejectsNoShrinkAndAnchorLoss(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:97 - the seal prevents a re-offer. The port must keep the
-// :110 assertion that the shortened hook stays OVER 130 B, or the byte filter, not the
-// seal, is what excludes it on run 2 and the test passes with the seal deleted.
-func TestJudge_SealPreventsReoffer(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:125 - rejects a markdown link in the hook.
-func TestJudge_RejectsHookWithMarkdownLink(t *testing.T) { t.Skip("ported in task 6") }
-
 // MemoryCompact.Tests.ps1:137 - regex/wildcard anchor, no false accept.
 func TestAnchors_NoWildcardFalseAccept(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompact.Tests.ps1:154 - migration removes line and file only after a byte-equal
-// read-back by id.
-func TestMigrate_WriteThenVerifyByID(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:167 - no id returned, keep the line.
-func TestMigrate_NoIDKeepsLine(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:176 - read-back mismatch, keep the line.
-func TestMigrate_ReadBackMismatchKeepsLine(t *testing.T) { t.Skip("ported in task 6") }
-
 // MemoryCompact.Tests.ps1:187 - hygiene without the judge, throttle still marked.
 func TestDerive_HygieneWithoutJudge(t *testing.T) { t.Skip("ported in task 3") }
-
-// MemoryCompact.Tests.ps1:206 - protected-set overflow.
-func TestFeasibility_ProtectedSetOverflow(t *testing.T) { t.Skip("ported in task 6") }
 
 // MemoryCompact.Tests.ps1:225 - the lock is held, so the contender exits 0 with no
 // receipt.
@@ -108,20 +78,6 @@ func TestLock_ContenderSkipsImmediately(t *testing.T) { t.Skip("ported in task 5
 
 // MemoryCompact.Tests.ps1:238 - the lock is free, so the run proceeds and receipts.
 func TestLock_FreeLockRuns(t *testing.T) { t.Skip("ported in task 5") }
-
-// MemoryCompact.Tests.ps1:248 - a judge attempt inside the 20 h window is skipped.
-func TestJudge_OncePerStorePerWindow_Skips(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:261 - a last attempt older than 20 h calls the judge.
-func TestJudge_OncePerStorePerWindow_Calls(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:273 - the PC catch-up spawn is removed; the hub's once-nightly
-// run replaces it.
-func TestNightly_HubOnceNightly(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompact.Tests.ps1:287 - the catch-up force/workspace bypass becomes the judge's
-// explicit window bypass.
-func TestJudge_ForceBypassesWindow(t *testing.T) { t.Skip("ported in task 6") }
 
 // --------------------------------------------------------------------------------
 // MemoryCompactRobustness.Tests.ps1
@@ -141,18 +97,6 @@ func TestHygiene_BlastCapAborts(t *testing.T) { t.Skip("ported in task 3") }
 // on disk.
 func TestDerive_ConcurrentAbortDeletesNothing(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompactRobustness.Tests.ps1:73 - skipped-judge-unavailable is not productive.
-func TestJudge_UnavailableIsNotProductive(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompactRobustness.Tests.ps1:84 - never deletes a DEDUPLICATED id.
-func TestMigrate_NeverDeletesDeduplicatedID(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompactRobustness.Tests.ps1:95 - a concurrent abort undoes the corpus write.
-func TestMigrate_UndoOnConcurrentAbort(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompactRobustness.Tests.ps1:111 - undoes an unverifiable write.
-func TestMigrate_UndoUnverifiedWrite(t *testing.T) { t.Skip("ported in task 6") }
-
 // MemoryCompactRobustness.Tests.ps1:123 - an unrepairable entry ghost aborts before any
 // write or post, twice.
 func TestHygiene_UnrepairableGhostAbortsBeforeWrite(t *testing.T) { t.Skip("ported in task 3") }
@@ -170,10 +114,6 @@ func TestHygiene_CheckboxAndFencedItemUntouched(t *testing.T) { t.Skip("ported i
 
 // MemoryCompactRobustness.Tests.ps1:190 - the blast-cap boundary: 23 aborts, 22 applies.
 func TestHygiene_BlastCapBoundary(t *testing.T) { t.Skip("ported in task 3") }
-
-// MemoryCompactRobustness.Tests.ps1:208 - a re-indexed orphan then migrated carries its
-// line in the receipt.
-func TestReceipt_ReindexedThenMigratedCarriesLine(t *testing.T) { t.Skip("ported in task 6") }
 
 // MemoryCompactRobustness.Tests.ps1:226 - out-of-tree commit and diff, no .git in a
 // store.
@@ -194,10 +134,6 @@ func TestFloor_RunsWithoutJudge(t *testing.T) { t.Skip("ported in task 3") }
 // MemoryCompactRobustness.Tests.ps1:332 - unconverged exits 1, throttle unmarked.
 func TestFloor_UnconvergedExitsOne(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompactRobustness.Tests.ps1:344 - never offers or migrates a body over 4000
-// chars.
-func TestMigrate_NeverOffersOverCapBody(t *testing.T) { t.Skip("ported in task 6") }
-
 // MemoryCompactRobustness.Tests.ps1:365 - re-indexes an orphan in a below-trigger store.
 func TestHygiene_ReindexesOrphanBelowTrigger(t *testing.T) { t.Skip("ported in task 3") }
 
@@ -205,20 +141,9 @@ func TestHygiene_ReindexesOrphanBelowTrigger(t *testing.T) { t.Skip("ported in t
 // store.
 func TestDerive_CleanStoreSilent(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompactRobustness.Tests.ps1:391 - the line floor migrates the oldest pullable
-// facts to target.
-func TestLineFloor_MigratesOldestToTarget(t *testing.T) { t.Skip("ported in task 6") }
-
-// MemoryCompactRobustness.Tests.ps1:435 - the line floor never migrates an attributed
-// statement.
-func TestLineFloor_NeverMigratesAttributed(t *testing.T) { t.Skip("ported in task 6") }
-
 // MemoryCompactRobustness.Tests.ps1:456 - a synthesized hook comes from the first prose
 // line and never injects a slug.
 func TestHygiene_SynthesizedHookNoInjectedSlug(t *testing.T) { t.Skip("ported in task 3") }
-
-// MemoryCompactRobustness.Tests.ps1:470 - the usage ledger writes outcome=empty.
-func TestUsageLedger_EmptyJudgeOutputIsAnOutcome(t *testing.T) { t.Skip("ported in task 6") }
 
 // MemoryCompactRobustness.Tests.ps1:523 - under the limit, a live session skips and the
 // streak is counted.

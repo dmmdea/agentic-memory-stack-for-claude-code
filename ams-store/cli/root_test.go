@@ -30,8 +30,16 @@ func TestCLI_MandatedVerbsArePresent(t *testing.T) {
 	}
 }
 
+// implemented lists the verbs whose engine has landed. They answer for themselves and
+// are exempt from the stub contract below; the list shrinks to nothing as the remaining
+// tasks land, and a verb left here by mistake is caught by its own tests.
+var implemented = map[string]bool{"judge-apply": true}
+
 func TestCLI_StubVerbsExitNotImplementedWithSilentStdout(t *testing.T) {
 	for _, v := range cli.Verbs() {
+		if implemented[v] {
+			continue
+		}
 		code, stdout, stderr := run(t, v)
 		if code != cli.ExitNotImplemented {
 			t.Errorf("%s: exit = %d, want %d", v, code, cli.ExitNotImplemented)
