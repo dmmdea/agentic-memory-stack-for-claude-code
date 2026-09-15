@@ -39,10 +39,21 @@ type Report struct {
 	Resurrected []string `json:"resurrected,omitempty"`
 	// Conflicts are the conflict-in-history findings, each with the loser's commit id.
 	Conflicts []Conflict `json:"conflicts,omitempty"`
-	// Deferred, Materialized and Deleted mirror the materialize report.
-	Deferred     []string `json:"deferred,omitempty"`
-	Materialized []string `json:"materialized,omitempty"`
-	Deleted      []string `json:"deleted,omitempty"`
+	// Deferred, Materialized and Deleted mirror the materialize report. Deferred keeps
+	// the op of each withheld change: a receipt that cannot tell a postponed deletion
+	// from a postponed edit is not an audit trail.
+	Deferred     []DeferredEntry `json:"deferred,omitempty"`
+	Materialized []string        `json:"materialized,omitempty"`
+	Deleted      []string        `json:"deleted,omitempty"`
+}
+
+// DeferredPaths is the queued paths alone, for the callers that only need the set.
+func (r *Report) DeferredPaths() []string {
+	out := make([]string, 0, len(r.Deferred))
+	for _, e := range r.Deferred {
+		out = append(out, e.Path)
+	}
+	return out
 }
 
 // Round merges the hub's branch into ours and materializes the result.

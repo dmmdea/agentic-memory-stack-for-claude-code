@@ -16,6 +16,7 @@ import (
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/cli"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
+	amsync "github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/sync"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
 )
 
@@ -57,9 +58,9 @@ func TestCLI_SyncDrainsTheDeferredQueueOnceTheSessionIsGone(t *testing.T) {
 
 	syncAt(t, pc, sessionStart.Add(2*time.Minute), "this PC syncs under a live session")
 
-	queue, err := merge.LoadDeferred(pc.StateRoot, "ws")
-	if err != nil {
-		t.Fatal(err)
+	queue, qErr := merge.LoadDeferred(pc.StateRoot, "ws")
+	if qErr != nil {
+		t.Fatal(qErr)
 	}
 	if len(queue.Entries) != 2 {
 		t.Fatalf("the scenario needs both changes deferred, got %+v", queue.Entries)
@@ -67,6 +68,30 @@ func TestCLI_SyncDrainsTheDeferredQueueOnceTheSessionIsGone(t *testing.T) {
 	doomed := filepath.Join(pc.ProjectsRoot, "ws", "memory", "doomed.md")
 	if _, err := os.Stat(doomed); err != nil {
 		t.Fatalf("the deferral must leave the file alone while the session runs: %v", err)
+	}
+
+	// The receipt is the only audit trail for what the merge decided and did not apply,
+	// and a withheld DELETION is the entry an operator most needs to see named as such:
+	// "deferred: ws/memory/doomed.md" reads as a postponed edit, not as a fact file this
+	// PC is about to lose.
+	receipts, err := amsync.ReadReceipts(amsync.ReceiptPath(pc.StateRoot), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(receipts) == 0 {
+		t.Fatal("the pass wrote no receipt")
+	}
+	ops := map[string]string{}
+	for _, d := range receipts[len(receipts)-1].Deferred {
+		ops[d.Path] = d.Op
+	}
+	if ops["ws/memory/doomed.md"] != "delete" {
+		t.Errorf("the receipt calls the withheld deletion %q, want \"delete\": %+v",
+			ops["ws/memory/doomed.md"], receipts[len(receipts)-1].Deferred)
+	}
+	if ops["ws/memory/shared.md"] != "replace" {
+		t.Errorf("the receipt calls the withheld replacement %q, want \"replace\": %+v",
+			ops["ws/memory/shared.md"], receipts[len(receipts)-1].Deferred)
 	}
 
 	// The session writes once more before it ends, so the queued replacement is no longer
@@ -89,9 +114,9 @@ func TestCLI_SyncDrainsTheDeferredQueueOnceTheSessionIsGone(t *testing.T) {
 	if !strings.Contains(got, "FROM-THE-OTHER-PC") {
 		t.Errorf("the drain never applied the queued replacement:\n%s", got)
 	}
-	queue, err = merge.LoadDeferred(pc.StateRoot, "ws")
-	if err != nil {
-		t.Fatal(err)
+	queue, qErr = merge.LoadDeferred(pc.StateRoot, "ws")
+	if qErr != nil {
+		t.Fatal(qErr)
 	}
 	if len(queue.Entries) != 0 {
 		t.Errorf("the queue must be empty once every entry is decided: %+v", queue.Entries)

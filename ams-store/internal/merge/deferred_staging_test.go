@@ -56,7 +56,7 @@ func TestFleet_DeferredPathsAreNotResurrectedByTheNextStagingPass(t *testing.T) 
 	}
 
 	rep := b.syncOnce("b syncs under a live session", b.mo(), ws)
-	if !contains(rep.Deferred, ws+"/memory/doomed.md") || !contains(rep.Deferred, ws+"/memory/shared.md") {
+	if !contains(rep.DeferredPaths(), ws+"/memory/doomed.md") || !contains(rep.DeferredPaths(), ws+"/memory/shared.md") {
 		t.Fatalf("the scenario did not defer both changes, so it proves nothing: %v", rep.Deferred)
 	}
 

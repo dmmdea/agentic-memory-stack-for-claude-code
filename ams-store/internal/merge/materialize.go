@@ -36,9 +36,12 @@ func (mo MaterializeOptions) workTreePath(e *Engine, rel string) string {
 
 // MaterializeReport is what one materialize did.
 type MaterializeReport struct {
-	Written  []string
-	Deleted  []string
-	Deferred []string
+	Written []string
+	Deleted []string
+	// Deferred carries the ENTRIES, not just their paths: what a change was going to do
+	// is the whole point of reporting it, and "deferred: x.md" for a withheld deletion
+	// reads as a postponed edit.
+	Deferred []DeferredEntry
 }
 
 // materialize brings the work tree to the merged tree, file by file.
@@ -154,7 +157,7 @@ func (e *Engine) materialize(ctx context.Context, prevTree, newTree string, mo M
 			queued[ws] = append(queued[ws], DeferredEntry{
 				Path: c.path, Op: c.op, Blob: c.oid, OursBlob: ours, QueuedAt: now,
 			})
-			rep.Deferred = append(rep.Deferred, c.path)
+			rep.Deferred = append(rep.Deferred, queued[ws][len(queued[ws])-1])
 			continue
 		}
 		if c.op == OpDelete {

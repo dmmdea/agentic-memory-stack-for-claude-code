@@ -257,7 +257,7 @@ func Once(ctx context.Context, opt Options) Result {
 			}
 			res.Receipt.ConflictsInHistory = append(res.Receipt.ConflictsInHistory, merged.ConflictsInHistory...)
 			for _, d := range merged.Deferred {
-				res.Receipt.Deferred = append(res.Receipt.Deferred, d.Path)
+				res.Receipt.Deferred = append(res.Receipt.Deferred, DeferredRef{Path: d.Path, Op: d.Op})
 			}
 			// MEMORY.md is derived, never merged: re-derive every store the merge
 			// touched so no index points at a file the merge just removed.
@@ -336,7 +336,7 @@ func Once(ctx context.Context, opt Options) Result {
 // stale file over the merged blob. "I could not tell" means "do not touch it".
 func drainDeferred(ctx context.Context, opt Options, workspaces []string, res *Result, now time.Time, logw io.Writer) error {
 	for _, ws := range workspaces {
-		pending, err := merge.DeferredPaths(opt.Roots.StateRoot, ws)
+		pending, err := merge.QueuedPaths(opt.Roots.StateRoot, ws)
 		if err != nil {
 			return fmt.Errorf("the deferred queue of %s cannot be read, so this pass cannot know what is pending: %w", ws, err)
 		}

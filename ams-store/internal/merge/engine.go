@@ -232,7 +232,7 @@ func deferredHold(stateRoot, workspace string) ([]string, error) {
 	if stateRoot == "" {
 		return nil, nil
 	}
-	return DeferredPaths(stateRoot, workspace)
+	return QueuedPaths(stateRoot, workspace)
 }
 
 func dateEnv(when time.Time) []string {

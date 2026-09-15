@@ -179,7 +179,7 @@ func (r Repo) deferredHold(workspace string) ([]string, error) {
 	if r.StateRoot == "" {
 		return nil, nil
 	}
-	hold, err := merge.DeferredPaths(r.StateRoot, workspace)
+	hold, err := merge.QueuedPaths(r.StateRoot, workspace)
 	if err != nil {
 		return nil, fmt.Errorf("sync: the deferred queue of %s cannot be read, so nothing of it may be staged: %w", workspace, err)
 	}

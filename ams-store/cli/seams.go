@@ -337,11 +337,16 @@ func reportToResult(rep *merge.Report) amsync.MergeResult {
 		})
 		out.ConflictedPaths = append(out.ConflictedPaths, c.Path)
 	}
-	for _, p := range rep.Deferred {
-		out.Deferred = append(out.Deferred, amsync.DeferredEntry{Path: p, Op: "replace"})
+	for _, e := range rep.Deferred {
+		// The op is carried, never assumed. A withheld deletion reported as a
+		// "replace" is the one line in the receipt an operator would misread.
+		queuedAt, _ := time.Parse(time.RFC3339, e.QueuedAt)
+		out.Deferred = append(out.Deferred, amsync.DeferredEntry{
+			Path: e.Path, Op: string(e.Op), Blob: e.Blob, QueuedAt: queuedAt,
+		})
 	}
 	seen := map[string]bool{}
-	for _, p := range concat(rep.Materialized, rep.Deleted, rep.Deferred, rep.Resurrected) {
+	for _, p := range concat(rep.Materialized, rep.Deleted, rep.DeferredPaths(), rep.Resurrected) {
 		ws := workspaceOfRel(p)
 		if ws != "" && !seen[ws] {
 			seen[ws] = true

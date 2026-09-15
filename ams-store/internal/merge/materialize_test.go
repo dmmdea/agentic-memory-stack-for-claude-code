@@ -115,7 +115,7 @@ func TestMaterialize_LiveSessionFileDeferred(t *testing.T) {
 		t.Fatalf("a file the live session touched must not be replaced under it, got %q", got)
 	}
 	want := ws + "/memory/live.md"
-	if !contains(rep.Deferred, want) {
+	if !contains(rep.DeferredPaths(), want) {
 		t.Fatalf("the replacement must be queued on the deferred list, got %v", rep.Deferred)
 	}
 	d, err := merge.LoadDeferred(b.stateDir, ws)
@@ -154,7 +154,7 @@ func TestMaterialize_LiveSessionDeletionDeferred(t *testing.T) {
 		t.Fatal("a deletion must never be materialized while a session is live in the workspace")
 	}
 	want := ws + "/memory/doomed.md"
-	if !contains(rep.Deferred, want) {
+	if !contains(rep.DeferredPaths(), want) {
 		t.Fatalf("the deletion must be queued, got %v", rep.Deferred)
 	}
 	d, err := merge.LoadDeferred(b.stateDir, ws)
@@ -267,7 +267,7 @@ func TestMaterialize_LiveSessionDeferred_NoIndexChange(t *testing.T) {
 	mo.Derive = func(string) error { derived++; return nil }
 	rep := b.mergeOnly(mo)
 
-	if !contains(rep.Deferred, ws+"/memory/one.md") {
+	if !contains(rep.DeferredPaths(), ws+"/memory/one.md") {
 		t.Fatalf("the replacement must be queued, not applied: %v", rep.Deferred)
 	}
 	if got, _ := b.read(ws, "one.md"); got != sessionText {
