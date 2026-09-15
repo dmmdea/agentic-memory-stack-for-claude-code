@@ -122,6 +122,16 @@ func Run(ctx context.Context, opt Options, args ...string) (Result, error) {
 	env = append(env, opt.ExtraEnv...)
 	cmd.Env = env
 
+	// The network is hardened HERE or not at all. Every caller that opens a socket has to
+	// come through this function, so the check that the hardened environment is present
+	// belongs on this side of the call rather than in each caller's own options: the one
+	// place that forgot it (merge.Engine's Fetch and Push) looked exactly like the places
+	// that remembered, and nothing could tell them apart until now. Refused BEFORE the
+	// process starts, so a call with no GIT_SSH_COMMAND never reaches a host key.
+	if sub := NetworkSubcommand(full); sub != "" && !hasSSHCommand(env) {
+		return Result{Args: full}, fmt.Errorf("git %s: refused: %w", sub, ErrUnhardenedNetwork)
+	}
+
 	switch {
 	case opt.StdinRaw != nil:
 		cmd.Stdin = bytes.NewReader(opt.StdinRaw)
