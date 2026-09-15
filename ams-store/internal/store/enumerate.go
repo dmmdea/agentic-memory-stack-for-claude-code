@@ -80,7 +80,16 @@ func ResolveReparseTarget(dir string) string {
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(filepath.Dir(dir), target)
 	}
-	return strings.TrimRight(filepath.Clean(target), `\/`)
+	cleaned := strings.TrimRight(filepath.Clean(target), `\/`)
+	// Fail CLOSED on a dangling alias. os.Readlink returns the link's stored target even
+	// when nothing is there (a broken symlink, or a junction whose target was removed), so
+	// resolving it is not enough: a target that does not exist is an alias of nothing and
+	// must resolve to "" rather than crown a phantom directory its own store. os.Stat
+	// follows the link chain to the physical directory.
+	if _, err := os.Stat(cleaned); err != nil {
+		return ""
+	}
+	return cleaned
 }
 
 // Enumerate returns every populated store under projectsRoot, deduplicated by canonical
