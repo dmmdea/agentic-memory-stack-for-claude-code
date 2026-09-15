@@ -213,51 +213,94 @@ var Mutations = []Mutation{
 		ID: "local-commit-before-fetch", Rule: "sync commits locally BEFORE it fetches", Task: 5,
 		File: "internal/sync/sync.go", Test: "TestSync_OfflineCommitThenResume", Package: "./internal/sync",
 		Why: "committing after the fetch loses a whole day of offline history whenever the hub is unreachable.",
+		Hunks: []Hunk{{
+			Old: "\t// 1. derive, so the index is correct whether or not the hub is reachable.\n\tres.Derived = deriveAll(ctx, opt, workspaces, now, logw)\n\n\t// 2. stage and commit LOCALLY, before any network call.\n",
+			New: "\t// 1. derive, so the index is correct whether or not the hub is reachable.\n\tres.Derived = deriveAll(ctx, opt, workspaces, now, logw)\n\n\tif hub, _ := HasHub(ctx, repo); hub {\n\t\tif fErr := fetchHub(ctx, gitx.Options{GitDir: repo.GitDir, WorkTree: repo.WorkTree,\n\t\t\tTimeout: opt.Timeout, ExtraEnv: []string{\"GIT_SSH_COMMAND=\" + SSHCommand(opt.Roots.StateRoot)}}); fErr != nil {\n\t\t\tres.Err = fErr\n\t\t\tres.ExitCode = exitNetwork\n\t\t\tres.Receipt.Status = StatusOffline\n\t\t\tres.Receipt.Offline = true\n\t\t\tres.Receipt.Note = \"fetch failed: \" + oneLine(fErr.Error())\n\t\t\twriteReceipt(opt.Roots.StateRoot, res.Receipt, logw)\n\t\t\treturn res\n\t\t}\n\t}\n\n\t// 2. stage and commit LOCALLY, before any network call.\n",
+		}},
 	},
 	{
 		ID: "push-loop-bound", Rule: "the push loop is bounded at three attempts", Task: 5,
 		File: "internal/sync/sync.go", Test: "TestSync_PushLoopUnderConcurrentPush_BoundedAtThree", Package: "./internal/sync",
 		Why: "an unbounded loop under a busy hub spins forever on a hook-adjacent path.",
+		Hunks: []Hunk{{
+			Old: "\tfor attempt := 1; attempt <= MaxPushAttempts; attempt++ {\n",
+			New: "\tfor attempt := 1; attempt <= MaxPushAttempts+2; attempt++ {\n",
+		}, {
+			Old: "\t\tif attempt == MaxPushAttempts {\n",
+			New: "\t\tif attempt == MaxPushAttempts+2 {\n",
+		}},
 	},
 	{
 		ID: "contender-skips", Rule: "a lock contender skips immediately and never waits", Task: 5,
 		File: "internal/lock/lock.go", Test: "TestLock_ContenderSkipsImmediately", Package: "./internal/lock",
 		Why: "the gate runs on every Write|Edit; a lock that blocks puts the network's worst case on the hook path.",
+		Hunks: []Hunk{{
+			Old: "\t\tif IsLive(*existing, now, stale) {\n",
+			New: "\t\tif false {\n",
+		}},
 	},
 	{
 		ID: "lock-stale-10m", Rule: "a lock older than ten minutes is broken and taken", Task: 5,
 		File: "internal/lock/lock.go", Test: "TestLock_StaleAfterTenMinutes", Package: "./internal/lock",
 		Why: "a crashed holder otherwise wedges every derive on the PC until someone notices.",
+		Hunks: []Hunk{{
+			Old: "\tif now.Sub(h.AcquiredAt.UTC()) >= stale {\n\t\treturn false\n\t}\n",
+			New: "\tif false {\n\t\treturn false\n\t}\n",
+		}},
 	},
 	{
 		ID: "derive-doctrine-first", Rule: "the derived render puts doctrine first", Task: 3,
 		File: "internal/index/render.go", Test: "TestDerive_DoctrineFirst", Package: "./internal/derive",
 		Why: "doctrine below the 200-line cap is a standing order nobody is shown.",
+		Hunks: []Hunk{{
+			Old: "\t\tif dx, dy := isDoctrine(x), isDoctrine(y); dx != dy {\n\t\t\treturn dx\n\t\t}\n",
+			New: "\t\tif false {\n\t\t\treturn false\n\t\t}\n",
+		}},
 	},
 	{
 		ID: "floor-descending", Rule: "the floor truncates in descending rendered length", Task: 3,
 		File: "internal/derive/floor.go", Test: "TestDerive_FloorDescendingRenderedLength", Package: "./internal/derive",
 		Why: "ascending order truncates many short hooks to save what one long one would have.",
+		Hunks: []Hunk{{
+			Old: "\tsort.SliceStable(long, func(i, j int) bool { return long[i].Bytes > long[j].Bytes })\n",
+			New: "\tsort.SliceStable(long, func(i, j int) bool { return long[i].Bytes < long[j].Bytes })\n",
+		}},
 	},
 	{
 		ID: "floor-stop-below", Rule: "the floor stops below trigger, not below the sync limit", Task: 3,
 		File: "internal/derive/floor.go", Test: "TestDerive_FloorStopsBelowTrigger", Package: "./internal/derive",
 		Why: "stopping at the sync limit leaves the index one edit away from being refused by the harness.",
+		Hunks: []Hunk{{
+			Old: "\tstop := opt.StopBelowBytes\n\tif stop <= 0 {\n\t\tstop = store.TriggerBytes\n\t}\n",
+			New: "\tstop := opt.StopBelowBytes\n\tif stop <= 0 {\n\t\tstop = store.SyncLimitBytes\n\t}\n",
+		}},
 	},
 	{
 		ID: "two-hundred-line-stop", Rule: "the render stops at the injection cap and reports over-inject-limit", Task: 3,
 		File: "internal/index/render.go", Test: "TestDerive_TwoHundredLineStop_ReportsOverInjectLimit", Package: "./internal/derive",
 		Why: "entries past line 200 are not loaded into context and must be reported, not silently carried.",
+		Hunks: []Hunk{{
+			Old: "\t\tif limit > 0 && used >= limit {\n\t\t\tres.Omitted = append(res.Omitted, r.Slug)\n\t\t\tcontinue\n\t\t}\n",
+			New: "\t\tif false {\n\t\t\tres.Omitted = append(res.Omitted, r.Slug)\n\t\t\tcontinue\n\t\t}\n",
+		}},
 	},
 	{
 		ID: "always-lf", Rule: "derive writes LF unconditionally", Task: 3,
 		File: "internal/derive/derive.go", Test: "TestDerive_AlwaysLF", Package: "./internal/derive",
 		Why: "the prevailing-newline rule makes two PCs render different bytes for the same fact set.",
+		Hunks: []Hunk{{
+			Old: "\tfinal := index.RenderDerived(hy.Keep, renderOpt)\n\tnewText := final.Text\n",
+			New: "\tfinal := index.RenderDerived(hy.Keep, renderOpt)\n\tnewText := strings.ReplaceAll(final.Text, \"\\n\", idx.Newline)\n",
+		}},
 	},
 	{
 		ID: "doctrine-never-floored", Rule: "the floor never truncates doctrine", Task: 3,
 		File: "internal/derive/floor.go", Test: "TestFloor_NeverTruncatesDoctrine", Package: "./internal/derive",
 		Why: "a truncated standing order is a standing order with its condition cut off.",
+		Hunks: []Hunk{{
+			Old: "\t\tif opt.Doctrine != nil && opt.Doctrine(rec) {\n\t\t\tcontinue\n\t\t}\n",
+			New: "\t\tif false {\n\t\t\tcontinue\n\t\t}\n",
+		}},
 	},
 }
 
