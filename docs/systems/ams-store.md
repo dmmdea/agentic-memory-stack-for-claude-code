@@ -41,9 +41,10 @@ silently degrades (`gate.Options{Floor: nil}` prints the same advisory block and
 never rewrites a thing).
 
 Open for Phase 4, deliberately: the floor's engage threshold stays on the legacy
-hysteresis, `<STATE_ROOT>/role` is not seeded on any machine, `dream-consolidate.py`
-does not emit a plan file yet, and `VERSION` is unchanged - the installer wires the
-binary in and bumps it.
+hysteresis as the DEFAULT of `--engage-at` (the flip is a change of that default,
+not an edit to the floor), `<STATE_ROOT>/role` is not seeded on any machine,
+`dream-consolidate.py` does not emit a plan file yet, and the installer does not
+wire the binary in.
 
 ## Why Go, not the PowerShell library
 
@@ -108,9 +109,10 @@ over-trigger stamp was trackable, and whichever ran last won.
 
 ```
 ams-store derive   [--store <dir>|--all] [--workspace <slug>] [--dry-run] [--json]
-                   [--no-harvest] [--stop-below <bytes>] [--projects-root <dir>]
+                   [--no-harvest] [--engage-at <bytes>] [--stop-below <bytes>]
+                   [--projects-root <dir>]
 ams-store lint     [--all] [--workspace <slug>] [--json] [--quiet] [--summary-out <path>]
-ams-store gate     [--stdin-payload]
+ams-store gate     [--stdin-payload] [--engage-at <bytes>]
 ams-store sync     [--once] [--watch] [--timeout <dur>] [--hub-host <name>]
                    [--workspace <slug>] [--allow-local-path] [--json]
 ams-store lock     status | acquire --for <dur> --reason <s> | release | break
@@ -158,10 +160,16 @@ leaves the run unconverged (exit 1).
 
 Phase 3 ships the **legacy hysteresis as the default**: the floor engages at or
 above the 25,000 B sync limit and stops below the 20,000 B trigger, so a store
-between the two is left alone. `--stop-below <bytes>` moves the stop. The
-unconditional-to-trigger floor the design calls for is a threshold change held
-for Phase 4, after the zero-hooks-lost check, so it lands as a decided change
-rather than a silent one.
+between the two is left alone. Both thresholds are flags on the two verbs that run
+the floor: `--engage-at <bytes>` moves the engage point and `--stop-below <bytes>`
+moves the stop, on `derive` and on `gate`. The unconditional-to-trigger floor the
+design calls for is therefore a change of `--engage-at`'s DEFAULT rather than an
+edit to the floor, held for Phase 4 after the zero-hooks-lost check so it lands as
+a decided change rather than a silent one - and it can be rehearsed on one PC
+first. The gate carried its own copy of the same threshold in its silent-exit and
+advise-only rules; both read the engage value now, or a lowered `--engage-at`
+would have been accepted on the command line and then silently skipped before the
+floor was ever called.
 
 The render stops at the 200-line injection cap and reports the omitted entries as
 `over-inject-limit N`; they stay on disk and are the judge's first candidates.
@@ -196,19 +204,68 @@ first and the derived index last, so no index ever points at a file that has not
 landed. A file a live session has touched since that session started is DEFERRED
 rather than replaced, and the queue is applied at the next session boundary.
 
-`MEMORY.md` is never tracked and never merged. Two guards hold that: the
-`info/exclude` entry and the `:(exclude)` pathspec on the forced add, because
-either one alone would still keep it out and a mutation that removes only one
-would look tested. Staging is narrowed to `*.md` for the same reason the exclude
-is a deny-list: the force that gets fact files past the exclude would otherwise
-track whatever else is in the directory, and the PowerShell compactor leaves
-`.bak-<date>-<kind>` files beside the index.
+### The deferred queue is a pending merge result, not a note
 
-A store whose whole workspace directory is gone has its deletion staged, which is
-the one way a store leaves the fleet. The guard is the WORKSPACE directory rather
-than the memory folder: a store folder that vanished while its workspace is still
-there is far more likely a bad stat than a decision, and propagating that would
-carry a fleet-wide removal off one bad read.
+A queued path is already resolved in HISTORY and only withheld from the work tree,
+and both halves of that need holding.
+
+**Nothing re-stages a queued path while it waits.** The staging pass excludes every
+queued path by literal `:(exclude,literal)` pathspec, because a blanket add would
+otherwise re-add the file whose deletion was withheld (resurrecting a judge
+migration fleet-wide) and re-commit the session's older bytes over the merged blob
+(reverting another PC's edit) - the same defect in both directions. The exclusion
+alone is not enough: the merge is computed OUT of tree, so after `update-ref` the
+repository index still describes the pre-merge state and `git commit` would commit
+that stale entry verbatim for exactly the paths the add excludes. Materialize
+therefore runs `git read-tree <merged-tree>` first - plumbing, no `-u`, no file
+touched - which is the only spelling that reconciles the index while leaving the
+work tree alone, `reset` and `checkout` being forbidden here.
+
+**The queue is drained at the top of every `sync --once` pass**, for every
+enumerated workspace, before derive/stage/commit; the watcher's passes drain the
+same way, and a pass that finds queued changes with no drain wired REFUSES (exit 3)
+rather than staging as if nothing were pending. The drain is a RE-CHECK, not a
+replay: each entry records the ours-side blob (the on-disk bytes at defer time) as
+well as the merged blob. If the file still holds those bytes, the merged result
+lands or the file is removed. If it does not, the session edited it AFTER the merge
+and the later edit wins: a replace is merged three-way (base = the queued bytes,
+ours = disk, theirs = the merged blob) with the disk side taking a real body
+conflict, and a deletion is abandoned and reported `resurrected` - deletion-table
+row 3, one pass late, with the deleted side still reachable in history. An entry a
+live session still blocks stays queued. A queue that cannot be read is an error and
+never an empty queue: the drain refuses and the workspace is not staged.
+
+The receipt carries both ends. `deferred` names each withheld change with its OP
+(`[{"path":...,"op":"delete"}]`, where every entry used to be reported as
+`replace`), and `deferred_applied` names what a drain landed, so the audit trail
+does not show changes going into a queue and never coming out.
+
+`MEMORY.md` is never tracked and never merged. Two guards hold that: the
+`info/exclude` entry and the `:(exclude)` pathspec that both staging passes share,
+because either one alone would still keep it out and a mutation that removes only
+one would look tested.
+
+**Staging is two passes over one exclusion list.** The first is the forced add,
+narrowed to `*.md`, and it is the only thing that may ADD a path: the force that
+gets fact files past the blanket exclude would otherwise track whatever else is in
+the directory, and the PowerShell compactor leaves `.bak-<date>-<kind>` files
+beside the index. The second is `git add -u` over the store, TRACKED paths only and
+any extension, because narrowing the add also stopped git ever noticing that the
+artifacts ALREADY tracked are gone - a `.bak-<date>-<kind>` moved out of a store
+stayed tracked with its stale bytes forever and would materialize onto every other
+PC. `-u` never adds a file, so what may be added stays exactly as narrow as it was,
+and the deferred queue is excluded from both passes. An unmatched pathspec is the
+ordinary answer for an empty store in either pass, and the two spell it
+differently, so the shared prefix is what is matched.
+
+A store that is gone has its deletion staged, which is the one way a store leaves
+the fleet. The stat is the STORE directory (`<ws>/memory`), not the workspace: a
+store is recognised by its `MEMORY.md`, so a workspace whose memory directory was
+deleted is never enumerated, was therefore never in the live set, and a stat of the
+workspace kept succeeding and skipping it - its fact files stayed tracked with
+stale bytes forever. Only `IsNotExist` counts as a removal; any other stat error
+leaves the store tracked, which keeps the original caution against propagating a
+fleet-wide removal off one bad read and makes it exact.
 
 **`sync --watch`** is one singleton watcher per PC, not one per session. It holds
 `watch.lock`, wakes on the dirty marker through a filesystem watch, and holds no
@@ -220,7 +277,25 @@ a `Write` is a hook that can stop the operator working, so every error path is
 swallowed and the worst case is silence. It advises under the caps, normalizes an
 index that has crossed the sync limit through the same floor `derive` uses, commits
 locally and marks the tree dirty. It never touches the network: the watcher is what
-carries the change to the hub.
+carries the change to the hub. That claim is proved structurally rather than by a
+stopwatch - the test points `GIT_SSH_COMMAND` at a recording stub, gives the
+fixture hub an ssh URL and fails if the marker file exists, with a companion test
+that dials on purpose and fails if the marker is ABSENT, so "no marker" can never
+quietly mean "the stub was never reached".
+
+### Network calls are hardened by refusal, not by convention
+
+Every reachable network git call already carried the hardening environment
+(`BatchMode=yes`, `ConnectTimeout=2`, `StrictHostKeyChecking=yes`, a pinned
+`known_hosts`) - except the merge engine's own `Fetch`/`Push`, which built their
+commands without it. Rather than add a fourth copy of the same literal, one helper
+in `gitx` owns that environment and `gitx.Run` REFUSES, before the process starts,
+any network subcommand (`fetch`, `push`, `ls-remote`, `clone`, `pull`,
+`remote update`, including behind global options like `-c` and `--git-dir`) whose
+assembled environment carries no non-empty `GIT_SSH_COMMAND`. A local plumbing call
+is untouched by the guard. The single source of truth is now structural: a new
+network call site cannot forget the hardening, because forgetting it does not dial
+- it fails. (`GIT_TERMINAL_PROMPT=0` stays set universally.)
 
 **`lint`** is read-only by contract and never writes inside a store. It carries the
 shipped rules (orphan, dangling, dup-slug, long-line, oversized-file, budget
@@ -230,9 +305,31 @@ losing commit id so the loser is recoverable. `compactor-silent` is parameterise
 on a PC the finding does not exist, because there is no local nightly to be silent;
 on the hub `--nightly-unit` names the systemd timer. The G7 clock - hours over
 trigger without an applied decision - comes from `.ams/over-trigger.json`, which
-rides in the synced tree outside every store and merges with a `min` reducer, so
-the earliest crossing any PC saw is the truth. `derive` and `sync` write it; lint
+rides in the synced tree outside every store. `derive` and `sync` write it; lint
 only reads it.
+
+**A cleared clock stays cleared.** The reducer takes the earliest crossing any PC
+saw, but a clear is an ABSENCE, and a union-of-keys minimum could never represent
+one: the store converged, the local PC deleted its key, and the next merge with any
+PC that had not re-derived brought the old clock straight back, so the G7 alarm
+could never reset. The file therefore carries a second object, `cleared_at`, one
+tombstone per workspace. The reducer takes the MAX of the tombstones first (a
+monotone step, so either reduction order yields the same bytes), then the MIN over
+only the stamps strictly NEWER than their workspace's clear; a dead stamp is
+dropped, the tombstone is kept even when nothing survives it, and a PC that
+re-crosses the trigger after a clear stamps a fresh time that outlives it. An
+unparseable time on either side leaves the stamp ALIVE, so a garbled tombstone
+cannot silence a starvation alarm. A file written before the tombstone existed
+reads correctly (a missing `cleared_at` is empty) and is rewritten into the new
+shape on the first stamp change or merge.
+
+**One renderer owns those bytes.** The producer wrote the file with indented JSON
+while the merge reducer rewrote the same tracked file compactly, so every stamp
+change cost an extra commit and no two PCs agreed on the bytes until a merge had
+run. `lint` now projects its typed stamps onto the merge type and writes through
+the reducer's own renderer at RFC3339 second precision, so one crossing renders
+identically on two machines, and it prunes any stamp the tombstone already
+resolved so it cannot emit bytes the reducer would rewrite.
 
 ## judge-apply
 
@@ -350,15 +447,31 @@ covers a failure that a green suite cannot see:
 times the suite. It exists because a passing suite proves the tests run, not that
 they would NOTICE if a rule were lost.
 
-For each of the 25 rules in blueprint 10.2 it copies the target file aside, applies
-one minimal change that breaks that rule, **builds**, runs the named test alone
-expecting it to FAIL, and restores the file with a byte compare against the
-pre-image. The build step is not ceremony: a mutation that does not compile reads
-as a red test while proving nothing. Neither is the byte-verified restore - the
-gate's first ever run used WSL git against a Windows worktree checkout, every
-`git checkout --` failed silently, fifteen mutations stacked on each other, and it
-reported four rules SURVIVED that had never been tested in isolation.
+For each rule in the table it copies the target file aside, applies one minimal
+change that breaks that rule, **builds**, runs the named test alone expecting it to
+FAIL, and restores the file with a byte compare against the pre-image. The build
+step is not ceremony: a mutation that does not compile reads as a red test while
+proving nothing. Neither is the byte-verified restore - the gate's first ever run
+used WSL git against a Windows worktree checkout, every `git checkout --` failed
+silently, fifteen mutations stacked on each other, and it reported four rules
+SURVIVED that had never been tested in isolation.
 
-Current state: **red 25, survived 0, broken 0, pending 0**. A SURVIVED rule means
-nothing tests it; a NOCOMPILE entry means the mutation is broken. Both were hit
-while arming the last ten and both are reported separately for that reason.
+**The table itself is now anchored by a test.** `TestPorting_EveryMutationAnchorStillExists`
+asserts that each hunk's `Old` text occurs EXACTLY once in its file, byte for byte
+and by the same comparison the applier makes, and
+`TestPorting_EveryMutationNamesATestThatExists` asserts every named test is in the
+`go test -list` set. The table had rotted silently once already: a refactor moved a
+pathspec into another package, the gate refused that row as STALE, and nothing
+automated noticed - so the rule "MEMORY.md is untracked everywhere" was documented
+as defended while no mutation could reach it. A `go test ./internal/porting` now
+fails the moment an anchor moves, which is also what caught the re-anchoring this
+round needed.
+
+Measured state, and the figure is stamped with the commit it was measured at
+because this gate is local-only and drifts between runs: **red 29, survived 0,
+broken 0, pending 0 at `43a6d61`** (windows/amd64, git 2.55.0, whole table, exit
+0). A SURVIVED rule means nothing tests it; a NOCOMPILE or STALE entry means the
+mutation is broken. Both were hit while arming the last ten and both are reported
+separately for that reason, and the figure that stood here before (red 25) was
+never true at the commit it was written at - the gate reported red 23, survived 1,
+broken 1 there. The four deletion-table rows added since take the table to 29.

@@ -156,8 +156,28 @@ Four things this record asserted were settled by building it, and two of them ch
 The 1:1 counterpart obligation this record placed on the test suite is now a test rather
 than a claim. All 95 Pester scenarios map to a named Go test, with exactly one exemption
 carrying its reason - the `-CatchUp` fresh-then-stale run, whose spawn this record removes
-from the PCs. Each of the 25 merge rules has a mutation that turns its named test red;
-the gate currently reports red 25, survived 0, broken 0.
+from the PCs. Every merge rule has a mutation that turns its named test red; the measured
+gate is quoted in `docs/systems/ams-store.md`, stamped with the commit it was measured at,
+because it is a local gate that drifts and an unstamped count is the claim this amendment
+had to correct once already.
+
+**Two rules above are amended by the repair round that followed (2026-09-15).** Point 5's
+"deletions are deferred to the session boundary" understated what a deferral is: a deferred
+path is already resolved in HISTORY and only withheld from the work tree, so the queue is
+load-bearing in both directions. Nothing may re-stage a queued path while it waits (a
+blanket add resurrected a withheld deletion fleet-wide and re-committed a live session's
+older bytes over a merged blob), and the queue must be DRAINED at every session boundary,
+which is where an unreferenced `ApplyDeferred` had left it unread. The drain is a re-check
+against the bytes that were on disk when the entry was queued, not a replay: an unchanged
+file takes the merged result, and a file the session edited after the merge keeps the later
+edit - a replace is reconciled three-way with the disk side winning a real body conflict,
+and a deletion is abandoned and reported `resurrected`, which is this record's own
+modify-vs-delete rule arriving one pass late. Point 8's synced first-crossing stamp needs
+one addition: a `min` reducer over a union of keys cannot represent a CLEAR, so a converged
+store's cleared clock returned from any PC that had not re-derived and the health number
+could never reset. The stamp file carries a per-workspace `cleared_at` tombstone; the
+reducer maxes the tombstones and then mins only the stamps newer than their clear, and an
+unparseable time keeps a stamp alive so a garbled tombstone cannot silence the alarm.
 
 ## Alternatives considered
 
