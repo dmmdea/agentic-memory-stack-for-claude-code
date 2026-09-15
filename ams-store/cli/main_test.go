@@ -2,9 +2,11 @@ package cli_test
 
 import (
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/cli"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
 )
 
@@ -13,6 +15,26 @@ import (
 // testutil.RunWithSandboxHome - one implementation, so a package that adds a TestMain
 // later cannot get a weaker version of it.
 func TestMain(m *testing.M) { os.Exit(testutil.RunWithSandboxHome(m)) }
+
+// isolateLocks points every per-PC lock the verbs take at names nothing outside this
+// test can hold, and restores the production names when the test ends.
+//
+// Without it the verbs take `Local\ams-store` and the PowerShell compactor's
+// `Local\ams-memory-compact` - real objects on the operator's desktop. Measured at the
+// branch this was written on: with a sibling process holding the legacy mutex, sixteen
+// tests in this package fail on exit 4, and several others pass while asserting nothing,
+// because the verb skipped as a contender before it produced the output under test. The
+// suite's result must not depend on whether a nightly compaction happens to be running.
+//
+// The pid is in the name because two checkouts run this package at once during a repair
+// round; the test name is in it because two tests in one binary must not contend either.
+// The re-executed child process (TestHelperSleeper) needs no override: it only sleeps,
+// and takes no lock at all.
+func isolateLocks(t *testing.T) {
+	t.Helper()
+	suffix := "-" + strconv.Itoa(os.Getpid()) + "-" + t.Name()
+	t.Cleanup(cli.UseTestLockNames(`Local\ams-store-test`+suffix, `Local\ams-store-test-legacy`+suffix))
+}
 
 // sleeperEnv makes a re-executed test binary block instead of running the suite, which is
 // how these tests get a REAL live process id that is not their own.

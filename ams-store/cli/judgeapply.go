@@ -168,7 +168,7 @@ func runJudgeApply(env Env, args []string) int {
 	// the legacy compactor mutex, for as long as both exist. The hub runs this from a
 	// timer while the same checkout may be syncing; without the lock a nightly apply and
 	// a merge materialize can be inside one store at the same moment.
-	l, lockErr := lock.Acquire(lock.Options{Path: LockPath(roots.StateRoot), Reason: "judge-apply", Now: now})
+	l, lockErr := lock.Acquire(lockOptions(LockPath(roots.StateRoot), "judge-apply", now))
 	if lockErr != nil {
 		if isHeld(lockErr) {
 			fmt.Fprintln(env.Stderr, "ams-store judge-apply: the per-PC lock is held; skipping")

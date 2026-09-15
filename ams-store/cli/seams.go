@@ -47,7 +47,7 @@ type deriveLock struct {
 }
 
 func (d deriveLock) TryAcquire(reason string) (func(), bool, error) {
-	l, err := lock.Acquire(lock.Options{Path: d.path, Reason: reason, Now: d.now})
+	l, err := lock.Acquire(lockOptions(d.path, reason, d.now))
 	if err != nil {
 		if isHeld(err) {
 			return nil, false, nil

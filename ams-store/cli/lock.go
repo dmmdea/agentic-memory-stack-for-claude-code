@@ -43,6 +43,53 @@ func lockCommand() command {
 // LockPath is the per-PC lock file under a state root.
 func LockPath(stateRoot string) string { return filepath.Join(stateRoot, lock.FileName) }
 
+// lockNames is the pair of Windows named mutexes every verb in this package takes the
+// per-PC lock with. Empty means the production names, which is what the binary always
+// uses; only a test binary ever sets it.
+//
+// internal/lock already offers the seam - lock.Options.MutexName and LegacyMutexName
+// exist, its own suite isolates itself through them - but the verbs BUILD their
+// lock.Options here, so a cli test had no way to say "not the operator's real lock".
+// The cost of that was measured: with the PowerShell compactor's own
+// Local\ams-memory-compact held by any sibling process (a real nightly compaction, a
+// second checkout's test binary), sixteen cli tests fail on exit 4, and the ones that
+// assert about a verb's OUTPUT go vacuously green because the verb skipped as a
+// contender before it did anything to assert about. That is worse than flakiness: the
+// gate's no-network test reported PASS while the gate never ran.
+//
+// It is package-level state rather than a field on globalOpts on purpose: the flag set
+// is the operator's surface, and a --mutex-name flag would be a way to point the
+// shipped binary away from the lock it exists to respect.
+var lockNames struct {
+	mutex  string
+	legacy string
+}
+
+// UseTestLockNames scopes every per-PC lock this package takes to the given mutex names
+// and returns the restore function. It is exported for cli's external test package,
+// which is the only caller: package cli_test cannot reach an unexported variable, and a
+// test that has to spawn a whole binary to isolate a mutex will not be written.
+//
+// legacy may be "-" to disable the legacy mutex entirely, exactly as lock.Options
+// documents.
+func UseTestLockNames(mutexName, legacy string) func() {
+	prev := lockNames
+	lockNames.mutex, lockNames.legacy = mutexName, legacy
+	return func() { lockNames = prev }
+}
+
+// lockOptions is the ONE construction of lock.Options in this package. Every verb goes
+// through it, so an isolation seam cannot reach four call sites and miss the fifth.
+func lockOptions(path, reason string, now time.Time) lock.Options {
+	return lock.Options{
+		Path:            path,
+		Reason:          reason,
+		Now:             now,
+		MutexName:       lockNames.mutex,
+		LegacyMutexName: lockNames.legacy,
+	}
+}
+
 func runLock(env Env, args []string) int {
 	var g globalOpts
 	fs := newFlagSet("lock")
@@ -116,7 +163,7 @@ func lockStatus(env Env, g globalOpts, path string, now time.Time) int {
 // file and exited would leave a holder whose PID is dead, which the next contender
 // breaks at once - so the lock would have protected nothing.
 func lockAcquire(env Env, g globalOpts, path, reason string, hold time.Duration, now time.Time) int {
-	l, err := lock.Acquire(lock.Options{Path: path, Reason: reason, Now: now})
+	l, err := lock.Acquire(lockOptions(path, reason, now))
 	if err != nil {
 		if errors.Is(err, lock.ErrHeld) {
 			// A contender SKIPS. No retry, no backoff, no timeout parameter.

@@ -101,7 +101,7 @@ func runGate(env Env, args []string) (code int) {
 		// advisory printer: it says the index is over the limit and does nothing about it.
 		Floor: floorAdapter{},
 		TryLock: func() (func(), bool) {
-			l, err := lock.Acquire(lock.Options{Path: LockPath(roots.StateRoot), Reason: "gate", Now: now})
+			l, err := lock.Acquire(lockOptions(LockPath(roots.StateRoot), "gate", now))
 			if err != nil {
 				return func() {}, false
 			}
@@ -143,7 +143,7 @@ func markAndCommit(ctx context.Context, env Env, g globalOpts, roots store.Roots
 		fmt.Fprintf(env.Stderr, "ams-store gate: dirty marker: %v\n", err)
 	}
 
-	l, err := lock.Acquire(lock.Options{Path: LockPath(roots.StateRoot), Reason: "gate", Now: now})
+	l, err := lock.Acquire(lockOptions(LockPath(roots.StateRoot), "gate", now))
 	if err != nil {
 		// A contender skips. The marker is already down, so the work is not lost - the
 		// holder's own pass, or the next one, will commit it.

@@ -26,6 +26,7 @@ const hubHost = "hub-host"
 // scenario costs milliseconds.
 func runIn(t *testing.T, sb *testutil.Sandbox, stdin string, args ...string) (int, string, string) {
 	t.Helper()
+	isolateLocks(t)
 	var out, errb strings.Builder
 	full := append([]string{args[0],
 		"--state-root", sb.StateRoot,
