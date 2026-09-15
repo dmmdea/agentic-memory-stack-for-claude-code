@@ -524,6 +524,90 @@ func Run(opt Options) (*Result, error) {
 	return res, nil
 }
 
+// Harvest runs the harvest step alone: it copies each index entry's hook text into that
+// entry's fact file as hook:, and stamps `migrated: <id>` onto a re-created slug the
+// history says was migrated. It writes no index and renders nothing.
+//
+// The step is part of derive; the standalone entry point exists because harvest must run
+// on every PC BEFORE that PC's first push (DESIGN:365-366). Without it, PC A's index hook
+// and PC B's index hook for the same slug arrive at the hub as two competing `hook:`
+// additions; with it, both sides already carry the key and the merge sees a `hook:`-only
+// difference, which the deletion table's normalized comparison treats as no difference.
+func Harvest(opt Options) (*Result, error) {
+	now := opt.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	res := &Result{
+		TS:         now.UTC().Format(time.RFC3339Nano),
+		Workspace:  opt.Store.Workspace,
+		DryRun:     opt.DryRun,
+		Status:     StatusErrorStore,
+		Mem0:       []string{},
+		Mem0Orphan: []string{},
+	}
+	logf := func(format string, a ...any) {
+		if opt.Log == nil {
+			return
+		}
+		fmt.Fprintf(opt.Log, opt.Store.Workspace+": "+format+"\n", a...)
+	}
+
+	if opt.Lock != nil {
+		release, ok, err := opt.Lock.TryAcquire("harvest")
+		if err != nil {
+			res.Note = err.Error()
+			return res, fmt.Errorf("acquire the per-PC lock: %w", err)
+		}
+		if !ok {
+			res.Status = StatusSkippedLockHeld
+			res.Note = "another process holds the per-PC lock; skipping immediately rather than queueing behind it"
+			return res, ErrLocked
+		}
+		if release != nil {
+			defer release()
+		}
+	}
+
+	dir := opt.Store.Dir
+	indexPath := opt.Store.IndexPath
+	if indexPath == "" {
+		indexPath = filepath.Join(dir, store.IndexName)
+	}
+	preBytes, err := os.ReadFile(indexPath)
+	if err != nil {
+		res.Note = err.Error()
+		return res, fmt.Errorf("read index %s: %w", indexPath, err)
+	}
+	idx := index.Parse(string(preBytes))
+	res.BeforeBytes = index.ByteCount(string(preBytes))
+	res.BeforeLines = idx.LineCount()
+
+	factFiles, err := store.FactFiles(dir)
+	if err != nil {
+		res.Note = err.Error()
+		return res, err
+	}
+	names := make([]string, 0, len(factFiles))
+	onDisk := make(map[string]bool, len(factFiles))
+	for _, f := range factFiles {
+		names = append(names, f.Name)
+		onDisk[f.Name] = true
+	}
+
+	res.Status = StatusNoOp
+	if opt.NoHarvest || opt.DryRun {
+		return res, nil
+	}
+	harvest(opt, dir, idx.Entries(), names, onDisk, res, logf)
+	if res.Harvested > 0 || res.MigratedStamped > 0 {
+		res.Status = StatusApplied
+		res.Changed = true
+		logf("harvested %d hook(s), stamped %d migrated id(s)", res.Harvested, res.MigratedStamped)
+	}
+	return res, nil
+}
+
 // harvest is the only fact-file write derive makes (DESIGN:193-195, decision Q8).
 //
 // It must run on every PC before that PC's first push: without it PC A's index hook and
