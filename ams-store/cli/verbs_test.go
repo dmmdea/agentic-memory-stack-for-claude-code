@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/cli"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gate"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lint"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
@@ -326,21 +328,92 @@ func TestCLI_GateAdvisesOnAnOversizedIndex(t *testing.T) {
 	}
 }
 
+// sshStub writes a recording stand-in for ssh and points GIT_SSH_COMMAND at it for the
+// rest of the test. It returns the marker path the stub touches.
+//
+// git runs GIT_SSH_COMMAND through a shell - its own bundled sh on Windows - so one
+// POSIX script serves every platform. The stub exits 255, which is what ssh itself
+// returns when it cannot connect: a dial that reaches the stub must look to git like a
+// dial that failed, or a test could pass because the transport succeeded.
+func sshStub(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	marker := filepath.ToSlash(filepath.Join(dir, "dialed"))
+	script := filepath.Join(dir, "ssh-stub.sh")
+	body := "#!/bin/sh\n: > \"" + marker + "\"\nexit 255\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", "sh \""+filepath.ToSlash(script)+"\"")
+	return marker
+}
+
+// TestCLI_GateNeverTouchesTheNetwork.
+//
+// "No network on the hook path" (DESIGN:184, blueprint section 6) is a hard rule: the
+// gate runs on every Write and Edit inside the harness's 10 s hook timeout, and a dial
+// on a dead tailnet link is time the operator spends waiting on their own edit.
+//
+// The proof is a RECORDING STUB, not a stopwatch. The previous form asserted only that
+// the verb finished inside 8 s, against a product that caps its own SSH connect at 2 s
+// and a fixture host that fails DNS in milliseconds; a real `git fetch hub main`
+// inserted into the gate path passed it in 3.69 s and the whole module stayed green.
+// Here the hub remote speaks ssh and ssh IS the stub, so any git subcommand that opens
+// the transport leaves a file behind - whether it succeeds, fails or times out. The
+// timing check stays as a second assertion, because "never dials" and "never blocks the
+// edit loop" are two different promises and the gate owes both.
 func TestCLI_GateNeverTouchesTheNetwork(t *testing.T) {
-	// Network is never on a hook's critical path. The proof here is structural: the gate
-	// runs with a hub remote configured and an unroutable URL, and still exits 0 fast.
 	sb := testutil.NewSandbox(t)
 	dir := cleanStore(t, sb, "ws")
 	gitDir := sb.InitHistory()
 	gitCLI(t, gitDir, sb.ProjectsRoot, "remote", "add", "hub", "ams-hub@"+hubHost+":ams-store.git")
 
+	marker := sshStub(t)
+
 	start := time.Now()
 	code, _, _ := runIn(t, sb, hookPayload(filepath.Join(dir, store.IndexName)), "gate")
+	elapsed := time.Since(start)
 	if code != cli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
-	if d := time.Since(start); d > 8*time.Second {
-		t.Errorf("the gate took %s; it must stay well under the 10 s hook timeout and must never dial the hub", d)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("the gate opened the ssh transport: %s exists. Network is never on a hook's"+
+			" critical path - the gate commits locally and marks the tree dirty, and the"+
+			" watcher is what carries the change to the hub.", marker)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat the dial marker: %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Errorf("the gate took %s; it must stay well under the 10 s hook timeout", elapsed)
+	}
+}
+
+// TestCLI_GateNetworkStubRecordsARealDial is the control for the test above: it proves
+// the stub can fail it.
+//
+// A guard that has never been seen to fire is decorative, and this one is cheap to arm -
+// the same fixture, the same stub, and one deliberate fetch through the same gitx path
+// the gate uses. Without it, "the marker does not exist" is equally consistent with "the
+// gate dials nothing" and "GIT_SSH_COMMAND never reached git at all".
+func TestCLI_GateNetworkStubRecordsARealDial(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	cleanStore(t, sb, "ws")
+	gitDir := sb.InitHistory()
+	gitCLI(t, gitDir, sb.ProjectsRoot, "remote", "add", "hub", "ams-hub@"+hubHost+":ams-store.git")
+
+	marker := sshStub(t)
+
+	// The fetch is EXPECTED to fail - the stub is not an ssh server. What is under test is
+	// that it got as far as the transport.
+	_, _ = gitx.Run(context.Background(), gitx.Options{
+		GitDir: gitDir, WorkTree: sb.ProjectsRoot, Timeout: 30 * time.Second,
+		OkExit: gitx.OkExitCodes(0, 1, 128),
+	}, "fetch", "hub", "main")
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("a real fetch left no dial marker (%v), so the no-network assertion above"+
+			" proves nothing. GIT_SSH_COMMAND is not reaching git, or the stub is not"+
+			" runnable here.", err)
 	}
 }
 
