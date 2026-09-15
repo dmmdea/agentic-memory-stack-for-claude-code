@@ -91,3 +91,63 @@ func TestSync_TrackedNonFactFileDeletionIsStaged(t *testing.T) {
 			" resurrection the exclusion exists to prevent.", tracked)
 	}
 }
+
+// TestSync_StoreRemovedWhileTheWorkspaceStaysIsStaged covers the removal shape the
+// workspace-level guard could not see.
+//
+// Enumeration recognises a store by its index, so a workspace whose `memory` directory is
+// gone is never enumerated - and the removal sweep then stats the WORKSPACE directory,
+// which is still there, and concludes nothing was removed. The fact files stay tracked
+// forever with their stale bytes, are pushed on every sync, and materialize back onto
+// every other PC. A project folder outliving its store is the ordinary case: the
+// transcripts stay behind when the store is deleted.
+func TestSync_StoreRemovedWhileTheWorkspaceStaysIsStaged(t *testing.T) {
+	sb, repo, _ := pcFixture(t, "keep", map[string]string{"a.md": "---\nname: a\n---\n\nbody\n"})
+	sb.AddStore("gone", []string{"# Memory Index", "", "- [B](b.md)"},
+		map[string]string{"b.md": "---\nname: b\n---\n\nbody\n"})
+
+	ctx := context.Background()
+	for _, ws := range []string{"keep", "gone"} {
+		if err := repo.Stage(ctx, ws); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repo.Commit(ctx, "seed", "pc", "local"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The store is deleted; the project directory and its transcripts stay.
+	if err := os.RemoveAll(filepath.Join(sb.ProjectsRoot, "gone", "memory")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sb.ProjectsRoot, "gone", "session.jsonl"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := repo.StageVanishedStores(ctx, []string{"keep"})
+	if err != nil {
+		t.Fatalf("StageVanishedStores: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "gone" {
+		t.Fatalf("staged removals = %v, want [gone]: the store is what is tracked, so the"+
+			" store directory is what decides whether it is gone", removed)
+	}
+	if _, err := repo.Commit(ctx, "remove gone", "pc", "local"); err != nil {
+		t.Fatal(err)
+	}
+	still, err := repo.Tracked(ctx, "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(still) != 0 {
+		t.Fatalf("the removed store is still tracked: %v", still)
+	}
+	kept, err := repo.Tracked(ctx, "keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) == 0 {
+		t.Fatal("the surviving store was untracked too - a removal pass that takes the" +
+			" live stores with it is worse than the leak it fixes")
+	}
+}

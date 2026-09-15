@@ -98,12 +98,19 @@ func (r Repo) StageShared(ctx context.Context) error {
 // its files are never seen as deleted. A live sync on 2026-09-15 reported "5 store(s)"
 // and left 61 deletions of exactly such a store unstaged.
 //
-// The guard is the whole WORKSPACE directory, not just its memory folder. A store folder
-// that vanished while its workspace is still there is far more likely a transient stat
-// failure than a decision, and propagating that would carry a fleet-wide removal off one
-// bad read - the merge's modify/delete rule would resurrect edited files, but untouched
-// ones would simply go. The caller passes the workspaces enumeration actually found, so a
-// failed enumeration (which fails closed upstream) never reaches this.
+// The guard is the STORE directory, because the store is what is tracked. Guarding the
+// whole workspace directory instead missed the ordinary shape of a removal: a project
+// folder outlives its store - the transcripts stay behind - and enumeration recognises a
+// store by its index, so such a workspace is never enumerated and its files stayed
+// tracked with stale bytes forever, pushed on every sync and materialized back onto every
+// other PC.
+//
+// The original caution stands and is spelled out instead of approximated: only a stat
+// that says NOT FOUND is a removal. Any other stat error - a permission fault, a
+// disconnected share - leaves the store tracked, because propagating a fleet-wide removal
+// off one bad read is the failure worth being careful about. The caller passes the
+// workspaces enumeration actually found, so a failed enumeration (which fails closed
+// upstream) never reaches this.
 func (r Repo) StageVanishedStores(ctx context.Context, live []string) ([]string, error) {
 	res, err := gitx.Run(ctx, r.opts(), "ls-files")
 	if err != nil {
@@ -126,8 +133,8 @@ func (r Repo) StageVanishedStores(ctx context.Context, live []string) ([]string,
 			continue
 		}
 		seen[ws] = true
-		if _, statErr := os.Stat(filepath.Join(r.WorkTree, ws)); statErr == nil {
-			continue // the workspace is still there; this is not a removal
+		if _, statErr := os.Stat(filepath.Join(r.WorkTree, filepath.FromSlash(RelPath(ws)))); !os.IsNotExist(statErr) {
+			continue // the store is there, or we cannot tell: either way, not a removal
 		}
 		if _, err := gitx.Run(ctx, r.opts(), "rm", "-r", "-q", "--cached", "--ignore-unmatch",
 			"--", RelPath(ws)); err != nil {
