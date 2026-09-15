@@ -161,3 +161,57 @@ func TestSync_RepoShapeMatchesTheMergeEngine(t *testing.T) {
 		t.Fatalf("sync and the merge engine write different info/exclude files.\nsync:\n%s\nmerge:\n%s", got, want)
 	}
 }
+
+// TestSync_OnlyFactFilesAreStaged.
+//
+// Nothing but MEMORY.md and fact files may live in a store (blueprint 1.4): the store is
+// synced by the harness and globbed by agents, so anything else in there resurfaces in
+// every agent's glob on every PC that receives it.
+//
+// Staging used a FORCED pathspec over the whole directory, because info/exclude excludes
+// everything and the force is what gets fact files past it. The force also drags in
+// whatever else is sitting there - and something always is: the PowerShell compactor
+// leaves .bak-<date>-<kind> files beside the index, and a live sync on 2026-09-15 put
+// several of them into history, on their way to the hub and then to every other PC.
+//
+// Narrowing the force to *.md is the fix. This test is about what is STAGED, not about
+// what is deleted: a file that is already tracked stays tracked and stays on disk, because
+// untracking it here would propagate a deletion of a real file on someone else's machine.
+func TestSync_OnlyFactFilesAreStaged(t *testing.T) {
+	sb, repo, _ := pcFixture(t, "ws", map[string]string{"a.md": "---\nname: a\n---\n\nbody\n"})
+	dir := filepath.Join(sb.ProjectsRoot, "ws", "memory")
+	for _, name := range []string{
+		"MEMORY.md.bak-2026-09-15-linefloor",
+		"a.md.bak-2026-09-15-frontmatter",
+		"notes.txt",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("junk\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+	if err := repo.Stage(ctx, "ws"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Commit(ctx, "seed", "pc", "local"); err != nil {
+		t.Fatal(err)
+	}
+
+	tracked, err := repo.Tracked(ctx, "ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ws/memory/a.md"}
+	if len(tracked) != 1 || tracked[0] != want[0] {
+		t.Fatalf("tracked = %v, want exactly %v.\n"+
+			"A forced pathspec over the whole directory carries maintenance artifacts to"+
+			" the hub and from there into every agent's glob on every PC.", tracked, want)
+	}
+	// The files are still on disk: this narrows what is SYNCED, it does not clean up.
+	for _, name := range []string{"MEMORY.md.bak-2026-09-15-linefloor", "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s was removed from disk; narrowing the pathspec must not delete anything", name)
+		}
+	}
+}

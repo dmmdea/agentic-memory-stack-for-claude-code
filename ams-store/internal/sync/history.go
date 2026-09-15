@@ -138,17 +138,19 @@ func RelPath(workspace string) string { return workspace + "/memory" }
 func IndexRelPath(workspace string) string { return RelPath(workspace) + "/" + store.IndexName }
 
 // Stage stages every fact file of a workspace, additions, modifications and deletions
-// alike, and never MEMORY.md.
+// alike, and never MEMORY.md and never anything that is not a fact file.
 //
-// The forced pathspec is what gets fact files past the blanket exclude; the explicit
-// :(exclude) is what keeps the force from also dragging MEMORY.md in. Without it, `add
-// -f` would override the exclude for the whole directory and the derived index would
-// become a tracked, mergeable file again - the exact thing the design removed.
+// The forced pathspec is what gets fact files past the blanket exclude. It is narrowed to
+// *.md for the same reason info/exclude is a deny-list with re-includes: the force
+// overrides the exclude, so a force over the whole DIRECTORY tracks whatever happens to be
+// sitting in it. Something always is - the PowerShell compactor leaves .bak-<date>-<kind>
+// files beside the index - and blueprint 1.4 is explicit that nothing but MEMORY.md and
+// fact files may live in a store, because the store is globbed by agents on every PC that
+// receives it. The explicit :(exclude) then keeps the index itself out, since MEMORY.md
+// matches *.md and is DERIVED, never merged.
 func (r Repo) Stage(ctx context.Context, workspace string) error {
 	rel := RelPath(workspace)
-	_, err := gitx.Run(ctx, r.opts(),
-		"add", "-A", "-f", "--", rel, ":(exclude)"+IndexRelPath(workspace))
-	if err != nil {
+	if err := gitx.AddFactFiles(ctx, r.opts(), rel, store.IndexName); err != nil {
 		return fmt.Errorf("sync: stage %s: %w", rel, err)
 	}
 	return nil

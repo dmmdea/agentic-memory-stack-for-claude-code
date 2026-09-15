@@ -72,6 +72,32 @@ func EmptyTree(ctx context.Context, opt Options) (string, error) {
 	return out, nil
 }
 
+// AddFactFiles stages a store's fact files: additions, modifications and deletions.
+//
+// The pathspec is forced past info/exclude and narrowed to *.md, with the derived index
+// excluded. It lives here rather than in two packages because the merge engine and sync
+// both stage the same thing, and a narrowing applied in one place only is a narrowing
+// that whichever code path ran last undoes.
+//
+// An unmatched pathspec is NOT an error here. git add exits 128 with "did not match any
+// files" when a store holds no fact file at all - a workspace whose facts were all
+// migrated, or one created empty - and that is a store with nothing to stage, not a
+// failure. The message is checked rather than the code alone, so a genuine bad pathspec
+// still surfaces.
+func AddFactFiles(ctx context.Context, opt Options, storeRel, indexName string) error {
+	o := opt
+	o.OkExit = OkExitCodes(0, 128)
+	res, err := Run(ctx, o, "add", "-A", "-f", "--",
+		":(glob)"+storeRel+"/*.md", ":(exclude)"+storeRel+"/"+indexName)
+	if err != nil {
+		return err
+	}
+	if res.Code == 0 || strings.Contains(res.Stderr, "did not match any files") {
+		return nil
+	}
+	return fmt.Errorf("git add %s: exit %d: %s", storeRel, res.Code, strings.TrimSpace(res.Stderr))
+}
+
 // HashObject writes data as a blob and returns its id. data may be empty.
 func HashObject(ctx context.Context, opt Options, data []byte) (string, error) {
 	if data == nil {

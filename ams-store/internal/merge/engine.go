@@ -172,11 +172,12 @@ func (e *Engine) Commit(ctx context.Context, co CommitOptions) (oid string, chan
 		if _, statErr := os.Stat(filepath.Join(e.WorkTree, filepath.FromSlash(rel))); statErr != nil {
 			continue
 		}
-		// -f forces past info/exclude for the fact files, and the exclude pathspec keeps
-		// MEMORY.md out even under -f: forcing the directory in would otherwise track
-		// the one file the design requires to stay untracked.
-		if _, err := gitx.Run(ctx, e.opt(), "add", "-A", "-f", "--",
-			rel, ":(exclude)"+rel+"/"+store.IndexName); err != nil {
+		// -f forces past info/exclude for the fact files, narrowed to *.md so the force
+		// does not also track whatever else is sitting in the directory (blueprint 1.4:
+		// nothing but MEMORY.md and fact files may live in a store). The exclude pathspec
+		// then keeps MEMORY.md out even under -f, since it matches *.md too and forcing
+		// it in would track the one file the design requires to stay untracked.
+		if err := gitx.AddFactFiles(ctx, e.opt(), rel, store.IndexName); err != nil {
 			return "", false, err
 		}
 	}

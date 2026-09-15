@@ -3,11 +3,14 @@ package testutil
 import (
 	"fmt"
 	"strings"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
-// EmDash is the index separator, built from its code point so this source file stays
-// ASCII-only like every other file in the module.
-const EmDash = "—"
+// EmDash is the index separator. It is store.EmDash, not a second copy: two spellings of
+// the separator is how a fixture ends up asserting against a character the renderer never
+// writes.
+const EmDash = store.EmDash
 
 // FactFile renders a fact file in the exact shape New-Fact produces in the Pester
 // fixture: --- , name:, a double-quoted description:, metadata: with node_type, a
