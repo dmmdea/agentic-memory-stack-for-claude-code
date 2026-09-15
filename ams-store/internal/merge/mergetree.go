@@ -119,10 +119,22 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 		return nil, err
 	}
 	baseTreeish := base
+	emptyTree := ""
 	if !hasBase {
-		// Unrelated histories: two PCs that both initialized before either pushed. The
-		// empty tree is the honest base - everything on both sides is an addition.
-		baseTreeish, err = gitx.EmptyTree(ctx, e.opt())
+		// Unrelated histories: two PCs that each ran `git init` before either had pushed.
+		// The empty tree is the honest base - everything on both sides is an addition.
+		//
+		// It has to be handed to merge-tree as a COMMIT, not as the tree itself. git 2.55
+		// accepts a tree for --merge-base; git 2.43 refuses it outright ("object ... is a
+		// tree, not a commit") and the whole first sync between two fresh PCs fails. The
+		// design's floor is git 2.38, so the version that refuses is inside the supported
+		// range and the version that accepts is the one this was written on - which is
+		// how it shipped green. Wrapping the empty tree in a commit works on both.
+		emptyTree, err = gitx.EmptyTree(ctx, e.opt())
+		if err != nil {
+			return nil, err
+		}
+		baseTreeish, err = gitx.CommitTree(ctx, e.opt(), emptyTree, nil, "ams-store: empty merge base")
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +146,7 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 	}
 	rep.Clean = mt.Clean
 
-	baseTree := baseTreeish
+	baseTree := emptyTree
 	if hasBase {
 		baseTree, err = e.treeOf(ctx, base)
 		if err != nil {

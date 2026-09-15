@@ -715,3 +715,43 @@ func TestMerge_IndexIsNeverTracked(t *testing.T) {
 		t.Fatalf("B's index was changed by the sync: %q", got)
 	}
 }
+
+// TestMerge_UnrelatedHistoriesMergeOnEverySupportedGit is the FIRST sync of the fleet:
+// two PCs that each ran `git init` locally before either had ever pushed, so their
+// histories share no commit at all. It is the shape the seed produces on every PC after
+// the Qube's, and it happens exactly once per box - which is also why it can ship broken.
+//
+// The failure it pins is VERSION-dependent, and therefore invisible on the machine it was
+// written on. The unrelated-histories path has to hand merge-tree a base; git 2.55 accepts
+// the empty TREE for --merge-base, and git 2.43 refuses it outright as "not a commit". The
+// design's floor is git 2.38, so the version that refuses is inside the supported range
+// and the version that accepts is the one the engine was developed against. The Linux CI
+// runner is what notices.
+func TestMerge_UnrelatedHistoriesMergeOnEverySupportedGit(t *testing.T) {
+	f := newFleet(t, "a", "b")
+	a, b := f.pcs["a"], f.pcs["b"]
+
+	a.write(ws, "a.md", fact("A", "written on A", "the a hook", "a body\n"))
+	a.commit("A writes")
+	if r := a.push(); !r.OK {
+		t.Fatalf("A could not seed the hub: %s", r.Stderr)
+	}
+
+	// B has never fetched, so its own main is a root commit unrelated to A's.
+	b.write(ws, "b.md", fact("B", "written on B", "the b hook", "b body\n"))
+	b.commit("B writes")
+
+	rep := b.mergeOnly(b.mo())
+	if rep.Commit == "" {
+		t.Fatalf("nothing was merged across the unrelated histories: %+v", rep)
+	}
+	for _, name := range []string{"a.md", "b.md"} {
+		if !b.exists(ws, name) {
+			t.Errorf("%s is missing from B's work tree after the merge; an unrelated-history"+
+				" merge must be a union, not a replacement", name)
+		}
+	}
+	if r := b.push(); !r.OK {
+		t.Fatalf("B could not push the merge: %s", r.Stderr)
+	}
+}
