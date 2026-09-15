@@ -1,10 +1,3 @@
-// Package porting holds the two tables that make the PowerShell-to-Go port checkable
-// rather than merely claimed: the 1:1 Pester counterpart table, and the mutation gate.
-//
-// Both exist because "we ported it" is not a fact anyone can verify from a diff. The
-// counterpart table says every behaviour the PowerShell suite pinned is still pinned
-// here, by name; the mutation table says each of those pins is load-bearing, because
-// breaking the rule turns the named test red.
 package porting
 
 // Counterpart is one Pester scenario and the Go test that carries it.
