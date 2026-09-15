@@ -10,7 +10,8 @@ import (
 
 // deriveUsage is the --help block for `ams-store derive`, blueprint section 1.1.
 const deriveUsage = `usage: ams-store derive [--store <dir>|--all] [--workspace <slug>] [--dry-run] [--json]
-                        [--no-harvest] [--stop-below <bytes>] [--projects-root <dir>]
+                        [--no-harvest] [--engage-at <bytes>] [--stop-below <bytes>]
+                        [--projects-root <dir>]
 
 Re-derive MEMORY.md from the fact files of one store or of every store. derive is the
 single deterministic writer: it harvests index hooks into frontmatter, runs hygiene,
@@ -23,8 +24,14 @@ index atomically as LF.
   --dry-run              report what would change; write nothing
   --json                 one JSON document on stdout, nothing else
   --no-harvest           skip the frontmatter harvest step
+  --engage-at <bytes>    floor engage threshold (default: the harness sync limit)
   --stop-below <bytes>   floor stop threshold (default: the compactor trigger)
   --projects-root <dir>  override the projects root (test injection)
+
+The two floor thresholds are decision Q2's hysteresis: the floor engages at or above
+--engage-at and truncates down to --stop-below. The Phase 4 flip to an
+unconditional-to-trigger floor is a change of --engage-at's DEFAULT, so it can be
+rehearsed and measured on one PC before it is decided for the fleet.
 
 Exit: 0 normal or skipped, 1 still over the sync limit after the floor, 2 bad
 invocation, 3 refused, 4 lock held by another process.`
@@ -56,6 +63,7 @@ func runDerive(env Env, args []string) int {
 		dryRun    bool
 		noHarvest bool
 		stopBelow int
+		engageAt  int
 	)
 	fs := newFlagSet("derive")
 	fs.StringVar(&storeDir, "store", "", "one store (the memory directory)")
@@ -64,6 +72,7 @@ func runDerive(env Env, args []string) int {
 	fs.BoolVar(&dryRun, "dry-run", false, "report what would change; write nothing")
 	fs.BoolVar(&noHarvest, "no-harvest", false, "skip the frontmatter harvest step")
 	fs.IntVar(&stopBelow, "stop-below", 0, "floor stop threshold in bytes")
+	fs.IntVar(&engageAt, "engage-at", 0, "floor engage threshold in bytes")
 	g.bind(fs)
 	if _, err := parseArgs(fs, args); err != nil {
 		return usageError(env, fs.Name(), err)
@@ -115,6 +124,7 @@ func runDerive(env Env, args []string) int {
 			DryRun:         dryRun,
 			NoHarvest:      noHarvest,
 			StopBelowBytes: stopBelow,
+			EngageAtBytes:  engageAt,
 			Now:            now,
 			Commits:        commits,
 			Lock:           dlock,

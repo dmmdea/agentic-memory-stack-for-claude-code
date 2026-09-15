@@ -47,11 +47,12 @@ type FloorResult struct {
 // night - so this interface is a seam for wiring, never a licence for a second
 // implementation.
 //
-// Contract (LIB:634-688): truncate non-doctrine entry hooks IN PLACE, longest rendered
-// line first, until the projected index is under stopBelow; never touch a doctrine line;
-// reject any truncation that does not shrink the line or that fails the round-trip check.
+// Contract (LIB:634-688): engage only at or above engageAt; then truncate non-doctrine
+// entry hooks IN PLACE, longest rendered line first, until the projected index is under
+// stopBelow; never touch a doctrine line; reject any truncation that does not shrink the
+// line or that fails the round-trip check.
 type Floorer interface {
-	Floor(records []*index.Record, storeDir, newline string, stopBelow int) (FloorResult, error)
+	Floor(records []*index.Record, storeDir, newline string, engageAt, stopBelow int) (FloorResult, error)
 }
 
 // Options configures one gate invocation.
@@ -63,6 +64,12 @@ type Options struct {
 	// StopBelow is the floor's stop threshold. Zero means the compactor trigger, which
 	// is the legacy hysteresis: engage at the sync limit, stop below the trigger.
 	StopBelow int
+	// EngageAt is the size at or above which the gate normalizes at all. Zero means the
+	// sync limit - decision Q2's legacy hysteresis, and the value Phase 4 lowers to the
+	// trigger. It is the gate's own threshold as well as the floor's: below it the gate
+	// advises and never rewrites, so the two must move together or the gate would
+	// silently skip a floor it was told to run.
+	EngageAt int
 	// TryLock takes the per-PC lock. It returns ok=false when another process holds it,
 	// and the gate then does nothing at all: a contender skips, the gate NEVER waits.
 	// Nil means no locking.
@@ -139,6 +146,15 @@ func run(ctx context.Context, opt Options, stdin io.Reader) {
 	if stopBelow <= 0 {
 		stopBelow = store.TriggerBytes
 	}
+	engageAt := opt.EngageAt
+	if engageAt <= 0 {
+		engageAt = store.SyncLimitBytes
+	}
+	// Asking the floor to stop below a size it is not allowed to engage at is a request
+	// to engage there; derive.Floor reconciles the pair the same way.
+	if stopBelow > engageAt {
+		engageAt = stopBelow
+	}
 
 	path, ok := IndexPathFromPayload(stdin)
 	if !ok {
@@ -167,7 +183,7 @@ func run(ctx context.Context, opt Options, stdin io.Reader) {
 
 	// GATE:44 - silent exit when nothing is wrong. Silence is the product here: a hook
 	// that speaks on every write trains the operator to ignore it.
-	if len(long) == 0 && bytes < store.SyncLimitBytes && lineCount < store.InjectLimitLines {
+	if len(long) == 0 && bytes < engageAt && lineCount < store.InjectLimitLines {
 		return
 	}
 
@@ -185,14 +201,14 @@ func run(ctx context.Context, opt Options, stdin io.Reader) {
 		writeLine(out, line)
 	}
 
-	if bytes < store.SyncLimitBytes {
-		return // advise only: below the sync limit the gate never rewrites
+	if bytes < engageAt {
+		return // advise only: below the engage threshold the gate never rewrites
 	}
 	if opt.Floor == nil {
 		return
 	}
 
-	res, err := opt.Floor.Floor(ix.Records, filepath.Dir(path), ix.Newline, stopBelow)
+	res, err := opt.Floor.Floor(ix.Records, filepath.Dir(path), ix.Newline, engageAt, stopBelow)
 	if err != nil {
 		return
 	}

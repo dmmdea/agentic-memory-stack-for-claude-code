@@ -125,11 +125,12 @@ func newMigratedLookup(roots store.Roots) migratedLookup {
 // projection would make the gate converge a file that the nightly derive then re-floors.
 type floorAdapter struct{}
 
-func (floorAdapter) Floor(records []*index.Record, storeDir, newline string, stopBelow int) (gate.FloorResult, error) {
+func (floorAdapter) Floor(records []*index.Record, storeDir, newline string, engageAt, stopBelow int) (gate.FloorResult, error) {
 	doctrine := doctrineSet(records, storeDir)
 	res := derive.Floor(records, derive.FloorOptions{
 		Doctrine:       func(r *index.Record) bool { return doctrine[r.Slug] },
 		Project:        func(recs []*index.Record) string { return index.RenderVerbatim(recs, newline) },
+		EngageAtBytes:  engageAt,
 		StopBelowBytes: stopBelow,
 	})
 	return gate.FloorResult{Floored: res.Floored, Bytes: res.Bytes}, nil
