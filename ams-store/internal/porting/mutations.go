@@ -184,8 +184,11 @@ var Mutations = []Mutation{
 				New: "\t\"\" +\n",
 			},
 			{
+				// The pathspec is neutered rather than deleted so `store` stays
+				// referenced: an unused import is a BUILD failure, and a build failure
+				// reads as a red test while proving nothing about the rule.
 				Old: "\t\t\trel, \":(exclude)\"+rel+\"/\"+store.IndexName); err != nil {\n",
-				New: "\t\t\trel); err != nil {\n",
+				New: "\t\t\trel, \":(exclude)\"+rel+\"/not-\"+store.IndexName); err != nil {\n",
 			},
 		},
 	},
