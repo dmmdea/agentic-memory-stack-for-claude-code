@@ -38,7 +38,18 @@ Check "PowerShell 5.1+" { $PSVersionTable.PSVersion.Major -ge 5 } "Upgrade to Wi
 # Phases 2-windows-config.ps1 and 3-verify.ps1 are `#Requires -Version 7` — checking here
 # means the operator learns it at phase 0, not from a refusal two phases in.
 Check "PowerShell 7 (pwsh) for phases 2-3" { [bool](Get-Command pwsh -ErrorAction SilentlyContinue) } "Install PowerShell 7: winget install Microsoft.PowerShell"
-Check "WSL2 installed" { (wsl.exe --status 2>&1) -match 'WSL' } "Run: wsl --install (admin PowerShell)"
+Check "WSL2 installed" {
+    # wsl.exe writes UTF-16; in a non-console session (ssh, scheduled task) the default decoder
+    # renders it as NUL-interleaved text that never matches 'WSL' — decode it explicitly and also
+    # accept a clean exit code (v1.23.5: the first remote install read MISSING on a box with WSL2).
+    $prevEnc = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
+        $out = (wsl.exe --status 2>&1 | Out-String)
+        $rc = $LASTEXITCODE
+    } finally { [Console]::OutputEncoding = $prevEnc }
+    ($out -match 'WSL') -or ($rc -eq 0)
+} "Run: wsl --install (admin PowerShell)"
 Check "WSL distro resolved ($Distro)" { [bool]$Distro } "No WSL distro found. Install one (wsl --install -d Ubuntu) or pass -Distro <name> (see: wsl -l -q)"
 Check "WSL is running" { $null -ne (wsl.exe -d $Distro -e echo ok 2>&1 | Select-String 'ok') } "WSL distro not started: wsl -d $Distro"
 Check "WSL mirrored networking" {
@@ -46,7 +57,12 @@ Check "WSL mirrored networking" {
     if (Test-Path $wslconf) { (Get-Content $wslconf -Raw) -match 'networkingMode\s*=\s*mirrored' } else { $false }
 } "Add to $env:USERPROFILE\.wslconfig:`n  [wsl2]`n  networkingMode = mirrored`nThen: wsl --shutdown"
 
-Check "claude.cmd (Claude Code CLI)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\claude.cmd" } "Install Claude Code: npm i -g @anthropic-ai/claude-code"
+Check "claude (Claude Code CLI)" {
+    # npm global shim, the native installer's ~\.local\bin\claude.exe, or anything on PATH (v1.23.5)
+    (Test-Path "$env:USERPROFILE\AppData\Roaming\npm\claude.cmd") -or
+    (Test-Path "$env:USERPROFILE\.local\bin\claude.exe") -or
+    [bool](Get-Command claude -ErrorAction SilentlyContinue)
+} "Install Claude Code: npm i -g @anthropic-ai/claude-code (or the native installer)"
 Check "codex.cmd (Codex CLI)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" } "Install Codex: npm i -g @openai/codex"
 Check "Codex authenticated (ChatGPT subscription)" {
     if (-not (Test-Path "$env:USERPROFILE\.codex\auth.json")) { return $false }

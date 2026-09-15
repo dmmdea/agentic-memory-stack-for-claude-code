@@ -4,6 +4,17 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.5 (2026-09-15) — an explicit empty flag clears an inherited value; prerequisites read correctly over ssh
+
+- **`linux-replica.sh` / `linux-authority.sh`: `--flag ""` clears.** Inherit-on-re-run (v1.23.2–v1.23.4)
+  had no way to UNSET a value: re-pointing a replica from a WSL-hosted brain to a native one needed
+  `BRAIN_WSL` emptied, and `--brain-wsl ""` inherited the old hop instead. An explicit empty value now
+  clears the inherited value and says so; a flag not given at all still inherits.
+- **`0-prereqs.ps1` under a non-console session.** `wsl.exe` prints UTF-16, which the default decoder
+  renders as NUL-interleaved text that never matches "WSL" (the first remote install read "WSL2
+  installed MISSING" on a box with WSL2); the check now decodes it and accepts a clean exit code. The
+  Claude CLI check accepts the native installer's `~\.local\bin\claude.exe` and anything on PATH.
+
 ## v1.23.4 (2026-09-15) — the last members of both classes, found by an independent seat audit
 
 A clean-context audit of the whole repo (the local 27B seat, two contracts) after v1.23.2/v1.23.3:

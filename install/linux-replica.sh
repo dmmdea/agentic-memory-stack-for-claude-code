@@ -32,7 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""
+AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""; SET_BRAIN_WSL=0; SET_BRAIN_BACKUP_DIR=0
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
@@ -48,8 +48,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
         --brain-ssh) BRAIN_SSH="${2:-}"; shift 2 ;;
-        --brain-wsl) BRAIN_WSL="${2:-}"; shift 2 ;;
-        --brain-backup-dir) BRAIN_BACKUP_DIR="${2:-}"; shift 2 ;;
+        --brain-wsl) BRAIN_WSL="${2:-}"; SET_BRAIN_WSL=1; shift 2 ;;
+        --brain-backup-dir) BRAIN_BACKUP_DIR="${2:-}"; SET_BRAIN_BACKUP_DIR=1; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
         --qdrant-storage-gb) QDRANT_STORAGE_GB="${2:-}"; shift 2 ;;
@@ -93,7 +93,13 @@ fi
 # path, and one without --brain-wsl blanked the WSL hop of a Windows-hosted brain). Explicit flag
 # > replica.env > default; only a first install with no replica.env applies the defaults.
 inherit_from_replica_env() {  # $1 = variable, $2 = replica.env key, $3 = flag (for the message)
-    local prev=""
+    local prev="" setflag="SET_$1"
+    # v1.23.5: an EXPLICIT empty value ("--brain-wsl ''") clears the inherited value — the only
+    # way to re-point a replica from a WSL-hosted brain to a native one without editing replica.env.
+    if [ "${!setflag:-0}" = 1 ]; then
+        [ -n "${!1}" ] || echo "    $3 cleared (explicit empty value; not inherited)"
+        return 0
+    fi
     [ -z "${!1}" ] || return 0
     [ -f "$MEM0_DIR/replica.env" ] && prev="$(sed -n "s/^$2='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$MEM0_DIR/replica.env" | head -n1)"
     [ -n "$prev" ] || return 0

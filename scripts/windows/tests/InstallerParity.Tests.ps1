@@ -290,6 +290,14 @@ Describe 'WSL installer provisions EmbeddingGemma, not Ollama+nomic (v0.22 H3)' 
         $src | Should -Not -Match 'enable[^\n]*egemma-rollback-prune\.timer' -Because 'the destructive one-shot must not be armed by a fresh install'
     }
 
+    It '0-prereqs decodes wsl.exe output as UTF-16 and accepts the native Claude install (v1.23.5)' {
+        # The first remote (ssh) install read "WSL2 installed MISSING" and "claude.cmd MISSING" on a
+        # box that had both: wsl.exe prints UTF-16 and the native installer puts claude.exe in ~\.local\bin.
+        $prereq = Get-Content (Join-Path $repoRoot 'install\0-prereqs.ps1') -Raw
+        $prereq | Should -Match '(?s)Check "WSL2 installed".*?OutputEncoding\s*=\s*\[System\.Text\.Encoding\]::Unicode.*?wsl\.exe --status'
+        $prereq | Should -Match '\.local\\bin\\claude\.exe'
+        $prereq | Should -Match 'Get-Command claude -ErrorAction SilentlyContinue'
+    }
     It '0-prereqs no longer requires Ollama; checks llama-swap instead' {
         $prereq = Get-Content (Join-Path $repoRoot 'install\0-prereqs.ps1') -Raw
         $prereq | Should -Not -Match 'Check "Ollama in WSL"' -Because 'Ollama is no longer a prerequisite (v0.22)'

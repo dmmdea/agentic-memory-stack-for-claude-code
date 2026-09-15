@@ -245,6 +245,24 @@ def test_every_optional_flag_inherits_from_stack_env_on_a_rerun(tmp_path):
     assert "--embed-model inherited" not in r.stdout and "--zfs-dataset inherited" not in r.stdout
 
 
+def test_explicit_empty_flag_clears_the_inherited_value(tmp_path):
+    """v1.23.5: `--eval-root ""` (or any optional flag given empty) clears the inherited value."""
+    home = tmp_path / "home"
+    eval_root = tmp_path / "eval-root"
+    (eval_root / "eval" / "retrieval-drift").mkdir(parents=True)
+    (eval_root / "eval" / "retrieval-drift" / "retrieval_drift.py").write_text("# stub\n", encoding="utf-8")
+    _stack_env(home, f"MEM0_EVAL_ROOT={eval_root}\nMEM0_ZFS_DATASET=pool/apps/ams\nMEM0_EMBED_MODEL=custom\n")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--eval-root", "", "--zfs-dataset", "", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "--eval-root cleared (explicit empty value; not inherited)" in r.stdout
+    assert "--zfs-dataset cleared (explicit empty value; not inherited)" in r.stdout
+    assert "--eval-root inherited" not in r.stdout and "--zfs-dataset inherited" not in r.stdout
+    assert "--embed-model inherited from ~/.mem0/stack.env: custom" in r.stdout, "flags not given still inherit"
+    conf = (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert "MEM0_ZFS_DATASET" not in conf, "an explicitly cleared dataset must not come back from the drop-in either"
+
+
 def test_an_inherited_eval_root_is_still_validated(tmp_path):
     """Inheriting must not smuggle a stale value past the check an explicit flag gets."""
     home = tmp_path / "home"

@@ -31,12 +31,14 @@
 #                  nothing else (the test harness uses it).
 #   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
 #                  --pcloud-dir, --zfs-dataset) keeps the value already in ~/.mem0/stack.env;
-#                  only a first install with no stack.env applies the defaults above.
+#                  only a first install with no stack.env applies the defaults above. An EXPLICIT
+#                  empty value (--eval-root "") clears the inherited value.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
+SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
@@ -47,11 +49,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --bind-ip) BIND_IP="${2:-}"; shift 2 ;;
         --secrets-dir) SECRETS_DIR="${2:-}"; shift 2 ;;
-        --zfs-dataset) ZFS_DATASET="${2:-}"; shift 2 ;;
+        --zfs-dataset) ZFS_DATASET="${2:-}"; SET_ZFS_DATASET=1; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
-        --eval-root) EVAL_ROOT="${2:-}"; shift 2 ;;
-        --pcloud-dir) PCLOUD_DIR="${2:-}"; shift 2 ;;
-        --embed-model) EMBED_MODEL="${2:-}"; shift 2 ;;
+        --eval-root) EVAL_ROOT="${2:-}"; SET_EVAL_ROOT=1; shift 2 ;;
+        --pcloud-dir) PCLOUD_DIR="${2:-}"; SET_PCLOUD_DIR=1; shift 2 ;;
+        --embed-model) EMBED_MODEL="${2:-}"; SET_EMBED_MODEL=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -90,7 +92,13 @@ fi
 # dropped the drift canary, an omitted --zfs-dataset the pool-usage check, an omitted
 # --pcloud-dir a custom mirror path. Explicit flag > stack.env > default.
 inherit_from_stack_env() {  # $1 = variable, $2 = stack.env key, $3 = flag (for the message)
-    local prev=""
+    local prev="" setflag="SET_$1"
+    # v1.23.5: an EXPLICIT empty value ("--eval-root ''") clears the inherited value instead of
+    # inheriting it; inherit applies only to flags that were not given at all.
+    if [ "${!setflag:-0}" = 1 ]; then
+        [ -n "${!1}" ] || echo "    $3 cleared (explicit empty value; not inherited)"
+        return 0
+    fi
     [ -z "${!1}" ] || return 0
     [ -f "$HOME/.mem0/stack.env" ] && prev="$(sed -n "s/^$2=//p" "$HOME/.mem0/stack.env" | head -n1)"
     [ -n "$prev" ] || return 0
@@ -102,7 +110,7 @@ inherit_from_stack_env EVAL_ROOT   MEM0_EVAL_ROOT   --eval-root
 inherit_from_stack_env PCLOUD_DIR  MEM0_PCLOUD_DIR  --pcloud-dir
 inherit_from_stack_env ZFS_DATASET MEM0_ZFS_DATASET --zfs-dataset
 # a box installed before v1.23.2 carries the dataset only in the rendered drop-in
-if [ -z "$ZFS_DATASET" ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
+if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
     ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
     [ -z "$ZFS_DATASET" ] || echo "    --zfs-dataset inherited from the installed drop-in: $ZFS_DATASET"
 fi
