@@ -196,11 +196,15 @@ var Mutations = []Mutation{
 				New: "\t\"\" +\n",
 			},
 			{
-				// The pathspec is neutered rather than deleted so `store` stays
-				// referenced: an unused import is a BUILD failure, and a build failure
-				// reads as a red test while proving nothing about the rule.
-				Old: "\t\t\trel, \":(exclude)\"+rel+\"/\"+store.IndexName); err != nil {\n",
-				New: "\t\t\trel, \":(exclude)\"+rel+\"/not-\"+store.IndexName); err != nil {\n",
+				// The second guard is the STAGING pathspec, and it lives in gitx: the
+				// merge engine and sync stage the same thing, so the exclusion was
+				// collapsed into AddFactFiles (3cde555) and this hunk moved with it.
+				// It is neutered rather than deleted so every identifier stays
+				// referenced: an unused import or parameter is a BUILD failure, and a
+				// build failure reads as a red test while proving nothing about the rule.
+				File: "internal/gitx/plumbing.go",
+				Old:  "\t\t\":(glob)\"+storeRel+\"/*.md\", \":(exclude)\"+storeRel+\"/\"+indexName)\n",
+				New:  "\t\t\":(glob)\"+storeRel+\"/*.md\", \":(exclude)\"+storeRel+\"/not-\"+indexName)\n",
 			},
 		},
 	},
