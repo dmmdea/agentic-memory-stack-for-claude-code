@@ -4,6 +4,7 @@ package merge_test
 // a real git in a temp fleet.
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lint"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
@@ -753,5 +755,34 @@ func TestMerge_UnrelatedHistoriesMergeOnEverySupportedGit(t *testing.T) {
 	}
 	if r := b.push(); !r.OK {
 		t.Fatalf("B could not push the merge: %s", r.Stderr)
+	}
+}
+
+// TestOverTrigger_ProducerAndReducerRenderTheSameBytes pins the two halves of the Q13
+// stamp to ONE renderer.
+//
+// The producer (lint.RecordOverTrigger, the maintenance path) and the reducer
+// (merge.MergeOverTrigger, every sync that sees the path on both sides) write the same
+// logical content to the same tracked file. Two renderers means the file flips format on
+// every change: each stamp costs an extra commit, and no two PCs agree on the bytes until
+// a merge has run. Byte-identity is the only assertion that cannot be satisfied by a
+// second implementation that happens to be equivalent today.
+func TestOverTrigger_ProducerAndReducerRenderTheSameBytes(t *testing.T) {
+	root := t.TempDir()
+	crossed := time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)
+	if _, err := lint.RecordOverTrigger(root, ws, true, crossed); err != nil {
+		t.Fatalf("record the crossing: %v", err)
+	}
+	produced, err := os.ReadFile(lint.StampPath(root))
+	if err != nil {
+		t.Fatalf("the producer wrote no stamp file: %v", err)
+	}
+	reduced, err := merge.MergeOverTrigger(produced, produced)
+	if err != nil {
+		t.Fatalf("reduce the produced bytes with themselves: %v", err)
+	}
+	if !bytes.Equal(produced, reduced) {
+		t.Fatalf("two renderers for one file: producer wrote %d B %q, the reducer rewrites it as %d B %q",
+			len(produced), produced, len(reduced), reduced)
 	}
 }

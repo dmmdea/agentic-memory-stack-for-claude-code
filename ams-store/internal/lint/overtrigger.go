@@ -3,9 +3,11 @@ package lint
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/atomic"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 )
 
 // The over-trigger stamp, DESIGN:257-258 and decision Q13.
@@ -83,13 +85,41 @@ func RecordOverTrigger(projectsRoot, workspace string, overTrigger bool, now tim
 	default:
 		return s, nil // already stamped, and the stamp is older: nothing to do
 	}
-	if err := os.MkdirAll(filepath.Dir(StampPath(projectsRoot)), 0o755); err != nil {
-		return s, err
-	}
-	if err := atomic.WriteJSONFile(StampPath(projectsRoot), s); err != nil {
+	if err := WriteStamps(projectsRoot, s); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// WriteStamps writes the stamp file through the ONE renderer that owns those bytes,
+// merge.RenderOverTrigger.
+//
+// The producer and the merge reducer write the same tracked file. When they render it
+// differently the file flips format on every change - each stamp costs an extra commit,
+// and the two PCs disagree on the bytes until a merge has run. atomic.WriteJSONFile is
+// deliberately NOT used here: its indented encoding is the second renderer this replaces.
+func WriteStamps(projectsRoot string, s Stamps) error {
+	if err := os.MkdirAll(filepath.Dir(StampPath(projectsRoot)), 0o755); err != nil {
+		return err
+	}
+	return atomic.WriteBytes(StampPath(projectsRoot), merge.RenderOverTrigger(s.toMerge()))
+}
+
+// toMerge projects the typed stamps onto the merge engine's string-keyed view, which is
+// the shape RenderOverTrigger encodes. Times are written at RFC3339 second precision:
+// that is what the reducer parses, and a nanosecond tail no PC can reproduce would make
+// the same crossing render differently on two machines.
+func (s Stamps) toMerge() merge.OverTrigger {
+	out := merge.OverTrigger{OverTriggerSince: make(map[string]string, len(s.OverTriggerSince))}
+	keys := make([]string, 0, len(s.OverTriggerSince))
+	for k := range s.OverTriggerSince {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out.OverTriggerSince[k] = s.OverTriggerSince[k].UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // MergeStamps is the min reducer the synced stamp file is merged with.
