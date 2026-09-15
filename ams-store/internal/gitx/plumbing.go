@@ -96,14 +96,34 @@ func EmptyTree(ctx context.Context, opt Options) (string, error) {
 func AddFactFiles(ctx context.Context, opt Options, storeRel, indexName string, hold []string) error {
 	o := opt
 	o.OkExit = OkExitCodes(0, 128)
-	args := []string{"add", "-A", "-f", "--",
-		":(glob)" + storeRel + "/*.md", ":(exclude)" + storeRel + "/" + indexName}
-	args = append(args, ExcludePathspecs(hold)...)
+	exclude := append([]string{":(exclude)" + storeRel + "/" + indexName}, ExcludePathspecs(hold)...)
+
+	add := append([]string{"add", "-A", "-f", "--", ":(glob)" + storeRel + "/*.md"}, exclude...)
+	if err := addPass(ctx, o, storeRel, add); err != nil {
+		return err
+	}
+	// The second pass is `-u`: TRACKED paths only, over the whole store, whatever their
+	// extension. Narrowing the forced add to *.md stopped new maintenance artifacts
+	// reaching the hub, and it also stopped git ever noticing that the ones ALREADY
+	// tracked are gone - a `.bak-<date>-<kind>` moved out of a store stays tracked with
+	// its stale bytes forever and materializes onto every other PC. `-u` never ADDS a
+	// file, so what may be added stays exactly as narrow as it was.
+	return addPass(ctx, o, storeRel, append([]string{"add", "-u", "--", storeRel}, exclude...))
+}
+
+// addPass runs one staging command and treats an unmatched pathspec as the ordinary
+// answer it is.
+//
+// The two passes spell that answer differently - `add -A` says "did not match any files"
+// and `add -u` says "did not match any file(s) known to git" - so the prefix both share
+// is what is matched. A store with no fact file yet, and a store with nothing tracked
+// yet, are both ordinary.
+func addPass(ctx context.Context, o Options, storeRel string, args []string) error {
 	res, err := Run(ctx, o, args...)
 	if err != nil {
 		return err
 	}
-	if res.Code == 0 || strings.Contains(res.Stderr, "did not match any files") {
+	if res.Code == 0 || strings.Contains(res.Stderr, "did not match any file") {
 		return nil
 	}
 	return fmt.Errorf("git add %s: exit %d: %s", storeRel, res.Code, strings.TrimSpace(res.Stderr))
