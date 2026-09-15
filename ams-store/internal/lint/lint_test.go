@@ -672,7 +672,7 @@ func TestLint_ResurrectedAndConflictsAreReadFromTheSyncReceipts(t *testing.T) {
 
 	if err := amsync.AppendReceipt(sb.StateRoot, amsync.Receipt{
 		TS:          fixedNow.Add(-time.Hour),
-		Host:        "qube",
+		Host:        "test-pc",
 		Kind:        "once",
 		Status:      amsync.StatusPushed,
 		Resurrected: []string{"ws/memory/a.md"},

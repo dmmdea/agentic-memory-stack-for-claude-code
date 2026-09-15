@@ -41,7 +41,7 @@ type RemotePolicy struct {
 	// AllowLocalPath permits a plain filesystem path as the hub URL. It is FALSE on
 	// every PC and true only on the hub itself, whose own ams-store checkout has the
 	// bare repository sitting beside it on the same disk (blueprint section 8: "the
-	// Lenovo holds its own checkout of the hub and judges that"). Allowing it by
+	// hub holds its own checkout of the bare repository and judges that"). Allowing it by
 	// default would let a PC quietly point at a path that syncs with nothing.
 	AllowLocalPath bool
 }

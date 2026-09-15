@@ -79,7 +79,7 @@ func TestRemote_ExpectedHostPinsTheHub(t *testing.T) {
 	}
 }
 
-// TestRemote_LocalPathIsOnlyForTheHubsOwnCheckout: the Lenovo judges its own checkout of
+// TestRemote_LocalPathIsOnlyForTheHubsOwnCheckout: the hub judges its own checkout of
 // the bare repository sitting beside it. A PC must never do that silently.
 func TestRemote_LocalPathIsOnlyForTheHubsOwnCheckout(t *testing.T) {
 	pc := RemotePolicy{}

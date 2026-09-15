@@ -45,7 +45,7 @@ func BigIndexFacts(n int) map[string]string {
 
 // IPLiteral joins four octets into a dotted address.
 //
-// The remote-policy tests need CGNAT (100.64.0.0/10) and RFC 1918 addresses as INPUT,
+// The remote-policy tests need carrier-grade-NAT and private-range addresses as INPUT,
 // because the rule under test is that reach is the MagicDNS name and NEVER an address,
 // and those are the ranges a tailnet and a LAN actually use. Written as literals they
 // trip the pre-push leak scanner, which cannot tell a generic fixture from the operator's
