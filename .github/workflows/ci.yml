@@ -188,3 +188,37 @@ jobs:
             throw "PSScriptAnalyzer reported $($findings.Count) error-severity finding(s)"
           }
           Write-Host 'PSScriptAnalyzer: no error-severity findings.'
+
+  ams-store-go-linux:
+    name: ams-store (Go, linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ams-store
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: git version (merge-tree --write-tree needs >= 2.38)
+        run: git --version
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+
+  ams-store-go-windows:
+    name: ams-store (Go, windows)
+    # windows-latest bills 2x, but this repo is PUBLIC so Actions minutes are free.
+    # Kept to build + test (no -race, which needs a C toolchain) so the Windows
+    # reparse/path code is exercised without the race-detector dependency.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ams-store
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+      - run: go test ./... -count=1
