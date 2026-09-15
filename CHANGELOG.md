@@ -125,7 +125,7 @@ landed with a test seen RED against the unfixed code first.
   exactly once in its file and that every named test exists; it caught the re-anchoring this
   round itself needed.
 
-Measured mutation gate at `43a6d61` (windows/amd64, git 2.55.0, the whole table, exit 0):
+Measured mutation gate at `e0d680c` (windows/amd64, git 2.55.0, the whole table, exit 0):
 **red 29, survived 0, broken 0, pending 0** - four rows more than the table had, since the
 deletion-table repair added its own.
 

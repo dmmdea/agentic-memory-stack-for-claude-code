@@ -469,8 +469,8 @@ round needed.
 
 Measured state, and the figure is stamped with the commit it was measured at
 because this gate is local-only and drifts between runs: **red 29, survived 0,
-broken 0, pending 0 at `43a6d61`** (windows/amd64, git 2.55.0, whole table, exit
-0). A SURVIVED rule means nothing tests it; a NOCOMPILE or STALE entry means the
+broken 0, pending 0 at `e0d680c`** (windows/amd64, git 2.55.0, whole table, exit
+0), which is the last commit of that round to touch Go source. A SURVIVED rule means nothing tests it; a NOCOMPILE or STALE entry means the
 mutation is broken. Both were hit while arming the last ten and both are reported
 separately for that reason, and the figure that stood here before (red 25) was
 never true at the commit it was written at - the gate reported red 23, survived 1,
