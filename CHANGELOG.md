@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## Unreleased — ams-store scaffold (System A store client, register P3-1 start)
+
+The Go rewrite of the auto-memory store library, write gate and nightly compactor begins
+here. This change adds the `ams-store/` module: store enumeration (fail-closed, reparse-point
+dedup, OS-gated case folding), the atomic writer, the `gitx` git wrapper (with the
+`git >= 2.38` check for `merge-tree --write-tree`), frontmatter + hook harvest, the doctrine
+rule, and the index parse/render core with the design's derived order (fixed heading, doctrine
+first, commit-time descending, slug tiebreak, always LF). Every verb is a stub (`not
+implemented`, exit 64); the engines land in the rows that follow. The 1:1 Pester-counterpart
+table is seeded (94 of 95 scenarios named; the removed catch-up-spawn scenario is the one
+exemption). Two Go CI jobs added (linux with `-race`, windows build+test). Measurements
+(receipt in the workspace): the Go gate spawns ~26x faster than the PS 5.1 gate (~15 ms vs
+~397 ms p50); the SessionStart hook order is not a fixed before/after. New system doc
+`docs/systems/ams-store.md`. No runtime/version change to the mem0 stack — `VERSION` is
+unchanged.
+
 ## v1.23.5 (2026-09-15) — an explicit empty flag clears an inherited value; prerequisites read correctly over ssh
 
 - **`linux-replica.sh` / `linux-authority.sh`: `--flag ""` clears.** Inherit-on-re-run (v1.23.2–v1.23.4)
