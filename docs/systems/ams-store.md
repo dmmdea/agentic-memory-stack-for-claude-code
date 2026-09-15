@@ -73,6 +73,7 @@ ams-store/
     frontmatter/     parse, harvest, doctrine rule
     atomic/          temp + rename + hash read-back writer
     gitx/            every git exec (argv, env, timeout, exit classifier, version check)
+    judge/           the hub-only apply path: plan schema, apply-guards, migration
     porting/         the 1:1 Pester-counterpart table
     testutil/        sandbox (temp projects root + state root + optional history repo)
 ```
@@ -86,7 +87,9 @@ ams-store lint     [--all] [--workspace <slug>] [--json] [--quiet] [--summary-ou
 ams-store gate     [--stdin-payload]
 ams-store sync     [--once] [--watch] [--timeout <dur>] [--remote <name>]
 ams-store lock     status | acquire --for <dur> --reason <s> | release | break
-ams-store judge-apply  <plan>            # hub-only
+ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-run]
+                      [--max-migrations 5] [--force] [--hub] [--candidates]
+                      [--mem0-url <url>] [--mem0-user <id>] [--json]   # hub-only
 ```
 
 ## What `derive` does
@@ -145,6 +148,74 @@ disappears from the index is a standing order nobody obeys.
 `MEMORY.md` - and an implicit "every populated store on this PC" turned one stray
 bare invocation into a fleet-wide write. `TestCLI_WritingVerbsRefuseAnImplicitScope`
 is the guard.
+
+## judge-apply
+
+The nightly judge is split in two on purpose (design Q1): the model call stays in
+the Python consolidation chain, which writes a **plan file**; this verb decides
+what of that plan may be applied, and applies it. Nothing in `ams-store` calls a
+model.
+
+**Hub-only.** The verb refuses to run unless `<state-root>/role` reads `hub`, or
+`--hub` is passed (for the hub's own first run, before the role file is seeded).
+The refusal is exit 3 and it happens before the plan file is even read. The design
+gives exactly one judge, on the Linux authority, against its own checkout of the
+hub: two PCs applying the same plan to their own copies would each migrate the
+same fact, each delete its own copy of the file, and push two different histories.
+
+**Plan schema** (version 1, strict — an unknown field or verb is refused, never
+ignored):
+
+```json
+{
+  "version": 1,
+  "generated_at": "2026-09-15T05:00:00Z",
+  "stores": [
+    {
+      "workspace": "<harness slug>",
+      "outcome": "ok | unavailable | empty | parse_fail",
+      "note": "free text, carried into the receipt",
+      "decisions": [
+        { "slug": "some-fact.md", "verb": "SHORTEN", "new_hook": "shorter hook text" },
+        { "slug": "other-fact.md", "verb": "MIGRATE" },
+        { "slug": "third-fact.md", "verb": "KEEP" }
+      ]
+    }
+  ]
+}
+```
+
+`SHORTEN` requires `new_hook`; `MIGRATE` may carry `mem0_text` and `metadata`;
+`KEEP` carries neither. An outcome other than `ok` must carry no decisions — a
+call that did not answer has none. `--candidates` prints the offer set the plan's
+producer should build its prompt from, which is the same filter the apply path
+uses, so what may be judged and what may be applied are one implementation.
+
+**The apply-guards**, each with a named test and a mutation that turns it red:
+
+| guard | rule |
+|---|---|
+| doctrine untouchable | never offered, and re-checked at apply time; a plan that names doctrine is refused |
+| strict decrease | per line, the rewrite must be shorter; per run, the projected index must shrink or the whole run is discarded |
+| anchors | a rewrite must keep at least one anchor token (number, path, URL, backticked identifier, ALL-CAPS term) of the line it replaces |
+| round-trip | the rewritten line must re-parse to the same slug set; a markdown link in a hook injects a phantom slug hygiene can never remove |
+| the seal | `sealed-lines.json` — one judge rewrite per line, ever |
+| write-then-verify | a fact file is deleted only after a byte-equal read-back **by id**; an unverifiable write is undone, and a record the server reports as deduplicated is never deleted |
+| blast cap | at most 20 % of the entries may be removed in one run; `--max-migrations` (default 5) additionally bounds the judge's own migrations |
+| protected-set overflow | when doctrine alone exceeds the budget the run reports `protected-set-overflow` and stops rather than loosen the hard rule |
+| the 20 h window | one judge attempt per store, computed from `judge_called` in the receipts ledger, never from a timer or a stamp file; `--force` bypasses that and nothing else |
+
+The corpus API key is read from the environment only (`MEM0_API_KEY`,
+`AMS_MEM0_KEY`): a key on a command line reaches the process list and the shell
+history.
+
+**`Migrated:` trailer.** A migrated fact's id has nowhere to live in the file it
+came from, because that file is the one being deleted. The deletion commit carries
+`Migrated: <slug> <mem0-id>` instead — the one artifact that outlives the file and
+is already synced to every PC. When a slug re-appears later, derive's harvest step
+looks it up (`git log --grep`, fails closed) and writes `migrated: <id>` into the
+new file, so the judge updates the existing record by id instead of adding a
+near-duplicate every night.
 
 ## Build and test
 
