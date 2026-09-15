@@ -19,17 +19,21 @@ register rows P3-* / P4-* / P5-*.
 
 ## Status
 
-**Scaffold (this change).** Implemented and tested: store enumeration
-(fail-closed, reparse-point/junction dedup, OS-gated case folding), the atomic
-writer (temp + rename + hash read-back), the git wrapper (`gitx`, with a
-`git >= 2.38` check for `merge-tree --write-tree` and a kill-tree timeout on every
-call), frontmatter parsing and the hook harvest, the doctrine rule, and the index
-parse/render core (the derived order: fixed heading, doctrine first, then by the
-commit time of each file's last change, slug tiebreak, always LF). Every verb is
-still a stub that prints `not implemented` and exits 64; the engines (derive
-floor, the merge engine, sync/watch/lock, gate, lint, judge-apply) land in the
-register rows that follow. The 1:1 Pester-counterpart table is seeded so the
-parity gate is enumerable from day one.
+**Scaffold + the derive engine (this change).** The scaffold carries store
+enumeration (fail-closed, reparse-point/junction dedup, OS-gated case folding),
+the atomic writer (temp + rename + hash read-back), the git wrapper (`gitx`, with
+a `git >= 2.38` check for `merge-tree --write-tree` and a kill-tree timeout on
+every call), frontmatter parsing, the doctrine rule and the index parse/render
+core.
+
+`derive` and `harvest` are now real: harvest, the four hygiene passes, the
+planned-ghost abort, the blast cap, the derived render with its injection stop,
+the convergence floor, the compare-and-swap write and the post-write invariants.
+`lint`, `gate`, `sync`, `lock` and `judge-apply` still print `not implemented`
+and exit 64; their engines land in the register rows that follow. The 1:1
+Pester-counterpart table is seeded so the parity gate is enumerable from day one,
+and the scenarios derive owns have moved out of the placeholder package into
+`internal/derive`.
 
 ## Why Go, not the PowerShell library
 
@@ -84,6 +88,63 @@ ams-store sync     [--once] [--watch] [--timeout <dur>] [--remote <name>]
 ams-store lock     status | acquire --for <dur> --reason <s> | release | break
 ams-store judge-apply  <plan>            # hub-only
 ```
+
+## What `derive` does
+
+`derive` is the single deterministic writer. Per store, under the per-PC lock
+(a contender skips; it never waits):
+
+1. read the index verbatim and enumerate the fact files **fail-closed** - "could
+   not read the directory" must never be spellable as "nothing is there", or a
+   caller concludes every line is dangling and the whole index is wiped with a
+   receipt reporting success;
+2. abort when the index has entries and the store enumerates no fact files;
+3. sweep leftover `*.am-tmp` from a previously failed write;
+4. **harvest**: copy each entry's hook text into its fact file as `hook:`, and
+   stamp `migrated: <id>` on a re-created slug the judge had migrated. Idempotent,
+   body-preserving, and it never adds a frontmatter block to a file that has none;
+5. **hygiene**, four passes, not three: duplicate slug, dangling removal (with the
+   bracketed-title exemption for checkbox lines), dead extra-link repair, orphan
+   re-index. The repair pass is the one the design's table omits and the shipped
+   compactor performs; without it the post-write ghost check fails forever;
+6. abort on a planned entry ghost, before anything is written;
+7. abort when hygiene's removals exceed the blast cap, `max(1, floor(entries * 0.2))`;
+8. render: fixed heading, doctrine first, then by the commit time of each file's
+   last change (one `git log --format=%ct --name-only` pass, never one exec per
+   file), slug as tiebreak, always LF;
+9. floor, then compare-and-swap against the hash taken at entry and the fact-file
+   set enumerated at entry - on drift it **aborts, never rolls back**, because a
+   directory-level revert clobbers what the live session just wrote;
+10. write atomically, verify the post-write invariants, touch the dirty marker,
+    commit locally and append a receipt row to `compact-receipts.jsonl`.
+
+### The floor and the injection cap
+
+The floor truncates non-doctrine hooks to the 130 B line cap in **descending**
+rendered length until the projected index is under the stop threshold. Doctrine
+is never truncated; a doctrine-only overflow is reported, never "fixed", and
+leaves the run unconverged (exit 1).
+
+Phase 3 ships the **legacy hysteresis as the default**: the floor engages at or
+above the 25,000 B sync limit and stops below the 20,000 B trigger, so a store
+between the two is left alone. `--stop-below <bytes>` moves the stop. The
+unconditional-to-trigger floor the design calls for is a threshold change held
+for Phase 4, after the zero-hooks-lost check, so it lands as a decided change
+rather than a silent one.
+
+The render stops at the 200-line injection cap and reports the omitted entries as
+`over-inject-limit N`; they stay on disk and are the judge's first candidates.
+**Doctrine is never dropped** - if doctrine alone exceeds the cap the render goes
+past it and reports `protected-set-overflow`, because a standing order that
+disappears from the index is a standing order nobody obeys.
+
+### Scope is required, never defaulted
+
+`ams-store derive` and `ams-store harvest` refuse to run without `--store`,
+`--all` or `--workspace`. Both write - harvest into fact files, derive into
+`MEMORY.md` - and an implicit "every populated store on this PC" turned one stray
+bare invocation into a fleet-wide write. `TestCLI_WritingVerbsRefuseAnImplicitScope`
+is the guard.
 
 ## Build and test
 

@@ -336,3 +336,65 @@ func TestHygiene_OrphanLeftUnindexedWithoutHeadroom(t *testing.T) {
 		t.Error("the orphan was re-indexed although doing so crosses the sync limit")
 	}
 }
+
+// Hygiene pass A (COMPACT:447-450, :461; blueprint section 3.3). The mutation run found
+// this one uncovered: removing the whole duplicate-slug pass turned NOTHING red, because
+// every other scenario happened to carry a unique slug per line. A second pointer at one
+// slug costs its bytes in every session's context forever and makes the store's own
+// reachability accounting disagree with itself, so it is dropped and counted.
+func TestHygiene_DuplicateSlugDropped(t *testing.T) {
+	lines := append(bigIndexLines(60),
+		"- [Fact 5 again](fact5.md) "+emDash+" a second pointer at a slug already indexed",
+		"- [Fact 5 third time](fact5.md) "+emDash+" and a third")
+
+	e := newEnv(t, "ws", lines, bigIndexFacts(60))
+
+	res, err := e.run()
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.DedupSlug != 2 {
+		t.Errorf("dedup_slug = %d, want 2 (the 2nd and 3rd pointer at fact5.md)", res.DedupSlug)
+	}
+	text := e.indexText()
+	if n := strings.Count(text, "(fact5.md)"); n != 1 {
+		t.Errorf("fact5.md is linked %d times, want exactly 1", n)
+	}
+	// The FIRST pointer is the one that survives: dropping the first and keeping a later
+	// one would rewrite a line the session wrote for no reason a reader can see.
+	if !strings.Contains(text, "- [Fact 5](fact5.md)") {
+		t.Error("the surviving pointer is not the first one parsed")
+	}
+	if strings.Contains(text, "Fact 5 again") || strings.Contains(text, "Fact 5 third time") {
+		t.Error("a duplicate pointer survived hygiene")
+	}
+	// Deduplication must not make the file look orphaned: the kept line still links it,
+	// so the post-write invariants hold and no re-index pass adds a fourth pointer.
+	if res.Reindexed != 0 {
+		t.Errorf("reindexed = %d, want 0 - the deduplicated slug is still linked", res.Reindexed)
+	}
+}
+
+// A store whose duplicate pointers outnumber the blast cap is REPORTED, never gutted: the
+// dedup counter feeds the same cap as the dangling counter (COMPACT:545-556), so a
+// pathological index cannot be emptied one fifth at a time.
+func TestHygiene_DuplicateSlugCountsAgainstTheBlastCap(t *testing.T) {
+	lines := bigIndexLines(10)
+	for i := 0; i < 5; i++ {
+		lines = append(lines, "- [Dup](fact1.md) "+emDash+" another pointer at fact1")
+	}
+
+	e := newEnv(t, "ws", lines, bigIndexFacts(10))
+
+	res, err := e.run()
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedBlastCap {
+		t.Fatalf("status = %q, want %q (5 removals over a cap of %d)",
+			res.Status, StatusAbortedBlastCap, 2)
+	}
+	if strings.Count(e.indexText(), "(fact1.md)") != 6 {
+		t.Error("the index was modified although the run aborted on the blast cap")
+	}
+}

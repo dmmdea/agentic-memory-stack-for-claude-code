@@ -250,3 +250,40 @@ func TestFloor_RejectsNonShrinkingAndUnparseableCandidates(t *testing.T) {
 		t.Error("the floored record was not marked Dirty, so the regenerator will emit its stale Raw")
 	}
 }
+
+// LIB:674 - a title that alone eats the cap is SKIPPED, not floored to a stub.
+//
+// The mutation run reached this guard through an equivalent mutant: with a 140-character
+// title the budget goes negative, TruncateToBytes returns "" and the empty-hook gate
+// catches it anyway. The interesting band is the one in between - a title long enough to
+// leave a budget of 1..23 bytes, where truncation would still "succeed" and would replace
+// a readable hook with three words of nothing. That band is what MinHookBudget protects
+// and what this fixture sits in.
+func TestFloor_SkipsALineWhoseTitleEatsTheCap(t *testing.T) {
+	title := strings.Repeat("T", 100) // + "a.md" + framing leaves a 15 B hook budget
+	summary := strings.Repeat("real hook text ", 20)
+	line := index.EntryLine(title, "a.md", summary, "")
+	recs := index.Parse(line).Records
+
+	overhead := index.ByteCount(index.EntryLine(title, "a.md", "x", "")) - 1
+	if budget := store.LineByteCap - overhead; budget < 1 || budget >= store.MinHookBudget {
+		t.Fatalf("fixture budget is %d B; it must sit in 1..%d for this guard to be the one under test",
+			budget, store.MinHookBudget-1)
+	}
+
+	res := Floor(recs, FloorOptions{
+		Project:        func(r []*index.Record) string { return index.RenderVerbatim(r, "\n") },
+		EngageAtBytes:  10,
+		StopBelowBytes: 5,
+	})
+
+	if res.Floored != 0 {
+		t.Errorf("floored = %d, want 0 - a %d B hook budget buys nothing a reader can use", res.Floored, store.LineByteCap-overhead)
+	}
+	if recs[0].Summary != strings.TrimRight(summary, " ") {
+		t.Errorf("the hook was truncated to %q; the whole line must be left for the judge or a human", recs[0].Summary)
+	}
+	if recs[0].Dirty {
+		t.Error("the skipped record was marked Dirty, so the regenerator will rewrite a line nothing changed")
+	}
+}

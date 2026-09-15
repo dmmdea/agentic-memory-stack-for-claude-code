@@ -74,6 +74,15 @@ func runDerive(env Env, args []string) int {
 		fmt.Fprintf(env.Stderr, "ams-store derive: unexpected argument %q\n", fs.Arg(0))
 		return ExitUsage
 	}
+	// Scope is REQUIRED, never defaulted to --all. derive is a writer: it harvests into
+	// fact files and rewrites MEMORY.md. A bare `ams-store derive` that quietly meant
+	// "every populated store on this PC" turned one stray invocation - the scaffold test
+	// that ran the whole verb table with no arguments - into a live write across every
+	// store on the machine. An explicit scope is the one guard a call site cannot forget.
+	if storeDir == "" && !all && workspace == "" {
+		fmt.Fprintln(env.Stderr, "ams-store derive: pass --store <dir>, --all, or --workspace <slug>")
+		return ExitUsage
+	}
 
 	roots, err := g.roots()
 	if err != nil {
