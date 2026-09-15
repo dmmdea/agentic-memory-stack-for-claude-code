@@ -1004,7 +1004,7 @@ if (-not $DryRun) {
         }
         $hbLines = @()
         try {
-            $hbHd = Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 30
+            $hbHd = Invoke-RestMethod -Uri ((Get-Mem0AuthorityUrl) + '/health/deep') -TimeoutSec 30
             $hbLines += "- /health/deep ok: $($hbHd.ok)"
             if ($hbHd.checks.capabilities) {
                 $cap = $hbHd.checks.capabilities

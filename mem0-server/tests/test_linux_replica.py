@@ -365,3 +365,25 @@ def test_installer_tenant_inherits_on_a_rerun(tmp_path):
     r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     assert r.returncode == 0, r.stderr + r.stdout
     assert "tenant inherited from the existing install: tenant-client" in r.stdout
+
+
+def test_installer_backup_dir_and_brain_wsl_inherit_on_a_rerun(tmp_path):
+    """v1.23.4: --brain-backup-dir (non-empty default, persisted to replica.env) and --brain-wsl
+    (empty default, persisted) follow the same inherit rule; an explicit flag still wins."""
+    home, env = _scratch_home(tmp_path)
+    (home / ".mem0" / "replica.env").write_text(
+        "BRAIN_SSH='brain'\nBRAIN_BACKUP_DIR='/srv/ams/mem0/backups'\nBRAIN_WSL='Ubuntu-X:tenant'\n", encoding="utf-8")
+    base = [BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--brain-ssh", "brain", "--user-id", "t", "--dry-run"]
+    r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "--brain-backup-dir inherited from ~/.mem0/replica.env: /srv/ams/mem0/backups" in r.stdout
+    assert "--brain-wsl inherited from ~/.mem0/replica.env: Ubuntu-X:tenant" in r.stdout
+    assert "WSL Ubuntu-X:tenant" in r.stdout
+    r = subprocess.run(base + ["--brain-backup-dir", "/other/backups"], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "--brain-backup-dir inherited" not in r.stdout
+    # first install, no replica.env: the stock default
+    (home / ".mem0" / "replica.env").unlink()
+    r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "inherited from ~/.mem0/replica.env" not in r.stdout
