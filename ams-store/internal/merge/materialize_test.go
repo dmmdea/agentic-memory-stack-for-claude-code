@@ -193,25 +193,25 @@ func TestDeferred_AppliedAtSessionEnd(t *testing.T) {
 	}
 
 	// Still live: applying now must change nothing and keep the queue.
-	applied, queued, err := b.eng.ApplyDeferred(context.Background(), ws, b.mo())
+	drain, err := b.eng.ApplyDeferred(context.Background(), ws, b.mo())
 	if err != nil {
 		t.Fatalf("apply deferred while live: %v", err)
 	}
-	if len(applied) != 0 || len(queued) != 2 {
-		t.Fatalf("a still-blocked entry must stay queued, applied=%v queued=%v", applied, queued)
+	if len(drain.Applied) != 0 || len(drain.StillQueued) != 2 {
+		t.Fatalf("a still-blocked entry must stay queued, applied=%v queued=%v", drain.Applied, drain.StillQueued)
 	}
 
 	// SessionEnd: the transcript is now older than the liveness window.
 	b.tick(time.Hour)
-	applied, queued, err = b.eng.ApplyDeferred(context.Background(), ws, b.mo())
+	drain, err = b.eng.ApplyDeferred(context.Background(), ws, b.mo())
 	if err != nil {
 		t.Fatalf("apply deferred at session end: %v", err)
 	}
-	if len(queued) != 0 {
-		t.Fatalf("the queue must be drained once the session is gone, still queued: %v", queued)
+	if len(drain.StillQueued) != 0 {
+		t.Fatalf("the queue must be drained once the session is gone, still queued: %v", drain.StillQueued)
 	}
-	if len(applied) != 2 {
-		t.Fatalf("both entries should have been applied, got %v", applied)
+	if len(drain.Applied) != 2 {
+		t.Fatalf("both entries should have been applied, got %v", drain.Applied)
 	}
 	if b.exists(ws, "doomed.md") {
 		t.Fatal("the queued deletion was not applied at session end")

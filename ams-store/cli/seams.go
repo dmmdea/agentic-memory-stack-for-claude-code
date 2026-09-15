@@ -262,6 +262,58 @@ func (m mergerAdapter) Merge(ctx context.Context, opts amsync.MergeOptions) (ams
 	return reportToResult(rep), nil
 }
 
+// ---------------------------------------------------------------------------
+// sync -> the deferred queue (blueprint 4.8)
+// ---------------------------------------------------------------------------
+
+// drainerAdapter adapts merge.Engine.ApplyDeferred to sync.Drainer.
+//
+// It is the seam the queue was missing: ApplyDeferred had no caller outside its own
+// tests, so every change withheld from a live session stayed in deferred.json forever.
+// The materialize options are the same ones the merge round uses - the same liveness
+// probe, including alias directories, and the same derive hook - because a drain IS a
+// materialize, arriving late.
+type drainerAdapter struct {
+	roots     store.Roots
+	machineID string
+	log       io.Writer
+}
+
+func (d drainerAdapter) ApplyDeferred(ctx context.Context, opts amsync.DrainOptions) (amsync.DrainResult, error) {
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	eng := &merge.Engine{
+		GitDir:    d.roots.HistoryGitDir(),
+		WorkTree:  d.roots.ProjectsRoot,
+		MachineID: d.machineID,
+		Now:       func() time.Time { return now },
+	}
+	deriver := deriverAdapter{roots: d.roots, machineID: d.machineID, log: d.log}
+	rep, err := eng.ApplyDeferred(ctx, opts.Workspace, merge.MaterializeOptions{
+		StateRoot: d.roots.StateRoot,
+		Live: merge.Liveness{
+			ProjectsRoot: d.roots.ProjectsRoot,
+			Now:          func() time.Time { return now },
+			ProbeDirs:    probeDirsFor(d.roots.ProjectsRoot),
+		},
+		Derive: func(workspace string) error {
+			_, dErr := deriver.Derive(ctx, amsync.DeriveOptions{Workspace: workspace, Now: now})
+			return dErr
+		},
+	})
+	if err != nil {
+		return amsync.DrainResult{}, err
+	}
+	return amsync.DrainResult{
+		Applied:     rep.Applied,
+		Merged:      rep.Merged,
+		Resurrected: rep.Resurrected,
+		StillQueued: rep.StillQueued,
+	}, nil
+}
+
 // reportToResult maps the merge engine's report onto the shape sync writes into its
 // receipt. Nothing is invented here: UpToDate is the engine's own "no commit and no
 // fast-forward", and the touched set is read off the paths that actually moved, so a

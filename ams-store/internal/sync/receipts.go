@@ -59,6 +59,10 @@ type Receipt struct {
 	ConflictsInHistory []ConflictRef `json:"conflict_in_history,omitempty"`
 	// Deferred lists paths materialization queued because a session was live.
 	Deferred []string `json:"deferred,omitempty"`
+	// DeferredApplied lists paths a previously queued change landed on in this pass. It
+	// is the other end of Deferred: without it the audit trail shows changes going into
+	// the queue and nothing ever coming out.
+	DeferredApplied []string `json:"deferred_applied,omitempty"`
 	// Removed lists workspaces whose whole directory is gone and whose tracked files
 	// this pass staged for deletion. It is a receipt field rather than a log line
 	// because a store leaving the fleet is the kind of change a human reads back later.

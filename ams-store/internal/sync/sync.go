@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -34,6 +35,10 @@ type Options struct {
 	// because materializing them is not this package's job.
 	Deriver Deriver
 	Merger  Merger
+	// Drainer applies the deferred queue at the top of the pass. A nil Drainer is only
+	// legal while every queue is EMPTY: a pass that finds queued changes and has no
+	// engine to apply them refuses, rather than staging over them.
+	Drainer Drainer
 	// MachineID is this PC's id; empty means read or create it under the state root.
 	MachineID string
 	// Policy is the remote policy. Zero value means shape rules only.
@@ -130,6 +135,22 @@ func Once(ctx context.Context, opt Options) Result {
 		return res
 	}
 	res.Receipt.Stores = len(workspaces)
+
+	// 0. drain the deferred queue FIRST.
+	//
+	// Everything below it - derive, stage, commit - reads the work tree and writes
+	// history from it, so a change the last merge withheld has to land before any of
+	// them, or this pass commits the state the deferral was protecting and the merge
+	// result is undone. This is blueprint 4.8's "applied at SessionEnd and at the next
+	// SessionStart": both hooks run `sync --once`, and so does every watcher pass.
+	if err := drainDeferred(ctx, opt, workspaces, &res, now, logw); err != nil {
+		res.Err = err
+		res.ExitCode = exitRefused
+		res.Receipt.Status = StatusRefused
+		res.Receipt.Note = err.Error()
+		writeReceipt(opt.Roots.StateRoot, res.Receipt, logw)
+		return res
+	}
 
 	// 1. derive, so the index is correct whether or not the hub is reachable.
 	res.Derived = deriveAll(ctx, opt, workspaces, now, logw)
@@ -304,6 +325,39 @@ func Once(ctx context.Context, opt Options) Result {
 	}
 	writeReceipt(opt.Roots.StateRoot, res.Receipt, logw)
 	return res
+}
+
+// drainDeferred applies every workspace's pending merge result before this pass touches
+// anything else.
+//
+// It fails the WHOLE pass on an unreadable queue. That is deliberate: the queue names
+// changes that are already in history and deliberately not on disk, so a pass that cannot
+// read it cannot know what it is allowed to stage, and staging on a guess re-commits the
+// stale file over the merged blob. "I could not tell" means "do not touch it".
+func drainDeferred(ctx context.Context, opt Options, workspaces []string, res *Result, now time.Time, logw io.Writer) error {
+	for _, ws := range workspaces {
+		pending, err := merge.DeferredPaths(opt.Roots.StateRoot, ws)
+		if err != nil {
+			return fmt.Errorf("the deferred queue of %s cannot be read, so this pass cannot know what is pending: %w", ws, err)
+		}
+		if len(pending) == 0 {
+			continue
+		}
+		if opt.Drainer == nil {
+			return fmt.Errorf("%d change(s) are queued for %s and no drain engine is wired into this build", len(pending), ws)
+		}
+		out, err := opt.Drainer.ApplyDeferred(ctx, DrainOptions{Workspace: ws, Now: now})
+		if err != nil {
+			return fmt.Errorf("apply the deferred queue of %s: %w", ws, err)
+		}
+		res.Receipt.DeferredApplied = append(res.Receipt.DeferredApplied, out.Applied...)
+		res.Receipt.Resurrected = append(res.Receipt.Resurrected, out.Resurrected...)
+		if len(out.Applied) > 0 || len(out.Resurrected) > 0 {
+			fmt.Fprintf(logw, "sync: %s: applied %d deferred change(s), %d still queued, %d resurrected\n",
+				ws, len(out.Applied), len(out.StillQueued), len(out.Resurrected))
+		}
+	}
+	return nil
 }
 
 // SSHCommand builds the GIT_SSH_COMMAND every network call runs under (DESIGN:184).
