@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## v1.23.4 (2026-09-15) — the last members of both classes, found by an independent seat audit
+
+A clean-context audit of the whole repo (the local 27B seat, two contracts) after v1.23.2/v1.23.3:
+
+- **`linux-replica.sh` inherits `--brain-backup-dir` and `--brain-wsl` from `~/.mem0/replica.env`.**
+  The backup dir had a non-empty default persisted into the receipt and never read back, so a
+  re-run without the flag rewrote a custom remote backup dir to `~/.mem0/backups`; an omitted
+  `--brain-wsl` blanked the WSL hop of a Windows-hosted brain.
+- **`stamp-retired-at.py` resolves the authority through `ams_env`** (`MEM0_URL` >
+  `~/.mem0/authority-url` > loopback; credential > key file) instead of a bare loopback literal.
+- **`1-wsl-services.sh`'s post-install health probe follows `MEM0_BIND`**, and the Windows dream's
+  brain-side `/health/deep` line goes through `Get-Mem0AuthorityUrl`.
+- Static pins for all three in `test_loopback_probe_pins.py`; replica-installer test for the inherit.
+  Left as-is by design: `3-verify.ps1`'s "brain, local authority" check and `restore-replica.*`,
+  which probe a WSL brain's / a replica's own local store.
+
 ## v1.23.3 (2026-09-14) — the deploy path on a dormant replica; the authority re-run restarts its server
 
 Both found by the v1.23.2 live deploy, both members of the same brain-assumption class.

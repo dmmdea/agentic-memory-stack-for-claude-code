@@ -30,8 +30,12 @@ import httpx
 
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "memories"
-MEM0 = "http://127.0.0.1:18791"
-KEY = (Path.home() / ".mem0" / "api-key").read_text().strip()
+# v1.23.4: the authority may bind its tailnet address (native box) — resolve like every chain job.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ams_env import api_key, mem0_url  # noqa: E402  (deployed flat beside this script)
+
+MEM0 = mem0_url()
+KEY = api_key()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 
 DRY_RUN = "--dry-run" in sys.argv

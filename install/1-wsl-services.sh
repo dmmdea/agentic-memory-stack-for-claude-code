@@ -443,7 +443,12 @@ systemctl --user is-active qdrant.service mem0.service l10-audit.timer decay-sca
 # 6. Health probes
 # ----------------------------------------------------------------------
 echo "==> Health probes"
-for endpoint in "Qdrant http://127.0.0.1:6333/healthz" "mem0 http://127.0.0.1:18791/health"; do
+# v1.23.4: probe the address the server binds (MEM0_BIND, resolved above); a wildcard bind answers on loopback.
+case "$MEM0_BIND" in
+    ""|0.0.0.0) mem0_probe_url="http://127.0.0.1:18791" ;;
+    *)          mem0_probe_url="http://${MEM0_BIND}:18791" ;;
+esac
+for endpoint in "Qdrant http://127.0.0.1:6333/healthz" "mem0 $mem0_probe_url/health"; do
     name="${endpoint%% *}"
     url="${endpoint#* }"
     if curl -fs -m 5 "$url" >/dev/null 2>&1; then

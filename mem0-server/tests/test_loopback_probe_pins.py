@@ -59,6 +59,27 @@ def test_authority_installer_restarts_a_running_server_on_a_rerun():
     assert "enable --now qdrant.service mem0.service" not in sh, "mem0 must not be started via enable --now (no restart on re-run)"
 
 
+def test_wsl_installer_health_probe_follows_mem0_bind():
+    """v1.23.4: the post-install probe targets the bind the installer just resolved."""
+    code = _code(REPO_ROOT / "install" / "1-wsl-services.sh")
+    assert code.count(LOOPBACK) == 1, "one literal: the wildcard/unset-bind default of mem0_probe_url"
+    assert '""|0.0.0.0) mem0_probe_url="http://127.0.0.1:18791"' in code
+    assert '"mem0 $mem0_probe_url/health"' in code
+
+
+def test_stamp_retired_at_resolves_through_ams_env():
+    code = _code(REPO_ROOT / "scripts" / "wsl" / "stamp-retired-at.py")
+    assert LOOPBACK not in code
+    assert "from ams_env import api_key, mem0_url" in code
+
+
+def test_windows_dream_probes_the_resolved_authority():
+    code = "\n".join(l for l in (REPO_ROOT / "scripts" / "windows" / "dream-consolidate.ps1").read_text(encoding="utf-8").splitlines()
+                     if not l.lstrip().startswith("#"))
+    assert "127.0.0.1:18791" not in code
+    assert "(Get-Mem0AuthorityUrl) + '/health/deep'" in code
+
+
 def test_stack_promote_follows_mem0_bind():
     code = _code(REPO_ROOT / "scripts" / "wsl" / "stack-promote.sh")
     assert LOOPBACK not in code

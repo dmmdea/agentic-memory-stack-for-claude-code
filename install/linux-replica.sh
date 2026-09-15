@@ -32,7 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR='~/.mem0/backups'
+AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
@@ -88,6 +88,21 @@ if [ -z "$USER_ID" ]; then
     [ -z "$USER_ID" ] || echo "    tenant inherited from the existing install: $USER_ID"
     [ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
 fi
+# v1.23.4: --brain-backup-dir and --brain-wsl inherit from the existing ~/.mem0/replica.env (the
+# same class: a re-run without --brain-backup-dir rewrote a custom remote backup dir to the stock
+# path, and one without --brain-wsl blanked the WSL hop of a Windows-hosted brain). Explicit flag
+# > replica.env > default; only a first install with no replica.env applies the defaults.
+inherit_from_replica_env() {  # $1 = variable, $2 = replica.env key, $3 = flag (for the message)
+    local prev=""
+    [ -z "${!1}" ] || return 0
+    [ -f "$MEM0_DIR/replica.env" ] && prev="$(sed -n "s/^$2='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$MEM0_DIR/replica.env" | head -n1)"
+    [ -n "$prev" ] || return 0
+    printf -v "$1" '%s' "$prev"
+    echo "    $3 inherited from ~/.mem0/replica.env: $prev"
+}
+inherit_from_replica_env BRAIN_BACKUP_DIR BRAIN_BACKUP_DIR --brain-backup-dir
+inherit_from_replica_env BRAIN_WSL       BRAIN_WSL       --brain-wsl
+[ -n "$BRAIN_BACKUP_DIR" ] || BRAIN_BACKUP_DIR='~/.mem0/backups'
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$BRAIN_WSL" ] || [[ "$BRAIN_WSL" == *:* ]] || fail "--brain-wsl must be <distro>:<user>"
 [[ "$QDRANT_STORAGE_GB" =~ ^[0-9]+$ ]] && [ "$QDRANT_STORAGE_GB" -ge 1 ] || fail "--qdrant-storage-gb must be a whole number of GiB"
