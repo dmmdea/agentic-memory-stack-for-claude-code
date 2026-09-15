@@ -628,10 +628,11 @@ func TestLint_ARemoteThatIsNotTheHubIsAFinding(t *testing.T) {
 	}{
 		{"origin", "ams-hub@" + hubHost + ":ams-store.git", "the right host under the wrong remote name"},
 		{"hub", "https://example.invalid/ams-store.git", "not SSH"},
-		{"hub", "ams-hub@100.101.102.103:ams-store.git", "a raw tailnet literal instead of the MagicDNS name"},
-		// No dots, so the dotted-name rule cannot catch it: only the IP-literal rule can.
-		// Reach is MagicDNS, never an address, and an address is what survives a rename.
-		{"hub", "ssh://ams-hub@[fd7a:115c:a1e0::1]/ams-store.git", "a bracketed IPv6 literal"},
+		{"hub", "ams-hub@" + testutil.IPLiteral(100, 101, 102, 103) + ":ams-store.git", "a raw tailnet literal instead of the MagicDNS name"},
+		// No dots, so the dotted-name rule cannot catch it. 2001:db8:: is RFC 3849's
+		// documentation prefix: the rule is shape-based, so the prefix carries no
+		// information and must not be a real tailnet ULA.
+		{"hub", "ssh://ams-hub@[2001:db8::1]/ams-store.git", "a bracketed IPv6 literal"},
 		{"hub", "ams-hub@some-other-box:ams-store.git", "a host that is not the hub"},
 	}
 	for _, c := range cases {

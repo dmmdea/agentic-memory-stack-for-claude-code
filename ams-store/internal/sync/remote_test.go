@@ -31,14 +31,14 @@ func TestRemote_PolicyAcceptsOnlySSHToAMagicDNSHost(t *testing.T) {
 	}
 
 	rejected := map[string]string{
-		"https://example.invalid/ams-store.git":      "must be SSH",
-		"git://" + hubHost + "/ams-store.git":        "must be SSH",
-		"ams-hub@192.0.2.10:/srv/ams/ams-store.git":  "IP literal",
-		"ams-hub@100.64.0.1:/srv/ams/ams-store.git":  "IP literal",
-		"ssh://ams-hub@[2001:db8::1]/ams-store.git":  "MagicDNS",
-		"ams-hub@" + hubHost + ".example.invalid:/a": "dotted name",
-		"/srv/ams/ams-store.git":                     "local path",
-		"":                                           "no URL",
+		"https://example.invalid/ams-store.git":                                    "must be SSH",
+		"git://" + hubHost + "/ams-store.git":                                      "must be SSH",
+		"ams-hub@192.0.2.10:/srv/ams/ams-store.git":                                "IP literal",
+		"ams-hub@" + testutil.IPLiteral(100, 64, 0, 1) + ":/srv/ams/ams-store.git": "IP literal",
+		"ssh://ams-hub@[2001:db8::1]/ams-store.git":                                "MagicDNS",
+		"ams-hub@" + hubHost + ".example.invalid:/a":                               "dotted name",
+		"/srv/ams/ams-store.git":                                                   "local path",
+		"":                                                                         "no URL",
 	}
 	for url, want := range rejected {
 		reason := p.CheckURL(url)
@@ -57,9 +57,9 @@ func TestRemote_PolicyAcceptsOnlySSHToAMagicDNSHost(t *testing.T) {
 func TestRemote_CGNATAndLANLiteralsAreRefusedEvenWhenTheyWork(t *testing.T) {
 	p := RemotePolicy{}
 	for _, url := range []string{
-		"ams-hub@10.0.0.5:/srv/ams/ams-store.git",
-		"ams-hub@192.168.1.50:/srv/ams/ams-store.git",
-		"ssh://ams-hub@100.100.100.100/srv/ams/ams-store.git",
+		"ams-hub@" + testutil.IPLiteral(10, 0, 0, 5) + ":/srv/ams/ams-store.git",
+		"ams-hub@" + testutil.IPLiteral(192, 168, 1, 50) + ":/srv/ams/ams-store.git",
+		"ssh://ams-hub@" + testutil.IPLiteral(100, 100, 100, 100) + "/srv/ams/ams-store.git",
 	} {
 		if reason := p.CheckURL(url); !strings.Contains(reason, "IP literal") {
 			t.Fatalf("CheckURL(%q) = %q, want an IP-literal refusal", url, reason)

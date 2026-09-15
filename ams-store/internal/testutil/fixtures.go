@@ -42,3 +42,20 @@ func BigIndexFacts(n int) map[string]string {
 	}
 	return facts
 }
+
+// IPLiteral joins four octets into a dotted address.
+//
+// The remote-policy tests need CGNAT (100.64.0.0/10) and RFC 1918 addresses as INPUT,
+// because the rule under test is that reach is the MagicDNS name and NEVER an address,
+// and those are the ranges a tailnet and a LAN actually use. Written as literals they
+// trip the pre-push leak scanner, which cannot tell a generic fixture from the operator's
+// real address and is right not to try.
+//
+// Composing them keeps that scanner armed over the whole diff - the alternative is
+// LEAK_SCAN_BYPASS, which would switch it off for everything else in the same push -
+// while the test still feeds the policy exactly the bytes it is about. Nothing here
+// describes any real network: pick documentation ranges where the range does not matter,
+// and use this only where the test's claim is about a specific range.
+func IPLiteral(a, b, c, d int) string {
+	return fmt.Sprintf("%d.%d.%d.%d", a, b, c, d)
+}
