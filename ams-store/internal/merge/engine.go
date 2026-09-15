@@ -34,6 +34,11 @@ type Engine struct {
 	// MachineID is this PC's id, recorded in every commit and used as the deterministic
 	// tiebreak when two commits land in the same second.
 	MachineID string
+	// StateRoot is STATE_ROOT, and it is required by Fetch and Push ONLY: it is where the
+	// pre-seeded known_hosts lives, so it is what the hardened network environment is
+	// built from. An engine that never touches the hub can leave it empty; one that does
+	// and has not set it is refused rather than dialling with the ambient ssh config.
+	StateRoot string
 	// Now is injectable so tests get deterministic commit times.
 	Now func() time.Time
 }
@@ -47,6 +52,19 @@ func (e *Engine) now() time.Time {
 
 func (e *Engine) opt() gitx.Options {
 	return gitx.Options{GitDir: e.GitDir, WorkTree: e.WorkTree}
+}
+
+// netOpt is opt() plus the hardened network environment (DESIGN:184), and it is the only
+// way a call in this package is allowed to reach the hub. gitx refuses a network
+// subcommand without it, so a future method that forgets is a refusal and not a silent
+// dial with whatever ssh config the box happens to carry.
+func (e *Engine) netOpt() (gitx.Options, error) {
+	if strings.TrimSpace(e.StateRoot) == "" {
+		return gitx.Options{}, fmt.Errorf("merge: a network call needs StateRoot (the known_hosts root); refusing to reach the hub unhardened")
+	}
+	o := e.opt()
+	o.ExtraEnv = gitx.NetworkEnv(e.StateRoot)
+	return o, nil
 }
 
 // excludeContent is info/exclude for the history repo.
@@ -292,7 +310,11 @@ func (e *Engine) workspaces() ([]string, error) {
 // Fetch updates the remote-tracking refs. It is never called from a hook: the design's
 // rule is that the network is never on a hook's critical path.
 func (e *Engine) Fetch(ctx context.Context, remote string) error {
-	_, err := gitx.Run(ctx, e.opt(), "fetch", "--prune", remote)
+	opt, err := e.netOpt()
+	if err != nil {
+		return err
+	}
+	_, err = gitx.Run(ctx, opt, "fetch", "--prune", remote)
 	return err
 }
 
@@ -307,7 +329,10 @@ type PushResult struct {
 
 // Push sends refs/heads/main to the hub.
 func (e *Engine) Push(ctx context.Context, remote string) (PushResult, error) {
-	opt := e.opt()
+	opt, err := e.netOpt()
+	if err != nil {
+		return PushResult{}, err
+	}
 	opt.OkExit = func(int) bool { return true }
 	res, err := gitx.Run(ctx, opt, "push", remote, MainRef+":"+MainRef)
 	if err != nil {

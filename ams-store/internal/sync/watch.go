@@ -265,7 +265,7 @@ func LsRemoteHead(ctx context.Context, r Repo, stateRoot string, timeout time.Du
 	res, err := gitx.Run(ctx, gitx.Options{
 		GitDir:   r.GitDir,
 		Timeout:  timeout,
-		ExtraEnv: []string{"GIT_SSH_COMMAND=" + SSHCommand(stateRoot)},
+		ExtraEnv: gitx.NetworkEnv(stateRoot),
 	}, "ls-remote", "--heads", HubRemote, Branch)
 	if err != nil {
 		return "", err

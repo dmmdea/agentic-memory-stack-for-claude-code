@@ -91,6 +91,9 @@ func (f *fleet) newPC(name string, clock time.Time) *pc {
 		GitDir:    p.gitDir,
 		WorkTree:  p.projects,
 		MachineID: p.machine,
+		// The state root is what the hardened network environment is built from, so a
+		// fixture PC that talks to the hub carries it exactly as a real PC does.
+		StateRoot: p.stateDir,
 		Now:       func() time.Time { return p.clock },
 	}
 	if err := p.eng.Initialize(context.Background()); err != nil {

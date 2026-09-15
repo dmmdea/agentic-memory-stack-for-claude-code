@@ -72,6 +72,42 @@ var Mutations = []Mutation{
 		}},
 	},
 	{
+		ID: "both-deleted", Rule: "a path BOTH sides deleted stays deleted", Task: 4,
+		File: "internal/merge/deletion.go", Test: "TestMerge_BothSidesDeletedTheSameFile_StaysDeleted", Package: "./internal/merge",
+		Why: "two PCs that re-home the same fact under two different slugs hand git a rename/rename, and the source path comes back conflicted although neither side still has it. Resolving it to the base blob is the union rule: the retired slug reappears on every PC, next to both of its replacements, forever.",
+		Hunks: []Hunk{{
+			Old: "\tcase !ours.present && !theirs.present:\n\t\tres.op = OpDelete\n",
+			New: "\tcase !ours.present && !theirs.present:\n\t\tres.op, res.content = OpReplace, toLF(base.data)\n",
+		}},
+	},
+	{
+		ID: "added-ours-only", Rule: "a path only OUR side added keeps our bytes, whatever git paired it with", Task: 4,
+		File: "internal/merge/deletion.go", Test: "TestMerge_AddedOnOursOnly_GitPairingNeverRewritesIt", Package: "./internal/merge",
+		Why: "with rename detection live - which is every git this tool supports below 2.55 - the other side's edit to the old path is written into the new slug we just created. Accepting the merged tree's version there silently rewrites a file this PC alone authored.",
+		Hunks: []Hunk{{
+			Old: "\t\t// Added on our side only.\n\t\tres.op = OpReplace\n\t\tres.content = toLF(ours.data)\n",
+			New: "\t\t// Added on our side only.\n\t\tres.op = OpNone\n\t\tres.content = nil\n",
+		}},
+	},
+	{
+		ID: "added-theirs-only", Rule: "a path only THEIR side added arrives as they wrote it", Task: 4,
+		File: "internal/merge/deletion.go", Test: "TestMerge_AddedOnTheirsOnly_GitPairingNeverRewritesIt", Package: "./internal/merge",
+		Why: "the mirror of added-ours-only: the pairing writes OUR edit of the old path into the slug the other PC re-homed the fact to, so a fact nobody on this PC ever touched arrives carrying this PC's text.",
+		Hunks: []Hunk{{
+			Old: "\tcase !ours.present && theirs.present:\n\t\tres.op = OpReplace\n\t\tres.content = toLF(theirs.data)\n",
+			New: "\tcase !ours.present && theirs.present:\n\t\tres.op = OpNone\n\t\tres.content = nil\n",
+		}},
+	},
+	{
+		ID: "identical-after-normalization", Rule: "two sides that added the same slug with identical bytes keep it once, written LF", Task: 4,
+		File: "internal/merge/deletion.go", Test: "TestMerge_TwoPCsAddTheSameSlugWithIdenticalBytes_KeptOnceAsLF", Package: "./internal/merge",
+		Why: "git calls a same-content add/add with differing file modes a conflict, and a conflicted path is handed to the table with nothing to decide. Anything but keeping the bytes drops a fact both PCs agreed on.",
+		Hunks: []Hunk{{
+			Old: "\tif bytes.Equal(ours.data, theirs.data) {\n\t\tres.op = OpReplace\n",
+			New: "\tif bytes.Equal(ours.data, theirs.data) {\n\t\tres.op = OpDelete\n",
+		}},
+	},
+	{
 		ID: "canon-eol", Rule: "the comparison normalizes CRLF to LF", Task: 4,
 		File: "internal/merge/canon.go", Test: "TestMerge_CRLFOnlyDifference_Identical", Package: "./internal/merge",
 		Why: "ten live fact files are CRLF; without the normalization each of them conflicts with its own LF twin on first sync.",

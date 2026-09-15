@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,8 +22,10 @@ import (
 // other reason is a process that never exits, on a box nobody is watching.
 const MaxPushAttempts = 3
 
-// KnownHostsFile is the pre-seeded known_hosts under STATE_ROOT.
-const KnownHostsFile = "known_hosts"
+// KnownHostsFile is the pre-seeded known_hosts under STATE_ROOT. The file, like the ssh
+// options that read it, is owned by gitx now: there is ONE hardened network environment in
+// this module and every caller gets it from the same place.
+const KnownHostsFile = gitx.KnownHostsFile
 
 // Options configures one sync pass. The caller holds the per-PC lock; Once does not take
 // it, because the lock covers derive AND sync together and the verb is what owns both.
@@ -225,7 +226,7 @@ func Once(ctx context.Context, opt Options) Result {
 		GitDir:   repo.GitDir,
 		WorkTree: repo.WorkTree,
 		Timeout:  opt.Timeout,
-		ExtraEnv: []string{"GIT_SSH_COMMAND=" + SSHCommand(opt.Roots.StateRoot)},
+		ExtraEnv: gitx.NetworkEnv(opt.Roots.StateRoot),
 	}
 
 	for attempt := 1; attempt <= MaxPushAttempts; attempt++ {
@@ -362,22 +363,10 @@ func drainDeferred(ctx context.Context, opt Options, workspaces []string, res *R
 
 // SSHCommand builds the GIT_SSH_COMMAND every network call runs under (DESIGN:184).
 //
-// BatchMode=yes so a missing key fails instead of prompting a box nobody is sitting at;
-// ConnectTimeout=2 so an unreachable hub costs two seconds, not a TCP timeout;
-// StrictHostKeyChecking=yes with a pre-seeded known_hosts so a changed host key is
-// refused rather than accepted on trust. Never prompt, never hang.
-func SSHCommand(stateRoot string) string {
-	kh := filepath.Join(stateRoot, KnownHostsFile)
-	return "ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=yes " +
-		"-o UserKnownHostsFile=" + quoteForSSH(kh)
-}
-
-func quoteForSSH(p string) string {
-	if !strings.ContainsAny(p, " \t") {
-		return p
-	}
-	return `"` + p + `"`
-}
+// The options themselves live in gitx.SSHCommand, beside the guard that refuses a network
+// subcommand without them: a second hand-built copy of this string is exactly how the
+// merge engine's Fetch and Push came to dial with the ambient ssh config.
+func SSHCommand(stateRoot string) string { return gitx.SSHCommand(stateRoot) }
 
 // fetchHub fetches the shared branch, tolerating the one failure that is not a failure:
 // a hub that has no branch yet.
