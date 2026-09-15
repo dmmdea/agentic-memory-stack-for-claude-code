@@ -53,6 +53,11 @@ type Options struct {
 	OkExit func(int) bool
 	// Stdin, when non-empty, is fed to the command.
 	Stdin string
+	// StdinRaw, when non-nil, is fed to the command verbatim and takes precedence over
+	// Stdin. It exists because an EMPTY stdin is a real input that Stdin's "" cannot
+	// express: `hash-object -w --stdin` on a zero-byte fact file must write the empty
+	// blob, and with no stdin attached at all it would inherit the parent's and hang.
+	StdinRaw []byte
 }
 
 // ExitError is returned when git ran and exited with a code OkExit rejects.
@@ -117,7 +122,10 @@ func Run(ctx context.Context, opt Options, args ...string) (Result, error) {
 	env = append(env, opt.ExtraEnv...)
 	cmd.Env = env
 
-	if opt.Stdin != "" {
+	switch {
+	case opt.StdinRaw != nil:
+		cmd.Stdin = bytes.NewReader(opt.StdinRaw)
+	case opt.Stdin != "":
 		cmd.Stdin = strings.NewReader(opt.Stdin)
 	}
 	var out, errb bytes.Buffer

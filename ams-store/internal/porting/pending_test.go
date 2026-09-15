@@ -59,9 +59,9 @@ func TestReceipts_LastJudgeUtcNilWhenNoCall(t *testing.T) { t.Skip("ported in ta
 // MemoryCompact.Tests.ps1:15 - below trigger does nothing.
 func TestDerive_BelowTriggerNoChange(t *testing.T) { t.Skip("ported in task 3") }
 
-// MemoryCompact.Tests.ps1:28 - the v2 form of the liveness skip: a live session defers
-// materialization instead of gating maintenance.
-func TestMaterialize_LiveSessionDeferred_NoIndexChange(t *testing.T) { t.Skip("ported in task 4") }
+// MemoryCompact.Tests.ps1:28 - the v2 form of the liveness skip (a live session defers
+// materialization instead of gating maintenance) is ported in internal/merge as
+// TestMaterialize_LiveSessionDeferred_NoIndexChange. Task 4.
 
 // MemoryCompact.Tests.ps1:41 - compare-and-swap abort on a mid-run write.
 func TestDerive_AbortsOnConcurrentIndexWrite(t *testing.T) { t.Skip("ported in task 3") }

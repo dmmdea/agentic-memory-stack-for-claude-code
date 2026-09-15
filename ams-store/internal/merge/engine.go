@@ -1,0 +1,320 @@
+package merge
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
+)
+
+// MainRef is the one branch this tool uses. There is no second branch anywhere in the
+// design: every PC and the hub track refs/heads/main and nothing else.
+const MainRef = "refs/heads/main"
+
+// TrailerMachine and TrailerKind are the commit trailers every ams-store commit carries.
+// TrailerMachine is read back as the body-conflict tiebreak, so it is data, not a note.
+const (
+	TrailerMachine = "Ams-Machine"
+	TrailerKind    = "Ams-Kind"
+)
+
+// Engine binds one local out-of-tree history repo.
+type Engine struct {
+	// GitDir is the history repo's git dir, which lives under STATE_ROOT and never
+	// inside a store: nothing for the harness to sync and nothing for an agent to glob.
+	GitDir string
+	// WorkTree is PROJECTS_ROOT.
+	WorkTree string
+	// MachineID is this PC's id, recorded in every commit and used as the deterministic
+	// tiebreak when two commits land in the same second.
+	MachineID string
+	// Now is injectable so tests get deterministic commit times.
+	Now func() time.Time
+}
+
+func (e *Engine) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
+}
+
+func (e *Engine) opt() gitx.Options {
+	return gitx.Options{GitDir: e.GitDir, WorkTree: e.WorkTree}
+}
+
+// excludeContent is info/exclude for the history repo.
+//
+// Everything is excluded by default and fact files are re-included by shape, because the
+// projects root also holds transcripts, tool state and whatever else the harness writes
+// there. MEMORY.md is excluded on purpose and stays untracked on every PC and on the
+// hub: it is DERIVED from the fact set, re-derived after every merge, and therefore
+// never merged and never in conflict.
+const excludeContent = "" +
+	"# ams-store: nothing is tracked except fact files and the shared state stamp.\n" +
+	"*\n" +
+	"!*/\n" +
+	"!*/memory/*.md\n" +
+	"*/memory/" + store.IndexName + "\n" +
+	"!/" + OverTriggerPath + "\n"
+
+// Initialize creates (idempotently) the history repo and pins the config the merge
+// engine depends on.
+//
+// core.autocrlf and core.safecrlf are off so git never rewrites a byte on its own - the
+// merge engine owns line-ending normalization and does it in one place. merge.renames is
+// off because a judge migration (a deletion) paired with an unrelated new fact file is
+// silently read as a rename, and the deletion is lost.
+func (e *Engine) Initialize(ctx context.Context) error {
+	if _, err := gitx.Require(ctx); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(e.GitDir, "HEAD")); err != nil {
+		if err := os.MkdirAll(filepath.Dir(e.GitDir), 0o755); err != nil {
+			return fmt.Errorf("history repo parent: %w", err)
+		}
+		if _, err := gitx.Run(ctx, e.opt(), "init", "-q", "-b", "main"); err != nil {
+			return err
+		}
+	}
+	for _, kv := range [][2]string{
+		{"user.name", "automemory"},
+		{"user.email", "automemory@localhost"},
+		{"commit.gpgsign", "false"},
+		{"core.autocrlf", "false"},
+		{"core.safecrlf", "false"},
+		{"core.quotepath", "false"},
+		{"merge.renames", "false"},
+	} {
+		if _, err := gitx.Run(ctx, e.opt(), "config", kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	info := filepath.Join(e.GitDir, "info")
+	if err := os.MkdirAll(info, 0o755); err != nil {
+		return fmt.Errorf("history repo info dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(info, "exclude"), []byte(excludeContent), 0o644); err != nil {
+		return fmt.Errorf("history repo info/exclude: %w", err)
+	}
+	return nil
+}
+
+// CommitOptions drives one local commit.
+type CommitOptions struct {
+	Message string
+	// Kind is the Ams-Kind trailer: local, merge or judge.
+	Kind string
+	// Workspaces limits staging to these workspaces' stores. Empty means every
+	// workspace directory under the work tree.
+	Workspaces []string
+	// Date pins the author and committer time. Zero means the engine clock.
+	Date time.Time
+}
+
+// StoreRel is a workspace's store path as git stores it: slash-separated, relative to
+// the work tree.
+func StoreRel(workspace string) string { return workspace + "/" + "memory" }
+
+// Commit stages every named store and the shared state stamp and commits.
+//
+// This is the merge-side hook `sync --once` calls, and the ORDER matters there: the local
+// commit happens BEFORE the fetch, so a PC that worked all day offline keeps its history
+// whatever the network did.
+func (e *Engine) Commit(ctx context.Context, co CommitOptions) (oid string, changed bool, err error) {
+	workspaces := co.Workspaces
+	if len(workspaces) == 0 {
+		workspaces, err = e.workspaces()
+		if err != nil {
+			return "", false, err
+		}
+	}
+	for _, ws := range workspaces {
+		rel := StoreRel(ws)
+		if _, statErr := os.Stat(filepath.Join(e.WorkTree, filepath.FromSlash(rel))); statErr != nil {
+			continue
+		}
+		// -f forces past info/exclude for the fact files, and the exclude pathspec keeps
+		// MEMORY.md out even under -f: forcing the directory in would otherwise track
+		// the one file the design requires to stay untracked.
+		if _, err := gitx.Run(ctx, e.opt(), "add", "-A", "-f", "--",
+			rel, ":(exclude)"+rel+"/"+store.IndexName); err != nil {
+			return "", false, err
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(e.WorkTree, filepath.FromSlash(OverTriggerPath))); statErr == nil {
+		if _, err := gitx.Run(ctx, e.opt(), "add", "-A", "-f", "--", OverTriggerPath); err != nil {
+			return "", false, err
+		}
+	}
+
+	dirty, err := e.indexDiffersFromHead(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if !dirty {
+		return "", false, nil
+	}
+
+	when := co.Date
+	if when.IsZero() {
+		when = e.now()
+	}
+	opt := e.opt()
+	opt.ExtraEnv = dateEnv(when)
+	msg := e.message(co.Message, co.Kind)
+	if _, err := gitx.Run(ctx, opt, "commit", "-q", "-m", msg); err != nil {
+		return "", false, err
+	}
+	head, ok, err := gitx.RevParse(ctx, e.opt(), "HEAD")
+	if err != nil || !ok {
+		return "", false, fmt.Errorf("commit produced no HEAD: %w", err)
+	}
+	return head, true, nil
+}
+
+func dateEnv(when time.Time) []string {
+	stamp := when.UTC().Format(time.RFC3339)
+	return []string{"GIT_AUTHOR_DATE=" + stamp, "GIT_COMMITTER_DATE=" + stamp}
+}
+
+func (e *Engine) message(subject, kind string) string {
+	if kind == "" {
+		kind = "local"
+	}
+	return subject + "\n\n" + TrailerMachine + ": " + e.MachineID + "\n" + TrailerKind + ": " + kind + "\n"
+}
+
+func (e *Engine) indexDiffersFromHead(ctx context.Context) (bool, error) {
+	_, hasHead, err := gitx.RevParse(ctx, e.opt(), "HEAD")
+	if err != nil {
+		return false, err
+	}
+	if !hasHead {
+		res, err := gitx.Run(ctx, e.opt(), "ls-files", "--cached")
+		if err != nil {
+			return false, err
+		}
+		return strings.TrimSpace(res.Stdout) != "", nil
+	}
+	opt := e.opt()
+	opt.OkExit = gitx.OkExitCodes(0, 1)
+	res, err := gitx.Run(ctx, opt, "diff", "--cached", "--quiet")
+	if err != nil {
+		return false, err
+	}
+	return res.Code == 1, nil
+}
+
+// workspaces lists the workspace directories that actually hold a store.
+func (e *Engine) workspaces() ([]string, error) {
+	entries, err := os.ReadDir(e.WorkTree)
+	if err != nil {
+		// Fail closed: "could not read" must never be spellable as "there is nothing
+		// there", which is how an empty enumeration once wiped an entire index.
+		return nil, fmt.Errorf("enumerate workspaces under %s: %w", e.WorkTree, err)
+	}
+	var out []string
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(e.WorkTree, ent.Name(), "memory")); err != nil {
+			continue
+		}
+		out = append(out, ent.Name())
+	}
+	return out, nil
+}
+
+// Fetch updates the remote-tracking refs. It is never called from a hook: the design's
+// rule is that the network is never on a hook's critical path.
+func (e *Engine) Fetch(ctx context.Context, remote string) error {
+	_, err := gitx.Run(ctx, e.opt(), "fetch", "--prune", remote)
+	return err
+}
+
+// PushResult distinguishes the one rejection the push loop retries from every other
+// failure. A non-fast-forward means somebody else pushed first and the loser re-merges;
+// anything else is a real error and must not be retried three times.
+type PushResult struct {
+	OK             bool
+	NonFastForward bool
+	Stderr         string
+}
+
+// Push sends refs/heads/main to the hub.
+func (e *Engine) Push(ctx context.Context, remote string) (PushResult, error) {
+	opt := e.opt()
+	opt.OkExit = func(int) bool { return true }
+	res, err := gitx.Run(ctx, opt, "push", remote, MainRef+":"+MainRef)
+	if err != nil {
+		return PushResult{Stderr: res.Stderr}, err
+	}
+	if res.Code == 0 {
+		return PushResult{OK: true, Stderr: res.Stderr}, nil
+	}
+	combined := res.Stderr + res.Stdout
+	lower := strings.ToLower(combined)
+	nonFF := strings.Contains(lower, "non-fast-forward") ||
+		strings.Contains(lower, "fetch first") ||
+		strings.Contains(lower, "behind its remote")
+	return PushResult{NonFastForward: nonFF, Stderr: combined}, nil
+}
+
+// Adopt takes a remote branch as this PC's history when there is nothing local to merge
+// with, and materializes it. It is the first-sync path, and it refuses to run when the
+// local branch has commits of its own - that case is a merge, not an adoption.
+func (e *Engine) Adopt(ctx context.Context, theirsRef string, mo MaterializeOptions) error {
+	theirs, ok, err := gitx.RevParse(ctx, e.opt(), theirsRef)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("adopt: %s does not exist", theirsRef)
+	}
+	ours, hasOurs, err := gitx.RevParse(ctx, e.opt(), MainRef)
+	if err != nil {
+		return err
+	}
+	if hasOurs {
+		return fmt.Errorf("adopt: %s already exists at %s; use Round", MainRef, ours)
+	}
+	if err := gitx.UpdateRef(ctx, e.opt(), MainRef, theirs, gitx.NullOID); err != nil {
+		return err
+	}
+	theirsTree, err := e.treeOf(ctx, theirs)
+	if err != nil {
+		return err
+	}
+	_, err = e.materialize(ctx, "", theirsTree, mo)
+	return err
+}
+
+func (e *Engine) treeOf(ctx context.Context, commit string) (string, error) {
+	res, err := gitx.Run(ctx, e.opt(), "rev-parse", commit+"^{tree}")
+	if err != nil {
+		return "", err
+	}
+	tree := strings.TrimSpace(res.Stdout)
+	if !gitx.IsOID(tree) {
+		return "", fmt.Errorf("rev-parse %s^{tree} returned %q", commit, tree)
+	}
+	return tree, nil
+}
+
+// workspaceOf returns the workspace a tracked path belongs to, or "" when the path is
+// not inside a store (the shared state stamp is the only such path today).
+func workspaceOf(p string) string {
+	parts := strings.Split(path.Clean(p), "/")
+	if len(parts) >= 3 && parts[1] == "memory" {
+		return parts[0]
+	}
+	return ""
+}
