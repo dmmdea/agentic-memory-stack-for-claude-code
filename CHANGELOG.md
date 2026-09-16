@@ -4,6 +4,34 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.27.0 — a Linux client can join the fleet store (register P4-3)
+
+`linux-client.sh` installed the MCP shim and the outbox and nothing else, so a native Linux box
+could not join the fleet store at all: no binary, no hub transport, no hooks. The Vivobook row had
+nothing to deploy. With `--ams-hub` the client now installs all three; without it the block is
+skipped and a thin client installs exactly as before. `linux-replica.sh` builds on this file, so
+both roles inherit it.
+
+- The binary goes to `~/.local/bin/ams-store`, fetched from the release of the tag in `VERSION`,
+  verified against its `SHA256SUMS`, with a `.sha256` sidecar, and `uname -m` picking amd64 or
+  arm64. No `sudo`: nothing on a client runs the binary but the user's own session.
+- The hub transport is the authority's, minus what only a hub needs: the ssh `Match` block,
+  `known_hosts` seeded from the user's, the history repo, exactly one remote named `hub`.
+- **The client is roleless by construction** and refuses to run where a `role` file exists. That
+  file is what makes `judge-apply` willing to decide; a PC carrying it would start applying the
+  nightly's plans to the whole fleet's memory.
+- Hook registration is a new Python helper, `claude-config/register-ams-hooks.py`, rather than
+  hand-rolled JSON in bash. It mirrors the PowerShell merge exactly, including the rule from the
+  2026-06-08 audit: identify our entries by command substring marker, remove only those, append
+  fresh, preserve everything else, and write only when the result differs so a re-run is
+  byte-identical.
+
+Rehearsed against the live authority in a sandboxed HOME, not only tested: the binary installed and
+verified, the store came up roleless, the three hooks registered with the right matcher and async
+fields, a second run reported "already current" with an identical `settings.json`, and an
+`ls-remote` through the config the installer wrote reached the hub. Twelve tests, three mutations
+seen red, the suite registered in CI.
+
 ## 1.26.2 — the corpus partition never reached the applier, so every migration failed on its own (register P4-1b follow-up)
 
 Found by a live run, not by a test. Against a purpose-made store and a hand-written plan, `judge-apply`
