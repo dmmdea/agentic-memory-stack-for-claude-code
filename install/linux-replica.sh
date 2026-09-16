@@ -20,7 +20,9 @@
 # Usage:
 #   bash install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <ssh-alias> \
 #        [--brain-wsl <distro>:<user>] [--brain-backup-dir <remote dir>] \
-#        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run]
+#        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run] \n#        [--ams-hub <user@host:repo.git>] [--ams-store-binary <file>] [--ams-store-sums <file>]
+#   --ams-hub and its two companions are forwarded verbatim to install/linux-client.sh, which
+#                is where the fleet store is installed; a replica joins the store as a client.
 #   --brain-wsl: the Brain keeps its stack inside WSL on a Windows host; snapshot commands run
 #                through wsl.exe on that host (the usual Windows+WSL install).
 #   --qdrant-storage-gb: size of the ext4 image that backs Qdrant's storage when the home
@@ -34,6 +36,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""; SET_BRAIN_WSL=0; SET_BRAIN_BACKUP_DIR=0
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
+# Fleet-store flags: a replica is a client plus a dormant brain, so these belong to the
+# client install and are forwarded to it verbatim. Without the forward the client would
+# skip its store block and the replica would silently never join the fleet.
+AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -53,6 +59,9 @@ while [ $# -gt 0 ]; do
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
         --qdrant-storage-gb) QDRANT_STORAGE_GB="${2:-}"; shift 2 ;;
+        --ams-hub) AMS_HUB="${2:-}"; shift 2 ;;
+        --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
+        --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -134,6 +143,9 @@ fi
 say "[1] thin client (install/linux-client.sh)"
 CLIENT_ARGS=(--authority "$AUTHORITY" --user-id "$USER_ID")
 [ -n "$API_KEY_FILE" ] && CLIENT_ARGS+=(--api-key-file "$API_KEY_FILE")
+[ -n "$AMS_HUB" ] && CLIENT_ARGS+=(--ams-hub "$AMS_HUB")
+[ -n "$AMS_BINARY" ] && CLIENT_ARGS+=(--ams-store-binary "$AMS_BINARY")
+[ -n "$AMS_SUMS" ] && CLIENT_ARGS+=(--ams-store-sums "$AMS_SUMS")
 [ "$DRY_RUN" = 1 ] && CLIENT_ARGS+=(--dry-run)
 bash "$SCRIPT_DIR/linux-client.sh" "${CLIENT_ARGS[@]}"
 
