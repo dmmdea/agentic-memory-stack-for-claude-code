@@ -210,3 +210,86 @@ def test_the_replica_documents_the_forwarded_flags():
     body = (REPO_ROOT / "install" / "linux-replica.sh").read_text(encoding="utf-8")[:4000]
     for flag in ("--ams-hub", "--ams-store-binary", "--ams-store-sums"):
         assert flag in body, f"{flag} is not documented in the replica usage header"
+
+
+# --------------------------------------------------------------- the L1a capture hooks
+
+
+PWSH = "/snap/bin/pwsh"
+CAPDIR = "/home/u/.claude/scripts"
+
+
+def run_capture(settings: Path, *extra, store=True):
+    args = [sys.executable, str(HOOKS), "--settings", str(settings),
+            "--pwsh", PWSH, "--capture-dir", CAPDIR, *extra]
+    if store:
+        args += ["--binary", BIN, "--hub-host", HUB]
+    return subprocess.run(args, capture_output=True, text=True, timeout=60)
+
+
+def test_capture_registers_stop_precompact_and_sessionstart(tmp_path):
+    s = tmp_path / "settings.json"
+    assert run_capture(s).returncode == 0
+    stop = f"{PWSH} -NoProfile -File {CAPDIR}/stop-extract.ps1"
+    start = f"{PWSH} -NoProfile -File {CAPDIR}/sessionstart-capture.ps1"
+    assert commands(s, "Stop") == [stop]
+    assert commands(s, "PreCompact") == [stop]
+    # SessionStart carries BOTH the store sync and the capture spawner; dropping either would
+    # silently disable half the box.
+    assert set(commands(s, "SessionStart")) == {f"{BIN} sync --once --hub-host {HUB}", start}
+
+
+def test_capture_alone_registers_without_the_store(tmp_path):
+    """A thin client may contribute to the corpus without joining the fleet store."""
+    s = tmp_path / "settings.json"
+    r = run_capture(s, store=False)
+    assert r.returncode == 0, r.stderr
+    assert commands(s, "PostToolUse") == [], "the store gate was registered without a store"
+    assert len(commands(s, "SessionStart")) == 1
+    assert "sessionstart-capture.ps1" in commands(s, "SessionStart")[0]
+
+
+def test_capture_pair_is_all_or_nothing(tmp_path):
+    s = tmp_path / "settings.json"
+    r = subprocess.run([sys.executable, str(HOOKS), "--settings", str(s),
+                        "--binary", BIN, "--hub-host", HUB, "--pwsh", PWSH],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "together or not at all" in r.stderr
+
+
+def test_registering_nothing_is_refused(tmp_path):
+    s = tmp_path / "settings.json"
+    r = subprocess.run([sys.executable, str(HOOKS), "--settings", str(s)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "nothing to register" in r.stderr
+
+
+def test_capture_rerun_is_byte_identical(tmp_path):
+    s = tmp_path / "settings.json"
+    assert run_capture(s).returncode == 0
+    first = s.read_text(encoding="utf-8")
+    assert run_capture(s).returncode == 0
+    assert s.read_text(encoding="utf-8") == first
+
+
+def test_the_installer_resolves_the_tenant_in_the_capture_scripts():
+    """An unresolved sentinel posts every extracted fact under a literal '__WSL_USER__' tenant.
+    The authority ACCEPTS that, so nothing fails and the facts are simply not where anyone looks
+    (measured 2026-09-16: four facts landed there during the rehearsal)."""
+    body = INSTALLER.read_text(encoding="utf-8")
+    block = body.split("[5c] L1a capture")[1].split("6. receipt")[0]
+    # Assert the SUBSTITUTION, not merely that both strings appear somewhere in the block: the
+    # guard line below mentions the sentinel and the echo mentions the tenant, so a block that
+    # copied the files verbatim would still contain both.
+    subst = [ln for ln in block.splitlines()
+             if "sed" in ln and "__WSL_USER__" in ln and "$USER_ID" in ln]
+    assert subst, "the capture scripts are deployed without resolving the tenant sentinel"
+    assert "unresolved operator sentinel" in block, "an unresolved sentinel must fail the install"
+
+
+def test_the_capture_block_skips_loudly_without_its_runtimes():
+    body = INSTALLER.read_text(encoding="utf-8")
+    block = body.split("[5c] L1a capture")[1].split("6. receipt")[0]
+    assert "SKIPPED - missing:" in block
+    assert "pwsh" in block and "codex" in block
+    assert "~/.codex/auth.json" in block, "an unauthenticated codex would fail at the first call"

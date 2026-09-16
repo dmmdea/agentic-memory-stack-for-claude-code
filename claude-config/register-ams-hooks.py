@@ -30,6 +30,28 @@ GATE_MARKERS = ("memory-index-write-lint.sh", "memory-index-write-gate.ps1", "am
 SYNC_MARKERS = ("ams-store",)
 
 
+CAPTURE_STOP_MARKERS = ("stop-extract.ps1",)
+CAPTURE_START_MARKERS = ("sessionstart-capture.ps1",)
+
+
+def capture_entries(pwsh: str, capture_dir: str):
+    """The L1a capture hooks, mirroring 2-windows-config.ps1's Stop / PreCompact / SessionStart.
+
+    Both scripts are SPAWNERS: they exit immediately after detaching the worker, so Stop and
+    PreCompact stay synchronous (they must finish before the transcript moves) while the
+    SessionStart one is async and must never hold a session open.
+    """
+    stop = f"{pwsh} -NoProfile -File {capture_dir}/stop-extract.ps1"
+    start = f"{pwsh} -NoProfile -File {capture_dir}/sessionstart-capture.ps1"
+    return {
+        "Stop": [{"markers": CAPTURE_STOP_MARKERS, "command": stop, "timeout": 10}],
+        "PreCompact": [{"markers": CAPTURE_STOP_MARKERS, "command": stop, "timeout": 10}],
+        "SessionStart": [
+            {"markers": CAPTURE_START_MARKERS, "command": start, "async": True, "timeout": 15}
+        ],
+    }
+
+
 def entries(binary: str, hub_host: str):
     """The three hook entries a Linux client registers, in the Windows installer's shape."""
     gate = f"{binary} gate"
@@ -69,12 +91,19 @@ def is_ours(existing_block: dict, markers) -> bool:
     return False
 
 
-def merge(settings: dict, binary: str, hub_host: str):
+def merge(settings: dict, binary: str, hub_host: str, pwsh: str = "", capture_dir: str = ""):
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise SystemExit("FAIL: settings.json 'hooks' is not an object; refusing to rewrite it")
+    wanted = dict(entries(binary, hub_host)) if binary and hub_host else {}
+    if pwsh and capture_dir:
+        # Two events carry BOTH a store entry and a capture entry (SessionStart), so the rows are
+        # appended rather than replaced: dropping one would unregister the other.
+        for event, rows in capture_entries(pwsh, capture_dir).items():
+            wanted.setdefault(event, [])
+            wanted[event] = list(wanted[event]) + list(rows)
     report = []
-    for event, rows in entries(binary, hub_host).items():
+    for event, rows in wanted.items():
         markers = tuple(m for row in rows for m in row["markers"])
         fresh = [block(row) for row in rows]
         current = hooks.get(event) or []
@@ -89,14 +118,28 @@ def merge(settings: dict, binary: str, hub_host: str):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--settings", required=True, help="path to settings.json")
-    ap.add_argument("--binary", required=True, help="absolute path to the ams-store binary")
-    ap.add_argument("--hub-host", required=True, help="single-label MagicDNS host of the hub")
+    ap.add_argument("--binary", default="", help="absolute path to the ams-store binary (with --hub-host, registers the store hooks)")
+    ap.add_argument("--hub-host", default="", help="single-label MagicDNS host of the hub")
+    ap.add_argument("--pwsh", default="", help="absolute path to pwsh; with --capture-dir, registers the L1a capture hooks")
+    ap.add_argument("--capture-dir", default="", help="directory holding stop-extract.ps1 and sessionstart-capture.ps1")
     args = ap.parse_args(argv)
 
-    if "/" not in args.binary:
+    # The two features are independent: a box may join the fleet store, capture for the corpus,
+    # or both. Each pair is all-or-nothing, and asking for neither is a no-op worth refusing.
+    if bool(args.binary) != bool(args.hub_host):
+        print("FAIL: --binary and --hub-host are used together or not at all", file=sys.stderr)
+        return 2
+    if bool(args.pwsh) != bool(args.capture_dir):
+        print("FAIL: --pwsh and --capture-dir are used together or not at all", file=sys.stderr)
+        return 2
+    if not args.binary and not args.pwsh:
+        print("FAIL: nothing to register (give --binary/--hub-host, --pwsh/--capture-dir, or both)", file=sys.stderr)
+        return 2
+
+    if args.binary and "/" not in args.binary:
         print("FAIL: --binary must be an absolute path", file=sys.stderr)
         return 2
-    if "." in args.hub_host or "/" in args.hub_host:
+    if args.hub_host and ("." in args.hub_host or "/" in args.hub_host):
         # Same rule the store itself enforces: reach is the tailnet MagicDNS name only.
         print(f"FAIL: --hub-host '{args.hub_host}' must be a single-label host", file=sys.stderr)
         return 2
@@ -116,7 +159,7 @@ def main(argv=None) -> int:
             print(f"FAIL: {path} is not a JSON object", file=sys.stderr)
             return 1
 
-    report = merge(settings, args.binary, args.hub_host)
+    report = merge(settings, args.binary, args.hub_host, args.pwsh, args.capture_dir)
     after = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 
     if before == after:

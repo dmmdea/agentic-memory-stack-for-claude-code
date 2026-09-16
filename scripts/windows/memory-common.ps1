@@ -11,6 +11,20 @@
 #                     because a User-scope env var is INVISIBLE to hook children of a host process
 #                     that started before the var was set -- that is exactly why the L1a extractor
 #                     silently failed on one box (it resolved 'Ubuntu' and never found the API key).
+# ---------------------------------------------------------------- host kind (P4-3)
+# This sits FIRST on purpose: $script:Mem0Url is resolved at LOAD time further down, and a
+# helper defined after that line is not yet visible to the function that needs it - which
+# silently yielded the loopback fallback instead of the real authority.
+function Get-AmsHomeDir {
+    # RESOLVED PER CALL, never cached at load: the tests and the install rehearsals sandbox a box
+    # by setting $env:USERPROFILE (or $HOME) AFTER dot-sourcing, and a cached value would read the
+    # operator's real profile instead. Windows PowerShell 5.1 has no $PSVersionTable.Platform, so
+    # its absence reads as Windows. KEEP IN SYNC: this function lives in memory-common.ps1 and
+    # user-prompt-lib.ps1.
+    if ($PSVersionTable.Platform -eq 'Unix') { return $HOME }
+    return $env:USERPROFILE
+}
+
 function Get-Mem0AuthorityUrl {
     # v1.23 (P2-3, spec §7): the per-host file ~\.mem0\authority-url is the source of truth, exactly
     # as the WSL shim reads its ~/.mem0/authority-url. $env:MEM0_URL is only the fallback for a box
@@ -20,7 +34,7 @@ function Get-Mem0AuthorityUrl {
     $pattern = '^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/-]*)?$'
     $candidates = @()
     try {
-        $f = Join-Path $env:USERPROFILE '.mem0\authority-url'
+        $f = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'authority-url')
         if (Test-Path -LiteralPath $f) {
             foreach ($line in @([System.IO.File]::ReadAllLines($f))) {
                 $t = "$line".Trim()
@@ -38,7 +52,7 @@ function Get-Mem0AuthorityUrl {
 function Get-Mem0Role {
     # ~\.mem0\role (written by the installer beside authority-url) > receipt Role > brain.
     try {
-        $f = Join-Path $env:USERPROFILE '.mem0\role'
+        $f = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'role')
         if (Test-Path -LiteralPath $f) {
             $r = ([System.IO.File]::ReadAllText($f)).Trim().ToLowerInvariant()
             if ($r) { return $r }
@@ -59,9 +73,23 @@ $script:Mem0WslDistro = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else 
     } catch { $rcptDistro = $null }
     if ($rcptDistro) { $rcptDistro } else { 'Ubuntu' }   # last resort only; the installer always writes the receipt
 }
-$script:Mem0KeyPath = "\\wsl.localhost\$($script:Mem0WslDistro)\home\__WSL_USER__\.mem0\api-key"
-$script:LogDir = Join-Path $env:USERPROFILE '.claude\logs'
-$script:StateDir = Join-Path $env:USERPROFILE '.claude\state'
+# On Windows the key lives inside WSL and is read over the UNC share; a native Linux box has
+# it as an ordinary per-host file, written by install/linux-client.sh.
+if ($PSVersionTable.Platform -eq 'Unix') {
+    $script:Mem0KeyPath = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'api-key')
+} else {
+    $script:Mem0KeyPath = "\\wsl.localhost\$($script:Mem0WslDistro)\home\__WSL_USER__\.mem0\api-key"
+}
+# ---------------------------------------------------------------- host kind (P4-3)
+# Windows PowerShell 5.1 has no $PSVersionTable.Platform, so its ABSENCE means Windows: this
+# test is true only under pwsh on Unix and is safe to evaluate on 5.1. It draws the same line
+# the Python side already draws in codex_shim_client.judge_transport().
+# Every path below is built with Join-Path per segment rather than one literal with embedded
+# separators, because a backslash is an ordinary filename character on Unix, not a separator.
+$script:IsUnixHost = ($PSVersionTable.Platform -eq 'Unix')
+
+$script:LogDir = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' 'logs')
+$script:StateDir = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' 'state')
 
 # v0.19 L13: the dead Save-HookFixture function (zero callers) and the stale
 # $script:HOOK_CONTRACT_VERSION = 'v0.17' constant were removed — their 1-in-100
@@ -74,7 +102,14 @@ $script:StateDir = Join-Path $env:USERPROFILE '.claude\state'
 # Headless via `codex exec`. The model is PINNED PER JOB (see the routing block below);
 # ~/.codex/config.toml is only the fallback for a call site that names none. Verified against
 # Codex CLI 0.153.4 (2026-09-07).
-$script:CodexCmd = Join-Path $env:USERPROFILE 'AppData\Roaming\npm\codex.cmd'
+# The CLI is an npm global on both platforms, but only Windows needs the .cmd shim: on Unix the
+# package installs a real executable on PATH, which is what the authority already runs natively.
+if ($script:IsUnixHost) {
+    $script:CodexCmdSource = Get-Command 'codex' -ErrorAction SilentlyContinue
+    $script:CodexCmd = if ($script:CodexCmdSource) { $script:CodexCmdSource.Source } else { 'codex' }
+} else {
+    $script:CodexCmd = Join-Path (Get-AmsHomeDir) (Join-Path 'AppData' (Join-Path 'Roaming' (Join-Path 'npm' 'codex.cmd')))
+}
 $script:CodexEffortExtractor = 'low'      # I1: structured extraction, low effort is enough
 
 # ---------------------------------------------------------------- codex model routing (2026-09-07)
@@ -218,7 +253,7 @@ function Get-Mem0Key {
     # fallback is bounded to MaxStaleFallbackHours so a rotated-away key is not
     # served indefinitely.
     $MaxStaleFallbackHours = 24
-    $cachePath = Join-Path $env:USERPROFILE '.mem0\api-key.cache'
+    $cachePath = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'api-key.cache')
     $cached = $null
     try {
         if (Test-Path -LiteralPath $cachePath) {
@@ -548,7 +583,11 @@ function Invoke-CodexSubagent {
         # the authoritative copy; stdout scraping stays as the fallback.
         [string]$LastMessagePath = ''
     )
-    if (-not (Test-Path $script:CodexCmd)) {
+    if ($script:IsUnixHost) {
+        if (-not (Get-Command $script:CodexCmd -ErrorAction SilentlyContinue)) {
+            throw "codex not found on PATH (looked for '$($script:CodexCmd)')"
+        }
+    } elseif (-not (Test-Path $script:CodexCmd)) {
         throw "codex.cmd not found at $($script:CodexCmd)"
     }
     # Codex CLI authenticates against OpenAI via ChatGPT subscription OAuth
@@ -601,7 +640,7 @@ exit $LASTEXITCODE
     $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = 'powershell.exe'
+    $psi.FileName = if ($script:IsUnixHost) { 'pwsh' } else { 'powershell.exe' }
     $psi.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + $enc
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -625,7 +664,13 @@ exit $LASTEXITCODE
         $outTask = $p.StandardOutput.ReadToEndAsync()
         $errTask = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
-            try { & taskkill.exe /T /F /PID $p.Id 2>&1 | Out-Null } catch {}
+            # The whole TREE must die (pwsh -> codex -> node), or a hung child outlives us.
+            # taskkill is Windows-only; on Unix .NET's Kill($true) does the same job.
+            if ($script:IsUnixHost) {
+                try { $p.Kill($true) } catch {}
+            } else {
+                try { & taskkill.exe /T /F /PID $p.Id 2>&1 | Out-Null } catch {}
+            }
             try { $p.Kill() } catch {}
             # Drain the async readers post-kill (the killed process closed its pipes)
             # so they don't dangle as unobserved tasks; bounded so cleanup can't hang.
@@ -965,7 +1010,7 @@ function Acquire-CodexLock {
         [Parameter(Mandatory)][string]$Owner,    # 'l1a' | 'c1' | 'dream'
         [int]$MaxAgeMinutes = 30
     )
-    $lockFile = Join-Path $env:USERPROFILE '.claude\state\codex.lock'
+    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' 'codex.lock'))
     $lockDir = Split-Path -Parent $lockFile
     if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Path $lockDir -Force | Out-Null }
     $contents = "$Owner $((Get-Date).ToString('o')) pid=$PID"
@@ -1021,7 +1066,7 @@ function Acquire-CodexLock {
 }
 
 function Release-CodexLock {
-    $lockFile = Join-Path $env:USERPROFILE '.claude\state\codex.lock'
+    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' 'codex.lock'))
     if (-not (Test-Path -LiteralPath $lockFile)) { return }
     try {
         $contents = Get-Content -LiteralPath $lockFile -Raw -ErrorAction Stop

@@ -4,6 +4,37 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.0 — the capture path runs on a native Linux client (register P4-3)
+
+A Linux box could read the corpus but never contribute to it: the L1a capture path — a Stop /
+PreCompact / SessionStart hook spawning a worker that reads the finished transcript, asks Codex for
+durable facts and posts them to the authority — was written in PowerShell against Windows. That left
+the register's own invariant *"first-class on every OS"* unmet and it was the last thing between the
+Vivobook and its row's gate.
+
+The scripts now branch on host kind rather than assuming Windows, using the same test the Python
+side already uses (`$PSVersionTable.Platform`, absent on PowerShell 5.1, so its absence reads as
+Windows). What differs by platform: the home directory, the corpus key (a WSL UNC share vs the
+per-host file), the Codex CLI (a pinned npm `.cmd` vs PATH resolution), the child shell the subagent
+runs in, and the timeout kill (`taskkill /T /F` vs `.NET Kill($true)` — both kill the whole tree).
+Every path is built with `Join-Path` per segment, because a backslash is an ordinary filename
+character on Unix.
+
+`Get-AmsHomeDir` resolves per call and sits first in the file. Both were found by failures rather
+than reasoning: a cached value made the sandboxed-HOME suites read the operator's real profile, and
+a helper defined after `$script:Mem0Url`'s load-time assignment was invisible to the function that
+needed it, silently yielding the loopback fallback instead of the authority.
+
+`install/linux-client.sh` gains `[5c]`: it deploys the four capture scripts **with the tenant
+sentinel resolved** and registers the three capture hooks, skipping loudly without `pwsh`, `codex`
+or Codex auth. The substitution is load-bearing — an unresolved sentinel posts every fact under a
+literal `__WSL_USER__` tenant that the authority accepts, so nothing fails and the facts are simply
+not where anyone looks. The store hooks and the capture hooks are independent.
+
+Proven on the box: pwsh 7.6.5 on Ubuntu 26.04 with codex-cli 0.154.0 extracted four facts from a
+real transcript and posted them; the authority holds them with `source=l1a-extractor`. Four
+mutations seen red, one of which initially survived a weaker assertion that has been tightened.
+
 ## 1.27.1 — the replica installer forwards the fleet-store flags
 
 1.27.0 put the store block in `linux-client.sh`. `linux-replica.sh` — the installer the replica

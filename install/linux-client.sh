@@ -292,6 +292,53 @@ elif plan "install ams-store into $AMS_BIN_DIR, wire the hub transport for $AMS_
         --hub-host "$(ams_hub_host)" || fail "registering the ams-store hooks failed"
 fi
 
+# ---------------------------------------------------------------- 5c. L1a capture
+# The capture path is what makes a box contribute to the corpus rather than only read from it:
+# a Stop / PreCompact / SessionStart hook spawns a worker that reads the just-finished transcript,
+# asks the Codex CLI to extract durable facts, and posts them to the authority. It is written in
+# PowerShell and shared byte-for-byte with the Windows install, so a native Linux box needs pwsh 7
+# and the codex CLI; without either, the block is skipped LOUDLY rather than silently, because a
+# client that captures nothing looks identical to one that captures everything.
+say "[5c] L1a capture (pwsh + codex)"
+CAPTURE_FILES="memory-common.ps1 l1a-extract.ps1 stop-extract.ps1 sessionstart-capture.ps1"
+
+ams_capture_prereqs() {   # prints what is missing; empty output means ready
+    local missing=""
+    command -v pwsh >/dev/null 2>&1 || missing="$missing pwsh"
+    command -v codex >/dev/null 2>&1 || missing="$missing codex"
+    [ -r "$HOME/.codex/auth.json" ] || missing="$missing ~/.codex/auth.json"
+    printf '%s' "$missing"
+}
+
+CAPTURE_MISSING="$(ams_capture_prereqs)"
+if [ -n "$CAPTURE_MISSING" ]; then
+    echo "    SKIPPED - missing:$CAPTURE_MISSING"
+    echo "    install pwsh 7 (snap install powershell --classic) and the codex CLI"
+    echo "    (npm install -g @openai/codex, then 'codex login'), then re-run this installer."
+elif plan "deploy $CAPTURE_FILES to $SCRIPTS_DIR with the tenant resolved, and register the Stop / PreCompact / SessionStart capture hooks"; then :; else
+    for f in $CAPTURE_FILES; do
+        src="$REPO_ROOT/scripts/windows/$f"
+        [ -r "$src" ] || fail "capture script missing from the repo: $src"
+        # The SAME substitution the shim gets: these files carry the operator sentinel, and an
+        # unresolved one posts every extracted fact under a literal '__WSL_USER__' tenant - which
+        # the authority accepts, so nothing fails and the facts are simply not where anyone looks.
+        sed "s|__WSL_USER__|$USER_ID|g; s|__WIN_USER__|$USER_ID|g" "$src" > "$SCRIPTS_DIR/$f"
+        if grep -q "__WSL_USER__\|__WIN_USER__\|__WSL_DISTRO__" "$SCRIPTS_DIR/$f"; then
+            fail "unresolved operator sentinel left in $SCRIPTS_DIR/$f"
+        fi
+        echo "    installed: $f (tenant $USER_ID)"
+    done
+    # The store hooks are re-registered here only when this box also joined the store; capture
+    # stands on its own, so a thin client can contribute to the corpus without a local store.
+    HOOK_ARGS="--settings $CLAUDE_DIR/settings.json --pwsh $(command -v pwsh) --capture-dir $SCRIPTS_DIR"
+    if [ -n "$AMS_HUB" ]; then
+        HOOK_ARGS="$HOOK_ARGS --binary $AMS_BIN_DIR/ams-store --hub-host $(ams_hub_host)"
+    fi
+    # shellcheck disable=SC2086
+    "$PY" "$REPO_ROOT/claude-config/register-ams-hooks.py" $HOOK_ARGS || fail "registering the capture hooks failed"
+    echo "    codex: $(codex --version 2>/dev/null | head -n1)"
+fi
+
 # ---------------------------------------------------------------- 6. receipt
 say "[6] receipt"
 if plan "write $MEM0_DIR/client-receipt.json"; then :; else
