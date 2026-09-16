@@ -20,6 +20,10 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    # P4-1a (2026-09-16): a pushed release tag runs ONLY the release-assets job at the bottom;
+    # every other job carries `if: github.ref_type != 'tag'`, because the tree a tag points at
+    # already passed this matrix on main.
+    tags: ['v*']
   pull_request:
     branches: [main, dev]
 
@@ -33,6 +37,7 @@ concurrency:
 jobs:
   import-closure:
     name: Installer import closure
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +46,7 @@ jobs:
 
   tests:
     name: Python tests (public suites)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +118,7 @@ jobs:
 
   docs-gate:
     name: Docs gate (links, operator-neutral, ADR frontmatter)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +130,7 @@ jobs:
 
   pester:
     name: Pester (Windows product suites)
+    if: github.ref_type != 'tag'
     # The Windows-side product tests: hook libs, installer parity, daemon/client,
     # gates. They sandbox via TestDrive/fake USERPROFILE, mock HTTP, and use only
     # what a stock runner ships (powershell.exe 5.1 for child-process tests, .NET
@@ -142,6 +150,7 @@ jobs:
 
   ruff:
     name: ruff (pyflakes tier)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,6 +166,7 @@ jobs:
 
   shellcheck:
     name: shellcheck (error tier)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,6 +179,7 @@ jobs:
 
   psscriptanalyzer:
     name: PSScriptAnalyzer (error tier)
+    if: github.ref_type != 'tag'
     # PSScriptAnalyzer parses the AST — it never executes the scripts — so it runs
     # on Linux via cross-platform pwsh (preinstalled on the ubuntu runners). Keeps
     # the matrix on one OS and off the 2x-cost Windows runners.
@@ -191,6 +202,7 @@ jobs:
 
   ams-store-go-linux:
     name: ams-store (Go, linux)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -208,6 +220,7 @@ jobs:
 
   ams-store-go-windows:
     name: ams-store (Go, windows)
+    if: github.ref_type != 'tag'
     # windows-latest bills 2x, but this repo is PUBLIC so Actions minutes are free.
     # Kept to build + test (no -race, which needs a C toolchain) so the Windows
     # reparse/path code is exercised without the race-detector dependency.
@@ -222,3 +235,71 @@ jobs:
           go-version: '1.26'
       - run: go build ./...
       - run: go test ./... -count=1
+
+  release-assets:
+    name: ams-store release assets (tag v<VERSION> only)
+    # P4-1a (2026-09-16, blueprint §12.2-12.5): the store binary is never built on a PC and never
+    # committed. Pushing the tag `v<VERSION>` runs this one ubuntu job: it cross-compiles the
+    # client for every install target with the README's ldflags (version = the tag, so
+    # `ams-store --version` on a PC says exactly what the installer expected), writes SHA256SUMS
+    # over the assets and attaches all of it to the GitHub release for the tag.
+    # install/2-windows-config.ps1 downloads the Windows asset for the tag VERSION names and
+    # verifies it against SHA256SUMS before it registers a single hook; the Linux installers take
+    # the linux assets the same way. One Linux job of roughly a minute per release, inside the
+    # included minutes; no Windows runner here on purpose (2x minutes) - the Windows binary is a
+    # cross-compile. The tag must equal `v` + VERSION at that commit: a release whose asset says
+    # one version while the repo says another is exactly the skew the installer's checks exist
+    # to catch, so it is refused before anything is built.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: ams-store
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names the VERSION file
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="$(tr -d '[:space:]' < ../VERSION)"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match VERSION ($version): tag v$version, or bump VERSION first"
+            exit 1
+          fi
+          echo "releasing ams-store $tag"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: ams-store/go.sum
+      - name: Cross-compile every install target (CGO_ENABLED=0, static)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          commit="$(git rev-parse --short HEAD)"
+          built="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${commit} -X main.built=${built}"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$ldflags" -o dist/ams-store-windows-amd64.exe ./cmd/ams-store
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$ldflags" -o dist/ams-store-linux-amd64   ./cmd/ams-store
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "$ldflags" -o dist/ams-store-linux-arm64   ./cmd/ams-store
+          (cd dist && sha256sum ams-store-windows-amd64.exe ams-store-linux-amd64 ams-store-linux-arm64 > SHA256SUMS && cat SHA256SUMS)
+      - name: The linux/amd64 asset answers --version with the tag
+        run: |
+          out="$(./dist/ams-store-linux-amd64 --version)"
+          echo "$out"
+          case "$out" in
+            "ams-store ${GITHUB_REF_NAME} "*) ;;
+            *) echo "::error::--version does not carry the tag ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+      - name: Create the GitHub release with the assets attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-from-tag \
+            dist/ams-store-windows-amd64.exe \
+            dist/ams-store-linux-amd64 \
+            dist/ams-store-linux-arm64 \
+            dist/SHA256SUMS

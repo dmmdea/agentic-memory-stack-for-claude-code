@@ -185,12 +185,23 @@ agents glob it, so a maintenance folder there would resurface removed facts in e
 | Entry point | Trigger | Writes |
 |---|---|---|
 | `scripts/windows/memory-lint.ps1` | session start, 6h throttle | lint summary only |
-| `scripts/windows/memory-index-write-gate.ps1` | `PostToolUse` Write/Edit | MEMORY.md (only at/over the sync limit, CAS-guarded) + `write-gate-receipts.jsonl` |
-| `scripts/windows/memory-compact.ps1` | scheduled task, 05:00, 23h throttle | Index, history, receipts |
+| `scripts/windows/memory-index-write-gate.ps1` | `PostToolUse` Write/Edit (until 1.25.0; replaced by `ams-store gate` on a cut-over PC) | MEMORY.md (only at/over the sync limit, CAS-guarded) + `write-gate-receipts.jsonl` |
+| `scripts/windows/memory-compact.ps1` | scheduled task, 05:00, 23h throttle (until 1.25.0; the task is removed on a cut-over PC) | Index, history, receipts |
 | `scripts/windows/memory-store-lib.ps1` | dot-sourced library | nothing |
 
 The compactor accepts `-DryRun` (decide and report, write nothing), `-Force` (bypass throttle,
 trigger and liveness gate — for rehearsal) and `-Workspace <name>`.
+
+**2026-09-16 revision — the cutover to the store binary begins (1.25.0, register P4-1a).** On a
+PC the Windows installer has cut over, PostToolUse runs `ams-store gate` instead of the PowerShell
+gate, the session boundaries run `ams-store sync --once`, a resident watcher carries every local
+commit to the hub, the 05:00 compactor task is removed and the spawner no longer launches the
+`-CatchUp` child; the judge's SHORTEN/MIGRATE decisions move to the hub's nightly (P4-1b). The
+installer does this only behind a proven hub path — a box that cannot reach the hub keeps the
+rows above exactly as they are — and the PowerShell scripts stay deployed everywhere until the
+Phase 5 gate deletes them. The receipt readers here (`Get-AmStoreRunHistory`, the lint) read
+the Go binary's rows in the same `compact-receipts.jsonl` during the overlap; a Pester scenario
+pins that. The binary is documented in `ams-store.md`.
 
 ## Dependencies
 

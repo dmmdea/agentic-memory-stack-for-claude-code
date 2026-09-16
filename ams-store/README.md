@@ -92,6 +92,12 @@ go test ./... -count=1
 There is no Makefile and no build script; those three are the gates. CI adds `-race` on
 Linux and a test+build job on Windows.
 
+A pushed tag `v<VERSION>` runs the `release-assets` job in `.github/workflows/ci.yml`: it
+refuses a tag that disagrees with the `VERSION` file, cross-compiles the three targets
+below with the version stamp set to the tag, writes `SHA256SUMS` and attaches everything
+to the GitHub release of that tag. The installers download and verify from there; nothing
+builds the binary on a PC and nothing commits one.
+
 Cross-compile targets (`CGO_ENABLED=0`, static):
 
 ```

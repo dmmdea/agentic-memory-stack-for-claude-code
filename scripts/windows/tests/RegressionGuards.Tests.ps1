@@ -527,11 +527,15 @@ Describe 'Compactor throttle + catch-up (2026-09-06)' {
         $code | Should -Match 'MinIntervalSeconds\s+43200'
         $code | Should -Not -Match 'MinIntervalSeconds\s+82800' -Because 'the 23h window is what cost the 09-04 night'
     }
-    It 'the SessionStart spawner launches the compactor in -CatchUp mode beside the other children' {
-        $src = Get-Content $script:spawnPath -Raw
-        $src | Should -Match "'memory-compact\.ps1'"
-        $src | Should -Match '-CatchUp'
-        foreach ($n in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-lint.ps1')) { $src | Should -Match ([regex]::Escape($n)) }
+    It 'the SessionStart spawner launches the resident store watcher, not the compactor catch-up (P4-1a, 2026-09-16)' {
+        # The catch-up spawn went with the nightly it caught up (register P4-1, plan Q-A); the
+        # watcher takes its slot. Executable lines only: the comments still tell the story.
+        $code = script:CodeOf $script:spawnPath
+        $code | Should -Not -Match 'memory-compact\.ps1' -Because 'the compactor is retired on cut-over PCs; nothing may spawn it'
+        $code | Should -Not -Match '(?-i)-CatchUp\b' -Because 'case-sensitive on purpose: dream-catchup.ps1 stays and must not satisfy this'
+        $code | Should -Match "'sync --watch --hub-host '" -Because 'the watcher is the singleton the design names'
+        $code | Should -Match 'Import-PowerShellDataFile' -Because 'the hub comes from the receipt, never a literal'
+        foreach ($n in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-lint.ps1')) { $code | Should -Match ([regex]::Escape($n)) }
     }
     It 'an attributed statement is doctrine; a topic prefix or an all-caps label is not' {
         . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1')
@@ -642,7 +646,9 @@ Describe 'Codex model is pinned per job, never inherited (2026-09-07)' {
         # codex lock is orphaned. Worst case night = 180 + 240 + 240 + (3 x 2 x 180) = 29 min.
         $inst = Get-Content (Join-Path $script:repoRoot2 'install\2-windows-config.ps1') -Raw
         $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 40\)' -Because 'the 3am dream must outlast a 29-minute worst case'
-        $inst | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Minutes 30\)' -Because "the compactor's own lock window is 30 minutes"
+        # The compactor's 30-minute window pin left with its registration (P4-1a, 2026-09-16): the
+        # PowerShell nightly is retired, so the installer must not register it at all.
+        $inst | Should -Not -Match '(?<!Un)Register-ScheduledTask -TaskName \$compactTaskName' -Because 'the compactor task is unregistered by the installer, never registered'
     }
 }
 

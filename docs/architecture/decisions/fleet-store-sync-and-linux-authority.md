@@ -179,6 +179,38 @@ could never reset. The stamp file carries a per-workspace `cleared_at` tombstone
 reducer maxes the tombstones and then mins only the stamps newer than their clear, and an
 unparseable time keeps a stamp alive so a garbled tombstone cannot silence the alarm.
 
+## Amendment 2026-09-16: binary distribution by release asset; the Windows cutover begins
+
+Phase 4 opens with a decision this record left open: how the compiled store client reaches a
+PC. Three shapes were weighed - a sha256-pinned binary committed to the repository, a build on
+each PC, and a release asset per version tag - and the third is adopted. A committed binary
+puts megabytes of opaque bytes in every clone and makes a checkout, not a build, the thing that
+is trusted; a build on each PC puts a Go toolchain on every workstation for one program and
+makes "which binary is installed" a question about the PC's compiler rather than about a
+published artifact. A tag `v<VERSION>` therefore runs one Linux CI job that refuses a tag
+disagreeing with `VERSION`, cross-compiles the three targets with the version stamp set to the
+tag, writes `SHA256SUMS` and attaches everything to the GitHub release of that tag. The
+installers download from there and verify against `SHA256SUMS` before touching a hook; an
+offline drop is a named flag, and it is verified the same way when it ships with its sums. No
+binary is ever built on a PC and none is ever committed.
+
+The Windows installer (1.25.0) owns everything the seed did by hand on the first PC, so the
+next PC needs no hands: the ssh `Match` block for the hub user, the hub's host key seeded into
+the binary's own `known_hosts`, the history repo on `main` with `hub` as its one remote. Two
+rules follow from the transport's own hardening. First, **the sync hooks are registered only
+behind a proven path** - identity key present, host key seeded - because a strict-checking
+failure at SessionStart is silent by the hooks' fail-open contract, so the refusal has to be
+loud at install time instead. Second, **the PowerShell nightly is removed only behind that same
+proven path, after the gate binary is installed and before the watcher spawner is registered**:
+a store must never be without a gate, two writers must never race for one store, and a box
+that cannot reach the hub - which is where the judge now lives - keeps a judge of its own
+rather than a store that only ever shrinks by truncation. The PowerShell originals stay
+deployed on every box until the Phase 5 gate deletes them.
+
+Still open after this amendment: the hub-side checkout and the judge step in the nightly
+chain (P4-1b), the Linux installers' binary blocks (P4-1b, P4-3), and the induced propagation
+test on the first cut-over PC (P4-1c).
+
 ## Alternatives considered
 
 - **Keep the authority on the workstation and only run the nightly on the server.** Rejected:

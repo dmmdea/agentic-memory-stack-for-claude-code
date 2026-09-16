@@ -42,9 +42,12 @@ never rewrites a thing).
 
 Open for Phase 4, deliberately: the floor's engage threshold stays on the legacy
 hysteresis as the DEFAULT of `--engage-at` (the flip is a change of that default,
-not an edit to the floor), `<STATE_ROOT>/role` is not seeded on any machine,
-`dream-consolidate.py` does not emit a plan file yet, and the installer does not
-wire the binary in.
+not an edit to the floor), `<STATE_ROOT>/role` is not seeded on any machine, and
+`dream-consolidate.py` does not emit a plan file yet. **Since 1.25.0 the Windows
+installer wires the binary in** (register P4-1a; see *Release assets and install*
+below): it installs the release asset, writes the hub transport, registers the
+gate and sync hooks, spawns the watcher and retires the PowerShell nightly. The
+Linux installers follow (P4-1b for the hub, P4-3 for the thin client).
 
 ## Why Go, not the PowerShell library
 
@@ -431,6 +434,66 @@ before either had pushed - handed `merge-tree` the empty TREE as its merge base,
 which 2.55 accepts and 2.43 refuses. The design's floor is git 2.38, so the version
 that refuses is inside the supported range and the version that accepts is the one
 the engine was written on.
+
+### Release assets and install (P4-1a)
+
+The binary is never built on a PC and never committed. A pushed tag `v<VERSION>` runs
+the `release-assets` job in `ci.yml` (every other job skips tags): it refuses a tag
+that does not equal `v` + the `VERSION` file at that commit, cross-compiles
+`ams-store-windows-amd64.exe`, `ams-store-linux-amd64` and `ams-store-linux-arm64`
+with `CGO_ENABLED=0` and the ldflags above (the version stamp IS the tag, so
+`--version` on a PC says exactly what the installer expected), writes `SHA256SUMS`
+over the three, and attaches all four files to the GitHub release of that tag.
+
+| OS | Path | Installed by |
+|---|---|---|
+| Windows | `%USERPROFILE%\.claude\scripts\ams-store.exe` (beside the hooks, with a `.sha256` sidecar) | `install/2-windows-config.ps1` (1.25.0) |
+| Linux client / replica | `~/.local/bin/ams-store` | `install/linux-client.sh`, `install/linux-replica.sh` (P4-3) |
+| Linux authority / hub | `/usr/local/bin/ams-store` | `install/linux-authority.sh` (P4-1b) |
+
+What the Windows installer does, in order, and why the order matters:
+
+1. **Binary first, before the receipt.** It downloads `SHA256SUMS` and the Windows
+   asset for the tag `VERSION` names, verifies the digest, and swaps the file in by
+   rename (a resident watcher may hold the old image open; Windows refuses to
+   overwrite a running image but allows a rename). A deployed binary whose digest
+   already equals the release's is left alone. `-BinaryPath` + `-BinarySums` is the
+   offline drop; an offline re-run keeps an installed binary that is already the tag
+   and matches its own sidecar. Anything else aborts the run before the receipt is
+   rewritten and before a hook is registered: `settings.json` must never point at a
+   missing exe, and the nightly must never be removed under a missing gate.
+2. **The hub transport (`-HubHost`, inherited from the receipt).** The installer
+   writes the `Match host <hub> user ams-hub` block into `~/.ssh/config` between
+   marker lines (idempotent; the remote policy pins the user@MagicDNS URL form and
+   ssh has no other way to bind that user to the hub's identity file), seeds the hub's
+   host-key lines from the user's `known_hosts` into `<STATE_ROOT>/known_hosts` (the
+   hardened `GIT_SSH_COMMAND` pins that file with strict checking), creates the
+   history repo on `main` if it is missing, renames a pre-binary `master` to `main`,
+   and makes `hub` its one remote. The sync hooks are registered ONLY when the
+   identity key exists and at least one host-key line was seeded: a strict-checking
+   failure at SessionStart is silent by contract, so the refusal is loud here instead.
+3. **The nightly goes.** Behind that proven path, and only there, the installer
+   unregisters `ClaudeCode-MemoryCompactor-5am`; the spawner script no longer launches
+   the `-CatchUp` child. A box that cannot prove its hub path keeps the legacy
+   nightly, because a store with no judge at all only ever shrinks by truncation.
+   `ams-store` takes the legacy mutex beside its own, so the two never race while
+   both exist.
+4. **Hooks.** PostToolUse `Write|Edit` runs `ams-store gate` (registered over the two
+   legacy markers, so the bash lint and the PowerShell gate are replaced in place);
+   SessionStart runs `ams-store sync --once --hub-host <hub>` asynchronously (the
+   network is never on a hook's critical path) and the maintenance spawner, which
+   launches `ams-store sync --watch --hub-host <hub>` hidden and detached (the
+   singleton exits at once when one is already running); SessionEnd runs
+   `sync --once` too. The receipt records `HubHost`, `AmsStoreTag`, `AmsStoreSha256`
+   and `AmsStoreSource`.
+
+`0-prereqs.ps1` parses `git --version` and requires 2.38 or newer. `3-verify.ps1`
+compares `--version` to `v<VERSION>`, the binary's digest to its sidecar, asserts the
+PostToolUse entry is the binary (exactly one stack entry), the SessionStart and
+SessionEnd sync entries and the watcher line in the spawner, runs
+`sync --once --hub-host <hub> --json` and expects exit 0, and asserts the compactor
+task is gone. Every installer run passes every flag its receipt recorded or relies on
+an inherit rule a Pester scenario pins.
 
 ### The gates that check the tests
 
