@@ -11,7 +11,6 @@ here rather than described:
     audit: an installer replaced whole event arrays and silently dropped user hooks).
 """
 import json
-import os
 import shutil
 import subprocess
 import sys
