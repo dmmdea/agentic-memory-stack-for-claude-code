@@ -75,6 +75,21 @@ SYNTH_TIMEOUT_S = 240
 MORNING_ROTATE_BYTES = 131072
 MORNING_KEEP_SECTIONS = 20
 
+# ---- store judge (register P4-1b) --------------------------------------------------------
+# The fleet's per-workspace auto-memory stores are maintained deterministically on every PC
+# (`ams-store gate` and `sync`), and JUDGED once a night here, on the hub's own checkout.
+# This phase does not touch a store: it writes a PLAN, and `ams-step-store-judge` applies it
+# with `ams-store judge-apply`, where every apply-guard lives. The split is deliberate - the
+# model's output is data that a guarded applier may refuse, never an edit it performs.
+STORE_JUDGE_PHASE = "store-judge"
+STORE_JUDGE_TIMEOUT_S = 240
+# One prompt per store, bounded. A store with hundreds of over-cap lines would otherwise
+# build a prompt no budget survives; the rest wait for tomorrow's attempt, and the
+# convergence floor in `derive` holds the index under the caps meanwhile.
+STORE_JUDGE_MAX_CANDIDATES = 40
+STORE_JUDGE_CANDIDATES_TIMEOUT_S = 120
+PLAN_VERSION = 1
+
 
 def log(msg: str) -> None:
     ams_env.log(COMPONENT, msg)
@@ -419,6 +434,97 @@ Existing canonical facts (do NOT re-nominate anything that duplicates these):
 # ---------------------------------------------------------------------------------------------
 # collaborators with real side effects (injectable)
 # ---------------------------------------------------------------------------------------------
+def store_judge_prompt(workspace: str, shorten: list[dict], migrate: list[dict]) -> str:
+    """One store's offer set, as the prompt the nightly judge answers.
+
+    The offer set comes from the binary (`judge-apply --candidates`), which already excludes
+    doctrine and already-sealed lines, so the model is never shown a line it may not touch.
+    Everything it returns is re-checked at apply time anyway.
+    """
+    def _bullets(items: list[dict], kind: str) -> str:
+        out = []
+        for c in items:
+            hook = _clip(str(c.get("Hook") or ""), 200)
+            desc = _clip(str(c.get("Description") or ""), 200)
+            out.append(f'- {c.get("Slug")} [{kind}, {c.get("Bytes")} B, type={c.get("Type")}]\n'
+                       f'  hook: {hook}\n  description: {desc}')
+        return "\n".join(out) if out else "- (none)"
+
+    return f"""You maintain one Claude Code auto-memory store: {workspace}. Decide each candidate below. Output STRICT JSON:
+{{"decisions":[{{"slug":"x.md","verb":"SHORTEN","new_hook":"..."}},{{"slug":"y.md","verb":"MIGRATE"}},{{"slug":"z.md","verb":"KEEP"}}]}}
+
+Verbs:
+- SHORTEN: the index line is over the 130 B cap. Give a STRICTLY SHORTER new_hook that keeps the
+  trigger detail a future session searches for (the error string, the flag, the path, the number).
+  Losing the anchor is worse than leaving the line long: a rewrite that keeps the topic and drops
+  the specifics is REJECTED at apply time.
+- MIGRATE: the fact is reference material a session rarely needs in context. It moves to the
+  searchable corpus and leaves the index. Prefer MIGRATE for narrow, self-contained facts.
+- KEEP: leave it exactly as it is. The safe default, and the right answer whenever unsure.
+
+Rules:
+- One decision per slug, at most one verb each. Slugs exactly as given.
+- SHORTEN carries new_hook and nothing else; MIGRATE and KEEP carry no new_hook.
+- Never invent a slug that is not listed.
+- Deciding nothing is valid: {{"decisions":[]}}.
+
+Over-cap lines (SHORTEN or KEEP):
+{_bullets(shorten, "over-cap")}
+
+Pullable facts (MIGRATE or KEEP):
+{_bullets(migrate, "pullable")}
+"""
+
+
+def _ams_store_bin() -> str:
+    """The store binary the authority installer put in /usr/local/bin."""
+    return (os.environ.get("AMS_STORE_BIN") or "/usr/local/bin/ams-store").strip()
+
+
+def _ams_checkout_root() -> str:
+    """The hub's own checkout: <root>/projects is the work tree, <root>/state the state root
+    (holding role=hub). Empty means this box has no checkout and the phase is a no-op."""
+    return (os.environ.get("AMS_STORE_CHECKOUT") or "").strip()
+
+
+def _plan_schema_path() -> Path | None:
+    """The deployed schema sits beside this script (linux-authority.sh copies it there); a
+    repo checkout keeps it under docs/schemas. Returns whichever exists, else None."""
+    here = Path(__file__).resolve().parent
+    for p in (here / "judge-plan.schema.json",
+              here.parents[1] / "docs" / "schemas" / "judge-plan.schema.json"):
+        if p.exists():
+            return p
+    return None
+
+
+def validate_plan(plan: dict) -> str:
+    """"" when the plan validates, else the first error, one line.
+
+    The schema is GENERATED from the Go types `ams-store judge-apply` decodes with, so a plan
+    that validates here is one the applier accepts. A plan that does NOT validate is never
+    written: the step treats a missing plan as a deterministic-only night, which is a correct
+    (if unproductive) outcome, while a malformed plan would make the applier refuse the whole
+    file and take every store's decisions down with it.
+    """
+    path = _plan_schema_path()
+    if path is None:
+        return "the judge-plan schema is not deployed beside this script"
+    try:
+        import jsonschema  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        return f"jsonschema is not importable: {e}"
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        cls = jsonschema.validators.validator_for(schema)
+        errs = sorted(cls(schema).iter_errors(plan), key=lambda e: list(e.path))
+    except Exception as e:  # noqa: BLE001
+        return f"schema load failed: {e}"
+    if errs:
+        return f"{list(errs[0].path)}: {errs[0].message}"
+    return ""
+
+
 def _run_deployed(script: str, env: dict | None = None) -> tuple[int, str]:
     """Run a sibling maintenance script with THIS interpreter: the deployed copy under
     ~/apps/mem0-scripts when it exists (never the dev tree at 3 am), else the repo sibling."""
@@ -583,6 +689,124 @@ class Dream:
             log(f"  morning-summary rotation failed (non-fatal): {e}")
 
     # -- the run ----------------------------------------------------------------------------
+    # ---- store judge (register P4-1b) ----------------------------------------------------
+    def _store_workspaces(self, checkout: str) -> list[str]:
+        """Every workspace with a store in the hub checkout, sorted so a night's plan is
+        deterministic. A workspace whose memory/ is missing is not a store."""
+        proj = Path(checkout) / "projects"
+        try:
+            names = [p.name for p in proj.iterdir() if (p / "memory").is_dir()]
+        except OSError as e:
+            log(f"  store-judge: cannot read {proj}: {e}")
+            return []
+        return sorted(names)
+
+    def _store_candidates(self, checkout: str, ws: str) -> dict | None:
+        """The binary's own offer set for one store: doctrine and sealed lines already
+        excluded. None means the call failed, which is an `unavailable` outcome, not empty."""
+        proj = Path(checkout) / "projects"
+        cmd = [_ams_store_bin(), "judge-apply", "--candidates", "--json",
+               "--store", str(proj / ws / "memory"), "--workspace", ws,
+               "--projects-root", str(proj), "--state-root", str(Path(checkout) / "state")]
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=STORE_JUDGE_CANDIDATES_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001
+            log(f"  store-judge {ws}: candidates failed: {e}")
+            return None
+        if cp.returncode != 0:
+            log(f"  store-judge {ws}: candidates exit={cp.returncode}: {_clip((cp.stderr or '').strip(), 200)}")
+            return None
+        try:
+            return json.loads(cp.stdout or "{}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  store-judge {ws}: candidates output unparseable: {e}")
+            return None
+
+    def _store_judge(self) -> dict:
+        """Write the nightly judge plan for the hub's checkout. Never raises into the chain:
+        every failure ends as an outcome in the plan, or as no plan at all."""
+        checkout = _ams_checkout_root()
+        if not checkout:
+            log("  store-judge: AMS_STORE_CHECKOUT is unset; this box holds no hub checkout (skipped)")
+            return {"stores": 0, "decisions": 0, "written": False, "note": "no checkout"}
+        if not Path(_ams_store_bin()).exists():
+            log(f"  store-judge: {_ams_store_bin()} is not installed (skipped)")
+            return {"stores": 0, "decisions": 0, "written": False, "note": "no binary"}
+
+        workspaces = self._store_workspaces(checkout)
+        if not workspaces:
+            log(f"  store-judge: no stores under {checkout}/projects (skipped)")
+            return {"stores": 0, "decisions": 0, "written": False, "note": "no stores"}
+
+        stores, decided, called = [], 0, 0
+        for ws in workspaces:
+            cs = self._store_candidates(checkout, ws)
+            if cs is None:
+                stores.append({"workspace": ws, "outcome": "unavailable",
+                               "note": "the candidates call failed", "decisions": []})
+                continue
+            shorten = list(cs.get("shorten") or [])[:STORE_JUDGE_MAX_CANDIDATES]
+            migrate = list(cs.get("migrate") or [])[:STORE_JUDGE_MAX_CANDIDATES]
+            if not shorten and not migrate:
+                # Nothing to decide is not a failed night: the deterministic work already
+                # holds this store, and a judge call here would spend budget to say KEEP.
+                stores.append({"workspace": ws, "outcome": "empty",
+                               "note": "nothing over the cap and nothing pullable", "decisions": []})
+                continue
+            called += 1
+            r = self._judge_call("store-judge", store_judge_prompt(ws, shorten, migrate),
+                                 ams_env.MODEL_CLASSIFY, "medium", STORE_JUDGE_TIMEOUT_S)
+            if not r.get("ok"):
+                log(f"  store-judge {ws}: judge failed: {r.get('error_type')}")
+                stores.append({"workspace": ws, "outcome": "unavailable",
+                               "note": f"judge failed: {r.get('error_type')}", "decisions": []})
+                continue
+            parsed = extract_json(r.get("response", ""), "decisions")
+            if parsed is None:
+                log(f"  store-judge {ws}: malformed JSON from the judge")
+                stores.append({"workspace": ws, "outcome": "parse_fail",
+                               "note": "malformed JSON from the judge", "decisions": []})
+                continue
+            offered = {str(c.get("Slug")) for c in shorten} | {str(c.get("Slug")) for c in migrate}
+            decisions, seen = [], set()
+            for d in list(parsed.get("decisions") or []):
+                slug = str(d.get("slug") or "").strip()
+                verb = str(d.get("verb") or "").strip()
+                # A slug the offer set did not contain is a hallucinated edit, and a repeated
+                # slug is an ambiguity; both are dropped here so the whole store's plan is not
+                # refused by the applier for one bad line.
+                if slug not in offered or slug in seen or verb not in ("SHORTEN", "MIGRATE", "KEEP"):
+                    log(f"  store-judge {ws}: dropped decision {slug!r}/{verb!r} (not offered, repeated, or unknown verb)")
+                    continue
+                seen.add(slug)
+                item = {"slug": slug, "verb": verb}
+                if verb == "SHORTEN":
+                    hook = str(d.get("new_hook") or "").strip()
+                    if not hook:
+                        log(f"  store-judge {ws}: dropped SHORTEN {slug} with no new_hook")
+                        continue
+                    item["new_hook"] = hook
+                decisions.append(item)
+            decided += len(decisions)
+            stores.append({"workspace": ws, "outcome": "ok",
+                           "note": f"{len(shorten)} over-cap, {len(migrate)} pullable offered",
+                           "decisions": decisions})
+
+        plan = {"version": PLAN_VERSION,
+                "generated_at": self.now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "stores": stores}
+        bad = validate_plan(plan)
+        if bad:
+            log(f"  store-judge: the plan does NOT validate ({bad}); nothing written")
+            return {"stores": len(stores), "decisions": decided, "written": False, "note": f"invalid: {bad}"}
+        if self.dry:
+            log(f"  store-judge: DryRun -- plan not written ({len(stores)} store(s), {decided} decision(s))")
+            return {"stores": len(stores), "decisions": decided, "written": False, "note": "dry-run"}
+        self.save_phase(STORE_JUDGE_PHASE, plan)
+        log(f"  store-judge: plan written for {len(stores)} store(s), {decided} decision(s), {called} judge call(s)")
+        return {"stores": len(stores), "decisions": decided, "written": True, "note": "ok"}
+
     def run(self) -> dict:
         args = self.args
         if not self.dry and not args.force and not ams_env.throttle_ok("dream", THROTTLE_S):
@@ -816,6 +1040,18 @@ class Dream:
                 log(f"  autopromote: morning-summary append failed (non-fatal): {e}")
         log(f"  autopromote done: promoted={self.promoted} failed={failed} gate_blocked={blocked_n} deduped={len(deduped)} over_cap={len(over_cap)} gate_codex_tokens={self.tokens['gate']} (DryRun={self.dry}, {promote_ms if promote_ms is not None else 'skipped'})")
 
+        # ---- phase 3.7: the store judge (register P4-1b) ---------------------------------
+        # The plan only; `ams-step-store-judge` applies it after this step and before
+        # index-refresh. A failure here is an outcome in the plan or no plan at all, never an
+        # exception into the chain: the store-judge step treats a missing plan as a
+        # deterministic-only night, which is exactly what an unjudged store should get.
+        log("=== phase 3.7: store judge (plan only) ===")
+        try:
+            self.store_judge = self._store_judge()
+        except Exception as e:  # noqa: BLE001
+            log(f"  store-judge failed (non-fatal): {e}")
+            self.store_judge = {"stores": 0, "decisions": 0, "written": False, "note": f"error: {e}"}
+
         # ---- phase 4: prune & index (deployed builder; the throttle marks only after a good build)
         log("=== phase 4: prune & index ===")
         index_exit = 0
@@ -944,7 +1180,14 @@ def main(argv=None, **injected) -> None:
     qdrant_http = injected.get("qdrant_http") or httpx.Client(timeout=10.0)
     eval_runner = injected.get("eval_runner") or _real_eval_runner(ams_env.eval_root())
     probe = injected.get("probe", codex_usage.probe_window)
-    out = run(args, mem0=mem0, judge=judge, qdrant_http=qdrant_http, eval_runner=eval_runner, probe=probe)
+    # `now` is threaded too (2026-09-16). It was the one injected collaborator main() read
+    # out of **injected and silently dropped, so a caller that pinned the clock got the real
+    # one: the exit-code scenarios reached the gather skip instead of the phase under test as
+    # soon as the real date passed their fixture's 36 h window, and failed for a reason that
+    # had nothing to do with exit codes. A seam that accepts an argument and ignores it is
+    # worse than one that does not accept it.
+    out = run(args, mem0=mem0, judge=judge, qdrant_http=qdrant_http, eval_runner=eval_runner,
+              probe=probe, now=injected.get("now"))
     print(f"dream: {out['note']} (posted={out['posted']} promoted={out['promoted']})", flush=True)
     if out.get("unreachable"):
         sys.exit(4)

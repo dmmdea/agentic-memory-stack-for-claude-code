@@ -1,0 +1,18 @@
+[Unit]
+Description=AMS chain step: apply the nightly store-judge plan to the hub checkout and push it
+PartOf=ams-nightly.target
+After=mem0.service ams-step-dream.service
+
+[Service]
+Type=oneshot
+LoadCredentialEncrypted=ams-api-key:__SECRETS_DIR__/ams-api-key.cred
+Environment=MEM0_API_KEY_FILE=%d/ams-api-key
+Environment=MEM0_HOST_KIND=native
+Environment=MEM0_CODEX_TRANSPORT=native
+Environment=AMS_STORE_BIN=/usr/local/bin/ams-store
+Environment=AMS_STORE_CHECKOUT=__AMS_CHECKOUT__
+Environment=AMS_STORE_HUB_HOST=__AMS_HUB_HOST__
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded store-judge /bin/bash %h/apps/mem0-scripts/ams-store-judge-apply.sh
+
+[Install]
+WantedBy=ams-nightly.target

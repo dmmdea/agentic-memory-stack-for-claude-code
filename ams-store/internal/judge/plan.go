@@ -49,6 +49,15 @@ const (
 	VerbKeep Verb = "KEEP"
 )
 
+// Verbs is every verb there is, in the order the generated JSON Schema lists them.
+//
+// It exists so scripts/planschema reads the enum from here instead of retyping it: a
+// fourth verb added to the switch in Validate and not to this slice would produce a
+// schema that rejects a plan this build applies, and the Python producer would stop
+// writing plans for the store that used it. TestPlan_VerbsAndOutcomesAreExhaustive
+// fails when the two drift.
+var Verbs = []Verb{VerbShorten, VerbMigrate, VerbKeep}
+
 // Outcome records what the judge CALL did, independently of what its plan says. It is
 // carried in the plan file so an attempt that produced no decisions is still an outcome
 // with a receipt, never a non-event: "the judge returned nothing" and "the judge had
@@ -70,6 +79,10 @@ const (
 	// OutcomeParseFail is a judge call whose output could not be parsed as a plan.
 	OutcomeParseFail Outcome = "parse_fail"
 )
+
+// Outcomes is every outcome there is, ok first. Read by scripts/planschema for the same
+// reason as Verbs: the schema must carry this enum, not a copy of it.
+var Outcomes = []Outcome{OutcomeOK, OutcomeUnavailable, OutcomeEmpty, OutcomeParseFail}
 
 // Decision is one entry's verb.
 //
@@ -117,11 +130,17 @@ type Plan struct {
 // PlanVersion is the schema version this build understands.
 const PlanVersion = 1
 
-// reSlug is the slug rule, and the only one there is (LIB:223-224): no whitespace, no
-// closing paren, ending in .md. There is no slugification function anywhere in this
+// SlugPattern is the slug rule, and the only one there is (LIB:223-224): no whitespace,
+// no closing paren, ending in .md. There is no slugification function anywhere in this
 // system - slugs are consumed exactly as the harness writes them - so validation is the
 // one place a malformed slug can be caught.
-var reSlug = regexp.MustCompile(`^[^)\s]+\.md$`)
+//
+// It is exported as the PATTERN, not just the compiled regexp, because the generated JSON
+// Schema must carry this exact rule: a schema with a looser slug rule lets the producer
+// write a plan the decoder then refuses, and the store stops being judged.
+const SlugPattern = `^[^)\s]+\.md$`
+
+var reSlug = regexp.MustCompile(SlugPattern)
 
 // LoadPlan reads and validates a plan file.
 //

@@ -211,6 +211,36 @@ Still open after this amendment: the hub-side checkout and the judge step in the
 chain (P4-1b), the Linux installers' binary blocks (P4-1b, P4-3), and the induced propagation
 test on the first cut-over PC (P4-1c).
 
+## Amendment 2026-09-16: the hub decides, and the contract between the two languages is generated
+
+Phase 4's second row wires the judge this record promised. Three decisions were made building it.
+
+**The plan is a generated contract, not a documented one.** The nightly writes the plan in Python
+and `ams-store judge-apply` decodes it in Go with unknown fields refused. A format described in
+prose drifts the first time a field is added on one side; so the JSON Schema the producer validates
+against is GENERATED from the consumer's own types, and three tests hold it — the generator's file
+must be current, the Go decoder's verdict on a shared corpus must match, and the schema's verdict on
+the SAME corpus must match plus stay a subset of the decoder's. The subset direction is the one that
+matters: a schema stricter than the decoder makes the producer refuse to write a plan the consumer
+would have applied, and the nightly then stops deciding for that store with nothing failing anywhere.
+
+**The hub's checkout reaches the bare repository the way every PC does.** This record's code
+anticipated a local path for the hub's own checkout, since both sit on the same disk. Measured on
+the live box, they do not share a user: the bare repository is `0750` and owned by the git-shell
+user, so the authority service user cannot read it. Widening that would have meant a shared group
+and `core.sharedRepository` on the one repository every PC pushes to. The checkout therefore uses
+the same `user@<magicdns>:repo.git` URL the remote policy pins for every PC, through an ssh `Match`
+block the installer writes — one transport story for the fleet, and no permission change on the
+repository that holds every store.
+
+**A missing plan is a supported night.** The step applies the plan and then syncs; with no plan it
+skips the apply and still syncs. That is what makes the deterministic floor independent of the
+judge: a night where the model was unreachable, over quota, or simply had nothing to say still
+leaves every index derived, committed and pushed. The producer leans on this deliberately - it
+validates the plan before writing and writes nothing when validation fails, because a malformed
+plan makes the applier refuse the whole file and take every store's decisions down with it, while
+a missing one costs exactly one night of judgement.
+
 ## Alternatives considered
 
 - **Keep the authority on the workstation and only run the nightly on the server.** Rejected:

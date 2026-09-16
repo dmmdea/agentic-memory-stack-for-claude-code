@@ -365,6 +365,36 @@ gives exactly one judge, on the Linux authority, against its own checkout of the
 hub: two PCs applying the same plan to their own copies would each migrate the
 same fact, each delete its own copy of the file, and push two different histories.
 
+**Who writes the plan, and where it comes from (1.26.0).** The producer is the
+nightly consolidator's `store judge` phase, which runs between the autonomous
+promotion and the prune. For each store in the hub's checkout it asks the binary
+for the offer set — `judge-apply --candidates --json`, which already excludes
+doctrine and already-sealed lines — and calls the judge once per store that has
+something to decide. A store with an empty offer set is `outcome: empty` with no
+call at all; a call that fails is `unavailable`; output that will not parse is
+`parse_fail`. Decisions naming a slug the offer set did not contain, repeating a
+slug, or carrying the wrong fields for their verb are dropped by the producer, so
+one bad line cannot make the applier refuse the whole file and take every other
+store's decisions with it. The plan is validated against the generated schema
+**before** it is written, and a plan that does not validate is not written at all:
+a missing plan is a deterministic-only night, which is strictly better than a
+malformed one.
+
+**The schema is generated, not hand-kept.** `docs/schemas/judge-plan.schema.json`
+is produced by `go run ./scripts/planschema` from the Go types in
+`internal/judge/plan.go` — the verbs, the outcomes, the slug rule and the version
+are read from that package, never retyped. Three tests hold the contract: the
+generator's own test fails when the checked-in file is stale; `plan_corpus_test.go`
+runs `ParsePlan` over a shared corpus of 26 documents and asserts the decoder's
+verdict on each; and `test_judge_plan_schema.py` runs the schema over the **same**
+corpus and asserts both the schema's verdict and the subset invariant — anything
+the schema rejects, the decoder must reject too. The schema is deliberately a
+subset: JSON Schema 2020-12 cannot express "workspaces are unique" or "slugs are
+unique within a store", so those stay decoder-only and the corpus marks them. A
+schema *stricter* than the decoder is the dangerous direction, because it makes
+the producer refuse to write a plan the consumer would have applied, and the
+nightly then stops deciding for that store with no failure anywhere.
+
 **Plan schema** (version 1, strict — an unknown field or verb is refused, never
 ignored):
 
@@ -494,6 +524,30 @@ SessionEnd sync entries and the watcher line in the spawner, runs
 `sync --once --hub-host <hub> --json` and expects exit 0, and asserts the compactor
 task is gone. Every installer run passes every flag its receipt recorded or relies on
 an inherit rule a Pester scenario pins.
+
+**The hub checkout and the nightly step (1.26.0, P4-1b).** The authority installs
+the binary at `/usr/local/bin/ams-store` from the linux/amd64 release asset of the
+tag in `VERSION`, checksum-verified against the release's `SHA256SUMS`
+(`--ams-store-binary` + `--ams-store-sums` for an offline drop), and builds its own
+checkout of the hub: `<checkout>/projects` is the work tree, `<checkout>/state` the
+state root, carrying `role` = `hub` (which is what makes `judge-apply` willing to
+run at all), a seeded `known_hosts` and a history repo on `main` whose one remote is
+`hub`. The transport is the fleet's, not a special case: the same
+`user@<magicdns>:repo.git` URL form every PC uses, reached through an ssh `Match`
+block the installer writes idempotently. (The hub's bare repository sits on the same
+disk, but it belongs to a different user and is not readable by the authority
+service user, so the local-path shortcut `--allow-local-path` exists for is not the
+path taken here.) Both flags are inherited from `stack.env` on a re-run, and a box
+that configures neither gets no binary, no checkout and **no store-judge step** —
+the unit is dropped from the rendered set rather than enabled with nothing to judge.
+
+The step itself is `ams-step-store-judge.service`, after `ams-step-dream` (whose
+plan it applies) and before `ams-step-index-refresh`, running through
+`ams-step.sh --guarded` like every other step. It applies the plan store by store
+and then syncs once, which is what carries the result to the bare repository and
+what every PC picks up at its next session boundary. **A missing plan is not a
+failure**: the apply loop is skipped and the sync still runs, so the deterministic
+floor lands on a night the judge never spoke — the clause the P4-1b gate names.
 
 **The session-start line (1.25.1, P4-1c).** `sync --once` is silent on stdout by
 contract and the SessionStart hook runs it asynchronously, so the metric line the
