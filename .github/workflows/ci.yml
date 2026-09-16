@@ -116,6 +116,7 @@ jobs:
             mem0-server/tests/test_dream_consolidate.py \
             mem0-server/tests/test_judge_plan_schema.py \
             mem0-server/tests/test_linux_authority_installer.py \
+            mem0-server/tests/test_linux_client_store.py \
             mem0-server/tests/test_linux_client_installer.py \
             mem0-server/tests/test_linux_replica.py \
             mem0-server/tests/test_w7_server_smalls.py \

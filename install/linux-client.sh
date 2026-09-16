@@ -33,6 +33,11 @@ AUTHORITY=""
 API_KEY_FILE=""
 USER_ID=""
 DRY_RUN=0
+AMS_HUB=""
+AMS_BINARY=""
+AMS_SUMS=""
+AMS_RELEASE_REPO="dmmdea/agentic-memory-stack-for-claude-code"
+AMS_BIN_DIR="${AMS_BIN_DIR:-$HOME/.local/bin}"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
 MEM0_DIR="$HOME/.mem0"
@@ -47,6 +52,10 @@ while [ $# -gt 0 ]; do
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
+        --ams-hub) AMS_HUB="${2:-}"; shift 2 ;;
+        --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
+        --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
+        --ams-release-repo) AMS_RELEASE_REPO="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -174,12 +183,123 @@ if plan "append $SNIPPET to $CLAUDE_MD unless the marker is present"; then :; el
     fi
 fi
 
+# ---------------------------------------------------------------- 5b. the fleet store
+# A client joins the fleet store by holding the binary, the hub transport and the three hooks
+# that drive it. It is deliberately ROLELESS: the `role` file is what makes judge-apply willing
+# to decide, and only the authority's checkout may carry it. Skipped entirely without --ams-hub,
+# so a plain thin client installs exactly as it did before.
+say "[5b] ams-store + hub transport"
+ams_hub_user() { printf '%s' "${AMS_HUB%%@*}"; }
+ams_hub_host() { local r="${AMS_HUB#*@}"; printf '%s' "${r%%:*}"; }
+ams_hub_repo() { printf '%s' "${AMS_HUB##*:}"; }
+
+ams_install_binary() {
+    local tag="v$STACK_VERSION" asset="ams-store-linux-amd64" dest="$AMS_BIN_DIR/ams-store"
+    local src="" want="" have="" sums="" cleanup=""
+    case "$(uname -m)" in
+        aarch64|arm64) asset="ams-store-linux-arm64" ;;
+    esac
+    mkdir -p "$AMS_BIN_DIR"
+    if [ -n "$AMS_BINARY" ]; then
+        [ -r "$AMS_BINARY" ] || fail "--ams-store-binary $AMS_BINARY is not readable"
+        src="$AMS_BINARY"
+        if [ -n "$AMS_SUMS" ]; then
+            [ -r "$AMS_SUMS" ] || fail "--ams-store-sums $AMS_SUMS is not readable"
+            want="$(awk -v a="$asset" '{ n=$2; sub(/^\*/,"",n); if (n==a) print $1 }' "$AMS_SUMS" | head -n1)"
+            [ -n "$want" ] || fail "--ams-store-sums has no entry for $asset"
+        else
+            echo "    WARN: --ams-store-binary without --ams-store-sums: the drop is installed UNVERIFIED"
+        fi
+    else
+        local base="https://github.com/$AMS_RELEASE_REPO/releases/download/$tag"
+        sums="$(mktemp)"; src="$(mktemp)"; cleanup="$sums $src"
+        curl -fsSL -o "$sums" "$base/SHA256SUMS" \
+            || fail "cannot fetch $base/SHA256SUMS; pass --ams-store-binary <file> --ams-store-sums <file> for an offline drop"
+        want="$(awk -v a="$asset" '{ n=$2; sub(/^\*/,"",n); if (n==a) print $1 }' "$sums" | head -n1)"
+        [ -n "$want" ] || fail "release $tag: SHA256SUMS has no entry for $asset"
+        if [ -x "$dest" ] && [ "$(sha256sum "$dest" | awk '{print $1}')" = "$want" ]; then
+            echo "    ams-store already current ($("$dest" --version 2>/dev/null | head -n1))"
+            printf '%s\n' "$want" > "$dest.sha256"
+            rm -f $cleanup; return 0
+        fi
+        curl -fsSL -o "$src" "$base/$asset" || fail "cannot fetch $base/$asset"
+    fi
+    have="$(sha256sum "$src" | awk '{print $1}')"
+    if [ -n "$want" ] && [ "$have" != "$want" ]; then
+        [ -z "$cleanup" ] || rm -f $cleanup
+        fail "checksum mismatch for $asset ($tag): SHA256SUMS says $want, the file is $have - not installed"
+    fi
+    # No sudo: a client owns its own bin directory. An authority needs /usr/local/bin because a
+    # systemd unit runs the binary; nothing on a client runs it but the user's own session.
+    install -m 0755 "$src" "$dest" || { [ -z "$cleanup" ] || rm -f $cleanup; fail "cannot install $dest"; }
+    printf '%s\n' "$have" > "$dest.sha256"
+    [ -z "$cleanup" ] || rm -f $cleanup
+    echo "    installed: $("$dest" --version 2>/dev/null | head -n1) (sha256 ${have:0:12}...)"
+}
+
+ams_ssh_block() {  # $1 = hub host, $2 = hub user
+    local cfg="$HOME/.ssh/config" begin="# >>> ams-store hub (managed by linux-client.sh)" end="# <<< ams-store hub"
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"; touch "$cfg"; chmod 600 "$cfg"
+    if grep -qF "$begin" "$cfg"; then
+        awk -v b="$begin" -v e="$end" 'index($0,b){skip=1} !skip{print} index($0,e){skip=0}' "$cfg" > "$cfg.ams.tmp"
+        mv "$cfg.ams.tmp" "$cfg"; chmod 600 "$cfg"
+    fi
+    printf '\n%s\nMatch host %s user %s\n    IdentityFile ~/.ssh/id_ed25519_ams_hub\n    IdentitiesOnly yes\n%s\n' \
+        "$begin" "$1" "$2" "$end" >> "$cfg"
+}
+
+ams_setup_client_store() {
+    local host user repo proj state
+    host="$(ams_hub_host)"; user="$(ams_hub_user)"; repo="$(ams_hub_repo)"
+    [ -n "$host" ] && [ -n "$user" ] && [ -n "$repo" ] || fail "--ams-hub must be user@host:repo.git, got '$AMS_HUB'"
+    case "$host" in *.*) fail "--ams-hub host '$host' is dotted; reach is the tailnet MagicDNS name only" ;; esac
+    proj="$CLAUDE_DIR/projects"; state="$CLAUDE_DIR/state/automemory"
+    mkdir -p "$proj" "$state"
+    # No role file here, ever: a PC that carried `hub` would start applying judge plans.
+    [ -e "$state/role" ] && fail "$state/role exists on a client; remove it (only the authority's checkout is the hub)"
+    ams_ssh_block "$host" "$user"
+    # The binary pins UserKnownHostsFile=<state>/known_hosts with StrictHostKeyChecking=yes, so
+    # an unseeded client fails every sync silently.
+    if ssh-keygen -F "$host" -f "$HOME/.ssh/known_hosts" 2>/dev/null | grep -v '^#' > "$state/known_hosts"; then :; fi
+    [ -s "$state/known_hosts" ] || fail "the hub's host key is not in ~/.ssh/known_hosts (accept it once: ssh $user@$host) - the store is not usable without it"
+    [ -r "$HOME/.ssh/id_ed25519_ams_hub" ] || fail "the hub identity key ~/.ssh/id_ed25519_ams_hub is absent (provision this box's key on the hub first)"
+    if [ ! -f "$state/history.git/HEAD" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" init -q -b main
+        echo "    history repo created at $state/history.git (branch main)"
+    fi
+    local want="$user@$host:$repo" have
+    have="$(git --git-dir "$state/history.git" --work-tree "$proj" remote get-url hub 2>/dev/null || true)"
+    for r in $(git --git-dir "$state/history.git" --work-tree "$proj" remote 2>/dev/null); do
+        [ "$r" = hub ] || { git --git-dir "$state/history.git" --work-tree "$proj" remote remove "$r"; echo "    removed remote '$r' (the remote policy allows only hub)"; }
+    done
+    if [ -z "$have" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" remote add hub "$want"
+    elif [ "$have" != "$want" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" remote set-url hub "$want"
+    fi
+    echo "    store ready (roleless client, remote hub=$want, known_hosts seeded)"
+}
+
+if [ -z "$AMS_HUB" ]; then
+    echo "    no --ams-hub: this client does not join the fleet store (skipped)"
+elif plan "install ams-store into $AMS_BIN_DIR, wire the hub transport for $AMS_HUB, register the gate + sync hooks"; then :; else
+    command -v git >/dev/null 2>&1 || fail "git is required for the fleet store"
+    ams_install_binary
+    ams_setup_client_store
+    "$PY" "$REPO_ROOT/claude-config/register-ams-hooks.py" \
+        --settings "$CLAUDE_DIR/settings.json" \
+        --binary "$AMS_BIN_DIR/ams-store" \
+        --hub-host "$(ams_hub_host)" || fail "registering the ams-store hooks failed"
+fi
+
 # ---------------------------------------------------------------- 6. receipt
 say "[6] receipt"
 if plan "write $MEM0_DIR/client-receipt.json"; then :; else
     SHA="$(sha256sum "$SHIM" | cut -c1-64)"
-    printf '{"role":"client","authority":"%s","user_id":"%s","stack_version":"%s","shim_sha256":"%s","python":"%s","installed_at":"%s"}\n' \
-        "$AUTHORITY" "$USER_ID" "$STACK_VERSION" "$SHA" "$PY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MEM0_DIR/client-receipt.json"
+    AMS_STORE_SHA=""
+    [ -r "$AMS_BIN_DIR/ams-store.sha256" ] && AMS_STORE_SHA="$(head -n1 "$AMS_BIN_DIR/ams-store.sha256")"
+    printf '{"role":"client","authority":"%s","user_id":"%s","stack_version":"%s","shim_sha256":"%s","python":"%s","ams_hub":"%s","ams_store_sha256":"%s","installed_at":"%s"}\n' \
+        "$AUTHORITY" "$USER_ID" "$STACK_VERSION" "$SHA" "$PY" "$AMS_HUB" "$AMS_STORE_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MEM0_DIR/client-receipt.json"
     echo "    $MEM0_DIR/client-receipt.json"
 fi
 
