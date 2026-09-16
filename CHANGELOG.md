@@ -4,6 +4,19 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.27.1 — the replica installer forwards the fleet-store flags
+
+1.27.0 put the store block in `linux-client.sh`. `linux-replica.sh` — the installer the replica
+boxes actually run — calls that script with an EXPLICITLY built argument list, and `--ams-hub` was
+not in it. A replica install would have printed "no --ams-hub: this client does not join the fleet
+store (skipped)", reported success, and left the box outside the fleet with nothing failing
+anywhere. Found by reading the replica's own flag list against the client's, one commit after
+shipping the block, and before any box was installed with it.
+
+`--ams-hub`, `--ams-store-binary` and `--ams-store-sums` are now accepted and forwarded verbatim.
+The test runs the replica installer's dry run end to end and asserts the hub reaches the client's
+plan; removing the forward makes it fail with the exact symptom.
+
 ## 1.27.0 — a Linux client can join the fleet store (register P4-3)
 
 `linux-client.sh` installed the MCP shim and the outbox and nothing else, so a native Linux box

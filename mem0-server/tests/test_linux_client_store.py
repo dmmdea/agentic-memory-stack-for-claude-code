@@ -11,6 +11,7 @@ here rather than described:
     audit: an installer replaced whole event arrays and silently dropped user hooks).
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -171,3 +172,41 @@ def test_the_binary_is_verified_against_the_release_sums():
     invocations = [ln for ln in block.splitlines()
                    if ln.strip().startswith("sudo ") or " sudo " in ln.split("#")[0]]
     assert not invocations, f"a client installs into its own bin, never through sudo: {invocations}"
+
+
+# --------------------------------------------------------------- the replica forwards the flags
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_replica_installer_forwards_the_hub_to_the_client(tmp_path):
+    """A replica is a client plus a dormant brain, and it builds the client's arguments
+    EXPLICITLY - so a flag it does not name is silently dropped. Before this test, --ams-hub was
+    dropped: the replica install reported success and the box never joined the fleet store."""
+    replica = REPO_ROOT / "install" / "linux-replica.sh"
+    home = tmp_path / "home"
+    home.mkdir()
+    # The client's prerequisite step needs the editor CLI, which a test box need not have.
+    binp = tmp_path / "bin"
+    binp.mkdir()
+    stub = binp / "claude"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), PATH=f"{binp}:{os.environ.get('PATH', '')}")
+
+    r = subprocess.run(
+        [BASH, str(replica), "--authority", "http://192.0.2.9:18791", "--brain-ssh", "nobrain",
+         "--user-id", "t", "--ams-hub", "ams-hub@hub-host:ams-store.git", "--dry-run"],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    out = r.stdout + r.stderr
+    assert "install/linux-client.sh" in out, f"the replica never reached the client step:\n{out[:800]}"
+    assert "ams-hub@hub-host:ams-store.git" in out, (
+        "the replica did not forward --ams-hub to the client, so the box would never "
+        f"join the fleet store:\n{out[:1200]}"
+    )
+
+
+def test_the_replica_documents_the_forwarded_flags():
+    body = (REPO_ROOT / "install" / "linux-replica.sh").read_text(encoding="utf-8")[:4000]
+    for flag in ("--ams-hub", "--ams-store-binary", "--ams-store-sums"):
+        assert flag in body, f"{flag} is not documented in the replica usage header"
