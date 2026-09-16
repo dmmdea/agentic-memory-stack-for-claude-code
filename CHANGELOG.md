@@ -125,9 +125,15 @@ landed with a test seen RED against the unfixed code first.
   exactly once in its file and that every named test exists; it caught the re-anchoring this
   round itself needed.
 
-Measured mutation gate at `e0d680c` (windows/amd64, git 2.55.0, the whole table, exit 0):
+Measured mutation gate at `29fbd5a` (windows/amd64, git 2.55.0, the whole table, exit 0):
 **red 29, survived 0, broken 0, pending 0** - four rows more than the table had, since the
 deletion-table repair added its own.
+
+Two lead findings from the seed recon, after the repair round: history repos on Windows now pin
+`core.longpaths=true` (a live projects root holds four workspace directories over MAX_PATH, and a
+store under one would have been unstageable), and `derive --dry-run` no longer promises to
+"write nothing" - it never touched the store or the dirty marker, and its receipt row, flagged
+`dry_run`, is the compactor's contract (lint skips such rows); the cli test pins that shape.
 
 `VERSION` moves to 1.24.0 for the engines. Phase 4 wires the binary into the installer.
 

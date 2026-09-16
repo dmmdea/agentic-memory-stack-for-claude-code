@@ -103,7 +103,13 @@ rule and ONE history-repo shape in the binary - each of those had two
 implementations at some point during the parallel build, and each duplication
 decided behaviour rather than merely repeating it. The sync and merge packages
 both initialize the history repo; they disagreed about whether the shared
-over-trigger stamp was trackable, and whichever ran last won.
+over-trigger stamp was trackable, and whichever ran last won. That one shape is
+`merge.RepoConfig`: an `automemory` identity with signing off, `core.autocrlf`,
+`core.safecrlf` and `core.quotepath` off so git never rewrites a byte, an empty
+`core.hooksPath` under the git dir so the operator's global hooks never see a hub
+push, renames off, and on Windows `core.longpaths` on - git refuses a work-tree
+directory over MAX_PATH otherwise, and a live projects root already holds four
+workspace directories past that length.
 
 ## Verbs
 
@@ -150,6 +156,12 @@ ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-ru
    directory-level revert clobbers what the live session just wrote;
 10. write atomically, verify the post-write invariants, touch the dirty marker,
     commit locally and append a receipt row to `compact-receipts.jsonl`.
+
+`--dry-run` leaves the store and the dirty marker untouched and still appends its
+receipt row, flagged `dry_run` with status `dry-run`: the ledger is the record of
+every run, rehearsals included (the compactor's own contract, carried 1:1), and
+lint skips `dry_run` rows when it judges whether the maintainer is silent or
+starved, so a rehearsal can never pass for a run.
 
 ### The floor and the injection cap
 
@@ -468,8 +480,7 @@ fails the moment an anchor moves, which is also what caught the re-anchoring thi
 round needed.
 
 Measured state, and the figure is stamped with the commit it was measured at
-because this gate is local-only and drifts between runs: **red 29, survived 0,
-broken 0, pending 0 at `e0d680c`** (windows/amd64, git 2.55.0, whole table, exit
+because this gate is local-only and drifts between runs: **red 29, survived 0, broken 0, pending 0 at `29fbd5a`** (windows/amd64, git 2.55.0, whole table, exit
 0), which is the last commit of that round to touch Go source. A SURVIVED rule means nothing tests it; a NOCOMPILE or STALE entry means the
 mutation is broken. Both were hit while arming the last ten and both are reported
 separately for that reason, and the figure that stood here before (red 25) was
