@@ -210,6 +210,16 @@ invisible until connectivity returns, and the box that has been offline for a we
 is exactly the one whose history matters most when it comes back. Having no hub
 configured is a fully successful pass, not a failure.
 
+**A store with no index is the fresh-checkout shape, not an error.** `MEMORY.md` is
+derived and never tracked, so a checkout that has just materialized its stores from
+the hub - a new PC's first sync, or the hub's own checkout on the authority - holds
+fact files and no index at all. `derive` treats a missing index as an empty one and
+renders it from the files (nothing to harvest, every file re-indexed from its
+frontmatter hook); the second pass is the fixed point. Any other read error still
+fails closed. Before 1.25.2 the first sync of a fresh checkout materialized every
+store and then died on `read index ...: no such file`, exit 5, leaving the stores on
+disk with no index - which is exactly the state a new PC starts from.
+
 The push loop is bounded at three attempts. A non-fast-forward rejection is the
 loop's signal that another PC pushed first, so it re-merges and retries; anything
 else is a real error and is never retried. The merge itself never runs `git merge`,
