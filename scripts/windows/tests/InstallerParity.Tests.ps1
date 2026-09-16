@@ -469,9 +469,14 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         Test-Path (Join-Path $repoRoot 'claude-config\memory-index-write-lint.sh') | Should -BeTrue
     }
 
-    It 'the SessionStart spawner launches the lint child' {
-        (Get-Content (Join-Path $winDir 'memory-maintenance-spawn.ps1') -Raw) |
-            Should -Match "'memory-lint\.ps1'" -Because 'lint runs as a detached SessionStart child beside the other two'
+    It 'the SessionStart spawner launches the store lint (ams-store lint --summary-out), with memory-lint.ps1 only as the fallback while the binary is absent (P4-1c)' {
+        $code = ((Get-Content (Join-Path $winDir 'memory-maintenance-spawn.ps1') -Raw) -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        $code | Should -Match "'lint --summary-out \`"'" -Because 'the Go lint writes the summary the banner reads, with the G7 clock the PowerShell lint leaves null'
+        $code | Should -Match "'state\\automemory'" -Because 'the summary must land in the state root the banner and Test-MemoryStack read'
+        $code | Should -Match "--hub-host" -Because 'the history-remote rule needs the hub name to accept the hub remote'
+        $i = $code.IndexOf("elseif (Test-Path (Join-Path `$ScriptDir 'memory-lint.ps1'))")
+        $i | Should -BeGreaterThan 0 -Because 'the PowerShell lint stays as the fallback so a box with an aborted install is never without a lint'
+        $i | Should -BeGreaterThan $code.IndexOf('if (Test-Path $exe) {') -Because 'the fallback is the else branch, never the first choice'
     }
 
     It 'no comment sits between a line-continuation backtick and the next argument' {
