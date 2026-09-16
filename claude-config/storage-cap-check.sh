@@ -182,7 +182,7 @@ if gen:
     except Exception:
         stale_h = None
 if stale_h is not None and stale_h > 12:
-    parts.append(f"auto-memory lint: STALE ({stale_h}h old) - memory-lint.ps1 has not completed since then")
+    parts.append(f"auto-memory lint: STALE ({stale_h}h old) - the store lint has not completed since then")
 else:
     c = d.get("counts") or {}
     n = int(c.get("actionable") or 0)
@@ -191,10 +191,32 @@ else:
         for f in d.get("findings") or []:
             k = f.get("kind")
             if k in ("orphan", "dangling", "dup-slug", "over-sync-limit", "over-inject-limit",
-                     "compactor-silent", "compactor-unproductive", "compactor-starved", "history-remote", "scan-error"):
+                     "compactor-silent", "compactor-unproductive", "compactor-starved", "history-remote", "scan-error",
+                     "resurrected", "conflict-in-history"):
                 kinds[k] = kinds.get(k, 0) + 1
         detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
         parts.append(f"auto-memory lint: {n} actionable ({detail})")
+    # G7 (design section 9, register P4-1c): hours over trigger WITHOUT an applied decision, per
+    # store, from the store lint's over_trigger_hours (the over-trigger clock that rides in the
+    # synced tree; min across PCs). A skip cannot satisfy it; only a decision applied on the hub
+    # clears it. Quiet below 24 h, loud at or above - this line is the one observer that does
+    # not depend on the authority being up.
+    over = []
+    for s in d.get("stores") or []:
+        try:
+            h = float(s.get("over_trigger_hours") or 0)
+        except Exception:
+            h = 0.0
+        if h > 0:
+            over.append((str(s.get("workspace") or "?"), h))
+    if over:
+        over.sort(key=lambda x: -x[1])
+        worst = over[0][1]
+        listing = ", ".join(f"{w} {h:g}h" for w, h in over)
+        if worst >= 24:
+            parts.append(f"AUTO-MEMORY G7 ALARM: over trigger without an applied decision for {worst:g}h ({listing}) - the hub judge has not decided; check the nightly chain")
+        else:
+            parts.append(f"auto-memory G7: over trigger {listing} (alarm at 24h; the hub judge decides nightly)")
 age = d.get("last_receipt_age_hours")
 if age is not None and age <= 24:
     parts.append(f"compactor ran {age}h ago (receipt: ~/.claude/state/automemory/compact-receipts.jsonl)")

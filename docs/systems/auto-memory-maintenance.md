@@ -72,8 +72,13 @@ following night.
 
 ### Pillar 1 — lint (read-only)
 
-`memory-lint.ps1` is spawned detached at session start on its own 6-hour throttle. It
-enumerates every populated store (deduplicating alias directories by canonical path so one
+On a cut-over PC (1.25.1, register P4-1c) the session-start spawner runs the store binary's
+lint, `ams-store lint --summary-out <state>/lint-summary.json --hub-host <hub>`, on its own
+6-hour throttle; `memory-lint.ps1` runs only while the binary is absent. Both write the same
+summary file, but only the binary's lint fills the per-store `over_trigger_hours` (the G7
+clock: hours over trigger without an applied decision, from the over-trigger stamp that rides in
+the synced tree), and the session-start banner (`claude-config/storage-cap-check.sh`) prints it -
+quiet below 24 h, an `AUTO-MEMORY G7 ALARM` line at or above. The lint enumerates every populated store (deduplicating alias directories by canonical path so one
 store is never processed twice), and recomputes findings from disk: orphan, dangling, duplicate
 slug, over-long line, oversized fact file, missing frontmatter, near or over a budget. It writes
 one summary file and **never writes inside a store**.

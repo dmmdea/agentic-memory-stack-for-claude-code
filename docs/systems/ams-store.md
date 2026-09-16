@@ -495,6 +495,16 @@ SessionEnd sync entries and the watcher line in the spawner, runs
 task is gone. Every installer run passes every flag its receipt recorded or relies on
 an inherit rule a Pester scenario pins.
 
+**The session-start line (1.25.1, P4-1c).** `sync --once` is silent on stdout by
+contract and the SessionStart hook runs it asynchronously, so the metric line the
+design asks for at session start is the banner's, not the verb's: the spawner runs
+`ams-store lint --summary-out <state>/lint-summary.json --hub-host <hub>` (the
+PowerShell lint only while the binary is absent), and the banner prints the per-store
+`over_trigger_hours` that lint writes - the G7 clock, hours over trigger without an
+applied decision, taken from `over-trigger.json` with `min` across PCs - quiet below
+24 h and as an `AUTO-MEMORY G7 ALARM` line at or above. The PowerShell lint writes
+`null` there, which is why the lint swap is part of the cutover and not a cleanup.
+
 ### The gates that check the tests
 
 Four checks in `internal/porting` guard the suite itself, because each of them

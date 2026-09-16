@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.25.1 — the session-start line reports the G7 clock; the store lint runs at session start (register P4-1c)
+
+The design's Phase 4 induced test asks for "the session-start line reporting the metric". `ams-store sync --once`
+is silent on stdout by contract and the SessionStart hook runs it asynchronously, so the line is the SessionStart
+banner's: `claude-config/storage-cap-check.sh` now prints, per store, the hours over trigger without an applied
+decision (`stores[].over_trigger_hours` from `lint-summary.json`) - `auto-memory G7: over trigger <ws> <h>h` below
+24 h, `AUTO-MEMORY G7 ALARM: …` at or above - and its stale-summary wording no longer names the PowerShell lint.
+The maintenance spawner runs the binary's lint (`ams-store lint --summary-out <state>/lint-summary.json
+--hub-host <hub>`) instead of `memory-lint.ps1`, which stays as the fallback only while the binary is absent:
+both write the same summary, but only the binary's lint fills the G7 field (the PowerShell lint writes `null`).
+Tests: a new banner suite runs the real script with a fixture summary (quiet line, alarm line listing the worst
+store first, silent when nothing is over trigger, staleness instead of a stale clock, bash syntax);
+InstallerParity and RegressionGuards pin the spawner's lint child and its fallback branch. The isolated induced
+G2 test (a 32,646 B index written past the gate, floored to 19,896 B by the session-start pass, 130 hooks
+harvested first) is recorded in the workspace receipt for P4-1c.
+
 ## 1.25.0 — ams-store into the Windows install (register P4-1a)
 
 The Windows installer now installs the store binary and cuts the PC over to it. `2-windows-config.ps1`
