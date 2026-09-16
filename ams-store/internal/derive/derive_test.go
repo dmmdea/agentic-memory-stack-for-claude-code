@@ -675,3 +675,45 @@ func migratedOf(fm *frontmatter.Frontmatter) string {
 func isLocked(err error) bool {
 	return err == ErrLocked || strings.Contains(err.Error(), ErrLocked.Error())
 }
+
+// A store with no index is the fresh-checkout shape: the index is derived and never
+// tracked, so a PC (or the hub's own checkout) that has just materialized a store from the
+// hub holds fact files and nothing else. derive renders the index from them - harvest finds
+// nothing, every file is re-indexed with its frontmatter hook - and the second derive is
+// the fixed point. Seen RED on 2026-09-16: the first sync of a fresh checkout materialized
+// five stores and then failed on "read index ...: The system cannot find the file
+// specified", leaving no index anywhere.
+func TestDerive_MissingIndexIsRenderedFromTheFactFiles(t *testing.T) {
+	e := newEnv(t, "fresh",
+		[]string{"# Memory Index", ""},
+		map[string]string{
+			"a.md": factWithHook("a", "desc a", "hook a"),
+			"b.md": factWithHook("b", "desc b", "hook b"),
+		})
+	if err := os.Remove(e.st.IndexPath); err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.run()
+	if err != nil {
+		t.Fatalf("derive on a store with no index: %v", err)
+	}
+	if res.Status != StatusApplied {
+		t.Errorf("status = %q, want applied (note %q)", res.Status, res.Note)
+	}
+	if res.BeforeBytes != 0 || res.Reindexed != 2 {
+		t.Errorf("before_bytes = %d reindexed = %d, want 0 and 2 (note %q)", res.BeforeBytes, res.Reindexed, res.Note)
+	}
+	got := e.indexText()
+	for _, want := range []string{index.DefaultHeading, "(a.md)", "(b.md)", "hook a", "hook b"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("derived index lacks %q:\n%s", want, got)
+		}
+	}
+	res2, err := e.run()
+	if err != nil {
+		t.Fatalf("second derive: %v", err)
+	}
+	if res2.Status != StatusNoOp {
+		t.Errorf("second derive status = %q, want no-op: the render must be a fixed point (note %q)", res2.Status, res2.Note)
+	}
+}

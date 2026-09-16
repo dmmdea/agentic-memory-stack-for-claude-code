@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -203,10 +204,21 @@ func Run(opt Options) (*Result, error) {
 	}
 
 	// ---- 1. read the index and enumerate the fact files, fail-closed -----------------
+	// A store with NO index is the fresh-checkout shape: the index is derived and never
+	// tracked, so a PC (or the hub's own checkout) that has just materialized a store from
+	// the hub holds fact files and nothing else. That is not a failure to read; it is an
+	// empty index to render from the files (harvest finds nothing, every file is
+	// re-indexed). Before this, the first sync of a fresh checkout materialized every store
+	// and then failed on "read index: no such file", leaving no index at all. Any other
+	// read error stays fail-closed.
 	preBytes, err := os.ReadFile(indexPath)
+	indexAbsent := false
 	if err != nil {
-		res.Note = err.Error()
-		return res, fmt.Errorf("read index %s: %w", indexPath, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			res.Note = err.Error()
+			return res, fmt.Errorf("read index %s: %w", indexPath, err)
+		}
+		indexAbsent, preBytes = true, nil
 	}
 	preText := string(preBytes)
 	preHash := atomic.Hash(preBytes)
@@ -463,8 +475,13 @@ func Run(opt Options) (*Result, error) {
 	// ---- 9a. compare-and-swap: nothing has been written yet, so an abort is clean -----
 	nowHash, err := atomic.FileHash(indexPath)
 	if err != nil {
-		res.Note = addNote(res.Note, err.Error())
-		return res, err
+		if !(indexAbsent && errors.Is(err, fs.ErrNotExist)) {
+			res.Note = addNote(res.Note, err.Error())
+			return res, err
+		}
+		// Still absent: nothing appeared under the job, and the swap below CREATES the
+		// index. An index that appeared meanwhile is a concurrent write and aborts.
+		nowHash = preHash
 	}
 	nowFiles, err := store.FactFiles(dir)
 	if err != nil {
@@ -576,8 +593,12 @@ func Harvest(opt Options) (*Result, error) {
 	}
 	preBytes, err := os.ReadFile(indexPath)
 	if err != nil {
-		res.Note = err.Error()
-		return res, fmt.Errorf("read index %s: %w", indexPath, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			res.Note = err.Error()
+			return res, fmt.Errorf("read index %s: %w", indexPath, err)
+		}
+		// No index, nothing to harvest: the fresh-checkout shape (see Run).
+		preBytes = nil
 	}
 	idx := index.Parse(string(preBytes))
 	res.BeforeBytes = index.ByteCount(string(preBytes))

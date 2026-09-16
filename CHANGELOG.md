@@ -4,6 +4,20 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.25.2 — a fresh checkout derives its index instead of failing (register P4-1b/P4-2 prerequisite)
+
+`MEMORY.md` is derived and never tracked, so a checkout that has just materialized its stores from the hub holds
+fact files and no index. `derive` read that index fail-closed, so the FIRST sync of any fresh checkout - a new PC,
+or the hub's own checkout on the authority - materialized every store and then died with
+`merge failed: read index ...: The system cannot find the file specified`, exit 5, leaving the stores on disk with
+no index at all. Found by rehearsing the hub checkout against the live hub before wiring it (five stores, 350 fact
+files materialized, zero indexes). A missing index is now an empty one: `derive` renders it from the fact files
+(nothing to harvest, every file re-indexed from its frontmatter hook) and the compare-and-swap treats "still
+absent" as unchanged while an index that appeared mid-run still aborts; `harvest` does the same. Any other read
+error stays fail-closed. Two tests, both seen red against the old read: the derive engine renders an index for a
+store that has none and the second pass is a no-op, and a CLI seam test drives a fresh checkout's first sync
+against a bare hub end to end.
+
 ## 1.25.1 — the session-start line reports the G7 clock; the store lint runs at session start (register P4-1c)
 
 The design's Phase 4 induced test asks for "the session-start line reporting the metric". `ams-store sync --once`
