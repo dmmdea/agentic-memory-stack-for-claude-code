@@ -4,7 +4,35 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## Unreleased - ams-store: the known_hosts path survives the shell git runs ssh through
+## 1.25.0 — ams-store into the Windows install (register P4-1a)
+
+The Windows installer now installs the store binary and cuts the PC over to it. `2-windows-config.ps1`
+downloads `ams-store-windows-amd64.exe` from the GitHub release of the tag `VERSION` names (the new
+`release-assets` job in `ci.yml` cross-compiles windows/amd64, linux/amd64 and linux/arm64 on a pushed
+`v*` tag, refuses a tag that disagrees with `VERSION`, and attaches the three binaries with `SHA256SUMS`;
+every other CI job skips tags), verifies the asset against `SHA256SUMS`, installs it beside the hooks
+with a `.sha256` sidecar, and aborts before the receipt and before hook registration when it cannot
+(`-BinaryPath` + `-BinarySums` is the offline drop; an offline re-run keeps an installed binary that is
+already the tag and matches its sidecar). It then writes the hub transport the seed did by hand: the
+`Match host <hub> user ams-hub` ssh block (idempotent, between marker lines), the hub's host key into the
+binary's own `<state>/known_hosts`, a history repo on `main` with `hub` as its one remote in the
+user@MagicDNS form. It registers `ams-store gate` on PostToolUse over the two legacy markers (the
+PowerShell gate is replaced, never duplicated), `ams-store sync --once` at SessionStart (async) and at
+SessionEnd, and the maintenance spawner, which now launches the resident watcher (`sync --watch`, one
+per PC) instead of the compactor catch-up; and it removes the 5am `ClaudeCode-MemoryCompactor-5am`
+task. The sync hooks and the task removal happen only behind a proven hub path (`-HubHost`, inherited
+from the receipt; the identity key present; the host key seeded) - a box that cannot prove it keeps
+its legacy nightly and the installer says so in red. The receipt records `HubHost`, `AmsStoreTag`,
+`AmsStoreSha256` and `AmsStoreSource`; `0-prereqs.ps1` requires git >= 2.38 (parsed, not merely
+present); `3-verify.ps1` compares `--version` to the tag, the binary to its sidecar, the hook table to
+the binary, runs `sync --once --json` and asserts the compactor task is gone. Pester: the installer
+suites are extended (InstallerParity, RegressionGuards, AuthorityResolution) and a new
+`AmsStoreInstall.Tests.ps1` runs the checksum parser, the ssh block writer, the known_hosts seeder and
+the history-remote initialiser for real against a TestDrive, plus the Q-F scenario that the PowerShell
+receipt reader tolerates the Go binary's rows. The PowerShell originals stay deployed until the Phase 5
+gate deletes them.
+
+### ams-store: the known_hosts path survives the shell git runs ssh through
 
 The first live push to the hub (the P3-4 seed, minutes after 1.24.0 merged) failed with "No ED25519
 host key is known" although the state-root known_hosts held the right key: `gitx.SSHCommand` quoted the

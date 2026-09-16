@@ -186,6 +186,13 @@ Describe 'Regression guards for the authority contract' {
         $code | Should -Match "AuthoritySsh = '\`$eAuthoritySsh'"
         $code | Should -Match '\(Import-PowerShellDataFile \$receiptPath\)\.AuthoritySsh'
     }
+    It 'the Windows receipt records HubHost and inherits it on a re-run (P4-1a)' {
+        # Same rule as AuthoritySsh: a plain re-run must not blank the store hub, or the next
+        # install silently strips the sync hooks and keeps the legacy nightly.
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'install\2-windows-config.ps1')
+        $code | Should -Match "HubHost     = '\`$eHubHost'"
+        $code | Should -Match '\(Import-PowerShellDataFile \$receiptPath\)\.HubHost'
+    }
     It 'memory-compact.ps1 posts, reads back and deletes through Get-Mem0AuthorityUrl, never loopback (v1.23.2)' {
         # The compactor runs on EVERY box (brain and replicas). Its three mem0 calls were the last
         # hard-coded loopback probes in scripts/windows: on a replica they hit the dormant local

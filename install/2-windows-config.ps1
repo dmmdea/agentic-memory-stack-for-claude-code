@@ -47,7 +47,22 @@ param(
     # holds the canonical key. Written to ~/.mem0/replica.env as BRAIN_SSH on a replica —
     # mem0-canonize.sh forwards there, replay-ops.py executes queued canonizations there.
     # Empty inherits the existing line (same rule as -AuthorityUrl: a re-run never blanks it).
-    [string]$AuthoritySsh = ''
+    [string]$AuthoritySsh = '',
+    # P4-1a (2026-09-16, register P4-1): the MagicDNS name of the store hub - the fleet's one git
+    # remote for the per-workspace auto-memory stores (blueprint §5.4 pins the user@MagicDNS URL
+    # form to it). Inherits the previous receipt's value when omitted. Empty on a box with no hub:
+    # the store gate still runs (local commits) but no sync hook and no watcher are registered,
+    # and the legacy nightly compactor task is kept.
+    [string]$HubHost = '',
+    # P4-1a: an OFFLINE DROP of the store binary. By default the installer downloads the release
+    # asset of the tag named in VERSION and verifies it against the release's SHA256SUMS; on a box
+    # that cannot reach GitHub pass a local ams-store.exe here, plus -BinarySums (the SHA256SUMS
+    # file it shipped with) so the drop is verified the same way. A drop without sums installs
+    # UNVERIFIED and says so.
+    [string]$BinaryPath = '',
+    [string]$BinarySums = '',
+    # P4-1a: the GitHub repository whose releases carry the binary (the canonical public repo).
+    [string]$ReleaseRepo = 'dmmdea/agentic-memory-stack-for-claude-code'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,6 +136,156 @@ function Backup-File {
 Write-Host "==> [1] Installing runtime scripts to $ScriptsDir"
 foreach ($d in @($ClaudeDir, $ScriptsDir, $LogsDir, $StateDir)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+}
+
+# ----------------------------------------------------------------------
+# 1s. Install the store binary: ams-store.exe from the release asset of the VERSION tag
+# ----------------------------------------------------------------------
+# P4-1a (2026-09-16, register P4-1, blueprint §12.4): the Go store client replaces the PowerShell
+# write gate and the nightly compactor on every PC. The binary is never built on a PC and never
+# committed: the release workflow (.github/workflows/release.yml) cross-compiles it for the tag
+# named in VERSION and attaches it with a SHA256SUMS file; this block downloads that asset,
+# verifies the checksum against SHA256SUMS, installs it beside the hooks and records a .sha256
+# sidecar (the shape build-hook-client.ps1 records for the compiled client). -BinaryPath
+# (+ -BinarySums) is the offline drop. A binary that cannot be installed aborts the run BEFORE
+# the receipt is rewritten and BEFORE hook registration: settings.json must never point at a
+# missing exe, and the compactor task is never removed under a missing gate.
+$stackVersion  = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
+$amsStoreTag   = 'v' + $stackVersion
+$amsStoreAsset = 'ams-store-windows-amd64.exe'
+$amsStoreExe   = Join-Path $ScriptsDir 'ams-store.exe'
+
+function Get-AmsFileSha256 {
+    # Lowercase hex, through the .NET type: Get-FileHash depends on module auto-loading, which a
+    # -NoProfile launcher has been seen to skip (memory: verify-in-the-production-launcher).
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { return ([System.BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() }
+        finally { $fs.Dispose() }
+    } finally { $sha.Dispose() }
+}
+
+function Read-AmsSumsHash {
+    # The digest SHA256SUMS records for ONE asset, or $null. Accepts the two sha256sum shapes
+    # ("<hex>  name" text mode, "<hex> *name" binary mode) and nothing looser: a line that names
+    # the asset without a 64-hex digest is not a checksum.
+    param([string]$SumsText, [string]$Asset)
+    foreach ($line in ($SumsText -split "`r?`n")) {
+        $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(\S+)$')
+        if ($m.Success -and $m.Groups[2].Value -eq $Asset) { return $m.Groups[1].Value.ToLowerInvariant() }
+    }
+    return $null
+}
+
+function Get-AmsStoreVersionToken {
+    # The second token of `ams-store --version` ("ams-store v1.25.0 (7546f11, ...)"), or ''.
+    param([string]$Exe)
+    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $out = (& $Exe --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { return '' }
+        $m = [regex]::Match($out, '^ams-store\s+(\S+)')
+        if ($m.Success) { return $m.Groups[1].Value }
+    } catch {}
+    return ''
+}
+
+function Install-AmsStoreBinary {
+    # Returns @{ Sha256; Source; Version } or throws with the reason. Idempotent: a deployed exe
+    # whose content hash equals the digest the release records is left alone (sidecar refreshed).
+    # Source: release | release-cached (offline re-run, the installed tag re-verified against its
+    # own sidecar) | drop | drop-unverified.
+    param(
+        [string]$Tag, [string]$Asset, [string]$Dest, [string]$ReleaseRepo,
+        [string]$BinaryPath, [string]$BinarySums
+    )
+    $ErrorActionPreference = 'Stop'
+    $sidecar = $Dest + '.sha256'
+    $expected = $null; $source = 'release'; $candidate = $null
+    if ($BinaryPath) {
+        if (-not (Test-Path -LiteralPath $BinaryPath)) { throw "-BinaryPath $BinaryPath does not exist" }
+        $candidate = $BinaryPath
+        if ($BinarySums) {
+            if (-not (Test-Path -LiteralPath $BinarySums)) { throw "-BinarySums $BinarySums does not exist" }
+            $expected = Read-AmsSumsHash (Get-Content -LiteralPath $BinarySums -Raw) $Asset
+            if (-not $expected) { throw "-BinarySums $BinarySums has no entry for $Asset" }
+            $source = 'drop'
+        } else {
+            $source = 'drop-unverified'
+            Write-Host "    WARN: -BinaryPath without -BinarySums: the drop is installed UNVERIFIED (its own digest is recorded)" -ForegroundColor Yellow
+        }
+    } else {
+        $base = "https://github.com/$ReleaseRepo/releases/download/$Tag"
+        try {
+            $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS" -UseBasicParsing -TimeoutSec 30).Content
+            if ($sums -is [byte[]]) { $sums = [System.Text.Encoding]::UTF8.GetString($sums) }
+        } catch {
+            # Offline re-run: keep a deployed binary that already IS this tag and matches its own
+            # sidecar; anything else is a loud failure, never a silent skip.
+            $reason = $_.Exception.Message
+            if ((Test-Path -LiteralPath $Dest) -and (Test-Path -LiteralPath $sidecar)) {
+                $have = Get-AmsFileSha256 $Dest
+                $recorded = ((Get-Content -LiteralPath $sidecar -Raw) -split '\s+')[0].ToLowerInvariant()
+                $ver = Get-AmsStoreVersionToken $Dest
+                if ($have -eq $recorded -and $ver -eq $Tag) {
+                    Write-Host "    WARN: release $Tag unreachable ($reason); keeping the installed $ver (sidecar-verified)" -ForegroundColor Yellow
+                    return @{ Sha256 = $have; Source = 'release-cached'; Version = $ver }
+                }
+            }
+            throw "cannot fetch $base/SHA256SUMS ($reason) and no verified $Tag binary is installed; pass -BinaryPath <ams-store.exe> -BinarySums <SHA256SUMS> for an offline drop"
+        }
+        $expected = Read-AmsSumsHash $sums $Asset
+        if (-not $expected) { throw "release ${Tag}: SHA256SUMS has no entry for $Asset (is the release workflow's asset name in step with this installer?)" }
+        if ((Test-Path -LiteralPath $Dest) -and ((Get-AmsFileSha256 $Dest) -eq $expected)) {
+            Set-Content -LiteralPath $sidecar -Value $expected -NoNewline -Encoding ascii
+            $ver = Get-AmsStoreVersionToken $Dest
+            Write-Host "    ams-store.exe already current ($ver, sha256 $($expected.Substring(0, 12))...)"
+            return @{ Sha256 = $expected; Source = 'release'; Version = $ver }
+        }
+        $candidate = Join-Path ([System.IO.Path]::GetTempPath()) ('ams-store-' + [guid]::NewGuid().ToString('N') + '.exe')
+        Invoke-WebRequest -Uri "$base/$Asset" -UseBasicParsing -TimeoutSec 300 -OutFile $candidate
+    }
+    $have = Get-AmsFileSha256 $candidate
+    if ($expected -and $have -ne $expected) {
+        if (-not $BinaryPath) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        throw "checksum mismatch for $Asset ($Tag): SHA256SUMS says $expected, the file is $have - not installed"
+    }
+    if ((Test-Path -LiteralPath $Dest) -and ((Get-AmsFileSha256 $Dest) -eq $have)) {
+        if (-not $BinaryPath) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        Set-Content -LiteralPath $sidecar -Value $have -NoNewline -Encoding ascii
+        $ver = Get-AmsStoreVersionToken $Dest
+        Write-Host "    ams-store.exe already current ($ver, $source)"
+        return @{ Sha256 = $have; Source = $source; Version = $ver }
+    }
+    # Swap in. A resident `sync --watch` may hold the old exe open: Windows refuses to overwrite a
+    # running image but allows a rename, so the old file steps aside as .prev (deleted here when
+    # nothing holds it, otherwise on the next run).
+    $prev = $Dest + '.prev'
+    if (Test-Path -LiteralPath $prev) { Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $Dest) { Move-Item -LiteralPath $Dest -Destination $prev -Force }
+    if ($BinaryPath) { Copy-Item -LiteralPath $candidate -Destination $Dest -Force }
+    else { Move-Item -LiteralPath $candidate -Destination $Dest -Force }
+    Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $sidecar -Value $have -NoNewline -Encoding ascii
+    $ver = Get-AmsStoreVersionToken $Dest
+    if (-not $ver) { throw "$Dest does not answer --version after install" }
+    if ($ver -ne $Tag) {
+        if ($source -eq 'release') { throw "release $Tag asset reports version '$ver'" }
+        Write-Host "    WARN: the dropped binary reports $ver while VERSION names $Tag (3-verify will report it)" -ForegroundColor Yellow
+    }
+    Write-Host "    installed: ams-store.exe $ver ($source, sha256 $($have.Substring(0, 12))...)"
+    return @{ Sha256 = $have; Source = $source; Version = $ver }
+}
+
+Write-Host "==> [1s] Installing ams-store.exe ($amsStoreTag from the release assets of $ReleaseRepo)"
+try {
+    $amsInstall = Install-AmsStoreBinary -Tag $amsStoreTag -Asset $amsStoreAsset -Dest $amsStoreExe -ReleaseRepo $ReleaseRepo -BinaryPath $BinaryPath -BinarySums $BinarySums
+} catch {
+    Write-Host "FATAL: ams-store.exe not installed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "       aborting before the receipt and before hook registration (settings.json and the scheduled tasks are untouched)" -ForegroundColor Red
+    exit 1
 }
 
 # ----------------------------------------------------------------------
@@ -207,6 +372,17 @@ if (-not $AuthoritySsh -and (Test-Path $receiptPath)) {
     try { $p = (Import-PowerShellDataFile $receiptPath).AuthoritySsh; if ($p) { $AuthoritySsh = "$p".Trim() } } catch {}
 }
 $eAuthoritySsh = $AuthoritySsh.Replace("'", "''")
+# P4-1a: an omitted -HubHost inherits the previous receipt's value (same rule as -AuthoritySsh).
+if (-not $HubHost -and (Test-Path $receiptPath)) {
+    try { $p = (Import-PowerShellDataFile $receiptPath).HubHost; if ($p) { $HubHost = "$p".Trim(); Write-Host "    store hub inherited from the previous receipt: $HubHost" } } catch {}
+}
+# Strict form: a host name. It lands on hook command lines, in an ssh config and in a git URL,
+# so anything that is not a host name is rejected outright rather than escaped-and-hoped.
+if ($HubHost -and ($HubHost -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$')) { throw "-HubHost '$HubHost' is not a host name" }
+$eHubHost   = $HubHost.Replace("'", "''")
+$eAmsTag    = ([string]$amsInstall.Version).Replace("'", "''")
+$eAmsSha    = [string]$amsInstall.Sha256
+$eAmsSource = [string]$amsInstall.Source
 $receipt = @"
 @{
     WslUser     = '$eWslUser'
@@ -226,6 +402,13 @@ $receipt = @"
     AuthorityUrl = '$eAuthorityUrl'
     # v1.23.1: the brain's ssh alias for canonize forwarding (replicas; mirrors ~/.mem0/replica.env BRAIN_SSH)
     AuthoritySsh = '$eAuthoritySsh'
+    # P4-1a: the store hub (MagicDNS name) the sync hooks and the resident watcher talk to; empty = no hub on this box.
+    HubHost     = '$eHubHost'
+    # P4-1a: the installed store binary - the version it reports (the release tag VERSION names), the sha256
+    # the installer verified, and where it came from (release | release-cached | drop | drop-unverified).
+    AmsStoreTag    = '$eAmsTag'
+    AmsStoreSha256 = '$eAmsSha'
+    AmsStoreSource = '$eAmsSource'
     # 4C autonomous-canonical-promotion gate (E/T4): off | shadow | enforce.
     # Ships 'shadow' (compute + log, never blocks). Flip to 'enforce' only after the
     # contradiction judge is calibrated (eval/promotion-gate/CALIBRATION.md). Reversible.
@@ -478,6 +661,153 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ----------------------------------------------------------------------
+# 1c. Store hub transport (P4-1a, session-7 plan Q-E)
+# ----------------------------------------------------------------------
+# Everything the P3-4 seed did by hand on the first PC, done by the installer for every PC: an
+# ssh Match block for the hub user (the remote policy pins the user@MagicDNS URL form, and ssh
+# has no other way to bind that user to the hub's identity file), the hub's host key seeded
+# into the binary's own known_hosts (the hardened GIT_SSH_COMMAND pins
+# UserKnownHostsFile=<state>/known_hosts with StrictHostKeyChecking=yes, so an unseeded PC
+# fails every sync), a history repo whose branch is `main` and whose one remote is `hub`.
+# The sync hooks are registered ONLY when this block proves the path (identity key present,
+# host key seeded): a strict-checking failure at SessionStart is silent by contract, so the
+# refusal has to be loud here instead.
+$amsStateRoot  = Join-Path $StateDir 'automemory'
+$amsHistoryDir = Join-Path $amsStateRoot 'history.git'
+$amsProjects   = Join-Path $ClaudeDir 'projects'
+$amsSshDir     = Join-Path $env:USERPROFILE '.ssh'
+$amsIdentity   = Join-Path $amsSshDir 'id_ed25519_ams_hub'
+$amsHubUser    = 'ams-hub'
+$amsHubRepo    = 'ams-store.git'
+
+function Set-AmsHubSshConfig {
+    # Idempotent Match block between two marker lines in ~/.ssh/config; the rest of the file is
+    # preserved byte for byte. Returns $true when the file changed.
+    param([string]$ConfigPath, [string]$HubHost, [string]$HubUser, [string]$IdentityFile)
+    $begin = '# >>> ams-store hub (managed by 2-windows-config.ps1)'
+    $end   = '# <<< ams-store hub'
+    $block = @($begin, "Match host $HubHost user $HubUser", "    IdentityFile $IdentityFile", '    IdentitiesOnly yes', $end) -join "`n"
+    $existing = if (Test-Path -LiteralPath $ConfigPath) { Get-Content -LiteralPath $ConfigPath -Raw } else { '' }
+    if ($null -eq $existing) { $existing = '' }
+    $pattern = '(?ms)^' + [regex]::Escape($begin) + '.*?^' + [regex]::Escape($end) + '[ \t]*'
+    $m = [regex]::Match($existing, $pattern)
+    if ($m.Success) {
+        $updated = $existing.Substring(0, $m.Index) + $block + $existing.Substring($m.Index + $m.Length)
+    } else {
+        $sep = if (-not $existing) { '' } elseif ($existing.EndsWith("`n")) { "`n" } else { "`n`n" }
+        $updated = $existing + $sep + $block + "`n"
+    }
+    if ($updated -eq $existing) { return $false }
+    $dir = Split-Path -Parent $ConfigPath
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($ConfigPath, $updated, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function Initialize-AmsKnownHosts {
+    # Seeds <state>/known_hosts with the hub's host-key lines from the user's known_hosts
+    # (`ssh-keygen -F`), overwriting the state copy so a rotated key converges. Returns the
+    # number of key lines seeded; 0 = the user has never accepted the hub's host key.
+    param([string]$HubHost, [string]$UserKnownHosts, [string]$StateKnownHosts)
+    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
+    if (-not (Test-Path -LiteralPath $UserKnownHosts)) { return 0 }
+    $lines = @()
+    try {
+        $out = & ssh-keygen -F $HubHost -f $UserKnownHosts 2>$null
+        $lines = @($out | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+    } catch { return 0 }
+    if ($lines.Count -eq 0) { return 0 }
+    $dir = Split-Path -Parent $StateKnownHosts
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($StateKnownHosts, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+    return $lines.Count
+}
+
+function Initialize-AmsHistoryRemote {
+    # The history repo the binary keeps (git dir under the state root, work tree = the projects
+    # root, blueprint §1.4): create it on `main` when absent (the same `git init -b main` the
+    # binary's own Initialize runs; the binary pins the config on its first pass), rename a
+    # pre-binary `master` to `main`, and make `hub` its one remote at the user@MagicDNS URL the
+    # remote policy accepts (blueprint §5.4). Returns the remote URL.
+    param([string]$GitDir, [string]$WorkTree, [string]$HubHost, [string]$HubUser, [string]$HubRepo)
+    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
+    $g = @('--git-dir', $GitDir, '--work-tree', $WorkTree)
+    if (-not (Test-Path -LiteralPath (Join-Path $GitDir 'HEAD'))) {
+        if (-not (Test-Path -LiteralPath $WorkTree)) { New-Item -ItemType Directory -Path $WorkTree -Force | Out-Null }
+        & git @g init -q -b main
+        if ($LASTEXITCODE -ne 0) { throw "git init failed for $GitDir (exit $LASTEXITCODE)" }
+        Write-Host "    history repo: created at $GitDir (branch main)"
+    }
+    $branch = (& git @g symbolic-ref --short HEAD 2>$null | Out-String).Trim()
+    if ($branch -eq 'master') {
+        & git @g rev-parse --verify -q HEAD 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { & git @g branch -m master main | Out-Null } else { & git @g symbolic-ref HEAD refs/heads/main | Out-Null }
+        Write-Host "    history repo: branch renamed master -> main"
+    }
+    $want = $HubUser + '@' + $HubHost + ':' + $HubRepo
+    # Exactly one remote, named hub (blueprint §5.4): any other remote makes every sync refuse
+    # with exit 3 at each session boundary, where nothing is watching. Converge loudly here.
+    foreach ($r in @((& git @g remote 2>$null) | Where-Object { $_ -and "$_".Trim() -and "$_".Trim() -ne 'hub' })) {
+        & git @g remote remove "$r".Trim() | Out-Null
+        Write-Host "    history repo: removed remote '$("$r".Trim())' (the remote policy allows only hub)" -ForegroundColor Yellow
+    }
+    $have = (& git @g remote get-url hub 2>$null | Out-String).Trim()
+    if (-not $have) { & git @g remote add hub $want | Out-Null; Write-Host "    history repo: remote hub added ($want)" }
+    elseif ($have -ne $want) { & git @g remote set-url hub $want | Out-Null; Write-Host "    history repo: remote hub $have -> $want" }
+    return $want
+}
+
+$amsSyncReady = $false
+$amsHubUrl = ''
+if (-not $HubHost) {
+    Write-Host "==> [1c] No -HubHost: the store gate runs locally only; sync hooks and the watcher are NOT registered" -ForegroundColor Yellow
+} else {
+    Write-Host "==> [1c] Store hub transport for $amsHubUser@$HubHost"
+    if (Set-AmsHubSshConfig -ConfigPath (Join-Path $amsSshDir 'config') -HubHost $HubHost -HubUser $amsHubUser -IdentityFile '~/.ssh/id_ed25519_ams_hub') {
+        Write-Host "    ssh config: Match block written"
+    } else {
+        Write-Host "    ssh config: Match block current"
+    }
+    $seeded = Initialize-AmsKnownHosts -HubHost $HubHost -UserKnownHosts (Join-Path $amsSshDir 'known_hosts') -StateKnownHosts (Join-Path $amsStateRoot 'known_hosts')
+    $missing = @()
+    if (-not (Test-Path -LiteralPath $amsIdentity)) { $missing += "identity key $amsIdentity is absent (provision this PC's key on the hub first)" }
+    if ($seeded -lt 1) { $missing += "the hub's host key is not in $amsSshDir\known_hosts (accept it once - ssh $amsHubUser@$HubHost - then re-run)" }
+    if ($missing.Count -gt 0) {
+        Write-Host "    REFUSED: sync hooks and the watcher are NOT registered on this box:" -ForegroundColor Red
+        foreach ($m in $missing) { Write-Host "      - $m" -ForegroundColor Red }
+    } else {
+        Write-Host "    known_hosts: $seeded line(s) seeded into $amsStateRoot\known_hosts"
+        $amsHubUrl = Initialize-AmsHistoryRemote -GitDir $amsHistoryDir -WorkTree $amsProjects -HubHost $HubHost -HubUser $amsHubUser -HubRepo $amsHubRepo
+        $amsSyncReady = $true
+    }
+}
+
+# ----------------------------------------------------------------------
+# 1d. Retire the nightly compactor task and the catch-up spawn (P4-1a, plan Q-A)
+# ----------------------------------------------------------------------
+# Ordered on purpose: the binary is installed (1s) and the hub path proven (1c) BEFORE the
+# PowerShell compactor's task goes, and the task goes BEFORE the watcher spawner is registered
+# (section 2), so at no point are two writers racing for the same stores and at no point is a
+# store ungated - the previous PostToolUse registration stands until section 2 replaces it.
+# The catch-up spawn left memory-maintenance-spawn.ps1 in the same change (the deployed copy
+# was refreshed in section 1). A box WITHOUT a proven hub path keeps its legacy nightly: the
+# gate's floor keeps the index under the caps either way, but the judge's SHORTEN/MIGRATE
+# decisions come from the hub only, and a store with no judge at all only ever shrinks by
+# truncation. `ams-store` takes the legacy mutex (Local\ams-memory-compact, decision Q9)
+# beside its own, so the two never run against one store at once while both exist.
+$compactTaskName = 'ClaudeCode-MemoryCompactor-5am'
+if ($amsSyncReady) {
+    if (Get-ScheduledTask -TaskName $compactTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $compactTaskName -Confirm:$false
+        Write-Host "==> [1d] Removed the nightly PowerShell compactor task ($compactTaskName): ams-store gate + sync + the hub judge replace it" -ForegroundColor Yellow
+    } else {
+        Write-Host "==> [1d] Nightly PowerShell compactor task absent (already retired)"
+    }
+} else {
+    Write-Host "==> [1d] Hub path not proven: the legacy compactor task is KEPT ($compactTaskName)" -ForegroundColor Yellow
+}
+
+# ----------------------------------------------------------------------
 # 2. Patch ~/.claude/settings.json with hooks
 # ----------------------------------------------------------------------
 Write-Host "==> [2] Registering hooks in settings.json"
@@ -598,10 +928,20 @@ $bashCapCheck = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "bash /mnt/c/Users/' +
 # compaction. A failure of wsl.exe itself returns non-2 codes, which PreCompact treats as
 # non-blocking.
 $bashPreCompactCapture = 'wsl.exe ' + $wslDistroArg + '-e bash -lc "python3 /mnt/c/Users/' + $env:USERNAME + '/.claude/scripts/precompact_capture.py || true"'
-# Auto-memory index write lint (PostToolUse). Same wsl.exe form as the cap-check: Git Bash on
-# Windows cannot resolve /mnt/c from a hook command string. Fail-open by construction - the
-# script always exits 0 - and `|| true` guards the wsl.exe layer itself.
-$psIndexGate = New-HookCommand 'memory-index-write-gate.ps1'
+# P4-1a (2026-09-16): the store binary's hooks. `gate` is the PostToolUse hook (exit 0 always,
+# advisory + local commit + dirty marker, never network) and REPLACES the PowerShell gate in
+# place: the two legacy markers stay in the PostToolUse entry so the bash lint and the PS gate
+# registrations are replaced, never duplicated. `sync --once` runs at SessionStart (async - the
+# network is never on a hook's critical path) and at SessionEnd (the one place a pass may block,
+# briefly, so a closing session's local commits reach the hub); both only when section 1c proved
+# the hub path. The resident watcher is spawned by memory-maintenance-spawn.ps1 (hidden,
+# detached, singleton), which reads the hub from the receipt.
+$amsGateCmd = (New-HookExeCommand 'ams-store.exe') + ' gate'
+$amsSyncCmd = (New-HookExeCommand 'ams-store.exe') + ' sync --once --hub-host ' + $HubHost
+# The SessionStart maintenance spawner (dream catch-up, mem0 index refresh, store lint, and now
+# the watcher). It was deployed but never registered by this installer before P4-1a - the live
+# boxes carried a hand-written entry - so a fresh install never launched its children.
+$psMaintSpawn = New-HookCommand 'memory-maintenance-spawn.ps1'
 
 # H12: v0.17 Phase 0 hooks — UserPromptSubmit (checkpoint + decision-capture + proactive-search)
 # and PreToolUse (audit gate). Previously only registered in the operator's local settings.json;
@@ -630,7 +970,10 @@ $psSessionCapture = New-HookCommand 'sessionstart-capture.ps1'
 # Each event maps to an ARRAY of stack-owned entries (SessionStart has two).
 # Every entry carries its own dedupe markers; an existing hook matching ANY
 # marker of ANY entry for that event is treated as ours and replaced.
-$hookEntries = @{
+# [ordered] (P4-1a, 2026-09-16): a plain hashtable enumerates in a process-dependent order, so
+# two identical runs wrote settings.json with the event blocks shuffled and the "second run
+# changes nothing" readback could never be byte-for-byte. The order below is the stable one.
+$hookEntries = [ordered]@{
     'Stop'               = @(@{ markers = @('stop-extract.ps1');           command = $psDispatcher })
     'PreCompact'         = @(
         @{ markers = @('stop-extract.ps1');                                command = $psDispatcher },
@@ -649,7 +992,9 @@ $hookEntries = @{
         # v0.27.1 R5: async Codex-shim pre-warm (flag-gated; no-op until the write-gate is enabled)
         @{ markers = @('codex-shim-spawn.ps1');                            command = $psShimSpawn; async = $true; timeout = 10 },
         # 2026-06-24: prior-session capture (per-turn hooks dead in VSCode-ext/SDK runtime; this carries capture)
-        @{ markers = @('sessionstart-capture.ps1');                        command = $psSessionCapture; async = $true; timeout = 15 }
+        @{ markers = @('sessionstart-capture.ps1');                        command = $psSessionCapture; async = $true; timeout = 15 },
+        # P4-1a: the maintenance spawner (detached children; launches the store watcher)
+        @{ markers = @('memory-maintenance-spawn.ps1');                    command = $psMaintSpawn; async = $true; timeout = 10 }
     )
     # H12: Phase 0 hooks (v0.20 Final: exe registration + both-shape dedupe)
     'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 5 })
@@ -661,7 +1006,9 @@ $hookEntries = @{
     # gate.ps1: same advisory text, and when the index is AT/OVER the sync limit it normalizes the
     # longest non-doctrine lines in place (receipted) so no session ever leaves an unloadable
     # index behind for the others. The old marker stays so the previous registration is replaced.
-    'PostToolUse'        = @(@{ markers = @('memory-index-write-lint.sh', 'memory-index-write-gate.ps1'); command = $psIndexGate; matcher = 'Write|Edit'; timeout = 10 })
+    # P4-1a (2026-09-16): the gate is the store binary (`ams-store gate`, blueprint §6); both
+    # legacy markers stay so the bash lint and the PowerShell gate registrations are replaced.
+    'PostToolUse'        = @(@{ markers = @('memory-index-write-lint.sh', 'memory-index-write-gate.ps1', 'ams-store'); command = $amsGateCmd; matcher = 'Write|Edit'; timeout = 10 })
 }
 
 # AMS-16 (2026-08-09, operator decision): the 0.F PreToolUse contradiction check
@@ -671,6 +1018,16 @@ $hookEntries = @{
 # alive on every existing box, since the merge loop only touches events it owns.
 $retiredHookMarkers = @{
     'PreToolUse' = @('pre-tool-check.ps1')
+}
+# P4-1a: the sync hooks exist only behind a proven hub path (section 1c). When the path is not
+# proven they are STRIPPED, not merely skipped: a box whose key was revoked, or whose hub was
+# unset, must not keep firing a sync that can only fail.
+if ($amsSyncReady) {
+    $hookEntries['SessionStart'] += @{ markers = @('ams-store'); command = $amsSyncCmd; async = $true; timeout = 90 }
+    $hookEntries['SessionEnd']    = @(@{ markers = @('ams-store'); command = $amsSyncCmd; timeout = 60 })
+} else {
+    $retiredHookMarkers['SessionStart'] = @('ams-store')
+    $retiredHookMarkers['SessionEnd']   = @('ams-store')
 }
 foreach ($evt in $retiredHookMarkers.Keys) {
     if (-not $hooks.PSObject.Properties[$evt]) { continue }
@@ -710,7 +1067,9 @@ foreach ($evt in $hookEntries.Keys) {
         $hookCmd = [ordered]@{ command = $entry.command; type = 'command' }
         if ($entry.timeout) { $hookCmd['timeout'] = $entry.timeout }
         if ($entry.async)   { $hookCmd['async']   = $true }
-        $newHookBlock = @{ hooks = @($hookCmd) }
+        # [ordered] (P4-1a): same reason as $hookEntries above - a plain hashtable put `matcher`
+        # before or after `hooks` at random, so consecutive runs differed byte for byte.
+        $newHookBlock = [ordered]@{ hooks = @($hookCmd) }
         if ($entry.matcher) { $newHookBlock['matcher'] = $entry.matcher }
         $newBlocks += $newHookBlock
     }
@@ -933,34 +1292,14 @@ Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 } # end brain-role gate (v1.16 §6.3)
 
 # ----------------------------------------------------------------------
-# 5c. Auto-memory compactor (5:00am) - registered on EVERY role, on purpose
+# 5c. Auto-memory compactor (5:00am) - RETIRED (P4-1a, 2026-09-16)
 # ----------------------------------------------------------------------
-# Deliberately OUTSIDE the brain-role gate above. The one-brain rule protects the SHARED mem0
-# corpus: only the brain may mutate it, because every box reads the same server. A workspace
-# auto-memory store is the opposite - it is LOCAL to the machine it lives on, so a replica that
-# never ran this job would simply let its own stores grow past the sync limit unmaintained.
-# The job's only shared-state action is a bounded mem0 write, which flows through the same
-# server API any box may call.
-#
-# 5:00am is offset from the 3:00 dream and 4:30 dedup so the shared Codex mutex is free.
-# WakeToRun + StartWhenAvailable: on a box that is powered off overnight this fires at the next
-# logon instead - which is exactly when sessions start, so the job's own liveness gate (skip
-# while a session in that workspace is active) and compare-and-swap are what make the catch-up
-# path safe. run-hidden.vbs keeps the firing windowless.
-$compactTaskName = 'ClaudeCode-MemoryCompactor-5am'
-Write-Host "==> [5c] Registering Task Scheduler entry: $compactTaskName"
-Unregister-ScheduledTask -TaskName $compactTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-$compactVbs = "C:\Users\$env:USERNAME\.claude\scripts\run-hidden.vbs"
-$compactAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
-    -Argument ("//nologo `"$compactVbs`" $psQuoted -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"C:\Users\$env:USERNAME\.claude\scripts\memory-compact.ps1`"")
-$compactTrigger = New-ScheduledTaskTrigger -Daily -At 5:00am
-# 2026-09-07: 20 -> 30 min, to match memory-compact.ps1's own computed lock window
-# (max(30, ceil(stores x per-call timeout / 60) + 5)). The script sized its lock for 30 minutes
-# of work while the scheduler killed it at 20; a lock window must never outlive its task.
-$compactSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
-$compactPrincipal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $compactTaskName -Action $compactAction -Trigger $compactTrigger -Settings $compactSettings -Principal $compactPrincipal -Description 'Daily 5am auto-memory compactor: keeps each workspace MEMORY.md index under the harness sync/injection caps. Archive-free by design - history is an out-of-tree local git repo; doctrine entries are never touched.' | Out-Null
-Write-Host "    Auto-memory compactor registered (next fire: 5:00 AM)"
+# The PowerShell nightly (registered here on every role from 2026-08-26 to 1.24.0) is replaced
+# by the store binary: `ams-store gate` keeps every index under the caps at write time, `sync`
+# carries the local commits to the hub, and the hub's nightly judge makes the SHORTEN/MIGRATE
+# decisions once for the fleet. Section 1d removes the task on every box whose hub path is
+# proven; nothing registers it any more. memory-compact.ps1 stays deployed until the Phase 5
+# gate deletes the PowerShell originals.
 
 Write-Host ""
 Write-Host "==> Windows config complete." -ForegroundColor Green

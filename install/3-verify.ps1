@@ -114,6 +114,60 @@ Check "EmbeddingGemma :11436" { try { $b = @{model='embeddinggemma'; input='titl
 Write-Host ""
 Write-Host "Windows-side files + config:"
 Check "Runtime scripts present" { @('memory-common.ps1','l1a-extract.ps1','dream-consolidate.ps1','stop-extract.ps1','mem0-mcp-shim.py','storage-cap-check.sh','sessionstart_bundle.py','precompact_capture.py','user-prompt-extract.ps1','user-prompt-lib.ps1','mem0-hook-daemon.ps1','mem0-hook-daemon-spawn.ps1','mem0-hook-client.cs','build-hook-client.ps1') | ForEach-Object { Test-Path "$env:USERPROFILE\.claude\scripts\$_" } | Where-Object { $_ -eq $false } | Measure-Object | ForEach-Object { $_.Count -eq 0 } } "Re-run 2-windows-config.ps1"
+# P4-1a (2026-09-16): the store binary. Its version token must equal the release tag VERSION
+# names (the release job stamps main.version with the tag), and its content hash must equal the
+# .sha256 sidecar the installer recorded from the release's SHA256SUMS. Both are read from the
+# deployed runtime, never from the repo.
+$amsExe = "$env:USERPROFILE\.claude\scripts\ams-store.exe"
+$amsTag = 'v' + (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'VERSION') -Raw).Trim()
+Check "ams-store.exe installed, --version = $amsTag" {
+    if (-not (Test-Path $amsExe)) { return $false }
+    $out = (& $amsExe --version 2>&1 | Out-String).Trim()
+    ($LASTEXITCODE -eq 0) -and ($out -match ('^ams-store\s+' + [regex]::Escape($amsTag) + '(\s|$)'))
+} "Re-run 2-windows-config.ps1 (it installs the release asset of $amsTag; -BinaryPath <exe> -BinarySums <SHA256SUMS> for an offline drop)"
+Check "ams-store.exe sha256 matches its .sha256 sidecar (recorded from the release's SHA256SUMS)" {
+    if (-not (Test-Path $amsExe) -or -not (Test-Path "$amsExe.sha256")) { return $false }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::OpenRead($amsExe)
+    try { $have = ([System.BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '') } finally { $fs.Dispose(); $sha.Dispose() }
+    $recorded = ((Get-Content -LiteralPath "$amsExe.sha256" -Raw) -split '\s+')[0]
+    [string]$have -ieq [string]$recorded
+} "The deployed binary does not match what the installer verified - re-run 2-windows-config.ps1"
+Check "PostToolUse gate is ams-store (exactly one stack entry; the PowerShell gate unregistered)" {
+    $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json
+    $cmds = @($s.hooks.PostToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+    $ours = @($cmds | Where-Object { $_ -like '*ams-store*' -or $_ -like '*memory-index-write-gate.ps1*' -or $_ -like '*memory-index-write-lint.sh*' })
+    ($ours.Count -eq 1) -and ($ours[0] -like '*ams-store.exe" gate*')
+} "Re-run 2-windows-config.ps1"
+# The sync hooks exist iff the receipt names a hub AND the installer proved the path (identity
+# key + host key); the compactor task is gone iff they exist. settings.json says what the
+# installer DECIDED, the receipt what was ASKED; the checks report the gap between the two.
+$amsHubHost = ''
+try { $amsHubHost = [string](Import-PowerShellDataFile $receiptFile).HubHost } catch {}
+if ($amsHubHost) {
+$amsSyncPattern = '*ams-store.exe" sync --once --hub-host ' + $amsHubHost + '*'
+Check "SessionStart (async) + SessionEnd run ams-store sync --once --hub-host $amsHubHost" {
+    $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json
+    $start = @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+    $end   = @($s.hooks.SessionEnd   | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+    ([bool]($start -like $amsSyncPattern)) -and ([bool]($end -like $amsSyncPattern))
+} "The receipt names a hub but the sync hooks are not registered: the installer REFUSED (identity key or known_hosts missing) - read its [1c] lines, fix, re-run"
+Check "SessionStart spawner registered and launches the resident watcher (sync --watch)" {
+    $s = Get-Content "$env:USERPROFILE\.claude\settings.json" -Raw | ConvertFrom-Json
+    $start = @($s.hooks.SessionStart | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+    ([bool]($start -like '*memory-maintenance-spawn.ps1*')) -and
+    ((Get-Content "$env:USERPROFILE\.claude\scripts\memory-maintenance-spawn.ps1" -Raw) -match 'sync --watch')
+} "Re-run 2-windows-config.ps1"
+Check "ams-store sync --once --hub-host $amsHubHost --json exits 0" {
+    $null = & $amsExe sync --once --hub-host $amsHubHost --json 2>&1
+    $LASTEXITCODE -eq 0
+} "sync failed: 4 = another pass holds the per-PC lock (retry), 5 = hub unreachable, 3 = refused (a remote that is not the hub) - read ~\.claude\state\automemory\sync-receipts.jsonl"
+Check "Nightly PowerShell compactor task retired (ams-store gate + sync + the hub judge replace it)" {
+    $null -eq (Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue)
+} "Re-run 2-windows-config.ps1 -HubHost $amsHubHost (it removes the task once the hub path is proven)"
+} else {
+    Write-Host "  NOTE: no store hub in the receipt (-HubHost): the gate runs locally only, no sync hooks, no hub judge; the legacy compactor task is $(if (Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue) { 'present' } else { 'absent' })" -ForegroundColor Yellow
+}
 # Scan ALL entries, not [0]: the idempotent installer preserves unrelated user hooks and
 # appends the stack's after them, and the host fires every registered entry regardless of
 # order — a [0]-only read false-MISSINGed the moment any other Stop hook existed. (Same
@@ -216,15 +270,9 @@ Check "Replica role: dream/dedup tasks absent (one-brain rule)" {
     ($null -eq $dream) -and ($null -eq $dedup)
 } "A read-replica must not run nightly canonical mutations - re-run 2-windows-config.ps1 -Role replica (it unregisters them)"
 }
-Check "Task Scheduler 5am auto-memory compactor" {
-    # Registered on every role (the stores are machine-local; see 2-windows-config.ps1 §5c).
-    # Assert the DEPLOYED launch path, not just the task name - the dedup precedent is a task
-    # that stayed green while its action executed an unmanaged dev worktree.
-    $t = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue
-    ($t -ne $null) -and
-    ($t.Actions[0].Arguments -match '\.claude\\scripts\\memory-compact\.ps1') -and
-    ($t.Actions[0].Arguments -notmatch '[/\\](Dev|repos|worktrees)[/\\]')
-} "Re-run 2-windows-config.ps1"
+# P4-1a (2026-09-16): the 5am PowerShell compactor task is RETIRED on every box whose hub path
+# is proven; its absence is asserted with the ams-store rows above (and its presence is only
+# noted, never demanded, on a box with no hub).
 Check "canonical-key exists (DPAPI blob or plaintext mode 600)" {
     # v0.20 Phase D (M9): post-Phase-H a DPAPI box has ONLY the .dpapi blob —
     # the old plaintext-only check false-failed there and its remediation

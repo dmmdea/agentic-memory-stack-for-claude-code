@@ -433,37 +433,31 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $replicaBranch | Should -Match 'Unregister-ScheduledTask' -Because 'a replica must remove tasks a pre-v1.16 install registered'
     }
 
-    It 'the auto-memory compactor is registered OUTSIDE the brain gate (every role) and the other two stay inside' {
-        # The one-brain rule protects the SHARED corpus. A workspace auto-memory store is
-        # machine-LOCAL, so gating its maintainer on the brain role would leave every replica's
-        # stores to grow past the harness sync limit unmaintained. This asserts the placement
-        # both ways, so a future edit cannot quietly move it inside the gate (or move the
-        # corpus-mutating tasks out of it).
+    It 'the auto-memory compactor task is RETIRED: unregistered behind the proven hub path, after the binary and before hooks, never registered (P4-1a)' {
+        # 2026-09-16 (register P4-1): the store binary's gate, sync and the hub judge replace the
+        # PowerShell nightly. Placement is asserted both ways: the removal must follow the binary
+        # install (a store is never left without a gate) and precede hook registration (the
+        # watcher spawner is registered after the last PowerShell writer is gone), and it must sit
+        # behind $amsSyncReady so a box with no proven hub keeps its legacy nightly.
         $src = Get-Content $installerPath -Raw
-        $gateIdx = $src.IndexOf("if (`$Role -ne 'brain')")
-        $endIdx  = $src.IndexOf('} # end brain-role gate')
-        $compact = $src.IndexOf('Register-ScheduledTask -TaskName $compactTaskName')
-        $compact | Should -BeGreaterThan 0 -Because 'the compactor task must be registered'
-        $compact | Should -BeGreaterThan $endIdx -Because 'workspace stores are machine-local: every role maintains its own'
-        $src.IndexOf('Register-ScheduledTask -TaskName $dedupTaskName') | Should -BeLessThan $endIdx
+        $src | Should -Not -Match '(?<!Un)Register-ScheduledTask -TaskName \$compactTaskName' -Because 'nothing registers the PowerShell nightly any more (the lookbehind keeps the Unregister call out of the match)'
+        $un = $src.IndexOf('Unregister-ScheduledTask -TaskName $compactTaskName -Confirm:$false')
+        $un | Should -BeGreaterThan 0 -Because 'the installer must remove the task it used to register'
+        $un | Should -BeGreaterThan $src.IndexOf('Install-AmsStoreBinary -Tag') -Because 'the gate binary must be installed before the nightly goes'
+        $un | Should -BeLessThan $src.IndexOf('Registering hooks in settings.json') -Because 'the watcher spawner is registered only after the nightly is gone'
+        $src.LastIndexOf('if ($amsSyncReady) {', $un) | Should -BeGreaterThan $src.IndexOf('# 1d. Retire the nightly compactor') -Because 'a box with no proven hub path keeps its legacy nightly'
+        $src.IndexOf('Register-ScheduledTask -TaskName $dedupTaskName') | Should -BeLessThan $src.IndexOf('} # end brain-role gate')
     }
 
-    It 'the compactor task action launches the DEPLOYED script, never a repo or worktree path' {
-        # The dedup precedent: a destructive nightly task executed an unmanaged dev worktree for
-        # weeks while a substring check stayed green.
+    It 'the write-time index gate is the store binary (ams-store gate) on PostToolUse, registered over both legacy markers' {
+        # 2026-09-03: the bash advisory was ignored live; 2026-09-16 (P4-1a): the Go gate replaces
+        # the PowerShell gate in place - both legacy markers stay so the previous registrations are
+        # REPLACED, never duplicated, and the PowerShell gate is registered nowhere.
         $src = Get-Content $installerPath -Raw
-        $line = ($src -split "`n" | Where-Object { $_ -match '^\$compactVbs\s*=|^\$compactAction\s*=|^\s+-Argument .*memory-compact\.ps1' }) -join "`n"
-        $line | Should -Match 'run-hidden\.vbs' -Because 'a 5am firing must never draw a console on the desktop'
-        $line | Should -Match '\.claude\\scripts\\memory-compact\.ps1' -Because 'the action must execute the deployed copy'
-        $line | Should -Not -Match '\$RepoRoot|worktrees' -Because 'a nightly job must never run whatever a dev checkout happens to contain'
-    }
-
-    It 'the write-time index gate is the Windows-native memory-index-write-gate.ps1 on PostToolUse' {
-        # 2026-09-03: the bash advisory was ignored live; the gate normalizes at the sync limit.
-        $src = Get-Content $installerPath -Raw
-        $src.Contains("`$psIndexGate = New-HookCommand 'memory-index-write-gate.ps1'") | Should -BeTrue -Because 'the hook command must be built from the deployed gate script'
-        $src | Should -Match "'PostToolUse'\s*=\s*@\(@\{ markers = @\('memory-index-write-lint\.sh', 'memory-index-write-gate\.ps1'\)" -Because 'the old marker must remain so the previous bash registration is REPLACED, not duplicated'
+        $src.Contains("`$amsGateCmd = (New-HookExeCommand 'ams-store.exe') + ' gate'") | Should -BeTrue -Because 'the hook command is the quoted forward-slash exe path plus the verb'
+        $src | Should -Match "'PostToolUse'\s*=\s*@\(@\{ markers = @\('memory-index-write-lint\.sh', 'memory-index-write-gate\.ps1', 'ams-store'\); command = \`$amsGateCmd" -Because 'the old markers must remain so the previous registrations are REPLACED, not duplicated'
         $src | Should -Match "matcher = 'Write\|Edit'" -Because 'the hook must be matcher-scoped to write tools'
+        $src | Should -Not -Match 'command = \$psIndexGate' -Because 'the PowerShell gate must not be registered anywhere any more'
     }
 
     It 'deploys the write-time lint script and the three auto-memory scripts' {
@@ -518,7 +512,7 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $src = Get-Content $installerPath -Raw
         $src | Should -Not -Match 'New-ScheduledTaskPrincipal[^\n]*USERDOMAIN' -Because 'a DOMAIN\user principal does not resolve on a workgroup box'
         $src | Should -Match '\$taskUserId\s*=\s*\[System\.Security\.Principal\.WindowsIdentity\]::GetCurrent\(\)\.Name' -Because 'the principal must come from the current identity'
-        ([regex]::Matches($src, 'New-ScheduledTaskPrincipal -UserId \$taskUserId')).Count | Should -Be 3 -Because 'dream, dedup and compactor registrations all use the shared principal'
+        ([regex]::Matches($src, 'New-ScheduledTaskPrincipal -UserId \$taskUserId')).Count | Should -Be 2 -Because 'the dream and dedup registrations use the shared principal (the compactor registration is retired, P4-1a)'
         # v1.20.3 defined $taskUserId INSIDE the brain branch, so a replica registered the
         # compactor (all roles, after the gate) with a null UserId. The definition must precede
         # the gate so every role sees it.
@@ -557,6 +551,107 @@ Describe 'installer is resumable / verify-as-you-go (v1.0 Phase 7B)' {
         $src = Get-Content $wslInstaller -Raw
         $src | Should -Match 'if \[ ! -d "\$MEM0_DIR/\.venv" \]'
         $src | Should -Match 'if \[ ! -x "\$QDRANT_DIR/qdrant" \]'
+    }
+}
+
+Describe 'ams-store into the Windows install (register P4-1a, 2026-09-16)' {
+    BeforeAll {
+        $script:ciPath     = Join-Path $script:repoRoot '.github\workflows\ci.yml'
+        $script:prereqPath = Join-Path $script:repoRoot 'install\0-prereqs.ps1'
+        $script:src  = Get-Content $script:installerPath -Raw
+        $script:code = ($script:src -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        # the release job is the LAST job in ci.yml; everything from its key to EOF is its text
+        $ci = Get-Content $script:ciPath -Raw
+        $ci.IndexOf("`n  release-assets:") | Should -BeGreaterThan 0 -Because 'the release job must exist in ci.yml'
+        $script:releaseJob = $ci.Substring($ci.IndexOf("`n  release-assets:"))
+        $script:ciHead     = $ci.Substring(0, $ci.IndexOf("`n  release-assets:"))
+    }
+
+    It 'the release job runs only for a pushed v* tag, with contents: write, on ubuntu-latest, and every other job skips tags' {
+        $script:ciHead | Should -Match "(?m)^\s+tags:\s*\['v\*'\]" -Because 'the release is tag-triggered'
+        $script:releaseJob | Should -Match "if: startsWith\(github\.ref, 'refs/tags/v'\)"
+        $script:releaseJob | Should -Match '(?m)^\s+permissions:\s*\r?\n\s+contents:\s*write' -Because 'GITHUB_TOKEN needs contents: write to create the release'
+        $script:releaseJob | Should -Match 'runs-on: ubuntu-latest'
+        $script:releaseJob | Should -Not -Match 'windows-latest' -Because 'Windows minutes bill 2x; the Windows binary is a cross-compile'
+        # every pre-existing job carries the tag guard, so a release tag re-runs none of the matrix
+        $jobs = @([regex]::Matches($script:ciHead, '(?m)^  ([a-z0-9-]+):\s*$') | ForEach-Object { $_.Groups[1].Value })
+        $jobs.Count | Should -BeGreaterOrEqual 9
+        foreach ($j in $jobs) {
+            $block = $script:ciHead.Substring($script:ciHead.IndexOf("`n  ${j}:"))
+            $block.Substring(0, [Math]::Min(400, $block.Length)) | Should -Match "if: github\.ref_type != 'tag'" -Because "job $j must not re-run on a release tag"
+        }
+    }
+
+    It 'the release job builds exactly the asset the installer downloads, plus SHA256SUMS, with --version stamped from the tag' {
+        $script:code | Should -Match "\`$amsStoreAsset\s*=\s*'ams-store-windows-amd64\.exe'"
+        $script:releaseJob | Should -Match 'GOOS=windows GOARCH=amd64 go build .* -o dist/ams-store-windows-amd64\.exe'
+        $script:releaseJob | Should -Match 'GOOS=linux\s+GOARCH=amd64 go build .* -o dist/ams-store-linux-amd64'
+        $script:releaseJob | Should -Match 'sha256sum .* > SHA256SUMS'
+        $script:releaseJob | Should -Match '-X main\.version=\$\{GITHUB_REF_NAME\}' -Because '--version must print the tag the installer verifies against'
+        $script:releaseJob | Should -Match 'tr -d .* < \.\./VERSION' -Because 'a tag that disagrees with VERSION is refused before anything is built'
+        $script:releaseJob | Should -Match 'gh release create "\$\{GITHUB_REF_NAME\}"'
+        $script:releaseJob | Should -Match '--verify-tag'
+        $script:releaseJob | Should -Match 'dist/SHA256SUMS'
+        ([regex]::Matches($script:releaseJob, 'dist/ams-store-windows-amd64\.exe')).Count | Should -BeGreaterOrEqual 2 -Because 'built once, attached once'
+    }
+
+    It 'the installer verifies the asset against SHA256SUMS and aborts BEFORE the receipt and BEFORE hook registration' {
+        $script:code | Should -Match 'releases/download/\$Tag'
+        $script:code | Should -Match 'Read-AmsSumsHash \$sums \$Asset'
+        $script:code | Should -Match 'checksum mismatch'
+        $fatal = $script:src.IndexOf('FATAL: ams-store.exe not installed')
+        $fatal | Should -BeGreaterThan 0
+        $fatal | Should -BeLessThan $script:src.IndexOf('$receipt = @"') -Because 'a failed install must leave the previous receipt intact'
+        $fatal | Should -BeLessThan $script:src.IndexOf('Registering hooks in settings.json') -Because 'settings.json must never point at a missing exe'
+        $script:code | Should -Match '\[string\]\$BinaryPath' -Because 'an offline drop is the sanctioned alternative to the download'
+        $script:code | Should -Match '\[string\]\$BinarySums' -Because 'a drop is verified against the SHA256SUMS it shipped with'
+    }
+
+    It 'the sync hooks (SessionStart async, SessionEnd) exist only behind the proven hub path and are stripped otherwise' {
+        $script:src.Contains("`$amsSyncCmd = (New-HookExeCommand 'ams-store.exe') + ' sync --once --hub-host ' + `$HubHost") | Should -BeTrue
+        $from = $script:src.IndexOf('if ($amsSyncReady) {', $script:src.IndexOf('$retiredHookMarkers = @{'))
+        $from | Should -BeGreaterThan 0
+        $block = $script:src.Substring($from)
+        $block = $block.Substring(0, $block.IndexOf('foreach ($evt in $retiredHookMarkers.Keys)'))
+        $block | Should -Match "\`$hookEntries\['SessionStart'\] \+= @\{ markers = @\('ams-store'\); command = \`$amsSyncCmd; async = \`$true"
+        $block | Should -Match "\`$hookEntries\['SessionEnd'\]\s*=\s*@\(@\{ markers = @\('ams-store'\); command = \`$amsSyncCmd"
+        $block | Should -Match "\`$retiredHookMarkers\['SessionStart'\] = @\('ams-store'\)"
+        $block | Should -Match "\`$retiredHookMarkers\['SessionEnd'\]\s*=\s*@\('ams-store'\)"
+    }
+
+    It 'the SessionStart maintenance spawner is registered (it launches the resident watcher) and reads the hub from the receipt' {
+        $script:src | Should -Match "markers = @\('memory-maintenance-spawn\.ps1'\);\s*command = \`$psMaintSpawn; async = \`$true"
+        $spawn = ((Get-Content (Join-Path $script:winDir 'memory-maintenance-spawn.ps1') -Raw) -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+        $spawn | Should -Match "'sync --watch --hub-host '"
+        $spawn | Should -Match 'Import-PowerShellDataFile'
+        $spawn | Should -Not -Match 'memory-compact\.ps1' -Because 'the compactor catch-up spawn is retired with the nightly'
+    }
+
+    It 'the receipt records the hub and the installed binary, and inherits -HubHost on a re-run' {
+        foreach ($f in "HubHost     = '\`$eHubHost'", "AmsStoreTag    = '\`$eAmsTag'", "AmsStoreSha256 = '\`$eAmsSha'", "AmsStoreSource = '\`$eAmsSource'") {
+            $script:src | Should -Match $f
+        }
+        $script:code | Should -Match '\(Import-PowerShellDataFile \$receiptPath\)\.HubHost'
+    }
+
+    It 'the hub transport is written by the installer: ssh Match block, seeded known_hosts, main branch, one hub remote' {
+        $script:code | Should -Match 'Set-AmsHubSshConfig -ConfigPath'
+        $script:code | Should -Match 'Initialize-AmsKnownHosts -HubHost'
+        $script:code | Should -Match 'Initialize-AmsHistoryRemote -GitDir'
+        $script:code | Should -Match 'REFUSED: sync hooks and the watcher are NOT registered' -Because 'a silent strict-checking failure at SessionStart must be refused loudly here'
+        $script:code | Should -Match "StateKnownHosts \(Join-Path \`$amsStateRoot 'known_hosts'\)" -Because 'the binary pins UserKnownHostsFile=<state>/known_hosts'
+    }
+
+    It '0-prereqs parses git >= 2.38 and 3-verify checks --version, the sidecar, the hooks, the sync exit code and the retired task' {
+        $pre = Get-Content $script:prereqPath -Raw
+        $pre | Should -Match 'Test-GitVersionAtLeast -VersionText .* -Major 2 -Minor 38'
+        $v = Get-Content $script:verifierPath -Raw
+        $v | Should -Match "'\^ams-store\\s\+' \+ \[regex\]::Escape\(\`$amsTag\)"
+        $v | Should -Match '\$amsExe\.sha256'
+        $v | Should -Match "ams-store\.exe`" gate"
+        $v | Should -Match 'sync --once --hub-host \$amsHubHost --json'
+        $v | Should -Match 'sync --watch'
+        $v | Should -Match "\`$null -eq \(Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am'"
     }
 }
 

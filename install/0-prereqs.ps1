@@ -70,7 +70,19 @@ Check "Codex authenticated (ChatGPT subscription)" {
     $auth.auth_mode -eq 'chatgpt' -and $auth.tokens -and $auth.tokens.access_token
 } "Run: codex login   (pick 'Sign in with ChatGPT')"
 
-Check "git CLI" { Get-Command git -ErrorAction SilentlyContinue } "Install Git for Windows: winget install Git.Git"
+# P4-1a (2026-09-16): the store binary merges with `git merge-tree --write-tree`, which needs
+# git >= 2.38 (ams-store/internal/gitx pins the same floor at runtime). Parse the version; a git
+# that is merely present is not enough.
+function Test-GitVersionAtLeast {
+    param([string]$VersionText, [int]$Major, [int]$Minor)
+    $m = [regex]::Match([string]$VersionText, '(\d+)\.(\d+)')
+    if (-not $m.Success) { return $false }
+    return ([version]::new([int]$m.Groups[1].Value, [int]$m.Groups[2].Value)) -ge ([version]::new($Major, $Minor))
+}
+Check "git >= 2.38 (ams-store merge-tree --write-tree)" {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $false }
+    Test-GitVersionAtLeast -VersionText ((git --version 2>&1 | Out-String)) -Major 2 -Minor 38
+} "Install or upgrade Git for Windows to 2.38+: winget install --id Git.Git"
 
 Write-Host ""
 Write-Host "Checking WSL-side prerequisites..."
