@@ -31,9 +31,13 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # transcript (the watermark case) still needs a warm embedder.
 # Authority precedence: ~\.mem0\authority-url (first non-empty line) > $env:MEM0_URL > the
 # daemon's own default (loopback :18791 - on a replica that is a swallowed connection-refused).
+# Host kind (P4-3): the same two lines the other spawner carries, for the same reason.
+$IsUnixHost = ($PSVersionTable.Platform -eq 'Unix')
+$HomeDirPath = if ($IsUnixHost) { $HOME } else { $env:USERPROFILE }
+
 $prewarmUrl = ''
 try {
-    $authFile = Join-Path $env:USERPROFILE '.mem0\authority-url'
+    $authFile = Join-Path $HomeDirPath (Join-Path '.mem0' 'authority-url')
     if (Test-Path -LiteralPath $authFile) {
         foreach ($line in @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)) {
             if ($line -and $line.Trim()) { $prewarmUrl = $line.Trim(); break }
@@ -47,9 +51,15 @@ if ($prewarmUrl -notmatch '^https?://[A-Za-z0-9._:\[\]/-]+$') { $prewarmUrl = ''
 if ($prewarmUrl) {
     $prewarmCmd = "try { Invoke-RestMethod '" + $prewarmUrl.TrimEnd('/') + "/health/embedder' -TimeoutSec 20 | Out-Null } catch {}"
     try {
-        Start-Process -FilePath 'pwsh.exe' `
-            -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command',"`"$prewarmCmd`"" `
-            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        if ($IsUnixHost) {
+            Start-Process -FilePath 'pwsh' `
+                -ArgumentList '-NoProfile','-Command',$prewarmCmd `
+                -ErrorAction Stop | Out-Null
+        } else {
+            Start-Process -FilePath 'pwsh.exe' `
+                -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command',"`"$prewarmCmd`"" `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        }
     } catch {
         try {
             Start-Process -FilePath 'powershell.exe' `
@@ -57,7 +67,7 @@ if ($prewarmUrl) {
                 -WindowStyle Hidden -ErrorAction Stop | Out-Null
         } catch {
             try {
-                $prewarmLogDir = Join-Path $env:USERPROFILE '.claude\logs'
+                $prewarmLogDir = Join-Path $HomeDirPath (Join-Path '.claude' 'logs')
                 if (-not (Test-Path $prewarmLogDir)) { New-Item -ItemType Directory -Path $prewarmLogDir -Force | Out-Null }
                 Add-Content -Path (Join-Path $prewarmLogDir 'sessionstart-capture.log') -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' embedder pre-warm spawn failed: ' + $_.Exception.Message)
             } catch {}
@@ -81,18 +91,18 @@ try {
 } catch {}
 
 # Find the most-recently-modified transcript that is NOT the current session (2-level glob, no -Recurse).
-$projects = Join-Path $env:USERPROFILE '.claude\projects'
+$projects = Join-Path $HomeDirPath (Join-Path '.claude' 'projects')
 if (-not (Test-Path $projects)) { exit 0 }
 $prior = $null
 try {
-    $prior = Get-ChildItem -Path (Join-Path $projects '*\*.jsonl') -File -ErrorAction SilentlyContinue |
+    $prior = Get-ChildItem -Path (Join-Path $projects (Join-Path '*' '*.jsonl')) -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $curTrans -and $_.BaseName -ne $curSid -and $_.Length -gt 0 } |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
 } catch {}
 if (-not $prior) { exit 0 }
 
 # Watermark: skip if this exact transcript@mtime was already captured by a previous SessionStart.
-$stateDir = Join-Path $env:USERPROFILE '.claude\state'
+$stateDir = Join-Path $HomeDirPath (Join-Path '.claude' 'state')
 $wm = Join-Path $stateDir 'last-sessionstart-capture'
 $sig = $prior.FullName + '|' + $prior.LastWriteTimeUtc.Ticks
 try {
@@ -106,9 +116,15 @@ try {
 # Spawn the extractor DETACHED (pwsh.exe first; powershell.exe 5.1 fallback) - never block startup.
 $spawned = $false
 try {
-    Start-Process -FilePath 'pwsh.exe' `
-        -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$($prior.FullName)`"",'-EventName','SessionStart' `
-        -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    if ($IsUnixHost) {
+        Start-Process -FilePath 'pwsh' `
+            -ArgumentList '-NoProfile','-File',$Worker,'-TranscriptPath',$prior.FullName,'-EventName','SessionStart' `
+            -ErrorAction Stop | Out-Null
+    } else {
+        Start-Process -FilePath 'pwsh.exe' `
+            -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$($prior.FullName)`"",'-EventName','SessionStart' `
+            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    }
     $spawned = $true
 } catch {
     try {

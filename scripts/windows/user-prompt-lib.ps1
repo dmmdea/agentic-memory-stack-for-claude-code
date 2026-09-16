@@ -11,6 +11,16 @@
 # running the hook pipeline. The production hook dot-sources it from $PSScriptRoot;
 # deploy BOTH files to C:\Users\__WIN_USER__\.claude\scripts\ together.
 
+function Get-AmsHomeDir {
+    # RESOLVED PER CALL, never cached at load: the tests and the install rehearsals sandbox a box
+    # by setting $env:USERPROFILE (or $HOME) AFTER dot-sourcing, and a cached value would read the
+    # operator's real profile instead. Windows PowerShell 5.1 has no $PSVersionTable.Platform, so
+    # its absence reads as Windows. KEEP IN SYNC: this function lives in memory-common.ps1 and
+    # user-prompt-lib.ps1.
+    if ($PSVersionTable.Platform -eq 'Unix') { return $HOME }
+    return $env:USERPROFILE
+}
+
 function Get-Mem0WslDistro {
     <#
     .SYNOPSIS
@@ -1155,7 +1165,7 @@ function Get-Mem0AuthorityUrl {
     $pattern = '^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/-]*)?$'
     $candidates = @()
     try {
-        $f = Join-Path $env:USERPROFILE '.mem0\authority-url'
+        $f = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'authority-url')
         if (Test-Path -LiteralPath $f) {
             foreach ($line in @([System.IO.File]::ReadAllLines($f))) {
                 $t = "$line".Trim()
@@ -1173,7 +1183,7 @@ function Get-Mem0AuthorityUrl {
 function Get-Mem0Role {
     # ~\.mem0\role (written by the installer beside authority-url) > receipt Role > brain.
     try {
-        $f = Join-Path $env:USERPROFILE '.mem0\role'
+        $f = Join-Path (Get-AmsHomeDir) (Join-Path '.mem0' 'role')
         if (Test-Path -LiteralPath $f) {
             $r = ([System.IO.File]::ReadAllText($f)).Trim().ToLowerInvariant()
             if ($r) { return $r }

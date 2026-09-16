@@ -33,7 +33,7 @@ try {
         # the corpus must be byte-faithful to detect wire-format drift. Contract
         # version lives in the FILENAME (...-contract<ver>.json), not the payload.
         try {
-            $fixtureDir = Join-Path $env:USERPROFILE '.claude\state\hook-fixtures'
+            $fixtureDir = Join-Path $HomeDirPath (Join-Path '.claude' (Join-Path 'state' 'hook-fixtures'))
             if (-not (Test-Path $fixtureDir)) { New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null }
             if ((Get-Random -Minimum 0 -Maximum 10) -eq 0) {
                 # v0.18 LOW-2: sub-second timestamp avoids 1-second filename collisions
@@ -46,6 +46,13 @@ try {
     }
 } catch { }
 
+# Host kind (P4-3). A spawner must stay tiny - it runs on every Stop and PreCompact - so it
+# carries these two lines rather than dot-sourcing the shared library. PS 5.1 has no
+# $PSVersionTable.Platform, so its absence reads as Windows.
+$IsUnixHost = ($PSVersionTable.Platform -eq 'Unix')
+$HomeDirPath = if ($IsUnixHost) { $HOME } else { $env:USERPROFILE }
+$TempDirPath = if ($IsUnixHost) { '/tmp' } else { $env:TEMP }
+
 # Fallback: env vars (never populated by Claude Code but kept for manual/test invocations)
 if (-not $trans) { $trans = $env:CLAUDE_TRANSCRIPT_PATH }
 if (-not $evt)   { $evt   = $env:CLAUDE_HOOK_EVENT }
@@ -53,25 +60,35 @@ if (-not $evt)   { $evt   = 'Stop' }
 
 # For PreCompact, snapshot the transcript before it gets mutated by compaction
 if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
-    $snap = Join-Path $env:TEMP "precompact-snap-$PID.jsonl"
+    $snap = Join-Path $TempDirPath "precompact-snap-$PID.jsonl"
     Copy-Item -Path $trans -Destination $snap -ErrorAction SilentlyContinue
     if (Test-Path $snap) { $trans = $snap }
 }
 
-# Spawn detached, hidden - claude.cmd auth works in this context (verified)
-try {
-    Start-Process -FilePath 'pwsh.exe' `
-        -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt `
-        -WindowStyle Hidden `
-        -ErrorAction SilentlyContinue | Out-Null
-} catch {
-    # If pwsh.exe missing, fall back to powershell.exe (Windows PS 5.1)
+# Spawn detached - claude.cmd auth works in this context on Windows (verified). On Unix there is
+# no window to hide and no execution policy, and quoting the path would pass literal quote
+# characters to the worker, so the argument list differs by platform.
+if ($IsUnixHost) {
     try {
-        Start-Process -FilePath 'powershell.exe' `
+        Start-Process -FilePath 'pwsh' `
+            -ArgumentList '-NoProfile','-File',$Worker,'-TranscriptPath',$trans,'-EventName',$evt `
+            -ErrorAction SilentlyContinue | Out-Null
+    } catch { }
+} else {
+    try {
+        Start-Process -FilePath 'pwsh.exe' `
             -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt `
             -WindowStyle Hidden `
             -ErrorAction SilentlyContinue | Out-Null
-    } catch { }
+    } catch {
+        # If pwsh.exe missing, fall back to powershell.exe (Windows PS 5.1)
+        try {
+            Start-Process -FilePath 'powershell.exe' `
+                -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt `
+                -WindowStyle Hidden `
+                -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
+    }
 }
 
 exit 0
