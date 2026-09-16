@@ -4,7 +4,30 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## 1.26.1 — the store-judge phase finds the checkout through stack.env (register P4-1b follow-up)
+## 1.26.1 — two reasons the nightly judge would never have written a plan (register P4-1b follow-up)
+
+Both found by reading the DEPLOYED authority minutes after 1.26.0 installed, not by any test, and both
+silent: the phase would have logged a skip and the applier would have run the deterministic path
+forever, nightly, with every test green.
+
+**1. The producer could not see the checkout.** The plan is written by `ams-step-dream.service`, whose
+unit carries the credentials and the judge transport but **not** the store variables — those were added
+to `ams-step-store-judge.service`, the applier. `systemctl --user show ams-step-dream.service -p
+Environment | grep -i ams` returned nothing. `_ams_checkout_root()` and `_ams_store_bin()` now read the
+environment first and then `~/.mem0/stack.env`, the precedence every other install value uses
+(`ams_env.eval_root`), and the installer records `MEM0_AMS_STORE_BIN` beside `MEM0_AMS_CHECKOUT`.
+
+**2. The schema it validates against was not deployed.** `validate_plan` refuses to write a plan it
+cannot validate, and the schema lives under `docs/` — it is the published contract, generated from the
+Go types — so the installer's `scripts/wsl/*` glob never carried it. On the authority:
+`validate_plan says: 'the judge-plan schema is not deployed beside this script'`. `linux-authority.sh`
+now copies `docs/schemas/judge-plan.schema.json` into the scripts directory beside the consolidator.
+
+Each fix has a test that fails against the shipped code: one drives the phase with **nothing** in the
+environment and only the installer's `stack.env` on disk; the other asserts the copy and that the
+generated schema is checked in at all.
+
+
 
 The plan is written by `ams-step-dream.service`, whose unit carries the credentials and the judge
 transport but **not** the store variables — those were added to `ams-step-store-judge.service`, the

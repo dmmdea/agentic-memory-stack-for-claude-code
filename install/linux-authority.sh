@@ -398,6 +398,13 @@ if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; depl
     done
     chmod +x "$SCRIPTS_DIR"/*.sh
     cp "$REPO_ROOT/scripts/wsl/l10-audit.py" "$MEM0_DIR/l10-audit.py"
+    # The store-judge phase validates the nightly plan against this schema BEFORE writing it and
+    # refuses to write when the schema is absent - so the schema must travel WITH the scripts.
+    # It lives under docs/ rather than scripts/wsl/ (it is the published contract, generated from
+    # the Go types), so the glob above does not carry it: measured on the authority after the
+    # first install, `validate_plan` returned "the judge-plan schema is not deployed beside this
+    # script" and no plan would ever have been written.
+    cp "$REPO_ROOT/docs/schemas/judge-plan.schema.json" "$SCRIPTS_DIR/judge-plan.schema.json"
     systemctl --user daemon-reload
     # One chain (spec §4): any per-job timer a previous install enabled is turned off, never deleted.
     for t in decay-scan stack-backup goals-stale-sweep contradiction-sweep retrieval-pairs episodic-reconcile goal-recurrence-promote egemma-rollback-prune offline-watcher; do
