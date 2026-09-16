@@ -385,6 +385,34 @@ def _plan(home):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
+def test_store_judge_reads_the_checkout_from_stack_env_when_the_unit_does_not_set_it(home, monkeypatch):
+    """The plan is written by ams-step-dream.service, whose unit carries the credentials and
+    the transport but NOT the store variables. An env-only lookup skipped the phase every
+    night and no plan was ever written - the applier would have run the deterministic path
+    forever with every test green. stack.env is the receipt every other install value is read
+    from, so the phase reads it too."""
+    m = _mod()
+    root = _checkout(home, {"ws-a": ["a.md"]})
+    binary = home / "bin" / "ams-store"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    # exactly what the installer writes, and NOTHING in the environment
+    (home / ".mem0").mkdir(exist_ok=True)
+    (home / ".mem0" / "stack.env").write_text(
+        f"MEM0_ROLE=brain\nMEM0_AMS_CHECKOUT={root}\nMEM0_AMS_STORE_BIN={binary}\n", encoding="utf-8")
+    monkeypatch.delenv("AMS_STORE_CHECKOUT", raising=False)
+    monkeypatch.delenv("AMS_STORE_BIN", raising=False)
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, "ok"))
+    monkeypatch.setattr(m.Dream, "_store_candidates",
+                        lambda self, checkout, ws: {"workspace": ws, "shorten": [], "migrate": []})
+    assert m._ams_checkout_root() == str(root)
+    assert m._ams_store_bin() == str(binary)
+    _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]"))
+    plan = _plan(home)
+    assert plan is not None, "the phase must find the checkout through stack.env"
+    assert plan["stores"][0]["workspace"] == "ws-a"
+
+
 def test_store_judge_is_skipped_when_the_box_holds_no_checkout(home, monkeypatch):
     """Every PC runs this script; only the hub has a checkout. No checkout, no plan, no call."""
     m = _mod()

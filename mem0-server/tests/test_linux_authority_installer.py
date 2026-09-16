@@ -383,6 +383,18 @@ def test_the_checkout_is_hub_role_seeded_and_single_remote():
     assert "init -q -b main" in sh
 
 
+def test_the_plan_schema_travels_with_the_deployed_scripts():
+    """The store-judge phase validates the plan against this schema before writing it and
+    refuses to write without it. The schema lives under docs/ (it is the published contract,
+    generated from the Go types), so the scripts/wsl/* glob does not carry it - measured on the
+    authority after the first install: validate_plan returned "the judge-plan schema is not
+    deployed beside this script" and no plan would ever have been written."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert 'cp "$REPO_ROOT/docs/schemas/judge-plan.schema.json" "$SCRIPTS_DIR/judge-plan.schema.json"' in sh
+    assert (REPO_ROOT / "docs" / "schemas" / "judge-plan.schema.json").is_file(), \
+        "the generated schema must be checked in, or the installer copies nothing"
+
+
 def test_stack_env_records_the_checkout_and_the_hub():
     sh = SCRIPT.read_text(encoding="utf-8")
     assert "printf 'MEM0_AMS_CHECKOUT=%s\\n' \"$AMS_CHECKOUT\" >> \"$MEM0_DIR/stack.env\"" in sh
