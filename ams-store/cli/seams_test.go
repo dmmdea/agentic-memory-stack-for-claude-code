@@ -371,3 +371,67 @@ func mustJSON(t *testing.T, s string) string {
 	}
 	return string(b)
 }
+
+// A fresh checkout - the hub's own checkout on the authority, or a PC whose history repo
+// was just initialized against the hub - has no store and no index when its first sync
+// runs. The merge materializes every store's fact files, and the re-derive after the
+// merge must CREATE each index from them. Seen RED on 2026-09-16 on a temp-root
+// rehearsal of the hub checkout: five stores materialized, then "merge failed: read
+// index .../MEMORY.md: The system cannot find the file specified", exit 5, no index.
+func TestSeam_FreshCheckoutMaterializesAndDerivesEveryStore(t *testing.T) {
+	testutil.RequireGit(t)
+	hub := filepath.Join(t.TempDir(), "hub.git")
+	out, err := exec.Command("git", "init", "-q", "--bare", "-b", "main", hub).CombinedOutput()
+	if err != nil {
+		t.Fatalf("init hub: %v\n%s", err, out)
+	}
+	syncArgs := func(sb *testutil.Sandbox) []string {
+		return []string{"sync", "--once", "--allow-local-path", "--json",
+			"--projects-root", sb.ProjectsRoot, "--state-root", sb.StateRoot,
+			"--now", "2026-09-16T06:00:00Z", "--machine-id", filepath.Base(sb.Root)}
+	}
+
+	// PC B holds two stores and pushes them.
+	b := testutil.NewSandbox(t)
+	b.AddStore("ws1", []string{"# Memory Index", "", "- [One](one.md) " + emDash + " the first hook"},
+		map[string]string{"one.md": testutil.FactFile("one", "the first hook", "project", "body one")})
+	b.AddStore("ws2", []string{"# Memory Index", "", "- [Two](two.md) " + emDash + " the second hook"},
+		map[string]string{"two.md": testutil.FactFile("two", "the second hook", "project", "body two")})
+	gitAt(t, filepath.Join(b.StateRoot, "history.git"), b.ProjectsRoot, "init", "-q", "-b", "main")
+	gitAt(t, filepath.Join(b.StateRoot, "history.git"), b.ProjectsRoot, "remote", "add", "hub", hub)
+	if code, _, stderr := run(t, syncArgs(b)...); code != cli.ExitOK {
+		t.Fatalf("B sync exit = %d: %s", code, stderr)
+	}
+
+	// PC C is the fresh checkout: an initialized repo pointing at the hub, nothing else.
+	c := testutil.NewSandbox(t)
+	gitAt(t, filepath.Join(c.StateRoot, "history.git"), c.ProjectsRoot, "init", "-q", "-b", "main")
+	gitAt(t, filepath.Join(c.StateRoot, "history.git"), c.ProjectsRoot, "remote", "add", "hub", hub)
+	code, stdout, stderr := run(t, syncArgs(c)...)
+	if code != cli.ExitOK {
+		t.Fatalf("fresh checkout sync exit = %d: %s\n%s", code, stderr, stdout)
+	}
+	if strings.Contains(stdout, `"status": "hub-offline"`) || strings.Contains(stdout, "merge failed") {
+		t.Fatalf("the first sync of a fresh checkout failed:\n%s", stdout)
+	}
+	for ws, fact := range map[string]string{"ws1": "one.md", "ws2": "two.md"} {
+		if _, err := os.Stat(filepath.Join(c.ProjectsRoot, ws, "memory", fact)); err != nil {
+			t.Fatalf("%s: the fact was not materialized: %v", ws, err)
+		}
+		idx, err := os.ReadFile(filepath.Join(c.ProjectsRoot, ws, "memory", store.IndexName))
+		if err != nil {
+			t.Fatalf("%s: the fresh checkout has no derived index: %v", ws, err)
+		}
+		if !strings.Contains(string(idx), "("+fact+")") {
+			t.Errorf("%s: the derived index does not point at %s:\n%s", ws, fact, idx)
+		}
+	}
+	// The second pass has nothing to do: the render is the fixed point.
+	code, stdout, stderr = run(t, syncArgs(c)...)
+	if code != cli.ExitOK {
+		t.Fatalf("second sync exit = %d: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"status": "up-to-date"`) && !strings.Contains(stdout, `"status": "pushed"`) {
+		t.Errorf("second sync of the fresh checkout: %s", stdout)
+	}
+}
