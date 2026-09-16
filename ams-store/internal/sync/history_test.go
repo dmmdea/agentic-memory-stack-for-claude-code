@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -267,4 +268,26 @@ func gitOut(t *testing.T, repo Repo, args ...string) string {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// TestHistory_InitializeSetsLongPathsOnWindows: git on Windows refuses to open a work-tree
+// directory whose path exceeds MAX_PATH unless core.longpaths is on. The projects root
+// holds workspace directories over 230 characters, so a store under one would be
+// unstageable (seen on a live repo, 2026-09-15). Off Windows the key is not set at all.
+func TestHistory_InitializeSetsLongPathsOnWindows(t *testing.T) {
+	_, repo, _ := historyFixture(t)
+	if err := repo.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	out, _ := exec.Command("git", "--git-dir="+repo.GitDir, "config", "--get", "core.longpaths").Output()
+	got := strings.TrimSpace(string(out))
+	if runtime.GOOS == "windows" {
+		if got != "true" {
+			t.Fatalf("core.longpaths is %q on windows after Initialize, want true", got)
+		}
+		return
+	}
+	if got != "" {
+		t.Fatalf("core.longpaths is %q off windows, want unset", got)
+	}
 }

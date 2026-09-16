@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -96,7 +97,7 @@ const HooksDirName = "ams-hooks"
 // RepoConfig is the config every history repo carries, in one place because sync and the
 // merge engine both initialize it and two spellings mean whichever ran last decides.
 func RepoConfig(hooksDir string) [][2]string {
-	return [][2]string{
+	cfg := [][2]string{
 		// An identity is required to commit at all, and a global config may demand signing,
 		// which no unattended maintainer can satisfy.
 		{"user.name", "automemory"},
@@ -116,6 +117,13 @@ func RepoConfig(hooksDir string) [][2]string {
 		{"merge.renames", "false"},
 		{"diff.renames", "false"},
 	}
+	if runtime.GOOS == "windows" {
+		// git on Windows refuses to open a work-tree path over MAX_PATH unless this is
+		// on; the projects root holds workspace directories over 230 characters, and a
+		// store under one would be unstageable. Off Windows the key means nothing.
+		cfg = append(cfg, [2]string{"core.longpaths", "true"})
+	}
+	return cfg
 }
 
 // Initialize creates (idempotently) the history repo and pins the config the merge

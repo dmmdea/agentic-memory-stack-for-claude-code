@@ -333,3 +333,22 @@ func TestCLI_HarvestScopedToOneStoreWritesHooksAndNoIndex(t *testing.T) {
 		t.Error("harvest rewrote the index; it writes fact files only")
 	}
 }
+
+// A dry run reports and writes NOTHING - the help text promises it. The receipts ledger is
+// what lint's compactor-silent and starved rules read, so a dry-run row there would let a
+// rehearsal pass for a real run (2026-09-15: a --dry-run against a live store appended a
+// row to the operator's compact-receipts.jsonl). The dirty marker is a write too: it wakes
+// the watcher into a sync pass the dry run never earned.
+func TestCLI_DeriveDryRunWritesNoReceiptAndNoDirtyMarker(t *testing.T) {
+	sb := sandboxStore(t, plainIndex(), plainFacts())
+
+	args := append(deriveArgs(sb), "--dry-run")
+	if code, _, _ := run(t, args...); code != cli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, rel := range []string{"compact-receipts.jsonl", "dirty"} {
+		if _, err := os.Stat(filepath.Join(sb.StateRoot, rel)); err == nil {
+			t.Errorf("a dry run wrote %s; --dry-run promises to write nothing", rel)
+		}
+	}
+}
