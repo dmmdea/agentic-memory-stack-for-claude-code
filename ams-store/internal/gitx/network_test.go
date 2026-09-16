@@ -3,6 +3,7 @@ package gitx
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -117,6 +118,44 @@ func TestGitX_NetworkSubcommandReadsPastGlobalOptions(t *testing.T) {
 	} {
 		if got := NetworkSubcommand(tc.args); got != tc.want {
 			t.Fatalf("NetworkSubcommand(%v) = %q, want %q", tc.args, got, tc.want)
+		}
+	}
+}
+
+// TestGitX_SSHCommandSurvivesTheShellGitRunsItThrough pins the one property the first live
+// hub push found missing: git hands GIT_SSH_COMMAND to `sh -c`, so a known_hosts path that is
+// not quoted reaches ssh with every backslash eaten (`C:\Users\...` became `C:Users...`, ssh
+// read a file that does not exist, and strict checking refused the hub with "No ED25519 host
+// key is known"). The fleet tests never saw it because their remotes are local paths. The
+// proof is the round trip itself: whatever SSHCommand emits, the shell must hand ssh the
+// exact path - with backslashes, with spaces, with a quote in it.
+func TestGitX_SSHCommandSurvivesTheShellGitRunsItThrough(t *testing.T) {
+	for _, root := range []string{
+		`C:\ams\state\automemory`,
+		`C:\ams\some root\state`,
+		"/srv/ams/state",
+		"/srv/some one/it's state",
+	} {
+		cmd := SSHCommand(root)
+		want := filepath.Join(root, KnownHostsFile)
+		i := strings.Index(cmd, "UserKnownHostsFile=")
+		if i < 0 {
+			t.Fatalf("%q: no UserKnownHostsFile option", cmd)
+		}
+		arg := cmd[i+len("UserKnownHostsFile="):]
+		if !strings.HasPrefix(arg, "'") {
+			t.Fatalf("root %q: the known_hosts path is not single-quoted for the shell: %s", root, arg)
+		}
+		sh, err := exec.LookPath("sh")
+		if err != nil {
+			t.Skip("no sh on PATH; the quoting assertion above still holds")
+		}
+		out, err := exec.Command(sh, "-c", "printf %s "+arg).Output()
+		if err != nil {
+			t.Fatalf("root %q: sh -c failed on %s: %v", root, arg, err)
+		}
+		if got := string(out); got != want {
+			t.Fatalf("root %q: the shell handed ssh %q, want %q", root, got, want)
 		}
 	}
 }

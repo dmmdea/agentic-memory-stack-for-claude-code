@@ -309,6 +309,11 @@ is untouched by the guard. The single source of truth is now structural: a new
 network call site cannot forget the hardening, because forgetting it does not dial
 - it fails. (`GIT_TERMINAL_PROMPT=0` stays set universally.)
 
+The known_hosts path in that command is always single-quoted. git runs `GIT_SSH_COMMAND` through
+`sh -c`, and an unquoted Windows path loses every backslash on the way - the first live hub push
+read a known_hosts that did not exist and strict checking refused the hub. A test runs the emitted
+option through `sh -c` and asserts ssh receives the exact path.
+
 **`lint`** is read-only by contract and never writes inside a store. It carries the
 shipped rules (orphan, dangling, dup-slug, long-line, oversized-file, budget
 findings, `compactor-starved`, `compactor-unproductive`) and adds `resurrected` and
