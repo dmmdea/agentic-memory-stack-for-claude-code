@@ -84,7 +84,11 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".mem0").mkdir()
-    for v in ("MEM0_PROMOTION_GATE_MODE", "MEM0_EVAL_ROOT", "MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE"):
+    for v in ("MEM0_PROMOTION_GATE_MODE", "MEM0_EVAL_ROOT", "MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE",
+              # P4-1b: the store-judge phase reads these. Unset by default so every existing
+              # scenario keeps its judge-call count, and a developer box that HAS a checkout
+              # configured cannot change what the suite measures.
+              "AMS_STORE_CHECKOUT", "AMS_STORE_BIN"):
         monkeypatch.delenv(v, raising=False)
     return tmp_path
 
@@ -258,13 +262,18 @@ def test_orient_read_failure_degrades_to_empty(home):
 
 
 def test_failed_phases_exit_5_and_skips_exit_0(home, monkeypatch):
+    # now=NOW, like every other scenario (2026-09-16): these two calls went through main()
+    # without pinning the clock, so once the real date passed the EV fixture's 36 h window
+    # the run skipped at gather and exited 0 instead of reaching the phase under test. The
+    # assertion then failed for a reason that had nothing to do with exit codes, and it did
+    # so silently because this suite is not in CI - which this change also fixes.
     m = _mod()
     monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (2, "boom"))
     with pytest.raises(SystemExit) as e:
-        m.main([], mem0=FakeMem0(EV), judge=_judge(SIG, '{"insights":[]}', "[]"), qdrant_http=None, eval_runner=lambda c: (0, ""))
+        m.main([], mem0=FakeMem0(EV), judge=_judge(SIG, '{"insights":[]}', "[]"), qdrant_http=None, eval_runner=lambda c: (0, ""), now=NOW)
     assert e.value.code == 5, "an index build failure must receipt ok:false"
     with pytest.raises(SystemExit) as e:
-        m.main([], mem0=FakeMem0(EV), judge=_judge({"ok": False, "error_type": "usage_limit", "error": "x"}), qdrant_http=None, eval_runner=lambda c: (0, ""))
+        m.main([], mem0=FakeMem0(EV), judge=_judge({"ok": False, "error_type": "usage_limit", "error": "x"}), qdrant_http=None, eval_runner=lambda c: (0, ""), now=NOW)
     assert e.value.code == 5
     (home / ".mem0" / "dedup.lock").write_text("x")
     with pytest.raises(SystemExit) as e:
@@ -329,3 +338,186 @@ def test_all_points_scrolls_qdrant_newest_first(home):
     assert seen == [None, "p2"]
     assert [p["id"] for p in pts] == ["b", "a"], "newest first, unretrievable points dropped"
     assert pts[1]["metadata"]["source"] == "l1a" and pts[0]["memory"] == "new"
+
+
+# ---- the store judge (register P4-1b) ----------------------------------------------------
+# The nightly writes a PLAN; `ams-step-store-judge` applies it with `ams-store judge-apply`,
+# where every apply-guard lives. These scenarios pin the producer's half of that contract:
+# what it refuses to write, what it drops, and that what it does write validates against the
+# schema generated from the Go types the applier decodes with.
+
+STORE_REPLY = '{"decisions":[{"slug":"a.md","verb":"SHORTEN","new_hook":"shorter, keeps :18791"},{"slug":"b.md","verb":"MIGRATE"}]}'
+OFFER_A = {"Slug": "a.md", "Title": "A", "Hook": "a long hook", "Type": "project", "Description": "d", "Bytes": 210}
+OFFER_B = {"Slug": "b.md", "Title": "B", "Hook": "b hook", "Type": "reference", "Description": "d", "Bytes": 90}
+
+
+def _checkout(home, stores):
+    """A hub checkout: <root>/projects/<ws>/memory with fact files, plus <root>/state."""
+    root = home / "checkout"
+    for ws, facts in stores.items():
+        d = root / "projects" / ws / "memory"
+        d.mkdir(parents=True)
+        (d / "MEMORY.md").write_text("# Memory Index\n\n", encoding="utf-8")
+        for f in facts:
+            (d / f).write_text('---\nname: x\ndescription: "d"\n---\n\nbody\n', encoding="utf-8")
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _arm_store_judge(m, monkeypatch, home, stores, candidates):
+    """Point the phase at a checkout with a present (never executed) binary, and script the
+    offer set. _store_candidates is the seam: the real one shells out to the binary, which a
+    unit test must not need."""
+    root = _checkout(home, stores)
+    binary = home / "bin" / "ams-store"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setenv("AMS_STORE_CHECKOUT", str(root))
+    monkeypatch.setenv("AMS_STORE_BIN", str(binary))
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, "ok"))
+    monkeypatch.setattr(m.Dream, "_store_candidates",
+                        lambda self, checkout, ws: candidates(ws), raising=True)
+    return root
+
+
+def _plan(home):
+    p = home / ".mem0" / "maintenance" / "dream" / "store-judge.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+
+def test_store_judge_is_skipped_when_the_box_holds_no_checkout(home, monkeypatch):
+    """Every PC runs this script; only the hub has a checkout. No checkout, no plan, no call."""
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, "ok"))
+    j = _judge(SIG, INS, "[]")
+    out = _run(m, [], mem0=FakeMem0(EV), judge=j)
+    assert out["phase"] == "done"
+    assert _plan(home) is None
+    assert len(j.calls) == 3, "the store judge must not spend a call on a box with no checkout"
+
+
+def test_store_judge_empty_offer_set_is_ok_with_no_decisions_and_no_judge_call(home, monkeypatch):
+    """Nothing over the cap and nothing pullable is a successful night with no call.
+
+    The outcome must be `ok`, not `empty`. Measured against the applier on 2026-09-16:
+    `empty` means "a call answered with whitespace", and on a store that IS over the trigger
+    the applier receipts that as skipped-judge-unavailable - an unproductive night, which is
+    what lint's compactor-unproductive watchdog counts. `ok` with no decisions receipts as
+    no-op and keeps the producer's note.
+    """
+    m = _mod()
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]},
+                     lambda ws: {"workspace": ws, "shorten": [], "migrate": []})
+    j = _judge(SIG, INS, "[]")
+    _run(m, [], mem0=FakeMem0(EV), judge=j)
+    plan = _plan(home)
+    assert plan["version"] == 1 and len(plan["stores"]) == 1
+    assert plan["stores"][0]["workspace"] == "ws-a"
+    assert plan["stores"][0]["outcome"] == "ok", "a store with nothing offered is not a failed judge call"
+    assert plan["stores"][0]["note"] == "nothing over the cap and nothing pullable"
+    assert plan["stores"][0]["decisions"] == []
+    assert len(j.calls) == 3, "no judge call for a store with nothing to decide"
+    assert m.validate_plan(plan) == ""
+
+
+def test_store_judge_whitespace_answer_is_empty_not_parse_fail(home, monkeypatch):
+    """A call that answered with nothing and a call whose output will not parse are different
+    facts with different receipts on the applier's side, so the producer keeps them apart."""
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": []}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: offers)
+    _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]", "   \n  "))
+    plan = _plan(home)
+    assert plan["stores"][0]["outcome"] == "empty"
+    assert plan["stores"][0]["decisions"] == []
+    assert m.validate_plan(plan) == ""
+
+
+def test_store_judge_candidates_failure_is_unavailable_not_empty(home, monkeypatch):
+    """'the judge had nothing to say' and 'the offer set could not be read' are different
+    facts, and only one of them is a defect to chase."""
+    m = _mod()
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: None)
+    j = _judge(SIG, INS, "[]")
+    _run(m, [], mem0=FakeMem0(EV), judge=j)
+    plan = _plan(home)
+    assert plan["stores"][0]["outcome"] == "unavailable"
+    assert plan["stores"][0]["decisions"] == []
+    assert len(j.calls) == 3
+    assert m.validate_plan(plan) == ""
+
+
+def test_store_judge_writes_a_valid_plan_and_drops_what_was_not_offered(home, monkeypatch):
+    """A slug the offer set never contained is a hallucinated edit; a repeated slug is an
+    ambiguity. Both are dropped HERE so one bad line cannot make the applier refuse the whole
+    file and take every other store's decisions down with it."""
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": [OFFER_B]}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md", "b.md"]}, lambda ws: offers)
+    reply = ('{"decisions":[{"slug":"a.md","verb":"SHORTEN","new_hook":"shorter, keeps :18791"},'
+             '{"slug":"a.md","verb":"KEEP"},'
+             '{"slug":"never-offered.md","verb":"MIGRATE"},'
+             '{"slug":"b.md","verb":"MIGRATE"}]}')
+    j = _judge(SIG, INS, "[]", reply)
+    _run(m, [], mem0=FakeMem0(EV), judge=j)
+    plan = _plan(home)
+    assert m.validate_plan(plan) == ""
+    sp = plan["stores"][0]
+    assert sp["outcome"] == "ok"
+    assert [(d["slug"], d["verb"]) for d in sp["decisions"]] == [("a.md", "SHORTEN"), ("b.md", "MIGRATE")]
+    assert sp["decisions"][0]["new_hook"] == "shorter, keeps :18791"
+    assert "new_hook" not in sp["decisions"][1], "a MIGRATE carrying new_hook is refused by the applier"
+    comps = [json.loads(ln)["component"]
+             for ln in (home / ".mem0" / "maintenance" / "codex-usage.jsonl").read_text().splitlines()]
+    assert "store-judge" in comps, "the judge call must reach the usage ledger"
+
+
+def test_store_judge_malformed_json_is_parse_fail(home, monkeypatch):
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": []}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: offers)
+    _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]", "I cannot produce JSON today"))
+    plan = _plan(home)
+    assert plan["stores"][0]["outcome"] == "parse_fail"
+    assert plan["stores"][0]["decisions"] == []
+    assert m.validate_plan(plan) == ""
+
+
+def test_store_judge_dry_run_writes_no_plan(home, monkeypatch):
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": []}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: offers)
+    _run(m, ["--dry-run"], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]", STORE_REPLY))
+    assert _plan(home) is None, "--dry-run writes nothing, including the plan"
+
+
+def test_store_judge_refuses_to_write_a_plan_that_does_not_validate(home, monkeypatch):
+    """A malformed plan makes the applier refuse the WHOLE file; a missing plan is a
+    deterministic-only night. The second is strictly better, so validation gates the write."""
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": []}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: offers)
+    monkeypatch.setattr(m, "validate_plan", lambda plan: "['stores', 0]: invented failure")
+    _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]", STORE_REPLY))
+    assert _plan(home) is None
+
+
+def test_validate_plan_runs_the_generated_schema(home):
+    """The schema is generated from the Go types the applier decodes with; this is the
+    producer's half of that contract."""
+    m = _mod()
+    good = {"version": 1, "stores": [{"workspace": "ws-a", "outcome": "ok",
+                                      "decisions": [{"slug": "a.md", "verb": "KEEP"}]}]}
+    assert m.validate_plan(good) == ""
+    assert m.validate_plan({"version": 2, "stores": [{"workspace": "ws-a"}]}) != ""
+    assert m.validate_plan({"version": 1, "stores": []}) != ""
+    assert m.validate_plan({"version": 1, "stores": [{"workspace": "ws-a",
+                                                     "decisions": [{"slug": "a.md", "verb": "SHORTEN"}]}]}) != ""
+
+
+def test_store_judge_prompt_names_only_offered_slugs(home):
+    m = _mod()
+    p = m.store_judge_prompt("ws-a", [OFFER_A], [OFFER_B])
+    assert "ws-a" in p and "a.md" in p and "b.md" in p
+    assert "STRICT JSON" in p and "Never invent a slug" in p
+    assert "- (none)" in m.store_judge_prompt("ws-b", [], [])

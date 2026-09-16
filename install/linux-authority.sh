@@ -11,6 +11,11 @@
 #   [3] Qdrant (loopback 6333; ZFS is an accepted storage filesystem — the Phase 1 restore
 #       drill is its proof)
 #   [4] mem0 server venv + modules + VERSION stamp (same lists as the WSL installer)
+#   [4b] the store binary (/usr/local/bin/ams-store, from the release asset of the tag in
+#       VERSION, checksum-verified) and the HUB CHECKOUT this box judges: <checkout>/projects
+#       as the work tree, <checkout>/state as the state root with role=hub, an ssh Match block
+#       for the hub user, a seeded known_hosts and one remote named hub. Both are skipped when
+#       --ams-checkout/--ams-hub are not configured, and so is the store-judge chain step.
 #   [5] units: mem0/qdrant/l10-audit + the ams-nightly chain + the native drop-in;
 #       NO per-job timers (one chain, spec §4); scripts deployed to ~/apps/mem0-scripts
 #   [6] enable qdrant, mem0, l10-audit.timer, ams-nightly.timer; health probes on the bind ip
@@ -27,6 +32,15 @@
 #   --embed-model: the llama-swap model name whose GGUF the store was embedded with (default
 #                  embeddinggemma). A different conversion of the same model is a different vector
 #                  space: the restore looked healthy while every search scored noise.
+#   --ams-checkout: where this box keeps its own checkout of the store hub (<dir>/projects is
+#                  the work tree, <dir>/state the state root). With --ams-hub it enables the
+#                  nightly store-judge step; omit BOTH on a box that is not the store hub.
+#   --ams-hub:     the hub remote, user@host:repo.git (the MagicDNS form the remote policy
+#                  pins). The host is also what the ssh Match block and the sync's --hub-host
+#                  are built from; no machine name is compiled into this repo.
+#   --ams-store-binary / --ams-store-sums: an OFFLINE drop of the store binary and the
+#                  SHA256SUMS it shipped with, for a box that cannot reach the release. Without
+#                  them the installer downloads the asset for the tag in VERSION and verifies it.
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 #   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
@@ -38,6 +52,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
+# P4-1b: the store hub's own checkout and the binary that judges it.
+AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
+AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
 SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -54,6 +71,10 @@ while [ $# -gt 0 ]; do
         --eval-root) EVAL_ROOT="${2:-}"; SET_EVAL_ROOT=1; shift 2 ;;
         --pcloud-dir) PCLOUD_DIR="${2:-}"; SET_PCLOUD_DIR=1; shift 2 ;;
         --embed-model) EMBED_MODEL="${2:-}"; SET_EMBED_MODEL=1; shift 2 ;;
+        --ams-checkout) AMS_CHECKOUT="${2:-}"; SET_AMS_CHECKOUT=1; shift 2 ;;
+        --ams-hub) AMS_HUB="${2:-}"; SET_AMS_HUB=1; shift 2 ;;
+        --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
+        --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -109,6 +130,8 @@ inherit_from_stack_env EMBED_MODEL MEM0_EMBED_MODEL --embed-model
 inherit_from_stack_env EVAL_ROOT   MEM0_EVAL_ROOT   --eval-root
 inherit_from_stack_env PCLOUD_DIR  MEM0_PCLOUD_DIR  --pcloud-dir
 inherit_from_stack_env ZFS_DATASET MEM0_ZFS_DATASET --zfs-dataset
+inherit_from_stack_env AMS_CHECKOUT MEM0_AMS_CHECKOUT --ams-checkout
+inherit_from_stack_env AMS_HUB      MEM0_AMS_HUB      --ams-hub
 # a box installed before v1.23.2 carries the dataset only in the rendered drop-in
 if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
     ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
@@ -125,8 +148,23 @@ PIP_SPECS="$(grep -E "pip install --quiet 'mem0ai" "$WSL_INSTALLER" | head -1 | 
 STACK_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 UNITS="mem0.service qdrant.service l10-audit.service l10-audit.timer"
 for u in "$REPO_ROOT"/systemd/ams-*; do [ -f "$u" ] && UNITS="$UNITS $(basename "$u")"; done
+# P4-1b: the store-judge step exists only on the box that HOLDS the hub checkout. Rendering it
+# elsewhere would leave __AMS_CHECKOUT__ unresolved (which render_units refuses) and enable a
+# nightly step with nothing to judge, so it is dropped from the set instead.
+AMS_STORE_JUDGE_UNIT="ams-step-store-judge.service"
+if [ -z "$AMS_CHECKOUT" ] || [ -z "$AMS_HUB" ]; then
+    UNITS="$(printf '%s\n' $UNITS | grep -vx "$AMS_STORE_JUDGE_UNIT" | tr '\n' ' ')"
+fi
 echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID"
 echo "    units: $UNITS"
+
+# P4-1b helpers -----------------------------------------------------------------------------
+# The hub remote is given as user@host:repo.git, the one form the remote policy accepts besides
+# ssh://. The host is parsed out of it rather than taken as its own flag, so the ssh Match block,
+# the sync's --hub-host and the git remote can never name three different machines.
+ams_hub_user() { printf '%s' "${AMS_HUB%%@*}"; }
+ams_hub_host() { local r="${AMS_HUB#*@}"; printf '%s' "${r%%:*}"; }
+ams_hub_repo() { local r="${AMS_HUB#*@}"; printf '%s' "${r#*:}"; }
 
 render_units() {  # $1 = destination dir
     local dst="$1"; mkdir -p "$dst/mem0.service.d"
@@ -135,7 +173,8 @@ render_units() {  # $1 = destination dir
         # they differ (the first live l10-audit run failed 203/EXEC on /home/<tenant>/...), so every
         # home-relative path renders as %h FIRST; the bare sentinel then becomes the tenant id.
         sed -e "s|/home/__WSL_USER__|%h|g" -e "s|__WSL_USER__|$USER_ID|g" -e "s|__WIN_USER__||g" -e "s|__WSL_DISTRO__|native|g" \
-            -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" "$REPO_ROOT/systemd/$unit" > "$dst/$unit"
+            -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__REPO_ROOT_WSL__|$REPO_ROOT|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" \
+            -e "s|__AMS_CHECKOUT__|$AMS_CHECKOUT|g" -e "s|__AMS_HUB_HOST__|$(ams_hub_host)|g" "$REPO_ROOT/systemd/$unit" > "$dst/$unit"
         # The shared mem0.service keeps its WSL ExecStartPre (the DPAPI fetch) so the WSL install is
         # untouched; a native box must not carry it. The drop-in below supplies the native pre-start.
         sed -i '/dpapi-fetch-key\.sh/d' "$dst/$unit"
@@ -190,6 +229,9 @@ ENV
     [ -z "$PCLOUD_DIR" ] || printf 'MEM0_PCLOUD_DIR=%s\n' "$PCLOUD_DIR" >> "$MEM0_DIR/stack.env"
     # v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
     [ -z "$ZFS_DATASET" ] || printf 'MEM0_ZFS_DATASET=%s\n' "$ZFS_DATASET" >> "$MEM0_DIR/stack.env"
+    # P4-1b: same inherit rule for the store hub's checkout and remote.
+    [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_CHECKOUT=%s\n' "$AMS_CHECKOUT" >> "$MEM0_DIR/stack.env"
+    [ -z "$AMS_HUB" ] || printf 'MEM0_AMS_HUB=%s\n' "$AMS_HUB" >> "$MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi
@@ -250,6 +292,98 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------- 5. units + scripts
+# ---------------------------------------------------------------- 4b. store binary + hub checkout
+# Ordered BEFORE the units on purpose (the Windows installer's rule): the chain step must never be
+# enabled on a box where the binary or the checkout it judges is missing.
+say "[4b] store binary + hub checkout"
+ams_install_binary() {
+    local tag="v$STACK_VERSION" asset="ams-store-linux-amd64" dest="/usr/local/bin/ams-store"
+    local src="" want="" have="" sums="" cleanup=""
+    if [ -n "$AMS_BINARY" ]; then
+        [ -r "$AMS_BINARY" ] || fail "--ams-store-binary $AMS_BINARY is not readable"
+        src="$AMS_BINARY"
+        if [ -n "$AMS_SUMS" ]; then
+            [ -r "$AMS_SUMS" ] || fail "--ams-store-sums $AMS_SUMS is not readable"
+            want="$(awk -v a="$asset" '{ n=$2; sub(/^\*/,"",n); if (n==a) print $1 }' "$AMS_SUMS" | head -n1)"
+            [ -n "$want" ] || fail "--ams-store-sums has no entry for $asset"
+        else
+            echo "    WARN: --ams-store-binary without --ams-store-sums: the drop is installed UNVERIFIED"
+        fi
+    else
+        local base="https://github.com/$AMS_RELEASE_REPO/releases/download/$tag"
+        sums="$(mktemp)"; src="$(mktemp)"; cleanup="$sums $src"
+        curl -fsSL -o "$sums" "$base/SHA256SUMS" \
+            || fail "cannot fetch $base/SHA256SUMS; pass --ams-store-binary <file> --ams-store-sums <file> for an offline drop"
+        want="$(awk -v a="$asset" '{ n=$2; sub(/^\*/,"",n); if (n==a) print $1 }' "$sums" | head -n1)"
+        [ -n "$want" ] || fail "release $tag: SHA256SUMS has no entry for $asset"
+        if [ -x "$dest" ] && [ "$(sha256sum "$dest" | awk '{print $1}')" = "$want" ]; then
+            echo "    ams-store already current ($("$dest" --version 2>/dev/null | head -n1))"
+            rm -f $cleanup; return 0
+        fi
+        curl -fsSL -o "$src" "$base/$asset" || fail "cannot fetch $base/$asset"
+    fi
+    have="$(sha256sum "$src" | awk '{print $1}')"
+    if [ -n "$want" ] && [ "$have" != "$want" ]; then
+        [ -z "$cleanup" ] || rm -f $cleanup
+        fail "checksum mismatch for $asset ($tag): SHA256SUMS says $want, the file is $have - not installed"
+    fi
+    sudo -n install -m 0755 "$src" "$dest" || { [ -z "$cleanup" ] || rm -f $cleanup; fail "sudo -n install to $dest failed (passwordless sudo is required, or install it by hand)"; }
+    [ -z "$cleanup" ] || rm -f $cleanup
+    echo "    installed: $("$dest" --version 2>/dev/null | head -n1) (sha256 ${have:0:12}...)"
+}
+
+ams_ssh_block() {  # $1 = hub host, $2 = hub user
+    local cfg="$HOME/.ssh/config" begin="# >>> ams-store hub (managed by linux-authority.sh)" end="# <<< ams-store hub"
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"; touch "$cfg"; chmod 600 "$cfg"
+    if grep -qF "$begin" "$cfg"; then
+        awk -v b="$begin" -v e="$end" 'index($0,b){skip=1} !skip{print} index($0,e){skip=0}' "$cfg" > "$cfg.ams.tmp"
+        mv "$cfg.ams.tmp" "$cfg"; chmod 600 "$cfg"
+    fi
+    printf '\n%s\nMatch host %s user %s\n    IdentityFile ~/.ssh/id_ed25519_ams_hub\n    IdentitiesOnly yes\n%s\n' \
+        "$begin" "$1" "$2" "$end" >> "$cfg"
+}
+
+ams_setup_checkout() {
+    local root="$AMS_CHECKOUT" host user repo proj state
+    host="$(ams_hub_host)"; user="$(ams_hub_user)"; repo="$(ams_hub_repo)"
+    [ -n "$host" ] && [ -n "$user" ] && [ -n "$repo" ] || fail "--ams-hub must be user@host:repo.git, got '$AMS_HUB'"
+    case "$host" in *.*) fail "--ams-hub host '$host' is dotted; reach is the tailnet MagicDNS name only" ;; esac
+    proj="$root/projects"; state="$root/state"
+    mkdir -p "$proj" "$state"
+    # The role file is what makes judge-apply willing to run here at all; a PC stays roleless.
+    printf 'hub\n' > "$state/role"
+    ams_ssh_block "$host" "$user"
+    # The binary pins UserKnownHostsFile=<state>/known_hosts with StrictHostKeyChecking=yes, so
+    # an unseeded checkout fails every sync silently. Seed it from the user's known_hosts, and
+    # refuse loudly rather than leave a chain step that can only fail.
+    if ssh-keygen -F "$host" -f "$HOME/.ssh/known_hosts" 2>/dev/null | grep -v '^#' > "$state/known_hosts"; then :; fi
+    [ -s "$state/known_hosts" ] || fail "the hub's host key is not in ~/.ssh/known_hosts (accept it once: ssh $user@$host) - the checkout is not usable without it"
+    [ -r "$HOME/.ssh/id_ed25519_ams_hub" ] || fail "the hub identity key ~/.ssh/id_ed25519_ams_hub is absent (provision this box's key on the hub first)"
+    if [ ! -f "$state/history.git/HEAD" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" init -q -b main
+        echo "    history repo created at $state/history.git (branch main)"
+    fi
+    local want="$user@$host:$repo" have
+    have="$(git --git-dir "$state/history.git" --work-tree "$proj" remote get-url hub 2>/dev/null || true)"
+    # Exactly one remote, named hub: any other makes every sync refuse with exit 3.
+    for r in $(git --git-dir "$state/history.git" --work-tree "$proj" remote 2>/dev/null); do
+        [ "$r" = hub ] || { git --git-dir "$state/history.git" --work-tree "$proj" remote remove "$r"; echo "    removed remote '$r' (the remote policy allows only hub)"; }
+    done
+    if [ -z "$have" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" remote add hub "$want"
+    elif [ "$have" != "$want" ]; then
+        git --git-dir "$state/history.git" --work-tree "$proj" remote set-url hub "$want"
+    fi
+    echo "    checkout $root ready (role=hub, remote hub=$want, known_hosts seeded)"
+}
+
+if [ -z "$AMS_CHECKOUT" ] || [ -z "$AMS_HUB" ]; then
+    echo "    --ams-checkout/--ams-hub not configured: no store binary, no checkout, no store-judge step"
+elif plan "install /usr/local/bin/ams-store (v$STACK_VERSION) and prepare the hub checkout at $AMS_CHECKOUT"; then :; else
+    ams_install_binary
+    ams_setup_checkout
+fi
+
 say "[5] units (native drop-in; no per-job timers) + maintenance scripts"
 if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; deploy scripts/wsl/*.{py,sh} to $SCRIPTS_DIR"; then :; else
     mkdir -p "$SYSTEMD_USER_DIR" "$SCRIPTS_DIR"

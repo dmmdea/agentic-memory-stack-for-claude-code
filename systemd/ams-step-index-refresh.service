@@ -1,7 +1,7 @@
 [Unit]
 Description=AMS chain step: MEMORY.md index refresh (decoupled from the dream; no-op after a full dream)
 PartOf=ams-nightly.target
-After=mem0.service ams-step-semantic-dedup.service
+After=mem0.service ams-step-semantic-dedup.service ams-step-store-judge.service
 
 [Service]
 Type=oneshot

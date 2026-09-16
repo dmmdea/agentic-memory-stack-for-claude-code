@@ -4,6 +4,50 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.26.0 — the hub decides: the store-judge step, the hub checkout, and a generated plan contract (register P4-1b)
+
+The nightly judge the fleet-store design promised is wired. `dream-consolidate.py` gains a **store
+judge** phase between the autonomous promotion and the prune: for every store in the hub's checkout it
+asks the binary for the offer set (`judge-apply --candidates --json`, which already excludes doctrine
+and sealed lines), calls the judge once per store that has something to decide, and writes a plan.
+A store with nothing to decide is `outcome: ok` with no decisions and no call - a judge that kept
+everything is a successful plan, and the applier receipts it `no-op`. (`empty` is reserved for a call
+that answered with whitespace, which on an over-trigger store the applier records as
+`skipped-judge-unavailable`; using it for "nothing was offered" would have reported healthy stores as
+failing judges to lint's `compactor-unproductive` watchdog - found by rehearsing the wrapper against
+the real binary before shipping.) A failed call is `unavailable`; unparseable output is `parse_fail`. Decisions naming a slug that was never offered, repeating a slug,
+or carrying the wrong fields for their verb are dropped by the producer, so one bad line cannot make
+the applier refuse the whole file. The plan is validated against the schema **before** it is written
+and a plan that does not validate is not written at all - a missing plan is a deterministic-only
+night, which is strictly better than a malformed one.
+
+**The contract is generated, not documented.** `docs/schemas/judge-plan.schema.json` is produced by
+`go run ./scripts/planschema` from `internal/judge/plan.go` - verbs, outcomes, slug rule and version
+read from the package, never retyped. Three tests hold it: the generator's file must be current, the
+Go decoder's verdict on a shared 26-document corpus must match, and the schema's verdict on the same
+corpus must match AND stay a subset of the decoder's (a schema stricter than the decoder makes the
+producer refuse to write a plan the consumer would have applied - the nightly then stops deciding
+with nothing failing anywhere).
+
+**The chain step.** `ams-step-store-judge.service` runs after `ams-step-dream` and before
+`ams-step-index-refresh`, through `ams-step.sh --guarded` like every step: it applies the plan store
+by store with `ams-store judge-apply`, then syncs once. A missing plan skips the apply and still
+syncs, so the deterministic floor lands on a night the judge never spoke.
+
+**The authority installer** gains `--ams-checkout` and `--ams-hub` (both inherited from `stack.env`
+on a re-run): it installs `/usr/local/bin/ams-store` from the linux/amd64 release asset of the tag in
+`VERSION`, checksum-verified (`--ams-store-binary`/`--ams-store-sums` for an offline drop), and
+prepares the checkout - `role` = `hub`, an ssh `Match` block, a seeded `known_hosts`, a history repo
+on `main` with `hub` as its one remote, reached by the same `user@<magicdns>:repo.git` form every PC
+uses. A box that configures neither flag gets no binary, no checkout, and the step is dropped from
+the rendered unit set rather than enabled with nothing to judge.
+
+Also: `main()` in the consolidator threaded every injected collaborator except `now`, so a test that
+pinned the clock silently got the real one - the exit-code scenarios had been passing for a reason
+unrelated to exit codes since their fixture aged out of the 36 h window. Fixed, and the dream suite
+is now in CI (it never was, which is why that rotted unnoticed), along with the new schema suite and
+`jsonschema` in the CI dependency line.
+
 ## 1.25.2 — a fresh checkout derives its index instead of failing (register P4-1b/P4-2 prerequisite)
 
 `MEMORY.md` is derived and never tracked, so a checkout that has just materialized its stores from the hub holds

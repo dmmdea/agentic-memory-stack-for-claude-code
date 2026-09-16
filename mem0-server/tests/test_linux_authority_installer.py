@@ -300,3 +300,104 @@ def test_stack_env_records_the_zfs_dataset():
     """The installer writes what a re-run must be able to read back."""
     sh = SCRIPT.read_text(encoding="utf-8")
     assert "printf 'MEM0_ZFS_DATASET=%s\\n' \"$ZFS_DATASET\" >> \"$MEM0_DIR/stack.env\"" in sh
+
+
+# ---- the hub checkout and the store-judge step (register P4-1b) --------------------------
+HUB = "ams-hub@hubbox:ams-store.git"
+
+
+def test_store_judge_unit_is_absent_when_the_box_holds_no_checkout(tmp_path):
+    """Every authority runs this installer; only the store hub holds a checkout. Rendering the
+    step elsewhere would enable a nightly with nothing to judge - and leave __AMS_CHECKOUT__
+    unresolved, which render_units refuses outright."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    names = {p.name for p in out.rglob("*")}
+    assert "ams-step-store-judge.service" not in names
+    for p in out.rglob("*"):
+        if p.is_file():
+            assert not re.search(r"__[A-Z_]+__", p.read_text(encoding="utf-8")), p.name
+
+
+def test_store_judge_unit_is_rendered_and_resolved_with_a_checkout(tmp_path):
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--ams-checkout", "/srv/ams/judge", "--ams-hub", HUB,
+                 "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    unit = (out / "ams-step-store-judge.service").read_text(encoding="utf-8")
+    assert not re.search(r"__[A-Z_]+__", unit), "every sentinel must resolve"
+    assert "Environment=AMS_STORE_CHECKOUT=/srv/ams/judge" in unit
+    assert "Environment=AMS_STORE_HUB_HOST=hubbox" in unit, "the host is parsed out of --ams-hub"
+    assert "Environment=AMS_STORE_BIN=/usr/local/bin/ams-store" in unit
+    assert "After=mem0.service ams-step-dream.service" in unit, "the plan is dream's output"
+    assert "WantedBy=ams-nightly.target" in unit and "PartOf=ams-nightly.target" in unit
+    assert "Requires=" not in unit, "a failed step must never stop the chain (design section 4)"
+    assert "ams-step.sh --guarded store-judge" in unit, "every chain step carries the boot guard"
+    assert "LoadCredentialEncrypted=ams-api-key" in unit and "MEM0_API_KEY_FILE=%d/ams-api-key" in unit
+    # The refresh must not run before the judge has applied the night's plan.
+    refresh = (out / "ams-step-index-refresh.service").read_text(encoding="utf-8")
+    assert "ams-step-store-judge.service" in refresh
+
+
+def test_dry_run_with_a_checkout_still_writes_nothing(tmp_path):
+    r, home = _run(["--bind-ip", "192.0.2.9", "--ams-checkout", str(tmp_path / "judge"),
+                    "--ams-hub", HUB, "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "[dry-run]" in r.stdout
+    assert not (tmp_path / "judge").exists(), "--dry-run must not create the checkout"
+    assert not (home / ".ssh").exists(), "--dry-run must not touch the ssh config"
+
+
+def test_a_dotted_hub_host_is_refused(tmp_path):
+    """reMagicDNS in the remote policy refuses a dotted name at sync time; the installer must
+    refuse it at install time rather than build a checkout that can never push."""
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--ams-checkout", str(tmp_path / "judge"),
+                 "--ams-hub", "ams-hub@hub.example.com:ams-store.git", "--render-only",
+                 str(tmp_path / "render")], tmp_path)
+    # render-only exits before the checkout block, so the refusal is asserted on the parser:
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "is dotted; reach is the tailnet MagicDNS name only" in sh
+    assert r.returncode == 0
+
+
+def test_the_store_binary_comes_from_a_verified_release_asset():
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert 'asset="ams-store-linux-amd64"' in sh
+    assert "releases/download/$tag" in sh
+    assert "checksum mismatch for $asset" in sh, "a mismatch must refuse, never install"
+    assert "--ams-store-binary" in sh and "--ams-store-sums" in sh, "an offline drop is the sanctioned alternative"
+    assert "sudo -n install -m 0755" in sh
+    # Ordering: the binary and the checkout come BEFORE the units, so the chain step is never
+    # enabled on a box where what it runs is missing.
+    assert sh.index("[4b] store binary + hub checkout") < sh.index("[5] units (native drop-in")
+
+
+def test_the_checkout_is_hub_role_seeded_and_single_remote():
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "printf 'hub\\n' > \"$state/role\"" in sh, "judge-apply refuses without role=hub"
+    assert "ssh-keygen -F \"$host\" -f \"$HOME/.ssh/known_hosts\"" in sh
+    assert "the hub's host key is not in ~/.ssh/known_hosts" in sh, "an unseeded checkout must refuse loudly"
+    assert "id_ed25519_ams_hub is absent" in sh
+    assert "the remote policy allows only hub" in sh
+    assert "init -q -b main" in sh
+
+
+def test_stack_env_records_the_checkout_and_the_hub():
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "printf 'MEM0_AMS_CHECKOUT=%s\\n' \"$AMS_CHECKOUT\" >> \"$MEM0_DIR/stack.env\"" in sh
+    assert "printf 'MEM0_AMS_HUB=%s\\n' \"$AMS_HUB\" >> \"$MEM0_DIR/stack.env\"" in sh
+    assert "inherit_from_stack_env AMS_CHECKOUT MEM0_AMS_CHECKOUT --ams-checkout" in sh
+    assert "inherit_from_stack_env AMS_HUB      MEM0_AMS_HUB      --ams-hub" in sh
+
+
+def test_the_judge_apply_wrapper_treats_a_missing_plan_as_deterministic_only():
+    """The P4-1b gate's second half: the floor lands even when the plan is empty."""
+    w = (REPO_ROOT / "scripts" / "wsl" / "ams-store-judge-apply.sh").read_text(encoding="utf-8")
+    assert "deterministic-only night" in w
+    assert 'if [ -s "$PLAN" ]; then' in w, "a missing plan skips the apply loop"
+    i_else = w.index("no plan at $PLAN")
+    i_sync = w.index('"$BIN" sync $sync_args')
+    assert i_else < i_sync, "the sync must run whether or not a plan existed"
+    assert "MEM0_API_KEY_FILE" in w, "the corpus key comes from the systemd credential, never a flag"
+    assert "--plan" in w and "--workspace" in w and "--state-root" in w

@@ -1,0 +1,201 @@
+{
+  "$defs": {
+    "decision": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verb": {
+                "const": "SHORTEN"
+              }
+            },
+            "required": [
+              "verb"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mem0_text": {
+                "maxLength": 0,
+                "type": "string"
+              },
+              "new_hook": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              }
+            },
+            "required": [
+              "new_hook"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "verb": {
+                "const": "MIGRATE"
+              }
+            },
+            "required": [
+              "verb"
+            ]
+          },
+          "then": {
+            "properties": {
+              "new_hook": {
+                "maxLength": 0,
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "verb": {
+                "const": "KEEP"
+              }
+            },
+            "required": [
+              "verb"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mem0_text": {
+                "maxLength": 0,
+                "type": "string"
+              },
+              "new_hook": {
+                "maxLength": 0,
+                "type": "string"
+              }
+            }
+          }
+        }
+      ],
+      "description": "One index entry's verb. Mirrors judge.Decision.",
+      "properties": {
+        "mem0_text": {
+          "description": "Overrides the text a MIGRATE posts. Normally absent.",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "new_hook": {
+          "description": "The rewritten hook. Required for SHORTEN, forbidden otherwise.",
+          "type": "string"
+        },
+        "slug": {
+          "description": "The fact file the decision is about.",
+          "pattern": "^[^)\\s]+\\.md$",
+          "type": "string"
+        },
+        "verb": {
+          "description": "SHORTEN, MIGRATE or KEEP.",
+          "enum": [
+            "SHORTEN",
+            "MIGRATE",
+            "KEEP"
+          ]
+        }
+      },
+      "required": [
+        "slug",
+        "verb"
+      ],
+      "type": "object"
+    },
+    "storePlan": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "unavailable",
+                  "empty",
+                  "parse_fail"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decisions": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ],
+      "description": "One store's decisions plus the outcome of the call that produced them. Mirrors judge.StorePlan.",
+      "properties": {
+        "decisions": {
+          "items": {
+            "$ref": "#/$defs/decision"
+          },
+          "type": "array"
+        },
+        "note": {
+          "type": "string"
+        },
+        "outcome": {
+          "description": "Defaults to ok when absent.",
+          "enum": [
+            "ok",
+            "unavailable",
+            "empty",
+            "parse_fail"
+          ]
+        },
+        "workspace": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/dmmdea/agentic-memory-stack-for-claude-code/main/docs/schemas/judge-plan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The nightly store-judge plan: written by dream-consolidate.py on the authority, applied by `ams-store judge-apply`. GENERATED from ams-store/internal/judge/plan.go by `go run ./scripts/planschema` - do not edit by hand. It is a SUBSET of the Go decoder's rules: uniqueness of workspaces and of slugs within a store cannot be expressed here and is enforced by judge.Plan.Validate, which is the authority.",
+  "properties": {
+    "generated_at": {
+      "description": "RFC3339, advisory only.",
+      "type": "string"
+    },
+    "stores": {
+      "items": {
+        "$ref": "#/$defs/storePlan"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "version": {
+      "const": 1,
+      "description": "The only version this build applies."
+    }
+  },
+  "required": [
+    "version",
+    "stores"
+  ],
+  "title": "ams-store judge plan",
+  "type": "object"
+}

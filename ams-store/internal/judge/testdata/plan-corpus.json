@@ -1,0 +1,209 @@
+{
+  "_comment": [
+    "The judge plan's cross-language corpus. ONE table, two validators:",
+    "  internal/judge/plan_corpus_test.go        runs judge.ParsePlan and asserts the 'decoder' verdict",
+    "  mem0-server/tests/test_judge_plan_schema.py runs docs/schemas/judge-plan.schema.json and asserts 'schema',",
+    "                                            plus the subset invariant: schema reject => decoder reject.",
+    "The decoder is the AUTHORITY. The schema is deliberately a subset: JSON Schema 2020-12 cannot express",
+    "uniqueness of a property across array items, so the two duplicate cases below are decoder-only rejections.",
+    "A case the schema rejects and the decoder accepts would be a producer writing plans that never apply -",
+    "that is the invariant the Python test enforces, and it is why this file is shared rather than duplicated."
+  ],
+  "cases": [
+    {
+      "name": "minimal: one store, no decisions",
+      "why": "a judge that kept everything is a valid, successful plan",
+      "decoder": "accept",
+      "schema": "accept",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": []}]}
+    },
+    {
+      "name": "decisions absent entirely",
+      "why": "Validate does not require the key; nil decodes to an empty slice",
+      "decoder": "accept",
+      "schema": "accept",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a"}]}
+    },
+    {
+      "name": "every verb, with generated_at, note and metadata",
+      "why": "the full shape the producer writes",
+      "decoder": "accept",
+      "schema": "accept",
+      "doc": {
+        "version": 1,
+        "generated_at": "2026-09-16T03:00:00Z",
+        "stores": [{
+          "workspace": "ws-a",
+          "outcome": "ok",
+          "note": "one call, three decisions",
+          "decisions": [
+            {"slug": "a.md", "verb": "SHORTEN", "new_hook": "a shorter hook"},
+            {"slug": "b.md", "verb": "MIGRATE", "metadata": {"topic": "wsl"}},
+            {"slug": "c.md", "verb": "KEEP"}
+          ]
+        }]
+      }
+    },
+    {
+      "name": "outcome unavailable with no decisions",
+      "why": "a call that did not answer is still an outcome with a receipt",
+      "decoder": "accept",
+      "schema": "accept",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "outcome": "unavailable", "note": "codex timeout", "decisions": []}]}
+    },
+    {
+      "name": "unknown field at the top level",
+      "why": "DisallowUnknownFields / additionalProperties false: a dropped field is a decision the operator believes was applied",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a"}], "dry_run": true}
+    },
+    {
+      "name": "unknown field on a decision",
+      "why": "same rule one level down",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "KEEP", "reason": "because"}]}]}
+    },
+    {
+      "name": "unsupported version",
+      "why": "version is a const, not a minimum",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 2, "stores": [{"workspace": "ws-a"}]}
+    },
+    {
+      "name": "version absent",
+      "why": "an absent version decodes to 0 and is not 1",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"stores": [{"workspace": "ws-a"}]}
+    },
+    {
+      "name": "stores absent",
+      "why": "a plan that names no stores applies nothing and would be receipted as a clean run",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1}
+    },
+    {
+      "name": "stores empty",
+      "why": "same reason; minItems 1",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": []}
+    },
+    {
+      "name": "blank workspace",
+      "why": "TrimSpace == \"\" on the decoder; minLength + a non-whitespace pattern on the schema",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "   "}]}
+    },
+    {
+      "name": "slug with whitespace",
+      "why": "the slug rule is the harness's, and there is no slugification anywhere",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a b.md", "verb": "KEEP"}]}]}
+    },
+    {
+      "name": "slug with a closing paren",
+      "why": "a paren in a slug breaks the index line's markdown link",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a).md", "verb": "KEEP"}]}]}
+    },
+    {
+      "name": "slug not ending .md",
+      "why": "fact files are markdown",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.txt", "verb": "KEEP"}]}]}
+    },
+    {
+      "name": "unknown verb",
+      "why": "guessing at a producer/consumer disagreement is how a KEEP becomes a delete",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "DELETE"}]}]}
+    },
+    {
+      "name": "verb absent",
+      "why": "no verb is not a KEEP",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md"}]}]}
+    },
+    {
+      "name": "SHORTEN without new_hook",
+      "why": "a shorten with nothing to shorten to",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "SHORTEN"}]}]}
+    },
+    {
+      "name": "SHORTEN with a blank new_hook",
+      "why": "whitespace is not a hook",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "SHORTEN", "new_hook": "   "}]}]}
+    },
+    {
+      "name": "SHORTEN carrying mem0_text",
+      "why": "a shorten does not post to the corpus",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "SHORTEN", "new_hook": "short", "mem0_text": "x"}]}]}
+    },
+    {
+      "name": "MIGRATE carrying new_hook",
+      "why": "a migrate removes the line rather than rewriting it",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "MIGRATE", "new_hook": "x"}]}]}
+    },
+    {
+      "name": "KEEP carrying an edit",
+      "why": "keep means keep",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "KEEP", "new_hook": "x"}]}]}
+    },
+    {
+      "name": "unknown outcome",
+      "why": "the outcome enum is closed",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "outcome": "weird", "decisions": []}]}
+    },
+    {
+      "name": "outcome unavailable carrying decisions",
+      "why": "a call that did not answer has no decisions",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "outcome": "unavailable", "decisions": [{"slug": "a.md", "verb": "KEEP"}]}]}
+    },
+    {
+      "name": "metadata with a non-string value",
+      "why": "metadata is map[string]string on the decoder and string-valued on the schema",
+      "decoder": "reject",
+      "schema": "reject",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "MIGRATE", "metadata": {"n": 1}}]}]}
+    },
+    {
+      "name": "two stores with the same workspace",
+      "why": "DECODER-ONLY: JSON Schema 2020-12 cannot express uniqueness of a property across array items",
+      "decoder": "reject",
+      "schema": "accept",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a"}, {"workspace": "ws-a"}]}
+    },
+    {
+      "name": "two decisions for the same slug",
+      "why": "DECODER-ONLY, same reason: the second decision would silently win",
+      "decoder": "reject",
+      "schema": "accept",
+      "doc": {"version": 1, "stores": [{"workspace": "ws-a", "decisions": [{"slug": "a.md", "verb": "KEEP"}, {"slug": "a.md", "verb": "MIGRATE"}]}]}
+    }
+  ]
+}
