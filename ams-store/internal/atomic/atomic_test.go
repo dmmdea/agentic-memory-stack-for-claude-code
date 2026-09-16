@@ -10,7 +10,7 @@ import (
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/atomic"
 )
 
-const em = "—"
+const em = "\u2014"
 
 // MemoryStoreLib.Tests.ps1:24. Read the file, write it straight back, and require the
 // bytes to be identical: no BOM, no newline rewrite, no em-dash mangling, and no
@@ -18,7 +18,7 @@ const em = "—"
 func TestIO_RoundTripBomlessLFWithEmDash(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "idx.md")
-	line := "- [Title](t.md) " + em + " café rule"
+	line := "- [Title](t.md) " + em + " caf\u00e9 rule"
 	in := []byte(line + "\n" + line + "\n")
 	if err := os.WriteFile(p, in, 0o644); err != nil {
 		t.Fatal(err)

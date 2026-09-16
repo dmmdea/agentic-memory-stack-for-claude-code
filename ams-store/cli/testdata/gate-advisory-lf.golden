@@ -1,0 +1,4 @@
+[auto-memory index] 27854 B / 70 lines (caps: 25000 B sync, 200 lines injected)
+  OVER THE SYNC LIMIT: the harness loads only part of this file until it is under the limit.
+  70 index line(s) over 130 B. The index format is one pointer per entry: "- [Title](file.md) - hook". Keep the hook to the trigger for opening the file; detail belongs in the fact file.
+  NORMALIZED: 29 over-cap hook(s) truncated to the line cap; index 27854 -> 19966 B. Your in-context copy of MEMORY.md is now STALE - re-read it before the next edit, and keep new hooks under 130 B. Full text of every entry is still in its fact file.

@@ -121,6 +121,64 @@ remaining workstations follow when they are online.
 reach the authority (transcript extraction stays per workstation, see Alternatives). Transcripts
 that exist locally on the authority are appended as before.
 
+## Amendment 2026-09-15: Phase 3 is code complete, pending the hub and the seed
+
+`ams-store` exists and every mandated verb is real - `derive`, `lint`, `gate`, `sync`,
+`sync --watch`, `lock`, plus the hub-only `judge-apply` and an explicit `harvest`. What
+remains before it runs a fleet is operational, not code: the hub is built (P3-3) but the
+seed has not been pushed (P3-4), `<STATE_ROOT>/role` is not written on any machine, and
+the binary is not yet installed by the installer (Phase 4, which is also where `VERSION`
+moves).
+
+Four things this record asserted were settled by building it, and two of them changed:
+
+- **"The store client is one implementation for three operating systems" holds, and the
+  measurement that justified it is in.** The PowerShell 5.1 gate is ~397 ms p50; the Go
+  path is ~15 ms. That clears the 5x bar by five times over, so the named pwsh-7-on-Linux
+  fallback stays a fallback.
+- **`merge.renames=false` is not sufficient and is no longer relied on.** Measured on two
+  installed gits: 2.55 honours it for `merge-tree --write-tree`, and 2.43 honours nothing -
+  not `merge.renames`, not `diff.renames`, not `-X`, which it accepts in silence and
+  ignores. On 2.43 a fact re-homed under a new slug has its remove+add read as a rename and
+  the other side's version of the old path disappears with no conflicted path and no report.
+  The engine now rules the deletion table over every path the two sides disagree about on
+  existence, and `merge-tree` keeps only the content merges. The "minimum git 2.38" floor
+  stays adequate ONLY because of that audit.
+- **The empty merge base must be a commit.** The first sync between two PCs that each ran
+  `git init` before either had pushed has no common ancestor. Handing `merge-tree` the empty
+  TREE works on git 2.55 and fails outright on 2.43, which is inside the supported range.
+- **`over_trigger_since` rides in the synced tree, not on an orphan ref.** It lives at
+  `<PROJECTS_ROOT>/.ams/over-trigger.json`, outside every store (nothing but `MEMORY.md` and
+  fact files may sit in a store) and inside the tree, merged by a `min` reducer as a
+  special-cased path. The orphan-branch proposal in the original risk list was dropped: it
+  needed a second transport for one file.
+
+The 1:1 counterpart obligation this record placed on the test suite is now a test rather
+than a claim. All 95 Pester scenarios map to a named Go test, with exactly one exemption
+carrying its reason - the `-CatchUp` fresh-then-stale run, whose spawn this record removes
+from the PCs. Every merge rule has a mutation that turns its named test red; the measured
+gate is quoted in `docs/systems/ams-store.md`, stamped with the commit it was measured at,
+because it is a local gate that drifts and an unstamped count is the claim this amendment
+had to correct once already.
+
+**Two rules above are amended by the repair round that followed (2026-09-15).** Point 5's
+"deletions are deferred to the session boundary" understated what a deferral is: a deferred
+path is already resolved in HISTORY and only withheld from the work tree, so the queue is
+load-bearing in both directions. Nothing may re-stage a queued path while it waits (a
+blanket add resurrected a withheld deletion fleet-wide and re-committed a live session's
+older bytes over a merged blob), and the queue must be DRAINED at every session boundary,
+which is where an unreferenced `ApplyDeferred` had left it unread. The drain is a re-check
+against the bytes that were on disk when the entry was queued, not a replay: an unchanged
+file takes the merged result, and a file the session edited after the merge keeps the later
+edit - a replace is reconciled three-way with the disk side winning a real body conflict,
+and a deletion is abandoned and reported `resurrected`, which is this record's own
+modify-vs-delete rule arriving one pass late. Point 8's synced first-crossing stamp needs
+one addition: a `min` reducer over a union of keys cannot represent a CLEAR, so a converged
+store's cleared clock returned from any PC that had not re-derived and the health number
+could never reset. The stamp file carries a per-workspace `cleared_at` tombstone; the
+reducer maxes the tombstones and then mins only the stamps newer than their clear, and an
+unparseable time keeps a stamp alive so a garbled tombstone cannot silence the alarm.
+
 ## Alternatives considered
 
 - **Keep the authority on the workstation and only run the nightly on the server.** Rejected:

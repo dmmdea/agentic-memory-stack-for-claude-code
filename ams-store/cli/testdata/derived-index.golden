@@ -1,0 +1,7 @@
+# Memory Index
+
+Some preamble line the parser keeps verbatim.
+- [Rule](rule.md) — NEVER ship without the gate
+- [Alpha](Alpha.md) — an ordinary fact with an — inside it
+- [Mid](mid.md) — a middling fact
+- [Zulu path](zulu.md) — config at `C:\Users\x\.claude` and port 18791

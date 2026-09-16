@@ -49,7 +49,7 @@ const (
 	ReceiptTailLines = 600
 	// EmDash is the canonical index separator, built from its code point and never typed
 	// as a literal. LIB:30.
-	EmDash = "—"
+	EmDash = "\u2014"
 )
 
 // IndexName is the one file in a store that is not a fact file.

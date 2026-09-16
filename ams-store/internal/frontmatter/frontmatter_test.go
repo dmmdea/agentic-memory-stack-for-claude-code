@@ -10,7 +10,7 @@ import (
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
 )
 
-const em = "—"
+const em = "\u2014"
 
 func write(t *testing.T, name, content string) string {
 	t.Helper()

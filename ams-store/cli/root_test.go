@@ -10,6 +10,7 @@ import (
 
 func run(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	isolateLocks(t)
 	var out, errb bytes.Buffer
 	code = cli.RunWith(cli.Env{Stdout: &out, Stderr: &errb, Stdin: strings.NewReader("")}, args)
 	return code, out.String(), errb.String()
@@ -30,8 +31,19 @@ func TestCLI_MandatedVerbsArePresent(t *testing.T) {
 	}
 }
 
+// TestCLI_StubVerbsExitNotImplementedWithSilentStdout covers the verbs whose engines have
+// not landed yet.
+//
+// It iterates cli.StubVerbs, NOT cli.Verbs. Iterating every verb meant that the moment a
+// verb was wired this test invoked it for real with no roots - which on 2026-09-15 ran
+// sync against the operator's live history repo and committed 5 live stores. A test that
+// asserts "not implemented" must be told which verbs those are, not guess.
 func TestCLI_StubVerbsExitNotImplementedWithSilentStdout(t *testing.T) {
-	for _, v := range cli.Verbs() {
+	stubs := cli.StubVerbs()
+	if len(stubs) == 0 {
+		t.Skip("every verb is wired")
+	}
+	for _, v := range stubs {
 		code, stdout, stderr := run(t, v)
 		if code != cli.ExitNotImplemented {
 			t.Errorf("%s: exit = %d, want %d", v, code, cli.ExitNotImplemented)
@@ -41,6 +53,28 @@ func TestCLI_StubVerbsExitNotImplementedWithSilentStdout(t *testing.T) {
 		}
 		if !strings.Contains(stderr, "not implemented") {
 			t.Errorf("%s: stderr = %q, want it to say the verb is not implemented", v, stderr)
+		}
+	}
+}
+
+// TestCLI_WritingVerbsRefuseAnImplicitScope is the regression guard for the incident that
+// produced it: `ams-store derive` with no scope meant "every populated store under the
+// real projects root", so a test that walked the verb table with no arguments harvested
+// hook: into every live fact file on the PC and re-rendered every live MEMORY.md. A verb
+// that writes must be told what to write to.
+func TestCLI_WritingVerbsRefuseAnImplicitScope(t *testing.T) {
+	for _, v := range []string{"derive", "harvest"} {
+		code, stdout, stderr := run(t, v)
+		if code != cli.ExitUsage {
+			t.Errorf("%s: exit = %d, want %d (bad invocation)", v, code, cli.ExitUsage)
+		}
+		if stdout != "" {
+			t.Errorf("%s: stdout = %q, want empty", v, stdout)
+		}
+		for _, want := range []string{"--store", "--all", "--workspace"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("%s: stderr = %q, want it to name %s", v, stderr, want)
+			}
 		}
 	}
 }
@@ -144,4 +178,13 @@ func TestCLI_ExitCodeContract(t *testing.T) {
 			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
 		}
 	}
+}
+
+// runStdin is run with a hook payload on stdin, for the gate.
+func runStdin(t *testing.T, stdin string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	isolateLocks(t)
+	var out, errb bytes.Buffer
+	code = cli.RunWith(cli.Env{Stdout: &out, Stderr: &errb, Stdin: strings.NewReader(stdin)}, args)
+	return code, out.String(), errb.String()
 }

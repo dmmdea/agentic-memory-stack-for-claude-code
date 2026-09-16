@@ -12,6 +12,7 @@ import (
 var (
 	reEOL         = regexp.MustCompile(`\r?\n`)
 	reTopDesc     = regexp.MustCompile(`^description\s*:`)
+	reTopHook     = regexp.MustCompile(`^hook\s*:`)
 	reTopMetadata = regexp.MustCompile(`^metadata\s*:`)
 )
 
@@ -49,12 +50,32 @@ func InsertHook(text, hook string) (string, bool) {
 	if hook == "" {
 		return text, false
 	}
+	return InsertKey(text, "hook", QuoteYAML(hook))
+}
+
+// insertAfter is the placement preference per key: the first pattern that matches a
+// top-level line puts the new key on the line AFTER it. Deterministic placement matters
+// because two PCs harvesting the same file must produce the same bytes.
+var insertAfter = map[string][]*regexp.Regexp{
+	"hook":     {reTopDesc},
+	"migrated": {reTopHook, reTopDesc},
+}
+
+// InsertKey writes `key: value` into a file's existing frontmatter block, verbatim - value
+// is already rendered, so a caller decides whether it needs quoting. It reports whether
+// anything changed.
+//
+// A file with no frontmatter block is left ALONE rather than given one: adding a block
+// would change the no-frontmatter lint population, and it is not derive's business to
+// invent metadata for a file a session wrote as plain prose. A key that is already present
+// is never rewritten, which is what makes both harvest steps idempotent.
+func InsertKey(text, key, value string) (string, bool) {
 	loc := reBlock.FindStringSubmatchIndex(text)
 	if !strings.HasPrefix(text, "---") || loc == nil {
 		return text, false
 	}
 	block := text[loc[2]:loc[3]]
-	if _, ok := Lookup(block, "hook"); ok {
+	if _, ok := Lookup(block, key); ok {
 		return text, false
 	}
 
@@ -63,16 +84,22 @@ func InsertHook(text, hook string) (string, bool) {
 		eol = "\r\n"
 	}
 	lines := reEOL.Split(block, -1)
-	line := "hook: " + QuoteYAML(hook)
 
 	at := -1
-	for i, l := range lines {
-		if reTopDesc.MatchString(l) {
-			at = i + 1
+	for _, pattern := range insertAfter[key] {
+		for i, l := range lines {
+			if pattern.MatchString(l) {
+				at = i + 1
+				break
+			}
+		}
+		if at >= 0 {
 			break
 		}
 	}
 	if at < 0 {
+		// Last top-level key before metadata:, so the nested block stays at the bottom
+		// where every real fact file keeps it.
 		for i, l := range lines {
 			if reTopMetadata.MatchString(l) {
 				at = i
@@ -86,7 +113,7 @@ func InsertHook(text, hook string) (string, bool) {
 
 	out := make([]string, 0, len(lines)+1)
 	out = append(out, lines[:at]...)
-	out = append(out, line)
+	out = append(out, key+": "+value)
 	out = append(out, lines[at:]...)
 
 	return text[:loc[2]] + strings.Join(out, eol) + text[loc[3]:], true

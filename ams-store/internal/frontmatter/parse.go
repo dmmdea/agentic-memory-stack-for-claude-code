@@ -73,15 +73,39 @@ func Lookup(block, key string) (string, bool) {
 		return "", false
 	}
 	v := strings.TrimSpace(m[1])
-	// Exactly one outer pair, and only when both ends agree. Inner quotes are untouched:
-	// real descriptions carry them.
+	// Exactly one outer pair, and only when both ends agree.
 	if len(v) >= 2 {
 		f, l := v[0], v[len(v)-1]
-		if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
+		switch {
+		case f == '"' && l == '"':
+			// A double-quoted scalar is unescaped, so a value this package WROTE reads
+			// back byte-identical. Only \" and \\ are recognised, which is exactly what
+			// QuoteYAML produces: a real hand-written description carrying bare inner
+			// quotes (the shape every shipped fact file uses) contains no backslash
+			// escapes at all, so unescaping is a no-op on it.
+			v = unescapeDoubleQuoted(v[1 : len(v)-1])
+		case f == '\'' && l == '\'':
 			v = v[1 : len(v)-1]
 		}
 	}
 	return v, true
+}
+
+func unescapeDoubleQuoted(v string) string {
+	if !strings.Contains(v, `\`) {
+		return v
+	}
+	var b strings.Builder
+	b.Grow(len(v))
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\\' && i+1 < len(v) && (v[i+1] == '"' || v[i+1] == '\\') {
+			b.WriteByte(v[i+1])
+			i++
+			continue
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
 }
 
 // ParseText parses frontmatter out of a fact file's text. It returns nil when the text

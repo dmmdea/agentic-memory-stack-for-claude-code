@@ -60,6 +60,10 @@ type command struct {
 	Summary string
 	Usage   string
 	Run     func(env Env, args []string) int
+	// Stub marks a verb whose engine has not landed. It is what StubVerbs reports, and
+	// it is set in exactly one place per verb - beside the notImplemented body - so the
+	// flag and the behaviour cannot drift apart.
+	Stub bool
 }
 
 // commands returns the verb table in help order.
@@ -81,6 +85,21 @@ func Verbs() []string {
 	out := make([]string, 0, len(cmds))
 	for _, c := range cmds {
 		out = append(out, c.Name)
+	}
+	return out
+}
+
+// StubVerbs lists the verbs whose engines have not landed yet, in help order.
+//
+// It is derived from the verb table rather than written down twice, so wiring a verb
+// removes it from here automatically and no test can go on asserting "not implemented"
+// about a verb that now does something.
+func StubVerbs() []string {
+	var out []string
+	for _, c := range commands() {
+		if c.Stub {
+			out = append(out, c.Name)
+		}
 	}
 	return out
 }

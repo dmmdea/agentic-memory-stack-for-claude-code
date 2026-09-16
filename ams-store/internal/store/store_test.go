@@ -215,7 +215,7 @@ func TestStore_ConstantsMatchTheShippedLibrary(t *testing.T) {
 			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
 		}
 	}
-	if store.EmDash != "—" || len(store.EmDash) != 3 {
+	if store.EmDash != "\u2014" || len(store.EmDash) != 3 {
 		t.Errorf("EmDash = %q (%d bytes), want U+2014 as 3 UTF-8 bytes", store.EmDash, len(store.EmDash))
 	}
 }

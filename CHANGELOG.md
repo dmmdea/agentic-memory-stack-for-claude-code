@@ -4,7 +4,7 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## Unreleased — ams-store scaffold (System A store client, register P3-1 start)
+## 1.24.0 — ams-store engines (System A store client, register P3-1/P3-2)
 
 The Go rewrite of the auto-memory store library, write gate and nightly compactor begins
 here. This change adds the `ams-store/` module: store enumeration (fail-closed, reparse-point
@@ -19,6 +19,123 @@ exemption). Two Go CI jobs added (linux with `-race`, windows build+test). Measu
 ~397 ms p50); the SessionStart hook order is not a fixed before/after. New system doc
 `docs/systems/ams-store.md`. No runtime/version change to the mem0 stack — `VERSION` is
 unchanged.
+
+**The engines (this change).** No verb is a stub any more. `derive` and `harvest` (harvest,
+the four hygiene passes, planned-ghost abort, blast cap, derived render with the injection
+stop, convergence floor, compare-and-swap write); the merge engine (out-of-tree three-way
+merge, deletion table, field-aware frontmatter merge, commit-time winner with the machine-id
+tiebreak, CRLF normalization, materialize order, deferred queue, liveness); `sync` /
+`sync --watch` / `lock` / `gate` / `lint`; and the hub-only `judge-apply` with every
+apply-guard and the `Migrated:` trailer.
+
+- **The seams are connected and tested as pairs.** Each engine was built against a one-method
+  interface and a fake, which is what keeps the packages independent and also what makes a
+  disconnected seam invisible: `gate.Options{Floor: nil}` compiles, ships and passes every
+  unit test while the write gate silently becomes an advisory printer. `cli/seams.go` is the
+  one place they meet and each adapter carries an end-to-end test driving the real pair.
+- **Three duplications collapsed, each of which decided behaviour.** `internal/sync` and
+  `internal/merge` both wrote the history repo's `info/exclude` and config, and disagreed
+  about whether the shared over-trigger stamp was trackable — whichever ran last won.
+  `internal/derive` carried a second copy of the anchor rule. `cli` had two global-flag
+  structs, one of which left the state root empty when the home could not be resolved. One
+  floor, one doctrine rule, one anchor rule, one repo shape.
+- **The empty merge base must be a commit, not a tree.** The first sync between two PCs that
+  each ran `git init` before either had pushed works on git 2.55 and fails outright on git
+  2.43 (`object ... is a tree, not a commit`). The design's floor is 2.38, so the version
+  that refuses is inside the supported range; found by the mandatory Linux `-race` run, which
+  is the only place the other git version is exercised.
+- **Staging is narrowed to fact files.** The forced pathspec that gets fact files past the
+  blanket exclude also tracked whatever else was in the store directory, and the PowerShell
+  compactor leaves `.bak-<date>-<kind>` files there; a live sync put several into history on
+  their way to the hub and from there into every agent's glob. Nothing is untracked or
+  deleted — that is a decision for a human.
+- **A store whose whole workspace directory is gone now has its deletion staged**, which is
+  the one way a store leaves the fleet; and the history repo pins a repo-local empty
+  `core.hooksPath` so a global hooks path aimed at GitHub pushes does not refuse the hub push.
+- **The G7 over-trigger clock is written.** `derive` and `sync` stamp
+  `.ams/over-trigger.json`; nothing wrote it before, so `over_trigger_hours` was null on every
+  PC and the 24 h alarm was inert.
+- **The parity gate is a test, not a table in a plan.** It reads the four Pester files,
+  extracts all 95 `It` blocks and asserts a Go test of the mapped name exists, with exactly
+  one exemption carrying its reason inline. A companion check refuses any remaining
+  placeholder skip, because a skipped test is still a test to `go test -list`. Two more repo
+  gates: every package that can resolve the operator's home runs its tests with the home
+  moved (two live incidents on 2026-09-15 came from tests that did not), and Go source stays
+  ASCII.
+- **The mutation gate is armed on every rule.** Ten rules carried a name but no mutation and
+  were reported rather than checked. Arming them caught one mutation that did not compile (a
+  build failure reads as a red test while proving nothing) and one that SURVIVED (it added a
+  fetch before the local commit but ignored the error, so the rule was never actually broken).
+  The measured figure is in the repair round below; the figure first written here (red 25)
+  was never true at that commit.
+
+**The repair round (this change).** A three-lens review of the engines found two severe
+defects at the merge/sync seam, four moderate ones and a stale claim in these notes. Each fix
+landed with a test seen RED against the unfixed code first.
+
+- **The deferred queue is a pending merge result, not a note.** A queued path was re-staged by
+  the next blanket add and re-committed, resurrecting a withheld deletion fleet-wide and
+  re-committing a live session's older bytes over a merged blob. Staging now excludes every
+  queued path, and materialize reconciles the repository index with `read-tree` first, because
+  the merge is computed out of tree and `git commit` was committing the stale index entry for
+  exactly the paths the add excluded.
+- **The queue is drained.** `ApplyDeferred` had no production caller at all: the queue was
+  written and never read. Every `sync --once` pass (and every watcher pass) drains it first,
+  for every enumerated workspace, and a pass with queued changes and no drain wired refuses.
+  The drain is a RE-CHECK against the ours-side blob recorded at defer time, not a blind
+  write: an unchanged file takes the merged result, an edited one keeps the later edit (a
+  replace is merged three-way with the disk side winning a real conflict, a deletion is
+  abandoned and reported `resurrected`). A corrupt queue is a refusal, never an empty queue.
+  The receipt names each withheld change's OP - every one of them used to be reported as
+  `replace` - and lists what a drain applied.
+- **Staging is two passes over one exclusion list.** The narrowed forced add still may add only
+  `*.md`, and a second `git add -u` stages the removal of TRACKED paths of any extension, so a
+  `.bak-<date>-<kind>` moved out of a store stops being tracked with stale bytes forever. A
+  store whose memory directory is gone is now recognised as gone: the sweep stats the STORE
+  directory, since a workspace whose store was deleted is never enumerated and the workspace
+  stat kept succeeding.
+- **A cleared over-trigger stamp stays cleared.** The G7 clock's reducer was a union over keys
+  and a clear is an absence, so a converged store's cleared stamp came straight back from any
+  PC that had not re-derived and the alarm could never reset. The file carries a `cleared_at`
+  tombstone per workspace; the reducer maxes the tombstones, then mins only the stamps newer
+  than their clear. A garbled time keeps the stamp ALIVE, so a bad tombstone cannot silence a
+  starvation alarm. One renderer owns the file's bytes now - the producer indented and the
+  reducer compacted the same tracked file, so every stamp change cost an extra commit.
+- **A network git call that is not hardened does not dial.** The merge engine's `Fetch`/`Push`
+  built their commands without the `GIT_SSH_COMMAND` hardening every other call site applies.
+  One helper owns that environment and `gitx.Run` now REFUSES any network subcommand whose
+  environment lacks it, before the process starts - the single source of truth is structural
+  rather than a convention a new call site can forget.
+- **`--engage-at <bytes>`** makes decision Q2's engage threshold a flag on `derive` and `gate`,
+  defaulting to today's value, so the Phase 4 flip is a change of a default rather than an edit
+  to the floor. The gate's own duplicate copy of the threshold reads it too, or a lowered flag
+  would have been accepted and then silently skipped.
+- **Four dark rows of the deletion table are executed and mutated.** Both-deleted,
+  added-on-ours-only, added-on-theirs-only and the identical-bytes short circuit had zero
+  executed statements; they now have end-to-end fleet fixtures and their own mutations.
+- **Four tests that could not fail, fixed.** The gate's "never touches the network" claim was a
+  wall-clock proxy that a real `git fetch` passed; it is a recording ssh stub with a control
+  test now. The lock contender test never reached the file-lock branch on Windows (the named
+  mutex short-circuited first), so its mutation SURVIVED. Every `cli` verb took the PRODUCTION
+  Windows mutex names, so a real compaction - or a sibling test process - turned sixteen tests
+  red and others vacuously green; the verbs take an isolatable lock. The placeholder-skip check
+  scanned line by line and a gofmt-wrapped `t.Skip` evaded it; it parses the file now.
+- **The mutation table is anchored by a test.** A hunk whose anchor text moved made the gate
+  report the row broken and nothing automated noticed. A test asserts each hunk's `Old` occurs
+  exactly once in its file and that every named test exists; it caught the re-anchoring this
+  round itself needed.
+
+Measured mutation gate at `29fbd5a` (windows/amd64, git 2.55.0, the whole table, exit 0):
+**red 29, survived 0, broken 0, pending 0** - four rows more than the table had, since the
+deletion-table repair added its own.
+
+Two lead findings from the seed recon, after the repair round: history repos on Windows now pin
+`core.longpaths=true` (a live projects root holds four workspace directories over MAX_PATH, and a
+store under one would have been unstageable), and `derive --dry-run` no longer promises to
+"write nothing" - it never touched the store or the dirty marker, and its receipt row, flagged
+`dry_run`, is the compactor's contract (lint skips such rows); the cli test pins that shape.
+
+`VERSION` moves to 1.24.0 for the engines. Phase 4 wires the binary into the installer.
 
 ## v1.23.5 (2026-09-15) — an explicit empty flag clears an inherited value; prerequisites read correctly over ssh
 
