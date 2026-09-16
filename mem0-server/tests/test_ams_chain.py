@@ -218,6 +218,26 @@ def test_step_exports_mem0_url_from_authority_file(tmp_path):
     assert "url=http://x:1" in r.stdout, "an explicit MEM0_URL wins"
 
 
+def test_step_exports_the_corpus_user_from_stack_env(tmp_path):
+    """The store judge writes facts into the corpus, and the authority refuses an empty
+    partition per REQUEST: without this export every migration fails on its own while the
+    step still exits 0. Deployed 2026-09-16 with no user anywhere; found by a live run."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_WSL_USER=stackuser\n", encoding="utf-8")
+    r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "echo user=$MEM0_USER_ID"])
+    assert "user=stackuser" in r.stdout
+
+    (home / ".mem0" / "stack.env").write_text(
+        "MEM0_WSL_USER=stackuser\nMEM0_DEFAULT_USER_ID=corpususer\n", encoding="utf-8")
+    r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "echo user=$MEM0_USER_ID"])
+    assert "user=corpususer" in r.stdout, "MEM0_DEFAULT_USER_ID outranks the stack user"
+
+    r, rows, _ = _step(tmp_path, ["demo", "bash", "-c", "echo user=$MEM0_USER_ID"],
+                       env_extra={"MEM0_USER_ID": "explicit"})
+    assert "user=explicit" in r.stdout, "an explicit MEM0_USER_ID wins"
+
+
 def test_rtcwake_arm_computes_next_0245():
     r = subprocess.run([BASH, str(SCRIPTS / "ams-rtcwake-arm.sh"), "--dry-run", "02:45"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
