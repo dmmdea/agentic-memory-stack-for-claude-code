@@ -300,6 +300,14 @@ func mem0Client(env Env, f judgeApplyFlags) judge.Mem0Client {
 	if user == "" {
 		user = strings.TrimSpace(firstEnv("MEM0_USER_ID", "AMS_MEM0_USER"))
 	}
+	if user == "" {
+		// The authority refuses an empty partition per request, so a client built without a
+		// user turns every migration into its own HTTP 500 while the night still exits 0.
+		// A missing partition is the same class of misconfiguration as a missing authority
+		// and is reported the same way: once, before any write is attempted.
+		fmt.Fprintln(env.Stderr, "ams-store judge-apply: no corpus user configured; migrations will be reported as not performed")
+		return nil
+	}
 	return &judge.HTTPMem0{
 		BaseURL: url,
 		APIKey:  strings.TrimSpace(firstEnv("MEM0_API_KEY", "AMS_MEM0_KEY")),

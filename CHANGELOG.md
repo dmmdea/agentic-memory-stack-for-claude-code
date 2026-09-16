@@ -4,6 +4,33 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.26.2 — the corpus partition never reached the applier, so every migration failed on its own (register P4-1b follow-up)
+
+Found by a live run, not by a test. Against a purpose-made store and a hand-written plan, `judge-apply`
+reported `dry-run: migrated 1` and then, applying for real:
+`mem0 add: HTTP 500: {"detail":"Invalid user_id: cannot be empty or whitespace-only"}` — the fact was
+kept, the receipt named the orphan, and the verb exited 0. The authority partitions the corpus by
+`user_id`; the applier reads that partition from `MEM0_USER_ID`; **nothing in the deployed chain ever
+set it.** `ams-step.sh` resolves the authority URL for every step (`ams_env.mem0_url`) but not the
+partition, and the step unit carries the credential only. Every MIGRATE decision the nightly judge
+made would have failed one request at a time, been receipted `line kept`, and the night would have
+exited 0 — forever, with every test green.
+
+Two halves, because the wiring and the refusal are different defects:
+
+- **`ams-step.sh` exports `MEM0_USER_ID`** beside `MEM0_URL`, from `MEM0_DEFAULT_USER_ID` and then
+  `MEM0_WSL_USER` in `~/.mem0/stack.env` — the precedence `ams_env.user_id()` already uses — with an
+  explicit environment value still winning.
+- **`judge-apply` refuses to build a corpus client without a partition**, exactly as it already refuses
+  without an authority: one line on stderr, migrations reported as not performed, nothing posted. A
+  client built with an empty partition turns one misconfiguration into one failure per fact, which is
+  precisely how this stayed invisible.
+
+Three tests, each seen red against the shipped code: a fake authority proves that nothing is attempted
+when no partition is configured and that the fact survives; a second proves the configured partition
+reaches the wire as `user_id` and the migration completes; the chain test proves the export and its
+precedence.
+
 ## 1.26.1 — two reasons the nightly judge would never have written a plan (register P4-1b follow-up)
 
 Both found by reading the DEPLOYED authority minutes after 1.26.0 installed, not by any test, and both
@@ -26,21 +53,6 @@ now copies `docs/schemas/judge-plan.schema.json` into the scripts directory besi
 Each fix has a test that fails against the shipped code: one drives the phase with **nothing** in the
 environment and only the installer's `stack.env` on disk; the other asserts the copy and that the
 generated schema is checked in at all.
-
-
-
-The plan is written by `ams-step-dream.service`, whose unit carries the credentials and the judge
-transport but **not** the store variables — those were added to `ams-step-store-judge.service`, the
-applier. So the producer's environment-only lookup found nothing, the phase logged "this box holds no
-hub checkout (skipped)" and **no plan would ever have been written**: the applier would have run the
-deterministic path forever, nightly, with every test green and no failure anywhere. Found by reading
-the deployed unit on the authority right after the first live install, not by any test.
-
-`_ams_checkout_root()` and `_ams_store_bin()` now read the environment first and then `~/.mem0/stack.env`,
-the same precedence every other install value uses (`ams_env.eval_root`), and the authority installer
-records `MEM0_AMS_STORE_BIN` beside `MEM0_AMS_CHECKOUT` so the receipt names what it installed and
-where. A test drives the phase with **nothing** in the environment and only the installer's `stack.env`
-on disk; it fails against the shipped lookup.
 
 ## 1.26.0 — the hub decides: the store-judge step, the hub checkout, and a generated plan contract (register P4-1b)
 

@@ -66,6 +66,15 @@ fi
 if [ -z "${MEM0_URL:-}" ] && [ -s "$HOME/.mem0/authority-url" ]; then
     MEM0_URL="$(head -n1 "$HOME/.mem0/authority-url")"; export MEM0_URL
 fi
+# The corpus PARTITION travels with the authority (ams_env.user_id): MEM0_DEFAULT_USER_ID first,
+# then the stack's own user. The store judge is the job that needs it - it writes facts into the
+# corpus - and an empty user_id is refused by the authority per REQUEST, so without this every
+# migration fails on its own and the night still reads as green.
+if [ -z "${MEM0_USER_ID:-}" ] && [ -s "$HOME/.mem0/stack.env" ]; then
+    MEM0_USER_ID="$(sed -n 's/^MEM0_DEFAULT_USER_ID=//p' "$HOME/.mem0/stack.env" | head -n1)"
+    [ -n "$MEM0_USER_ID" ] || MEM0_USER_ID="$(sed -n 's/^MEM0_WSL_USER=//p' "$HOME/.mem0/stack.env" | head -n1)"
+    [ -n "$MEM0_USER_ID" ] && export MEM0_USER_ID
+fi
 # $EPOCHREALTIME (bash >= 5) in microseconds: `date +%s%3N` is GNU-only; the uutils coreutils
 # shipped on Ubuntu 26.04 ignores the width and prints nanoseconds (first live chain run
 # receipted 1,834,879,975 ms for a 2 s step).
