@@ -232,6 +232,10 @@ ENV
     # P4-1b: same inherit rule for the store hub's checkout and remote.
     [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_CHECKOUT=%s\n' "$AMS_CHECKOUT" >> "$MEM0_DIR/stack.env"
     [ -z "$AMS_HUB" ] || printf 'MEM0_AMS_HUB=%s\n' "$AMS_HUB" >> "$MEM0_DIR/stack.env"
+    # The producer (the dream's store-judge phase) reads BOTH from here: its own unit carries
+    # the credentials and the transport but not the store variables, so an environment-only
+    # lookup skipped the phase every night and no plan was ever written.
+    [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_STORE_BIN=%s\n' "/usr/local/bin/ams-store" >> "$MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi

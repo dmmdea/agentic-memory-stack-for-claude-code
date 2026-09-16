@@ -4,6 +4,21 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.26.1 — the store-judge phase finds the checkout through stack.env (register P4-1b follow-up)
+
+The plan is written by `ams-step-dream.service`, whose unit carries the credentials and the judge
+transport but **not** the store variables — those were added to `ams-step-store-judge.service`, the
+applier. So the producer's environment-only lookup found nothing, the phase logged "this box holds no
+hub checkout (skipped)" and **no plan would ever have been written**: the applier would have run the
+deterministic path forever, nightly, with every test green and no failure anywhere. Found by reading
+the deployed unit on the authority right after the first live install, not by any test.
+
+`_ams_checkout_root()` and `_ams_store_bin()` now read the environment first and then `~/.mem0/stack.env`,
+the same precedence every other install value uses (`ams_env.eval_root`), and the authority installer
+records `MEM0_AMS_STORE_BIN` beside `MEM0_AMS_CHECKOUT` so the receipt names what it installed and
+where. A test drives the phase with **nothing** in the environment and only the installer's `stack.env`
+on disk; it fails against the shipped lookup.
+
 ## 1.26.0 — the hub decides: the store-judge step, the hub checkout, and a generated plan contract (register P4-1b)
 
 The nightly judge the fleet-store design promised is wired. `dream-consolidate.py` gains a **store

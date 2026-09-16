@@ -478,13 +478,26 @@ Pullable facts (MIGRATE or KEEP):
 
 def _ams_store_bin() -> str:
     """The store binary the authority installer put in /usr/local/bin."""
-    return (os.environ.get("AMS_STORE_BIN") or "/usr/local/bin/ams-store").strip()
+    return (os.environ.get("AMS_STORE_BIN")
+            or ams_env.stack_env().get("MEM0_AMS_STORE_BIN")
+            or "/usr/local/bin/ams-store").strip()
 
 
 def _ams_checkout_root() -> str:
     """The hub's own checkout: <root>/projects is the work tree, <root>/state the state root
-    (holding role=hub). Empty means this box has no checkout and the phase is a no-op."""
-    return (os.environ.get("AMS_STORE_CHECKOUT") or "").strip()
+    (holding role=hub). Empty means this box has no checkout and the phase is a no-op.
+
+    The environment wins, then stack.env - the same precedence as every other install value
+    (see ams_env.eval_root). Reading stack.env is what makes this work AT ALL under the
+    nightly chain: the plan is written by ams-step-dream.service, whose unit carries the
+    credentials and the transport but not the store variables, so an env-only lookup skipped
+    the phase every night and no plan was ever written - the applier would have run the
+    deterministic path forever with every test green. Found by reading the deployed unit
+    after the first live install, not by any test.
+    """
+    return (os.environ.get("AMS_STORE_CHECKOUT")
+            or ams_env.stack_env().get("MEM0_AMS_CHECKOUT")
+            or "").strip()
 
 
 def _plan_schema_path() -> Path | None:
