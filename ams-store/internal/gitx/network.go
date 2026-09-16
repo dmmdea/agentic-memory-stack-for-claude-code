@@ -38,11 +38,13 @@ func NetworkEnv(stateRoot string) []string {
 	return []string{"GIT_SSH_COMMAND=" + SSHCommand(stateRoot)}
 }
 
+// quoteForSSH makes a path survive the shell git runs GIT_SSH_COMMAND through. Always
+// single-quoted: an unquoted Windows path loses every backslash to `sh -c` (the first live
+// hub push read a known_hosts that did not exist and strict checking refused the hub), and
+// double quotes would still let the shell interpret backslashes and dollars. A single quote
+// inside the path is closed, escaped and reopened, which is the one form sh accepts.
 func quoteForSSH(p string) string {
-	if !strings.ContainsAny(p, " \t") {
-		return p
-	}
-	return `"` + p + `"`
+	return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
 }
 
 // networkVerbs are the git subcommands that open a socket. `remote` is here for its

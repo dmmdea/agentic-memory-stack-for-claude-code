@@ -4,6 +4,17 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## Unreleased - ams-store: the known_hosts path survives the shell git runs ssh through
+
+The first live push to the hub (the P3-4 seed, minutes after 1.24.0 merged) failed with "No ED25519
+host key is known" although the state-root known_hosts held the right key: `gitx.SSHCommand` quoted the
+`UserKnownHostsFile` path only when it contained a space, git hands `GIT_SSH_COMMAND` to `sh -c`, and the
+shell ate every backslash of the Windows path, so ssh read a file that does not exist. The path is now
+always single-quoted (an embedded quote is closed, escaped and reopened), pinned by a test that runs the
+emitted option through `sh -c` and asserts the shell hands ssh the exact path - with backslashes, spaces
+and a quote. The fleet tests never saw it because their remotes are local paths and ssh never runs. No
+runtime or version change; the binary is rebuilt from this commit.
+
 ## 1.24.0 — ams-store engines (System A store client, register P3-1/P3-2)
 
 The Go rewrite of the auto-memory store library, write gate and nightly compactor begins
