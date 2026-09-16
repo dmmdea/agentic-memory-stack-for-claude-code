@@ -334,21 +334,34 @@ func TestCLI_HarvestScopedToOneStoreWritesHooksAndNoIndex(t *testing.T) {
 	}
 }
 
-// A dry run reports and writes NOTHING - the help text promises it. The receipts ledger is
-// what lint's compactor-silent and starved rules read, so a dry-run row there would let a
-// rehearsal pass for a real run (2026-09-15: a --dry-run against a live store appended a
-// row to the operator's compact-receipts.jsonl). The dirty marker is a write too: it wakes
-// the watcher into a sync pass the dry run never earned.
-func TestCLI_DeriveDryRunWritesNoReceiptAndNoDirtyMarker(t *testing.T) {
+// A dry run leaves the store and the dirty marker alone but still appends its receipt row,
+// flagged dry_run, because the ledger is the audit trail of every run - rehearsals included
+// (MemoryCompactRobustness.Tests.ps1:265) - and lint skips dry_run rows when it judges
+// whether the maintainer is silent or starved. The help text used to promise "write
+// nothing"; the row is the one write a dry run makes, and this pins that it is flagged.
+func TestCLI_DeriveDryRunTouchesOnlyTheFlaggedReceipt(t *testing.T) {
 	sb := sandboxStore(t, plainIndex(), plainFacts())
 
 	args := append(deriveArgs(sb), "--dry-run")
 	if code, _, _ := run(t, args...); code != cli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	for _, rel := range []string{"compact-receipts.jsonl", "dirty"} {
-		if _, err := os.Stat(filepath.Join(sb.StateRoot, rel)); err == nil {
-			t.Errorf("a dry run wrote %s; --dry-run promises to write nothing", rel)
-		}
+	if _, err := os.Stat(filepath.Join(sb.StateRoot, "dirty")); err == nil {
+		t.Errorf("a dry run touched the dirty marker; that wakes the watcher into a pass it never earned")
+	}
+	b, err := os.ReadFile(filepath.Join(sb.StateRoot, "compact-receipts.jsonl"))
+	if err != nil {
+		t.Fatalf("a dry run must still append its flagged receipt row: %v", err)
+	}
+	rows := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(rows) != 1 {
+		t.Fatalf("receipt rows = %d, want exactly one", len(rows))
+	}
+	var row map[string]any
+	if err := json.Unmarshal([]byte(rows[0]), &row); err != nil {
+		t.Fatalf("receipt is not JSON (%v): %s", err, rows[0])
+	}
+	if row["dry_run"] != true || row["status"] != "dry-run" {
+		t.Errorf("dry_run=%v status=%v; lint can only skip a rehearsal row it can recognise", row["dry_run"], row["status"])
 	}
 }

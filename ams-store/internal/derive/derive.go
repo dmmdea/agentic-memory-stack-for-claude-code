@@ -765,11 +765,6 @@ func touchDirty(opt Options, logf func(string, ...any)) {
 // mtime, so a failure here otherwise masquerades as "the maintainer is dead" and sends the
 // operator to the wrong subsystem.
 func writeReceipt(opt Options, res *Result, logf func(string, ...any)) {
-	if opt.DryRun {
-		// A dry run writes NOTHING, and the ledger is a write: lint reads it for the
-		// compactor-silent and starved rules, so a rehearsal row would pass for a run.
-		return
-	}
 	path := opt.ReceiptPath
 	if path == "" {
 		if opt.Roots.StateRoot == "" {

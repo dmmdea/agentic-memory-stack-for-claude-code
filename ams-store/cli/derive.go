@@ -21,7 +21,8 @@ index atomically as LF.
   --store <dir>          one store (the memory directory) instead of every store
   --all                  every populated store under the projects root
   --workspace <slug>     restrict to one workspace slug
-  --dry-run              report what would change; write nothing
+  --dry-run              report what would change; the store stays untouched and the
+                         receipt row is flagged dry_run
   --json                 one JSON document on stdout, nothing else
   --no-harvest           skip the frontmatter harvest step
   --engage-at <bytes>    floor engage threshold (default: the harness sync limit)
@@ -69,7 +70,7 @@ func runDerive(env Env, args []string) int {
 	fs.StringVar(&storeDir, "store", "", "one store (the memory directory)")
 	fs.BoolVar(&all, "all", false, "every populated store under the projects root")
 	fs.StringVar(&workspace, "workspace", "", "restrict to one workspace slug")
-	fs.BoolVar(&dryRun, "dry-run", false, "report what would change; write nothing")
+	fs.BoolVar(&dryRun, "dry-run", false, "report what would change; the store stays untouched, the receipt row is flagged dry_run")
 	fs.BoolVar(&noHarvest, "no-harvest", false, "skip the frontmatter harvest step")
 	fs.IntVar(&stopBelow, "stop-below", 0, "floor stop threshold in bytes")
 	fs.IntVar(&engageAt, "engage-at", 0, "floor engage threshold in bytes")
