@@ -717,3 +717,33 @@ func TestDerive_MissingIndexIsRenderedFromTheFactFiles(t *testing.T) {
 		t.Errorf("second derive status = %q, want no-op: the render must be a fixed point (note %q)", res2.Status, res2.Note)
 	}
 }
+
+// The fresh-checkout path must not weaken the compare-and-swap: a store that had NO index
+// when the run began, and that gains a real one mid-run, is a live session writing under
+// the job and must abort with the concurrent write intact. (An EMPTY index appearing is
+// deliberately not an abort: Hash(nil) is the empty-file hash, and rendering over zero
+// bytes clobbers nothing - the same outcome as an index that was empty at read time.)
+func TestDerive_MissingIndexStillAbortsOnAConcurrentWrite(t *testing.T) {
+	e := newEnv(t, "fresh-cas",
+		[]string{"# Memory Index", ""},
+		map[string]string{"a.md": factWithHook("a", "desc a", "hook a")})
+	if err := os.Remove(e.st.IndexPath); err != nil {
+		t.Fatal(err)
+	}
+	live := "# Memory Index\n\n- [Written by a live session](a.md) " + emDash + " mid-run\n"
+	mutate := &fakeCommits{onCall: func() {
+		if err := os.WriteFile(e.st.IndexPath, []byte(live), 0o644); err != nil {
+			t.Fatalf("write index mid-run: %v", err)
+		}
+	}}
+	res, err := e.run(func(o *Options) { o.Commits = mutate })
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedConcurrent {
+		t.Errorf("status = %q, want %q: an index that appears mid-run is a live session", res.Status, StatusAbortedConcurrent)
+	}
+	if got := e.indexText(); got != live {
+		t.Errorf("the concurrent write was clobbered; an abort must never roll back over a live session:\n%q", got)
+	}
+}
