@@ -380,9 +380,15 @@ nightly consolidator's `store judge` phase, which runs between the autonomous
 promotion and the prune. For each store in the hub's checkout it asks the binary
 for the offer set — `judge-apply --candidates --json`, which already excludes
 doctrine and already-sealed lines — and calls the judge once per store that has
-something to decide. A store with an empty offer set is `outcome: empty` with no
-call at all; a call that fails is `unavailable`; output that will not parse is
-`parse_fail`. Decisions naming a slug the offer set did not contain, repeating a
+something to decide. A store with an empty offer set is `outcome: ok` with **no
+decisions and no call at all** — a judge that kept everything is a successful plan,
+and the applier receipts it as `no-op`. (`empty` is reserved for a call that
+answered with whitespace, which on an over-trigger store the applier correctly
+records as `skipped-judge-unavailable`: an unproductive night. Using it for "nothing
+was offered" would have reported healthy stores as failing judges, and lint's
+`compactor-unproductive` watchdog counts exactly that — found by rehearsing the
+wrapper against the real binary before shipping.) A call that fails is
+`unavailable`; output that will not parse is `parse_fail`. Decisions naming a slug the offer set did not contain, repeating a
 slug, or carrying the wrong fields for their verb are dropped by the producer, so
 one bad line cannot make the applier refuse the whole file and take every other
 store's decisions with it. The plan is validated against the generated schema

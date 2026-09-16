@@ -396,9 +396,15 @@ def test_store_judge_is_skipped_when_the_box_holds_no_checkout(home, monkeypatch
     assert len(j.calls) == 3, "the store judge must not spend a call on a box with no checkout"
 
 
-def test_store_judge_empty_offer_set_is_an_outcome_not_a_judge_call(home, monkeypatch):
-    """Nothing over the cap and nothing pullable is a successful, unproductive night: a call
-    here would spend budget to be told KEEP."""
+def test_store_judge_empty_offer_set_is_ok_with_no_decisions_and_no_judge_call(home, monkeypatch):
+    """Nothing over the cap and nothing pullable is a successful night with no call.
+
+    The outcome must be `ok`, not `empty`. Measured against the applier on 2026-09-16:
+    `empty` means "a call answered with whitespace", and on a store that IS over the trigger
+    the applier receipts that as skipped-judge-unavailable - an unproductive night, which is
+    what lint's compactor-unproductive watchdog counts. `ok` with no decisions receipts as
+    no-op and keeps the producer's note.
+    """
     m = _mod()
     _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]},
                      lambda ws: {"workspace": ws, "shorten": [], "migrate": []})
@@ -407,9 +413,23 @@ def test_store_judge_empty_offer_set_is_an_outcome_not_a_judge_call(home, monkey
     plan = _plan(home)
     assert plan["version"] == 1 and len(plan["stores"]) == 1
     assert plan["stores"][0]["workspace"] == "ws-a"
-    assert plan["stores"][0]["outcome"] == "empty"
+    assert plan["stores"][0]["outcome"] == "ok", "a store with nothing offered is not a failed judge call"
+    assert plan["stores"][0]["note"] == "nothing over the cap and nothing pullable"
     assert plan["stores"][0]["decisions"] == []
     assert len(j.calls) == 3, "no judge call for a store with nothing to decide"
+    assert m.validate_plan(plan) == ""
+
+
+def test_store_judge_whitespace_answer_is_empty_not_parse_fail(home, monkeypatch):
+    """A call that answered with nothing and a call whose output will not parse are different
+    facts with different receipts on the applier's side, so the producer keeps them apart."""
+    m = _mod()
+    offers = {"workspace": "ws-a", "shorten": [OFFER_A], "migrate": []}
+    _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]}, lambda ws: offers)
+    _run(m, [], mem0=FakeMem0(EV), judge=_judge(SIG, INS, "[]", "   \n  "))
+    plan = _plan(home)
+    assert plan["stores"][0]["outcome"] == "empty"
+    assert plan["stores"][0]["decisions"] == []
     assert m.validate_plan(plan) == ""
 
 

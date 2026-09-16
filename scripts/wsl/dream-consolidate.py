@@ -751,7 +751,15 @@ class Dream:
             if not shorten and not migrate:
                 # Nothing to decide is not a failed night: the deterministic work already
                 # holds this store, and a judge call here would spend budget to say KEEP.
-                stores.append({"workspace": ws, "outcome": "empty",
+                #
+                # The outcome is `ok` with no decisions, NOT `empty`. Measured against the
+                # applier on 2026-09-16: `empty` means "a call answered with whitespace", and
+                # on a store that IS over the trigger the applier receipts that as
+                # skipped-judge-unavailable - an unproductive night, which is what lint's
+                # compactor-unproductive watchdog counts. A store with nothing offered is a
+                # judge that kept everything, which is a successful plan; it receipts as
+                # no-op and keeps this note.
+                stores.append({"workspace": ws, "outcome": "ok",
                                "note": "nothing over the cap and nothing pullable", "decisions": []})
                 continue
             called += 1
@@ -762,7 +770,16 @@ class Dream:
                 stores.append({"workspace": ws, "outcome": "unavailable",
                                "note": f"judge failed: {r.get('error_type')}", "decisions": []})
                 continue
-            parsed = extract_json(r.get("response", ""), "decisions")
+            # A call that answered with whitespace and a call whose output will not parse are
+            # different facts with different receipts on the applier's side, so they are not
+            # collapsed here: `empty` is the first, `parse_fail` the second.
+            raw = str(r.get("response") or "")
+            if not raw.strip():
+                log(f"  store-judge {ws}: the judge returned nothing")
+                stores.append({"workspace": ws, "outcome": "empty",
+                               "note": "the judge call succeeded and returned nothing", "decisions": []})
+                continue
+            parsed = extract_json(raw, "decisions")
             if parsed is None:
                 log(f"  store-judge {ws}: malformed JSON from the judge")
                 stores.append({"workspace": ws, "outcome": "parse_fail",
