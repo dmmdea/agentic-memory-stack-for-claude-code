@@ -91,6 +91,7 @@ func runHarvest(env Env, args []string) int {
 			// Decision Q8: the id comes from the judge's deletion commit, so harvest is
 			// where a re-created slug gets its `migrated:` key back.
 			Migrated: newMigratedLookup(roots),
+			Deleted:  newDeletedLookup(roots),
 			Log:      env.Stderr,
 		})
 		if res != nil {

@@ -4,6 +4,19 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.3 — the blast cap also exempts pointers to files the history deleted on purpose
+
+1.28.2 exempted dangling pointers whose slug carries a `Migrated:` trailer. The same shape
+arises without a trailer: a hand re-home of a store's doctrine into topic files deletes a
+hundred single-fact files in one commit, and every PC then holds a hundred dangling pointers
+over its 20 % cap — the clean-up hygiene would refuse on every pass, on every PC, forever. A
+file that a commit in the shared history deleted and that is absent at HEAD is a decision
+already made and synced, not a wipe in progress, so those pointers no longer count either
+(receipt field `dedangled_history_deleted`; an abort's note reports the exempt total). The
+lookup fails closed: a file still present at HEAD, a missing history, or any error counts. The
+wipe-protection the cap exists for is unchanged, because an unreadable directory has no
+deletion commits.
+
 ## 1.28.2 — the blast cap no longer refuses the judge's own deletions (register P4-4, night 1)
 
 The second thing night 1 found on the PCs. The hub judge may delete up to 20 % of a store's entries

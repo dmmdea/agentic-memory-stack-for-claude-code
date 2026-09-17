@@ -186,6 +186,14 @@ func (f *fakeMigrated) MigratedID(_ store.Store, slug string) (string, bool, err
 	return id, ok, nil
 }
 
+// fakeDeleted is the deletion half of the blast cap's evidence rule: the slugs a commit
+// in the history removed. The judge task implements the real one over git.
+type fakeDeleted struct{ gone map[string]bool }
+
+func (f *fakeDeleted) DeletedInHistory(_ string, slug string) (bool, error) {
+	return f.gone[slug], nil
+}
+
 // heldLock is a lock another process already owns.
 type heldLock struct{ asked int }
 
