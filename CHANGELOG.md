@@ -4,6 +4,23 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.2 — the blast cap no longer refuses the judge's own deletions (register P4-4, night 1)
+
+The second thing night 1 found on the PCs. The hub judge may delete up to 20 % of a store's entries
+in one night — its own blast cap. A PC receives those deletions as files vanishing under an index
+that still points at them, and its hygiene pass drops the dangling pointers, bounded by the same
+20 % — of the *smaller* entry count that is left. Whenever the night removed more than about a
+sixth of the store, the PC's count exceeded its cap on every pass, and hygiene refused forever:
+16 pointers over a 14-line cap on one store, 2 over a 1-line cap on a five-line store, both
+`aborted-blast-cap` at every sync.
+
+A dangling pointer whose slug carries a `Migrated:` trailer in the history is a decision the judge
+already made and verified (write-then-verify into the corpus), not evidence of a store being gutted.
+Hygiene now looks each dangling slug up through the same history lookup that stamps `migrated:`,
+and those pointers no longer count against the cap; the receipt reports them as `dedangled_migrated`
+and an abort's note says how many were exempt. The lookup fails closed: no trailer, or an unreadable
+history, still counts, and the pre-existing abort on a mass-dangling index is unchanged.
+
 ## 1.28.1 — a harvest stamp no longer resurrects a queued deletion (register P4-4, night 1)
 
 The first night of the P4-4 metric found the judge's migrations being undone by the PC that

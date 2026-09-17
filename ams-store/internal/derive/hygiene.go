@@ -52,6 +52,11 @@ type HygieneResult struct {
 	Reindexed     int
 	LeftUnindexed []string
 	Note          string
+	// Dangling names the entries pass B dropped because their file is gone - the
+	// LINE removals, as opposed to the dead-extra-link repairs Dedangled also counts.
+	// The blast cap reads it to tell a wipe in progress from the judge's migrations
+	// arriving: a slug the history says was migrated is not counted against the cap.
+	Dangling []string
 }
 
 var (
@@ -110,6 +115,7 @@ func Hygiene(in HygieneInput) *HygieneResult {
 				continue
 			}
 			res.Dedangled++
+			res.Dangling = append(res.Dangling, r.Slug)
 			continue
 		}
 		seen[r.Slug] = true
