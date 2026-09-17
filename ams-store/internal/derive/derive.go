@@ -354,12 +354,17 @@ func Run(opt Options) (*Result, error) {
 	cap := BlastCap(len(entries))
 	if removals := res.Dedangled - res.DedangledMigrated + res.DedupSlug; removals > cap {
 		res.Status = StatusAbortedBlastCap
-		exempt := ""
+		// The note names the TRUE removal count first, then what counted: a reader must
+		// not mistake the post-exemption figure for what hygiene wanted to do.
+		wanted := strconv.Itoa(res.Dedangled + res.DedupSlug)
 		if res.DedangledMigrated > 0 {
-			exempt = " (" + strconv.Itoa(res.DedangledMigrated) + " more point at migrated facts and are exempt)"
+			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), "+strconv.Itoa(res.DedangledMigrated)+
+				" of them pointers to migrated facts and exempt; "+strconv.Itoa(removals)+" count against the "+
+				strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
+		} else {
+			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), over the "+
+				strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
 		}
-		res.Note = addNote(res.Note, "hygiene wanted to remove "+strconv.Itoa(removals)+" line(s)"+exempt+", over the "+
-			strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
 		logf("%s", res.Note)
 		writeReceipt(opt, res, logf)
 		return res, nil

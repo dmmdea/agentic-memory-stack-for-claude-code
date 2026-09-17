@@ -179,7 +179,7 @@ func TestHygiene_BlastCapExemptsMigratedDanglingPointers(t *testing.T) {
 	if res.Status != StatusAbortedBlastCap {
 		t.Fatalf("status = %q, want %q", res.Status, StatusAbortedBlastCap)
 	}
-	if !strings.Contains(res.Note, "19 line(s) (11 more point at migrated facts and are exempt)") {
+	if !strings.Contains(res.Note, "remove 30 line(s), 11 of them pointers to migrated facts and exempt; 19 count against the 18-line cap") {
 		t.Errorf("note does not separate the exempt pointers: %s", res.Note)
 	}
 
