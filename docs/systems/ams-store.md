@@ -150,7 +150,11 @@ ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-ru
    re-index. The repair pass is the one the design's table omits and the shipped
    compactor performs; without it the post-write ghost check fails forever;
 6. abort on a planned entry ghost, before anything is written;
-7. abort when hygiene's removals exceed the blast cap, `max(1, floor(entries * 0.2))`;
+7. abort when hygiene's removals exceed the blast cap, `max(1, floor(entries * 0.2))` -
+   a dangling pointer whose slug carries a `Migrated:` trailer in the history is exempt
+   from that count (the receipt's `dedangled_migrated`): the judge's night may remove up to
+   20 % of a store, and a PC then holds that many pointers over a smaller entry count, so
+   counting them refused the clean-up on every pass; the lookup fails closed;
 8. render: fixed heading, doctrine first, then by the commit time of each file's
    last change (one `git log --format=%ct --name-only` pass, never one exec per
    file), slug as tiebreak, always LF;
@@ -459,7 +463,7 @@ uses, so what may be judged and what may be applied are one implementation.
 | round-trip | the rewritten line must re-parse to the same slug set; a markdown link in a hook injects a phantom slug hygiene can never remove |
 | the seal | `sealed-lines.json` — one judge rewrite per line, ever |
 | write-then-verify | a fact file is deleted only after a byte-equal read-back **by id**; an unverifiable write is undone, and a record the server reports as deduplicated is never deleted |
-| blast cap | at most 20 % of the entries may be removed in one run; `--max-migrations` (default 5) additionally bounds the judge's own migrations |
+| blast cap | at most 20 % of the entries may be removed in one run, not counting dangling pointers to facts the history says were migrated; `--max-migrations` (default 5) additionally bounds the judge's own migrations |
 | protected-set overflow | when doctrine alone exceeds the budget the run reports `protected-set-overflow` and stops rather than loosen the hard rule |
 | the 20 h window | one judge attempt per store, computed from `judge_called` in the receipts ledger, never from a timer or a stamp file; `--force` bypasses that and nothing else |
 

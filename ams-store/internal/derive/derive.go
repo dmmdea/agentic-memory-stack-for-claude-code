@@ -129,29 +129,33 @@ type Result struct {
 	Status      string `json:"status"`
 	// Shortened and Migrated are always zero for derive; they stay in the shape so a
 	// receipt reader cannot tell the two writers apart by field set alone.
-	Shortened            int      `json:"shortened"`
-	Migrated             int      `json:"migrated"`
-	Reindexed            int      `json:"reindexed"`
-	Dedangled            int      `json:"dedangled"`
-	DedupSlug            int      `json:"dedup_slug"`
-	Floored              int      `json:"floored"`
-	LineFloored          int      `json:"line_floored"`
-	Mem0                 []string `json:"mem0"`
-	Mem0Orphan           []string `json:"mem0_orphan"`
-	AfterBytes           *int     `json:"after_bytes"`
-	AfterLines           *int     `json:"after_lines"`
-	Commit               *string  `json:"commit"`
-	Snapshot             *string  `json:"snapshot"`
-	Note                 string   `json:"note"`
-	SkipStreak           int      `json:"skip_streak"`
-	LivenessOverride     bool     `json:"liveness_override"`
-	JudgeCalled          bool     `json:"judge_called"`
-	Harvested            int      `json:"harvested"`
-	MigratedStamped      int      `json:"migrated_stamped"`
-	OverInjectLimit      int      `json:"over_inject_limit"`
-	ProtectedSetOverflow bool     `json:"protected_set_overflow"`
-	Unconverged          bool     `json:"unconverged"`
-	Changed              bool     `json:"changed"`
+	Shortened        int      `json:"shortened"`
+	Migrated         int      `json:"migrated"`
+	Reindexed        int      `json:"reindexed"`
+	Dedangled        int      `json:"dedangled"`
+	DedupSlug        int      `json:"dedup_slug"`
+	Floored          int      `json:"floored"`
+	LineFloored      int      `json:"line_floored"`
+	Mem0             []string `json:"mem0"`
+	Mem0Orphan       []string `json:"mem0_orphan"`
+	AfterBytes       *int     `json:"after_bytes"`
+	AfterLines       *int     `json:"after_lines"`
+	Commit           *string  `json:"commit"`
+	Snapshot         *string  `json:"snapshot"`
+	Note             string   `json:"note"`
+	SkipStreak       int      `json:"skip_streak"`
+	LivenessOverride bool     `json:"liveness_override"`
+	JudgeCalled      bool     `json:"judge_called"`
+	Harvested        int      `json:"harvested"`
+	MigratedStamped  int      `json:"migrated_stamped"`
+	// DedangledMigrated is how many of the dangling pointers hygiene dropped point at
+	// a slug the history says the judge migrated. They are inside Dedangled, and they
+	// are the removals the blast cap does not count.
+	DedangledMigrated    int  `json:"dedangled_migrated"`
+	OverInjectLimit      int  `json:"over_inject_limit"`
+	ProtectedSetOverflow bool `json:"protected_set_overflow"`
+	Unconverged          bool `json:"unconverged"`
+	Changed              bool `json:"changed"`
 }
 
 // Run derives one store's MEMORY.md, following the step order of blueprint section 3.1.
@@ -339,11 +343,28 @@ func Run(opt Options) (*Result, error) {
 	}
 
 	// ---- 7. blast cap over ALL removals ----------------------------------------------
+	// A dangling pointer whose slug the history says the judge MIGRATED is not a wipe in
+	// progress: the fact is in the corpus (write-then-verify) and its file left by a
+	// commit every PC receives. The hub's own cap lets one night remove up to 20 % of a
+	// store's entries; a PC then holds that many dangling pointers over a SMALLER entry
+	// count, so counting them here refused the clean-up on every pass, forever (2026-09-17:
+	// 16 pointers over a 14-line cap, and 2 over a 1-line cap on a five-line store). The
+	// lookup fails closed - a slug with no trailer, or an unreadable history, still counts.
+	res.DedangledMigrated = migratedDangling(opt, hy.Dangling, logf)
 	cap := BlastCap(len(entries))
-	if removals := res.Dedangled + res.DedupSlug; removals > cap {
+	if removals := res.Dedangled - res.DedangledMigrated + res.DedupSlug; removals > cap {
 		res.Status = StatusAbortedBlastCap
-		res.Note = addNote(res.Note, "hygiene wanted to remove "+strconv.Itoa(removals)+" line(s), over the "+
-			strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
+		// The note names the TRUE removal count first, then what counted: a reader must
+		// not mistake the post-exemption figure for what hygiene wanted to do.
+		wanted := strconv.Itoa(res.Dedangled + res.DedupSlug)
+		if res.DedangledMigrated > 0 {
+			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), "+strconv.Itoa(res.DedangledMigrated)+
+				" of them pointers to migrated facts and exempt; "+strconv.Itoa(removals)+" count against the "+
+				strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
+		} else {
+			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), over the "+
+				strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
+		}
 		logf("%s", res.Note)
 		writeReceipt(opt, res, logf)
 		return res, nil
@@ -669,6 +690,31 @@ func harvestReindexed(dir string, keep []*index.Record, res *Result, logf func(s
 			res.Harvested++
 		}
 	}
+}
+
+// migratedDangling counts the dangling pointers whose slug carries a migration trailer in
+// the history: removals that consume a decision the judge already made rather than
+// evidence of a store being gutted. Without a lookup nothing is explained, and a lookup
+// error explains nothing either - the cap must fail closed.
+func migratedDangling(opt Options, slugs []string, logf func(string, ...any)) int {
+	if opt.Migrated == nil || len(slugs) == 0 {
+		return 0
+	}
+	n := 0
+	for _, slug := range slugs {
+		id, ok, err := opt.Migrated.MigratedID(opt.Store, slug)
+		if err != nil {
+			logf("migrated lookup %s: %v", slug, err)
+			continue
+		}
+		if ok && id != "" {
+			n++
+		}
+	}
+	if n > 0 {
+		logf("%d dangling pointer(s) name migrated facts; not counted against the blast cap", n)
+	}
+	return n
 }
 
 // stampMigrated is decision Q8's consumer.

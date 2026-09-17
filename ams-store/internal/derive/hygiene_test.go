@@ -122,6 +122,79 @@ func TestHygiene_BlastCapBoundary(t *testing.T) {
 
 // BlastCap is max(1, floor(entries*0.2)): a store with four entries may still lose one, or
 // a tiny store could never be repaired at all.
+// TestHygiene_BlastCapExemptsMigratedDanglingPointers pins the 2026-09-17 finding. The hub
+// judge may delete up to 20 % of a store's entries in one night; the PC then holds that
+// many dangling pointers over a SMALLER entry count, so counting them against its own 20 %
+// cap refused the clean-up on every pass (16 pointers over a 14-line cap, 2 over a 1-line
+// cap). A pointer whose slug the history says was migrated consumes a decision already
+// made and verified; it is not evidence of a wipe and does not count. The lookup fails
+// closed: without one, the same index still aborts.
+func TestHygiene_BlastCapExemptsMigratedDanglingPointers(t *testing.T) {
+	build := func() ([]string, map[string]string) {
+		lines := bigIndexLines(60)
+		for i := 1; i <= 30; i++ {
+			lines = append(lines, fmt.Sprintf("- [Gone %d](missing%d.md) %s dangling", i, i, emDash))
+		}
+		return lines, bigIndexFacts(60)
+	}
+	migrated := func(n int) *fakeMigrated {
+		ids := map[string]string{}
+		for i := 1; i <= n; i++ {
+			ids[fmt.Sprintf("missing%d.md", i)] = fmt.Sprintf("id-%d", i)
+		}
+		return &fakeMigrated{ids: ids}
+	}
+
+	// 90 entries before hygiene (60 live + 30 dangling) give a cap of 18. 30 removals with
+	// 25 explained by trailers leave 5 unexplained -> applied, and ALL 30 pointers go, not
+	// only the explained ones; the plain 30 would have aborted (the test at the top).
+	lines, facts := build()
+	e := newEnv(t, "ws", lines, facts)
+	res, err := e.run(func(o *Options) { o.Migrated = migrated(25) })
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusApplied {
+		t.Fatalf("status = %q, want %q (note: %s)", res.Status, StatusApplied, res.Note)
+	}
+	if res.Dedangled != 30 || res.DedangledMigrated != 25 {
+		t.Errorf("dedangled = %d / dedangled_migrated = %d, want 30 / 25", res.Dedangled, res.DedangledMigrated)
+	}
+	if strings.Contains(e.indexText(), "missing") {
+		t.Error("a dangling pointer survived the applied run")
+	}
+	rows := e.receipts()
+	if got := rows[len(rows)-1]["dedangled_migrated"]; got != float64(25) {
+		t.Errorf("receipt dedangled_migrated = %v, want 25", got)
+	}
+
+	// The boundary: 30 removals with 11 explained leaves 19 > 18 -> still refused, and the
+	// note says how many were exempt so the reader can tell the two causes apart.
+	lines, facts = build()
+	e = newEnv(t, "ws", lines, facts)
+	res, err = e.run(func(o *Options) { o.Migrated = migrated(11) })
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedBlastCap {
+		t.Fatalf("status = %q, want %q", res.Status, StatusAbortedBlastCap)
+	}
+	if !strings.Contains(res.Note, "remove 30 line(s), 11 of them pointers to migrated facts and exempt; 19 count against the 18-line cap") {
+		t.Errorf("note does not separate the exempt pointers: %s", res.Note)
+	}
+
+	// Fail closed: no lookup wired means nothing is explained (the pre-existing abort).
+	lines, facts = build()
+	e = newEnv(t, "ws", lines, facts)
+	res, err = e.run()
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedBlastCap || res.DedangledMigrated != 0 {
+		t.Errorf("without a lookup: status = %q, dedangled_migrated = %d; want abort and 0", res.Status, res.DedangledMigrated)
+	}
+}
+
 func TestHygiene_BlastCapNeverZero(t *testing.T) {
 	for _, tc := range []struct{ entries, want int }{{0, 1}, {1, 1}, {4, 1}, {5, 1}, {10, 2}, {112, 22}, {113, 22}} {
 		if got := BlastCap(tc.entries); got != tc.want {
