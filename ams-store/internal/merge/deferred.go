@@ -1,7 +1,6 @@
 package merge
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -219,6 +218,13 @@ func (e *Engine) ApplyDeferred(ctx context.Context, workspace string, mo Materia
 // It fails CLOSED in both directions that matter: an entry with no recorded ours-blob
 // (queued by an older build, or queued for a path that was not on disk) is treated as
 // CHANGED, because "I do not know what was there" must never authorise an overwrite.
+//
+// The comparison is the deletion table's NORMALIZED one, not byte equality. Between the
+// merge and the drain the PC's own derive runs, and derive writes fact files: it harvests
+// `hook:` and stamps `migrated:` (the id arrives in the very merge that queued the
+// deletion). Neither is a session's edit, and a byte comparison read them as one - every
+// queued deletion came back "resurrected" and the judge's migrations were undone on the
+// next push (2026-09-17, nineteen files on one PC). Only a difference Canon keeps counts.
 func (e *Engine) diskStillHoldsQueuedBytes(ctx context.Context, ent DeferredEntry, disk []byte, diskErr error) (bool, error) {
 	if diskErr != nil || ent.OursBlob == "" {
 		return false, nil
@@ -227,7 +233,7 @@ func (e *Engine) diskStillHoldsQueuedBytes(ctx context.Context, ent DeferredEntr
 	if err != nil {
 		return false, err
 	}
-	return bytes.Equal(queued, disk), nil
+	return NormalizedEqual(queued, disk), nil
 }
 
 // reconcileLaterEdit merges the session's later edit with the merged blob the queue was

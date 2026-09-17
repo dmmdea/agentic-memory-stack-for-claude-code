@@ -4,6 +4,23 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.1 — a harvest stamp no longer resurrects a queued deletion (register P4-4, night 1)
+
+The first night of the P4-4 metric found the judge's migrations being undone by the PC that
+received them. The hub judge migrated nineteen facts from one store and deleted their files; a PC
+synced under a live session, so every deletion was queued rather than materialized (§5.3(7)); then
+that PC's own post-merge derive wrote each queued file — it stamped `migrated: <id>` from the
+`Migrated:` trailer that had just arrived in the same merge, and re-harvested the hook. The drain
+compared bytes, read those machine writes as a session's later edit, and abandoned every deletion
+as `resurrected`; the next push re-added the files to the hub. Measured on the second store the
+same night: three migrated facts back on the hub, each carrying its own `migrated:` stamp.
+
+The drain's re-check now uses the deletion table's normalized comparison instead of byte
+equality, and `migrated:` joins `hook:` and `modified:` as a line that comparison ignores: harvest
+output is never a person's edit. A real body edit after the merge still resurrects the deletion —
+that case is pinned alongside the new one. No format changes, no migration; the fix takes effect
+on each PC's next sync.
+
 ## 1.28.0 — the capture path runs on a native Linux client (register P4-3)
 
 A Linux box could read the corpus but never contribute to it: the L1a capture path — a Stop /

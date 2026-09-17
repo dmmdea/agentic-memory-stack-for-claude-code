@@ -172,7 +172,12 @@ against the bytes that were on disk when the entry was queued, not a replay: an 
 file takes the merged result, and a file the session edited after the merge keeps the later
 edit - a replace is reconciled three-way with the disk side winning a real body conflict,
 and a deletion is abandoned and reported `resurrected`, which is this record's own
-modify-vs-delete rule arriving one pass late. Point 8's synced first-crossing stamp needs
+modify-vs-delete rule arriving one pass late. "Edited" there is the deletion table's
+normalized comparison, not byte equality (amended 2026-09-17): derive itself writes a queued
+file between the merge and the drain - the `hook:` harvest and the `migrated:` stamp taken
+from the trailer that arrived with the deletion - and under byte equality every judge
+migration a live-session PC received came back `resurrected` and was pushed back to the hub.
+`migrated:` joins `hook:` and `modified:` as a line the comparison ignores. Point 8's synced first-crossing stamp needs
 one addition: a `min` reducer over a union of keys cannot represent a CLEAR, so a converged
 store's cleared clock returned from any PC that had not re-derived and the health number
 could never reset. The stamp file carries a per-workspace `cleared_at` tombstone; the
