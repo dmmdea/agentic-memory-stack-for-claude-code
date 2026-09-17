@@ -3,6 +3,7 @@ package judge
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -152,4 +153,59 @@ type HistoryMigrated struct {
 // MigratedFor implements the lookup.
 func (h HistoryMigrated) MigratedFor(slug string) (string, bool) {
 	return MigratedFor(h.Repo, slug)
+}
+
+// DeletedInHistory reports whether a store-relative path was removed by a commit in the
+// shared history and is absent from HEAD - a deletion somebody DECIDED, as opposed to a
+// file that merely cannot be seen right now.
+//
+// It is the second half of the blast cap's evidence rule (the first is the Migrated:
+// trailer): a dangling index pointer whose file the history says was deleted is the
+// consequence of a decision already made and synced, so removing the pointer is not a
+// wipe in progress. A hand re-home of a hundred doctrine facts into topic files is
+// exactly this shape - no trailer, one deletion commit, every PC then holding a hundred
+// dangling pointers over its 20 % cap - and without this rule every PC refuses that
+// clean-up forever (2026-09-17).
+//
+// It fails CLOSED: a missing repo, a path still present at HEAD, an unparsable log, any
+// error at all - all answer false, which means "counts against the cap".
+func DeletedInHistory(repo HistoryRepo, relPath string) (bool, error) {
+	if !repo.Valid() || strings.TrimSpace(relPath) == "" {
+		return false, nil
+	}
+	ctx := context.Background()
+	opt := gitx.Options{GitDir: repo.GitDir, WorkTree: repo.WorkTree, Timeout: 30 * time.Second}
+	// Present at HEAD means not deleted, whatever the log says about an earlier life.
+	present := opt
+	present.OkExit = gitx.OkExitCodes(0, 1, 128)
+	res, err := gitx.Run(ctx, present, "cat-file", "-e", "HEAD:"+relPath)
+	if err != nil {
+		return false, err
+	}
+	if res.Code == 0 {
+		return false, nil
+	}
+	res, err = gitx.Run(ctx, opt, "log", "-1", "--diff-filter=D", "--format=%H", "--", relPath)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(res.Stdout) != "", nil
+}
+
+// HistoryDeleted is the concrete lookup derive's blast cap takes for the deletion half of
+// its evidence rule; it satisfies derive.DeletedLookup so derive never imports git.
+type HistoryDeleted struct {
+	Repo HistoryRepo
+}
+
+// DeletedInHistory resolves the store-relative path of a slug and asks the history.
+func (h HistoryDeleted) DeletedInHistory(storeDir, slug string) (bool, error) {
+	if !h.Repo.Valid() || h.Repo.WorkTree == "" {
+		return false, nil
+	}
+	rel, err := filepath.Rel(h.Repo.WorkTree, storeDir)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return false, nil
+	}
+	return DeletedInHistory(h.Repo, filepath.ToSlash(filepath.Join(rel, slug)))
 }

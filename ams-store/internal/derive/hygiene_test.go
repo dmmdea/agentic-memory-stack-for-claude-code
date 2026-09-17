@@ -179,7 +179,7 @@ func TestHygiene_BlastCapExemptsMigratedDanglingPointers(t *testing.T) {
 	if res.Status != StatusAbortedBlastCap {
 		t.Fatalf("status = %q, want %q", res.Status, StatusAbortedBlastCap)
 	}
-	if !strings.Contains(res.Note, "remove 30 line(s), 11 of them pointers to migrated facts and exempt; 19 count against the 18-line cap") {
+	if !strings.Contains(res.Note, "remove 30 line(s), 11 of them pointers to migrated or history-deleted facts and exempt; 19 count against the 18-line cap") {
 		t.Errorf("note does not separate the exempt pointers: %s", res.Note)
 	}
 
@@ -192,6 +192,63 @@ func TestHygiene_BlastCapExemptsMigratedDanglingPointers(t *testing.T) {
 	}
 	if res.Status != StatusAbortedBlastCap || res.DedangledMigrated != 0 {
 		t.Errorf("without a lookup: status = %q, dedangled_migrated = %d; want abort and 0", res.Status, res.DedangledMigrated)
+	}
+}
+
+// TestHygiene_BlastCapExemptsHistoryDeletedPointers is the deletion half of the same
+// rule (1.28.3): a hand re-home deletes a hundred doctrine files in one commit and leaves
+// every PC with a hundred dangling pointers over its cap. A pointer whose file the history
+// says was deleted on purpose does not count. A slug both migrated and deleted is counted
+// once, as migrated; the two receipt fields are disjoint.
+func TestHygiene_BlastCapExemptsHistoryDeletedPointers(t *testing.T) {
+	lines := bigIndexLines(60)
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, fmt.Sprintf("- [Gone %d](missing%d.md) %s dangling", i, i, emDash))
+	}
+	gone := map[string]bool{}
+	for i := 1; i <= 25; i++ {
+		gone[fmt.Sprintf("missing%d.md", i)] = true
+	}
+	e := newEnv(t, "ws", lines, bigIndexFacts(60))
+	res, err := e.run(func(o *Options) {
+		o.Deleted = &fakeDeleted{gone: gone}
+		// missing1 is ALSO migrated: it must be counted once, under migrated.
+		o.Migrated = &fakeMigrated{ids: map[string]string{"missing1.md": "id-1"}}
+	})
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusApplied {
+		t.Fatalf("status = %q, want %q (note: %s)", res.Status, StatusApplied, res.Note)
+	}
+	if res.Dedangled != 30 || res.DedangledMigrated != 1 || res.DedangledHistoryDeleted != 24 {
+		t.Errorf("dedangled = %d / migrated = %d / history_deleted = %d, want 30 / 1 / 24",
+			res.Dedangled, res.DedangledMigrated, res.DedangledHistoryDeleted)
+	}
+	if strings.Contains(e.indexText(), "missing") {
+		t.Error("a dangling pointer survived the applied run")
+	}
+	rows := e.receipts()
+	if got := rows[len(rows)-1]["dedangled_history_deleted"]; got != float64(24) {
+		t.Errorf("receipt dedangled_history_deleted = %v, want 24", got)
+	}
+
+	// Only 11 explained leaves 19 > 18: still refused, and the note carries the exempt total.
+	lines = bigIndexLines(60)
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, fmt.Sprintf("- [Gone %d](missing%d.md) %s dangling", i, i, emDash))
+	}
+	few := map[string]bool{}
+	for i := 1; i <= 11; i++ {
+		few[fmt.Sprintf("missing%d.md", i)] = true
+	}
+	e = newEnv(t, "ws", lines, bigIndexFacts(60))
+	res, err = e.run(func(o *Options) { o.Deleted = &fakeDeleted{gone: few} })
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedBlastCap || !strings.Contains(res.Note, "remove 30 line(s), 11 of them pointers to migrated or history-deleted facts and exempt; 19 count against the 18-line cap") {
+		t.Errorf("status = %q, note = %s", res.Status, res.Note)
 	}
 }
 

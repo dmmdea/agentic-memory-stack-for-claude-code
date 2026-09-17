@@ -64,6 +64,68 @@ func TestMigrated_TrailerRoundTripsThroughHistory(t *testing.T) {
 // Fails closed: no repo, a malformed slug, or a repo with no such commit all answer "no
 // known migration". A wrong id written into a fact file would make the judge update
 // somebody else's record.
+// TestDeleted_InHistoryResolvesOnlyADeletedPath pins the deletion half of the blast cap's
+// evidence rule: true only for a path a commit removed AND that is absent at HEAD; false
+// for a live file, a never-tracked path, a re-added path, and a missing repo.
+func TestDeleted_InHistoryResolvesOnlyADeletedPath(t *testing.T) {
+	lines, facts := bigStore(60)
+	f := newFixture(t, "ws", lines, facts, testutil.Mem0OK)
+	gitDir := f.sb.InitHistory()
+	repo := HistoryRepo{GitDir: gitDir, WorkTree: f.sb.ProjectsRoot}
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "add", "-A", "-f", "--", "ws/memory")
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "commit", "-q", "-m", "seed")
+
+	// A hand deletion: remove the file, commit it, no trailer.
+	if err := os.Remove(filepath.Join(f.dir, "fact5.md")); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "add", "-A", "-f", "--", "ws/memory")
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "commit", "-q", "-m", "re-home fact5 into a topic file")
+
+	for _, tc := range []struct {
+		rel  string
+		want bool
+	}{
+		{"ws/memory/fact5.md", true},
+		{"ws/memory/fact6.md", false},
+		{"ws/memory/never-existed.md", false},
+	} {
+		got, err := DeletedInHistory(repo, tc.rel)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.rel, err)
+		}
+		if got != tc.want {
+			t.Errorf("DeletedInHistory(%s) = %v, want %v", tc.rel, got, tc.want)
+		}
+	}
+
+	// Re-added after the deletion: present at HEAD, so no longer "deleted".
+	if err := os.WriteFile(filepath.Join(f.dir, "fact5.md"), []byte(facts["fact5.md"]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "add", "-A", "-f", "--", "ws/memory")
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "commit", "-q", "-m", "fact5 comes back")
+	if got, _ := DeletedInHistory(repo, "ws/memory/fact5.md"); got {
+		t.Error("a path present at HEAD must never read as deleted, whatever the log holds")
+	}
+
+	// The concrete type derive takes resolves the slug against the store directory.
+	if err := os.Remove(filepath.Join(f.dir, "fact7.md")); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "add", "-A", "-f", "--", "ws/memory")
+	gitRun(t, gitDir, f.sb.ProjectsRoot, "commit", "-q", "-m", "drop fact7")
+	if got, err := (HistoryDeleted{Repo: repo}).DeletedInHistory(f.dir, "fact7.md"); err != nil || !got {
+		t.Errorf("HistoryDeleted.DeletedInHistory(fact7.md) = %v, %v; want true", got, err)
+	}
+	if got, _ := (HistoryDeleted{Repo: repo}).DeletedInHistory(f.dir, "fact8.md"); got {
+		t.Error("a live slug must not read as deleted")
+	}
+	if got, _ := (HistoryDeleted{}).DeletedInHistory(f.dir, "fact7.md"); got {
+		t.Error("no repo must fail closed")
+	}
+}
+
 func TestMigrated_LookupFailsClosed(t *testing.T) {
 	if _, ok := MigratedFor(HistoryRepo{}, "a.md"); ok {
 		t.Error("an unconfigured repo answered a lookup")

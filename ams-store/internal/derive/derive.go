@@ -83,6 +83,13 @@ type MigratedLookup interface {
 	MigratedID(st store.Store, slug string) (id string, ok bool, err error)
 }
 
+// DeletedLookup answers whether a slug's file was removed by a commit in the shared
+// history and is absent from HEAD - the deletion half of the blast cap's evidence rule
+// (the judge task implements it over the history repo; a test substitutes a map).
+type DeletedLookup interface {
+	DeletedInHistory(storeDir, slug string) (deleted bool, err error)
+}
+
 // Committer records the derived index in the local history. Optional: derive works
 // offline and without a history repo, because an index that is correct on disk is worth
 // more than one that waited for git.
@@ -111,10 +118,14 @@ type Options struct {
 	Lock             Lock
 	Commits          CommitTimes
 	Migrated         MigratedLookup
-	Committer        Committer
-	Log              io.Writer
-	ReceiptPath      string
-	DirtyPath        string
+	// Deleted is the blast cap's second evidence source: a dangling pointer whose file
+	// the history says was deleted on purpose does not count against the cap. Nil means
+	// nothing is explained that way.
+	Deleted     DeletedLookup
+	Committer   Committer
+	Log         io.Writer
+	ReceiptPath string
+	DirtyPath   string
 }
 
 // Result is one store's receipt row. The field names are the compactor's, so one reader
@@ -151,11 +162,15 @@ type Result struct {
 	// DedangledMigrated is how many of the dangling pointers hygiene dropped point at
 	// a slug the history says the judge migrated. They are inside Dedangled, and they
 	// are the removals the blast cap does not count.
-	DedangledMigrated    int  `json:"dedangled_migrated"`
-	OverInjectLimit      int  `json:"over_inject_limit"`
-	ProtectedSetOverflow bool `json:"protected_set_overflow"`
-	Unconverged          bool `json:"unconverged"`
-	Changed              bool `json:"changed"`
+	DedangledMigrated int `json:"dedangled_migrated"`
+	// DedangledHistoryDeleted is the same for pointers whose file a commit in the shared
+	// history deleted (and that is absent at HEAD): a decision already made and synced,
+	// never a wipe in progress. Disjoint from DedangledMigrated - a slug is counted once.
+	DedangledHistoryDeleted int  `json:"dedangled_history_deleted"`
+	OverInjectLimit         int  `json:"over_inject_limit"`
+	ProtectedSetOverflow    bool `json:"protected_set_overflow"`
+	Unconverged             bool `json:"unconverged"`
+	Changed                 bool `json:"changed"`
 }
 
 // Run derives one store's MEMORY.md, following the step order of blueprint section 3.1.
@@ -350,16 +365,17 @@ func Run(opt Options) (*Result, error) {
 	// count, so counting them here refused the clean-up on every pass, forever (2026-09-17:
 	// 16 pointers over a 14-line cap, and 2 over a 1-line cap on a five-line store). The
 	// lookup fails closed - a slug with no trailer, or an unreadable history, still counts.
-	res.DedangledMigrated = migratedDangling(opt, hy.Dangling, logf)
+	res.DedangledMigrated, res.DedangledHistoryDeleted = explainedDangling(opt, hy.Dangling, logf)
+	exempt := res.DedangledMigrated + res.DedangledHistoryDeleted
 	cap := BlastCap(len(entries))
-	if removals := res.Dedangled - res.DedangledMigrated + res.DedupSlug; removals > cap {
+	if removals := res.Dedangled - exempt + res.DedupSlug; removals > cap {
 		res.Status = StatusAbortedBlastCap
 		// The note names the TRUE removal count first, then what counted: a reader must
 		// not mistake the post-exemption figure for what hygiene wanted to do.
 		wanted := strconv.Itoa(res.Dedangled + res.DedupSlug)
-		if res.DedangledMigrated > 0 {
-			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), "+strconv.Itoa(res.DedangledMigrated)+
-				" of them pointers to migrated facts and exempt; "+strconv.Itoa(removals)+" count against the "+
+		if exempt > 0 {
+			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), "+strconv.Itoa(exempt)+
+				" of them pointers to migrated or history-deleted facts and exempt; "+strconv.Itoa(removals)+" count against the "+
 				strconv.Itoa(cap)+"-line cap for this store; refusing and reporting instead")
 		} else {
 			res.Note = addNote(res.Note, "hygiene wanted to remove "+wanted+" line(s), over the "+
@@ -692,29 +708,41 @@ func harvestReindexed(dir string, keep []*index.Record, res *Result, logf func(s
 	}
 }
 
-// migratedDangling counts the dangling pointers whose slug carries a migration trailer in
-// the history: removals that consume a decision the judge already made rather than
-// evidence of a store being gutted. Without a lookup nothing is explained, and a lookup
-// error explains nothing either - the cap must fail closed.
-func migratedDangling(opt Options, slugs []string, logf func(string, ...any)) int {
-	if opt.Migrated == nil || len(slugs) == 0 {
-		return 0
+// explainedDangling counts the dangling pointers the history explains: a slug with a
+// migration trailer (the judge moved it to the corpus) or a slug a commit deleted on
+// purpose. Both are removals that consume a decision already made and synced, never
+// evidence of a store being gutted. Each slug is counted once, migrated first. Without a
+// lookup nothing is explained, and a lookup error explains nothing either - the cap must
+// fail closed.
+func explainedDangling(opt Options, slugs []string, logf func(string, ...any)) (migrated, deleted int) {
+	if len(slugs) == 0 || (opt.Migrated == nil && opt.Deleted == nil) {
+		return 0, 0
 	}
-	n := 0
 	for _, slug := range slugs {
-		id, ok, err := opt.Migrated.MigratedID(opt.Store, slug)
-		if err != nil {
-			logf("migrated lookup %s: %v", slug, err)
-			continue
+		if opt.Migrated != nil {
+			id, ok, err := opt.Migrated.MigratedID(opt.Store, slug)
+			if err != nil {
+				logf("migrated lookup %s: %v", slug, err)
+			} else if ok && id != "" {
+				migrated++
+				continue
+			}
 		}
-		if ok && id != "" {
-			n++
+		if opt.Deleted != nil {
+			gone, err := opt.Deleted.DeletedInHistory(opt.Store.Dir, slug)
+			if err != nil {
+				logf("history lookup %s: %v", slug, err)
+				continue
+			}
+			if gone {
+				deleted++
+			}
 		}
 	}
-	if n > 0 {
-		logf("%d dangling pointer(s) name migrated facts; not counted against the blast cap", n)
+	if migrated+deleted > 0 {
+		logf("%d dangling pointer(s) name migrated facts and %d history-deleted facts; not counted against the blast cap", migrated, deleted)
 	}
-	return n
+	return migrated, deleted
 }
 
 // stampMigrated is decision Q8's consumer.

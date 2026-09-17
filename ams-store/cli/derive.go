@@ -130,6 +130,7 @@ func runDerive(env Env, args []string) int {
 			Commits:        commits,
 			Lock:           dlock,
 			Migrated:       migrated,
+			Deleted:        newDeletedLookup(roots),
 			Committer:      committer,
 			Log:            env.Stderr,
 		})

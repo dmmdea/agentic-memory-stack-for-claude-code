@@ -112,6 +112,24 @@ func newMigratedLookup(roots store.Roots) migratedLookup {
 	}}}
 }
 
+// deletedLookup adapts judge.HistoryDeleted to derive.DeletedLookup: the deletion half of
+// the blast cap's evidence rule. A dangling pointer whose file a synced commit deleted is
+// a decision already made, not a wipe in progress, so hygiene may drop it past the cap.
+// Fails closed like its sibling.
+type deletedLookup struct {
+	h judge.HistoryDeleted
+}
+
+func (d deletedLookup) DeletedInHistory(storeDir, slug string) (bool, error) {
+	return d.h.DeletedInHistory(storeDir, slug)
+}
+
+func newDeletedLookup(roots store.Roots) deletedLookup {
+	return deletedLookup{h: judge.HistoryDeleted{Repo: judge.HistoryRepo{
+		GitDir: roots.HistoryGitDir(), WorkTree: roots.ProjectsRoot,
+	}}}
+}
+
 // ---------------------------------------------------------------------------
 // gate -> derive's floor (blueprint 12.1: ONE floor in this binary)
 // ---------------------------------------------------------------------------
@@ -183,6 +201,7 @@ func (d deriverAdapter) Derive(_ context.Context, opts amsync.DeriveOptions) (am
 		// taking it again would make the pass a contender against itself.
 		Commits:   derive.NewHistoryCommitTimes(d.roots),
 		Migrated:  newMigratedLookup(d.roots),
+		Deleted:   newDeletedLookup(d.roots),
 		Committer: nil, // sync commits the whole pass itself, once, after every store.
 		Log:       d.log,
 	})
