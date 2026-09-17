@@ -224,6 +224,71 @@ func TestDeferred_CorruptQueueIsAnErrorNotAnEmptyQueue(t *testing.T) {
 func numbered(first, last string) string { return body3(first, "body line 6", last) }
 
 // body3 is the same twelve lines with a third editable slot in the middle.
+// TestDeferred_HarvestStampDoesNotResurrectAQueuedDeletion pins the 2026-09-17 incident.
+//
+// The judge migrated a fact on the hub and deleted its file. A PC synced under a live
+// session, so the deletion was queued; then that PC's own post-merge derive wrote the
+// queued file - it stamped `migrated: <id>` from the trailer that had just arrived in the
+// merge, and re-harvested the hook. Neither write is a session's edit, but the drain
+// compared bytes and read them as one: every queued deletion came back "resurrected", the
+// next push re-added the files, and the migrations were undone for the whole fleet. The
+// drain's re-check has to use the deletion table's normalized comparison, so that only a
+// difference Canon keeps counts as the session's later decision.
+func TestDeferred_HarvestStampDoesNotResurrectAQueuedDeletion(t *testing.T) {
+	f := newFleet(t, "a", "b")
+	a, b := f.pcs["a"], f.pcs["b"]
+
+	a.write(ws, "migrated.md", fact("Migrated", "d", "h", body3("first", "middle", "last")))
+	a.write(ws, "edited.md", fact("Edited", "d", "h", body3("first", "middle", "last")))
+	a.syncOnce("seed", a.mo(), ws)
+	b.fetch()
+	if err := b.eng.Adopt(context.Background(), "refs/remotes/"+hubRemote+"/main", b.mo()); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	a.tick(time.Minute)
+	a.remove(ws, "migrated.md")
+	a.remove(ws, "edited.md")
+	a.syncOnce("the judge migrated both", a.mo(), ws)
+
+	b.tick(2 * time.Minute)
+	b.markLive(ws, time.Minute)
+	rep := b.syncOnce("b syncs under a live session", b.mo(), ws)
+	if len(rep.Deferred) != 2 {
+		t.Fatalf("the scenario needs both deletions deferred, got %v", rep.Deferred)
+	}
+
+	// Derive runs after the merge. On the first file it stamps the migrated id and
+	// re-harvests the hook - machine writes, nothing a person decided. On the second the
+	// session itself rewrites the body afterwards - the one case the queue protects.
+	b.tick(time.Minute)
+	b.touch(ws, "migrated.md", fact("Migrated", "d", "re-harvested", body3("first", "middle", "last"),
+		"migrated: 5bb28df3-243a-4bef-8d1e-79a59045246b"), 0)
+	b.touch(ws, "edited.md", fact("Edited", "d", "h", body3("first", "STILL-IN-USE", "last")), 0)
+
+	// Session over.
+	b.tick(time.Hour)
+	drain, err := b.eng.ApplyDeferred(context.Background(), ws, b.mo())
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	if b.exists(ws, "migrated.md") {
+		t.Fatal("a queued deletion whose file only gained harvest output (migrated:, hook:) must be applied:" +
+			" harvest is not a session's edit, and reading it as one resurrects every migration the judge makes")
+	}
+	if !contains(drain.Applied, ws+"/memory/migrated.md") || contains(drain.Resurrected, ws+"/memory/migrated.md") {
+		t.Fatalf("the harvest-only file must be reported applied, never resurrected: %+v", drain)
+	}
+	// The control: a real body edit after the merge is still the later decision.
+	if !b.exists(ws, "edited.md") || !contains(drain.Resurrected, ws+"/memory/edited.md") {
+		t.Fatalf("a queued deletion whose BODY the session edited must still be resurrected: %+v", drain)
+	}
+	if len(drain.StillQueued) != 0 {
+		t.Fatalf("the session is gone; nothing may stay queued: %v", drain.StillQueued)
+	}
+}
+
 func body3(first, mid, last string) string {
 	lines := []string{first}
 	for i := 2; i <= 11; i++ {

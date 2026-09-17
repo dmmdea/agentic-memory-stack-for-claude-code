@@ -251,7 +251,9 @@ enumerated workspace, before derive/stage/commit; the watcher's passes drain the
 same way, and a pass that finds queued changes with no drain wired REFUSES (exit 3)
 rather than staging as if nothing were pending. The drain is a RE-CHECK, not a
 replay: each entry records the ours-side blob (the on-disk bytes at defer time) as
-well as the merged blob. If the file still holds those bytes, the merged result
+well as the merged blob. If the file still says what those bytes said - the
+deletion table's normalized comparison, which ignores line endings and the
+harvest-written `hook:`, `modified:` and `migrated:` lines - the merged result
 lands or the file is removed. If it does not, the session edited it AFTER the merge
 and the later edit wins: a replace is merged three-way (base = the queued bytes,
 ours = disk, theirs = the merged blob) with the disk side taking a real body
@@ -259,6 +261,14 @@ conflict, and a deletion is abandoned and reported `resurrected` - deletion-tabl
 row 3, one pass late, with the deleted side still reachable in history. An entry a
 live session still blocks stays queued. A queue that cannot be read is an error and
 never an empty queue: the drain refuses and the workspace is not staged.
+
+The re-check has to be the normalized comparison and not byte equality, because the
+PC's own derive writes the queued files between the merge and the drain: it
+re-harvests `hook:` and stamps `migrated: <id>` from the `Migrated:` trailer that
+arrived in the same merge that queued the deletion. Under byte equality every queued
+deletion read as a session edit and came back `resurrected`, and the next push
+re-added the judge's migrated facts to the hub (2026-09-17, nineteen files on one
+PC, three already back on the hub from another store).
 
 The receipt carries both ends. `deferred` names each withheld change with its OP
 (`[{"path":...,"op":"delete"}]`, where every entry used to be reported as

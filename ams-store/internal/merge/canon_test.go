@@ -2,12 +2,12 @@ package merge
 
 import "testing"
 
-// TestCanon_IgnoresOnlyLineEndingsAndTheTwoAdvisoryKeYS pins the exact width of the
-// normalized comparison. It ignores CRLF and the `hook:` / `modified:` lines and NOTHING
-// else: widen it and a real edit stops counting as a modification, so the deletion table
-// silently drops somebody's work; narrow it and a routine harvest resurrects every
-// deletion the judge made.
-func TestCanon_IgnoresOnlyLineEndingsAndTheTwoAdvisoryKeys(t *testing.T) {
+// TestCanon_IgnoresOnlyLineEndingsAndTheHarvestKeys pins the exact width of the
+// normalized comparison. It ignores CRLF and the `hook:` / `modified:` / `migrated:`
+// lines and NOTHING else: widen it and a real edit stops counting as a modification, so
+// the deletion table silently drops somebody's work; narrow it and a routine harvest
+// resurrects every deletion the judge made (2026-09-17: `migrated:` was the missing key).
+func TestCanon_IgnoresOnlyLineEndingsAndTheHarvestKeys(t *testing.T) {
 	base := "---\nname: N\ndescription: \"d\"\nhook: \"one\"\nmetadata:\n  type: project\n  modified: 2026-01-01\n---\n\nbody\n"
 
 	crlf := ""
@@ -30,6 +30,11 @@ func TestCanon_IgnoresOnlyLineEndingsAndTheTwoAdvisoryKeys(t *testing.T) {
 	modChanged := "---\nname: N\ndescription: \"d\"\nhook: \"one\"\nmetadata:\n  type: project\n  modified: 2099-12-31\n---\n\nbody\n"
 	if !NormalizedEqual([]byte(base), []byte(modChanged)) {
 		t.Fatal("a modified-only difference must compare equal")
+	}
+
+	migratedStamped := "---\nname: N\ndescription: \"d\"\nhook: \"one\"\nmigrated: 5bb28df3-243a-4bef-8d1e-79a59045246b\nmetadata:\n  type: project\n  modified: 2026-01-01\n---\n\nbody\n"
+	if !NormalizedEqual([]byte(base), []byte(migratedStamped)) {
+		t.Fatal("a migrated-stamp-only difference must compare equal: harvest wrote it, nobody edited the fact")
 	}
 
 	for _, real := range []string{
