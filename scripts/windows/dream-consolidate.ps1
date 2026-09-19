@@ -9,6 +9,23 @@ param([switch]$DryRun, [switch]$Force)
 $ErrorActionPreference = 'Continue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+
+. (Join-Path $ScriptDir 'memory-common.ps1')
+. (Join-Path $ScriptDir 'autopromote-lib.ps1')
+Initialize-MemoryEnv
+
+# 1.28.4 (register P5-11): the consolidator runs on the brain only. A replica has no live local
+# store to consolidate or prune, its drift snapshots have nothing to hit, and any insight it posts
+# lands on the authority beside the brain's own night. This holds for -Force too: a manual
+# /dream-now on a replica is a request for the brain's chain, not for a second consolidator.
+$DcRole = Get-Mem0Role
+if ($DcRole -ne 'brain') {
+    Write-MemoryLog -Component 'dream' -Message "skipping: role=$DcRole - the brain runs the nightly chain; a replica never consolidates"
+    exit 0
+}
+
+# 1.28.4 review: the receipt resolution below used to run first; its WslUser/Distro fallbacks
+# shell out to wsl.exe, which is a side effect a replica must never pay, so it now follows the gate.
 # v1.0 Phase 7A: operator receipt — resolve operator-specific paths so this
 # nightly consolidator is operator-agnostic (no hardcoded handle/distro/repo).
 # Written by install/2-windows-config.ps1; live fallback if absent.
@@ -28,10 +45,6 @@ $DcRepoWsl = if ($DcCfg -and $DcCfg.RepoRootWsl) { $DcCfg.RepoRootWsl } else { '
 # (drift compare no-ops, never a false alarm).
 $DcEvalWsl = if ($DcCfg -and $DcCfg.EvalRootWsl) { $DcCfg.EvalRootWsl } elseif ($DcRepoWsl) { $DcRepoWsl } else { '' }
 $DcHomeUnc = "\\wsl.localhost\$DcDistro\home\$DcWslUser"
-
-. (Join-Path $ScriptDir 'memory-common.ps1')
-. (Join-Path $ScriptDir 'autopromote-lib.ps1')
-Initialize-MemoryEnv
 
 # Nightly throttle (independent of L1a 10-min throttle). -Force bypasses ONLY this throttle
 # check (for a manual /dream-now); the Codex lock below still applies so a -Force run can

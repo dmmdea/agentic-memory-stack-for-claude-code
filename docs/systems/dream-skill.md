@@ -191,7 +191,7 @@ promotions, the drift canary before/after, the morning summary and the usage led
 ## Interfaces and entry points
 
 - **Trigger:** Windows Task Scheduler entry `ClaudeCode-DreamConsolidator-3am`, daily at 03:00, `-WakeToRun`, action = `dream-consolidate.ps1`.
-- **Catch-up:** `dream-catchup.ps1`, spawned detached from a SessionStart hook, nudges the consolidator when debt has accumulated.
+- **Catch-up:** `dream-catchup.ps1`, spawned detached from a SessionStart hook, nudges the consolidator when debt has accumulated. **Brain only (1.28.4):** on any other role (`~/.mem0/role`) the catch-up, the index refresh and the consolidator itself log the role and exit, because the nightly chain runs on the brain and a replica's `last-dream` marker never advances again.
 - **Flags:** `-DryRun` makes zero promotions and zero file writes (nominees logged only); `-Force` bypasses **only** the 24h throttle.
 - **Backend calls:** mem0 REST (`GET`/search for evidence and canonical, `POST` insights) and `mem0-canonize.sh --actor dream-autopromote` for canonical promotion.
 

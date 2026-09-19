@@ -519,8 +519,13 @@ if [ -n "$_WINPROFILE" ]; then
     [ "${_nsec:-0}" -gt 0 ] && _hb+="${_nsec} morning-summary section(s) in last 48h (review: ~/.claude/state/dream/morning-summary.md). "
   fi
 fi
+# 1.28.4 (register P5-11): the drift guard runs inside the brain's dream. A replica's copy of this
+# state file is frozen at the last night the dream ran locally (before the authority cutover) and
+# printed a permanent "DRIFT GUARD DEAD" here. Read it on the brain only: ~/.mem0/role is written by
+# the installer beside authority-url; an absent file is the brain.
+_ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
 _RDS="$HOME/.mem0/retrieval-drift-state.json"
-if [ -f "$_RDS" ]; then
+if [ "$_ROLE" = brain ] && [ -f "$_RDS" ]; then
   _rd=$(python3 -c "
 import json,sys
 try: d=json.load(open(sys.argv[1]))

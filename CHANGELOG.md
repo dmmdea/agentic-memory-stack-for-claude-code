@@ -4,6 +4,22 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.4 — a replica never dreams (register P5-11)
+
+Since the authority moved to the native Linux brain, the nightly chain (dream, store judge, index,
+backups) runs there and a replica's `~/.claude/state/last-dream` marker never advances again. The
+Windows-side catch-up read that as a permanent "long gap" and, every 6 h throttle window, ran a
+full consolidation FROM the replica: insights posted to the authority on top of the brain's own
+night, the drift snapshot failing against the dormant loopback server (a standing "DRIFT GUARD
+DEAD" in every session banner), the index build failing the same way and never marking its
+throttle, ~28k Codex tokens a run. Measured on the Qube 2026-09-19: two runs a day since the
+cutover.
+
+The catch-up, the standalone index refresh and the consolidator itself now read the installer's
+`~/.mem0/role` (absent = brain) and exit with a logged `role=<r>` on anything but the brain; the
+consolidator's gate holds for `-Force` too. The session banner reads the drift state only on the
+brain. Nothing changes on the brain: an explicit `role=brain` still runs every path.
+
 ## 1.28.3 — the blast cap also exempts pointers to files the history deleted on purpose
 
 1.28.2 exempted dangling pointers whose slug carries a `Migrated:` trailer. The same shape

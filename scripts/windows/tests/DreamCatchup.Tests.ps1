@@ -32,7 +32,8 @@ BeforeAll {
             [double]$DreamAgeHours,      # age of the last-dream marker; $null => no marker
             [switch]$WithLearnLine,      # write a learn-rules.jsonl line (debt)
             [switch]$WithPromoteLine,    # write a promote-queue.jsonl line (debt)
-            [switch]$NoDreamMarker
+            [switch]$NoDreamMarker,
+            [string]$Role                # 1.28.4: write ~\.mem0\role (absent = brain)
         )
         $sandbox = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $scripts = Join-Path $sandbox '.claude\scripts'
@@ -65,6 +66,7 @@ exit 0
         }
         if ($WithLearnLine)   { Set-Content -Path (Join-Path $mem0 'learn-rules.jsonl')   -Value '{"rule":"x"}' -Encoding UTF8 }
         if ($WithPromoteLine) { Set-Content -Path (Join-Path $mem0 'promote-queue.jsonl') -Value '{"id":"y"}'  -Encoding UTF8 }
+        if ($Role)            { Set-Content -Path (Join-Path $mem0 'role') -Value $Role -Encoding UTF8 -NoNewline }
 
         [pscustomobject]@{ Root = $sandbox; Scripts = $scripts; State = $state; Logs = $logs; Mem0 = $mem0 }
     }
@@ -204,5 +206,59 @@ Describe 'memory-index-refresh: 6h throttle honored' {
         Invoke-InSandbox -ScriptPath (Join-Path $scripts 'memory-index-refresh.ps1') -SandboxRoot $sandbox
         $sizeAfter = (Get-Item (Join-Path $sandbox '.claude\logs\index-refresh.log')).Length
         $sizeAfter | Should -Be $sizeBefore -Because 'the 6h throttle blocks the second run before it logs'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# (g) 1.28.4 (register P5-11): a replica never dreams. The brain's nightly chain is the only
+#     dream; on any other role the catch-up, the index refresh and the consolidator itself log
+#     the role and exit before touching Codex, WSL or the state dir.
+# ---------------------------------------------------------------------------
+Describe 'role gate: a replica never dreams (1.28.4, P5-11)' {
+    It 'catch-up on a replica: maximal debt, yet no invoke, and the role is logged' {
+        $sb = New-CatchupSandbox -NoDreamMarker -WithLearnLine -WithPromoteLine -Role 'replica'
+        Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'dream-catchup.ps1') -SandboxRoot $sb.Root
+        Test-DreamInvoked -State $sb.State | Should -BeFalse -Because 'the brain runs the nightly chain; a replica has nothing to catch up'
+        (Get-Content (Join-Path $sb.Logs 'dream-catchup.log') -Raw) | Should -Match 'role=replica'
+        Test-Path (Join-Path $sb.State 'last-dream-catchup') | Should -BeTrue -Because 'the gate stamps the 6h throttle so a burst of session starts logs once'
+    }
+
+    It 'catch-up on a client: same gate (anything but brain)' {
+        $sb = New-CatchupSandbox -NoDreamMarker -WithLearnLine -Role 'client'
+        Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'dream-catchup.ps1') -SandboxRoot $sb.Root
+        Test-DreamInvoked -State $sb.State | Should -BeFalse
+        (Get-Content (Join-Path $sb.Logs 'dream-catchup.log') -Raw) | Should -Match 'role=client'
+    }
+
+    It 'catch-up on the brain (explicit role file) still invokes' {
+        $sb = New-CatchupSandbox -NoDreamMarker -WithLearnLine -Role 'brain'
+        Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'dream-catchup.ps1') -SandboxRoot $sb.Root
+        Test-DreamInvoked -State $sb.State | Should -BeTrue -Because 'the gate must not change the brain'
+    }
+
+    It 'index refresh on a replica: logs the role, stamps its throttle, never reaches the receipt/WSL path' {
+        $sb = New-CatchupSandbox -NoDreamMarker -Role 'replica'
+        Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'memory-index-refresh.ps1') -SandboxRoot $sb.Root
+        $log = Get-Content (Join-Path $sb.Logs 'index-refresh.log') -Raw
+        $log | Should -Match 'skip: role=replica'
+        $log | Should -Not -Match 'no RepoRootWsl' -Because 'the role gate sits before the receipt lookup'
+        Test-Path (Join-Path $sb.State 'last-index-refresh') | Should -BeTrue
+    }
+
+    It 'the consolidator itself refuses on a replica, even with -Force, before creating its state dir' {
+        $sb = New-CatchupSandbox -NoDreamMarker -Role 'replica'
+        # The REAL consolidator this time (not the stub): it needs its lib beside it and a receipt
+        # so the WSL-user/distro fallbacks never shell out on a runner without WSL.
+        Copy-Item $script:consolidate $sb.Scripts -Force
+        Copy-Item (Join-Path $script:winDir 'autopromote-lib.ps1') $sb.Scripts
+        Set-Content -Path (Join-Path $sb.Scripts 'mem0-stack.config.psd1') -Value "@{ WslUser = 'sandbox'; Distro = 'Sandbox'; Role = 'replica' }" -Encoding UTF8
+        $saved = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $sb.Root
+            '' | & $script:ps51 -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb.Scripts 'dream-consolidate.ps1') -Force *> $null
+        } finally { $env:USERPROFILE = $saved }
+        (Get-Content (Join-Path $sb.Logs 'dream.log') -Raw) | Should -Match 'skipping: role=replica'
+        Test-Path (Join-Path $sb.State 'dream') | Should -BeFalse -Because 'the gate exits before the phase state dir is created'
+        Test-Path (Join-Path $sb.State 'last-dream') | Should -BeFalse -Because 'nothing ran, nothing is stamped'
     }
 }
