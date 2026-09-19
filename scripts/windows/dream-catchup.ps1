@@ -35,6 +35,21 @@ if (-not (Test-Throttle -Name 'dream-catchup' -MinIntervalSeconds 21600)) {
     exit 0
 }
 
+# 1.28.4 (register P5-11): a replica never dreams. Since the authority moved to the native Linux
+# brain (2026-09-14) the nightly chain runs THERE (ams-nightly.target: dream, store judge, index,
+# backups). A replica's ~/.claude/state/last-dream marker therefore never advances again, so the
+# "long gap" debt rule fired on every 6 h window and ran a full consolidation FROM the replica:
+# insights posted to the authority on top of the brain's own night, the drift snapshot failing on
+# the dormant loopback server ("DRIFT GUARD DEAD" in every session banner), ~28k Codex tokens a
+# run, and the throttle never marked because phase 4 failed the same way. The role is the
+# installer's ~\.mem0\role (beside authority-url; absent = brain); only the brain may proceed.
+$role = Get-Mem0Role
+if ($role -ne 'brain') {
+    Mark-Throttle -Name 'dream-catchup'
+    Write-MemoryLog -Component 'dream-catchup' -Message "role=${role}: the brain runs the nightly chain; no catch-up on this box"
+    exit 0
+}
+
 try {
     # (a) Read the dream throttle's last-run marker DIRECTLY — same file Test-Throttle 'dream'
     # uses (~/.claude/state/last-dream). We only READ it here; we never consume/update it, so

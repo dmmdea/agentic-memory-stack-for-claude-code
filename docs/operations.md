@@ -161,7 +161,7 @@ Get-Content "$env:USERPROFILE\.claude\logs\dream.log" -Tail 40
 ```
 
 **Fixes:**
-- **Missed night (PC off, etc.)** → self-healing: at the next session start, `dream-catchup.ps1` re-runs a dream that's >48 h stale or has pending queues. To force one now: `dream-consolidate.ps1 -Force` (respects the shared Codex lock).
+- **Missed night (PC off, etc.)** → self-healing: at the next session start, `dream-catchup.ps1` re-runs a dream that's >48 h stale or has pending queues. On a replica both are no-ops since 1.28.4 (the log line says `role=replica`): the brain's `ams-nightly.target` is the dream, so read its journal there. To force one now: `dream-consolidate.ps1 -Force` (respects the shared Codex lock).
 - **Task missing/broken** → re-register idempotently: rerun `install\2-windows-config.ps1`.
 - **Ran but 0 insights** → often correct (no consolidation-worthy evidence). Check the log's Codex output preview.
 - The MEMORY.md index refresh is decoupled (`memory-index-refresh.ps1`, 6-h throttle) — a down dream no longer freezes the index.
