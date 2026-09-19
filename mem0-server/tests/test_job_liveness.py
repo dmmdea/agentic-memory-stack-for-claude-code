@@ -437,3 +437,84 @@ def test_parse_ts_epoch_formats():
     assert parse_ts_epoch("not a time") is None
     assert parse_ts_epoch("") is None
     assert parse_ts_epoch(None) is None
+
+
+# ---- 1.28.5 (register P5-12): the native brain's markers ---------------------------------
+
+def _native_fixture(tmp_path, now_s, *, dream_age_h=10, sections=2):
+    mem0_dir = tmp_path / "mem0"
+    maint = mem0_dir / "maintenance"
+    dream = maint / "dream"
+    dream.mkdir(parents=True)
+    (maint / "last-dream").write_text(str(now_s - dream_age_h * 3600), encoding="utf-8")
+    for name in ("prune.json", "gather.json"):
+        f = dream / name
+        f.write_text("{}", encoding="utf-8")
+        os.utime(f, (now_s - dream_age_h * 3600, now_s - dream_age_h * 3600))
+    now_dt = dt.datetime.fromtimestamp(now_s)
+    body = "".join(
+        "## Chain -- %s\n- ok\n\n" % (now_dt - dt.timedelta(hours=h)).strftime("%Y-%m-%d %H:%M")
+        for h in range(1, sections + 1))
+    (maint / "morning-summary.md").write_text(body, encoding="utf-8")
+    return mem0_dir
+
+
+def test_native_brain_markers_fill_the_dream_fields(tmp_path):
+    """The chain on a native Linux brain writes under ~/.mem0/maintenance; with no Windows
+    profile at all the collector must still see the night (the row read 'unknown' on a
+    brain whose chain had just run 16/16)."""
+    now_s = 1_700_000_000
+    mem0_dir = _native_fixture(tmp_path, now_s, dream_age_h=10, sections=2)
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=None, now_s=now_s,
+                              environ={}, stack_env={"MEM0_HOST_KIND": "native"})
+    assert out["last_dream_age_h"] == 10.0
+    assert out["prune_age_h"] == 10.0
+    assert out["gather_age_h"] == 10.0
+    assert out["morning_summary_sections_48h"] == 2
+    assert out["morning_summary_age_h"] is not None
+    assert "win_state" not in (out.get("error") or ""), "a native host has no Windows profile to miss"
+
+
+def test_native_dream_age_comes_from_content_not_mtime(tmp_path):
+    now_s = 1_700_000_000
+    mem0_dir = _native_fixture(tmp_path, now_s, dream_age_h=3)
+    marker = mem0_dir / "maintenance" / "last-dream"
+    os.utime(marker, (now_s - 999_999, now_s - 999_999))
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=None, now_s=now_s,
+                              environ={}, stack_env={"MEM0_HOST_KIND": "native"})
+    assert out["last_dream_age_h"] == 3.0
+
+
+def test_native_markers_never_override_a_windows_profile(tmp_path):
+    """A box with both sources keeps the profile's reading: the native block fills nulls only."""
+    now_s = 1_700_000_000
+    mem0_dir = _native_fixture(tmp_path, now_s, dream_age_h=30)
+    win_home = tmp_path / "winhome"
+    state = win_home / ".claude" / "state"
+    state.mkdir(parents=True)
+    (state / "last-dream").write_text(str(now_s - 2 * 3600), encoding="utf-8")
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=win_home, now_s=now_s,
+                              environ={}, stack_env={})
+    assert out["last_dream_age_h"] == 2.0
+    assert out["prune_age_h"] == 30.0, "prune.json is absent from the profile, so the native copy fills it"
+
+
+def test_native_host_missing_markers_are_noted_not_raised(tmp_path):
+    now_s = 1_700_000_000
+    mem0_dir = tmp_path / "mem0"
+    mem0_dir.mkdir()
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=None, now_s=now_s,
+                              environ={}, stack_env={"MEM0_HOST_KIND": "native"})
+    assert out["last_dream_age_h"] is None
+    assert "native last_dream: missing" in out["error"]
+    assert "win_state" not in out["error"]
+
+
+def test_windows_host_collects_no_native_notes(tmp_path):
+    """A WSL box without the maintenance dir must not gain four new 'missing' notes."""
+    now_s = 1_700_000_000
+    mem0_dir = tmp_path / "mem0"
+    mem0_dir.mkdir()
+    out = job_liveness_health(mem0_dir=mem0_dir, win_home=tmp_path / "winhome", now_s=now_s,
+                              environ={}, stack_env={})
+    assert "native" not in (out.get("error") or "")

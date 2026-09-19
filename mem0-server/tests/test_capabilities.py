@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capabilities import (  # noqa: E402
+    _canonical_key_state,
     CAPABILITIES,
     L1A_CONVICT_H,
     admission_selfprobe,
@@ -470,6 +471,16 @@ def test_canonical_key_plaintext_is_degraded_never_alive():
     assert out["states"]["canonical-key"] == "degraded"
     # degraded is not dead: promotions still work, so it must not convict.
     assert "canonical-key" not in out["dead_required"]
+
+
+def test_canonical_key_systemd_credential_is_alive():
+    """1.28.5 (P5-12): the native brain serves the key from the systemd credentials
+    directory (LoadCredentialEncrypted in every shipped unit) -- encrypted at rest, the
+    Linux equivalent of the DPAPI posture; plaintext stays degraded."""
+    cred = {"ok": True, "present": True, "source": "credential", "dpapi_blob": False}
+    plain = {"ok": True, "present": True, "source": "plaintext", "dpapi_blob": False}
+    assert _canonical_key_state(cred) == "alive"
+    assert _canonical_key_state(plain) == "degraded"
 
 
 def test_canonical_key_alive_only_on_a_real_dpapi_posture():

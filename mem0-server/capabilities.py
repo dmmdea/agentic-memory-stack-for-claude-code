@@ -319,7 +319,13 @@ def _canonical_key_state(check):
         # prefix swallows it, which is exactly how this brain ran for weeks) and
         # the provider quietly fell back to plaintext. Treating the blob's mere
         # existence as health would relocate the drift, not end it.
-        if check.get("source") in ("runtime", "dpapi"):
+        # 1.28.5 (register P5-12): "credential" is the systemd credentials directory. Every
+        # unit this product ships loads the key with LoadCredentialEncrypted (systemd-creds,
+        # bound to the host key / TPM), so on the native brain that source IS the DPAPI-class
+        # posture: encrypted at rest, decrypted only into the service's private mount. It was
+        # missing here because the rule predates the native brain, and the brain read
+        # 'degraded' for the strongest posture it has.
+        if check.get("source") in ("runtime", "dpapi", "credential"):
             return "alive"
         return "degraded"
     # ok without a key = no key configured at all: promotions are disabled by

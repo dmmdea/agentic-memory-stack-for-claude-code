@@ -36,6 +36,9 @@ nightly ones:
 
 Sources:
 - role: env MEM0_ROLE, else ~/.mem0/stack.env (the WSL operator receipt).
+- native brain (1.28.5): ~/.mem0/maintenance/last-dream (epoch content), maintenance/dream/
+  prune.json + gather.json (mtime), maintenance/morning-summary.md -- read for any of those
+  fields the Windows profile did not fill; MEM0_HOST_KIND=native skips the profile lookup,
 - WSL-native: ~/.mem0/backups/manifest-*.json (newest mtime),
   ~/.mem0/dedup-report.jsonl (mtime — the dedup job unlinks+rewrites the report
   every run, so mtime is a real liveness signal even on zero-delete days),
@@ -415,7 +418,14 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
             notes.append(f"{name}: {e.__class__.__name__}")
 
     # --- Windows-side sources (via /mnt/c) ---
-    if win_home is None:
+    # 1.28.5 (register P5-12): a native Linux host (MEM0_HOST_KIND=native, the brain since the
+    # authority cutover) has no Windows profile at all -- its dream, index and morning-summary
+    # markers live under ~/.mem0/maintenance (ams_env.state_dir()) and are read in the native
+    # block below. Reporting "MEM0_WIN_USER unset" there was a false note, and the nulls it left
+    # made capabilities call a chain that ran 16/16 the same night "unknown".
+    host_kind = ((environ or os.environ).get("MEM0_HOST_KIND")
+                 or senv.get("MEM0_HOST_KIND") or "").strip().lower()
+    if win_home is None and host_kind != "native":
         win_user = (environ or os.environ).get("MEM0_WIN_USER") or senv.get("MEM0_WIN_USER")
         if win_user:
             win_home = Path("/mnt/c/Users") / win_user
@@ -475,6 +485,51 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
                 notes.append("morning_summary: missing")
         except OSError as e:
             notes.append(f"morning_summary: {e.__class__.__name__}")
+
+    # --- native-brain sources (~/.mem0/maintenance, the Python port's ams_env.state_dir()) ---
+    # 1.28.5 (P5-12). Same four signals the Windows block reads from the profile, from where the
+    # native chain writes them: last-dream (epoch CONTENT, the throttle mark that only a completed
+    # cycle writes), dream/prune.json + dream/gather.json (phase receipts), morning-summary.md.
+    # Fills only what is still null, so a box that has both never reads the native copy over the
+    # profile's; notes name each missing file only when the host is native, so a Windows box does
+    # not collect four extra "missing" notes for a directory it never writes.
+    native_dir = mem0_dir / "maintenance"
+    _native_note = host_kind == "native"
+    if out["last_dream_age_h"] is None:
+        try:
+            marker = native_dir / "last-dream"
+            if marker.exists():
+                epoch = parse_epoch_content(marker.read_text(encoding="utf-8"))
+                if epoch is None:
+                    notes.append("native last_dream: unparseable content")
+                else:
+                    out["last_dream_age_h"] = age_hours(epoch, now_s)
+            elif _native_note:
+                notes.append("native last_dream: missing")
+        except OSError as e:
+            notes.append(f"native last_dream: {e.__class__.__name__}")
+    for field, name in (("prune_age_h", "prune.json"), ("gather_age_h", "gather.json")):
+        if out[field] is not None:
+            continue
+        try:
+            f = native_dir / "dream" / name
+            if f.exists():
+                out[field] = _mtime_age(f, now_s)
+            elif _native_note:
+                notes.append(f"native {name}: missing")
+        except OSError as e:
+            notes.append(f"native {name}: {e.__class__.__name__}")
+    if out["morning_summary_age_h"] is None:
+        try:
+            ms = native_dir / "morning-summary.md"
+            if ms.exists():
+                out["morning_summary_age_h"] = _mtime_age(ms, now_s)
+                out["morning_summary_sections_48h"] = count_recent_sections(
+                    tail_text(ms), _dt.datetime.fromtimestamp(now_s))
+            elif _native_note:
+                notes.append("native morning_summary: missing")
+        except OSError as e:
+            notes.append(f"native morning_summary: {e.__class__.__name__}")
 
     if notes:
         out["error"] = "; ".join(notes)[:300]

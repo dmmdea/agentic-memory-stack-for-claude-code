@@ -4,6 +4,23 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.28.5 — the native brain's liveness probe sees its own dream (register P5-12)
+
+`job_liveness` read the dream throttle mark, the `prune.json` / `gather.json` phase receipts
+and the morning summary only from a Windows profile under `/mnt/c/Users/<MEM0_WIN_USER>`. A
+native Linux brain has no such profile: its chain writes those under `~/.mem0/maintenance`
+(`ams_env.state_dir()`), so the four fields stayed null, the health note read
+"MEM0_WIN_USER unset", and `capabilities` reported dream-cycle, memory-index, sweep-job and
+codex-auth as `unknown` on a brain whose chain had run 16/16 the same night. The collector now
+skips the profile lookup when `MEM0_HOST_KIND=native` and reads the native paths for any of
+those fields the profile did not fill (a profile's markers still win where both exist); its
+"missing" notes are raised only on a native host, so a Windows box collects nothing new.
+
+Same class, same box: the canonical-key row read `degraded` for the strongest posture the
+brain has. Every shipped unit loads the key with `LoadCredentialEncrypted` (systemd-creds),
+which the provider reports as source `credential`; that source now counts as `alive` beside
+`runtime` and `dpapi`, and plaintext stays `degraded`.
+
 ## 1.28.4 — a replica never dreams (register P5-11)
 
 Since the authority moved to the native Linux brain, the nightly chain (dream, store judge, index,
