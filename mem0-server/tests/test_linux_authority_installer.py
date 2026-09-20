@@ -404,12 +404,38 @@ def test_stack_env_records_the_checkout_and_the_hub():
 
 
 def test_the_judge_apply_wrapper_treats_a_missing_plan_as_deterministic_only():
-    """The P4-1b gate's second half: the floor lands even when the plan is empty."""
+    """The P4-1b gate's second half: the floor lands even when the plan is empty.
+
+    P5-10 widened the guard and added a sync BEFORE the apply, so two things moved: a plan
+    withdrawn by a failed pre-sync has to skip the loop for the same reason a missing file
+    does, and "the sync still runs" now means the TRAILING one (rindex, not index - the
+    first occurrence is the pre-apply sync and it sits above the else branch)."""
     w = (REPO_ROOT / "scripts" / "wsl" / "ams-store-judge-apply.sh").read_text(encoding="utf-8")
     assert "deterministic-only night" in w
-    assert 'if [ -s "$PLAN" ]; then' in w, "a missing plan skips the apply loop"
+    assert 'if [ -n "$PLAN" ] && [ -s "$PLAN" ]; then' in w, "a missing or withdrawn plan skips the apply loop"
     i_else = w.index("no plan at $PLAN")
-    i_sync = w.index('"$BIN" sync $sync_args')
-    assert i_else < i_sync, "the sync must run whether or not a plan existed"
+    i_sync = w.rindex('"$BIN" sync $sync_args')
+    assert i_else < i_sync, "the deterministic sync must run whether or not a plan existed"
     assert "MEM0_API_KEY_FILE" in w, "the corpus key comes from the systemd credential, never a flag"
     assert "--plan" in w and "--workspace" in w and "--state-root" in w
+
+
+def test_the_judge_apply_wrapper_syncs_the_checkout_before_it_applies():
+    """P5-10 (2026-09-19): the plan was written against a checkout the dream step had just
+    synced, but the minutes between the two steps are enough for a PC to push an edit to a
+    planned file - and a decision applied to a day-old copy is what resurrected two facts on
+    night 3. So the wrapper syncs FIRST, and an exit that is not 0 (current) or 6 (a conflict
+    recorded in history: the work tree IS the merge result) withdraws the plan rather than
+    applying it to files of unknown age. The trailing sync still runs either way, so the
+    deterministic floor lands, and the pre-sync's exit is carried out of the script."""
+    w = (REPO_ROOT / "scripts" / "wsl" / "ams-store-judge-apply.sh").read_text(encoding="utf-8")
+    i_pre = w.index('"$BIN" sync $sync_args')
+    i_guard = w.index('if [ -n "$PLAN" ] && [ -s "$PLAN" ]; then')
+    assert i_pre < i_guard, "the sync must run before the apply loop, not only after it"
+    assert w.index("pre_rc=$?") < i_guard, "the pre-apply sync's exit must be captured"
+    # 0 and 6 are a current checkout; everything else clears PLAN so nothing is applied.
+    pre = w[i_pre:i_guard]
+    assert "0|6)" in pre and 'PLAN=""' in pre, "a failed pre-apply sync withdraws the plan"
+    assert "pre_sync_exit=$pre_rc" in w, "the receipt line names the pre-apply sync's exit"
+    assert 'case "$pre_rc" in 0|6) ;; *) exit "$pre_rc" ;; esac' in w, \
+        "a stale checkout must leave the script non-zero, after the deterministic sync"

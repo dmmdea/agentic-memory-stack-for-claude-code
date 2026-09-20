@@ -108,6 +108,19 @@ def _run(m, args, **kw):
     return m.run(m.parse_args(args), **kw)
 
 
+def _dream(m, **kw):
+    """A Dream built exactly as run() builds it, for a test that drives ONE phase instead of
+    the whole cycle and wants that phase's return value rather than what it left on disk.
+    parse_args([]) is what makes self.dry False - the flag is read off args, not passed in."""
+    kw.setdefault("mem0", FakeMem0(EV))
+    kw.setdefault("judge", _judge(SIG, INS, "[]"))
+    kw.setdefault("qdrant_http", None)
+    kw.setdefault("eval_runner", lambda c: (0, ""))
+    kw.setdefault("now", NOW)
+    return m.Dream(m.parse_args([]), kw["mem0"], kw["judge"], kw["qdrant_http"],
+                   kw["eval_runner"], kw["now"])
+
+
 def test_gather_is_store_fed_and_36h_windowed(home):
     m = _mod()
     seen = {}
@@ -372,6 +385,7 @@ def _arm_store_judge(m, monkeypatch, home, stores, candidates):
     binary = home / "bin" / "ams-store"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)  # P5-10: the phase now runs `sync --once` for real before it reads candidates
     monkeypatch.setenv("AMS_STORE_CHECKOUT", str(root))
     monkeypatch.setenv("AMS_STORE_BIN", str(binary))
     monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, "ok"))
@@ -396,6 +410,7 @@ def test_store_judge_reads_the_checkout_from_stack_env_when_the_unit_does_not_se
     binary = home / "bin" / "ams-store"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)  # P5-10: the phase now runs `sync --once` for real before it reads candidates
     # exactly what the installer writes, and NOTHING in the environment
     (home / ".mem0").mkdir(exist_ok=True)
     (home / ".mem0" / "stack.env").write_text(
@@ -411,6 +426,84 @@ def test_store_judge_reads_the_checkout_from_stack_env_when_the_unit_does_not_se
     plan = _plan(home)
     assert plan is not None, "the phase must find the checkout through stack.env"
     assert plan["stores"][0]["workspace"] == "ws-a"
+
+
+def _fake_sync(calls, rc=0, status="pushed"):
+    """Stand in for the binary's `sync --once --json`; records the call in order with the
+    candidates seam so a test can assert WHICH ran first."""
+    class _CP:
+        def __init__(self):
+            self.returncode = rc
+            self.stdout = json.dumps({"status": status})
+            self.stderr = "" if rc == 0 else "fetch failed: hub unreachable"
+
+    def run(cmd, **kw):
+        calls.append(("sync", list(cmd)))
+        return _CP()
+    return run
+
+
+def test_store_judge_syncs_the_checkout_before_reading_candidates(home, monkeypatch):
+    """P5-10 (2026-09-19): the checkout only moves when something syncs it, and nothing did
+    between one night's apply and the next night's plan - the judge migrated day-old copies of
+    two facts a session had edited, and the merge's modify-vs-delete rule undid it. The plan
+    must be written against a checkout synced seconds earlier: sync runs first, with the
+    checkout's roots and the pinned hub host."""
+    m = _mod()
+    calls = []
+    offers = {"offers": [OFFER_A], "outcome": "offered"}
+    root = _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]},
+                            lambda ws: (calls.append(("candidates", ws)), offers)[1])
+    monkeypatch.setattr(m.subprocess, "run", _fake_sync(calls))
+    monkeypatch.setenv("AMS_STORE_HUB_HOST", "hub-box")
+    monkeypatch.setattr(m.Dream, "_judge_call", lambda self, comp, prompt, **kw: {"ok": True, "text": '{"decisions":[]}'})
+    d = _dream(m)
+    out = d._store_judge()
+    assert calls and calls[0][0] == "sync", f"the sync must run before any candidates call: {calls}"
+    cmd = calls[0][1]
+    assert cmd[1:3] == ["sync", "--once"] and "--json" in cmd
+    assert cmd[cmd.index("--projects-root") + 1] == str(root / "projects")
+    assert cmd[cmd.index("--state-root") + 1] == str(root / "state")
+    assert cmd[cmd.index("--hub-host") + 1] == "hub-box"
+    assert ("candidates", "ws-a") in calls
+    assert out["written"] is True and _plan(home) is not None
+
+
+def test_store_judge_hub_host_falls_back_to_stack_env_ams_hub(home, monkeypatch):
+    """The dream unit carries no AMS_STORE_HUB_HOST (only the store-judge unit does); the
+    host comes from stack.env's MEM0_AMS_HUB user@host:repo.git, the value the authority
+    installer records. No host at all still syncs - the policy then checks shape only."""
+    m = _mod()
+    monkeypatch.delenv("AMS_STORE_HUB_HOST", raising=False)
+    (home / ".mem0").mkdir(parents=True, exist_ok=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_AMS_HUB=ams-hub@hub-box:ams-store.git\n", encoding="utf-8")
+    assert m._ams_hub_host() == "hub-box"
+    (home / ".mem0" / "stack.env").write_text("MEM0_ROLE=brain\n", encoding="utf-8")
+    assert m._ams_hub_host() == ""
+
+
+def test_store_judge_writes_no_plan_when_the_checkout_sync_fails(home, monkeypatch):
+    """A hub the checkout cannot reach (exit 5), a lock held by another sync (4) or a refusal
+    (3) all mean the files are of unknown age: no plan is the correct plan, and the note says
+    why. Exit 6 (a conflict recorded in history) is a CURRENT checkout and still plans."""
+    m = _mod()
+    for rc, expect_plan in ((5, False), (4, False), (3, False), (6, True)):
+        calls = []
+        offers = {"offers": [OFFER_A], "outcome": "offered"}
+        _arm_store_judge(m, monkeypatch, home, {"ws-a": ["a.md"]},
+                         lambda ws: (calls.append(("candidates", ws)), offers)[1])
+        monkeypatch.setattr(m.subprocess, "run", _fake_sync(calls, rc=rc, status="offline" if rc == 5 else "conflict"))
+        monkeypatch.setattr(m.Dream, "_judge_call", lambda self, comp, prompt, **kw: {"ok": True, "text": '{"decisions":[]}'})
+        p = home / ".mem0" / "maintenance" / "dream" / "store-judge.json"
+        if p.exists():
+            p.unlink()
+        out = _dream(m)._store_judge()
+        assert out["written"] is expect_plan, (rc, out)
+        assert (_plan(home) is not None) is expect_plan, (rc, out)
+        if not expect_plan:
+            assert f"exit={rc}" in out["note"] and not any(c[0] == "candidates" for c in calls), (rc, out, calls)
+        import shutil
+        shutil.rmtree(home / "checkout")
 
 
 def test_store_judge_is_skipped_when_the_box_holds_no_checkout(home, monkeypatch):

@@ -41,8 +41,26 @@ if [ -z "${MEM0_API_KEY:-}" ] && [ -n "${MEM0_API_KEY_FILE:-}" ] && [ -r "${MEM0
     export MEM0_API_KEY
 fi
 
+sync_args="--once --projects-root $PROJECTS --state-root $STATE"
+[ -n "$HUB_HOST" ] && sync_args="$sync_args --hub-host $HUB_HOST"
+
+# P5-10 (2026-09-19): sync BEFORE the apply as well as after. The plan was written against a
+# checkout the dream step had just synced; the minutes in between are enough for a PC to push
+# an edit to a planned file, and a decision applied to a day-old copy is what resurrected two
+# facts on night 3. Exit 0 and 6 (conflict recorded, work tree = merge result) are current;
+# anything else leaves the plan unapplied, loudly - the post-apply sync below still runs so the
+# deterministic floor lands whatever happened here.
+# shellcheck disable=SC2086
+"$BIN" sync $sync_args
+pre_rc=$?
+case "$pre_rc" in
+    0|6) ;;
+    *) echo "ams-store-judge: pre-apply sync exit=$pre_rc; the plan would apply to a stale checkout - not applied" >&2
+       PLAN="" ;;
+esac
+
 applied=0; skipped=0; failed=0
-if [ -s "$PLAN" ]; then
+if [ -n "$PLAN" ] && [ -s "$PLAN" ]; then
     echo "ams-store-judge: applying $PLAN"
     for d in "$PROJECTS"/*/memory; do
         [ -d "$d" ] || continue
@@ -62,11 +80,10 @@ else
     echo "ams-store-judge: no plan at $PLAN; deterministic-only night (the sync below still derives every store)"
 fi
 
-sync_args="--once --projects-root $PROJECTS --state-root $STATE"
-[ -n "$HUB_HOST" ] && sync_args="$sync_args --hub-host $HUB_HOST"
 # shellcheck disable=SC2086
 "$BIN" sync $sync_args
 rc=$?
-echo "ams-store-judge: applied=$applied skipped=$skipped failed=$failed sync_exit=$rc"
+echo "ams-store-judge: applied=$applied skipped=$skipped failed=$failed pre_sync_exit=$pre_rc sync_exit=$rc"
 [ "$failed" = 0 ] || exit 1
+case "$pre_rc" in 0|6) ;; *) exit "$pre_rc" ;; esac
 exit "$rc"

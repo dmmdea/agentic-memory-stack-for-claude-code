@@ -4,6 +4,41 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.29.0 — a decision is applied to today's files, and no two passes hold the lock (register P5-10, P5-14)
+
+**The judge decided on a day-stale checkout (P5-10 a).** The hub's checkout is a PC like any
+other: it moves only when something syncs it, and nothing did between one night's apply and the
+next night's plan. The judge read copies a session had edited hours earlier, migrated two of
+those facts, and the chain's own post-apply merge then met modify-vs-delete and kept the edited
+files — `resurrected`, the deletion table working exactly as designed on a wrong-input decision.
+Phase 3.7 now runs `ams-store sync --once` on the checkout before it reads any candidate, and
+`ams-store-judge-apply.sh` runs the same sync before its apply loop. An exit that is not 0 or 6
+(a conflict recorded in history: the work tree IS the merge result) means the files are of
+unknown age, so no plan is written and nothing is applied — the trailing deterministic sync
+still runs, so the floor lands whatever happened.
+
+**Two passes could hold the per-PC lock, and a stale stage re-added queued deletions (P5-10 b).**
+Breaking a dead holder's lock file was a bare `os.Remove`, which two contenders could both win:
+each read the same dead holder, the first removed it and created its own lock, and the second's
+remove deleted THAT fresh lock before creating another. The break now happens under an O_EXCL
+sibling guard, re-reads the holder under it and leaves a live one alone; a guard older than a
+minute belongs to a breaker that died mid-break and is cleared without granting the lock.
+Separately, `Commit` now puts HEAD's entry back in the index for every path any workspace's
+deferred queue holds: `Stage` already excludes them, but a stage taken BEFORE a concurrent merge
+wrote the queue carried the on-disk bytes that merge had withheld, and the commit that followed
+re-added three hub deletions on top of the merge. The queue is honoured at the moment of commit,
+whatever admitted the concurrency. The watcher also takes the per-PC lock through the same seam
+every other verb uses and retries a refused pass shortly after, instead of leaving the dirty
+marker until the next remote check.
+
+**The replica installer runs on aarch64 (P5-14).** Qdrant publishes a glibc build for x86_64 and
+a musl one for aarch64; the installer picks by `uname -m` and refuses any other architecture by
+name. Both Linux builds link jemalloc, which aborts at startup on anything but 4 KiB pages
+(`<jemalloc>: Unsupported system page size`) — the Raspberry Pi 5's default kernel is 16 KiB. The
+page size is now a prerequisite check, before anything is installed, and names the remedy
+(`kernel=kernel8.img` under `[pi5]`, the 4 KiB `linux-image-rpi-v8` kernel). The thin client's
+pwsh hint also covers boxes with no snap and arm64.
+
 ## 1.28.5 — the native brain's liveness probe sees its own dream (register P5-12)
 
 `job_liveness` read the dream throttle mark, the `prune.json` / `gather.json` phase receipts
