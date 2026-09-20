@@ -31,6 +31,22 @@ whatever admitted the concurrency. The watcher also takes the per-PC lock throug
 every other verb uses and retries a refused pass shortly after, instead of leaving the dirty
 marker until the next remote check.
 
+**The weekly contradiction sweep had never once run (P5-13, new).** `codex login status`
+exits 0 and prints "Logged in using ChatGPT" on STDERR, leaving stdout empty. The native
+health check read stdout alone, so every native host reported `logged_in=False` on a Codex
+that was logged in. `contradiction-sweep --judge codex` preflights that health, so it
+refused to judge, fell back to `ensure-codex-shim.sh` hunting a Windows shim a native brain
+does not have, failed on the empty `MEM0_WIN_USER`, and exited 0 with
+`outcome=no-op:codex-shim-unreachable`. The chain's health stamp then recorded the step
+`"ok": true` with a fresh `last_success`, so a weekly memory-integrity sweep that had never
+judged anything reported green every Sunday since the authority went native - both recorded
+Sundays (2026-09-13, 2026-09-20) are the same no-op. The health check now reads both
+streams. The test that covered this passed throughout because its fixture put the message on
+stdout, the one stream the real binary does not use; it now also asserts the stderr shape
+measured on the live authority. `test_codex_native_transport.py` was absent from CI's
+headless list entirely and has been added - the whole native-transport suite (11 tests) was
+never running there.
+
 **The replica installer runs on aarch64 (P5-14).** Qdrant publishes a glibc build for x86_64 and
 a musl one for aarch64; the installer picks by `uname -m` and refuses any other architecture by
 name. Both Linux builds link jemalloc, which aborts at startup on anything but 4 KiB pages

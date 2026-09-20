@@ -114,6 +114,25 @@ def test_native_health_reports_login():
     assert out["ok"] is False and out["logged_in"] is False
 
 
+def test_native_health_reads_the_stream_codex_actually_writes_to():
+    """Measured on the live authority 2026-09-20: `codex login status` exits 0 and writes
+    "Logged in using ChatGPT" to STDERR, leaving stdout EMPTY. The parse read stdout only,
+    so every native host reported logged_in=False on a logged-in Codex. That is why
+    contradiction-sweep no-op'd with "codex shim unreachable" every Sunday since the brain
+    went native, chased the Windows shim it does not have, and still exited 0 while the
+    chain's health stamp recorded it green. The test above passed throughout because its
+    fixture put the message on stdout - the stream the real binary does not use."""
+    out = csc.health(_run=lambda cmd, **kw: _cp(0, out="", err="Logged in using ChatGPT\n"))
+    assert out["ok"] is True and out["logged_in"] is True, \
+        "a logged-in Codex that answers on stderr must read as healthy"
+    # A refusal on stderr must still read as refused - the fix must not just say yes.
+    out = csc.health(_run=lambda cmd, **kw: _cp(1, out="", err="Not logged in\n"))
+    assert out["ok"] is False and out["logged_in"] is False
+    # And "not logged in" anywhere in either stream wins over the substring "logged in".
+    out = csc.health(_run=lambda cmd, **kw: _cp(0, out="", err="Not logged in\n"))
+    assert out["ok"] is False and out["logged_in"] is False
+
+
 def test_shim_path_is_untouched_when_transport_is_shim(monkeypatch):
     import httpx
     monkeypatch.setenv("MEM0_CODEX_TRANSPORT", "shim")
