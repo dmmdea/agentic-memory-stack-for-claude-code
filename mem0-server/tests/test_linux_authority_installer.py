@@ -95,6 +95,28 @@ def test_render_only_includes_the_chain_and_no_per_job_timers(tmp_path):
     assert names == {"l10-audit.timer", "ams-nightly.timer"}, names
 
 
+def test_wiki_index_step_is_rendered_only_with_wiki_sources(tmp_path):
+    """The wiki-index step needs a PC to pull from; without --wiki-sources it is dropped from
+    the rendered set (the store-judge rule), with it the unit lands and stack.env records
+    both the sources and the key so a re-run inherits them."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not (out / "ams-step-wiki-index.service").exists()
+    assert "--wiki-sources not configured: no wiki-index step" in r.stdout
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--wiki-sources", "op@pc-a op@pc-b",
+                 "--wiki-pull-key", "/k/wiki", "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    unit = (out2 / "ams-step-wiki-index.service").read_text(encoding="utf-8")
+    assert "ams-step.sh --guarded wiki-index" in unit
+    assert "Before=ams-step-stack-backup.service" in unit
+    assert "op@pc-a" not in unit  # sources travel in stack.env, never in a unit
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "MEM0_WIKI_SOURCES=%s" in text and "MEM0_WIKI_PULL_KEY=%s" in text
+    assert "inherit_from_stack_env WIKI_SOURCES  MEM0_WIKI_SOURCES" in text
+
+
 def test_installer_enables_every_chain_step():
     """WantedBy=ams-nightly.target only binds a step once it is enabled; the first live run
     started the target and pulled in nothing because only the timer was enabled."""

@@ -4,6 +4,26 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.30.0 — the operator's wiki gets a searchable index on the brain, kept fresh two ways
+
+**The wiki's semantic index existed nowhere.** The operator's LLM Wiki (a curated markdown
+vault on a cloud-synced folder) had a Qdrant index built by maintainer-side scripts into the
+PC that was the brain at the time; the v2 cutover made every PC's Qdrant a dormant replica and
+nobody moved the collection, so `wiki-search` answered "collection missing" for six days while
+its scripts still pointed at a drive letter that had moved. The scripts are now in this repo,
+scrubbed and configurable, and the index lives on the brain box
+([docs/systems/wiki-index.md](docs/systems/wiki-index.md)).
+
+**Two refresh paths.** A replica's `wiki-index.sh` snapshots `wiki/` from a tar on stdin and
+builds or searches through an SSH tunnel to the brain's loopback Qdrant (alias from
+`WIKI_BRAIN_SSH`, `MEM0_BRAIN_SSH`, or the SSH-config Host that names the authority). On the
+brain, a new chain step `wiki-index` (`--guarded`, after `index-refresh`, before the stamping
+backup) pulls `wiki/` from the first reachable PC in `--wiki-sources` over a dedicated key the
+operator pins to a forced tar command, and builds locally; with no PC reachable it keeps the
+index while the last pull is under 72 h old and fails after. The installer renders the step
+only when `--wiki-sources` is set — the store-judge rule, applied again. The index is outside
+the backup set on purpose: the vault is the record, a rebuild is the restore.
+
 ## 1.29.0 — a decision is applied to today's files, and no two passes hold the lock (register P5-10, P5-14)
 
 **The judge decided on a day-stale checkout (P5-10 a).** The hub's checkout is a PC like any
