@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,10 @@ const (
 	// is a single `ls-remote`, and it runs ONLY while a session is live: a PC with
 	// nobody working on it must produce no network traffic at all.
 	RemoteCheckEvery = 5 * time.Minute
+	// RetryHeldAfter is how soon a pass skipped because the per-PC lock was held is tried
+	// again. Acquire never waits, so a held lock costs one failed create and a short timer;
+	// the dirty marker the pass was answering is still there.
+	RetryHeldAfter = 3 * time.Second
 )
 
 // Exit reasons a watch run ends with.
@@ -45,6 +50,17 @@ type WatchOptions struct {
 	LivenessWithin time.Duration
 	// SingletonName overrides the named mutex, for tests.
 	SingletonName string
+	// AcquirePassLock takes the per-PC lock for ONE pass and returns its release, or
+	// ok=false when another process holds it. Nil means the lock package's production
+	// names and the state root's lock file. The CLI wires its own (the test-name seam).
+	//
+	// P5-10 (2026-09-19): a watcher pass used to call Once with no lock at all and with
+	// the watcher's START time as the pass clock. A hook-driven `sync --once` (which
+	// holds the lock for its whole pass) merged the hub and queued three deletions while
+	// the watcher's pass was staging the pre-merge work tree; the watcher then committed
+	// that stage on top of the merge and pushed it - the deletions came back on every
+	// PC. Every pass now takes the same lock every other verb takes, with a fresh clock.
+	AcquirePassLock func(now time.Time) (release func(), ok bool, err error)
 }
 
 // WatchSummary is what a watch run did before exiting.
@@ -58,6 +74,8 @@ type WatchSummary struct {
 	// RemoteChecks counts ls-remote calls, so a test can assert the "only while live,
 	// only every 5 min" rule rather than trusting it.
 	RemoteChecks int
+	// Skipped counts passes that found the per-PC lock held and were retried.
+	Skipped int
 }
 
 // Watch runs the singleton watcher until no session is live or the idle window expires.
@@ -134,7 +152,7 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 		lsRemote: func(c context.Context) (string, error) {
 			return LsRemoteHead(c, repo, opt.Roots.StateRoot, opt.Timeout)
 		},
-		runSync: func(c context.Context) Result { return Once(c, opt.Options) },
+		runSync: watchPass(opt.Options, opt.AcquirePassLock, time.Now, logw),
 		now:     time.Now,
 		after:   time.After,
 		log:     logw,
@@ -156,6 +174,51 @@ type watchDeps struct {
 	now      func() time.Time
 	after    func(time.Duration) <-chan time.Time
 	log      io.Writer
+}
+
+// watchPass is one sync pass as the watcher runs it: the per-PC lock taken first, a
+// clock read for THIS pass, Once, release. The lock is the same file and mutexes every
+// other verb takes, so a pass and a hook-driven `sync --once` can never interleave their
+// stage, merge and commit steps (P5-10). A held lock is not an error: the pass reports
+// LockHeld, writes nothing, and the loop retries after RetryHeldAfter while the dirty
+// marker stands.
+func watchPass(base Options, acquire func(time.Time) (func(), bool, error), clock func() time.Time, logw io.Writer) func(context.Context) Result {
+	if acquire == nil {
+		acquire = func(now time.Time) (func(), bool, error) {
+			l, err := lock.Acquire(lock.Options{
+				Path:   filepath.Join(base.Roots.StateRoot, lock.FileName),
+				Reason: "sync",
+				Now:    now,
+			})
+			if err != nil {
+				if errors.Is(err, lock.ErrHeld) {
+					return nil, false, nil
+				}
+				return nil, false, err
+			}
+			return func() { _ = l.Release() }, true, nil
+		}
+	}
+	if clock == nil {
+		clock = time.Now
+	}
+	if logw == nil {
+		logw = io.Discard
+	}
+	return func(ctx context.Context) Result {
+		o := base
+		o.Now = clock()
+		release, ok, err := acquire(o.Now)
+		if err != nil {
+			return Result{ExitCode: exitRefused, Err: fmt.Errorf("watch: per-PC lock: %w", err)}
+		}
+		if !ok {
+			fmt.Fprintf(logw, "watch: the per-PC lock is held by another process; pass skipped, retry in %s\n", RetryHeldAfter)
+			return Result{ExitCode: exitLocked, LockHeld: true}
+		}
+		defer release()
+		return Once(ctx, o)
+	}
 }
 
 // runWatch is the event loop of DESIGN:179-184.
@@ -184,6 +247,23 @@ func runWatch(ctx context.Context, opt WatchOptions, d watchDeps) (WatchSummary,
 	idleDeadline := start.Add(idle)
 	nextRemote := start.Add(every)
 	lastHead := ""
+	// retryAt is set when a pass found the per-PC lock held: the marker is still dirty
+	// and nothing else will wake the loop for it, so a short timer does.
+	var retryAt time.Time
+	pass := func(ctx context.Context) {
+		res := d.runSync(ctx)
+		if res.LockHeld {
+			sum.Skipped++
+			retryAt = d.now().Add(RetryHeldAfter)
+			return
+		}
+		retryAt = time.Time{}
+		sum.Syncs++
+		if res.Err != nil {
+			fmt.Fprintf(logw, "watch: sync: %v\n", res.Err)
+		}
+		idleDeadline = d.now().Add(idle)
+	}
 
 	for {
 		if !d.anyLive() {
@@ -199,6 +279,11 @@ func runWatch(ctx context.Context, opt WatchOptions, d watchDeps) (WatchSummary,
 		wait := idleDeadline.Sub(now)
 		if r := nextRemote.Sub(now); r < wait {
 			wait = r
+		}
+		if !retryAt.IsZero() {
+			if r := retryAt.Sub(now); r < wait {
+				wait = r
+			}
 		}
 		if wait < 0 {
 			wait = 0
@@ -219,18 +304,20 @@ func runWatch(ctx context.Context, opt WatchOptions, d watchDeps) (WatchSummary,
 				// it, not new work.
 				continue
 			}
-			res := d.runSync(ctx)
-			sum.Syncs++
-			if res.Err != nil {
-				fmt.Fprintf(logw, "watch: sync: %v\n", res.Err)
-			}
-			idleDeadline = d.now().Add(idle)
+			pass(ctx)
 
 		case <-d.after(wait):
 			now := d.now()
 			if !d.anyLive() {
 				sum.Reason = ExitReasonNoSession
 				return sum, nil
+			}
+			if !retryAt.IsZero() && !now.Before(retryAt) {
+				if d.isDirty() {
+					pass(ctx)
+				} else {
+					retryAt = time.Time{} // the holder's own pass cleared the marker
+				}
 			}
 			if !now.Before(nextRemote) {
 				nextRemote = now.Add(every)
@@ -242,12 +329,7 @@ func runWatch(ctx context.Context, opt WatchOptions, d watchDeps) (WatchSummary,
 					fmt.Fprintf(logw, "watch: ls-remote: %v\n", err)
 				} else if head != "" && head != lastHead {
 					if lastHead != "" {
-						res := d.runSync(ctx)
-						sum.Syncs++
-						if res.Err != nil {
-							fmt.Fprintf(logw, "watch: sync: %v\n", res.Err)
-						}
-						idleDeadline = d.now().Add(idle)
+						pass(ctx)
 					}
 					lastHead = head
 				}

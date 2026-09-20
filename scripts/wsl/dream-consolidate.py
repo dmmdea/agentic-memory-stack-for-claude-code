@@ -88,6 +88,12 @@ STORE_JUDGE_TIMEOUT_S = 240
 # convergence floor in `derive` holds the index under the caps meanwhile.
 STORE_JUDGE_MAX_CANDIDATES = 40
 STORE_JUDGE_CANDIDATES_TIMEOUT_S = 120
+# P5-10 (2026-09-19): the checkout syncs only inside the chain, so at 03:00 its store was the
+# PREVIOUS night's. A session had edited two of the facts the judge then migrated from the stale
+# copies, and the chain's own post-apply merge met modify-vs-delete and kept the edited files -
+# `resurrected`, the deletion table working as designed on a wrong-input decision. The plan is
+# now written only against a checkout that synced seconds earlier.
+STORE_JUDGE_SYNC_TIMEOUT_S = 300
 PLAN_VERSION = 1
 
 
@@ -500,6 +506,19 @@ def _ams_checkout_root() -> str:
             or "").strip()
 
 
+def _ams_hub_host() -> str:
+    """The MagicDNS name the sync's remote policy pins the hub to: the store-judge unit's
+    AMS_STORE_HUB_HOST, else the host part of stack.env's MEM0_AMS_HUB (user@host:repo.git).
+    Empty means the policy checks shape only - the sync still runs."""
+    host = os.environ.get("AMS_STORE_HUB_HOST", "").strip()
+    if host:
+        return host
+    hub = ams_env.stack_env().get("MEM0_AMS_HUB", "").strip()
+    if "@" in hub and ":" in hub:
+        return hub.split("@", 1)[1].split(":", 1)[0].strip()
+    return ""
+
+
 def _plan_schema_path() -> Path | None:
     """The deployed schema sits beside this script (linux-authority.sh copies it there); a
     repo checkout keeps it under docs/schemas. Returns whichever exists, else None."""
@@ -736,6 +755,36 @@ class Dream:
             log(f"  store-judge {ws}: candidates output unparseable: {e}")
             return None
 
+    def _sync_checkout(self, checkout: str) -> tuple[bool, str]:
+        """`ams-store sync --once` on the hub checkout, so the plan reads TODAY's files.
+
+        The checkout is a PC like any other: it only moves when something syncs it, and until
+        P5-10 nothing did between one night's apply and the next night's plan. Exit 0 (pushed
+        or up to date) and 6 (a conflict recorded in history: the work tree IS the merge result)
+        are a current checkout; anything else - the hub unreachable (5), the per-PC lock held
+        (4), a refusal (3) - means the judge would decide on files of unknown age, and no plan
+        is the correct plan for that night."""
+        proj = Path(checkout) / "projects"
+        cmd = [_ams_store_bin(), "sync", "--once", "--json",
+               "--projects-root", str(proj), "--state-root", str(Path(checkout) / "state")]
+        host = _ams_hub_host()
+        if host:
+            cmd += ["--hub-host", host]
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=STORE_JUDGE_SYNC_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001
+            return False, f"checkout sync failed: {e}"
+        status = ""
+        try:
+            status = str(json.loads(cp.stdout or "{}").get("status", ""))
+        except Exception:  # noqa: BLE001
+            pass
+        if cp.returncode not in (0, 6):
+            return False, (f"checkout sync exit={cp.returncode} status={status or '?'}: "
+                           f"{_clip((cp.stderr or '').strip(), 200)}")
+        return True, status or "ok"
+
     def _store_judge(self) -> dict:
         """Write the nightly judge plan for the hub's checkout. Never raises into the chain:
         every failure ends as an outcome in the plan, or as no plan at all."""
@@ -746,6 +795,13 @@ class Dream:
         if not Path(_ams_store_bin()).exists():
             log(f"  store-judge: {_ams_store_bin()} is not installed (skipped)")
             return {"stores": 0, "decisions": 0, "written": False, "note": "no binary"}
+
+        # P5-10: sync FIRST, so the offer set below is today's store and not last night's.
+        synced, why = self._sync_checkout(checkout)
+        if not synced:
+            log(f"  store-judge: {why}; the plan would decide on stale files - none written")
+            return {"stores": 0, "decisions": 0, "written": False, "note": why}
+        log(f"  store-judge: checkout synced ({why})")
 
         workspaces = self._store_workspaces(checkout)
         if not workspaces:

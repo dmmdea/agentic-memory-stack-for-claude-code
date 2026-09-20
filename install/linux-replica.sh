@@ -122,6 +122,18 @@ inherit_from_replica_env BRAIN_WSL       BRAIN_WSL       --brain-wsl
 [ -z "$BRAIN_WSL" ] || [[ "$BRAIN_WSL" == *:* ]] || fail "--brain-wsl must be <distro>:<user>"
 [[ "$QDRANT_STORAGE_GB" =~ ^[0-9]+$ ]] && [ "$QDRANT_STORAGE_GB" -ge 1 ] || fail "--qdrant-storage-gb must be a whole number of GiB"
 for t in python3 curl jq ssh systemctl; do command -v "$t" >/dev/null || fail "$t is required"; done
+# Qdrant publishes two Linux builds: a glibc one for x86_64 and a musl one for aarch64 (a Raspberry
+# Pi 5, an Apple-silicon VM). Both link jemalloc, which aborts at startup on a kernel with anything
+# but 4 KiB pages ("<jemalloc>: Unsupported system page size") - and the Pi 5 boots a 16 KiB-page
+# kernel by default. Refuse here, with the remedy, instead of installing a binary that dies on its
+# first `--version`.
+case "$(uname -m)" in
+    x86_64)        QDRANT_ASSET="qdrant-x86_64-unknown-linux-gnu.tar.gz" ;;
+    aarch64|arm64) QDRANT_ASSET="qdrant-aarch64-unknown-linux-musl.tar.gz" ;;
+    *) fail "unsupported CPU architecture '$(uname -m)': Qdrant publishes Linux builds for x86_64 and aarch64 only" ;;
+esac
+PAGE_SIZE="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+[ "$PAGE_SIZE" = 4096 ] || fail "this kernel uses ${PAGE_SIZE}-byte pages and Qdrant's Linux builds abort on anything but 4096 (jemalloc). On a Raspberry Pi 5: add 'kernel=kernel8.img' under [pi5] in /boot/firmware/config.txt (the 4 KiB kernel, package linux-image-rpi-v8), reboot, confirm 'getconf PAGESIZE' prints 4096, then re-run"
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
 for f in scripts/travel/restore-replica.sh scripts/travel/offline-watcher.py systemd/mem0.service systemd/qdrant.service systemd/offline-watcher.service systemd/offline-watcher.timer scripts/wsl/generate-canonical-key.sh scripts/wsl/dpapi-fetch-key.sh; do
     [ -f "$REPO_ROOT/$f" ] || fail "missing $REPO_ROOT/$f"
@@ -133,7 +145,7 @@ PIP_SPECS="$(grep -E "pip install --quiet 'mem0ai" "$WSL_INSTALLER" | head -1 | 
 [ -n "$MEM0_MODULES" ] && [ -n "$QDRANT_VERSION" ] && [ -n "$PIP_SPECS" ] || fail "could not read MEM0_MODULES / QDRANT_VERSION / the mem0 pip line from $WSL_INSTALLER"
 STACK_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 echo "    stack $STACK_VERSION; authority $AUTHORITY; brain via ssh '$BRAIN_SSH'${BRAIN_WSL:+ (WSL $BRAIN_WSL)}; tenant $USER_ID"
-echo "    server: qdrant $QDRANT_VERSION, $(echo "$MEM0_MODULES" | wc -w) modules, specs: $PIP_SPECS"
+echo "    server: qdrant $QDRANT_VERSION ($QDRANT_ASSET, ${PAGE_SIZE}-byte pages), $(echo "$MEM0_MODULES" | wc -w) modules, specs: $PIP_SPECS"
 if [ "$DRY_RUN" = 0 ]; then
     curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null || fail "no local embedder on :11436 — serve EmbeddingGemma@768 through llama-swap first (see install/llama-swap-setup.md)"
     ssh -o BatchMode=yes -o ConnectTimeout=15 "$BRAIN_SSH" exit 0 >/dev/null 2>&1 || fail "ssh '$BRAIN_SSH' does not accept key auth from this box"
@@ -216,7 +228,7 @@ if plan "download qdrant, write config.yaml (127.0.0.1:6333); back storage with 
         echo "    mounted: $(df -hT "$QDRANT_DIR/storage" | tail -1)"
     fi
     if [ ! -x "$QDRANT_DIR/qdrant" ]; then
-        curl -fsSL -o /tmp/qdrant.tar.gz "https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz"
+        curl -fsSL -o /tmp/qdrant.tar.gz "https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VERSION}/${QDRANT_ASSET}"
         tar -xzf /tmp/qdrant.tar.gz -C "$QDRANT_DIR"; rm -f /tmp/qdrant.tar.gz; chmod +x "$QDRANT_DIR/qdrant"
     fi
     cat > "$QDRANT_DIR/config/config.yaml" <<YAML

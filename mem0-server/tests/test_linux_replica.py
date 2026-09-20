@@ -203,6 +203,22 @@ def test_qdrant_storage_gets_ext4_when_the_home_filesystem_cannot_host_it():
     assert sh.index("qdrant_fs_ok()") < sh.index('say "[5] mem0 server'), "the storage decision belongs to the qdrant step"
 
 
+def test_qdrant_asset_follows_the_cpu_and_the_page_size_is_a_prerequisite():
+    """Live finding (2026-09-19, a Raspberry Pi 5): Qdrant's only Linux arm64 build is the musl
+    one, and both Linux builds abort on a 16 KiB-page kernel ('<jemalloc>: Unsupported system
+    page size') - the Pi 5's default. The installer picks the asset by `uname -m`, refuses any
+    other architecture, and refuses a non-4096 page size in the prerequisites step with the
+    remedy (the 4 KiB kernel) spelled out, instead of installing a binary that dies on --version."""
+    sh = INSTALLER.read_text(encoding="utf-8")
+    assert 'x86_64)        QDRANT_ASSET="qdrant-x86_64-unknown-linux-gnu.tar.gz"' in sh
+    assert 'aarch64|arm64) QDRANT_ASSET="qdrant-aarch64-unknown-linux-musl.tar.gz"' in sh
+    assert "unsupported CPU architecture" in sh
+    assert 'PAGE_SIZE="$(getconf PAGESIZE' in sh and '[ "$PAGE_SIZE" = 4096 ] || fail' in sh
+    assert "kernel=kernel8.img" in sh and "[pi5]" in sh
+    assert "qdrant-x86_64-unknown-linux-gnu.tar.gz\"" not in sh.split("say \"[4] qdrant")[1],         "the download must use $QDRANT_ASSET, not a hard-coded x86_64 name"
+    assert sh.index('PAGE_SIZE="$(getconf') < sh.index('say "[1] thin client'), "the page-size check is a prerequisite, before anything is installed"
+
+
 def test_units_and_scripts_ship_together():
     for f in ("systemd/offline-watcher.service", "systemd/offline-watcher.timer", "scripts/travel/restore-replica.sh", "scripts/travel/offline-watcher.py"):
         assert (REPO_ROOT / f).is_file(), f

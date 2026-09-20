@@ -139,7 +139,13 @@ func runSyncOnce(env Env, g globalOpts, opt amsync.Options) int {
 // contender behind a lock that is, by its own rule, dead. Each pass the watcher runs
 // takes and drops the lock itself.
 func runSyncWatch(env Env, g globalOpts, opt amsync.Options) int {
-	sum, err := amsync.Watch(context.Background(), amsync.WatchOptions{Options: opt})
+	// Each pass takes the per-PC lock through the same seam every other verb uses, so a
+	// test binary's lock names reach the watcher too (P5-10).
+	wo := amsync.WatchOptions{Options: opt}
+	wo.AcquirePassLock = func(now time.Time) (func(), bool, error) {
+		return deriveLock{path: LockPath(opt.Roots.StateRoot), now: now}.TryAcquire("sync")
+	}
+	sum, err := amsync.Watch(context.Background(), wo)
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "ams-store sync --watch: %v\n", err)
 		return ExitRefused

@@ -207,7 +207,17 @@ func (r Repo) HasStagedChanges(ctx context.Context, workspace string) (bool, err
 // Commit commits the staged tree with trailers naming the machine and the kind of work.
 // It returns "" when nothing was staged - git's own diff is the no-op guard, so a run
 // that changed nothing leaves no commit and no noise in the log.
+//
+// Before the diff it puts HEAD's entry back into the index for every path any workspace's
+// deferred queue holds. Stage already excludes those paths, but a stage taken BEFORE a
+// concurrent merge wrote the queue carries the on-disk bytes that merge withheld, and the
+// commit that followed re-added three hub deletions on top of the merge (P5-10,
+// 2026-09-19). The queue is honoured at the moment of commit, whatever admitted the
+// concurrency, so no verb's commit can carry a queued path.
 func (r Repo) Commit(ctx context.Context, message, machineID, kind string) (string, error) {
+	if err := r.unstageQueued(ctx); err != nil {
+		return "", err
+	}
 	res, err := gitx.Run(ctx, gitx.Options{
 		GitDir: r.GitDir, WorkTree: r.WorkTree, OkExit: gitx.OkExitCodes(0, 1),
 	}, "diff", "--cached", "--quiet")
@@ -222,6 +232,39 @@ func (r Repo) Commit(ctx context.Context, message, machineID, kind string) (stri
 		return "", fmt.Errorf("sync: commit: %w", err)
 	}
 	return r.Head(ctx)
+}
+
+// unstageQueued resets the index entry of every queued path to HEAD's: the merge result
+// for a path a live session is still holding the old bytes of. A path HEAD does not have
+// leaves the index (git reset on an unborn branch has no HEAD, so rm --cached does the
+// same there); a queued path that matches nothing is not an error. A queue that cannot
+// be read fails the commit, for the reason LoadDeferred gives: "I could not tell" means
+// "do not touch it".
+func (r Repo) unstageQueued(ctx context.Context) error {
+	if r.StateRoot == "" {
+		return nil
+	}
+	held, err := merge.AllQueuedPaths(r.StateRoot)
+	if err != nil {
+		return fmt.Errorf("sync: the deferred queues cannot be read, so nothing may be committed: %w", err)
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	head, err := r.Head(ctx)
+	if err != nil {
+		return err
+	}
+	var args []string
+	if head == "" {
+		args = append([]string{"rm", "-q", "-r", "--cached", "--ignore-unmatch", "--"}, held...)
+	} else {
+		args = append([]string{"reset", "-q", "--"}, held...)
+	}
+	if _, err := gitx.Run(ctx, r.opts(), args...); err != nil {
+		return fmt.Errorf("sync: unstage the deferred queue before committing: %w", err)
+	}
+	return nil
 }
 
 // Head is the current commit of the shared branch, or "" when there is none yet.

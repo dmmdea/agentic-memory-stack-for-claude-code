@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/atomic"
@@ -71,6 +72,39 @@ func QueuedPaths(stateRoot, workspace string) ([]string, error) {
 	for _, e := range d.Entries {
 		out = append(out, e.Path)
 	}
+	return out, nil
+}
+
+// AllQueuedPaths is the union of every workspace's queue under a state root, for a caller
+// that must not commit any of it. A queue that cannot be read is an error for the same
+// reason it is in LoadDeferred: "absent" and "corrupt" must not collapse into "nothing
+// pending". A state root that does not exist yet has no queues.
+func AllQueuedPaths(stateRoot string) ([]string, error) {
+	entries, err := os.ReadDir(stateRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read the state root for deferred queues: %w", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, sErr := os.Stat(DeferredPath(stateRoot, e.Name())); sErr != nil {
+			if os.IsNotExist(sErr) {
+				continue
+			}
+			return nil, fmt.Errorf("stat the deferred queue of %s: %w", e.Name(), sErr)
+		}
+		paths, qErr := QueuedPaths(stateRoot, e.Name())
+		if qErr != nil {
+			return nil, qErr
+		}
+		out = append(out, paths...)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 

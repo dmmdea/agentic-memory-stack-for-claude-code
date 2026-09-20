@@ -145,7 +145,11 @@ def health(timeout_s: float = 3.0, client: Optional[httpx.Client] = None, _run=s
     if judge_transport() == "native":
         try:
             cp = _run([shutil.which("codex") or "codex", "login", "status"], capture_output=True, text=True, timeout=timeout_s + 5)
-            text = (cp.stdout or "").lower()
+            # BOTH streams: `codex login status` exits 0 and prints "Logged in using ChatGPT"
+            # on STDERR with stdout empty (measured on the authority, 2026-09-20). Reading
+            # stdout alone made every native host report logged_in=False on a logged-in Codex,
+            # which sent contradiction-sweep hunting a Windows shim the brain does not have.
+            text = ((cp.stdout or "") + "\n" + (cp.stderr or "")).lower()
             logged = cp.returncode == 0 and "logged in" in text and "not logged in" not in text
             return {"ok": logged, "transport": "native", "logged_in": logged,
                     "detail": (cp.stdout or cp.stderr or "").strip()[:120]}

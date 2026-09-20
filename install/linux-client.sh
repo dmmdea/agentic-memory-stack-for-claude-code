@@ -313,7 +313,9 @@ ams_capture_prereqs() {   # prints what is missing; empty output means ready
 CAPTURE_MISSING="$(ams_capture_prereqs)"
 if [ -n "$CAPTURE_MISSING" ]; then
     echo "    SKIPPED - missing:$CAPTURE_MISSING"
-    echo "    install pwsh 7 (snap install powershell --classic) and the codex CLI"
+    echo "    install pwsh 7 (snap install powershell --classic; without snap, or on arm64, unpack the"
+    echo "    powershell-<ver>-linux-<x64|arm64>.tar.gz release into /opt/microsoft/powershell/7 and"
+    echo "    symlink /usr/local/bin/pwsh) and the codex CLI"
     echo "    (npm install -g @openai/codex, then 'codex login'), then re-run this installer."
 elif plan "deploy $CAPTURE_FILES to $SCRIPTS_DIR with the tenant resolved, and register the Stop / PreCompact / SessionStart capture hooks"; then :; else
     for f in $CAPTURE_FILES; do
