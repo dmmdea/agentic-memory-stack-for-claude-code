@@ -64,13 +64,17 @@ type Result struct {
 	ExitCode int
 	// Derived is the per-store derive results, in store order.
 	Derived []DeriveResult
-	Err     error
+	// LockHeld is set by a watcher pass that found the per-PC lock held and did NOT run:
+	// no receipt, no commit, the dirty marker left for the retry.
+	LockHeld bool
+	Err      error
 }
 
 // Exit codes this package produces, mirroring blueprint section 1.2.
 const (
 	exitOK       = 0
 	exitRefused  = 3
+	exitLocked   = 4
 	exitNetwork  = 5
 	exitConflict = 6
 )

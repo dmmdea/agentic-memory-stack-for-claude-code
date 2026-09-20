@@ -1,8 +1,11 @@
 package lock
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -360,5 +363,53 @@ func TestLock_LiveHolderFileRefusesWithoutTheMutex(t *testing.T) {
 	h, err := ReadHolder(path)
 	if err != nil || h == nil || h.Reason != "derive" {
 		t.Fatalf("the live holder's file was overwritten: %+v (%v)", h, err)
+	}
+}
+
+// TestLock_TwoBreakersOfOneDeadLockAdmitExactlyOne: breaking a dead holder used to be a
+// bare remove, so two contenders that read the same dead holder could both proceed - the
+// second's remove deleted the first's fresh lock. The barrier holds both at the point
+// where each has decided the holder is dead; exactly one may then own the lock.
+func TestLock_TwoBreakersOfOneDeadLockAdmitExactlyOne(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	now := time.Now().UTC()
+	dead := Holder{PID: 999999, StartTimeUnix: 1, Host: "test", AcquiredAt: now.Add(-time.Minute), Reason: "sync"}
+	writeHolder(t, path, dead)
+
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	testBeforeBreak = func() { arrived.Done(); arrived.Wait() }
+	defer func() { testBeforeBreak = nil }()
+
+	results := make(chan *Lock, 2)
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			// Distinct mutex names: two processes in two Windows sessions share no mutex,
+			// so the file is the only thing between them.
+			o := Options{Path: path, Reason: "sync", Now: now,
+				MutexName:       fmt.Sprintf(`Local\ams-store-test-%s-%d`, strings.ReplaceAll(t.Name(), "/", "_"), i),
+				LegacyMutexName: "-"}
+			l, err := Acquire(o)
+			if err != nil && err != ErrHeld {
+				t.Errorf("contender %d: %v", i, err)
+			}
+			results <- l
+		}(i)
+	}
+	var held []*Lock
+	for i := 0; i < 2; i++ {
+		if l := <-results; l != nil {
+			held = append(held, l)
+		}
+	}
+	if len(held) != 1 {
+		t.Fatalf("%d contenders hold the lock after both broke one dead holder, want exactly 1", len(held))
+	}
+	if err := held[0].Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".breaking"); !os.IsNotExist(err) {
+		t.Fatal("the break guard must not outlive the break")
 	}
 }

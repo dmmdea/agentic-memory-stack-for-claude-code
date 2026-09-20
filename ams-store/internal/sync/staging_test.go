@@ -151,3 +151,64 @@ func TestSync_StoreRemovedWhileTheWorkspaceStaysIsStaged(t *testing.T) {
 			" live stores with it is worse than the leak it fixes")
 	}
 }
+
+// TestHistory_CommitHonoursTheDeferredQueueEvenWhenStagedBeforeIt is the commit-time half
+// of P5-10 (2026-09-19). Stage excludes queued paths, but a stage taken BEFORE a concurrent
+// merge wrote the queue carries the on-disk bytes that merge withheld, and the commit that
+// followed re-added three hub deletions on top of the merge. Whatever admitted the
+// concurrency, Commit itself must put HEAD's entry back for every queued path first - so
+// no verb's commit can ever carry a queued path. A queued path that exists nowhere must
+// not fail the commit.
+func TestHistory_CommitHonoursTheDeferredQueueEvenWhenStagedBeforeIt(t *testing.T) {
+	sb, repo, _ := pcFixture(t, "ws", map[string]string{
+		"a.md": "---\nname: a\n---\n\nbody a\n",
+		"b.md": "---\nname: b\n---\n\nbody b\n",
+	})
+	ctx := context.Background()
+	if err := repo.Stage(ctx, "ws"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Commit(ctx, "seed", "pc", "local"); err != nil {
+		t.Fatal(err)
+	}
+	// The hub deleted a.md and the merge landed: HEAD no longer has it, the file stays on
+	// disk because a session is live, and the queue names it.
+	if _, err := gitx.Run(ctx, repo.opts(), "rm", "-q", "--cached", "--", "ws/memory/a.md"); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := repo.Commit(ctx, "merge hub: 1 resolved", "pc", "merge")
+	if err != nil || merged == "" {
+		t.Fatalf("merge commit: %q, %v", merged, err)
+	}
+	// The stale stage: this pass added a.md from the work tree before the queue existed.
+	if _, err := gitx.Run(ctx, repo.opts(), "add", "-f", "--", "ws/memory/a.md"); err != nil {
+		t.Fatal(err)
+	}
+	if err := merge.SaveDeferred(sb.StateRoot, "ws", merge.Deferred{
+		Tree: merged,
+		Entries: []merge.DeferredEntry{
+			{Path: "ws/memory/a.md", Op: merge.OpDelete, QueuedAt: "2026-09-19T17:52:09Z"},
+			{Path: "ws/memory/ghost.md", Op: merge.OpDelete, QueuedAt: "2026-09-19T17:52:09Z"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := repo.Commit(ctx, "sync pc: 1 store(s)", "pc", "local")
+	if err != nil {
+		t.Fatalf("Commit with a queued path staged: %v", err)
+	}
+	head, err := repo.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := repo.HasFile(ctx, head, "ws/memory/a.md"); has {
+		t.Fatalf("commit %s resurrected the queued deletion of a.md", short(c))
+	}
+	if c != "" {
+		t.Fatalf("only the queued path was staged, so nothing should have been committed; got %s", short(c))
+	}
+	if _, err := os.Stat(filepath.Join(sb.ProjectsRoot, "ws", "memory", "a.md")); err != nil {
+		t.Fatalf("the work-tree copy the queue protects must stay on disk: %v", err)
+	}
+}

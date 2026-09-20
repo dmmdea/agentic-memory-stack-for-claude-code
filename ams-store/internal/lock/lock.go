@@ -52,6 +52,14 @@ const WatchMutexName = `Local\ams-store-watch`
 // WatchFileName is the watcher's singleton lock file, flocked on Linux.
 const WatchFileName = "watch.lock"
 
+// BreakGuardStale bounds how long a break guard (see breakDead) may sit on disk before a
+// contender treats it as abandoned by a breaker that died mid-break.
+const BreakGuardStale = time.Minute
+
+// testBeforeBreak, when a test sets it, runs after a dead holder has been read and before
+// its file is broken - the window two contenders race in. Nil in production.
+var testBeforeBreak func()
+
 // ErrHeld is returned by Acquire when another live process holds the lock. It is not a
 // failure: the caller reports exit 4 and does nothing else.
 var ErrHeld = errors.New("the per-PC lock is held by another process")
@@ -180,13 +188,55 @@ func Acquire(opt Options) (*Lock, error) {
 			releaseMutexes(taken)
 			return nil, ErrHeld
 		}
-		if err := os.Remove(opt.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if testBeforeBreak != nil {
+			testBeforeBreak()
+		}
+		if err := breakDead(opt.Path, *existing, now); err != nil {
 			releaseMutexes(taken)
 			return nil, ErrHeld
 		}
 	}
 	releaseMutexes(taken)
 	return nil, ErrHeld
+}
+
+// breakDead removes a dead or stale holder's file so the caller's next O_EXCL create can
+// win it - under a guard, because the bare remove it replaced was a race two contenders
+// could both win: each read the same dead holder, the first removed it and created its
+// own lock, and the second's remove then deleted THAT fresh lock and created another. Two
+// processes then held "the" per-PC lock (P5-10, 2026-09-19).
+//
+// The guard is a sibling file taken with O_EXCL: only its creator may break, everyone
+// else yields with ErrHeld and comes back on its next wake. Under the guard the holder is
+// read AGAIN and must still be the dead one that was read before - a fresh live holder
+// that appeared in between is left alone. A guard older than BreakGuardStale belongs to
+// a breaker that died mid-break; it is cleared and this contender still yields, so the
+// next one gets a clean attempt. Whoever breaks does not automatically win: the create
+// after this is O_EXCL, and a loser there yields too.
+func breakDead(path string, dead Holder, now time.Time) error {
+	guard := path + ".breaking"
+	f, err := os.OpenFile(guard, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if st, sErr := os.Stat(guard); sErr == nil && now.Sub(st.ModTime()) > BreakGuardStale {
+				_ = os.Remove(guard)
+			}
+		}
+		return ErrHeld
+	}
+	_ = f.Close()
+	defer os.Remove(guard)
+	cur, rErr := ReadHolder(path)
+	if rErr != nil {
+		return ErrHeld
+	}
+	if cur != nil && (cur.PID != dead.PID || !cur.AcquiredAt.Equal(dead.AcquiredAt)) {
+		return ErrHeld // someone re-took it while this contender was deciding
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return ErrHeld
+	}
+	return nil
 }
 
 // Release drops the lock. It removes the file only when the file still records THIS
