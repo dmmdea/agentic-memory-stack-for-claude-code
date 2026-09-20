@@ -44,8 +44,14 @@ healthCheckTimeout: 300
 logLevel: info
 
 groups:
-  always_loaded:
-    swap: false        # both models stay resident; they're small and CPU-only
+  # Both models mem0 depends on go in a NON-exclusive, NON-swapping group. This is the one
+  # setting people get wrong. A model listed in NO group falls into llama-swap's implicit
+  # default group (`swap: true, exclusive: true`), so every embed first has to drain whatever
+  # chat seat happens to be loaded — on a box that also serves a large model that reads as
+  # `/health/deep: embedder timed out` and a retrieval canary at 0/N, with nothing obviously
+  # wrong in the logs. `swap: false, exclusive: false` lets them co-reside.
+  support:
+    swap: false
     exclusive: false
     members: ["embeddinggemma", "bge-reranker-v2-m3"]
 
@@ -57,7 +63,7 @@ models:
       --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
       --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
-    ttl: 0
+    ttl: 300
     aliases: ["embeddinggemma-300m"]
 
   bge-reranker-v2-m3:
@@ -72,6 +78,13 @@ models:
 
 (If you expand `~` manually, use your real home path — llama-swap does not expand `~`
 inside `cmd` on every platform.)
+
+`ttl: 300` on both, not `ttl: 0`. An idle model that never unloads holds its weights for the
+rest of the day on a box you may also want for something else; 300 s is long enough that a
+working session never pays a reload and short enough that an idle box gives the memory back.
+The `support` group above is what keeps the 300 s from costing you anything — the models
+co-reside rather than fighting a chat seat for the slot, so a reload is a cold start, not a
+queue behind someone else's model.
 
 ## 5. Run it as a service (systemd user unit)
 
