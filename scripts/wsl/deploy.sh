@@ -145,7 +145,7 @@ rsync -rc $DRY -v --include='*.py' --include='*.sh' --exclude='*' \
 # are versioned and deployed from the operator's private maintenance repo
 # (deliberately not public — they carry operator-specific data patterns and
 # vault paths). Extend the allowlist only for scripts with a named home.
-MAINTAINER_SIDE="test-debris-purge.py _debris_patterns.py wiki-index-build.py wiki-search.py wiki-index.sh test_wiki_index.py"
+MAINTAINER_SIDE="test-debris-purge.py _debris_patterns.py"
 orphans=""
 for f in "$SCRIPTS_DIR"/*.py "$SCRIPTS_DIR"/*.sh; do
     [ -f "$f" ] || continue

@@ -1,0 +1,12 @@
+[Unit]
+Description=AMS chain step: LLM Wiki semantic index (wiki/ pulled from a PC that mounts the vault, embedded into this box's Qdrant; backstop for the session-side refresh)
+PartOf=ams-nightly.target
+After=mem0.service qdrant.service ams-step-index-refresh.service
+Before=ams-step-stack-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded wiki-index /bin/bash %h/apps/mem0-scripts/wiki-index-nightly.sh
+
+[Install]
+WantedBy=ams-nightly.target

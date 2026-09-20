@@ -41,6 +41,12 @@
 #   --ams-store-binary / --ams-store-sums: an OFFLINE drop of the store binary and the
 #                  SHA256SUMS it shipped with, for a box that cannot reach the release. Without
 #                  them the installer downloads the asset for the tag in VERSION and verifies it.
+#   --wiki-sources: space-separated user@host list of the PCs that mount the operator's LLM
+#                  Wiki, tried in order by the nightly wiki-index step (stack.env
+#                  MEM0_WIKI_SOURCES; docs/systems/wiki-index.md). Omit -> the step is dropped
+#                  from the rendered set, like the store judge without a hub.
+#   --wiki-pull-key: the identity the step pulls with (default ~/.ssh/id_ed25519_wiki_pull;
+#                  stack.env MEM0_WIKI_PULL_KEY). Pin it on each PC to the forced tar command.
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 #   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
@@ -54,6 +60,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
 # P4-1b: the store hub's own checkout and the binary that judges it.
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
+WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
 AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
 SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
@@ -75,6 +82,8 @@ while [ $# -gt 0 ]; do
         --ams-hub) AMS_HUB="${2:-}"; SET_AMS_HUB=1; shift 2 ;;
         --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
         --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
+        --wiki-sources) WIKI_SOURCES="${2:-}"; SET_WIKI_SOURCES=1; shift 2 ;;
+        --wiki-pull-key) WIKI_PULL_KEY="${2:-}"; SET_WIKI_PULL_KEY=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -132,6 +141,8 @@ inherit_from_stack_env PCLOUD_DIR  MEM0_PCLOUD_DIR  --pcloud-dir
 inherit_from_stack_env ZFS_DATASET MEM0_ZFS_DATASET --zfs-dataset
 inherit_from_stack_env AMS_CHECKOUT MEM0_AMS_CHECKOUT --ams-checkout
 inherit_from_stack_env AMS_HUB      MEM0_AMS_HUB      --ams-hub
+inherit_from_stack_env WIKI_SOURCES  MEM0_WIKI_SOURCES  --wiki-sources
+inherit_from_stack_env WIKI_PULL_KEY MEM0_WIKI_PULL_KEY --wiki-pull-key
 # a box installed before v1.23.2 carries the dataset only in the rendered drop-in
 if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
     ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
@@ -154,6 +165,13 @@ for u in "$REPO_ROOT"/systemd/ams-*; do [ -f "$u" ] && UNITS="$UNITS $(basename 
 AMS_STORE_JUDGE_UNIT="ams-step-store-judge.service"
 if [ -z "$AMS_CHECKOUT" ] || [ -z "$AMS_HUB" ]; then
     UNITS="$(printf '%s\n' $UNITS | grep -vx "$AMS_STORE_JUDGE_UNIT" | tr '\n' ' ')"
+fi
+# Same rule for the wiki index: the step exists only where a wiki source is configured
+# (docs/systems/wiki-index.md); rendered without one it would fail loudly every night.
+WIKI_INDEX_UNIT="ams-step-wiki-index.service"
+if [ -z "$WIKI_SOURCES" ]; then
+    UNITS="$(printf '%s\n' $UNITS | grep -vx "$WIKI_INDEX_UNIT" | tr '\n' ' ')"
+    echo "    --wiki-sources not configured: no wiki-index step"
 fi
 echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID"
 echo "    units: $UNITS"
@@ -236,6 +254,9 @@ ENV
     # the credentials and the transport but not the store variables, so an environment-only
     # lookup skipped the phase every night and no plan was ever written.
     [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_STORE_BIN=%s\n' "/usr/local/bin/ams-store" >> "$MEM0_DIR/stack.env"
+    # The wiki-index step reads both from here (docs/systems/wiki-index.md).
+    [ -z "$WIKI_SOURCES" ] || printf 'MEM0_WIKI_SOURCES=%s\n' "$WIKI_SOURCES" >> "$MEM0_DIR/stack.env"
+    [ -z "$WIKI_PULL_KEY" ] || printf 'MEM0_WIKI_PULL_KEY=%s\n' "$WIKI_PULL_KEY" >> "$MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi
