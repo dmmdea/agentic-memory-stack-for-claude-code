@@ -4,6 +4,17 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.30.1 — the replica wrapper closes its tunnel
+
+**`wiki-index.sh` left its tunnel open.** The EXIT trap that closes the SSH control socket
+read the brain alias from a `local` of the function that opened it; when the trap fired after
+that function had returned, `set -u` killed it with "unbound variable" and the `ssh -f -N`
+outlived the run (found on the first post-release refresh). The alias is now a global, and
+`test_wiki_index_wrapper.py` — the wrapper had no test — pins the contract: snapshot from a
+tar (an empty one refused), tunnel opened → builder run → tunnel closed, in that order, the
+search passing its query and `--k`, and the alias resolution order (`WIKI_BRAIN_SSH`,
+`MEM0_BRAIN_SSH`, the SSH-config Host naming the authority, the host itself).
+
 ## 1.30.0 — the operator's wiki gets a searchable index on the brain, kept fresh two ways
 
 **The wiki's semantic index existed nowhere.** The operator's LLM Wiki (a curated markdown

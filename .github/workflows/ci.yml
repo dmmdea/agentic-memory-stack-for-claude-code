@@ -125,7 +125,8 @@ jobs:
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \
             scripts/wsl/test_wiki_index.py \
-            scripts/wsl/test_wiki_index_nightly.py
+            scripts/wsl/test_wiki_index_nightly.py \
+            scripts/wsl/test_wiki_index_wrapper.py
 
   docs-gate:
     name: Docs gate (links, operator-neutral, ADR frontmatter)

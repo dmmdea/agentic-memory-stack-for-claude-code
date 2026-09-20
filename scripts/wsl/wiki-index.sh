@@ -23,6 +23,7 @@ PY="${WIKI_PY:-$HOME/apps/mem0-server/.venv/bin/python}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SOCK="/tmp/wiki-qdrant-$$.sock"
 PORT=""
+BRAIN=""  # global: the EXIT trap reads it after tunnel_open has returned (set -u)
 
 brain_alias() {
     local a="" host=""
@@ -44,17 +45,19 @@ tunnel_open() {
     # A per-process control socket; the first free port in a small range so two sessions
     # can hold tunnels at once. ExitOnForwardFailure makes a busy port fail fast instead of
     # silently serving nothing.
-    local brain p
-    brain="$(brain_alias)" || return 1
+    local p
+    BRAIN="$(brain_alias)" || return 1
     for p in $(seq "$PORT_BASE" $((PORT_BASE + 9))); do
         if ssh -f -N -M -S "$SOCK" -o ExitOnForwardFailure=yes -o BatchMode=yes \
-               -o ConnectTimeout=10 -L "$p:127.0.0.1:6333" "$brain" 2>/dev/null; then
+               -o ConnectTimeout=10 -L "$p:127.0.0.1:6333" "$BRAIN" 2>/dev/null; then
             PORT="$p"
-            trap 'ssh -S "$SOCK" -O exit "$brain" >/dev/null 2>&1 || true' EXIT
+            # 1.30.1: the alias must be a global here — a `local` died as "unbound variable" when
+            # the trap fired after the function returned, and the tunnel outlived the run.
+            trap 'ssh -S "$SOCK" -O exit "$BRAIN" >/dev/null 2>&1 || true' EXIT
             return 0
         fi
     done
-    echo "wiki-index: could not open a tunnel to $brain:6333 (ports $PORT_BASE..$((PORT_BASE + 9)))" >&2
+    echo "wiki-index: could not open a tunnel to $BRAIN:6333 (ports $PORT_BASE..$((PORT_BASE + 9)))" >&2
     return 1
 }
 
