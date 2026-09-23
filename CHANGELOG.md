@@ -4,6 +4,11 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.4 — the installer stops reporting a phantom pid 0 (2026-09-23)
+
+### Fixed
+- **Installer: no phantom "pid 0" process.** With no `ams-store.exe` running, `Get-AmsStoreProcesses` returns an empty array that PowerShell hands to `-Processes` as `$null`, and `@($null)` is one element, so the 1.31.3 installer printed "1 ams-store.exe process(es) seen but could not be identified (pid 0)" on every clean install. `Select-AmsStoreProcessesForStore` now skips null entries. Test: `reports nothing when no ams-store.exe runs`.
+
 ## 1.31.3 — the self-test stops failing replicas for things the installer does on purpose; operator keys survive a re-run; a test HOME no longer holds the live store lock
 
 **The compactor row contradicted the installer.** Since 1.25.0, `install/2-windows-config.ps1`
