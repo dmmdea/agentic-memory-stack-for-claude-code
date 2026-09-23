@@ -251,6 +251,15 @@ Describe 'the binary swap stops this store''s ams-store.exe first (1.31.3 mixed-
         ($pick.Selected | Where-Object ProcessId -eq 12).Kind | Should -Be 'pass'
         @($pick.Unidentified) | Should -Be @(19)
     }
+    It 'reports nothing when no ams-store.exe runs (an empty function result arrives as $null)' {
+        # Get-AmsStoreProcesses returns an empty array, which PowerShell hands to -Processes as $null;
+        # @($null) is a one-element array, and it used to print "1 ... could not be identified (pid 0)".
+        foreach ($none in @($null, @())) {
+            $pick = Select-AmsStoreProcessesForStore -Processes $none -ImagePaths @($script:exe) -StateRoot $script:root -DefaultStateRoot $script:root -Owner 'PC\op'
+            @($pick.Selected).Count | Should -Be 0
+            @($pick.Unidentified).Count | Should -Be 0
+        }
+    }
     It 'asks the watcher to stop, lets a pass finish, tree-kills a pass that does not, and logs each' {
         $pick = script:Pick
         $script:kills = @(); $script:polls = 0; $script:stopReq = $null

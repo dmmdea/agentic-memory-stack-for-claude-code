@@ -230,7 +230,9 @@ function Select-AmsStoreProcessesForStore {
     $want = ConvertTo-AmCanonicalRoot -Path $StateRoot
     $images = @($ImagePaths | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).ToLowerInvariant() })
     $sel = @(); $unknown = @()
-    foreach ($p in @($Processes)) {
+    # An empty process list reaches -Processes as $null, and @($null) is ONE element: skip nulls,
+    # or "no ams-store.exe" is reported as one unidentifiable process with pid 0.
+    foreach ($p in @($Processes | Where-Object { $null -ne $_ })) {
         if ($Owner -and $p.Owner -and ([string]$p.Owner -ne $Owner)) { continue }
         $img = [string]$p.ExecutablePath
         if (-not $img) { $img = Get-AmsArgv0 -CommandLine ([string]$p.CommandLine) }
