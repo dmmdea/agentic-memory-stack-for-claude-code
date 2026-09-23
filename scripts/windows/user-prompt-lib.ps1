@@ -920,15 +920,25 @@ function Format-MemoryContextBlock {
 
 function Write-InjectionStateLog {
     # One line, prefixed 'C10 injection-state: '. Paths and exception text only, never content.
+    # Sinks, in order (C10 re-check L2):
+    #   1. inside the resident daemon ($script:DaemonLogPath set): its Write-Log -> ~\.mem0\hook-daemon.log;
+    #   2. every other host (inline hook, PreCompact, SessionStart): ~\.claude\logs\user-prompt-extract.log,
+    #      the same file the inline hook's own Write-Log uses;
+    #   3. last resort when that directory is unwritable: stderr, which Claude Code surfaces in the
+    #      hook's error output. Never throws.
     param([string]$Msg)
     $line = 'C10 injection-state: ' + $Msg
     try {
-        if ($null -ne $ExecutionContext.SessionState.InvokeCommand.GetCommand('Write-Log', 'Function')) { Write-Log $line; return }
+        if ($script:DaemonLogPath -and ($null -ne $ExecutionContext.SessionState.InvokeCommand.GetCommand('Write-Log', 'Function'))) { Write-Log $line; return }
+    } catch {}
+    try {
         $dir = [System.IO.Path]::Combine((Get-AmsHomeDir), '.claude', 'logs')
         if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
         [System.IO.File]::AppendAllText([System.IO.Path]::Combine($dir, 'user-prompt-extract.log'),
             '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] ' + $line + [System.Environment]::NewLine)
-    } catch {}
+    } catch {
+        try { [Console]::Error.WriteLine($line + ' (log dir unwritable: ' + $_.Exception.Message + ')') } catch {}
+    }
 }
 
 # The two file operations behind every state write and delete. Separate functions so Pester can
@@ -975,6 +985,17 @@ function Get-SessionInjectionMarkerPath {
     return ($StatePath -replace '\.json$', '.compacted')
 }
 
+function Get-InjectionMarkerTicks {
+    # UTC ticks of the session's last compaction reset (the marker's content, else its mtime),
+    # or -1 when there is no marker. Throws only if the marker exists but cannot be read at all.
+    param([string]$StatePath)
+    $mp = Get-SessionInjectionMarkerPath -StatePath $StatePath
+    if (-not [System.IO.File]::Exists($mp)) { return [int64]-1 }
+    $mt = [int64]0
+    if ([int64]::TryParse(([System.IO.File]::ReadAllText($mp)).Trim(), [ref]$mt)) { return $mt }
+    return [System.IO.File]::GetLastWriteTimeUtc($mp).Ticks
+}
+
 function Get-InjectionStateStamp {
     # Cheap change detector for the daemon's in-process cache: the state file's mtime + length and
     # the marker's mtime. A delete, an overwrite by another process or a new marker all change it.
@@ -1001,7 +1022,18 @@ function New-SessionInjectionState {
         GoalsSig    = ''
         OqSig       = ''
         Dirty       = $false
+        # C10 re-check L3: UTC ticks of the START of the request that owns this state (captured
+        # before its bundle POST). It is what a save stamps as 'ts', so a save whose request began
+        # before a compaction reset is older than the reset's marker and reads as stale.
+        StartTicks  = [int64]0
     }
+}
+
+function Get-InjectionStateTicks {
+    # The 'ts' a save of this state carries: its request start, else now.
+    param($State)
+    if (($null -ne $State) -and ([int64]$State.StartTicks -gt 0)) { return [int64]$State.StartTicks }
+    return [System.DateTime]::UtcNow.Ticks
 }
 
 function ConvertTo-InjectionStateJson {
@@ -1013,7 +1045,7 @@ function ConvertTo-InjectionStateJson {
     }
     $gs = ''; $os = ''
     if ($null -ne $State) { $gs = [string]$State.GoalsSig; $os = [string]$State.OqSig }
-    return ConvertTo-HookJson @{ v = 1; memories = [string[]]$keys; goals_sig = $gs; oq_sig = $os; ts = [string][System.DateTime]::UtcNow.Ticks }
+    return ConvertTo-HookJson @{ v = 1; memories = [string[]]$keys; goals_sig = $gs; oq_sig = $os; ts = [string](Get-InjectionStateTicks -State $State) }
 }
 
 function Read-SessionInjectionState {
@@ -1044,13 +1076,7 @@ function Read-SessionInjectionState {
             if ($null -eq $o) { throw 'empty or null JSON document' }
             $savedTicks = [int64]0
             [void][int64]::TryParse([string]$o.ts, [ref]$savedTicks)
-            $markerTicks = [int64]-1
-            $mp = Get-SessionInjectionMarkerPath -StatePath $path
-            if ([System.IO.File]::Exists($mp)) {
-                $mt = [int64]0
-                if ([int64]::TryParse(([System.IO.File]::ReadAllText($mp)).Trim(), [ref]$mt)) { $markerTicks = $mt }
-                else { $markerTicks = [System.IO.File]::GetLastWriteTimeUtc($mp).Ticks }
-            }
+            $markerTicks = Get-InjectionMarkerTicks -StatePath $path
             if (($markerTicks -ge 0) -and ($savedTicks -le $markerTicks)) {
                 Write-InjectionStateLog "state predates the compaction marker, ignored path=$path"
             } else {
@@ -1077,7 +1103,11 @@ function Save-SessionInjectionState {
     files and markers older than -SweepAgeDays. Returns $true on success; a failure is LOGGED with
     the path and the exception and returns $false. Never throws.
     #>
-    param($State, [int]$MaxKeys = 500, [int]$SweepAgeDays = 7)
+    # -Cache: the resident daemon's in-process cache. After a save the entry is refreshed, UNLESS a
+    # compaction marker newer than this state's request start exists: that save was in flight across
+    # a reset (re-check L3), so the entry is dropped and the next read judges the file against the
+    # marker instead of serving the pre-compaction state from memory.
+    param($State, [int]$MaxKeys = 500, [int]$SweepAgeDays = 7, [hashtable]$Cache)
     if (($null -eq $State) -or (-not $State.Path)) { return $false }
     $path = [string]$State.Path
     try {
@@ -1085,12 +1115,58 @@ function Save-SessionInjectionState {
         if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
         Write-InjectionStateFile -Path $path -Text (ConvertTo-InjectionStateJson -State $State -MaxKeys $MaxKeys)
         $State.Dirty = $false
-        Invoke-RateLimitStateSweep -StateDir $dir -MaxAgeHours ($SweepAgeDays * 24) -Filter 'mem0-injected-*'
-        return $true
     } catch {
         Write-InjectionStateLog "save FAILED path=${path}: $($_.Exception.Message)"
         return $false
     }
+    Invoke-InjectionStateSweep -StateDir $dir -MaxAgeDays $SweepAgeDays
+    if ($null -ne $Cache) {
+        try {
+            if ($Cache.Count -gt 256) { $Cache.Clear() }   # bounded: a daemon lives at most 2 h idle
+            $mk = Get-InjectionMarkerTicks -StatePath $path
+            if (($mk -ge 0) -and ((Get-InjectionStateTicks -State $State) -le $mk)) {
+                [void]$Cache.Remove($path)
+                Write-InjectionStateLog "save landed after a compaction reset it started before; marked stale path=$path"
+            } else {
+                $Cache[$path] = @{ Stamp = (Get-InjectionStateStamp -StatePath $path); State = $State }
+            }
+        } catch { [void]$Cache.Remove($path) }
+    }
+    return $true
+}
+
+function Invoke-InjectionStateSweep {
+    <#
+    .SYNOPSIS
+    C10: sweep injection-state files older than -MaxAgeDays (the shared Invoke-RateLimitStateSweep,
+    .json only) and compaction markers that no longer guard anything (re-check L1). A marker is
+    removed only when its paired state is gone or was saved AFTER the marker. A marker whose
+    stale state survived (a locked file the age sweep could not delete) is kept, because deleting
+    it would silently re-validate pre-compaction state. Every marker removal is logged.
+    #>
+    param([string]$StateDir, [int]$MaxAgeDays = 7)
+    Invoke-RateLimitStateSweep -StateDir $StateDir -MaxAgeHours ($MaxAgeDays * 24) -Filter 'mem0-injected-*.json'
+    try {
+        $cutoff = [System.DateTime]::Now.AddDays(-$MaxAgeDays)
+        foreach ($m in [System.IO.Directory]::GetFiles($StateDir, 'mem0-injected-*.compacted')) {
+            if ([System.IO.File]::GetLastWriteTime($m) -ge $cutoff) { continue }
+            $pair = $m -replace '\.compacted$', '.json'
+            $why = $null
+            if (-not [System.IO.File]::Exists($pair)) { $why = 'its state is gone' }
+            else {
+                try {
+                    $o = ConvertFrom-HookJson ([System.IO.File]::ReadAllText($pair))
+                    $saved = [int64]0
+                    [void][int64]::TryParse([string]$o.ts, [ref]$saved)
+                    if ($saved -gt (Get-InjectionMarkerTicks -StatePath $pair)) { $why = 'its state was saved after it' }
+                } catch { $why = $null }   # unreadable pair: keep guarding
+            }
+            if ($why) {
+                try { [System.IO.File]::Delete($m); Write-InjectionStateLog "marker removed ($why) path=$m" }
+                catch { Write-InjectionStateLog "marker sweep FAILED path=${m}: $($_.Exception.Message)" }
+            }
+        }
+    } catch {}
 }
 
 function Clear-SessionInjectionState {
@@ -1106,22 +1182,32 @@ function Clear-SessionInjectionState {
     $path = Get-SessionInjectionStatePath -SessionId $SessionId -StateDir $StateDir
     if (-not $path) { return 'no-session' }
     $tag = "clear session=$SessionId"
+    $e1 = $null; $e2 = $null; $e3 = $null
+    $marker = Get-SessionInjectionMarkerPath -StatePath $path
+    # C10 re-check L3: EVERY reset leaves a marker (the reset's epoch), not only the last-resort
+    # path. A save already in flight when the reset lands recreates the file with pre-compaction
+    # content; its ts is its request start, older than the marker, so the reader ignores it.
+    $epochNote = {
+        try { Write-InjectionStateFile -Path $marker -Text ([string][System.DateTime]::UtcNow.Ticks); return 'marker=written' }
+        catch { return ('marker=FAILED (' + $_.Exception.Message + '; a save in flight across this reset would count as fresh)') }
+    }
     if (-not [System.IO.File]::Exists($path)) {
-        Write-InjectionStateLog "$tag outcome=absent path=$path"
+        $mn = & $epochNote
+        Write-InjectionStateLog "$tag outcome=absent path=$path $mn"
         return 'absent'
     }
-    $e1 = $null; $e2 = $null; $e3 = $null
     try {
         Remove-InjectionStateFile -Path $path
-        Write-InjectionStateLog "$tag outcome=removed path=$path"
+        $mn = & $epochNote
+        Write-InjectionStateLog "$tag outcome=removed path=$path $mn"
         return 'removed'
     } catch { $e1 = $_.Exception.Message }
     try {
         Write-InjectionStateFile -Path $path -Text (ConvertTo-InjectionStateJson -State $null)
-        Write-InjectionStateLog "$tag outcome=truncated path=$path (delete failed: $e1)"
+        $mn = & $epochNote
+        Write-InjectionStateLog "$tag outcome=truncated path=$path (delete failed: $e1) $mn"
         return 'truncated'
     } catch { $e2 = $_.Exception.Message }
-    $marker = Get-SessionInjectionMarkerPath -StatePath $path
     try {
         Write-InjectionStateFile -Path $marker -Text ([string][System.DateTime]::UtcNow.Ticks)
         Write-InjectionStateLog "$tag outcome=invalidated marker=$marker (delete failed: $e1; overwrite failed: $e2)"
@@ -1157,6 +1243,9 @@ function Format-SessionMemoryContextBlock {
     renders with it, and persists what the returned block showed. The one render entry point of
     both prompt paths (daemon op=bundle_raw and op=bundle, inline fallback). With no -SessionId
     the render is the exact pre-C10 one. -Cache is the resident daemon's in-process state cache.
+    -RequestStartTicks: UTC ticks captured by the caller BEFORE its bundle POST (re-check L3); the
+    save is stamped with it, so a request that began before a compaction reset saves stale state.
+    Omitted -> the time this function starts (still before the read and the save).
     #>
     param(
         $Bundle,
@@ -1166,21 +1255,20 @@ function Format-SessionMemoryContextBlock {
         [string]$Source = '',
         [string]$SessionId,
         [string]$StateDir,
-        [hashtable]$Cache
+        [hashtable]$Cache,
+        [int64]$RequestStartTicks = 0
     )
+    if ($RequestStartTicks -le 0) { $RequestStartTicks = [System.DateTime]::UtcNow.Ticks }
     $state = $null
     try { $state = Read-SessionInjectionState -SessionId $SessionId -StateDir $StateDir -Cache $Cache } catch {
         Write-InjectionStateLog "session=$SessionId state read threw, dedupe off for this prompt: $($_.Exception.Message)"
         $state = $null
     }
+    if ($null -ne $state) { $state.StartTicks = $RequestStartTicks }
     $block = Format-MemoryContextBlock -Bundle $Bundle -Brand $Brand -AuditPath $AuditPath -Tier $Tier -Source $Source -SessionState $state
     if ($block -and ($null -ne $state) -and $state.Dirty) {
-        $saved = Save-SessionInjectionState -State $state
-        if (-not $saved) {
+        if (-not (Save-SessionInjectionState -State $state -Cache $Cache)) {
             Write-InjectionStateLog "session=$SessionId state not persisted; the next prompt may repeat this block"
-        } elseif ($null -ne $Cache) {
-            if ($Cache.Count -gt 256) { $Cache.Clear() }   # bounded: a daemon lives at most 2 h idle
-            $Cache[[string]$state.Path] = @{ Stamp = (Get-InjectionStateStamp -StatePath ([string]$state.Path)); State = $state }
         }
     }
     return $block

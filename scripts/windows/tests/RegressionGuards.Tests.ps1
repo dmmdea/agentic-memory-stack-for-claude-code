@@ -506,6 +506,20 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         $sets[0] | Should -Be $sets[1] -Because 'the two daemon paths must key and cache the state identically'
         $sets[0] | Should -Match 'StateDir' -Because 'both must name the state dir explicitly'
         $sets[0] | Should -Match 'Cache' -Because 'both must use the in-process state cache'
+        $sets[0] | Should -Match 'RequestStartTicks' -Because 'a save must carry its REQUEST start, so one in flight across a reset is stale (re-check L3)'
+    }
+
+    It 'C10 re-check L3: the request start is captured BEFORE the bundle POST on every render path' {
+        $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        foreach ($pair in @(@{ n = 'daemon bundle_raw'; code = $daemon; post = "Invoke-BundlePostWithColdRetry -Uri (`$script:BaseUrl + '/v1/context/bundle')" },
+                            @{ n = 'inline';            code = $inline; post = '$bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle"' })) {
+            $cap = $pair.code.IndexOf('$reqStartTicks = [System.DateTime]::UtcNow.Ticks')
+            $post = $pair.code.IndexOf($pair.post)
+            $cap | Should -BeGreaterOrEqual 0 -Because "$($pair.n) must capture the request start"
+            $post | Should -BeGreaterThan $cap -Because "$($pair.n) must capture it before the POST"
+        }
+        $inline.Contains('-RequestStartTicks $reqStartTicks') | Should -BeTrue
     }
 
     It 'C10 review: the transcript -> session-id derivation lives in ONE helper (cleanup 1)' {

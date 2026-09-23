@@ -205,7 +205,7 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
             $p.StandardInput.Write($Stdin)
             $p.StandardInput.Close()
             $null = $p.StandardOutput.ReadToEnd()
-            $null = $p.StandardError.ReadToEnd()
+            $script:LastHookStderr = $p.StandardError.ReadToEnd()
             if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch {}; throw "$Name did not exit" }
             return $p.ExitCode
         }
@@ -362,6 +362,19 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
         $code | Should -Be 0
         (Get-SandboxHookLog) | Should -Match "clear session=$($script:sid) outcome=invalidated"
         (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+    }
+
+    It 'recheck L2: with the logs dir unwritable, the reset outcome falls back to stderr (Claude Code shows hook stderr)' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        # a FILE where the logs directory should be: the directory cannot be created or appended to
+        New-Item -ItemType Directory -Path (Join-Path $script:sandboxHome '.claude') -Force | Out-Null
+        Set-Content -Path (Join-Path $script:sandboxHome '.claude\logs') -Value 'not a directory' -NoNewline
+        $pre = ([ordered]@{ session_id = $script:sid; transcript_path = $script:tpath; hook_event_name = 'PreCompact'; trigger = 'auto' } | ConvertTo-Json -Compress)
+        $code = Invoke-HookScript -Name 'stop-extract.ps1' -Stdin $pre -Stubs @{ 'l1a-extract.ps1' = 'exit 0' }
+        $code | Should -Be 0
+        $script:LastHookStderr | Should -Match "C10 injection-state: clear session=$($script:sid) outcome=removed"
     }
 
     It 'review C1b: PreCompact with no lib deployed logs that the reset was skipped (no silent no-op)' {
@@ -595,5 +608,100 @@ Describe 'Inline PowerShell fallback path end to end (real user-prompt-extract.p
         (Invoke-Inline $script:humanPrompt) | Should -BeNullOrEmpty
         @((Get-FakeRequests $script:recordPath) | Where-Object { $_.path -like '*context/bundle' }).Count | Should -Be 2
         Test-Path (Join-Path $script:sandboxHome ".claude\state\mem0-injected-$($script:sid).json") | Should -BeTrue
+    }
+}
+
+Describe 'Re-check round: the marker outlives its stale state, and a save in flight across a reset is stale' {
+
+    BeforeEach {
+        $script:sd = Join-Path $TestDrive ("rc-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:sd -Force | Out-Null
+        $script:DaemonLogPath = Join-Path $script:sd 'daemon.log'
+        $script:audit = Join-Path $script:sd 'audit.jsonl'
+        function script:Get-RcLog { if (Test-Path $script:DaemonLogPath) { Get-Content -Raw $script:DaemonLogPath } else { '' } }
+        function script:Save-OtherSession {
+            # any save in the same state dir runs the stale-file sweep
+            $o = Read-SessionInjectionState -SessionId ([guid]::NewGuid().ToString()) -StateDir $script:sd
+            $o.Dirty = $true
+            Save-SessionInjectionState -State $o | Should -BeTrue
+        }
+    }
+
+    # --- L1: the age sweep and the compaction marker ---------------------------------------------
+
+    It 'L1: an old marker is KEPT while its (locked) stale state still predates it' {
+        $a = Join-Path $script:sd 'mem0-injected-sessA.json'
+        $m = Join-Path $script:sd 'mem0-injected-sessA.compacted'
+        [System.IO.File]::WriteAllText($a, '{"v":1,"memories":["deadbeefdeadbeef"],"goals_sig":"","oq_sig":"","ts":"100"}')
+        [System.IO.File]::WriteAllText($m, '200')
+        $old = [System.DateTime]::Now.AddDays(-9)
+        [System.IO.File]::SetLastWriteTime($a, $old); [System.IO.File]::SetLastWriteTime($m, $old)
+        $lock = [System.IO.File]::Open($a, 'Open', 'ReadWrite', 'None')   # the age sweep cannot delete it
+        try { Save-OtherSession } finally { $lock.Dispose() }
+        Test-Path $a | Should -BeTrue
+        Test-Path $m | Should -BeTrue -Because 'deleting it would silently re-validate the pre-compaction state'
+        (Read-SessionInjectionState -SessionId 'sessA' -StateDir $script:sd).Memories.Count | Should -Be 0
+    }
+
+    It 'L1: an old marker whose state is gone is swept, and the removal is logged' {
+        $m = Join-Path $script:sd 'mem0-injected-sessB.compacted'
+        [System.IO.File]::WriteAllText($m, '200')
+        [System.IO.File]::SetLastWriteTime($m, [System.DateTime]::Now.AddDays(-9))
+        Save-OtherSession
+        Test-Path $m | Should -BeFalse
+        (Get-RcLog) | Should -Match 'C10 injection-state: marker removed .*mem0-injected-sessB\.compacted'
+    }
+
+    It 'L1: an old marker whose state was saved AFTER it is swept (it no longer guards anything)' {
+        $a = Join-Path $script:sd 'mem0-injected-sessC.json'
+        $m = Join-Path $script:sd 'mem0-injected-sessC.compacted'
+        [System.IO.File]::WriteAllText($m, '200')
+        [System.IO.File]::SetLastWriteTime($m, [System.DateTime]::Now.AddDays(-9))
+        [System.IO.File]::WriteAllText($a, '{"v":1,"memories":[],"goals_sig":"","oq_sig":"","ts":"300"}')
+        Save-OtherSession
+        Test-Path $m | Should -BeFalse
+        Test-Path $a | Should -BeTrue
+    }
+
+    # --- L3: a save that began before the reset is stale ------------------------------------------
+
+    It 'L3: every reset leaves a marker, so a state recreated by an in-flight save can be judged' {
+        $sid = [guid]::NewGuid().ToString()
+        $null = Format-SessionMemoryContextBlock -Bundle (New-BundleJson | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd
+        @(Clear-SessionInjectionStateForHook -SessionId $sid -StateDir $script:sd) | Should -Be @('removed')
+        Test-Path (Join-Path $script:sd "mem0-injected-$sid.compacted") | Should -BeTrue
+    }
+
+    It 'L3 interleave: request starts -> reads -> PreCompact reset lands -> the save lands; the next prompt re-surfaces (cache <cache>)' -ForEach @(@{ cache = 'off' }, @{ cache = 'on' }) {
+        $c = if ($cache -eq 'on') { @{} } else { $null }
+        $sid = [guid]::NewGuid().ToString()
+        # prompt 1 (before the compaction): alpha shown and recorded
+        $null = Format-SessionMemoryContextBlock -Bundle (New-BundleJson -Memories @('alpha fact') | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd -Cache $c
+        # prompt 2 starts: request-start captured before its bundle POST, then it reads the state
+        $t0 = [System.DateTime]::UtcNow.Ticks
+        Start-Sleep -Milliseconds 30
+        $st = Read-SessionInjectionState -SessionId $sid -StateDir $script:sd -Cache $c
+        $st.StartTicks = $t0
+        $blk = Format-MemoryContextBlock -Bundle (New-BundleJson -Memories @('beta fact', 'alpha fact') | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionState $st
+        $blk | Should -Not -Match 'alpha fact'           # prompt 2 still sees the pre-compaction state
+        # the compaction reset lands WHILE prompt 2 is in flight
+        Start-Sleep -Milliseconds 30
+        $null = Clear-SessionInjectionStateForHook -SessionId $sid -StateDir $script:sd
+        # ...then prompt 2's save lands, carrying pre-compaction content
+        Save-SessionInjectionState -State $st -Cache $c | Should -BeTrue
+        # prompt 3 (after the compaction): everything re-surfaces
+        $after = Format-SessionMemoryContextBlock -Bundle (New-BundleJson -Memories @('alpha fact') | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd -Cache $c
+        $after | Should -Match 'alpha fact'
+        $after | Should -Match 'Open goals'
+    }
+
+    It 'L3 control: a save that began AFTER the reset stays valid (dedupe resumes)' {
+        $sid = [guid]::NewGuid().ToString()
+        $null = Format-SessionMemoryContextBlock -Bundle (New-BundleJson | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd
+        $null = Clear-SessionInjectionStateForHook -SessionId $sid -StateDir $script:sd
+        Start-Sleep -Milliseconds 30
+        $first = Format-SessionMemoryContextBlock -Bundle (New-BundleJson | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd
+        $first | Should -Match 'alpha fact'
+        (Format-SessionMemoryContextBlock -Bundle (New-BundleJson | ConvertFrom-Json) -Brand 'ai-ecosystem' -AuditPath $script:audit -SessionId $sid -StateDir $script:sd) | Should -BeNullOrEmpty
     }
 }

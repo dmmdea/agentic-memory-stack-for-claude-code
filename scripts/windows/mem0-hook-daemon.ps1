@@ -240,6 +240,7 @@ function Invoke-DaemonRawBundle {
     }
 
     $swReq = [System.Diagnostics.Stopwatch]::StartNew()
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
     if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
         # consume cooldown token only when surfacing actually fires (v0.19 L2)
         try { if ($rateLimitState) { [System.IO.File]::WriteAllText($rateLimitState, [string][System.DateTime]::Now.ToFileTimeUtc()) } } catch {}
@@ -265,7 +266,7 @@ function Invoke-DaemonRawBundle {
                 # v0.22 D: render per tier (resolved above from sidecar/transcript).
                 # frontier/mid = full format; small = flat + legend. Fail-open frontier.
                 # C10: session-deduped (memories + goals/OQ sections), same state file as the inline path.
-                $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir -Cache $script:InjectionStateCache
+                $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir -Cache $script:InjectionStateCache -RequestStartTicks $reqStartTicks
                 $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
                 $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
                 if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
@@ -355,6 +356,7 @@ function Invoke-DaemonRequest {
     if (-not $apiKey) { return @{ ok = $false; error = 'no_api_key'; lib_hash = $script:LibHash } }
 
     $swReq = [System.Diagnostics.Stopwatch]::StartNew()
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
     try {
         # Same body the inline path sends to POST /v1/context/bundle (A.3).
         # v0.22 D / v1.0 R2: forward the consuming-model tier + initiative the
@@ -394,7 +396,7 @@ function Invoke-DaemonRequest {
         $contextBlock = $null
         $reqStateDir = $env:USERPROFILE + '\.claude\state'   # = Invoke-DaemonRawBundle's -StateDir default
         if (-not (Test-MachineTurnPrompt -Prompt ([string]$Req.prompt))) {
-            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource -SessionId ([string]$Req.session_id) -StateDir $reqStateDir -Cache $script:InjectionStateCache
+            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource -SessionId ([string]$Req.session_id) -StateDir $reqStateDir -Cache $script:InjectionStateCache -RequestStartTicks $reqStartTicks
         }
 
         $diag = @{

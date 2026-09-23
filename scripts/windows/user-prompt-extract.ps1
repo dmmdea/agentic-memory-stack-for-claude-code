@@ -480,6 +480,7 @@ if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
     # v0.19 L2 (MED-16): consume the cooldown token HERE — only when proactive
     # surfacing actually fires, never for prompts that skip it.
     try { if ($rateLimitState) { [System.IO.File]::WriteAllText($rateLimitState, [string][System.DateTime]::Now.ToFileTimeUtc()) } } catch {}
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
     try {
         $bundleBody = $script:Jss.Serialize(@{
             session_id            = $sessionId
@@ -513,7 +514,7 @@ if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
             # v0.22 D: render per tier (resolved above: sidecar -> transcript ->
             # frontier). frontier/mid = full format; small = flat + legend.
             # C10: session-deduped, from the same state file the daemon path uses.
-            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource -SessionId $sessionId -StateDir $stateDir
+            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource -SessionId $sessionId -StateDir $stateDir -RequestStartTicks $reqStartTicks
         } elseif (Test-FunctionAvailable 'Format-MemoryContextBlock') {
             $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource
         }

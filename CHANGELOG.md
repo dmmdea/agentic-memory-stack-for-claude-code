@@ -53,6 +53,12 @@ to `~/.claude/logs/user-prompt-extract.log`, or `~/.mem0/hook-daemon.log` inside
 Other changes in this round:
 - The daemon keeps each session's state in memory and reloads it when the file or the marker
   changes, so a warm prompt pays no file read, as with HK-5.
+- Every reset writes the marker, and each save is stamped with its request's start time
+  (captured before the bundle POST). A save that was in flight across a reset is therefore
+  stale, and the daemon's cache drops it.
+- The 7-day sweep keeps a marker while its stale state survives, and logs each marker it
+  removes.
+- When the logs directory is unwritable, log lines fall back to stderr.
 - One helper, `Get-TranscriptSessionId`, keys the state on every path.
 - The injection-state sweep reuses `Invoke-RateLimitStateSweep -Filter`.
 - Both daemon render sites pass the same `-StateDir` and `-Cache` (pinned).
