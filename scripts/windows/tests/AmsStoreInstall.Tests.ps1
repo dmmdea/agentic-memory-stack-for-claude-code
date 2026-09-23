@@ -24,7 +24,7 @@ BeforeAll {
     # The installer dot-sources memory-store-lib.ps1 for the shared hub-path predicate
     # (Get-AmHubHostKeyLines / Get-AmHubPathGaps); the extracted functions need it too.
     . (Join-Path $script:winDir 'memory-store-lib.ps1')
-    foreach ($n in 'Get-AmsFileSha256', 'Read-AmsSumsHash', 'Set-AmsHubSshConfig', 'Initialize-AmsKnownHosts', 'Initialize-AmsHistoryRemote') {
+    foreach ($n in 'Get-AmsFileSha256', 'Read-AmsSumsHash', 'Set-AmsHubSshConfig', 'Initialize-AmsKnownHosts', 'Initialize-AmsHistoryRemote', 'Get-AmsStoreVersionToken', 'Install-AmsStoreBinary', 'Select-AmsStoreProcessesForStore', 'Stop-AmsStoreProcessesForStore') {
         . ([scriptblock]::Create((script:Get-FunctionText -Path $script:installer -Name $n)))
     }
     . ([scriptblock]::Create((script:Get-FunctionText -Path $script:prereqs -Name 'Test-GitVersionAtLeast')))
@@ -222,5 +222,61 @@ Describe 'compactor task verdict (Get-AmCompactorTaskVerdict) mirrors installer 
         (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\Stack\scripts\memory-compact.ps1' -TaskState 'Ready' -HubGaps @('g')).Status | Should -Be 'OK'
         (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File D:\Dev\repo\scripts\windows\memory-compact.ps1' -HubGaps @()).Status | Should -Be 'FAIL'
         (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\x\other.ps1' -HubGaps @()).Status | Should -Be 'WARN'
+    }
+}
+
+Describe 'the binary swap stops this store''s ams-store.exe first (1.31.3 mixed-version window)' {
+    BeforeAll {
+        $script:exe  = 'C:\Profiles\op\.claude\scripts\ams-store.exe'
+        $script:root = 'C:\Profiles\op\.claude\state\automemory'
+        $script:fake = @(
+            [pscustomobject]@{ ProcessId = 11; ExecutablePath = ($script:exe + '.prev'); CommandLine = '"C:\Profiles\op\.claude\scripts\ams-store.exe" sync --watch --hub-host hub'; Owner = 'PC\op' }
+            [pscustomobject]@{ ProcessId = 12; ExecutablePath = $script:exe; CommandLine = 'ams-store.exe sync --once --hub-host hub'; Owner = 'PC\op' }
+            [pscustomobject]@{ ProcessId = 13; ExecutablePath = $script:exe; CommandLine = 'ams-store.exe sync --watch --state-root "C:\Temp\scratch\state"'; Owner = 'PC\op' }
+            [pscustomobject]@{ ProcessId = 14; ExecutablePath = 'C:\Profiles\other\.claude\scripts\ams-store.exe'; CommandLine = 'ams-store.exe sync --watch'; Owner = 'PC\other' }
+            [pscustomobject]@{ ProcessId = 15; ExecutablePath = $script:exe; CommandLine = 'ams-store.exe sync --watch'; Owner = 'PC\other' }
+            [pscustomobject]@{ ProcessId = 16; ExecutablePath = 'C:\Temp\go-build1\lock.test.exe'; CommandLine = 'lock.test.exe'; Owner = 'PC\op' }
+            [pscustomobject]@{ ProcessId = 17; ExecutablePath = $script:exe; CommandLine = ('ams-store.exe gate --state-root=' + $script:root); Owner = 'PC\op' }
+        )
+    }
+    It 'selects only this user''s image serving this state root (never another user, store or binary)' {
+        $sel = @(Select-AmsStoreProcessesForStore -Processes $script:fake -ImagePaths @($script:exe, ($script:exe + '.prev')) -StateRoot $script:root -DefaultStateRoot $script:root -Owner 'PC\op')
+        @($sel.ProcessId) | Should -Be @(11, 12, 17)
+        ($sel | Where-Object ProcessId -eq 11).Kind | Should -Be 'watch'
+        ($sel | Where-Object ProcessId -eq 12).Kind | Should -Be 'pass'
+    }
+    It 'stops a watcher at once, lets a pass finish, stops a pass that does not, and logs each' {
+        $sel = @(Select-AmsStoreProcessesForStore -Processes $script:fake -ImagePaths @($script:exe, ($script:exe + '.prev')) -StateRoot $script:root -DefaultStateRoot $script:root -Owner 'PC\op')
+        $script:stops = @(); $script:polls = 0
+        $done = @(Stop-AmsStoreProcessesForStore -Selected $sel -PassWaitSeconds 1 `
+            -HasExited { param($id) if ($id -eq 12) { $script:polls++; return ($script:polls -gt 2) }; return ($script:stops -contains $id) } `
+            -StopProcess { param($id) $script:stops += $id } -Sleep { param($ms) })
+        $script:stops | Should -Be @(11, 17) -Because 'the watcher is stopped, pass 12 finished on its own, pass 17 never did'
+        ($done | Where-Object ProcessId -eq 12).Action | Should -Be 'finished'
+        ($done | Where-Object ProcessId -eq 17).Action | Should -Be 'stopped'
+    }
+    It 'Install-AmsStoreBinary runs the stop step BEFORE the old image is renamed, and not at all when nothing changes' {
+        $d = Join-Path $TestDrive 'swap'; New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $dest = Join-Path $d 'ams-store.exe'
+        [System.IO.File]::WriteAllText($dest, 'old image')
+        $oldHash = Get-AmsFileSha256 $dest
+        $drop = Join-Path $d 'drop.exe'
+        Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\where.exe') -Destination $drop
+        $script:seen = $null
+        try {
+            Install-AmsStoreBinary -Tag 'v0.0.0' -Asset 'ams-store-windows-amd64.exe' -Dest $dest -ReleaseRepo 'x/y' -BinaryPath $drop -BeforeSwap { $script:seen = Get-AmsFileSha256 $dest } 6>$null | Out-Null
+        } catch {}   # where.exe does not answer --version; the swap has already happened
+        $script:seen | Should -Be $oldHash -Because 'the running store processes must be stopped while the old image is still in place'
+        (Get-AmsFileSha256 $dest) | Should -Be (Get-AmsFileSha256 $drop)
+        $script:seen = 'not called'
+        try { Install-AmsStoreBinary -Tag 'v0.0.0' -Asset 'a' -Dest $dest -ReleaseRepo 'x/y' -BinaryPath $drop -BeforeSwap { $script:seen = 'called' } 6>$null | Out-Null } catch {}
+        $script:seen | Should -Be 'not called' -Because 'an unchanged binary is not swapped, so nothing is stopped'
+    }
+    It 'the installer wires the stop step into the swap' {
+        $src = Get-Content -LiteralPath $script:installer -Raw
+        $src | Should -Match 'Install-AmsStoreBinary -Tag \$amsStoreTag .*-BeforeSwap \$amsStopForSwap'
+        $src | Should -Match 'Select-AmsStoreProcessesForStore -Processes \(Get-AmsStoreProcesses\)'
+        $src | Should -Match 'Stop-AmsStoreProcessesForStore -Selected \$sel'
+        $src | Should -Match "if \(\`$script:amsStoppedWatcher\) \{"
     }
 }

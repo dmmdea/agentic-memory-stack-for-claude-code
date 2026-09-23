@@ -243,6 +243,32 @@ Describe 'GUARD 0: one compactor instance per PC' {
         $r.ExitCode | Should -Be 0
         @($r.Receipts).Count | Should -Be 0
         (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'another compactor instance holds the per-PC lock'
+        $skip = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\compact-lock-skips.json') -Raw | ConvertFrom-Json
+        [int]$skip.skips | Should -Be 1 -Because 'a skip is counted, so a wedged holder cannot silence the nightly forever'
+        @($skip.skipped_nights).Count | Should -Be 1
+    }
+    It 'skips (counted, no receipt) while ams-store holds the Go file lock ams-store.lock, and runs once it is dead' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $sr = Join-Path $sb.Home '.claude\state\automemory'
+        [System.IO.Directory]::CreateDirectory($sr) | Out-Null
+        # A live holder in ams-store's own format: this Pester process, its real start time.
+        $me = Get-Process -Id $PID
+        $live = [ordered]@{ pid = $PID; start_time_unix = [DateTimeOffset]::new($me.StartTime.ToUniversalTime()).ToUnixTimeSeconds(); host = 'h'; acquired_at = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ'); reason = 'sync' }
+        [System.IO.File]::WriteAllText((Join-Path $sr 'ams-store.lock'), (($live | ConvertTo-Json -Compress) + "`n"))
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 0 -Because 'a live Go holder of the store file lock must stop the compactor'
+        (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'store file lock is held by pid'
+        (Get-Content -LiteralPath (Join-Path $sr 'compact-lock-skips.json') -Raw | ConvertFrom-Json).holder | Should -Match ('pid ' + $PID)
+        # The same file with a start time that does not match: a recycled pid, i.e. a dead holder.
+        $live.start_time_unix = 12345
+        [System.IO.File]::WriteAllText((Join-Path $sr 'ams-store.lock'), (($live | ConvertTo-Json -Compress) + "`n"))
+        $r2 = Invoke-Compactor -Sandbox $sb
+        @($r2.Receipts).Count | Should -BeGreaterThan 0 -Because 'a dead holder is broken and the run proceeds'
+        Test-Path -LiteralPath (Join-Path $sr 'ams-store.lock') | Should -BeFalse -Because 'the compactor releases the file lock it took'
+        Test-Path -LiteralPath (Join-Path $sr 'compact-lock-skips.json') | Should -BeFalse -Because 'a run that took the lock resets the skipped-night count'
     }
     It 'also yields to an UNOWNED handle on its store''s mutex (how ams-store holds it, decision Q9)' {
         $sb = New-Sandbox

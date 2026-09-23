@@ -826,13 +826,213 @@ function Read-AmJsonFile {
 
 $script:AmCompactMutexBase = 'Local\ams-memory-compact'
 
+function ConvertTo-AmCanonicalRoot {
+    # The one spelling of a state root both implementations hash and compare: full path,
+    # backslashes, no trailing separator, lower case (ams-store internal/lock/scope.go).
+    param([Parameter(Mandatory)][string]$Path)
+    return [System.IO.Path]::GetFullPath($Path).Replace('/', '\').TrimEnd('\', '/').ToLowerInvariant()
+}
+
 function Get-AmStoreMutexName {
     param([Parameter(Mandatory)][string]$Base, [string]$StateRoot = (Join-Path $env:USERPROFILE '.claude\state\automemory'))
-    $canon = [System.IO.Path]::GetFullPath($StateRoot).Replace('/', '\').TrimEnd('\', '/').ToLowerInvariant()
+    $canon = ConvertTo-AmCanonicalRoot -Path $StateRoot
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $bytes = $sha.ComputeHash((Get-AmUtf8).GetBytes($canon)) } finally { $sha.Dispose() }
     $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
     return ($Base + '-' + $hex.Substring(0, 16))
+}
+
+# ---------------------------------------------------------------- the Go file lock, from PowerShell
+# ams-store's per-PC lock is <state root>\ams-store.lock, created with O_EXCL and holding one JSON
+# object (internal/lock/lock.go Holder): pid, the holder PROCESS's start time in unix seconds,
+# host, acquired_at (RFC3339 UTC) and reason. A holder is live while it is younger than 10
+# minutes AND its pid runs with that start time. The compactor takes the same file so Go and
+# PowerShell exclude each other by the file too, not by mutex names alone: a pre-1.31.3 binary
+# still running from ams-store.exe.prev uses the bare names, and the file is the lock both sides
+# have always agreed on. A dead or stale holder is broken under the same `.breaking` guard Go
+# uses, then the create is retried exactly once. A contender never waits.
+
+$script:AmStoreLockFile   = 'ams-store.lock'
+$script:AmStoreLockStaleMinutes = 10
+
+function Get-AmProcessStartUnix {
+    param([int]$ProcessId)
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop
+        return [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+    } catch { return [int64]0 }
+}
+
+function Read-AmStoreLockHolder {
+    # $null when absent; throws when present but unparseable (absent and corrupt must not collapse).
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = [System.IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw ('lock file is empty: ' + $Path) }
+    return ($raw | ConvertFrom-Json)
+}
+
+function Test-AmStoreLockHolderLive {
+    param($Holder, [datetime]$NowUtc = [datetime]::UtcNow)
+    if (-not $Holder) { return $false }
+    $acq = ConvertTo-AmUtc $Holder.acquired_at
+    if ($null -eq $acq) { return $true }   # unreadable timestamp: treat as held, never break it
+    if (($NowUtc - $acq).TotalMinutes -ge $script:AmStoreLockStaleMinutes) { return $false }
+    $procId = [int]$Holder.pid
+    if ($procId -le 0) { return $false }
+    if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { return $false }
+    $want = [int64]$Holder.start_time_unix
+    if ($want -eq 0) { return $true }
+    $got = Get-AmProcessStartUnix -ProcessId $procId
+    if ($got -eq 0) { return $true }    # cannot read it (another user's process): assume alive
+    return ($got -eq $want)
+}
+
+function Test-AmSameLockHolder {
+    # Same pid and same acquisition instant. Compared as UTC instants: pwsh 7's ConvertFrom-Json
+    # turns acquired_at into a [DateTime], so a string compare would never match a re-read.
+    param($A, $B)
+    if (-not $A -or -not $B) { return $false }
+    if ([int]$A.pid -ne [int]$B.pid) { return $false }
+    $ta = ConvertTo-AmUtc $A.acquired_at; $tb = ConvertTo-AmUtc $B.acquired_at
+    if ($null -eq $ta -or $null -eq $tb) { return $false }
+    return ($ta.Ticks -eq $tb.Ticks)
+}
+
+function New-AmStoreLockFile {
+    # $true when this call created the file (it is ours), $false when it already existed.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Holder)
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    } catch [System.IO.IOException] { return $false }
+    try {
+        $b = (Get-AmUtf8).GetBytes((($Holder | ConvertTo-Json -Compress) + "`n"))
+        $fs.Write($b, 0, $b.Length)
+        $fs.Flush($true)
+    } finally { $fs.Dispose() }
+    return $true
+}
+
+function Enter-AmStoreFileLock {
+    # Returns @{ Held = $true; Path; Holder } when taken, or @{ Held = $false; Path; Holder = <the
+    # live holder or $null when unreadable> } when another process holds it.
+    param([Parameter(Mandatory)][string]$StateRoot, [string]$Reason = 'memory-compact', [datetime]$NowUtc = [datetime]::UtcNow)
+    if (-not (Test-Path -LiteralPath $StateRoot)) { [System.IO.Directory]::CreateDirectory($StateRoot) | Out-Null }
+    $path = Join-Path $StateRoot $script:AmStoreLockFile
+    $self = [ordered]@{
+        pid             = $PID
+        start_time_unix = (Get-AmProcessStartUnix -ProcessId $PID)
+        host            = [System.Environment]::MachineName
+        acquired_at     = $NowUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+        reason          = $Reason
+    }
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        if (New-AmStoreLockFile -Path $path -Holder $self) { return @{ Held = $true; Path = $path; Holder = [pscustomobject]$self } }
+        if ($attempt -eq 1) { break }
+        try { $existing = Read-AmStoreLockHolder -Path $path } catch { return @{ Held = $false; Path = $path; Holder = $null } }
+        if (-not $existing) { continue }
+        if (Test-AmStoreLockHolderLive -Holder $existing -NowUtc $NowUtc) { return @{ Held = $false; Path = $path; Holder = $existing } }
+        # Break the dead holder under the guard, re-reading it there (lock.go breakDead).
+        $guard = $path + '.breaking'
+        try {
+            $g = New-Object System.IO.FileStream($guard, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $g.Dispose()
+        } catch [System.IO.IOException] {
+            try { if (((Get-Date) - (Get-Item -LiteralPath $guard).LastWriteTime).TotalMinutes -gt 1) { Remove-Item -LiteralPath $guard -Force } } catch {}
+            return @{ Held = $false; Path = $path; Holder = $existing }
+        }
+        try {
+            $cur = $null
+            try { $cur = Read-AmStoreLockHolder -Path $path } catch { return @{ Held = $false; Path = $path; Holder = $existing } }
+            if ($cur -and -not (Test-AmSameLockHolder $cur $existing)) {
+                return @{ Held = $false; Path = $path; Holder = $cur }
+            }
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        } finally { Remove-Item -LiteralPath $guard -Force -ErrorAction SilentlyContinue }
+    }
+    return @{ Held = $false; Path = $path; Holder = $null }
+}
+
+function Exit-AmStoreFileLock {
+    # Removes the file only while it still records THIS holder: a lock broken as stale and
+    # re-taken belongs to its new holder.
+    param($Lock)
+    if (-not $Lock -or -not $Lock.Held) { return }
+    try {
+        $cur = Read-AmStoreLockHolder -Path $Lock.Path
+        if ($cur -and -not (Test-AmSameLockHolder $cur $Lock.Holder)) { return }
+    } catch {}
+    Remove-Item -LiteralPath $Lock.Path -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------- the compactor's skipped nights
+# GUARD 0 skips silently by design (a second instance is the normal case). But a WEDGED holder -
+# alive, not dead, keeping its handle - makes every nightly skip forever with exit 0. Each skip
+# is counted in <state root>\compact-lock-skips.json (distinct local dates since the last run
+# that took the lock, plus who held it); a run that takes the lock deletes the file, and
+# Test-MemoryStack WARNs at 2 skipped nights and FAILs at 4. A side file, not a receipt row:
+# compact-receipts.jsonl rows are per workspace, and its readers (lint, run history, the Go
+# receipt reader) would count a workspace-less row as a store run.
+
+$script:AmCompactSkipFile = 'compact-lock-skips.json'
+
+function Register-AmCompactorSkip {
+    param([Parameter(Mandatory)][string]$StateRoot, [string]$Holder = '', [datetime]$Now = (Get-Date))
+    $p = Join-Path $StateRoot $script:AmCompactSkipFile
+    $s = $null
+    try { $s = Read-AmJsonFile -Path $p } catch { $s = $null }
+    $nights = @()
+    if ($s -and $s.skipped_nights) { $nights = @($s.skipped_nights | ForEach-Object { [string]$_ }) }
+    $today = $Now.ToString('yyyy-MM-dd')
+    if ($nights -notcontains $today) { $nights += $today }
+    $count = 1
+    if ($s -and $s.skips) { $count = [int]$s.skips + 1 }
+    if (-not (Test-Path -LiteralPath $StateRoot)) { [System.IO.Directory]::CreateDirectory($StateRoot) | Out-Null }
+    Write-AmJsonFile -Path $p -Object ([ordered]@{
+        skipped_nights = @($nights)
+        skips          = $count
+        last_skip_utc  = $Now.ToUniversalTime().ToString('o')
+        holder         = $Holder
+    })
+}
+
+function Clear-AmCompactorSkips {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    Remove-Item -LiteralPath (Join-Path $StateRoot $script:AmCompactSkipFile) -Force -ErrorAction SilentlyContinue
+}
+
+function Get-AmStoreLockHolderHint {
+    # Who holds this store, as far as can be told: the Go lock file's holder, else the running
+    # ams-store.exe processes of this user. '' when nothing is found (a mutex with no visible holder).
+    param([Parameter(Mandatory)][string]$StateRoot)
+    try {
+        $h = Read-AmStoreLockHolder -Path (Join-Path $StateRoot $script:AmStoreLockFile)
+        if ($h) {
+            $name = ''
+            try { $name = (Get-Process -Id ([int]$h.pid) -ErrorAction Stop).ProcessName } catch { $name = 'not running' }
+            return ('pid ' + $h.pid + ' (' + $name + ', reason ' + $h.reason + ', since ' + $h.acquired_at + ')')
+        }
+    } catch {}
+    try {
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name='ams-store.exe'" -ErrorAction Stop)
+        if ($procs.Count -gt 0) {
+            return ('ams-store.exe running: ' + (($procs | ForEach-Object { 'pid ' + $_.ProcessId + ' "' + (($_.CommandLine -replace '^"[^"]*"\s*', '') -replace '^\S+\s*', '') + '"' }) -join '; '))
+        }
+    } catch {}
+    return ''
+}
+
+function Get-AmCompactorSkipVerdict {
+    # The Test-MemoryStack row: WARN at 2 skipped nights, FAIL at 4, OK otherwise.
+    param($State, [bool]$TaskPresent = $true)
+    if (-not $TaskPresent) { return [PSCustomObject]@{ Status = 'OK'; Detail = 'compactor task retired; skipped-night counter not judged' } }
+    if (-not $State) { return [PSCustomObject]@{ Status = 'OK'; Detail = 'no skipped nights (the last run took the store lock)' } }
+    $n = @($State.skipped_nights).Count
+    $who = if ($State.holder) { [string]$State.holder } else { 'holder not identified (a named mutex with no lock file)' }
+    $detail = "$n consecutive night(s) skipped because the store lock was held ($([int]$State.skips) skip(s), last $($State.last_skip_utc)); held by: $who"
+    if ($n -ge 4) { return [PSCustomObject]@{ Status = 'FAIL'; Detail = ($detail + ' - a wedged holder keeps the compactor from ever running; end that process') } }
+    if ($n -ge 2) { return [PSCustomObject]@{ Status = 'WARN'; Detail = $detail } }
+    return [PSCustomObject]@{ Status = 'OK'; Detail = $detail }
 }
 
 # ---------------------------------------------------------------- store hub path (P4-1a)

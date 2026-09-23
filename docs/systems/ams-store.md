@@ -546,7 +546,14 @@ What the Windows installer does, in order, and why the order matters:
    vector. A bare `Local\` name is global to the logon session, so a test run's sandbox
    compactor used to hold the live store's lock and the real `sync --once` exited 4. The
    compactor also counts a mutex that already exists as held, because `ams-store` opens it
-   without owning it.
+   without owning it. The compactor also takes the Go file lock `ams-store.lock` in the same
+   JSON format, with the same staleness rule and the same break guard, so Go and PowerShell
+   exclude each other through the file too. It counts the nights it skips in
+   `compact-lock-skips.json`, which Test-MemoryStack WARNs on at 2 and FAILs on at 4. The
+   binary swap first stops every `ams-store.exe` serving this user's store (the watcher at
+   once, a pass after 20 s), then restarts the watcher from the new image. For the 1.31.3
+   transition, a watcher on the default store refuses to start while the bare
+   `Local\ams-store-watch` is open, logging the refusal to `watch-refused.log`.
 4. **Hooks.** PostToolUse `Write|Edit` runs `ams-store gate` (registered over the two
    legacy markers, so the bash lint and the PowerShell gate are replaced in place);
    SessionStart runs `ams-store sync --once --hub-host <hub>` asynchronously (the

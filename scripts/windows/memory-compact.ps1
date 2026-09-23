@@ -74,6 +74,9 @@ try {
     if (-not $createdNew -or -not $script:AmInstanceMutex.WaitOne(0)) {
         Write-MemoryLog -Component $Component -Message ('another compactor instance holds the per-PC lock; exiting (pid ' + $PID + ')')
         $script:AmInstanceMutex.Dispose(); $script:AmInstanceMutex = $null
+        # Counted, so a WEDGED holder cannot silence the nightly forever (Test-MemoryStack
+        # WARNs at 2 skipped nights, FAILs at 4).
+        try { $amSr = Get-AmStateRoot; Register-AmCompactorSkip -StateRoot $amSr -Holder (Get-AmStoreLockHolderHint -StateRoot $amSr) } catch {}
         exit 0
     }
 } catch [System.Threading.AbandonedMutexException] {
@@ -325,6 +328,22 @@ function Remove-AmMem0Record {
         return $true
     } catch { return $false }
 }
+
+# GUARD 0b (1.31.3): the Go per-PC file lock, <state root>/ams-store.lock, taken the way
+# ams-store takes it. The mutex alone rests on both sides spelling one name; the file is the
+# lock every ams-store version agrees on, including a pre-1.31.3 image still running from
+# ams-store.exe.prev with the bare names. Taken here, just before the first store write, so the
+# finally below always releases it; a process that dies holding it is broken as dead by the
+# next contender (pid + start time).
+$script:AmFileLock = Enter-AmStoreFileLock -StateRoot (Get-AmStateRoot) -Reason 'memory-compact'
+if (-not $script:AmFileLock.Held) {
+    $amHolder = if ($script:AmFileLock.Holder) { 'pid ' + $script:AmFileLock.Holder.pid + ' (reason ' + $script:AmFileLock.Holder.reason + ')' } else { 'an unreadable lock file' }
+    Write-MemoryLog -Component $Component -Message ('the store file lock is held by ' + $amHolder + '; exiting (pid ' + $PID + ')')
+    try { Register-AmCompactorSkip -StateRoot (Get-AmStateRoot) -Holder (Get-AmStoreLockHolderHint -StateRoot (Get-AmStateRoot)) } catch {}
+    if ($script:AmInstanceMutex) { try { $script:AmInstanceMutex.ReleaseMutex() } catch {}; $script:AmInstanceMutex.Dispose() }
+    exit 0
+}
+try { Clear-AmCompactorSkips -StateRoot (Get-AmStateRoot) } catch {}
 
 $runStatuses = @()
 try {
@@ -1028,6 +1047,7 @@ if (-not $DryRun -and -not $Force -and @($productive).Count -gt 0) { Mark-Thrott
 
 } finally {
     if ($lockTaken) { Release-CodexLock }
+    Exit-AmStoreFileLock -Lock $script:AmFileLock
     if ($script:AmInstanceMutex) { try { $script:AmInstanceMutex.ReleaseMutex() } catch {}; $script:AmInstanceMutex.Dispose() }
 }
 # 2026-09-03: an unconverged store is a FAILED run - the scheduled task's LastTaskResult must

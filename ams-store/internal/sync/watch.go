@@ -38,7 +38,17 @@ const (
 	ExitReasonIdle      = "idle"
 	ExitReasonCancelled = "cancelled"
 	ExitReasonError     = "error"
+	// ExitReasonLegacyWatcher: a pre-1.31.3 watcher still holds the bare singleton name.
+	ExitReasonLegacyWatcher = "legacy-watcher"
 )
+
+// LegacyWatcherLog is the file in the state root a refused start appends its line to. The
+// watcher is spawned hidden with no console, so stderr alone would reach nobody.
+const LegacyWatcherLog = "watch-refused.log"
+
+// ErrLegacyWatcher is returned when a watcher from before the per-store mutex names is still
+// alive on this desktop. Starting beside it would put two watchers on one store.
+var ErrLegacyWatcher = errors.New("an older ams-store watcher (bare Local\\ams-store-watch) is still running")
 
 // WatchOptions configures the singleton watcher.
 type WatchOptions struct {
@@ -50,6 +60,11 @@ type WatchOptions struct {
 	LivenessWithin time.Duration
 	// SingletonName overrides the named mutex, for tests.
 	SingletonName string
+	// LegacyWatchName is the one-release transitional probe (1.31.3): when set and a mutex of
+	// that name is open, the watcher refuses to start. The CLI sets the bare pre-1.31.3 name
+	// for the operator's default store only; it is only ever OPENED, never created or taken,
+	// so a test or scratch root never touches the real name. Remove with the next release.
+	LegacyWatchName string
 	// AcquirePassLock takes the per-PC lock for ONE pass and returns its release, or
 	// ok=false when another process holds it. Nil means the lock package's production
 	// names and the state root's lock file. The CLI wires its own (the test-name seam).
@@ -83,6 +98,20 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 	logw := opt.Log
 	if logw == nil {
 		logw = io.Discard
+	}
+	if opt.LegacyWatchName != "" {
+		if held, pErr := lock.MutexExists(opt.LegacyWatchName); pErr == nil && held {
+			line := fmt.Sprintf("%s ams-store sync --watch REFUSED: an older ams-store watcher still holds %s (a pre-1.31.3 image running from ams-store.exe.prev); two watchers would run on one store. Stop it (re-run the installer, or end that ams-store.exe) and the next SessionStart starts this one.\n",
+				time.Now().UTC().Format(time.RFC3339), opt.LegacyWatchName)
+			fmt.Fprint(logw, line)
+			if mErr := os.MkdirAll(opt.Roots.StateRoot, 0o755); mErr == nil {
+				if f, fErr := os.OpenFile(filepath.Join(opt.Roots.StateRoot, LegacyWatcherLog), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); fErr == nil {
+					_, _ = f.WriteString(line)
+					_ = f.Close()
+				}
+			}
+			return WatchSummary{Reason: ExitReasonLegacyWatcher}, ErrLegacyWatcher
+		}
 	}
 	single, ok, err := lock.AcquireSingleton(lock.SingletonOptions{
 		Name: opt.SingletonName,

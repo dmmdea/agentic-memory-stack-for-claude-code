@@ -54,13 +54,57 @@ beside a Go pass on the same store. The binary and the PowerShell scripts must b
 release for the two to exclude each other; the installer puts both on the release `VERSION`
 names in one run.
 
+**Closing the upgrade window.** Moving to per-store names leaves a gap during the upgrade itself.
+The installer renames the running exe aside, and a pre-1.31.3 `sync --watch` kept running from
+`ams-store.exe.prev` on the bare names. On Windows the watcher singleton is a mutex only, so the
+next SessionStart would have started a second watcher on the scoped name, and a scoped compactor
+would have run beside the old one. Three changes close the gap, none of which takes the bare
+names:
+
+- Before the swap, the installer stops every `ams-store.exe` that serves this user's store. A
+  process qualifies when its image is the deployed exe or its `.prev`, its owner is this identity,
+  and its `--state-root` (or the default root) is this store. The resident watcher is stopped at
+  once. A derive or sync pass gets 20 s to finish, then is stopped. Each stop is logged. The
+  watcher is then restarted from the new image the way SessionStart starts it. If the hub path is
+  not proven, the log says the watcher starts at the next SessionStart. Another user's process,
+  another store's process and test binaries are left alone.
+- For this one release, a new watcher on the operator's default store refuses to start while a
+  bare-named `Local\ams-store-watch` is open, which means an old watcher is still alive. It
+  checks with `OpenMutex` and never creates or takes the name. The refusal goes to stderr and to
+  `watch-refused.log` in the state root, and the watcher exits non-zero. Scratch and test roots
+  never check the bare name.
+- The PowerShell compactor now also takes the Go file lock `ams-store.lock` in its state root.
+  It uses the same JSON holder (pid, process start time, host, `acquired_at`, reason), the same
+  10-minute staleness rule, the same `.breaking` guard for a dead holder, and releases the lock
+  only if it is still the holder. Exclusion between Go and PowerShell therefore no longer depends
+  on mutex names. Checked against the real binary: `ams-store lock status` reads a
+  PowerShell-held lock as live, `lock acquire` exits 4 against it, and PowerShell sees the lock
+  as held while Go holds it.
+
+**A wedged lock holder is now loud.** GUARD 0 exits 0 without a receipt when the store lock is
+held, because a second instance is the normal case. A holder that is wedged rather than dead
+keeps its handle, though, and would silence every nightly run. Each skip is now recorded in
+`compact-lock-skips.json`: the distinct nights skipped since the last run that took the lock,
+plus the holder (the lock file's pid and reason, or this user's running `ams-store.exe`
+processes). A run that takes the lock clears the file. Test-MemoryStack's new
+`auto-memory compactor skipped nights` row WARNs at 2 nights and FAILs at 4, and names the
+holder. While the task is retired, the row does not judge the counter.
+
 - Tests: `AmsStoreInstall.Tests.ps1` (the predicate on real `ssh-keygen` known_hosts, and the
   verdict table), `internal/lock/scope_test.go` (two roots hold at once with the production
   names, one root still excludes by the file and by the mutex alone, a compactor-held scoped
   legacy mutex stops a Go pass on its own root only, one watcher per root, the golden vector),
   `MemoryStoreLib.Tests.ps1` (the same golden vector from PowerShell), `MemoryCompact.Tests.ps1`
   (GUARD 0 on the sandbox's scoped name, an unowned handle stops it, another store's mutex does
-  not), `InstallerParity.Tests.ps1` (the installer and the self-test both call the shared
+  not, a live Go holder of `ams-store.lock` stops it and a recycled-pid holder is broken, skips
+  are counted), `CompactorLock.Tests.ps1` (the PowerShell file lock and the skipped-night
+  thresholds), `internal/sync/watch_legacy_test.go` (a fake old watcher holding the bare-name
+  stand-in makes the new watcher refuse and log, and the check never creates the name),
+  `cli/legacywatch_internal_test.go` (only the default root checks the bare name),
+  `AmsStoreInstall.Tests.ps1` (the stop step selects this store's processes from a fake process
+  list and never another user's or another store's, a pass is given time to finish, and the stop
+  runs before the old image is renamed; mutants without the stop step or without its wiring go
+  red), `InstallerParity.Tests.ps1` (the installer and the self-test both call the shared
   predicate), `RegressionGuards.Tests.ps1` (the replica branch comes before the local drift log is
   read), and `test_stack_env_writers.py` (a pre-existing `MEM0_BRAIN_SSH` survives a
   `--render-only` re-run as a fixed point, `stack_env_carry` on a CRLF file, and every writer's wiring).

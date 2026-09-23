@@ -461,6 +461,7 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $tms = Get-Content $script:tmsPath -Raw
         $tms | Should -Match 'Get-AmHubPathGaps -HubHost \$cHub'
         $tms | Should -Match 'Get-AmCompactorTaskVerdict -Present \$false -HubGaps \$cGaps'
+        $tms | Should -Match 'Get-AmCompactorSkipVerdict -State \$skipState -TaskPresent' -Because 'a wedged lock holder must surface as WARN/FAIL, not as silent exit-0 skips'
         $tms | Should -Not -Match "'auto-memory compactor task' 'FAIL' 'not registered - re-run 2-windows-config\.ps1'" -Because 'an absent task is not a FAIL on a box whose hub path is proven'
     }
 

@@ -93,15 +93,17 @@ var Counterparts = []Counterpart{
 	{"MemoryCompact.Tests.ps1", 187, "TestDerive_HygieneWithoutJudge", ""},
 	{"MemoryCompact.Tests.ps1", 206, "TestFeasibility_ProtectedSetOverflow", ""},
 	{"MemoryCompact.Tests.ps1", 234, "TestLock_ContenderSkipsImmediately", ""},
+	// 1.31.3: the compactor also takes the Go file lock; a held ams-store.lock makes it skip.
+	{"MemoryCompact.Tests.ps1", 250, "TestLock_ContenderSkipsImmediately", ""},
 	// 2026-09-23: the compactor mutex is scoped to the state root, and an unowned handle (how
 	// ams-store holds it) counts as held. The Go side of both obligations:
-	{"MemoryCompact.Tests.ps1", 247, "TestScopedLock_SameStateRootExcludesByMutexAlone", ""},
-	{"MemoryCompact.Tests.ps1", 259, "TestScopedLock_LegacyMutexIsScopedTheWayTheCompactorNamesIt", ""},
-	{"MemoryCompact.Tests.ps1", 271, "TestLock_FreeLockRuns", ""},
-	{"MemoryCompact.Tests.ps1", 281, "TestJudge_OncePerStorePerWindow_Skips", ""},
-	{"MemoryCompact.Tests.ps1", 294, "TestJudge_OncePerStorePerWindow_Calls", ""},
-	{"MemoryCompact.Tests.ps1", 306, "TestNightly_HubOnceNightly", ""},
-	{"MemoryCompact.Tests.ps1", 320, "TestJudge_ForceBypassesWindow", ""},
+	{"MemoryCompact.Tests.ps1", 273, "TestScopedLock_SameStateRootExcludesByMutexAlone", ""},
+	{"MemoryCompact.Tests.ps1", 285, "TestScopedLock_LegacyMutexIsScopedTheWayTheCompactorNamesIt", ""},
+	{"MemoryCompact.Tests.ps1", 297, "TestLock_FreeLockRuns", ""},
+	{"MemoryCompact.Tests.ps1", 307, "TestJudge_OncePerStorePerWindow_Skips", ""},
+	{"MemoryCompact.Tests.ps1", 320, "TestJudge_OncePerStorePerWindow_Calls", ""},
+	{"MemoryCompact.Tests.ps1", 332, "TestNightly_HubOnceNightly", ""},
+	{"MemoryCompact.Tests.ps1", 346, "TestJudge_ForceBypassesWindow", ""},
 
 	// ---------------- MemoryCompactRobustness.Tests.ps1 ----------------
 	{"MemoryCompactRobustness.Tests.ps1", 9, "TestHygiene_UnparsablePointerNotDuplicatedNoGrowth", ""},

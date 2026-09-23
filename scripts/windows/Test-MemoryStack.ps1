@@ -1087,17 +1087,17 @@ try {
 # absent + proven = OK, absent + not proven = FAIL, present = the action-shape checks. Before
 # 1.31.3 it FAILed every absent task, so a clean install on a replica with HubHost reported FAIL.
 try {
-    if (-not (Get-Command Get-AmCompactorTaskVerdict -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue)) {
         # Sibling first (the deployed self-test sits beside the deployed lib; a repo run uses the
         # repo lib), then the deployed path.
         foreach ($libCand in @((Join-Path $PSScriptRoot 'memory-store-lib.ps1'), (Join-Path $env:USERPROFILE '.claude\scripts\memory-store-lib.ps1'))) {
             if (Test-Path -LiteralPath $libCand) {
                 . $libCand
-                if (Get-Command Get-AmCompactorTaskVerdict -ErrorAction SilentlyContinue) { break }
+                if (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue) { break }
             }
         }
     }
-    if (-not (Get-Command Get-AmCompactorTaskVerdict -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue)) {
         Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' 'memory-store-lib.ps1 predates the hub-path predicate - cannot judge; re-run 2-windows-config.ps1'
     } else {
         $ctask = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue
@@ -1109,6 +1109,13 @@ try {
             Get-AmCompactorTaskVerdict -Present $false -HubGaps $cGaps
         }
         Add-Check 'RECOVERY' 'auto-memory compactor task' $cv.Status $cv.Detail
+        # 1.31.3: GUARD 0 skips silently when the store lock is held - the normal case for one
+        # night, but a WEDGED holder makes every nightly skip forever with exit 0. The compactor
+        # counts skipped nights in compact-lock-skips.json (cleared by a run that takes the lock).
+        $skipState = $null
+        try { $skipState = Read-AmJsonFile -Path (Join-Path $env:USERPROFILE '.claude\state\automemory\compact-lock-skips.json') } catch { $skipState = [pscustomobject]@{ skipped_nights = @(); skips = 0; holder = "unreadable skip file: $($_.Exception.Message)" } }
+        $sv = Get-AmCompactorSkipVerdict -State $skipState -TaskPresent ([bool]$ctask)
+        Add-Check 'RECOVERY' 'auto-memory compactor skipped nights' $sv.Status $sv.Detail
     }
 } catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "probe error: $($_.Exception.Message)" }
 

@@ -192,6 +192,71 @@ function Get-AmsStoreVersionToken {
     return ''
 }
 
+function Get-AmsStoreProcesses {
+    # Every running ams-store.exe on the box: pid, image path, command line and owner
+    # (DOMAIN\user). The owner is read per process so another user's binary is never touched.
+    $ErrorActionPreference = 'Continue'
+    $out = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='ams-store.exe'" -ErrorAction SilentlyContinue)) {
+        $owner = ''
+        try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop; if ($o.User) { $owner = "$($o.Domain)\$($o.User)" } } catch {}
+        $out += [pscustomobject]@{ ProcessId = [int]$p.ProcessId; ExecutablePath = [string]$p.ExecutablePath; CommandLine = [string]$p.CommandLine; Owner = $owner }
+    }
+    return $out
+}
+
+function Select-AmsStoreProcessesForStore {
+    # The ams-store.exe processes that serve THIS user's store: the image is one of $ImagePaths
+    # (the deployed exe or its .prev), the owner is $Owner, and the state root the process works
+    # on - its --state-root, else the default root - is $StateRoot. Anything else (another user,
+    # another store, a test binary, a scratch HOME) is left alone. Kind: watch | pass.
+    param($Processes, [string[]]$ImagePaths, [string]$StateRoot, [string]$DefaultStateRoot, [string]$Owner)
+    $want = ConvertTo-AmCanonicalRoot -Path $StateRoot
+    $images = @($ImagePaths | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).ToLowerInvariant() })
+    $sel = @()
+    foreach ($p in @($Processes)) {
+        if (-not $p.ExecutablePath) { continue }
+        if ($images -notcontains [System.IO.Path]::GetFullPath($p.ExecutablePath).ToLowerInvariant()) { continue }
+        if ($Owner -and ([string]$p.Owner -ne $Owner)) { continue }
+        $cl = [string]$p.CommandLine
+        $m = [regex]::Match($cl, '--state-root(?:=|\s+)(?:"([^"]+)"|(\S+))')
+        $root = if ($m.Success) { if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value } } else { $DefaultStateRoot }
+        try { if ((ConvertTo-AmCanonicalRoot -Path $root) -ne $want) { continue } } catch { continue }
+        $kind = if ($cl -match '\bsync\b' -and $cl -match '--watch\b') { 'watch' } else { 'pass' }
+        $sel += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = $kind; CommandLine = $cl; ExecutablePath = $p.ExecutablePath }
+    }
+    return $sel
+}
+
+function Stop-AmsStoreProcessesForStore {
+    # Stops the selected processes before the exe is swapped (1.31.3): a resident watcher at
+    # once; a derive/sync/gate pass gets $PassWaitSeconds to finish on its own, then is stopped.
+    # Every stop is logged. The process calls are parameters so a test drives a fake process list.
+    param($Selected, [int]$PassWaitSeconds = 20,
+        [scriptblock]$HasExited = { param($id) -not (Get-Process -Id $id -ErrorAction SilentlyContinue) },
+        [scriptblock]$StopProcess = { param($id) Stop-Process -Id $id -Force -ErrorAction SilentlyContinue },
+        [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms })
+    $done = @()
+    foreach ($p in @($Selected | Where-Object { $_.Kind -eq 'watch' })) {
+        & $StopProcess $p.ProcessId
+        Write-Host "    stopped the resident watcher pid $($p.ProcessId) ($($p.ExecutablePath)) before the swap" -ForegroundColor Yellow
+        $done += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = 'watch'; Action = 'stopped' }
+    }
+    foreach ($p in @($Selected | Where-Object { $_.Kind -ne 'watch' })) {
+        $waited = 0
+        while (-not (& $HasExited $p.ProcessId) -and $waited -lt ($PassWaitSeconds * 1000)) { & $Sleep 250; $waited += 250 }
+        if (& $HasExited $p.ProcessId) {
+            Write-Host "    ams-store pass pid $($p.ProcessId) finished on its own before the swap"
+            $done += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = 'pass'; Action = 'finished' }
+        } else {
+            & $StopProcess $p.ProcessId
+            Write-Host "    stopped ams-store pass pid $($p.ProcessId) after ${PassWaitSeconds}s ($($p.CommandLine))" -ForegroundColor Yellow
+            $done += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = 'pass'; Action = 'stopped' }
+        }
+    }
+    return $done
+}
+
 function Install-AmsStoreBinary {
     # Returns @{ Sha256; Source; Version } or throws with the reason. Idempotent: a deployed exe
     # whose content hash equals the digest the release records is left alone (sidecar refreshed).
@@ -199,7 +264,10 @@ function Install-AmsStoreBinary {
     # own sidecar) | drop | drop-unverified.
     param(
         [string]$Tag, [string]$Asset, [string]$Dest, [string]$ReleaseRepo,
-        [string]$BinaryPath, [string]$BinarySums
+        [string]$BinaryPath, [string]$BinarySums,
+        # Runs right before the swap, only when the exe is actually replaced: the caller stops
+        # every ams-store.exe serving this store there (1.31.3), so no old image keeps running.
+        [scriptblock]$BeforeSwap
     )
     $ErrorActionPreference = 'Stop'
     $sidecar = $Dest + '.sha256'
@@ -262,6 +330,10 @@ function Install-AmsStoreBinary {
     # Swap in. A resident `sync --watch` may hold the old exe open: Windows refuses to overwrite a
     # running image but allows a rename, so the old file steps aside as .prev (deleted here when
     # nothing holds it, otherwise on the next run).
+    # 1.31.3: first stop every ams-store.exe that serves this store. Renaming a running image
+    # aside kept a pre-1.31.3 `sync --watch` alive on the bare mutex names while the next
+    # SessionStart started a new watcher on the per-store name: two watchers on one store.
+    if ($BeforeSwap) { & $BeforeSwap }
     $prev = $Dest + '.prev'
     if (Test-Path -LiteralPath $prev) { Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue }
     if (Test-Path -LiteralPath $Dest) { Move-Item -LiteralPath $Dest -Destination $prev -Force }
@@ -279,9 +351,22 @@ function Install-AmsStoreBinary {
     return @{ Sha256 = $have; Source = $source; Version = $ver }
 }
 
+# The shared predicates (the hub path, the canonical state root) live in memory-store-lib.ps1,
+# so Test-MemoryStack.ps1 judges with the same answers this installer acts on. The lib only
+# defines functions and constants at load.
+. (Join-Path $RepoRoot 'scripts\windows\memory-store-lib.ps1')
+$amsDefaultStateRoot = Join-Path $env:USERPROFILE '.claude\state\automemory'
+$script:amsStoppedWatcher = $false
+$amsStopForSwap = {
+    $sel = @(Select-AmsStoreProcessesForStore -Processes (Get-AmsStoreProcesses) -ImagePaths @($amsStoreExe, ($amsStoreExe + '.prev')) `
+        -StateRoot (Join-Path $StateDir 'automemory') -DefaultStateRoot $amsDefaultStateRoot -Owner ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))
+    if ($sel.Count -eq 0) { Write-Host "    no running ams-store.exe serves this store" }
+    $stopped = @(Stop-AmsStoreProcessesForStore -Selected $sel)
+    if (@($stopped | Where-Object { $_.Kind -eq 'watch' }).Count -gt 0) { $script:amsStoppedWatcher = $true }
+}
 Write-Host "==> [1s] Installing ams-store.exe ($amsStoreTag from the release assets of $ReleaseRepo)"
 try {
-    $amsInstall = Install-AmsStoreBinary -Tag $amsStoreTag -Asset $amsStoreAsset -Dest $amsStoreExe -ReleaseRepo $ReleaseRepo -BinaryPath $BinaryPath -BinarySums $BinarySums
+    $amsInstall = Install-AmsStoreBinary -Tag $amsStoreTag -Asset $amsStoreAsset -Dest $amsStoreExe -ReleaseRepo $ReleaseRepo -BinaryPath $BinaryPath -BinarySums $BinarySums -BeforeSwap $amsStopForSwap
 } catch {
     Write-Host "FATAL: ams-store.exe not installed: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "       aborting before the receipt and before hook registration (settings.json and the scheduled tasks are untouched)" -ForegroundColor Red
@@ -675,10 +760,8 @@ if ($LASTEXITCODE -ne 0) {
 $amsStateRoot  = Join-Path $StateDir 'automemory'
 $amsHistoryDir = Join-Path $amsStateRoot 'history.git'
 $amsProjects   = Join-Path $ClaudeDir 'projects'
-# The hub-path predicate (Get-AmHubPathGaps) and its constants live in memory-store-lib.ps1 so
-# Test-MemoryStack.ps1 judges the retired compactor task with the same answer this block
-# acts on (steps 1c and 1d below). The lib only defines functions and constants at load.
-. (Join-Path $RepoRoot 'scripts\windows\memory-store-lib.ps1')
+# The hub-path predicate (Get-AmHubPathGaps) comes from memory-store-lib.ps1, dot-sourced
+# before step 1s (Test-MemoryStack.ps1 judges the retired compactor with the same answer).
 $amsSshDir     = Join-Path $env:USERPROFILE '.ssh'
 $amsHubUser    = $script:AmHubUser
 $amsHubRepo    = 'ams-store.git'
@@ -775,6 +858,25 @@ if (-not $HubHost) {
         Write-Host "    known_hosts: $seeded line(s) seeded into $amsStateRoot\known_hosts"
         $amsHubUrl = Initialize-AmsHistoryRemote -GitDir $amsHistoryDir -WorkTree $amsProjects -HubHost $HubHost -HubUser $amsHubUser -HubRepo $amsHubRepo
         $amsSyncReady = $true
+    }
+}
+# 1.31.3: a watcher stopped for the binary swap (step 1s) is started again from the NEW image,
+# exactly as memory-maintenance-spawn.ps1 starts it at SessionStart (hidden, same arguments).
+# It exits by itself when no session is live, so this costs nothing on an idle box.
+if ($script:amsStoppedWatcher) {
+    if ($amsSyncReady) {
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $amsStoreExe
+            $psi.Arguments = 'sync --watch --hub-host ' + $HubHost
+            $psi.UseShellExecute = $true
+            $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+            $wp = [System.Diagnostics.Process]::Start($psi)
+            Write-Host "    watcher restarted from the new image (pid $($wp.Id))"
+            $wp.Dispose()
+        } catch { Write-Host "    watcher not restarted ($($_.Exception.Message)); it starts at the next SessionStart" -ForegroundColor Yellow }
+    } else {
+        Write-Host "    the stopped watcher is not restarted here (hub path not proven); it starts at the next SessionStart once the path is proven" -ForegroundColor Yellow
     }
 }
 

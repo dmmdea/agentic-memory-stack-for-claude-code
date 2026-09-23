@@ -13,3 +13,6 @@ type mutexHandle = struct{}
 func acquireMutex(string) (mutexHandle, bool, error) { return mutexHandle{}, true, nil }
 
 func releaseMutex(mutexHandle) {}
+
+// MutexExists is always false off Windows: there are no named mutexes to find.
+func MutexExists(string) (bool, error) { return false, nil }
