@@ -61,3 +61,64 @@ Describe 'the Go file lock from PowerShell (Enter-AmStoreFileLock) - same file, 
         Test-Path -LiteralPath $l.Path | Should -BeTrue -Because 'the file now records another holder'
     }
 }
+
+Describe 'skipped nights run noon to noon (a retry across local midnight is one night)' {
+    It 'counts 23:50 and 00:10 as one night, and the next 05:00 nightly as the second' {
+        $sr = Join-Path $TestDrive 'nights'
+        $d = [datetime]::new(2026, 9, 20, 23, 50, 0, [DateTimeKind]::Local)
+        Register-AmCompactorSkip -StateRoot $sr -Now $d
+        Register-AmCompactorSkip -StateRoot $sr -Now $d.AddMinutes(20)            # 00:10, past local midnight
+        Register-AmCompactorSkip -StateRoot $sr -Now $d.AddHours(5).AddMinutes(10) # the 05:00 nightly, same night
+        $s = Read-AmJsonFile -Path (Join-Path $sr 'compact-lock-skips.json')
+        @($s.skipped_nights).Count | Should -Be 1
+        Register-AmCompactorSkip -StateRoot $sr -Now $d.AddDays(1).AddHours(5).AddMinutes(10)
+        @((Read-AmJsonFile -Path (Join-Path $sr 'compact-lock-skips.json')).skipped_nights).Count | Should -Be 2
+    }
+}
+
+Describe 'git locks a killed process leaves behind (Invoke-AmGitLockRecovery)' {
+    BeforeAll {
+        function script:New-GitDirWithLocks([string]$Name) {
+            $sr = Join-Path $TestDrive $Name
+            $gd = Join-Path $sr 'history.git'
+            New-Item -ItemType Directory -Force -Path (Join-Path $gd 'refs\heads') | Out-Null
+            Set-Content -LiteralPath (Join-Path $gd 'HEAD') -Value 'ref: refs/heads/main'
+            Set-Content -LiteralPath (Join-Path $gd 'index.lock') -Value ''
+            Set-Content -LiteralPath (Join-Path $gd 'refs\heads\main.lock') -Value ''
+            return $sr
+        }
+    }
+    It 'removes every lock when no git process for the repo is alive, and records it' {
+        $sr = script:New-GitDirWithLocks 'gl1'
+        $other = [pscustomobject]@{ ProcessId = 5; CommandLine = 'git.exe --git-dir=D:/elsewhere/.git status' }
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GitProcesses @($other) -Trigger 'test'
+        @($rec.removed).Count | Should -Be 2
+        @($rec.kept).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $sr 'history.git\index.lock') | Should -BeFalse
+        $v = Get-AmGitLockVerdict -Record (Read-AmJsonFile -Path (Join-Path $sr 'git-lock-recovery.json'))
+        $v.Status | Should -Be 'WARN'
+        $v.Detail | Should -Match 'index\.lock'
+    }
+    It 'keeps every lock while a git process for that repo is alive (or one whose command line cannot be read)' {
+        $sr = script:New-GitDirWithLocks 'gl2'
+        $gd = Join-Path $sr 'history.git'
+        $mine = [pscustomobject]@{ ProcessId = 6; CommandLine = ('git.exe --git-dir=' + $gd.Replace([string][char]92, '/') + ' commit -q') }
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GitProcesses @($mine)
+        @($rec.removed).Count | Should -Be 0
+        @($rec.kept).Count | Should -Be 2
+        Test-Path -LiteralPath (Join-Path $gd 'index.lock') | Should -BeTrue
+        (Get-AmGitLockVerdict -Record (Read-AmJsonFile -Path (Join-Path $sr 'git-lock-recovery.json'))).Status | Should -Be 'FAIL'
+        $sr3 = script:New-GitDirWithLocks 'gl3'
+        $blind = [pscustomobject]@{ ProcessId = 7; CommandLine = '' }
+        @((Invoke-AmGitLockRecovery -StateRoot $sr3 -GitProcesses @($blind)).kept).Count | Should -Be 2
+    }
+    It 'reports a lock older than 10 minutes as a FAIL (it jams every sync), a fresh one not at all' {
+        $sr = script:New-GitDirWithLocks 'gl4'
+        @(Get-AmStaleGitLocks -StateRoot $sr).Count | Should -Be 0 -Because 'a fresh lock is a sync in progress'
+        (Get-Item -LiteralPath (Join-Path $sr 'history.git\index.lock')).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-30)
+        $stale = @(Get-AmStaleGitLocks -StateRoot $sr)
+        $stale.Count | Should -Be 1
+        (Get-AmGitLockVerdict -Record $null -StaleLocks $stale).Status | Should -Be 'FAIL'
+        (Get-AmGitLockVerdict -Record $null -StaleLocks @()).Status | Should -Be 'OK'
+    }
+}

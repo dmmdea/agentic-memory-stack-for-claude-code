@@ -40,7 +40,15 @@ const (
 	ExitReasonError     = "error"
 	// ExitReasonLegacyWatcher: a pre-1.31.3 watcher still holds the bare singleton name.
 	ExitReasonLegacyWatcher = "legacy-watcher"
+	// ExitReasonStopRequested: the stop file appeared (the installer, before an exe swap).
+	ExitReasonStopRequested = "stop-requested"
 )
+
+// StopFile is the cooperative stop request, in the state root. Its appearance makes the
+// watcher exit BETWEEN passes, never inside one: a pass may have a git child mid-commit on
+// history.git, and a forced TerminateProcess skips gitx's killTree and can orphan it holding
+// index.lock. A leftover file is cleared when a watcher starts.
+const StopFile = "watch.stop"
 
 // LegacyWatcherLog is the file in the state root a refused start appends its line to. The
 // watcher is spawned hidden with no console, so stderr alone would reach nobody.
@@ -141,7 +149,10 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 		return WatchSummary{Reason: ExitReasonError}, fmt.Errorf("sync: watch %s: %w", opt.Roots.StateRoot, err)
 	}
 
+	stopPath := filepath.Join(opt.Roots.StateRoot, StopFile)
+	_ = os.Remove(stopPath) // a request meant for a previous watcher is not meant for this one
 	events := make(chan struct{}, 1)
+	stop := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -153,6 +164,13 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 			case ev, open := <-w.Events:
 				if !open {
 					return
+				}
+				if sameFile(ev.Name, stopPath) && ev.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+					select {
+					case stop <- struct{}{}:
+					default:
+					}
+					continue
 				}
 				if !sameFile(ev.Name, marker) {
 					continue
@@ -176,6 +194,7 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 	repo := NewRepo(opt.Roots)
 	deps := watchDeps{
 		events:  events,
+		stop:    stop,
 		anyLive: func() bool { return live.AnyClaudeSession(opt.Roots.ProjectsRoot, within, time.Now()) },
 		isDirty: func() bool { return IsDirty(opt.Roots.StateRoot) },
 		lsRemote: func(c context.Context) (string, error) {
@@ -196,6 +215,7 @@ func Watch(ctx context.Context, opt WatchOptions) (WatchSummary, error) {
 // without a real filesystem, a real clock or a real hub.
 type watchDeps struct {
 	events   <-chan struct{}
+	stop     <-chan struct{} // nil = no cooperative stop (tests that do not exercise it)
 	anyLive  func() bool
 	isDirty  func() bool
 	lsRemote func(context.Context) (string, error)
@@ -321,6 +341,12 @@ func runWatch(ctx context.Context, opt WatchOptions, d watchDeps) (WatchSummary,
 		select {
 		case <-ctx.Done():
 			sum.Reason = ExitReasonCancelled
+			return sum, nil
+
+		case <-d.stop:
+			// Reached only between passes: pass() runs synchronously in this loop.
+			fmt.Fprintln(logw, "watch: stop requested; exiting between passes")
+			sum.Reason = ExitReasonStopRequested
 			return sum, nil
 
 		case _, open := <-d.events:

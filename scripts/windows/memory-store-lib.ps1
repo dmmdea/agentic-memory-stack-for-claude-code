@@ -983,7 +983,9 @@ function Register-AmCompactorSkip {
     try { $s = Read-AmJsonFile -Path $p } catch { $s = $null }
     $nights = @()
     if ($s -and $s.skipped_nights) { $nights = @($s.skipped_nights | ForEach-Object { [string]$_ }) }
-    $today = $Now.ToString('yyyy-MM-dd')
+    # One NIGHT runs noon to noon (local): the 05:00 nightly and a catch-up retry at 23:50 or
+    # 00:10 are the same night, and a retry across local midnight is not a second night.
+    $today = $Now.AddHours(-12).ToString('yyyy-MM-dd')
     if ($nights -notcontains $today) { $nights += $today }
     $count = 1
     if ($s -and $s.skips) { $count = [int]$s.skips + 1 }
@@ -1033,6 +1035,108 @@ function Get-AmCompactorSkipVerdict {
     if ($n -ge 4) { return [PSCustomObject]@{ Status = 'FAIL'; Detail = ($detail + ' - a wedged holder keeps the compactor from ever running; end that process') } }
     if ($n -ge 2) { return [PSCustomObject]@{ Status = 'WARN'; Detail = $detail } }
     return [PSCustomObject]@{ Status = 'OK'; Detail = $detail }
+}
+
+# ---------------------------------------------------------------- git locks a killed process leaves
+# A process killed mid-commit or mid-gc (the installer's forced stop before an exe swap) can
+# leave index.lock or a ref .lock in a git dir ams-store drives; every later sync then fails on
+# it and nothing says why. After a forced stop the installer checks every git dir in the state
+# root (a directory holding HEAD: history.git, and any other) and removes a lock only when no
+# git process for that repo is alive - a git.exe whose command line names the git dir, or one
+# whose command line cannot be read (it might). The outcome is recorded in
+# git-lock-recovery.json, and Test-MemoryStack reports it, and any stale lock present now.
+
+$script:AmGitLockRecoveryFile = 'git-lock-recovery.json'
+$script:AmGitLockStaleMinutes = 10
+
+function Get-AmStoreGitDirs {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    if (-not (Test-Path -LiteralPath $StateRoot)) { return @() }
+    return @(Get-ChildItem -LiteralPath $StateRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'HEAD') } | ForEach-Object { $_.FullName })
+}
+
+function Get-AmGitLockFiles {
+    # Every *.lock under a git dir (index.lock, HEAD.lock, packed-refs.lock, refs/**/x.lock ...).
+    param([Parameter(Mandatory)][string]$GitDir)
+    if (-not (Test-Path -LiteralPath $GitDir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $GitDir -Recurse -File -Filter '*.lock' -ErrorAction SilentlyContinue)
+}
+
+function Get-AmGitProcesses {
+    # Running git.exe processes with their command lines ('' when unreadable).
+    $out = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='git.exe'" -ErrorAction SilentlyContinue)) {
+        $out += [pscustomobject]@{ ProcessId = [int]$p.ProcessId; CommandLine = [string]$p.CommandLine }
+    }
+    return $out
+}
+
+function Test-AmGitProcessForRepo {
+    param($GitProcesses, [Parameter(Mandatory)][string]$GitDir)
+    $a = (ConvertTo-AmCanonicalRoot -Path $GitDir)
+    $b = $a.Replace([string][char]92, '/')
+    foreach ($g in @($GitProcesses)) {
+        $cl = ([string]$g.CommandLine).ToLowerInvariant()
+        if (-not $cl) { return $true }                      # cannot tell: assume it is ours
+        if ($cl.Contains($a) -or $cl.Contains($b)) { return $true }
+    }
+    return $false
+}
+
+function Invoke-AmGitLockRecovery {
+    param([Parameter(Mandatory)][string]$StateRoot, $GitProcesses = @(), [string]$Trigger = '', [datetime]$NowUtc = [datetime]::UtcNow)
+    $removed = @(); $kept = @()
+    foreach ($gd in @(Get-AmStoreGitDirs -StateRoot $StateRoot)) {
+        $locks = @(Get-AmGitLockFiles -GitDir $gd)
+        if ($locks.Count -eq 0) { continue }
+        if (Test-AmGitProcessForRepo -GitProcesses $GitProcesses -GitDir $gd) {
+            foreach ($l in $locks) { $kept += [ordered]@{ path = $l.FullName; reason = 'a git process for this repo is alive (or one whose command line cannot be read)' } }
+            continue
+        }
+        foreach ($l in $locks) {
+            try { Remove-Item -LiteralPath $l.FullName -Force -ErrorAction Stop; $removed += $l.FullName }
+            catch { $kept += [ordered]@{ path = $l.FullName; reason = ('could not remove: ' + $_.Exception.Message) } }
+        }
+    }
+    $rec = [ordered]@{ ts = $NowUtc.ToString('o'); trigger = $Trigger; removed = @($removed); kept = @($kept) }
+    if ($removed.Count -gt 0 -or $kept.Count -gt 0) {
+        Write-AmJsonFile -Path (Join-Path $StateRoot $script:AmGitLockRecoveryFile) -Object $rec
+    }
+    return [pscustomobject]$rec
+}
+
+function Get-AmGitLockVerdict {
+    # The Test-MemoryStack row. FAIL: a lock older than 10 minutes is in a store git dir now
+    # (it jams every sync), or the last recovery had to KEEP a lock. WARN: a recovery removed
+    # locks in the last 14 days (a process was killed mid-git; the history is worth a look).
+    param($Record, $StaleLocks = @(), [datetime]$NowUtc = [datetime]::UtcNow)
+    $stale = @($StaleLocks)
+    if ($stale.Count -gt 0) {
+        return [PSCustomObject]@{ Status = 'FAIL'; Detail = ('stale git lock(s) older than ' + $script:AmGitLockStaleMinutes + ' min - every sync fails on them: ' + (($stale | ForEach-Object { [string]$_ }) -join '; ')) }
+    }
+    if ($Record) {
+        $ts = ConvertTo-AmUtc $Record.ts
+        $recent = ($null -ne $ts) -and (($NowUtc - $ts).TotalDays -le 14)
+        if ($recent -and @($Record.kept).Count -gt 0) {
+            return [PSCustomObject]@{ Status = 'FAIL'; Detail = ('git lock(s) KEPT after a forced stop (' + $Record.ts + '): ' + ((@($Record.kept) | ForEach-Object { [string]$_.path + ' (' + [string]$_.reason + ')' }) -join '; ')) }
+        }
+        if ($recent -and @($Record.removed).Count -gt 0) {
+            return [PSCustomObject]@{ Status = 'WARN'; Detail = ('a forced stop left git lock(s), removed ' + $Record.ts + ' (' + $Record.trigger + '): ' + (@($Record.removed) -join '; ')) }
+        }
+    }
+    return [PSCustomObject]@{ Status = 'OK'; Detail = 'no git lock left in the store git dirs' }
+}
+
+function Get-AmStaleGitLocks {
+    param([Parameter(Mandatory)][string]$StateRoot, [datetime]$NowUtc = [datetime]::UtcNow)
+    $out = @()
+    foreach ($gd in @(Get-AmStoreGitDirs -StateRoot $StateRoot)) {
+        foreach ($l in @(Get-AmGitLockFiles -GitDir $gd)) {
+            if (($NowUtc - $l.LastWriteTimeUtc).TotalMinutes -ge $script:AmGitLockStaleMinutes) { $out += $l.FullName }
+        }
+    }
+    return $out
 }
 
 # ---------------------------------------------------------------- store hub path (P4-1a)

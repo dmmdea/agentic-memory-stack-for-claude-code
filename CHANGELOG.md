@@ -81,6 +81,38 @@ names:
   PowerShell-held lock as live, `lock acquire` exits 4 against it, and PowerShell sees the lock
   as held while Go holds it.
 
+**Stopping a process no longer risks orphaning git.** `TerminateProcess` does not run the
+tree kill in `gitx` (the one that ends git child processes), so a `git.exe` killed mid-commit or
+mid-gc on `history.git` could be left holding `index.lock` or a ref lock, and every later sync
+would fail on it. The stop step now works in this order:
+
+- **The watcher is asked first.** The installer writes `watch.stop` in the state root. A
+  1.31.3+ watcher sees it through the directory watch it already has and exits between passes,
+  never in the middle of one. A leftover stop file is cleared when a watcher starts. An older
+  image ignores the file.
+- **Anything still alive after its grace is killed as a tree.** The grace is 30 s for a watcher
+  and 20 s for a pass. The kill is `taskkill /PID <pid> /T /F`. Right before it, the pid's start
+  time is re-checked against the WMI snapshot. A pid that now names another process, or whose
+  start time cannot be read, is not killed.
+- **After a forced stop, stale git locks are checked.** The installer looks at every git dir in
+  the state root for `*.lock` files. It removes them only if no `git.exe` for that repo is alive.
+  A git process whose command line names the git dir blocks removal, and so does one whose
+  command line cannot be read. The result goes to `git-lock-recovery.json`. The new
+  Test-MemoryStack row `store history git locks` FAILs on any store git lock older than
+  10 minutes, or on a lock that recovery had to keep, and WARNs for 14 days after locks were
+  removed.
+
+Three smaller fixes in the same step:
+
+- A process with no WMI image path is identified by `argv[0]` from its command line. One that
+  still cannot be identified gets its own line: "N ams-store.exe process(es) seen but could not
+  be identified (pid ...)".
+- A respawned watcher is checked 3 s later. A quiet exit 0 is reported as "no live session here,
+  it starts at the next SessionStart". A non-zero exit is reported with its code and the last
+  `watch-refused.log` line. The installer no longer says "watcher restarted" without checking.
+- Skipped nights now run noon to noon, local time. A catch-up retry across local midnight is no
+  longer counted as a second night.
+
 **A wedged lock holder is now loud.** GUARD 0 exits 0 without a receipt when the store lock is
 held, because a second instance is the normal case. A holder that is wedged rather than dead
 keeps its handle, though, and would silence every nightly run. Each skip is now recorded in

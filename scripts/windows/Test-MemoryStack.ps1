@@ -1087,17 +1087,17 @@ try {
 # absent + proven = OK, absent + not proven = FAIL, present = the action-shape checks. Before
 # 1.31.3 it FAILed every absent task, so a clean install on a replica with HubHost reported FAIL.
 try {
-    if (-not (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue)) {
         # Sibling first (the deployed self-test sits beside the deployed lib; a repo run uses the
         # repo lib), then the deployed path.
         foreach ($libCand in @((Join-Path $PSScriptRoot 'memory-store-lib.ps1'), (Join-Path $env:USERPROFILE '.claude\scripts\memory-store-lib.ps1'))) {
             if (Test-Path -LiteralPath $libCand) {
                 . $libCand
-                if (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue) { break }
+                if (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue) { break }
             }
         }
     }
-    if (-not (Get-Command Get-AmCompactorSkipVerdict -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue)) {
         Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' 'memory-store-lib.ps1 predates the hub-path predicate - cannot judge; re-run 2-windows-config.ps1'
     } else {
         $ctask = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue
@@ -1116,6 +1116,15 @@ try {
         try { $skipState = Read-AmJsonFile -Path (Join-Path $env:USERPROFILE '.claude\state\automemory\compact-lock-skips.json') } catch { $skipState = [pscustomobject]@{ skipped_nights = @(); skips = 0; holder = "unreadable skip file: $($_.Exception.Message)" } }
         $sv = Get-AmCompactorSkipVerdict -State $skipState -TaskPresent ([bool]$ctask)
         Add-Check 'RECOVERY' 'auto-memory compactor skipped nights' $sv.Status $sv.Detail
+        # 1.31.3: a process killed mid-git (the installer's forced stop) can leave index.lock or
+        # a ref lock that makes every later sync fail. The installer removes such locks when no
+        # git process for the repo is alive and records it; this row reports that, and any
+        # lock older than 10 minutes in a store git dir right now.
+        $glSr = Join-Path $env:USERPROFILE '.claude\state\automemory'
+        $glRec = $null
+        try { $glRec = Read-AmJsonFile -Path (Join-Path $glSr 'git-lock-recovery.json') } catch { $glRec = $null }
+        $glv = Get-AmGitLockVerdict -Record $glRec -StaleLocks @(Get-AmStaleGitLocks -StateRoot $glSr)
+        Add-Check 'RECOVERY' 'store history git locks' $glv.Status $glv.Detail
     }
 } catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "probe error: $($_.Exception.Message)" }
 
