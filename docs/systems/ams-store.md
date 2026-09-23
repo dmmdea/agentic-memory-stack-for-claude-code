@@ -553,9 +553,10 @@ What the Windows installer does, in order, and why the order matters:
    binary swap first stops every `ams-store.exe` serving this user's store. It asks the
    watcher to stop through `watch.stop`, which a 1.31.3+ watcher honours between passes, and
    gives a pass 20 s to finish. Anything still running after that is tree-killed
-   (`taskkill /T /F`) once its start time has been re-checked. After a forced stop, stale
-   `*.lock` files in the store's git dirs are removed when no git process for that repo is
-   alive. The result is recorded in `git-lock-recovery.json`, which the `store history git
+   (`taskkill /T /F`) once its start time has been re-checked. After a forced stop, stale git lock files
+   in the store's git dirs are removed. Only git's own lock names qualify, and each must be
+   older than 2 minutes, inside the state root, and not reached through a reparse point. A lock
+   is removed only while no `git.exe` of this user is alive, re-checked before each delete. The result is recorded in `git-lock-recovery.json`, which the `store history git
    locks` row reports. The swap then restarts the watcher from the new image and confirms it
    is still alive. For the 1.31.3
    transition, a watcher on the default store refuses to start while the bare

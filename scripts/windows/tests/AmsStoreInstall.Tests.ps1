@@ -316,7 +316,7 @@ Describe 'the binary swap stops this store''s ams-store.exe first (1.31.3 mixed-
         $src | Should -Match 'Stop-AmsStoreProcessesForStore -Selected \$pick\.Selected -StateRoot \$amsSr'
         $src | Should -Match 'process\(es\) seen but could not be identified'
         $src | Should -Match "if \(\`$stop\.Forced\) \{"
-        $src | Should -Match 'Invoke-AmGitLockRecovery -StateRoot \$amsSr -GitProcesses \(Get-AmGitProcesses\)'
+        $src | Should -Match 'Invoke-AmGitLockRecovery -StateRoot \$amsSr -WaitForGrace'
         $src | Should -Match 'Confirm-AmsWatcherAlive -Process \$wp'
         $src | Should -Not -Match 'watcher restarted from the new image \(pid \$\(\$wp\.Id\)\)"' -Because 'a respawn is confirmed alive, never claimed'
     }

@@ -94,13 +94,23 @@ would fail on it. The stop step now works in this order:
   and 20 s for a pass. The kill is `taskkill /PID <pid> /T /F`. Right before it, the pid's start
   time is re-checked against the WMI snapshot. A pid that now names another process, or whose
   start time cannot be read, is not killed.
-- **After a forced stop, stale git locks are checked.** The installer looks at every git dir in
-  the state root for `*.lock` files. It removes them only if no `git.exe` for that repo is alive.
-  A git process whose command line names the git dir blocks removal, and so does one whose
-  command line cannot be read. The result goes to `git-lock-recovery.json`. The new
-  Test-MemoryStack row `store history git locks` FAILs on any store git lock older than
-  10 minutes, or on a lock that recovery had to keep, and WARNs for 14 days after locks were
-  removed.
+- **After a forced stop, stale git locks are checked, conservatively.**
+  - **Which dirs:** a git dir must be a direct child of the state root with `HEAD`, `objects\`
+    and `refs\`, and must not be a reparse point.
+  - **Which files:** only git's own lock names are candidates: `index.lock`, `HEAD.lock`,
+    `config.lock`, `packed-refs.lock` and `shallow.lock` at the top level, and `*.lock` under
+    `refs\`. The search never enters a junction or symlink. Every file deleted must resolve
+    inside the canonical state root with no reparse point on the way.
+  - **When:** a lock younger than 2 minutes is left alone. The installer waits that grace out
+    once after a forced stop.
+  - **Only with no git running:** a lock is removed only while no `git.exe` of the current user
+    is alive at all, and that is re-checked before each delete. Matching on the command line
+    would miss cwd-only, relative, `--work-tree`-only and `GIT_DIR` invocations and git's own
+    children, and Windows cannot read another process's working directory reliably.
+  - **Reporting:** the result goes to `git-lock-recovery.json`. The new Test-MemoryStack row
+    `store history git locks` FAILs on a lock older than 10 minutes when no `git.exe` is alive.
+    It WARNs, naming the pids, when an old lock coexists with a running git, since a long gc can
+    hold one. It also WARNs for 14 days after a recovery removed or kept locks.
 
 Three smaller fixes in the same step:
 

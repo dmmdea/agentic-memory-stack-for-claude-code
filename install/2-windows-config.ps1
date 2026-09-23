@@ -425,7 +425,7 @@ $amsStopForSwap = {
     if (@($stop.Results | Where-Object { $_.Kind -eq 'watch' -and $_.Action -ne 'not-killed-identity' }).Count -gt 0) { $script:amsStoppedWatcher = $true }
     if ($stop.Forced) {
         # A killed process may have left a git lock behind; check every git dir in the store.
-        $rec = Invoke-AmGitLockRecovery -StateRoot $amsSr -GitProcesses (Get-AmGitProcesses) -Trigger 'installer forced stop'
+        $rec = Invoke-AmGitLockRecovery -StateRoot $amsSr -WaitForGrace -Trigger 'installer forced stop'
         foreach ($r in @($rec.removed)) { Write-Host "    removed stale git lock $r (no git process for that repo was alive)" -ForegroundColor Yellow }
         foreach ($k in @($rec.kept)) { Write-Host "    KEPT git lock $($k.path): $($k.reason)" -ForegroundColor Yellow }
         if (@($rec.removed).Count -eq 0 -and @($rec.kept).Count -eq 0) { Write-Host "    no git lock left behind in the store's git dirs" }

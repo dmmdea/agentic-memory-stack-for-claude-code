@@ -78,47 +78,108 @@ Describe 'skipped nights run noon to noon (a retry across local midnight is one 
 
 Describe 'git locks a killed process leaves behind (Invoke-AmGitLockRecovery)' {
     BeforeAll {
-        function script:New-GitDirWithLocks([string]$Name) {
+        function script:New-StoreGitDir([string]$Name, [int]$AgeMinutes = 5) {
+            # a real-shaped git dir: HEAD + objects/ + refs/, and git's own lock names
             $sr = Join-Path $TestDrive $Name
             $gd = Join-Path $sr 'history.git'
-            New-Item -ItemType Directory -Force -Path (Join-Path $gd 'refs\heads') | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $gd 'refs\heads'), (Join-Path $gd 'objects') | Out-Null
             Set-Content -LiteralPath (Join-Path $gd 'HEAD') -Value 'ref: refs/heads/main'
-            Set-Content -LiteralPath (Join-Path $gd 'index.lock') -Value ''
-            Set-Content -LiteralPath (Join-Path $gd 'refs\heads\main.lock') -Value ''
+            foreach ($f in @('index.lock', 'refs\heads\main.lock')) {
+                $p = Join-Path $gd $f
+                Set-Content -LiteralPath $p -Value ''
+                (Get-Item -LiteralPath $p).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-$AgeMinutes)
+            }
             return $sr
         }
+        $script:noGit = { @() }
     }
-    It 'removes every lock when no git process for the repo is alive, and records it' {
-        $sr = script:New-GitDirWithLocks 'gl1'
-        $other = [pscustomobject]@{ ProcessId = 5; CommandLine = 'git.exe --git-dir=D:/elsewhere/.git status' }
-        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GitProcesses @($other) -Trigger 'test'
+    It 'removes git''s lock files when NO git.exe of this user is alive, and records it' {
+        $sr = script:New-StoreGitDir 'gl1'
+        Set-Content -LiteralPath (Join-Path $sr 'history.git\objects\pack-x.lock') -Value ''   # not a git lock name: never touched
+        (Get-Item -LiteralPath (Join-Path $sr 'history.git\objects\pack-x.lock')).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-5)
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses $script:noGit -Trigger 'test'
         @($rec.removed).Count | Should -Be 2
-        @($rec.kept).Count | Should -Be 0
         Test-Path -LiteralPath (Join-Path $sr 'history.git\index.lock') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $sr 'history.git\objects\pack-x.lock') | Should -BeTrue -Because 'only index/HEAD/config/packed-refs/shallow.lock and refs/**/*.lock are git locks'
         $v = Get-AmGitLockVerdict -Record (Read-AmJsonFile -Path (Join-Path $sr 'git-lock-recovery.json'))
         $v.Status | Should -Be 'WARN'
         $v.Detail | Should -Match 'index\.lock'
     }
-    It 'keeps every lock while a git process for that repo is alive (or one whose command line cannot be read)' {
-        $sr = script:New-GitDirWithLocks 'gl2'
-        $gd = Join-Path $sr 'history.git'
-        $mine = [pscustomobject]@{ ProcessId = 6; CommandLine = ('git.exe --git-dir=' + $gd.Replace([string][char]92, '/') + ' commit -q') }
-        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GitProcesses @($mine)
+    It 'keeps every lock while ANY git.exe of this user is alive - whatever its command line says' {
+        $sr = script:New-StoreGitDir 'gl2'
+        # a cwd-only / GIT_DIR-env invocation names no git dir at all; it must still protect the lock
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses { @([pscustomobject]@{ ProcessId = 77; CommandLine = 'git.exe gc --auto' }) }
         @($rec.removed).Count | Should -Be 0
         @($rec.kept).Count | Should -Be 2
-        Test-Path -LiteralPath (Join-Path $gd 'index.lock') | Should -BeTrue
-        (Get-AmGitLockVerdict -Record (Read-AmJsonFile -Path (Join-Path $sr 'git-lock-recovery.json'))).Status | Should -Be 'FAIL'
-        $sr3 = script:New-GitDirWithLocks 'gl3'
-        $blind = [pscustomobject]@{ ProcessId = 7; CommandLine = '' }
-        @((Invoke-AmGitLockRecovery -StateRoot $sr3 -GitProcesses @($blind)).kept).Count | Should -Be 2
+        ($rec.kept[0].reason) | Should -Match '77'
+        Test-Path -LiteralPath (Join-Path $sr 'history.git\index.lock') | Should -BeTrue
     }
-    It 'reports a lock older than 10 minutes as a FAIL (it jams every sync), a fresh one not at all' {
-        $sr = script:New-GitDirWithLocks 'gl4'
+    It 're-queries the git processes before EACH delete (a git that starts mid-sweep keeps the rest)' {
+        $sr = script:New-StoreGitDir 'gl3'
+        $script:q = 0
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses { $script:q++; if ($script:q -ge 2) { @([pscustomobject]@{ ProcessId = 88; CommandLine = 'git.exe commit' }) } else { @() } }
+        @($rec.removed).Count | Should -Be 1 -Because 'the first delete saw no git; the second saw pid 88 start'
+        @($rec.kept).Count | Should -Be 1
+        $script:q | Should -BeGreaterOrEqual 2
+    }
+    It 'leaves a lock younger than the grace alone (a just-started git is not raced), and waits for it when asked' {
+        $sr = script:New-StoreGitDir 'gl4' -AgeMinutes 0
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses $script:noGit
+        @($rec.removed).Count | Should -Be 0
+        $rec.kept[0].reason | Should -Match 'younger than'
+        $script:slept = 0
+        $rec2 = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses $script:noGit -WaitForGrace -NowUtc ([datetime]::UtcNow) `
+            -Sleep { param($ms) $script:slept += $ms; foreach ($l in @(Get-ChildItem -LiteralPath (Join-Path $sr 'history.git') -Recurse -Filter '*.lock')) { $l.LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-3) } }
+        $script:slept | Should -BeGreaterThan 0
+        @($rec2.removed).Count | Should -Be 2
+    }
+    It 'never follows a junction: a git dir or a refs subtree that is a reparse point is skipped' {
+        $sr = script:New-StoreGitDir 'gl5'
+        $outside = script:New-StoreGitDir 'outside-target'
+        $j = Join-Path $sr 'evil.git'
+        New-Item -ItemType Junction -Path $j -Target (Join-Path $outside 'history.git') | Out-Null
+        $j2 = Join-Path $sr 'history.git\refs\linked'
+        New-Item -ItemType Junction -Path $j2 -Target (Join-Path $outside 'history.git\refs\heads') | Out-Null
+        $rec = Invoke-AmGitLockRecovery -StateRoot $sr -GetGitProcesses $script:noGit
+        Test-Path -LiteralPath (Join-Path $outside 'history.git\index.lock') | Should -BeTrue -Because 'a junctioned git dir is never entered'
+        Test-Path -LiteralPath (Join-Path $outside 'history.git\refs\heads\main.lock') | Should -BeTrue -Because 'a junctioned refs subtree is never entered'
+        @($rec.removed | Where-Object { $_ -like '*outside-target*' -or $_ -like '*evil.git*' -or $_ -like '*linked*' }).Count | Should -Be 0
+        @($rec.removed).Count | Should -Be 2
+    }
+    It 'Test-AmPathInsideRoot refuses a path outside the canonical root or through a reparse point' {
+        $sr = script:New-StoreGitDir 'gl6'
+        $outside = script:New-StoreGitDir 'gl6-out'
+        $j = Join-Path $sr 'via'
+        New-Item -ItemType Junction -Path $j -Target $outside | Out-Null
+        Test-AmPathInsideRoot -Path (Join-Path $sr 'history.git\index.lock') -Root $sr | Should -BeTrue
+        Test-AmPathInsideRoot -Path (Join-Path $outside 'history.git\index.lock') -Root $sr | Should -BeFalse
+        Test-AmPathInsideRoot -Path (Join-Path $j 'history.git\index.lock') -Root $sr | Should -BeFalse
+        Test-AmPathInsideRoot -Path (Join-Path $sr '..\gl6-out\history.git\index.lock') -Root $sr | Should -BeFalse
+    }
+    It 'a directory with HEAD but no objects/ or refs/ is not a git dir' {
+        $sr = Join-Path $TestDrive 'gl7'
+        New-Item -ItemType Directory -Force -Path (Join-Path $sr 'fake.git') | Out-Null
+        Set-Content -LiteralPath (Join-Path $sr 'fake.git\HEAD') -Value 'x'
+        Set-Content -LiteralPath (Join-Path $sr 'fake.git\index.lock') -Value ''
+        @(Get-AmStoreGitDirs -StateRoot $sr).Count | Should -Be 0
+    }
+}
+
+Describe 'the git-lock self-test row judges an old lock by whether any git is alive' {
+    It 'old lock and no git alive = FAIL; old lock with a git alive = WARN naming the pid; fresh lock = OK' {
+        $sr = Join-Path $TestDrive 'glv'
+        $gd = Join-Path $sr 'history.git'
+        New-Item -ItemType Directory -Force -Path (Join-Path $gd 'refs'), (Join-Path $gd 'objects') | Out-Null
+        Set-Content -LiteralPath (Join-Path $gd 'HEAD') -Value 'ref: refs/heads/main'
+        Set-Content -LiteralPath (Join-Path $gd 'index.lock') -Value ''
         @(Get-AmStaleGitLocks -StateRoot $sr).Count | Should -Be 0 -Because 'a fresh lock is a sync in progress'
-        (Get-Item -LiteralPath (Join-Path $sr 'history.git\index.lock')).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-30)
+        (Get-AmGitLockVerdict -Record $null -StaleLocks @(Get-AmStaleGitLocks -StateRoot $sr) -GitProcesses @()).Status | Should -Be 'OK'
+        (Get-Item -LiteralPath (Join-Path $gd 'index.lock')).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-30)
         $stale = @(Get-AmStaleGitLocks -StateRoot $sr)
         $stale.Count | Should -Be 1
-        (Get-AmGitLockVerdict -Record $null -StaleLocks $stale).Status | Should -Be 'FAIL'
-        (Get-AmGitLockVerdict -Record $null -StaleLocks @()).Status | Should -Be 'OK'
+        (Get-AmGitLockVerdict -Record $null -StaleLocks $stale -GitProcesses @()).Status | Should -Be 'FAIL'
+        $w = Get-AmGitLockVerdict -Record $null -StaleLocks $stale -GitProcesses @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'git.exe gc' })
+        $w.Status | Should -Be 'WARN' -Because 'a long gc or a slow push holds its lock legitimately'
+        $w.Detail | Should -Match '4242'
     }
 }

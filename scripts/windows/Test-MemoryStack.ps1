@@ -1123,7 +1123,7 @@ try {
         $glSr = Join-Path $env:USERPROFILE '.claude\state\automemory'
         $glRec = $null
         try { $glRec = Read-AmJsonFile -Path (Join-Path $glSr 'git-lock-recovery.json') } catch { $glRec = $null }
-        $glv = Get-AmGitLockVerdict -Record $glRec -StaleLocks @(Get-AmStaleGitLocks -StateRoot $glSr)
+        $glv = Get-AmGitLockVerdict -Record $glRec -StaleLocks @(Get-AmStaleGitLocks -StateRoot $glSr) -GitProcesses @(Get-AmCurrentUserGitProcesses)
         Add-Check 'RECOVERY' 'store history git locks' $glv.Status $glv.Detail
     }
 } catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "probe error: $($_.Exception.Message)" }
