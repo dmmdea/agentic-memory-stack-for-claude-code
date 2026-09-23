@@ -61,9 +61,17 @@ try {
                     if (($ssSource -eq 'compact') -or ($ssSource -eq 'clear')) {
                         $ssTp = $null
                         try { $ssTp = [string]$ssEvent.transcript_path } catch { $ssTp = $null }
-                        [void](Clear-SessionInjectionStateForHook -SessionId $ssSid -TranscriptPath $ssTp)
+                        # each reset outcome (removed / truncated / invalidated / FAILED) is logged by the lib
+                        $ssOutcomes = @(Clear-SessionInjectionStateForHook -SessionId $ssSid -TranscriptPath $ssTp)
                     }
-                } catch {}
+                } catch {
+                    try {
+                        $ssLogDir = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'logs')
+                        if (-not [System.IO.Directory]::Exists($ssLogDir)) { [void][System.IO.Directory]::CreateDirectory($ssLogDir) }
+                        [System.IO.File]::AppendAllText([System.IO.Path]::Combine($ssLogDir, 'user-prompt-extract.log'),
+                            '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] C10 SessionStart reset FAILED: ' + $_.Exception.Message + [System.Environment]::NewLine)
+                    } catch {}
+                }
                 $ssTier = Resolve-ModelTier -Model $ssModel -ConfigPath ([System.IO.Path]::Combine($ssScriptDir, 'model-tiers.json'))
                 if ([string]::IsNullOrWhiteSpace($ssTier)) { $ssTier = 'frontier' }
                 $ssInit = $null
@@ -83,7 +91,16 @@ try {
             }
         }
     }
-} catch {}
+} catch {
+    # C10 review: this block also hosts the compaction reset (it dot-sources the lib), so a failure
+    # here is logged, never swallowed. The daemon spawn below still runs.
+    try {
+        $ssLogDir2 = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'logs')
+        if (-not [System.IO.Directory]::Exists($ssLogDir2)) { [void][System.IO.Directory]::CreateDirectory($ssLogDir2) }
+        [System.IO.File]::AppendAllText([System.IO.Path]::Combine($ssLogDir2, 'user-prompt-extract.log'),
+            '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] SessionStart sidecar/C10 reset block FAILED (no sidecar, no reset): ' + $_.Exception.Message + [System.Environment]::NewLine)
+    } catch {}
+}
 
 # v0.20 Final (adversarial-review HIGH): exe self-heal. settings.json registers
 # UserPromptSubmit at the bare exe path with no fallback command — on a DR

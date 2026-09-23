@@ -112,7 +112,7 @@ A `UserPromptSubmit` event that no person typed: a background task notification,
 
 ## Session Injection State
 
-The per-session record (`~/.claude/state/mem0-injected-<session_id>.json`) of what the per-prompt block has already shown: hashes of the memory lines, plus one hash each for the goals and frontier-questions sections. Both prompt paths read it so a session is not shown the same line twice. PreCompact deletes it (SessionStart `compact` or `clear` repeats the delete as a backstop), because compaction discards the blocks it describes. See [memory-retrieval.md](flows/memory-retrieval.md).
+The per-session record (`~/.claude/state/mem0-injected-<session_id>.json`) of what the per-prompt block has already shown: hashes of the memory lines, plus one hash each for the goals and frontier-questions sections. Both prompt paths read it so a session is not shown the same line twice. PreCompact deletes it (SessionStart `compact` or `clear` repeats the delete as a backstop), because compaction discards the blocks it describes. When the delete fails, the reset overwrites the file with an empty state. When that fails too, it writes a compaction marker (`.compacted`), and the reader ignores any state saved before it. See [memory-retrieval.md](flows/memory-retrieval.md).
 
 ## Open Question
 

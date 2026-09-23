@@ -163,7 +163,17 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
         $script:savedUserProfile = $env:USERPROFILE
         $env:USERPROFILE = $script:sandboxHome
         $script:sid = [guid]::NewGuid().ToString()
+        $script:statePath = Join-Path $script:stateDir "mem0-injected-$($script:sid).json"
+        $script:tpath = "C:\x\agentic-memory-stack\$($script:sid).jsonl"
         Mock Get-Mem0ApiKeyCached { 'k' }
+        # In-process hosts log through Write-Log (the daemon's, routed here). Child hook scripts,
+        # which define no Write-Log, log to the sandbox's user-prompt-extract.log.
+        $script:DaemonLogPath = Join-Path $script:sandboxHome 'daemon.log'
+        function script:Get-DaemonLogText { if (Test-Path $script:DaemonLogPath) { Get-Content -Raw $script:DaemonLogPath } else { '' } }
+        function script:Get-SandboxHookLog {
+            $lp = Join-Path $script:sandboxHome '.claude\logs\user-prompt-extract.log'
+            if (Test-Path $lp) { Get-Content -Raw $lp } else { '' }
+        }
 
         # One substantive prompt through the real raw pipeline. The cooldown token is removed
         # first so a suppressed block can only come from the dedupe, never from the 1s rate
@@ -176,11 +186,11 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
 
         # Copy a production hook script beside the lib into a sandbox scripts dir and run it
         # under Windows PowerShell 5.1 (the production runtime) with the sandboxed profile.
-        function script:Invoke-HookScript([string]$Name, [string]$Stdin, [hashtable]$Stubs = @{}) {
+        function script:Invoke-HookScript([string]$Name, [string]$Stdin, [hashtable]$Stubs = @{}, [switch]$NoLib) {
             $dir = Join-Path $script:sandboxHome ("scripts-{0}" -f ([guid]::NewGuid().ToString('N')))
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
             Copy-Item (Join-Path $script:winDir $Name) $dir
-            Copy-Item (Join-Path $script:winDir 'user-prompt-lib.ps1') $dir
+            if (-not $NoLib) { Copy-Item (Join-Path $script:winDir 'user-prompt-lib.ps1') $dir }
             foreach ($k in $Stubs.Keys) { Set-Content -Path (Join-Path $dir $k) -Value $Stubs[$k] -NoNewline }
             $psi = [System.Diagnostics.ProcessStartInfo]::new()
             $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -256,6 +266,7 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
         $code = Invoke-HookScript -Name 'stop-extract.ps1' -Stdin $pre -Stubs @{ 'l1a-extract.ps1' = 'exit 0' }
         $code | Should -Be 0
         Test-Path (Join-Path $script:stateDir "mem0-injected-$($script:sid).json") | Should -BeFalse
+        (Get-SandboxHookLog) | Should -Match "C10 injection-state: clear session=$($script:sid) outcome=removed"
         $after = Invoke-Prompt
         $after | Should -Match 'alpha fact about the admission gate'
         $after | Should -Match 'Open goals \(1 shown\):'
@@ -270,6 +281,7 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
         $ss = ([ordered]@{ session_id = $script:sid; transcript_path = "C:\x\agentic-memory-stack\$($script:sid).jsonl"; hook_event_name = 'SessionStart'; source = $source; model = 'claude-opus-5-5' } | ConvertTo-Json -Compress)
         $code = Invoke-HookScript -Name 'mem0-hook-daemon-spawn.ps1' -Stdin $ss -Stubs @{ 'mem0-hook-daemon.ps1' = 'exit 0' }
         $code | Should -Be 0
+        (Get-SandboxHookLog) | Should -Match "C10 injection-state: clear session=$($script:sid) outcome=removed"
         $after = Invoke-Prompt
         $after | Should -Match 'alpha fact about the admission gate'
         $after | Should -Match 'Open goals \(1 shown\):'
@@ -289,6 +301,152 @@ Describe 'In-session dedupe (daemon path) and the compaction reset' {
         Mock Invoke-Mem0Post { $bundle }
         Set-Content -Path (Join-Path $script:stateDir "mem0-injected-$($script:sid).json") -Value 'not json {{' -NoNewline
         (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+        # review M4: an unreadable state is logged, distinct from a missing one
+        (Get-DaemonLogText) | Should -Match ('C10 injection-state: state unreadable, read as empty path=.*' + [regex]::Escape("mem0-injected-$($script:sid).json"))
+    }
+
+    It 'review M4: a MISSING state file is the normal first-prompt case and logs nothing' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        (Invoke-Prompt) | Should -Match 'alpha fact'
+        (Get-DaemonLogText) | Should -Not -Match 'unreadable'
+    }
+
+    # --- review CRITICAL 1: a failed compaction reset must never leave content suppressed ------
+
+    It 'review C1: delete fails -> the state is overwritten empty ("truncated"), logged, content re-surfaces' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        Mock Remove-InjectionStateFile { throw 'simulated delete denial' }
+        $out = @(Clear-SessionInjectionStateForHook -SessionId $script:sid -TranscriptPath $script:tpath -StateDir $script:stateDir)
+        $out | Should -Be @('truncated')
+        (Get-DaemonLogText) | Should -Match "clear session=$($script:sid) outcome=truncated .*simulated delete denial"
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+    }
+
+    It 'review C1: delete AND overwrite fail -> a compaction marker invalidates the stale state; logged; content re-surfaces' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        Mock Remove-InjectionStateFile { throw 'simulated delete denial' }
+        Mock Write-InjectionStateFile { if ($Path -like '*.json') { throw 'simulated write denial' } else { [System.IO.File]::WriteAllText($Path, $Text) } }
+        $out = @(Clear-SessionInjectionStateForHook -SessionId $script:sid -TranscriptPath $script:tpath -StateDir $script:stateDir)
+        $out | Should -Be @('invalidated')
+        Test-Path $script:statePath | Should -BeTrue   # the stale file is still on disk...
+        (Get-DaemonLogText) | Should -Match "outcome=invalidated .*simulated delete denial.*simulated write denial"
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'   # ...and is ignored
+    }
+
+    It 'review C1: delete, overwrite AND marker all fail -> outcome FAILED is logged' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        Mock Remove-InjectionStateFile { throw 'simulated delete denial' }
+        Mock Write-InjectionStateFile { throw 'simulated write denial' }
+        $out = @(Clear-SessionInjectionStateForHook -SessionId $script:sid -TranscriptPath $script:tpath -StateDir $script:stateDir)
+        $out | Should -Be @('failed')
+        (Get-DaemonLogText) | Should -Match 'outcome=FAILED'
+    }
+
+    It 'review C1 end to end: a LOCKED state file at PreCompact (real stop-extract.ps1) is invalidated by the marker; logged; content re-surfaces' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        (Invoke-Prompt) | Should -BeNullOrEmpty
+        $pre = ([ordered]@{ session_id = $script:sid; transcript_path = $script:tpath; hook_event_name = 'PreCompact'; trigger = 'auto' } | ConvertTo-Json -Compress)
+        $lock = [System.IO.File]::Open($script:statePath, 'Open', 'ReadWrite', 'None')   # delete + overwrite both fail
+        try {
+            $code = Invoke-HookScript -Name 'stop-extract.ps1' -Stdin $pre -Stubs @{ 'l1a-extract.ps1' = 'exit 0' }
+        } finally { $lock.Dispose() }
+        $code | Should -Be 0
+        (Get-SandboxHookLog) | Should -Match "clear session=$($script:sid) outcome=invalidated"
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+    }
+
+    It 'review C1b: PreCompact with no lib deployed logs that the reset was skipped (no silent no-op)' {
+        $pre = ([ordered]@{ session_id = $script:sid; transcript_path = $script:tpath; hook_event_name = 'PreCompact'; trigger = 'auto' } | ConvertTo-Json -Compress)
+        $code = Invoke-HookScript -Name 'stop-extract.ps1' -Stdin $pre -Stubs @{ 'l1a-extract.ps1' = 'exit 0' } -NoLib
+        $code | Should -Be 0
+        (Get-SandboxHookLog) | Should -Match 'C10 PreCompact reset skipped: user-prompt-lib\.ps1 not found'
+    }
+
+    # --- review CRITICAL 2: a failed save is logged, never swallowed --------------------------
+
+    It 'review C2: a failed save is logged with the path and the exception; the block still renders' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        Mock Write-InjectionStateFile { throw 'simulated disk full' }
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+        $log = Get-DaemonLogText
+        $log | Should -Match ('C10 injection-state: save FAILED path=.*' + [regex]::Escape("mem0-injected-$($script:sid).json") + '.*simulated disk full')
+        $log | Should -Match "session=$($script:sid) state not persisted"
+    }
+
+    # --- review M5: a classifier failure is logged and falls to the human path -------------------
+
+    It 'review M5: a throwing machine-turn classifier is logged by the daemon and the prompt is treated as human' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        Mock Test-MachineTurnPrompt { throw 'classifier boom' }
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+        (Get-DaemonLogText) | Should -Match 'machine-turn classifier failed .*classifier boom'
+    }
+
+    # --- cleanup review (2): the daemon keeps the state in process -------------------------------
+
+    It 'cleanup (2): an unchanged state file is served from the in-process cache, not re-read' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        # Same length, same mtime, garbage bytes: only a re-read could notice.
+        $fi = Get-Item $script:statePath
+        $len = $fi.Length; $t = $fi.LastWriteTimeUtc
+        [System.IO.File]::WriteAllText($script:statePath, ('x' * $len))
+        [System.IO.File]::SetLastWriteTimeUtc($script:statePath, $t)
+        (Invoke-Prompt) | Should -BeNullOrEmpty                       # cached state still dedupes
+        (Get-DaemonLogText) | Should -Not -Match 'unreadable'           # and the file was not parsed
+    }
+
+    It 'cleanup (2): a state file changed by another process is reloaded (the cache never hides a reset)' {
+        $bundle = New-BundleJson
+        Mock Invoke-Mem0Post { $bundle }
+        $null = Invoke-Prompt
+        # another process (the inline path, a reset) rewrites the file: an empty state
+        [System.IO.File]::WriteAllText($script:statePath, '{"v":1,"memories":[],"goals_sig":"","oq_sig":"","ts":"' + [System.DateTime]::UtcNow.Ticks + '"}')
+        (Invoke-Prompt) | Should -Match 'alpha fact about the admission gate'
+    }
+}
+
+Describe 'cleanup (1)/(3): one session-id derivation, one stale-file sweep' {
+
+    It 'Get-TranscriptSessionId: <case>' -ForEach @(
+        @{ case = 'UUID file name';     tp = 'C:\x\p\01234567-89ab-cdef-0123-456789abcdef.jsonl'; want = '01234567-89ab-cdef-0123-456789abcdef' }
+        @{ case = 'non-UUID file name'; tp = 'C:\x\p\weird-name.jsonl';                              want = 'unknown-weird-name' }
+        @{ case = 'no transcript';      tp = '';                                                     want = 'unknown-noop' }
+    ) {
+        Get-TranscriptSessionId -TranscriptPath $tp | Should -Be $want
+    }
+
+    It 'the compaction reset keys a non-UUID transcript exactly like the prompt paths do' {
+        $sd = Join-Path $TestDrive ("st-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $sd -Force | Out-Null
+        $tp = 'C:\x\p\weird-name.jsonl'
+        $null = Format-SessionMemoryContextBlock -Bundle (New-BundleJson | ConvertFrom-Json) -Brand 'ai-ecosystem' -SessionId (Get-TranscriptSessionId -TranscriptPath $tp) -StateDir $sd -AuditPath (Join-Path $sd 'a.jsonl')
+        Test-Path (Join-Path $sd 'mem0-injected-unknown-weird-name.json') | Should -BeTrue
+        @(Clear-SessionInjectionStateForHook -TranscriptPath $tp -StateDir $sd) | Should -Be @('removed')
+    }
+
+    It 'Invoke-RateLimitStateSweep -Filter sweeps old injection state and markers, and nothing else' {
+        $sd = Join-Path $TestDrive ("sw-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $sd -Force | Out-Null
+        $old = [System.DateTime]::Now.AddDays(-8)
+        foreach ($n in 'mem0-injected-a.json', 'mem0-injected-a.compacted', 'user-prompt-rate-limit-x') {
+            Set-Content (Join-Path $sd $n) 'x'; [System.IO.File]::SetLastWriteTime((Join-Path $sd $n), $old)
+        }
+        Set-Content (Join-Path $sd 'mem0-injected-fresh.json') 'x'
+        Invoke-RateLimitStateSweep -StateDir $sd -MaxAgeHours 168 -Filter 'mem0-injected-*'
+        @(Get-ChildItem $sd -Name | Sort-Object) | Should -Be @('mem0-injected-fresh.json', 'user-prompt-rate-limit-x')
     }
 }
 

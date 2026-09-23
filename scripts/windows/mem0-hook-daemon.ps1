@@ -84,6 +84,10 @@ function ConvertTo-DaemonB64 {
 # 25-prompt re-inject standing in for a compaction signal) is superseded by C10 (2026-09-22):
 # Format-SessionMemoryContextBlock in the lib dedupes memories AND sections for both prompt
 # paths from one per-session state file, reset by the real compaction hooks.
+# The daemon keeps that state IN PROCESS (as HK-5 did) so a warm prompt pays no file read: the
+# file stays the persistence and the cross-process source, and any change to it (the inline path
+# writing, a compaction reset deleting, a marker appearing) changes its stamp and forces a reload.
+$script:InjectionStateCache = @{}
 
 function Invoke-DaemonRawBundle {
     <#
@@ -134,18 +138,10 @@ function Invoke-DaemonRawBundle {
     if ($hookEvent.hook_event_name -ne 'UserPromptSubmit') { return $resp }
     if (-not $prompt) { return $resp }
 
-    # --- mirror §2: session_id from transcript filename
-    $sessionId = $null
-    if ($transcriptPath) {
-        $basename = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
-        if ($basename -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $sessionId = $basename }
-    }
-    if (-not $sessionId) {
-        $fnwe = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
-        if (-not $fnwe) { $fnwe = 'noop' }
-        $sessionId = "unknown-$fnwe"
-        Write-DaemonLog 'WARN: session_id fallback used (non-UUID transcript filename)'
-    }
+    # --- mirror §2: session_id from transcript filename (C10 cleanup: the ONE lib derivation the
+    # compaction reset also keys by)
+    $sessionId = Get-TranscriptSessionId -TranscriptPath ([string]$transcriptPath)
+    if ($sessionId -like 'unknown-*') { Write-DaemonLog 'WARN: session_id fallback used (non-UUID transcript filename)' }
 
     # --- mirror §3: brand inference (lib; $null = fail-closed downstream)
     $brand = $null
@@ -212,7 +208,10 @@ function Invoke-DaemonRawBundle {
     # task notification keeps its checkpoint and gets no block: it takes the checkpoint-only
     # branch below, exactly like a trivial prompt, and never consumes the surfacing cooldown.
     $isMachineTurn = $false
-    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt ([string]$prompt)) } catch { $isMachineTurn = $false }
+    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt ([string]$prompt)) } catch {
+        $isMachineTurn = $false
+        Write-DaemonLog "0.D machine-turn classifier failed ($($_.Exception.Message)); treating the prompt as human"
+    }
 
     # --- mirror §4: per-session rate limit (1s cooldown, fail-open, stale sweep)
     # v0.20 Phase F (L9): same lib functions as the inline path (parity by
@@ -266,7 +265,7 @@ function Invoke-DaemonRawBundle {
                 # v0.22 D: render per tier (resolved above from sidecar/transcript).
                 # frontier/mid = full format; small = flat + legend. Fail-open frontier.
                 # C10: session-deduped (memories + goals/OQ sections), same state file as the inline path.
-                $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir
+                $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir -Cache $script:InjectionStateCache
                 $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
                 $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
                 if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
@@ -390,10 +389,12 @@ function Invoke-DaemonRequest {
         # incl. client-side admission Layers 1/2/3 + the same rejected-candidate
         # audit file defaults. Tier-aware (v1.0 R2), fail-open frontier.
         # C10: a machine-turn prompt renders nothing (the server already returns empty sections for
-        # it; this is the client-side belt), and every other prompt renders session-deduped.
+        # it; this is the client-side belt), and every other prompt renders session-deduped with
+        # the SAME -StateDir / -Cache wiring as op=bundle_raw (pinned by RegressionGuards).
         $contextBlock = $null
+        $reqStateDir = $env:USERPROFILE + '\.claude\state'   # = Invoke-DaemonRawBundle's -StateDir default
         if (-not (Test-MachineTurnPrompt -Prompt ([string]$Req.prompt))) {
-            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource -SessionId ([string]$Req.session_id)
+            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource -SessionId ([string]$Req.session_id) -StateDir $reqStateDir -Cache $script:InjectionStateCache
         }
 
         $diag = @{

@@ -500,7 +500,15 @@ Describe 'Daemon protocol dispatch (Invoke-DaemonRequest via -DefineOnly)' {
     BeforeEach {
         $script:LibHash = 'test-lib-hash'
         $script:BaseUrl = 'http://127.0.0.1:1'   # never reached: Invoke-Mem0Post is mocked
+        # C10: op=bundle now reads and writes the session's injection state under
+        # $env:USERPROFILE\.claude\state. Sandbox it per test (a shared session id 's1' would
+        # otherwise dedupe across tests AND write into the operator's live state).
+        $script:sandboxHome = Join-Path $TestDrive ("dispatch-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path (Join-Path $script:sandboxHome '.claude\state') -Force | Out-Null
+        $script:savedUserProfile = $env:USERPROFILE
+        $env:USERPROFILE = $script:sandboxHome
     }
+    AfterEach { if ($null -ne $script:savedUserProfile) { $env:USERPROFILE = $script:savedUserProfile } }
 
     It 'ping -> ok + lib_hash (handshake probe)' {
         $r = Invoke-DaemonRequest -Req ([pscustomobject]@{ op = 'ping' })
@@ -537,6 +545,8 @@ Describe 'Daemon protocol dispatch (Invoke-DaemonRequest via -DefineOnly)' {
         $r.diag.episode_id | Should -Be 42
         $r.diag.action | Should -Be 'updated'
         $r.diag.memories | Should -Be 1
+        # positive control for the sandbox: the session state landed INSIDE it, not in ~\.claude\state
+        Test-Path (Join-Path $script:sandboxHome '.claude\state\mem0-injected-s1.json') | Should -BeTrue
     }
 
     It 'v1.0 R2: op=bundle forwards the client tier + renders tier-aware (small legend)' {

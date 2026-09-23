@@ -902,12 +902,55 @@ function Format-MemoryContextBlock {
 # One small state file per session in ~\.claude\state (the rate-limit token's directory), read and
 # written by BOTH prompt paths (resident daemon and inline fallback) through the functions below.
 # It holds 16-hex hashes only, never memory text: the keys of the memory lines this session was
-# shown, plus one hash each for the goals and the frontier-questions sections. A compaction
-# deletes it: PreCompact (stop-extract.ps1, synchronous) and SessionStart source=compact or clear
-# (mem0-hook-daemon-spawn.ps1, the backstop) both call Clear-SessionInjectionStateForHook.
-# Every failure fails OPEN: an unreadable state reads as empty (the full block renders, as before
-# C10), and a failed write means the next prompt repeats, as before C10. Never throws.
+# shown, one hash each for the goals and the frontier-questions sections, and the save time.
+# A compaction resets it: PreCompact (stop-extract.ps1, synchronous) and SessionStart
+# source=compact or clear (mem0-hook-daemon-spawn.ps1, the backstop) both call
+# Clear-SessionInjectionStateForHook.
+#
+# NOTHING HERE MAY FAIL SILENTLY, and no failure may suppress content (C10 review):
+#   - a reset that cannot delete the file overwrites it with an empty state; if that fails too it
+#     writes a compaction MARKER beside it (mem0-injected-<sid>.compacted) and the reader ignores
+#     any state saved before the marker; every outcome is logged, including total failure;
+#   - an unreadable state reads as empty (the full block renders) and is logged;
+#   - a failed save is logged with its path and exception.
+# Log sink (Write-InjectionStateLog): the host's Write-Log when it has one (the daemon routes it to
+# ~\.mem0\hook-daemon.log, the inline hook to ~\.claude\logs\user-prompt-extract.log), otherwise
+# ~\.claude\logs\user-prompt-extract.log directly (the PreCompact / SessionStart hooks).
 # ===========================================================================
+
+function Write-InjectionStateLog {
+    # One line, prefixed 'C10 injection-state: '. Paths and exception text only, never content.
+    param([string]$Msg)
+    $line = 'C10 injection-state: ' + $Msg
+    try {
+        if ($null -ne $ExecutionContext.SessionState.InvokeCommand.GetCommand('Write-Log', 'Function')) { Write-Log $line; return }
+        $dir = [System.IO.Path]::Combine((Get-AmsHomeDir), '.claude', 'logs')
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        [System.IO.File]::AppendAllText([System.IO.Path]::Combine($dir, 'user-prompt-extract.log'),
+            '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] ' + $line + [System.Environment]::NewLine)
+    } catch {}
+}
+
+# The two file operations behind every state write and delete. Separate functions so Pester can
+# make each one fail on its own (the reset's fallback chain) without touching the real file system.
+function Remove-InjectionStateFile { param([string]$Path) [System.IO.File]::Delete($Path) }
+function Write-InjectionStateFile { param([string]$Path, [string]$Text) [System.IO.File]::WriteAllText($Path, $Text) }
+
+function Get-TranscriptSessionId {
+    <#
+    .SYNOPSIS
+    The ONE transcript -> session-id derivation (C10 cleanup): the transcript's file name when it is
+    a UUID, else 'unknown-<file name>' ('unknown-noop' with no path). The daemon, the inline hook and
+    the compaction reset all key the injection state through this, so a reset can never look for
+    the file under a different name than the prompt paths wrote it under. Never throws.
+    #>
+    param([string]$TranscriptPath)
+    $bn = $null
+    try { if ($TranscriptPath) { $bn = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath) } } catch { $bn = $null }
+    if ($bn -and ($bn -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) { return $bn }
+    if (-not $bn) { $bn = 'noop' }
+    return 'unknown-' + $bn
+}
 
 function Get-InjectionLineKey {
     # 16 lowercase hex chars of SHA256(text): the dedupe key of one rendered line or section.
@@ -926,6 +969,29 @@ function Get-SessionInjectionStatePath {
     return [System.IO.Path]::Combine($StateDir, 'mem0-injected-' + $safe + '.json')
 }
 
+function Get-SessionInjectionMarkerPath {
+    # The compaction marker beside a state file: its content is the UTC ticks of the reset.
+    param([string]$StatePath)
+    return ($StatePath -replace '\.json$', '.compacted')
+}
+
+function Get-InjectionStateStamp {
+    # Cheap change detector for the daemon's in-process cache: the state file's mtime + length and
+    # the marker's mtime. A delete, an overwrite by another process or a new marker all change it.
+    param([string]$StatePath)
+    $s = 'absent'
+    try {
+        if ([System.IO.File]::Exists($StatePath)) {
+            $fi = [System.IO.FileInfo]::new($StatePath)
+            $s = [string]$fi.LastWriteTimeUtc.Ticks + ':' + [string]$fi.Length
+        }
+        $mp = Get-SessionInjectionMarkerPath -StatePath $StatePath
+        $m = 'none'
+        if ([System.IO.File]::Exists($mp)) { $m = [string][System.IO.File]::GetLastWriteTimeUtc($mp).Ticks }
+        return $s + '|' + $m
+    } catch { return 'unstampable-' + [guid]::NewGuid().ToString('N') }   # never a false cache hit
+}
+
 function New-SessionInjectionState {
     param([string]$Path)
     return @{
@@ -938,21 +1004,56 @@ function New-SessionInjectionState {
     }
 }
 
+function ConvertTo-InjectionStateJson {
+    param($State, [int]$MaxKeys = 500)
+    $keys = @()
+    if ($null -ne $State) {
+        $keys = @($State.MemoryOrder.ToArray())
+        if ($keys.Count -gt $MaxKeys) { $keys = @($keys[($keys.Count - $MaxKeys)..($keys.Count - 1)]) }
+    }
+    $gs = ''; $os = ''
+    if ($null -ne $State) { $gs = [string]$State.GoalsSig; $os = [string]$State.OqSig }
+    return ConvertTo-HookJson @{ v = 1; memories = [string[]]$keys; goals_sig = $gs; oq_sig = $os; ts = [string][System.DateTime]::UtcNow.Ticks }
+}
+
 function Read-SessionInjectionState {
     <#
     .SYNOPSIS
     C10: this session's injection state as a hashtable (Path, Memories, MemoryOrder, GoalsSig,
-    OqSig, Dirty), or $null when there is no session id (then the render does no dedupe). A
-    missing, unreadable or corrupt file reads as an EMPTY state: fail open, the full block renders.
+    OqSig, Dirty), or $null when there is no session id (then the render does no dedupe).
+    .DESCRIPTION
+    A MISSING file is the normal first prompt of a session: an empty state, no log. An UNREADABLE or
+    corrupt file reads as empty (fail open: the full block renders) and is logged. A state saved
+    before the session's compaction marker is ignored: that is the reset's last fallback when the
+    stale file could be neither deleted nor overwritten. -Cache (the resident daemon's per-process
+    hashtable) serves an unchanged file without re-reading it; any change on disk reloads.
     #>
-    param([string]$SessionId, [string]$StateDir)
+    param([string]$SessionId, [string]$StateDir, [hashtable]$Cache)
     $path = Get-SessionInjectionStatePath -SessionId $SessionId -StateDir $StateDir
     if (-not $path) { return $null }
+    $stamp = $null
+    if ($null -ne $Cache) {
+        $stamp = Get-InjectionStateStamp -StatePath $path
+        $hit = $Cache[$path]
+        if (($null -ne $hit) -and ($hit.Stamp -eq $stamp)) { $hit.State.Dirty = $false; return $hit.State }
+    }
     $state = New-SessionInjectionState -Path $path
     try {
         if ([System.IO.File]::Exists($path)) {
             $o = ConvertFrom-HookJson ([System.IO.File]::ReadAllText($path))
-            if ($null -ne $o) {
+            if ($null -eq $o) { throw 'empty or null JSON document' }
+            $savedTicks = [int64]0
+            [void][int64]::TryParse([string]$o.ts, [ref]$savedTicks)
+            $markerTicks = [int64]-1
+            $mp = Get-SessionInjectionMarkerPath -StatePath $path
+            if ([System.IO.File]::Exists($mp)) {
+                $mt = [int64]0
+                if ([int64]::TryParse(([System.IO.File]::ReadAllText($mp)).Trim(), [ref]$mt)) { $markerTicks = $mt }
+                else { $markerTicks = [System.IO.File]::GetLastWriteTimeUtc($mp).Ticks }
+            }
+            if (($markerTicks -ge 0) -and ($savedTicks -le $markerTicks)) {
+                Write-InjectionStateLog "state predates the compaction marker, ignored path=$path"
+            } else {
                 foreach ($k in @($o.memories)) {
                     $ks = [string]$k
                     if ($ks -and $state.Memories.Add($ks)) { $state.MemoryOrder.Add($ks) }
@@ -962,8 +1063,10 @@ function Read-SessionInjectionState {
             }
         }
     } catch {
+        Write-InjectionStateLog "state unreadable, read as empty path=${path}: $($_.Exception.Message)"
         $state = New-SessionInjectionState -Path $path
     }
+    if ($null -ne $Cache) { $Cache[$path] = @{ Stamp = $stamp; State = $state } }
     return $state
 }
 
@@ -971,61 +1074,80 @@ function Save-SessionInjectionState {
     <#
     .SYNOPSIS
     C10: persist a session's injection state (newest -MaxKeys memory keys kept) and sweep state
-    files older than -SweepAgeDays. Returns $true on success. Never throws.
+    files and markers older than -SweepAgeDays. Returns $true on success; a failure is LOGGED with
+    the path and the exception and returns $false. Never throws.
     #>
     param($State, [int]$MaxKeys = 500, [int]$SweepAgeDays = 7)
     if (($null -eq $State) -or (-not $State.Path)) { return $false }
+    $path = [string]$State.Path
     try {
-        $dir = [System.IO.Path]::GetDirectoryName([string]$State.Path)
+        $dir = [System.IO.Path]::GetDirectoryName($path)
         if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
-        $keys = @($State.MemoryOrder.ToArray())
-        if ($keys.Count -gt $MaxKeys) { $keys = @($keys[($keys.Count - $MaxKeys)..($keys.Count - 1)]) }
-        $json = ConvertTo-HookJson @{ v = 1; memories = [string[]]$keys; goals_sig = [string]$State.GoalsSig; oq_sig = [string]$State.OqSig }
-        [System.IO.File]::WriteAllText([string]$State.Path, $json)
+        Write-InjectionStateFile -Path $path -Text (ConvertTo-InjectionStateJson -State $State -MaxKeys $MaxKeys)
         $State.Dirty = $false
-        try {
-            $cutoff = [System.DateTime]::Now.AddDays(-$SweepAgeDays)
-            foreach ($f in [System.IO.Directory]::GetFiles($dir, 'mem0-injected-*.json')) {
-                if ([System.IO.File]::GetLastWriteTime($f) -lt $cutoff) { try { [System.IO.File]::Delete($f) } catch {} }
-            }
-        } catch {}
+        Invoke-RateLimitStateSweep -StateDir $dir -MaxAgeHours ($SweepAgeDays * 24) -Filter 'mem0-injected-*'
         return $true
-    } catch { return $false }
+    } catch {
+        Write-InjectionStateLog "save FAILED path=${path}: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Clear-SessionInjectionState {
-    # C10: delete one session's injection state. $true when a file was removed. Never throws.
+    <#
+    .SYNOPSIS
+    C10: reset one session's injection state after a compaction. Returns the outcome, which is also
+    logged: 'absent' (nothing to reset), 'removed', 'truncated' (delete failed; overwritten with an
+    empty state), 'invalidated' (delete and overwrite failed; the compaction marker makes the stale
+    file ignored), 'failed' (all three failed), or 'no-session'. Never throws. A failed delete must
+    never leave content suppressed, hence the fallback chain.
+    #>
     param([string]$SessionId, [string]$StateDir)
     $path = Get-SessionInjectionStatePath -SessionId $SessionId -StateDir $StateDir
-    if (-not $path) { return $false }
+    if (-not $path) { return 'no-session' }
+    $tag = "clear session=$SessionId"
+    if (-not [System.IO.File]::Exists($path)) {
+        Write-InjectionStateLog "$tag outcome=absent path=$path"
+        return 'absent'
+    }
+    $e1 = $null; $e2 = $null; $e3 = $null
     try {
-        if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path); return $true }
-    } catch {}
-    return $false
+        Remove-InjectionStateFile -Path $path
+        Write-InjectionStateLog "$tag outcome=removed path=$path"
+        return 'removed'
+    } catch { $e1 = $_.Exception.Message }
+    try {
+        Write-InjectionStateFile -Path $path -Text (ConvertTo-InjectionStateJson -State $null)
+        Write-InjectionStateLog "$tag outcome=truncated path=$path (delete failed: $e1)"
+        return 'truncated'
+    } catch { $e2 = $_.Exception.Message }
+    $marker = Get-SessionInjectionMarkerPath -StatePath $path
+    try {
+        Write-InjectionStateFile -Path $marker -Text ([string][System.DateTime]::UtcNow.Ticks)
+        Write-InjectionStateLog "$tag outcome=invalidated marker=$marker (delete failed: $e1; overwrite failed: $e2)"
+        return 'invalidated'
+    } catch { $e3 = $_.Exception.Message }
+    Write-InjectionStateLog "$tag outcome=FAILED path=$path (delete: $e1; overwrite: $e2; marker: $e3) - memories shown before the compaction stay deduped until the file is writable"
+    return 'failed'
 }
 
 function Clear-SessionInjectionStateForHook {
     <#
     .SYNOPSIS
     C10: the compaction reset, called by the PreCompact dispatcher (stop-extract.ps1) and by the
-    SessionStart launcher on source=compact or clear (mem0-hook-daemon-spawn.ps1). It clears the state under
-    every id a prompt path could have keyed it by: the transcript-derived id (the prompt paths'
-    own derivation — the UUID file name, else 'unknown-<name>') and the payload session_id.
-    Returns the number of files removed. Never throws.
+    SessionStart launcher on source=compact or clear (mem0-hook-daemon-spawn.ps1). It resets the
+    state under every id a prompt path could have keyed it by: Get-TranscriptSessionId of the
+    transcript (what the prompt paths use) and the payload session_id. Returns the outcome of each
+    reset (see Clear-SessionInjectionState); each outcome is logged there. Never throws.
     #>
     param([string]$SessionId, [string]$TranscriptPath, [string]$StateDir)
     $ids = [System.Collections.Generic.List[string]]::new()
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
-            $bn = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
-            if ($bn -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $ids.Add($bn) }
-            elseif ($bn) { $ids.Add('unknown-' + $bn) }
-        }
-    } catch {}
+    if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) { $ids.Add((Get-TranscriptSessionId -TranscriptPath $TranscriptPath)) }
     if ((-not [string]::IsNullOrWhiteSpace($SessionId)) -and (-not $ids.Contains($SessionId))) { $ids.Add($SessionId) }
-    $n = 0
-    foreach ($id in $ids) { if (Clear-SessionInjectionState -SessionId $id -StateDir $StateDir) { $n++ } }
-    return $n
+    if ($ids.Count -eq 0) { Write-InjectionStateLog 'clear skipped: the hook payload carries no session_id or transcript_path' }
+    $outcomes = @()
+    foreach ($id in $ids) { $outcomes += (Clear-SessionInjectionState -SessionId $id -StateDir $StateDir) }
+    return $outcomes
 }
 
 function Format-SessionMemoryContextBlock {
@@ -1034,7 +1156,7 @@ function Format-SessionMemoryContextBlock {
     C10: Format-MemoryContextBlock with in-session dedupe. It reads the session's injection state,
     renders with it, and persists what the returned block showed. The one render entry point of
     both prompt paths (daemon op=bundle_raw and op=bundle, inline fallback). With no -SessionId
-    the render is the exact pre-C10 one.
+    the render is the exact pre-C10 one. -Cache is the resident daemon's in-process state cache.
     #>
     param(
         $Bundle,
@@ -1043,12 +1165,24 @@ function Format-SessionMemoryContextBlock {
         [string]$Tier = 'frontier',
         [string]$Source = '',
         [string]$SessionId,
-        [string]$StateDir
+        [string]$StateDir,
+        [hashtable]$Cache
     )
     $state = $null
-    try { $state = Read-SessionInjectionState -SessionId $SessionId -StateDir $StateDir } catch { $state = $null }
+    try { $state = Read-SessionInjectionState -SessionId $SessionId -StateDir $StateDir -Cache $Cache } catch {
+        Write-InjectionStateLog "session=$SessionId state read threw, dedupe off for this prompt: $($_.Exception.Message)"
+        $state = $null
+    }
     $block = Format-MemoryContextBlock -Bundle $Bundle -Brand $Brand -AuditPath $AuditPath -Tier $Tier -Source $Source -SessionState $state
-    if ($block -and ($null -ne $state) -and $state.Dirty) { [void](Save-SessionInjectionState -State $state) }
+    if ($block -and ($null -ne $state) -and $state.Dirty) {
+        $saved = Save-SessionInjectionState -State $state
+        if (-not $saved) {
+            Write-InjectionStateLog "session=$SessionId state not persisted; the next prompt may repeat this block"
+        } elseif ($null -ne $Cache) {
+            if ($Cache.Count -gt 256) { $Cache.Clear() }   # bounded: a daemon lives at most 2 h idle
+            $Cache[[string]$state.Path] = @{ Stamp = (Get-InjectionStateStamp -StatePath ([string]$state.Path)); State = $state }
+        }
+    }
     return $block
 }
 
@@ -1228,10 +1362,12 @@ function Invoke-RateLimitStateSweep {
     including the legacy global 'user-prompt-rate-limit' file (the prefix match
     covers it). Fresh files are spared. Never throws.
     #>
-    param([string]$StateDir, [int]$MaxAgeHours = 1)
+    # C10 cleanup: -Filter lets the injection-state save reuse this sweep ('mem0-injected-*');
+    # the default keeps the rate-limit behavior byte-for-byte.
+    param([string]$StateDir, [int]$MaxAgeHours = 1, [string]$Filter = 'user-prompt-rate-limit*')
     try {
         $cutoff = [System.DateTime]::Now.AddHours(-$MaxAgeHours)
-        foreach ($sf in [System.IO.Directory]::GetFiles($StateDir, 'user-prompt-rate-limit*')) {
+        foreach ($sf in [System.IO.Directory]::GetFiles($StateDir, $Filter)) {
             if ([System.IO.File]::GetLastWriteTime($sf) -lt $cutoff) {
                 try { [System.IO.File]::Delete($sf) } catch {}
             }

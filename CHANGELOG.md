@@ -43,6 +43,25 @@ keeps the state, because a resumed context still holds its blocks. An unreadable
 open to the full block. This replaces HK-5, the daemon-only goals/questions blanking with a
 fixed 25-prompt re-inject; the inline path used to repeat those sections on every prompt.
 
+**No silent failure, and no failure that suppresses content** (review round). A reset that
+cannot delete the state overwrites it with an empty state. If that fails too, it writes a
+compaction marker (`mem0-injected-<session_id>.compacted`), and the reader ignores any state
+saved before it. Every reset outcome (`absent`, `removed`, `truncated`, `invalidated`, `FAILED`)
+is logged. So are an unreadable state, a failed save (with its path and exception), a missing
+lib at PreCompact and a classifier that throws. Lines start with `C10 injection-state:` and go
+to `~/.claude/logs/user-prompt-extract.log`, or `~/.mem0/hook-daemon.log` inside the daemon.
+Other changes in this round:
+- The daemon keeps each session's state in memory and reloads it when the file or the marker
+  changes, so a warm prompt pays no file read, as with HK-5.
+- One helper, `Get-TranscriptSessionId`, keys the state on every path.
+- The injection-state sweep reuses `Invoke-RateLimitStateSweep -Filter`.
+- Both daemon render sites pass the same `-StateDir` and `-Cache` (pinned).
+- The compiled client's scan is now depth-aware: only the top-level `prompt` counts. It skips
+  leading whitespace with no length cap and reads truncated stdin as human.
+- The client gates only the daemon-served path. It logs any block it withholds, with its byte
+  count, and relays the inline fallback's output unchanged, because that child already decided
+  with a real JSON parse.
+
 **Unchanged on purpose:** `memory_cap`, `goal_cap`, `oq_cap`, the 0.30 relevance threshold,
 R2 abstention, the R6 placement, and the render itself. Dedupe only removes lines before the
 unchanged line builders run, so an emitted block is byte-identical to the pre-change render of

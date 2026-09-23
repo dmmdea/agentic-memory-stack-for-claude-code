@@ -334,6 +334,13 @@ if ($script:DaemonServedBundle) {
     # v0.20 A.5: the daemon already extracted it from the same transcript path
     $sessionId = $fastSession
 }
+if ((-not $sessionId) -and (Test-FunctionAvailable 'Get-TranscriptSessionId')) {
+    # C10 cleanup: the ONE lib derivation, shared with the daemon and the compaction reset, so the
+    # injection-state file is always keyed the same way. The inline copy below only serves a
+    # missing-lib deploy, where no state file is ever read or written.
+    $sessionId = Get-TranscriptSessionId -TranscriptPath ([string]$transcriptPath)
+    if ($sessionId -like 'unknown-*') { Write-Log "WARN: could not extract UUID session_id from path '$transcriptPath', using '$sessionId'" }
+}
 if ((-not $sessionId) -and $transcriptPath) {
     $basename = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
     # Transcript filename is the session UUID (e.g. a71c302b-ecb7-413c-874f-aacd5955e3c5)
@@ -429,7 +436,7 @@ if ($prompt -and $prompt.Length -gt 5) {
 # as the daemon; with no lib there is no renderer either, so nothing could be emitted anyway.
 $isMachineTurn = $false
 if (Test-FunctionAvailable 'Test-MachineTurnPrompt') {
-    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt $prompt) } catch { $isMachineTurn = $false }
+    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt $prompt) } catch { $isMachineTurn = $false; Write-Log "0.D machine-turn classifier failed ($($_.Exception.Message)); treating the prompt as human" }
 }
 
 # v0.18 MED-16: proactive-search rate-limit (1s cooldown via state file).
