@@ -13,6 +13,9 @@
 #   4. import-smoke the server IN ITS VENV — refuses to restart on failure
 #   5. restart mem0.service, wait for /health, assert /health/deep ok:true
 #
+# Hosts: WSL brains and replicas. A native Linux authority (stack.env MEM0_HOST_KIND=native)
+#        is refused before any write; its deploy is a re-run of install/linux-authority.sh.
+#
 # Usage:  bash deploy.sh [--dry-run]
 # Rollback: previous module bytes are in the stack backup (~/.mem0/backups/) and git;
 #           `git checkout <last-good> && bash deploy.sh` is the restore path.
@@ -40,6 +43,29 @@ DISTRO="${MEM0_DISTRO:-${MEM0_WSL_DISTRO:-Ubuntu}}"
 case "${MEM0_BIND:-}" in
     ""|0.0.0.0) MEM0_HEALTH_URL="http://127.0.0.1:18791" ;;
     *)          MEM0_HEALTH_URL="http://${MEM0_BIND}:18791" ;;
+esac
+
+# --- -1. host-kind gate (1.31.2): this is the WSL deploy path; a native authority is refused ---
+# A native Linux authority (stack.env MEM0_HOST_KIND=native, written by install/linux-authority.sh)
+# needs sentinels, drop-ins and a unit set this script does not render: run here it wrote the ams-*
+# units with a literal __SECRETS_DIR__ (every step unit's credentials broken), put the WSL DPAPI
+# ExecStartPre back into mem0.service, and laid the WSL per-job timers beside the one nightly chain.
+# Its --dry-run passed and listed that damage as "unit CHANGED". The native path is a re-run of the
+# installer, which inherits every other flag from stack.env. Refused here, before any write and on
+# --dry-run too, so nothing below this line ever runs on a native box.
+case "$(printf '%s' "${MEM0_HOST_KIND:-}" | tr '[:upper:]' '[:lower:]')" in
+    native)
+        {
+            echo "==> REFUSED: this box is a native Linux authority (~/.mem0/stack.env MEM0_HOST_KIND=native)."
+            echo "    scripts/wsl/deploy.sh is the WSL deploy path; it cannot render this box's units"
+            echo "    (__SECRETS_DIR__, the native mem0.service drop-in, the single ams-nightly chain)."
+            echo "    Deploy by re-running the native installer from this checkout (every other flag"
+            echo "    is inherited from stack.env; add --dry-run first to preview):"
+            echo "      bash $REPO_ROOT/install/linux-authority.sh --bind-ip ${MEM0_BIND:-<tailnet ipv4>} --secrets-dir ${MEM0_SECRETS_DIR:-<dir with the .cred files>}"
+            echo "==> DEPLOY ABORTED before writing anything."
+        } >&2
+        exit 5
+        ;;
 esac
 
 echo "==> deploy: $REPO_ROOT -> live runtime ${DRY:+(DRY RUN)}"
@@ -165,12 +191,12 @@ fi
 # --- 3. systemd units (same sentinel resolution as the installer) ---
 # The ams-* units (the native authority's chain, its nft belt) carry LoadCredentialEncrypted lines and
 # __SECRETS_DIR__ sentinels only install/linux-authority.sh resolves; on a WSL brain or replica they
-# are not part of the install (1-wsl-services.sh keeps a fixed list) and must not land here.
-HOST_KIND="${MEM0_HOST_KIND:-wsl}"
+# are not part of the install (1-wsl-services.sh keeps a fixed list) and must not land here. The one
+# host that owns them (native) is refused by the gate at the top, so they are skipped unconditionally.
 for src in "$REPO_ROOT"/systemd/*.service "$REPO_ROOT"/systemd/*.timer; do
     [ -f "$src" ] || continue
     unit="$(basename "$src")"
-    case "$unit" in ams-*) [ "$HOST_KIND" = "native" ] || continue ;; esac
+    case "$unit" in ams-*) continue ;; esac
     resolved="$(sed -e "s|__WSL_USER__|$WSL_USER|g" \
                     -e "s|__WIN_USER__|$WIN_USER|g" \
                     -e "s|__WSL_DISTRO__|$DISTRO|g" \

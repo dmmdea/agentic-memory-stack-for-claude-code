@@ -284,7 +284,8 @@ def test_health_deep_reports_bound_collection():
 def test_deploy_skips_the_native_chain_units_on_a_wsl_host():
     """deploy.sh installs systemd/*.service|*.timer with the WSL sentinels only; the ams-* units of the
     native authority carry __SECRETS_DIR__ / LoadCredentialEncrypted lines and belong to
-    install/linux-authority.sh. A WSL brain or replica must never receive them."""
+    install/linux-authority.sh. A WSL brain or replica must never receive them. Since 1.31.2 the
+    native host is refused before the loop (test_deploy_host_kind.py), so the skip is unconditional."""
     text = (REPO_ROOT / "scripts" / "wsl" / "deploy.sh").read_text(encoding="utf-8")
-    assert 'case "$unit" in ams-*)' in text and '[ "$HOST_KIND" = "native" ] || continue' in text
-    assert text.index('HOST_KIND="${MEM0_HOST_KIND:-wsl}"') < text.index('for src in "$REPO_ROOT"/systemd/*.service')
+    assert 'case "$unit" in ams-*) continue ;; esac' in text
+    assert text.index('MEM0_HOST_KIND:-}') < text.index('for src in "$REPO_ROOT"/systemd/*.service')

@@ -122,6 +122,7 @@ jobs:
             mem0-server/tests/test_linux_client_installer.py \
             mem0-server/tests/test_linux_replica.py \
             mem0-server/tests/test_stack_env_writers.py \
+            mem0-server/tests/test_deploy_host_kind.py \
             mem0-server/tests/test_w7_server_smalls.py \
             claude-config/tests \
             scripts/wsl/test_ship_log_classifier.py \
