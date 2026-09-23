@@ -130,7 +130,8 @@ def evaluate_sparse_leg(fastembed_present, bm25_slot, points, with_bm25,
             out["ok"] = False
             out["cache_note"] = (
                 "durable fastembed cache UNPOPULATED — the leg dies at the "
-                "next reboot; run deploy.sh (seed step) or the installer"
+                "next reboot; run deploy.sh (seed step; WSL hosts) or the "
+                "installer (install/linux-authority.sh on a native authority)"
             )
     return out
 

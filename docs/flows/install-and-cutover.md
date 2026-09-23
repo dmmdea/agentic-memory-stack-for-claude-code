@@ -12,7 +12,7 @@ The through-line is that **the code is reinstalled, never transported.** The ins
 |---|---|
 | **Fresh install** | An operator runs `install.ps1` on a new Windows + WSL2 box for the first time. |
 | **Re-install / upgrade** | `git pull` (or `git checkout <ref>`) followed by re-running `install.ps1` to pick up changed hook scripts, tasks, or registrations. |
-| **Deploy (server-side change)** | `deploy.sh` inside WSL — the ongoing path for pushing changed server modules and maintenance scripts into the running runtime between full re-installs. |
+| **Deploy (server-side change)** | `deploy.sh` inside WSL — the ongoing path for pushing changed server modules and maintenance scripts into the running runtime between full re-installs. WSL brains and replicas only: on a native Linux authority (`stack.env` `MEM0_HOST_KIND=native`) `deploy.sh` refuses, and the deploy is a re-run `install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR>`. |
 | **Machine cutover** | Standing up the stack on a replacement machine and continuing there — the [`../MIGRATION.md`](../MIGRATION.md) runbook. |
 | **Rollback** | A bad change in the running stack — `git checkout <known-good-ref>` and re-run. |
 
@@ -20,7 +20,7 @@ The through-line is that **the code is reinstalled, never transported.** The ins
 
 - **The orchestrator** — [`../../install.ps1`](../../install.ps1): a pwsh-7+ script that resolves the WSL distro and role, then runs the four phases in strict order, aborting on any hard failure.
 - **The four phase scripts** — [`0-prereqs.ps1`](../../install/0-prereqs.ps1), [`1-wsl-services.sh`](../../install/1-wsl-services.sh), [`2-windows-config.ps1`](../../install/2-windows-config.ps1), [`3-verify.ps1`](../../install/3-verify.ps1).
-- **The deploy pipeline** — [`../../scripts/wsl/deploy.sh`](../../scripts/wsl/deploy.sh): the single gated repo-to-runtime path for server-side changes.
+- **The deploy pipeline** — [`../../scripts/wsl/deploy.sh`](../../scripts/wsl/deploy.sh): the single gated repo-to-runtime path for server-side changes on a WSL host (a native Linux authority re-runs [`../../install/linux-authority.sh`](../../install/linux-authority.sh) instead).
 - **The Receipts** — the machine-local record of the operator's choices: `~/.claude/scripts/mem0-stack.config.psd1` (Windows) and `~/.mem0/stack.env` (WSL).
 - **The repository** — the tracked source (scripts carry operator-neutral **Sentinel** tokens; `.example` files are templates), pinned to whatever ref is checked out.
 - **The operator** — chooses `-Role`, supplies the (optional) `-Distro`, and provides the one prerequisite the installer cannot build: llama-swap with both GGUFs.
@@ -59,7 +59,7 @@ Then the old machine is decommissioned (its writers stopped) so the two stores c
 
 ### Rollback — reinstall from a known-good ref
 
-Because install and deploy are idempotent and gated, rollback needs no special tooling: **`git checkout <known-good-ref>`**, then re-run `install.ps1` (Windows + WSL surfaces) or `deploy.sh` (WSL server surface). The re-run overwrites the deployed layer with the known-good source, the deploy gate blocks a restart on a bad build, and R9 parity confirms the deployed copies match the ref. A ref you have installed cleanly before is a safe rollback target.
+Because install and deploy are idempotent and gated, rollback needs no special tooling: **`git checkout <known-good-ref>`**, then re-run `install.ps1` (Windows + WSL surfaces) or `deploy.sh` (WSL server surface; on a native Linux authority, re-run `install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR>`). The re-run overwrites the deployed layer with the known-good source, the deploy gate blocks a restart on a bad build, and R9 parity confirms the deployed copies match the ref. A ref you have installed cleanly before is a safe rollback target.
 
 ## Data and state changes
 
@@ -123,7 +123,7 @@ A fresh install *creates* the machine-local set from the tracked source; a re-in
 - **Install transcript** — run `install.ps1 -LogFile install.log`; each phase prints a banner and per-check OK/MISSING/FAIL lines.
 - **Verify** — `3-verify.ps1` is the install-time end-to-end smoke; watch for the skew guard ("No hook references a missing deployed script") and the role-aware task checks.
 - **Health / parity** — `Test-MemoryStack.ps1` reports LIVENESS / INVARIANTS / RECOVERY, with the R9 parity check under RECOVERY surfacing any repo-vs-deployed drift after a deploy or rollback.
-- **Deploy** — `deploy.sh` echoes each rsynced surface, the import-smoke result, and the `/health/deep` sub-checks; `--dry-run` previews without writing.
+- **Deploy** — `deploy.sh` echoes each rsynced surface, the import-smoke result, and the `/health/deep` sub-checks; `--dry-run` previews without writing. On a native Linux authority it prints `REFUSED` with the installer command and exits 5 before any output of its own pipeline.
 - **Service logs (WSL)** — `systemctl --user status mem0.service` and `journalctl --user -u mem0.service -n 50`.
 - **Common symptom → cause** — a session deadlock at "Prompt is too long" points at a skewed deploy layer (a `settings.json`-referenced script missing on disk); the phase-3 skew guard is the check that surfaces it.
 

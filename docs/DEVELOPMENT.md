@@ -14,6 +14,8 @@ How to change this system safely: the repo tour, the test suites, the deploy pat
 | Installer | `install/*` | run it — it's idempotent by contract |
 | Docs | `*.md`, `docs/` | accuracy-review before merge (see conventions) |
 
+`deploy.sh` in the table means a **WSL** brain or replica. On a **native Linux authority** (`~/.mem0/stack.env` `MEM0_HOST_KIND=native`) every `deploy.sh` step above is instead a re-run `install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR>` from the checkout; `deploy.sh` refuses that host (see below).
+
 Two invariants to respect when placing code: **all LLM judgment goes to Codex** (local models embed/rerank only), and **anything that mutates tiers or deletes must write the ledger**.
 
 ## Running the tests
@@ -47,10 +49,18 @@ Conventions the suites encode: pure logic is factored into unit-testable helpers
 **One path** (v1.12, MEM-7 — born from a P0 where a hand-copied module never reached the installer):
 
 ```bash
-bash scripts/wsl/deploy.sh [--dry-run]   # from the repo root
+bash scripts/wsl/deploy.sh [--dry-run]   # from the repo root, on a WSL brain or replica
 ```
 
 It rsyncs server modules + maintenance scripts + sentinel-resolved systemd units, **import-smokes the server in its venv and refuses to restart on failure**, then restarts `mem0.service` and asserts `/health/deep` is green. Never hand-copy files into `~/apps/` — that's the exact failure class the single path exists to kill. Windows-side hooks redeploy via `install\2-windows-config.ps1` (idempotent). Rollback = `git checkout <last-good> && bash deploy.sh` (previous bytes also live in the weekly stack backup).
+
+**Native Linux authority: not `deploy.sh`.** A box whose `~/.mem0/stack.env` says `MEM0_HOST_KIND=native` renders units `deploy.sh` cannot (`__SECRETS_DIR__` credentials, the native `mem0.service` drop-in, one `ams-nightly` chain instead of the per-job timers). Since 1.31.2 `deploy.sh` refuses it before any write, on `--dry-run` too, and prints the right command. On that box, deploy (and roll back) with:
+
+```bash
+bash install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR> [--dry-run]
+```
+
+Both values are in `stack.env`; every other flag is inherited from it on a re-run ([installer-and-deploy.md](./systems/installer-and-deploy.md), *Linux authority, native*).
 
 ## The eval harnesses (private repo)
 

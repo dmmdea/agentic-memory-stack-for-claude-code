@@ -4,6 +4,37 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.2 — `deploy.sh` refuses a native authority instead of breaking it
+
+**`deploy.sh` is the WSL deploy path, and it ran on the native brain.** On a box whose
+`~/.mem0/stack.env` says `MEM0_HOST_KIND=native`, it rendered the `ams-*` units with only the
+WSL sentinels, so `__SECRETS_DIR__` stayed literal in every step unit's
+`LoadCredentialEncrypted=` and `CODEX_HOME=`. It also put the WSL DPAPI `ExecStartPre` back into
+`mem0.service` and wrote the WSL per-job timers onto a box that runs one chain
+(`ams-nightly.timer`). Its `--dry-run` exited 0 and listed the damage as 41 `unit CHANGED` lines,
+so an operator who followed "run deploy.sh" broke the brain without any error.
+
+- `deploy.sh` now checks the host kind right after it sources `stack.env`. On a native host it
+  stops before any write, with `--dry-run` too, and exits 5. The message gives the command that
+  does deploy there: `bash <checkout>/install/linux-authority.sh --bind-ip <MEM0_BIND>
+  --secrets-dir <MEM0_SECRETS_DIR>`, with both values read from `stack.env`. The installer
+  inherits every other flag on a re-run. The value is compared as the other `MEM0_HOST_KIND`
+  readers compare it (`.strip().lower()`): carriage returns are dropped and surrounding whitespace
+  is trimmed before a case-insensitive match. A CRLF receipt, which sources as `native` plus a CR,
+  is refused like any other native receipt.
+- The unit loop now skips `ams-*` units on every host. Its old native-only branch could no
+  longer run.
+- The docs that tell an operator to run `deploy.sh` now say which hosts it applies to
+  (`DEVELOPMENT.md`, `flows/install-and-cutover.md`, `systems/installer-and-deploy.md`).
+- `test_deploy_host_kind.py` runs `deploy.sh` against a temp `HOME` with recorder stubs for
+  `systemctl`, `curl`, `cmd.exe` and `wslpath`. It checks that a native receipt exits non-zero
+  and leaves `HOME` byte-for-byte as it was, with and without `--dry-run`, and that a WSL receipt
+  (or one without `MEM0_HOST_KIND`, or no receipt at all) gets past the check. It also runs CRLF,
+  padded and tab/CR variants of the native receipt. With the check removed, 4 of its tests fail;
+  with only the strip removed, the 8 variant tests fail.
+
+WSL brains and replicas behave as before.
+
 ## 1.31.1 — stack.env is a file every reader parses the same way
 
 **`deploy.sh` died on the brain's receipt.** `install/linux-authority.sh` wrote
