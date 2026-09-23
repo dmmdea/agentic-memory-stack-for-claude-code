@@ -38,6 +38,28 @@ KNOWN_HOOK_CONTRACT_VERSIONS = {"17.0", "20.0"}
 hook_contract_stats: dict = {"missing": 0, "unknown": 0, "last_unknown": None}
 
 
+# C10 (2026-09-22): machine turns. Claude Code raises UserPromptSubmit for background task
+# notifications as well as for human prompts, and before this gate the [MEMORY CONTEXT] block
+# rode ~91% of those notification turns. A notification reaches the hook with its prompt starting
+# <task-notification>, both when it opens its own turn and when it was queued behind a running
+# turn: the sampled hook inputs matched the transcript's queued_command prompt byte-for-byte, so
+# the wrapper is the same. Only leading ASCII whitespace is skipped.
+# The same verdict lives in the Windows lib (Test-MachineTurnPrompt) and in the compiled client
+# (mem0-hook-client.cs IsMachineTurnStdin). All three are tested against one corpus,
+# scripts/windows/tests/fixtures/machine-turn-prompts.json, so they cannot drift apart.
+MACHINE_TURN_MARKER = "<task-notification>"
+_MACHINE_TURN_LEADING_WS = " \t\r\n\f\v"
+
+
+def is_machine_turn_prompt(prompt: Optional[str]) -> bool:
+    """True when the prompt is a background task notification, not something a person typed.
+    None, empty and non-string input read as a human prompt, the side that keeps today's
+    behavior."""
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    return prompt.lstrip(_MACHINE_TURN_LEADING_WS).startswith(MACHINE_TURN_MARKER)
+
+
 def warn_hook_contract_version(endpoint: str, version: Optional[str]) -> None:
     """Log-and-count contract-version validation. NEVER rejects (back-compat:
     pre-v0.18 hooks and direct API callers don't send the field)."""

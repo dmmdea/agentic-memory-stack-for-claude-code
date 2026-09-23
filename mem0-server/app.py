@@ -401,6 +401,7 @@ class EpisodeCheckpointIn(BaseModel):
 # is extended in the same commit that bumps $HookContractVersion in the hooks.
 from hook_contract import (
     hook_contract_stats as _hook_contract_stats,
+    is_machine_turn_prompt as _is_machine_turn_prompt,  # C10: task notifications get no bundle
     warn_hook_contract_version as _warn_hook_contract_version,
 )
 
@@ -3079,6 +3080,21 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
         except Exception:
             log.exception("bundle: checkpoint failed (non-fatal)")
             out["checkpoint"] = {"ok": False}
+
+    # 1b) C10 (2026-09-22): a background task notification is a machine turn, not a prompt anyone
+    #     typed. The checkpoint above still lands (0.A is unchanged), nothing is searched, and the
+    #     sections come back empty, so no client can render a block for it. The Windows clients
+    #     already skip the bundle for these turns; this applies the same verdict at the one place
+    #     every path meets (hook_contract.is_machine_turn_prompt, tested against the shared
+    #     corpus in scripts/windows/tests/fixtures).
+    if _is_machine_turn_prompt(b.prompt):
+        out["machine_turn"] = True
+        for _wk in ("rejected_brand_scoped", "rejected_superseded", "rejected_contradicted"):
+            out[_wk] = 0
+        out["memories"] = []
+        out["goals"] = []
+        out["open_questions"] = []
+        return out
 
     # 2) admission-gated proactive search (same parameters the hook used:
     #    user_id=DEFAULT_USER_ID, optional brand, limit = memory_cap (tier-scaled),

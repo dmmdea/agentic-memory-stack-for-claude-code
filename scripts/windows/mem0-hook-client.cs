@@ -47,6 +47,7 @@
 
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Cryptography;
@@ -60,6 +61,15 @@ static class HookClient
 
     static string ScriptDir;             // exe's own dir = deployed scripts dir
 
+    // C10 (2026-09-22): set when the hook stdin is a background task notification (a MACHINE
+    // turn). WriteAdditionalContext, the one place this exe emits context, then writes nothing.
+    // The daemon transaction and the inline fallback still run (the 0.A checkpoint lives there);
+    // only the relay of any block is withheld. The exe is the last emitter before Claude Code, so
+    // a stale daemon or a stale fallback script cannot leak a block past this gate.
+    static bool SuppressContext;
+    const string MachineTurnMarker = "<task-notification>";
+    static readonly Regex PromptKey = new Regex("[{,]\\s*\"prompt\"\\s*:\\s*\"", RegexOptions.CultureInvariant);
+
     static int Main()
     {
         // Never block the prompt: a crash anywhere still exits 0 (empty output).
@@ -72,6 +82,8 @@ static class HookClient
 
         byte[] stdin = ReadAllStdin();
         if (stdin == null || stdin.Length == 0) return 0;  // PS inline also no-ops on empty stdin
+
+        SuppressContext = IsMachineTurnStdin(stdin);
 
         string pipeName = Environment.GetEnvironmentVariable("MEM0_HOOK_PIPE");
         if (string.IsNullOrEmpty(pipeName)) pipeName = "mem0-hook-daemon";
@@ -118,7 +130,7 @@ static class HookClient
         // SUCCESS: emit the daemon-rendered block (raw bytes + CRLF — the PS
         // client's [Console]::Out.WriteLine equivalent).
         if (contextBytes != null && contextBytes.Length > 0) WriteAdditionalContext(contextBytes);
-        Log("0.A+0.D served by daemon (exe): session=" + (sid ?? "?") + " " + (diag ?? "") + " exe_ms=" + sw.ElapsedMilliseconds);
+        Log("0.A+0.D served by daemon (exe): session=" + (sid ?? "?") + " " + (diag ?? "") + (SuppressContext ? " machine_turn=1" : "") + " exe_ms=" + sw.ElapsedMilliseconds);
 
         // Phase 0.B pre-gates: the decision verdict (needs_0b) is computed
         // DAEMON-side under the combined handshake (v0.21 Phase B M4) — the C#
@@ -407,6 +419,7 @@ static class HookClient
     // empty -> write nothing, still exit 0 (a guard must never block the prompt).
     static void WriteAdditionalContext(byte[] blockUtf8)
     {
+        if (SuppressContext) return;   // C10: a machine turn gets no block, whoever produced one
         if (blockUtf8 == null || blockUtf8.Length == 0) return;
         try
         {
@@ -445,6 +458,62 @@ static class HookClient
             }
         }
         sb.Append('"');
+        return sb.ToString();
+    }
+
+    // ------------------------------------------------------ C10 machine turn
+
+    // Is the hook's prompt a background task notification? Mirrors lib Test-MachineTurnPrompt and
+    // hook_contract.is_machine_turn_prompt; tests\fixtures\machine-turn-prompts.json is the corpus
+    // all three are tested against. The exe does not parse JSON (a serializer load costs the hot
+    // path tens of ms), so it finds the top-level "prompt" key, decodes the head of its string
+    // value, including \uXXXX escapes, and compares after leading ASCII whitespace. The anchor
+    // [{,] keeps an escaped \"prompt\": inside another value from matching, and prompt_id never
+    // matches. Any failure reads as a human prompt, which keeps today's behavior.
+    static bool IsMachineTurnStdin(byte[] stdin)
+    {
+        try
+        {
+            string s = Encoding.UTF8.GetString(stdin);
+            Match m = PromptKey.Match(s);
+            if (!m.Success) return false;
+            string head = DecodeJsonStringHead(s, m.Index + m.Length, 4096);
+            if (head == null) return false;
+            return head.TrimStart(' ', '\t', '\r', '\n', '\f', '\v').StartsWith(MachineTurnMarker, StringComparison.Ordinal);
+        }
+        catch { return false; }
+    }
+
+    // Decode at most maxChars of a JSON string value that starts at index i (just past its
+    // opening quote). Stops at the closing quote. Null on a malformed escape.
+    static string DecodeJsonStringHead(string s, int i, int maxChars)
+    {
+        var sb = new StringBuilder();
+        while (i < s.Length && sb.Length < maxChars)
+        {
+            char c = s[i];
+            if (c == '"') break;
+            if (c != '\\') { sb.Append(c); i++; continue; }
+            if (i + 1 >= s.Length) return null;
+            char e = s[i + 1];
+            switch (e)
+            {
+                case '"': sb.Append('"'); i += 2; break;
+                case '\\': sb.Append('\\'); i += 2; break;
+                case '/': sb.Append('/'); i += 2; break;
+                case 'b': sb.Append('\b'); i += 2; break;
+                case 'f': sb.Append('\f'); i += 2; break;
+                case 'n': sb.Append('\n'); i += 2; break;
+                case 'r': sb.Append('\r'); i += 2; break;
+                case 't': sb.Append('\t'); i += 2; break;
+                case 'u':
+                    if (i + 5 >= s.Length) return null;
+                    int cp;
+                    if (!int.TryParse(s.Substring(i + 2, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out cp)) return null;
+                    sb.Append((char)cp); i += 6; break;
+                default: return null;
+            }
+        }
         return sb.ToString();
     }
 

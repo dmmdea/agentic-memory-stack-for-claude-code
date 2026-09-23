@@ -296,6 +296,79 @@ Describe 'mem0-hook-client.exe fail-open matrix (real exe, scripted daemons, rec
     }
 }
 
+Describe 'mem0-hook-client.exe C10: a task notification never gets a block (real exe, scripted daemons)' {
+    # The exe is the LAST emitter before Claude Code, so it carries its own machine-turn gate:
+    # even a daemon (or an inline fallback) that hands back a block for a task notification is
+    # not relayed. The daemon transaction itself still runs (the 0.A checkpoint lives there).
+    # The prompt is read from the raw stdin JSON; the corpus is the one the lib and the server
+    # gates are tested against.
+
+    BeforeAll {
+        $script:c10corpus = (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts
+        function script:New-C10Stdin([string]$Prompt, [string]$Escape = 'Default') {
+            # Real hook-input key order; prompt_id precedes prompt (a scanner must not match it).
+            $o = [ordered]@{
+                session_id      = '00000000-0000-4000-8000-00000000c10a'
+                transcript_path = 'C:\nope\00000000-0000-4000-8000-00000000c10a.jsonl'
+                cwd             = 'C:\nope'
+                prompt_id       = '11111111-2222-4333-8444-555555555555'
+                permission_mode = 'default'
+                hook_event_name = 'UserPromptSubmit'
+                prompt          = $Prompt
+            }
+            return ($o | ConvertTo-Json -Compress -EscapeHandling $Escape)
+        }
+        function script:New-BlockLine([string]$Block) {
+            return '{"ok":true,"served":true,"lib_hash":"' + $script:fixtureHash + '","sid_b64":"' + (B64 'sid-c10') +
+                   '","context_b64":"' + (B64 $Block) + '","prompt_b64":"","tpath_b64":"","brand_b64":"","diag_b64":""}'
+        }
+    }
+
+    BeforeEach {
+        $script:recordPath = Join-Path $TestDrive ("record-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'corpus <name>: daemon returns a block -> relayed only for a human prompt' -ForEach @((Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts | ForEach-Object { @{ name = $_.name; prompt = [string]$_.prompt; machine_turn = [bool]$_.machine_turn } }) {
+        $name2 = New-TestPipeName
+        $blk = '[MEMORY CONTEXT - c10-exe]'
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine $blk)
+        try {
+            $r = Invoke-HookClient -Stdin (New-C10Stdin $prompt) -PipeName $name2 -RecordPath $script:recordPath
+            $r.ExitCode | Should -Be 0
+            if ($machine_turn) {
+                $r.StdOut | Should -BeNullOrEmpty
+            } else {
+                ($r.StdOut.TrimEnd("`r", "`n") | ConvertFrom-Json).hookSpecificOutput.additionalContext | Should -Be $blk
+            }
+        } finally { Stop-FakeDaemon $fake }
+    }
+
+    It 'HTML-escaped stdin (\u003c for <) is still recognised as a task notification' {
+        $name2 = New-TestPipeName
+        $stdin = New-C10Stdin ($script:c10corpus[0].prompt) -Escape 'EscapeHtml'
+        $stdin | Should -Match '\\u003ctask-notification'   # the fixture really is escaped
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine '[MEMORY CONTEXT - c10-escaped]')
+        try {
+            $r = Invoke-HookClient -Stdin $stdin -PipeName $name2 -RecordPath $script:recordPath
+            $r.ExitCode | Should -Be 0
+            $r.StdOut | Should -BeNullOrEmpty
+        } finally { Stop-FakeDaemon $fake }
+    }
+
+    It 'no pipe + task notification: the inline fallback still runs (checkpoint) but its stdout is not relayed' {
+        $r = Invoke-HookClient -Stdin (New-C10Stdin ($script:c10corpus[0].prompt)) -PipeName (New-TestPipeName) -RecordPath $script:recordPath
+        $r.ExitCode | Should -Be 0
+        (Get-Record $script:recordPath).skip_daemon | Should -BeTrue   # the fallback ran
+        $r.StdOut | Should -BeNullOrEmpty                                # ...and nothing reached Claude Code
+    }
+
+    It 'no pipe + human prompt: the fallback output is relayed (control)' {
+        $r = Invoke-HookClient -Stdin (New-C10Stdin 'what is the state of the admission gate') -PipeName (New-TestPipeName) -RecordPath $script:recordPath
+        $r.ExitCode | Should -Be 0
+        ($r.StdOut.TrimEnd("`r", "`n") | ConvertFrom-Json).hookSpecificOutput.additionalContext | Should -Be 'STUB-FALLBACK-RAN'
+    }
+}
+
 Describe 'mem0-hook-client.exe child-exit-code mapping (M7: code==2?0:code)' {
     # A dedicated bin dir whose stub user-prompt-extract.ps1 prints a marker and
     # exits with a chosen code; the exe is invoked with an ABSENT pipe so it

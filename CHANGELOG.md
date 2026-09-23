@@ -4,6 +4,51 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.0 — the per-prompt block is for people, and it does not repeat itself (C10)
+
+**The block rode machine turns.** Claude Code raises `UserPromptSubmit` for background task
+notifications as well as for prompts a person types, and the `[MEMORY CONTEXT]` block was
+injected on about 91% of those notification turns (and on 81% of human prompts). In long
+sessions 60–75% of the events are machine turns. Every injection stays in context and is
+re-read on each later call, which added up to 30–90k chars per long session. A prompt that
+starts with `<task-notification>` (after leading whitespace) is now a **machine turn**: it keeps
+the 0.A episode checkpoint through the checkpoint-only POST, the same path a trivial prompt
+takes, and gets no block. A notification queued behind a running turn reaches the hook with the
+same wrapper. In the transcripts, 3,932 queued and 3,727 own-turn notifications all start with
+it, and the sampled hook inputs match the queued prompt byte-for-byte. The verdict is applied
+at every point that can emit or serve the block, and all of them are tested against one shared
+corpus (`scripts/windows/tests/fixtures/machine-turn-prompts.json`):
+- the lib's `Test-MachineTurnPrompt`, which serves the daemon's `bundle_raw` and `bundle` ops
+  and the inline fallback;
+- the compiled client, which scans the stdin prompt and withholds any block it would relay.
+  It is the last emitter, so a stale daemon or fallback cannot leak one;
+- the server: `/v1/context/bundle` still checkpoints a machine turn but runs no search, and
+  returns empty sections with `machine_turn: true`.
+
+Peer messages from another session are not task notifications and keep the human path.
+
+**The block repeated itself.** 56% of the memory lines injected in a session had already been
+shown earlier in the same session. Both prompt paths now share one per-session state file,
+`~/.claude/state/mem0-injected-<session_id>.json`, which holds 16-hex hashes only, never memory
+text:
+- A memory line the session was already shown is dropped.
+- The goals and frontier-questions sections render only when their content differs from what
+  the session was last shown.
+- When nothing novel is left, R2 abstention applies and no block renders.
+
+A compaction discards the blocks, so it resets the state. `stop-extract.ps1` clears it on
+`PreCompact`, which is synchronous, so no prompt runs in between. `mem0-hook-daemon-spawn.ps1`
+clears it again on `SessionStart` with source `compact` or `clear`, as a backstop. `resume`
+keeps the state, because a resumed context still holds its blocks. An unreadable state fails
+open to the full block. This replaces HK-5, the daemon-only goals/questions blanking with a
+fixed 25-prompt re-inject; the inline path used to repeat those sections on every prompt.
+
+**Unchanged on purpose:** `memory_cap`, `goal_cap`, `oq_cap`, the 0.30 relevance threshold,
+R2 abstention, the R6 placement, and the render itself. Dedupe only removes lines before the
+unchanged line builders run, so an emitted block is byte-identical to the pre-change render of
+the reduced bundle. `MachineTurnDedupe.Tests.ps1` pins that parity, including the small tier.
+`UserPromptExtract.Tests.ps1`, which pins the render, passes unmodified.
+
 ## 1.30.1 — the replica wrapper closes its tunnel
 
 **`wiki-index.sh` left its tunnel open.** The EXIT trap that closes the SSH control socket

@@ -48,6 +48,22 @@ try {
                 # throws here and the whole block fails open (no sidecar).
                 $ssScriptDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
                 . ([System.IO.Path]::Combine($ssScriptDir, 'user-prompt-lib.ps1'))
+                # C10 (2026-09-22): after a compaction the session has lost every block it was
+                # shown, so its per-prompt dedupe state is cleared and the next prompt re-surfaces
+                # everything. This is the backstop for the PreCompact reset in stop-extract.ps1
+                # (this hook is async, so it can land after the first post-compaction prompt; the
+                # cost is one extra re-surface, never a lost one). 'clear' resets too: the context
+                # is gone, and the reset is a no-op when the session id is a new one. 'resume' keeps
+                # the state, because a resumed context still holds the blocks it was shown.
+                try {
+                    $ssSource = $null
+                    try { $ssSource = [string]$ssEvent.source } catch { $ssSource = $null }
+                    if (($ssSource -eq 'compact') -or ($ssSource -eq 'clear')) {
+                        $ssTp = $null
+                        try { $ssTp = [string]$ssEvent.transcript_path } catch { $ssTp = $null }
+                        [void](Clear-SessionInjectionStateForHook -SessionId $ssSid -TranscriptPath $ssTp)
+                    }
+                } catch {}
                 $ssTier = Resolve-ModelTier -Model $ssModel -ConfigPath ([System.IO.Path]::Combine($ssScriptDir, 'model-tiers.json'))
                 if ([string]::IsNullOrWhiteSpace($ssTier)) { $ssTier = 'frontier' }
                 $ssInit = $null

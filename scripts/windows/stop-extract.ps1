@@ -58,6 +58,25 @@ if (-not $trans) { $trans = $env:CLAUDE_TRANSCRIPT_PATH }
 if (-not $evt)   { $evt   = $env:CLAUDE_HOOK_EVENT }
 if (-not $evt)   { $evt   = 'Stop' }
 
+# C10 (2026-09-22): a compaction discards every [MEMORY CONTEXT] block this session was shown, so
+# the per-prompt dedupe state goes with it and the next prompt re-surfaces memories, goals and
+# questions. PreCompact is synchronous, so no prompt can run between this reset and the
+# compaction. The lib is dot-sourced on PreCompact only (a Stop never pays for it), and it runs
+# BEFORE the transcript path is swapped for the snapshot below: the prompt paths key the state by
+# the real transcript's file name. Any failure is silent and leaves the state in place;
+# mem0-hook-daemon-spawn.ps1 repeats the reset on SessionStart source=compact (and clear).
+if ($evt -eq 'PreCompact') {
+    try {
+        $c10Lib = Join-Path $ScriptDir 'user-prompt-lib.ps1'
+        if (Test-Path -LiteralPath $c10Lib) {
+            . $c10Lib
+            $c10Sid = $null
+            try { $c10Sid = [string]$hookEvent.session_id } catch { $c10Sid = $null }
+            [void](Clear-SessionInjectionStateForHook -SessionId $c10Sid -TranscriptPath ([string]$trans))
+        }
+    } catch { }
+}
+
 # For PreCompact, snapshot the transcript before it gets mutated by compaction
 if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
     $snap = Join-Path $TempDirPath "precompact-snap-$PID.jsonl"

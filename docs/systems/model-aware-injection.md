@@ -78,11 +78,13 @@ block at all — and this is true by construction, not by a runtime tier check.*
 independent facts make it impossible for the harness to receive the `[MEMORY CONTEXT]`
 block:
 
-1. **`UserPromptSubmit` fires on human prompts only.** It is *never* raised for a tool call
-   or an MCP invocation, and it does not fire inside subagents. The offload harness is
-   reached only via `mcp__local-offload__*` tool calls from the orchestrating agent — those
-   calls do not raise `UserPromptSubmit`, so the only producer of the block is never invoked
-   for them.
+1. **`UserPromptSubmit` is never raised for a tool call.** It fires for human prompts and
+   also for background task notifications, which get no block since C10 (see
+   [`../flows/memory-retrieval.md`](../flows/memory-retrieval.md), Channel 1). It is *never*
+   raised for a tool call or an MCP invocation, and it does not fire inside subagents. The
+   offload harness is reached only via `mcp__local-offload__*` tool calls from the
+   orchestrating agent. Those calls do not raise `UserPromptSubmit`, so the only producer of
+   the block is never invoked for them.
 2. **The block producer is bound only to the human-prompt client.** `UserPromptSubmit` is
    registered to a single command — the compiled `mem0-hook-client.exe` (PowerShell fallback
    `user-prompt-extract.ps1`) and the daemon it spawns. There is no matcher and no `mcp__`

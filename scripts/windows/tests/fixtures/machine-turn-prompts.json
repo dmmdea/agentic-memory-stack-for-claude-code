@@ -1,0 +1,55 @@
+{
+  "_comment": "C10 machine-turn corpus, shared by the three gates that must agree: the lib's Test-MachineTurnPrompt (daemon + inline PowerShell paths), the compiled client's stdin scan (mem0-hook-client.cs) and the server's hook_contract.is_machine_turn_prompt. Shapes are the REAL UserPromptSubmit hook inputs, scrubbed: a background task notification reaches the hook with its prompt starting with <task-notification>, both when it is its own turn (transcript user record, origin.kind=task-notification) and when it was queued behind a running turn (transcript queued_command attachment, commandMode=task-notification). Sampled hook-input fixtures matched the queued_command prompt byte-for-byte, so a queued notification uses the SAME wrapper. Peer messages from another session (cross-session-message / agent-message) are NOT task notifications and stay human-path on purpose.",
+  "prompts": [
+    {
+      "name": "task notification, own turn (background command finished)",
+      "machine_turn": true,
+      "prompt": "<task-notification>\n<task-id>b0c1d2e3f</task-id>\n<tool-use-id>toolu_01AAAAAAAAAAAAAAAAAAAAAAAA</tool-use-id>\n<output-file>C:\\Users\\__WIN_USER__\\AppData\\Local\\Temp\\claude\\example-project\\00000000-0000-4000-8000-000000000001\\tasks\\b0c1d2e3f.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run the stress test under a drained lease (30 min)\" completed (exit code 0)</summary>\n</task-notification>"
+    },
+    {
+      "name": "task notification, queued behind a running turn (agent finished)",
+      "machine_turn": true,
+      "prompt": "<task-notification>\n<task-id>a6cf7de54213ef878</task-id>\n<tool-use-id>toolu_01BBBBBBBBBBBBBBBBBBBBBBBB</tool-use-id>\n<output-file>C:\\Users\\__WIN_USER__\\AppData\\Local\\Temp\\claude\\example-project\\00000000-0000-4000-8000-000000000002\\tasks\\a6cf7de54213ef878.output</output-file>\n<status>completed</status>\n<summary>Agent \"Review the self-heal scripts\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own.</note>\n<result>No blockers. You missed nothing; revert is not needed. The admission gate and the memory stack both hold.</result>\n</task-notification>"
+    },
+    {
+      "name": "task notification, queued monitor event",
+      "machine_turn": true,
+      "prompt": "<task-notification>\n<task-id>bi7dkqg03</task-id>\n<summary>Monitor event: \"stress run started or failed to start\"</summary>\n<event>stress-20260922-131402.txt</event>\n</task-notification>"
+    },
+    {
+      "name": "task notification after leading whitespace",
+      "machine_turn": true,
+      "prompt": " \r\n\t <task-notification>\n<task-id>b9z8y7x6w</task-id>\n<status>stopped</status>\n<summary>Background workflow \"context audit\" did not finish before the previous session ended</summary>\n</task-notification>"
+    },
+    {
+      "name": "human prompt (substantive)",
+      "machine_turn": false,
+      "prompt": "what is the state of the admission gate and the memory stack deploy"
+    },
+    {
+      "name": "human prompt that quotes a notification mid-text",
+      "machine_turn": false,
+      "prompt": "why did this <task-notification> fire twice for the memory stack job?"
+    },
+    {
+      "name": "human prompt carrying a slash-command wrapper",
+      "machine_turn": false,
+      "prompt": "<command-message>session-handoff</command-message>\n<command-name>/session-handoff</command-name>"
+    },
+    {
+      "name": "near-miss tag is not the notification wrapper",
+      "machine_turn": false,
+      "prompt": "<task-notifications> are they noisy in the memory stack logs?"
+    },
+    {
+      "name": "cross-session peer message (not a task notification)",
+      "machine_turn": false,
+      "prompt": "Another Claude session sent a message:\n<cross-session-message from=\"uds:example\">please check the memory stack deploy</cross-session-message>"
+    },
+    {
+      "name": "empty prompt",
+      "machine_turn": false,
+      "prompt": ""
+    }
+  ]
+}

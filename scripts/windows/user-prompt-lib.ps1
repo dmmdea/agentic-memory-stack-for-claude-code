@@ -258,6 +258,29 @@ function Test-CorrectionLikePrompt {
     return $false
 }
 
+function Test-MachineTurnPrompt {
+    <#
+    .SYNOPSIS
+    C10 (2026-09-22): is this UserPromptSubmit prompt a MACHINE turn (a background task
+    notification) rather than something a person typed?
+    .DESCRIPTION
+    Claude Code raises UserPromptSubmit for both. A task notification reaches the hook with its
+    prompt starting <task-notification>, whether it opens its own turn or was queued behind a
+    running turn: the sampled hook inputs matched the transcript's queued_command prompt
+    byte-for-byte, so both use the same wrapper. Only leading ASCII whitespace is skipped. Before
+    this gate the [MEMORY CONTEXT] block rode ~91% of notification turns, where nobody reads it.
+    A machine turn keeps the 0.A checkpoint (checkpoint-only POST, as for a trivial prompt) and
+    gets no block.
+    Mirrors hook_contract.is_machine_turn_prompt (server) and IsMachineTurnStdin
+    (mem0-hook-client.cs). tests\fixtures\machine-turn-prompts.json is the corpus all three are
+    tested against. PS 5.1-safe, zero cmdlets, never throws.
+    #>
+    param([string]$Prompt)
+    if ([string]::IsNullOrEmpty($Prompt)) { return $false }
+    $trimmed = $Prompt.TrimStart([char[]]@([char]32, [char]9, [char]13, [char]10, [char]12, [char]11))
+    return $trimmed.StartsWith('<task-notification>', [System.StringComparison]::Ordinal)
+}
+
 function Add-LearnRuleCapture {
     <#
     .SYNOPSIS
@@ -610,7 +633,14 @@ function Format-MemoryContextBlock {
         [string]$Tier = 'frontier',
         # v1.23 P2-7: where the bundle came from ('authority:<host:port>' | 'local-replica');
         # '' renders the legacy header byte-for-byte.
-        [string]$Source = ''
+        [string]$Source = '',
+        # C10 (2026-09-22): the session's injection state (Read-SessionInjectionState). $null =
+        # no dedupe, which is the exact pre-C10 render. With a state, lines this session was
+        # already shown are dropped BEFORE the unchanged line builders run, so an emitted block
+        # is the pre-C10 render of a reduced bundle. What the returned block shows is committed
+        # into the state (Dirty=$true) only when a block is returned; the caller persists it
+        # (Format-SessionMemoryContextBlock).
+        $SessionState = $null
     )
     if (-not $Bundle) { return $null }
 
@@ -655,12 +685,42 @@ function Format-MemoryContextBlock {
     # (top relevance for frontier; top tier-rank for small) is the final line — adjacent to the
     # prompt. A cheap complement to R2/R3, not a lever.
     $memoryLines = [System.Collections.Generic.List[string]]::new()
+    # C10: ONE builder for a memory's rendered line, used by the dedupe key and by the render loop,
+    # so the key is exactly the text the session was shown. (The pre-C10 loop assigned $tier in
+    # THIS scope, which also overwrote the -Tier parameter; nothing reads -Tier after the loop,
+    # and the scriptblock's child scope leaves it alone.)
+    $memoryLineOf = {
+        param($h)
+        $tier   = if ($h.metadata -and $h.metadata.tier)  { $h.metadata.tier  } else { 'evidence' }
+        $hbrand = if ($h.metadata -and $h.metadata.brand) { $h.metadata.brand } else { 'cross-brand' }
+        # v0.22 D (small tier): drop the redundant [|brand] tag when the
+        # session brand is known (every surfaced row is same-brand or
+        # brand-neutral by admission). Keep it when brand is unknown.
+        if ($isSmall -and $Brand) { return "  - [$tier] $($h.memory)" }
+        return "  - [$tier|$hbrand] $($h.memory)"
+    }
+    $pendingMemoryKeys = [System.Collections.Generic.List[string]]::new()
+    $admittedBeforeDedupe = $false   # the raw-fallback eligibility keeps its pre-C10 meaning
     $hits = @($Bundle.memories)
     if ($hits.Count -gt 0) {
         $filteredResults = @(Select-AdmittedMemoryResults -Hits $hits -Brand $Brand -AuditPath $AuditPath)
         $rejectedCount = $hits.Count - $filteredResults.Count
         if ($rejectedCount -gt 0 -and ($null -ne $ExecutionContext.SessionState.InvokeCommand.GetCommand('Write-Log', 'Function'))) {
             Write-Log "0.D admission: $rejectedCount of $($hits.Count) results rejected (see admission-rejected.jsonl)"
+        }
+        if ($filteredResults.Count -gt 0) { $admittedBeforeDedupe = $true }
+        # C10 in-session dedupe: drop admitted memories whose line this session was already shown.
+        # Order is preserved, so the small-tier sort and the R6 reversal below see the same relative
+        # order as before; the caps were applied upstream and are untouched.
+        if (($null -ne $SessionState) -and ($filteredResults.Count -gt 0)) {
+            $novel = [System.Collections.Generic.List[object]]::new()
+            foreach ($h in $filteredResults) {
+                $k = Get-InjectionLineKey (& $memoryLineOf $h)
+                if ($k -and $SessionState.Memories.Contains($k)) { continue }
+                $novel.Add($h)
+                if ($k) { $pendingMemoryKeys.Add($k) }
+            }
+            $filteredResults = @($novel.ToArray())
         }
         if ($filteredResults.Count -gt 0) {
             $anyMemoryAdmitted = $true   # v1.0 R2: gates the whole block (below)
@@ -721,16 +781,7 @@ function Format-MemoryContextBlock {
             }
             $memoryLines.Add("Top $($filteredResults.Count) relevant memories:")
             foreach ($h in $filteredResults) {
-                $tier   = if ($h.metadata -and $h.metadata.tier)  { $h.metadata.tier  } else { 'evidence' }
-                $hbrand = if ($h.metadata -and $h.metadata.brand) { $h.metadata.brand } else { 'cross-brand' }
-                # v0.22 D (small tier): drop the redundant [|brand] tag when the
-                # session brand is known (every surfaced row is same-brand or
-                # brand-neutral by admission). Keep it when brand is unknown.
-                if ($isSmall -and $Brand) {
-                    $memoryLines.Add("  - [$tier] $($h.memory)")
-                } else {
-                    $memoryLines.Add("  - [$tier|$hbrand] $($h.memory)")
-                }
+                $memoryLines.Add([string](& $memoryLineOf $h))
             }
         }
     }
@@ -750,28 +801,45 @@ function Format-MemoryContextBlock {
         return [string]::IsNullOrWhiteSpace([string]$rowBrand)
     }
 
+    # C10: each section is built into its own list first, then appended unless its content equals
+    # what this session was last shown (same line builders, same bytes as before).
+    $pendingGoalsSig = $null
+    $pendingOqSig = $null
+
     # 2. Open goals (server sends <=5, same query GET /v1/goals served the hook)
     $goals = @(@($Bundle.goals) | Where-Object { & $brandGate $_ })
     if ($goals.Count -gt 0) {
-        $contextLines.Add("Open goals ($($goals.Count) shown):")
+        $goalLines = [System.Collections.Generic.List[string]]::new()
+        $goalLines.Add("Open goals ($($goals.Count) shown):")
         foreach ($g in $goals) {
             $title = $g.title
             if ($title.Length -gt 100) { $title = $title.Substring(0, 100) + '...' }
-            $contextLines.Add("  - [P$($g.priority) OPEN] $title")
+            $goalLines.Add("  - [P$($g.priority) OPEN] $title")
         }
-        $contextLines.Add('')
+        $goalsSig = if ($null -ne $SessionState) { Get-InjectionLineKey ($goalLines -join "`n") } else { $null }
+        if (-not ($goalsSig -and ($goalsSig -eq $SessionState.GoalsSig))) {
+            foreach ($gl in $goalLines) { $contextLines.Add($gl) }
+            $contextLines.Add('')
+            $pendingGoalsSig = $goalsSig
+        }
     }
 
     # 3. Open frontier questions (<=3)
     $questions = @(@($Bundle.open_questions) | Where-Object { & $brandGate $_ })
     if ($questions.Count -gt 0) {
-        $contextLines.Add('Open frontier questions:')
+        $oqLines = [System.Collections.Generic.List[string]]::new()
+        $oqLines.Add('Open frontier questions:')
         foreach ($q in $questions) {
             $qtext = $q.question_text
             if ($qtext.Length -gt 120) { $qtext = $qtext.Substring(0, 120) + '...' }
-            $contextLines.Add("  - $qtext")
+            $oqLines.Add("  - $qtext")
         }
-        $contextLines.Add('')
+        $oqSig = if ($null -ne $SessionState) { Get-InjectionLineKey ($oqLines -join "`n") } else { $null }
+        if (-not ($oqSig -and ($oqSig -eq $SessionState.OqSig))) {
+            foreach ($ql in $oqLines) { $contextLines.Add($ql) }
+            $contextLines.Add('')
+            $pendingOqSig = $oqSig
+        }
     }
 
     # v1.0 Phase 5 / R6 (placement): append the memory section LAST — goals + open-questions are
@@ -791,7 +859,9 @@ function Format-MemoryContextBlock {
     # pattern on no-memory turns). Defense-in-depth: the same $brandGate as goals/OQ (the
     # server already fails closed via only_brand_neutral; this is the client backstop).
     $rawFallbackLine = $null
-    if ((-not $anyMemoryAdmitted) -and $Bundle.raw_fallback -and (& $brandGate $Bundle.raw_fallback)) {
+    # C10: eligibility reads the PRE-dedupe admission, so dedupe can never open this path on a turn
+    # that admitted memories (the server sends raw_fallback only when it returned none anyway).
+    if ((-not $admittedBeforeDedupe) -and $Bundle.raw_fallback -and (& $brandGate $Bundle.raw_fallback)) {
         $snip = [string]$Bundle.raw_fallback.snippet
         if (-not [string]::IsNullOrWhiteSpace($snip)) {
             $rawFallbackLine = "Related past work (episode $($Bundle.raw_fallback.episode_id)): $snip"
@@ -804,9 +874,182 @@ function Format-MemoryContextBlock {
     # static-prepend on off-domain / no-memory-needed turns (the paper's #2 anti-pattern).
     # v1.0 R4 adds ONE exception: a strict-match raw-trace fallback may render its single line.
     # Session-start goal awareness is a separate hook and is unaffected.
-    if ($anyMemoryAdmitted) { return ($contextLines -join "`n") }
-    if ($rawFallbackLine) { return $rawFallbackLine }
+    # C10: with a session state, R2 now also covers "every admitted memory was already shown":
+    # $anyMemoryAdmitted is false and the whole block abstains. What a returned block shows is
+    # committed into the state here and only here.
+    if ($anyMemoryAdmitted) {
+        if ($null -ne $SessionState) {
+            foreach ($k in $pendingMemoryKeys) { if ($SessionState.Memories.Add($k)) { $SessionState.MemoryOrder.Add($k) } }
+            if ($pendingGoalsSig) { $SessionState.GoalsSig = $pendingGoalsSig }
+            if ($pendingOqSig) { $SessionState.OqSig = $pendingOqSig }
+            $SessionState.Dirty = $true
+        }
+        return ($contextLines -join "`n")
+    }
+    if ($rawFallbackLine) {
+        if ($null -ne $SessionState) {
+            $rk = Get-InjectionLineKey $rawFallbackLine
+            if ($rk -and $SessionState.Memories.Contains($rk)) { return $null }
+            if ($rk -and $SessionState.Memories.Add($rk)) { $SessionState.MemoryOrder.Add($rk); $SessionState.Dirty = $true }
+        }
+        return $rawFallbackLine
+    }
     return $null
+}
+
+# ===========================================================================
+# C10 (2026-09-22) — in-session dedupe of the [MEMORY CONTEXT] block.
+# One small state file per session in ~\.claude\state (the rate-limit token's directory), read and
+# written by BOTH prompt paths (resident daemon and inline fallback) through the functions below.
+# It holds 16-hex hashes only, never memory text: the keys of the memory lines this session was
+# shown, plus one hash each for the goals and the frontier-questions sections. A compaction
+# deletes it: PreCompact (stop-extract.ps1, synchronous) and SessionStart source=compact or clear
+# (mem0-hook-daemon-spawn.ps1, the backstop) both call Clear-SessionInjectionStateForHook.
+# Every failure fails OPEN: an unreadable state reads as empty (the full block renders, as before
+# C10), and a failed write means the next prompt repeats, as before C10. Never throws.
+# ===========================================================================
+
+function Get-InjectionLineKey {
+    # 16 lowercase hex chars of SHA256(text): the dedupe key of one rendered line or section.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $h = Get-StringSha256Hex $Text
+    if (-not $h) { return $null }
+    return $h.Substring(0, 16)
+}
+
+function Get-SessionInjectionStatePath {
+    param([string]$SessionId, [string]$StateDir)
+    if ([string]::IsNullOrWhiteSpace($SessionId)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($StateDir)) { $StateDir = [System.IO.Path]::Combine((Get-AmsHomeDir), '.claude', 'state') }
+    $safe = $SessionId -replace '[^A-Za-z0-9._-]', '_'
+    return [System.IO.Path]::Combine($StateDir, 'mem0-injected-' + $safe + '.json')
+}
+
+function New-SessionInjectionState {
+    param([string]$Path)
+    return @{
+        Path        = $Path
+        Memories    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        MemoryOrder = [System.Collections.Generic.List[string]]::new()
+        GoalsSig    = ''
+        OqSig       = ''
+        Dirty       = $false
+    }
+}
+
+function Read-SessionInjectionState {
+    <#
+    .SYNOPSIS
+    C10: this session's injection state as a hashtable (Path, Memories, MemoryOrder, GoalsSig,
+    OqSig, Dirty), or $null when there is no session id (then the render does no dedupe). A
+    missing, unreadable or corrupt file reads as an EMPTY state: fail open, the full block renders.
+    #>
+    param([string]$SessionId, [string]$StateDir)
+    $path = Get-SessionInjectionStatePath -SessionId $SessionId -StateDir $StateDir
+    if (-not $path) { return $null }
+    $state = New-SessionInjectionState -Path $path
+    try {
+        if ([System.IO.File]::Exists($path)) {
+            $o = ConvertFrom-HookJson ([System.IO.File]::ReadAllText($path))
+            if ($null -ne $o) {
+                foreach ($k in @($o.memories)) {
+                    $ks = [string]$k
+                    if ($ks -and $state.Memories.Add($ks)) { $state.MemoryOrder.Add($ks) }
+                }
+                if ($o.goals_sig) { $state.GoalsSig = [string]$o.goals_sig }
+                if ($o.oq_sig) { $state.OqSig = [string]$o.oq_sig }
+            }
+        }
+    } catch {
+        $state = New-SessionInjectionState -Path $path
+    }
+    return $state
+}
+
+function Save-SessionInjectionState {
+    <#
+    .SYNOPSIS
+    C10: persist a session's injection state (newest -MaxKeys memory keys kept) and sweep state
+    files older than -SweepAgeDays. Returns $true on success. Never throws.
+    #>
+    param($State, [int]$MaxKeys = 500, [int]$SweepAgeDays = 7)
+    if (($null -eq $State) -or (-not $State.Path)) { return $false }
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName([string]$State.Path)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $keys = @($State.MemoryOrder.ToArray())
+        if ($keys.Count -gt $MaxKeys) { $keys = @($keys[($keys.Count - $MaxKeys)..($keys.Count - 1)]) }
+        $json = ConvertTo-HookJson @{ v = 1; memories = [string[]]$keys; goals_sig = [string]$State.GoalsSig; oq_sig = [string]$State.OqSig }
+        [System.IO.File]::WriteAllText([string]$State.Path, $json)
+        $State.Dirty = $false
+        try {
+            $cutoff = [System.DateTime]::Now.AddDays(-$SweepAgeDays)
+            foreach ($f in [System.IO.Directory]::GetFiles($dir, 'mem0-injected-*.json')) {
+                if ([System.IO.File]::GetLastWriteTime($f) -lt $cutoff) { try { [System.IO.File]::Delete($f) } catch {} }
+            }
+        } catch {}
+        return $true
+    } catch { return $false }
+}
+
+function Clear-SessionInjectionState {
+    # C10: delete one session's injection state. $true when a file was removed. Never throws.
+    param([string]$SessionId, [string]$StateDir)
+    $path = Get-SessionInjectionStatePath -SessionId $SessionId -StateDir $StateDir
+    if (-not $path) { return $false }
+    try {
+        if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path); return $true }
+    } catch {}
+    return $false
+}
+
+function Clear-SessionInjectionStateForHook {
+    <#
+    .SYNOPSIS
+    C10: the compaction reset, called by the PreCompact dispatcher (stop-extract.ps1) and by the
+    SessionStart launcher on source=compact or clear (mem0-hook-daemon-spawn.ps1). It clears the state under
+    every id a prompt path could have keyed it by: the transcript-derived id (the prompt paths'
+    own derivation — the UUID file name, else 'unknown-<name>') and the payload session_id.
+    Returns the number of files removed. Never throws.
+    #>
+    param([string]$SessionId, [string]$TranscriptPath, [string]$StateDir)
+    $ids = [System.Collections.Generic.List[string]]::new()
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            $bn = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
+            if ($bn -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $ids.Add($bn) }
+            elseif ($bn) { $ids.Add('unknown-' + $bn) }
+        }
+    } catch {}
+    if ((-not [string]::IsNullOrWhiteSpace($SessionId)) -and (-not $ids.Contains($SessionId))) { $ids.Add($SessionId) }
+    $n = 0
+    foreach ($id in $ids) { if (Clear-SessionInjectionState -SessionId $id -StateDir $StateDir) { $n++ } }
+    return $n
+}
+
+function Format-SessionMemoryContextBlock {
+    <#
+    .SYNOPSIS
+    C10: Format-MemoryContextBlock with in-session dedupe. It reads the session's injection state,
+    renders with it, and persists what the returned block showed. The one render entry point of
+    both prompt paths (daemon op=bundle_raw and op=bundle, inline fallback). With no -SessionId
+    the render is the exact pre-C10 one.
+    #>
+    param(
+        $Bundle,
+        [string]$Brand,
+        [string]$AuditPath,
+        [string]$Tier = 'frontier',
+        [string]$Source = '',
+        [string]$SessionId,
+        [string]$StateDir
+    )
+    $state = $null
+    try { $state = Read-SessionInjectionState -SessionId $SessionId -StateDir $StateDir } catch { $state = $null }
+    $block = Format-MemoryContextBlock -Bundle $Bundle -Brand $Brand -AuditPath $AuditPath -Tier $Tier -Source $Source -SessionState $state
+    if ($block -and ($null -ne $state) -and $state.Dirty) { [void](Save-SessionInjectionState -State $state) }
+    return $block
 }
 
 function Select-AdmittedMemoryResults {

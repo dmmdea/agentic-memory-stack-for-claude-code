@@ -477,13 +477,23 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         $instCode.Contains("command = `$bashCapCheck; matcher = 'startup|clear|compact'") | Should -BeTrue -Because 'the banner entry must carry the matcher (resume excluded) at its source of truth'
     }
 
-    It 'HK-5 re-injects unchanged goals/questions every 25th prompt, not every 12th' {
-        # 2026-09-02 context audit: [MEMORY CONTEXT] is the second-largest injected class; the
-        # goals/questions half is blanked when unchanged and re-injected on a fixed cadence as a
-        # post-compaction guard. 25 keeps the guard and trims the routine repeat.
+    It 'C10 (supersedes HK-5): goals/questions re-render on a content change or a compaction reset, never on a cadence' {
+        # 2026-09-02 context audit: [MEMORY CONTEXT] is the second-largest injected class; HK-5
+        # blanked unchanged goals/questions in the DAEMON only and re-injected them every 25th
+        # prompt as a stand-in for a compaction signal. C10 (2026-09-22) replaces the stand-in
+        # with the real signal: a per-session state file both prompt paths share, reset by
+        # PreCompact and SessionStart source=compact. A cadence beside it would re-inject
+        # unchanged sections for no reason; a daemon-only dedupe would leave the inline path
+        # repeating them every prompt.
         $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
-        $daemon.Contains('$st.n -lt 25') | Should -BeTrue -Because 'the re-inject cadence is pinned at 25'
-        $daemon.Contains('$st.n -lt 12') | Should -BeFalse -Because 'the old 12 cadence must not linger beside the new one'
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        $daemon | Should -Not -Match '\$st\.n -lt \d+' -Because 'no fixed re-inject cadence may survive beside the compaction reset'
+        $daemon.Contains('Limit-RepeatedGoalsOq') | Should -BeFalse -Because 'the daemon-only in-memory dedupe is superseded'
+        ([regex]::Matches($daemon, 'Format-SessionMemoryContextBlock ')).Count | Should -Be 2 -Because 'both daemon render sites (bundle_raw and bundle) use the session-deduped render'
+        $inline.Contains('Format-SessionMemoryContextBlock ') | Should -BeTrue -Because 'the inline fallback must dedupe exactly like the daemon'
+        foreach ($hook in 'stop-extract.ps1', 'mem0-hook-daemon-spawn.ps1') {
+            (script:Get-CodeLines (Join-Path $script:winDir $hook)).Contains('Clear-SessionInjectionStateForHook ') | Should -BeTrue -Because "$hook carries a compaction reset"
+        }
     }
 
     It 'the maintenance-liveness row measures the LIVE stores, not the lint snapshot' {
