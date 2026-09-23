@@ -4,6 +4,29 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.1 — stack.env is a file every reader parses the same way
+
+**`deploy.sh` died on the brain's receipt.** `install/linux-authority.sh` wrote
+`MEM0_WIKI_SOURCES` unquoted and space-separated. `deploy.sh` and `storage-cap-check.sh`
+SOURCE `~/.mem0/stack.env` as bash, so the second host ran as a command:
+`stack.env: line 16: <user>@<host>: command not found`, before `deploy.sh --dry-run` did anything.
+Quoting would not fix it, because the other readers keep the raw text after `=` (the sed
+`stack_val` readers, the installers' inherit, `ams_env.py`, `job_liveness.py`).
+
+- Lists are stored comma-separated. `--wiki-sources` accepts commas, spaces or both, and an
+  inherited old-form value is rewritten, so re-runs converge. `wiki-index-nightly.sh` splits on
+  commas and whitespace, so a box whose receipt still has the space form keeps pulling.
+- A new `install/stack-env.sh` is the one writer, used by all three writers of the file
+  (`1-wsl-services.sh`, `linux-authority.sh`, `linux-replica.sh`). It refuses the whole file
+  when any value is not a plain token (whitespace, `$`, backtick, `~`, `;`, `|`, `&`, quotes ...).
+  The native installer runs that check before it touches anything, including on `--dry-run`.
+- `--render-only` now also renders the receipt. `test_stack_env_writers.py` checks that
+  `bash -c 'set -e; . stack.env'` succeeds and that bash, sed, `ams_env` and `job_liveness` agree
+  on every key, and it pins the list of writers.
+
+Behavior change: a Windows user name or repo path containing a space now stops phase 1 with a
+named error. Before, it wrote a receipt that `deploy.sh` could not source.
+
 ## 1.31.0 — the per-prompt block is for people, and it does not repeat itself (C10)
 
 **The block rode machine turns.** Claude Code raises `UserPromptSubmit` for background task

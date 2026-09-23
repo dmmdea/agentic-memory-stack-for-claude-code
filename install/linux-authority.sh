@@ -41,7 +41,8 @@
 #   --ams-store-binary / --ams-store-sums: an OFFLINE drop of the store binary and the
 #                  SHA256SUMS it shipped with, for a box that cannot reach the release. Without
 #                  them the installer downloads the asset for the tag in VERSION and verifies it.
-#   --wiki-sources: space-separated user@host list of the PCs that mount the operator's LLM
+#   --wiki-sources: user@host list (comma- or space-separated; stored comma-separated, since
+#                  stack.env is sourced by bash) of the PCs that mount the operator's LLM
 #                  Wiki, tried in order by the nightly wiki-index step (stack.env
 #                  MEM0_WIKI_SOURCES; docs/systems/wiki-index.md). Omit -> the step is dropped
 #                  from the rendered set, like the store judge without a hub.
@@ -57,6 +58,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# 1.31.1: the ONE stack.env writer (plain-token values only, comma lists); see the file.
+. "$SCRIPT_DIR/stack-env.sh"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
 # P4-1b: the store hub's own checkout and the binary that judges it.
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
@@ -149,8 +152,34 @@ if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_D
     [ -z "$ZFS_DATASET" ] || echo "    --zfs-dataset inherited from the installed drop-in: $ZFS_DATASET"
 fi
 [ -n "$EMBED_MODEL" ] || EMBED_MODEL="embeddinggemma"
+# 1.31.1: the wiki list is stored comma-separated whatever the flag or an older receipt used
+# (a space-separated receipt line is exactly what broke `. stack.env`), so re-runs converge.
+[ -z "$WIKI_SOURCES" ] || WIKI_SOURCES="$(stack_env_list "$WIKI_SOURCES")"
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 [ -z "$EVAL_ROOT" ] || [ -f "$EVAL_ROOT/eval/retrieval-drift/retrieval_drift.py" ] || fail "--eval-root $EVAL_ROOT has no eval/retrieval-drift/retrieval_drift.py"
+# The receipt this install will write, resolved ONCE and checked BEFORE anything is touched:
+# a value that is not a plain token (whitespace, $ ` ~ ; | & quotes ...) would be misread by
+# at least one class of stack.env reader, so the install refuses instead (install/stack-env.sh).
+STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_HOST_KIND=native
+                MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND="$BIND_IP" MEM0_ROLE=brain
+                MEM0_SECRETS_DIR="$SECRETS_DIR" MEM0_EMBED_MODEL="$EMBED_MODEL")
+[ -z "$EVAL_ROOT" ] || STACK_ENV_ARGS+=(MEM0_EVAL_ROOT="$EVAL_ROOT")
+[ -z "$PCLOUD_DIR" ] || STACK_ENV_ARGS+=(MEM0_PCLOUD_DIR="$PCLOUD_DIR")
+# v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
+[ -z "$ZFS_DATASET" ] || STACK_ENV_ARGS+=(MEM0_ZFS_DATASET="$ZFS_DATASET")
+# P4-1b: same inherit rule for the store hub's checkout and remote.
+[ -z "$AMS_CHECKOUT" ] || STACK_ENV_ARGS+=(MEM0_AMS_CHECKOUT="$AMS_CHECKOUT")
+[ -z "$AMS_HUB" ] || STACK_ENV_ARGS+=(MEM0_AMS_HUB="$AMS_HUB")
+# The producer (the dream's store-judge phase) reads BOTH from here: its own unit carries
+# the credentials and the transport but not the store variables, so an environment-only
+# lookup skipped the phase every night and no plan was ever written.
+[ -z "$AMS_CHECKOUT" ] || STACK_ENV_ARGS+=(MEM0_AMS_STORE_BIN=/usr/local/bin/ams-store)
+# The wiki-index step reads both from here (docs/systems/wiki-index.md).
+[ -z "$WIKI_SOURCES" ] || STACK_ENV_ARGS+=(MEM0_WIKI_SOURCES="$WIKI_SOURCES")
+[ -z "$WIKI_PULL_KEY" ] || STACK_ENV_ARGS+=(MEM0_WIKI_PULL_KEY="$WIKI_PULL_KEY")
+for kv in "${STACK_ENV_ARGS[@]}"; do
+    stack_env_check "${kv%%=*}" "${kv#*=}" || fail "refusing to install: ~/.mem0/stack.env must parse the same for bash, sed and Python (fix the value above)"
+done
 [ -f "$WSL_INSTALLER" ] || fail "missing $WSL_INSTALLER (run from a repo checkout)"
 MEM0_MODULES="$(grep -E '^MEM0_MODULES=' "$WSL_INSTALLER" | head -1 | sed -E 's/^MEM0_MODULES="(.*)"$/\1/')"
 QDRANT_VERSION="$(grep -E '^QDRANT_VERSION=' "$WSL_INSTALLER" | head -1 | cut -d= -f2 | tr -d '[:space:]')"
@@ -214,6 +243,8 @@ render_units() {  # $1 = destination dir
 }
 if [ -n "$RENDER_ONLY" ]; then
     render_units "$RENDER_ONLY"
+    # the receipt too (1.31.1), so its shape is testable without an install
+    stack_env_write "$RENDER_ONLY/stack.env" "${STACK_ENV_ARGS[@]}" || fail "could not render stack.env"
     echo "    rendered $(find "$RENDER_ONLY" -type f | wc -l) file(s) into $RENDER_ONLY"
     exit 0
 fi
@@ -232,31 +263,7 @@ say "[1] role=brain, stack.env (MEM0_HOST_KIND=native), authority-url"
 if plan "write $MEM0_DIR/role=brain, stack.env, authority-url=http://$BIND_IP:18791"; then :; else
     mkdir -p "$MEM0_DIR"; umask 077
     printf 'brain\n' > "$MEM0_DIR/role"
-    cat > "$MEM0_DIR/stack.env" <<ENV
-MEM0_WSL_USER=$USER_ID
-MEM0_WIN_USER=
-MEM0_DISTRO=native
-MEM0_HOST_KIND=native
-MEM0_REPO_ROOT_WSL=$REPO_ROOT
-MEM0_BIND=$BIND_IP
-MEM0_ROLE=brain
-MEM0_SECRETS_DIR=$SECRETS_DIR
-MEM0_EMBED_MODEL=$EMBED_MODEL
-ENV
-    [ -z "$EVAL_ROOT" ] || printf 'MEM0_EVAL_ROOT=%s\n' "$EVAL_ROOT" >> "$MEM0_DIR/stack.env"
-    [ -z "$PCLOUD_DIR" ] || printf 'MEM0_PCLOUD_DIR=%s\n' "$PCLOUD_DIR" >> "$MEM0_DIR/stack.env"
-    # v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
-    [ -z "$ZFS_DATASET" ] || printf 'MEM0_ZFS_DATASET=%s\n' "$ZFS_DATASET" >> "$MEM0_DIR/stack.env"
-    # P4-1b: same inherit rule for the store hub's checkout and remote.
-    [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_CHECKOUT=%s\n' "$AMS_CHECKOUT" >> "$MEM0_DIR/stack.env"
-    [ -z "$AMS_HUB" ] || printf 'MEM0_AMS_HUB=%s\n' "$AMS_HUB" >> "$MEM0_DIR/stack.env"
-    # The producer (the dream's store-judge phase) reads BOTH from here: its own unit carries
-    # the credentials and the transport but not the store variables, so an environment-only
-    # lookup skipped the phase every night and no plan was ever written.
-    [ -z "$AMS_CHECKOUT" ] || printf 'MEM0_AMS_STORE_BIN=%s\n' "/usr/local/bin/ams-store" >> "$MEM0_DIR/stack.env"
-    # The wiki-index step reads both from here (docs/systems/wiki-index.md).
-    [ -z "$WIKI_SOURCES" ] || printf 'MEM0_WIKI_SOURCES=%s\n' "$WIKI_SOURCES" >> "$MEM0_DIR/stack.env"
-    [ -z "$WIKI_PULL_KEY" ] || printf 'MEM0_WIKI_PULL_KEY=%s\n' "$WIKI_PULL_KEY" >> "$MEM0_DIR/stack.env"
+    stack_env_write "$MEM0_DIR/stack.env" "${STACK_ENV_ARGS[@]}" || fail "could not write $MEM0_DIR/stack.env"
     printf 'http://%s:18791\n' "$BIND_IP" > "$MEM0_DIR/authority-url"
     umask 022; echo "    written"
 fi

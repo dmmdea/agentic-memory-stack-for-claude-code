@@ -68,6 +68,14 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 - **mem0 server** under `~/apps/mem0-server/` with its venv. The full **`MEM0_MODULES` import closure** — every module `app.py` imports — is copied so a fresh install never crash-loops on a missing module; security floors for transitive deps are enforced and post-condition-asserted.
 - The **DPAPI key-fetch script**, the mem0 **API key**, and the **canonical-key** (generated only when neither a plaintext key nor a DPAPI blob already exists).
 - The **WSL-side receipt** `~/.mem0/stack.env` (`MEM0_WSL_USER`, `MEM0_WIN_USER`, `MEM0_DISTRO`, `MEM0_REPO_ROOT_WSL`, `MEM0_BIND`), which `deploy.sh` later sources.
+
+  **The receipt's format is a contract.** Its readers disagree on quoting:
+
+  - bash sources the file (`deploy.sh`, `storage-cap-check.sh`);
+  - sed reads the raw text after `=` (`stack-promote.sh`, the wiki-index step, the installers' inherit);
+  - Python splits on the first `=` (`ams_env.py`, `job_liveness.py`).
+
+  So since 1.31.1 every value is a plain token (letters, digits and `. _ / : @ % + = , -`), and a list is stored comma-separated. All three writers go through `install/stack-env.sh`: `1-wsl-services.sh`, `linux-authority.sh` and `linux-replica.sh`. An install refuses, before it touches anything, a value with whitespace or a shell metacharacter, such as a Windows user name or a repo path with a space. `mem0-server/tests/test_stack_env_writers.py` renders a receipt and checks that `bash -c 'set -e; . stack.env'` succeeds and that bash, sed, `ams_env` and `job_liveness` read every key identically. It also pins the list of writers. Before 1.31.1, an unquoted space-separated `MEM0_WIKI_SOURCES` made `deploy.sh` run the second host as a command.
 - The **EmbeddingGemma-300m** embedder GGUF staged to a stable path (the llama-swap model entry itself is an out-of-repo manual step).
 - **systemd-user units** (`mem0`, `qdrant`, `l10-audit`, `decay-scan`, `stack-backup`, and the hygiene sweep timers), with the same Sentinel substitution the Windows side uses, plus maintenance scripts deployed to `~/apps/mem0-scripts/` so timers exec *deployed* copies rather than a dev working tree.
 

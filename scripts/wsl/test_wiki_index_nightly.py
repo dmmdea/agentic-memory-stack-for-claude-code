@@ -132,3 +132,38 @@ def test_an_empty_tar_does_not_replace_the_snapshot(tmp_path):
     assert "op@up unreachable or empty" in r.stderr
     assert (keep / "Keep.md").exists()
     assert log == ""
+
+
+# 1.31.1: stack.env is SOURCED by bash (deploy.sh, storage-cap-check.sh), so the installer now
+# stores the list comma-separated; a space-separated value made `. stack.env` run the second
+# host as a command. The step reads both forms, so a box still carrying the old line keeps
+# working until its stack.env is rewritten.
+@pytest.mark.parametrize("value", ["op@down,op@up", "op@down op@up", "op@down, op@up", " op@down ,,op@up "],
+                         ids=["commas", "legacy-spaces", "comma-space", "stray-separators"])
+def test_stack_env_sources_split_on_commas_and_whitespace(tmp_path, value):
+    tar = _wiki_tar(tmp_path, 2)
+    body = f'case "$*" in *down*) exit 255;; esac; cat "{tar}"\n'
+    r, _, log = _run(tmp_path, None, body, stack_env=f"MEM0_WIKI_SOURCES={value}\n")
+    assert r.returncode == 0, r.stderr
+    assert "op@down unreachable" in r.stderr, "the first source must be tried on its own"
+    assert "pulled 2 pages from op@up" in r.stdout
+    assert "," not in r.stdout.split("pulled 2 pages from ", 1)[1].split()[0]
+
+
+def test_env_override_accepts_commas_too(tmp_path):
+    tar = _wiki_tar(tmp_path, 1)
+    body = f'case "$*" in *down*) exit 255;; esac; cat "{tar}"\n'
+    r, _, _ = _run(tmp_path, "op@down,op@up", body)
+    assert r.returncode == 0, r.stderr
+    assert "pulled 1 pages from op@up" in r.stdout
+
+
+@pytest.mark.parametrize("value", ["op@first,op@second", "op@first op@second"], ids=["commas", "legacy-spaces"])
+def test_every_stack_env_source_is_tried_in_order(tmp_path, value):
+    """Through the real stack_val path (no WIKI_SOURCES override): both hosts are attempted, in
+    the order written, each as its own ssh target."""
+    calls = tmp_path / "ssh-calls"
+    body = f'for a in "$@"; do case "$a" in op@*) echo "$a" >> "{calls}";; esac; done; exit 255\n'
+    r, _, _ = _run(tmp_path, None, body, stack_env=f"MEM0_WIKI_SOURCES={value}\n", extra_env={"WIKI_MAX_STALE_H": "72"})
+    assert calls.read_text(encoding="utf-8").split() == ["op@first", "op@second"]
+    assert r.stderr.index("op@first unreachable") < r.stderr.index("op@second unreachable")
