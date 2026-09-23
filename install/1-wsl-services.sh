@@ -29,6 +29,8 @@ WIN_USER="${2:-}"
 # BEFORE any sudo -i (login shells wipe WSL_DISTRO_NAME).
 DISTRO="${3:-${WSL_DISTRO_NAME:-$(. /etc/os-release 2>/dev/null; echo "${ID:-Ubuntu}")}}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 1.31.1: the ONE stack.env writer (plain-token values only; bash, sed and Python must agree).
+. "$REPO_ROOT/install/stack-env.sh"
 
 if [ -z "$WIN_USER" ]; then
     # Try to derive from cmd.exe
@@ -247,14 +249,13 @@ if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/role" ]; then
     MEM0_ROLE="$(tr -d '[:space:]' < "$USER_HOME/.mem0/role" || true)"
 fi
 MEM0_ROLE="${MEM0_ROLE:-brain}"
-cat > "$USER_HOME/.mem0/stack.env" <<ENV
-MEM0_WSL_USER=$WSL_USER
-MEM0_WIN_USER=$WIN_USER
-MEM0_DISTRO=$DISTRO
-MEM0_REPO_ROOT_WSL=$REPO_ROOT_WSL
-MEM0_BIND=$MEM0_BIND
-MEM0_ROLE=$MEM0_ROLE
-ENV
+# A Windows user name or repo path with a space would make every `. stack.env` run its second
+# word as a command (the 1.31.1 wiki-sources outage class), so such a value is refused here.
+if ! stack_env_write "$USER_HOME/.mem0/stack.env" MEM0_WSL_USER="$WSL_USER" MEM0_WIN_USER="$WIN_USER" \
+        MEM0_DISTRO="$DISTRO" MEM0_REPO_ROOT_WSL="$REPO_ROOT_WSL" MEM0_BIND="$MEM0_BIND" MEM0_ROLE="$MEM0_ROLE"; then
+    echo "FATAL: refusing to write $USER_HOME/.mem0/stack.env (a value is not a plain token; see above)" >&2
+    exit 1
+fi
 echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO bind=$MEM0_BIND role=$MEM0_ROLE"
 
 # Generate canonical-key if not present (v0.14 B: HMAC auth for tier=canonical promotions).

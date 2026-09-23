@@ -103,7 +103,10 @@ correct rebuild.
 - `scripts/wsl/wiki-index-build.py`, `scripts/wsl/wiki-search.py`, `scripts/wsl/wiki-index.sh`,
   `scripts/wsl/wiki-index-nightly.sh`
 - `systemd/ams-step-wiki-index.service`; `install/linux-authority.sh` (`--wiki-sources`,
-  `MEM0_WIKI_SOURCES` / `MEM0_WIKI_PULL_KEY` in `stack.env`, the unit dropped when unconfigured)
+  `MEM0_WIKI_SOURCES` / `MEM0_WIKI_PULL_KEY` in `stack.env`, the unit dropped when unconfigured).
+  The flag takes a comma- or space-separated list. Since 1.31.1 it is stored comma-separated,
+  because `stack.env` is sourced by bash, and the nightly step splits on commas and whitespace,
+  so an older space-separated receipt still works until the next install rewrites it
 - Tests: `scripts/wsl/test_wiki_index.py`, `scripts/wsl/test_wiki_index_nightly.py`,
   `mem0-server/tests/test_linux_authority_installer.py`
 - Related: [installer-and-deploy.md](./installer-and-deploy.md) (the chain),

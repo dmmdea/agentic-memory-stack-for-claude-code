@@ -34,6 +34,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# 1.31.1: the ONE stack.env writer (plain-token values only; bash, sed and Python must agree).
+. "$SCRIPT_DIR/stack-env.sh"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""; SET_BRAIN_WSL=0; SET_BRAIN_BACKUP_DIR=0
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
 # Fleet-store flags: a replica is a client plus a dormant brain, so these belong to the
@@ -175,14 +177,9 @@ BRAIN_BACKUP_DIR='$BRAIN_BACKUP_DIR'
 BRAIN_WSL='$BRAIN_WSL'
 REPLICA_CACHE='$MEM0_DIR/replica-snapshots'
 ENV
-    cat > "$MEM0_DIR/stack.env" <<ENV
-MEM0_WSL_USER=$USER_ID
-MEM0_WIN_USER=
-MEM0_DISTRO=native
-MEM0_REPO_ROOT_WSL=$REPO_ROOT
-MEM0_BIND=127.0.0.1
-MEM0_ROLE=replica
-ENV
+    stack_env_write "$MEM0_DIR/stack.env" MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native \
+        MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND=127.0.0.1 MEM0_ROLE=replica \
+        || fail "refusing to write $MEM0_DIR/stack.env (a value is not a plain token; see above)"
     umask 022
     echo "    role=replica; replica.env + stack.env written"
 fi

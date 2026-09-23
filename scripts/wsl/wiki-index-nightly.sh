@@ -12,7 +12,8 @@
 # index is rebuilt by the next run.
 #
 # Configuration (stack.env, written by install/linux-authority.sh --wiki-sources):
-#   MEM0_WIKI_SOURCES   space-separated user@host list, tried in order   (required)
+#   MEM0_WIKI_SOURCES   user@host list, tried in order; comma-separated since 1.31.1 (the file
+#                       is sourced by bash), space-separated in older receipts; both work (required)
 #   MEM0_WIKI_PULL_KEY  the identity file                (default ~/.ssh/id_ed25519_wiki_pull)
 # Env overrides for tests and hand runs: WIKI_SOURCES, WIKI_PULL_KEY, WIKI_SNAPSHOT,
 # WIKI_MAX_STALE_H, WIKI_PY.
@@ -50,7 +51,10 @@ fi
 
 mkdir -p "$(dirname "$SNAP")"
 pulled=""
-for src in $SOURCES; do
+# Split on commas AND whitespace: the installer writes commas (1.31.1); a receipt written
+# before that, or a hand-typed WIKI_SOURCES, may still use spaces.
+read -r -a SOURCE_LIST <<< "${SOURCES//,/ }"
+for src in "${SOURCE_LIST[@]}"; do
     tmp="$SNAP.new"; rm -rf "$tmp"; mkdir -p "$tmp"
     # The remote word is ignored by the forced command; it documents intent in the ssh log.
     if timeout 180 ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \

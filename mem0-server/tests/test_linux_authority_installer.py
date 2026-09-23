@@ -112,8 +112,10 @@ def test_wiki_index_step_is_rendered_only_with_wiki_sources(tmp_path):
     assert "ams-step.sh --guarded wiki-index" in unit
     assert "Before=ams-step-stack-backup.service" in unit
     assert "op@pc-a" not in unit  # sources travel in stack.env, never in a unit
+    # 1.31.1: pinned on the RENDERED receipt, comma-separated (stack.env is sourced by bash)
+    se = (out2 / "stack.env").read_text(encoding="utf-8").splitlines()
+    assert "MEM0_WIKI_SOURCES=op@pc-a,op@pc-b" in se and "MEM0_WIKI_PULL_KEY=/k/wiki" in se
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "MEM0_WIKI_SOURCES=%s" in text and "MEM0_WIKI_PULL_KEY=%s" in text
     assert "inherit_from_stack_env WIKI_SOURCES  MEM0_WIKI_SOURCES" in text
 
 
@@ -164,8 +166,10 @@ def test_eval_root_is_validated_and_pcloud_dir_accepted(tmp_path):
     (ev / "retrieval_drift.py").write_text("", encoding="utf-8")
     r, _ = _run(["--bind-ip", "192.0.2.9", "--eval-root", str(tmp_path / "eval"), "--pcloud-dir", "/x/y", "--dry-run"], tmp_path)
     assert r.returncode == 0, r.stderr
-    text = SCRIPT.read_text(encoding="utf-8")
-    assert "MEM0_EVAL_ROOT=%s" in text and "MEM0_PCLOUD_DIR=%s" in text
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--eval-root", str(tmp_path / "eval"), "--pcloud-dir", "/x/y", "--render-only", str(out)], tmp_path)
+    se = (out / "stack.env").read_text(encoding="utf-8").splitlines()
+    assert f"MEM0_EVAL_ROOT={tmp_path / 'eval'}" in se and "MEM0_PCLOUD_DIR=/x/y" in se
 
 
 def test_nft_persistence_unit_is_a_root_oneshot():
@@ -318,10 +322,13 @@ def test_first_install_applies_the_defaults(tmp_path):
     assert "inherited" not in r.stdout
 
 
-def test_stack_env_records_the_zfs_dataset():
-    """The installer writes what a re-run must be able to read back."""
-    sh = SCRIPT.read_text(encoding="utf-8")
-    assert "printf 'MEM0_ZFS_DATASET=%s\\n' \"$ZFS_DATASET\" >> \"$MEM0_DIR/stack.env\"" in sh
+def test_stack_env_records_the_zfs_dataset(tmp_path):
+    """The installer writes what a re-run must be able to read back (pinned on the rendered
+    receipt since 1.31.1, which writes stack.env through install/stack-env.sh)."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--zfs-dataset", "pool/apps/ams", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "MEM0_ZFS_DATASET=pool/apps/ams" in (out / "stack.env").read_text(encoding="utf-8").splitlines()
 
 
 # ---- the hub checkout and the store-judge step (register P4-1b) --------------------------
@@ -418,9 +425,11 @@ def test_the_plan_schema_travels_with_the_deployed_scripts():
 
 
 def test_stack_env_records_the_checkout_and_the_hub():
+    # 1.31.1: the values go through install/stack-env.sh (the rendered receipt is pinned in
+    # test_stack_env_writers.py); what a re-run reads back is still inherited here.
     sh = SCRIPT.read_text(encoding="utf-8")
-    assert "printf 'MEM0_AMS_CHECKOUT=%s\\n' \"$AMS_CHECKOUT\" >> \"$MEM0_DIR/stack.env\"" in sh
-    assert "printf 'MEM0_AMS_HUB=%s\\n' \"$AMS_HUB\" >> \"$MEM0_DIR/stack.env\"" in sh
+    assert 'STACK_ENV_ARGS+=(MEM0_AMS_CHECKOUT="$AMS_CHECKOUT")' in sh
+    assert 'STACK_ENV_ARGS+=(MEM0_AMS_HUB="$AMS_HUB")' in sh
     assert "inherit_from_stack_env AMS_CHECKOUT MEM0_AMS_CHECKOUT --ams-checkout" in sh
     assert "inherit_from_stack_env AMS_HUB      MEM0_AMS_HUB      --ams-hub" in sh
 
