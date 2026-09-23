@@ -813,3 +813,84 @@ function Read-AmJsonFile {
     if ([string]::IsNullOrWhiteSpace($raw)) { throw ('state file is empty (truncated write?): ' + $Path) }
     return ($raw | ConvertFrom-Json)
 }
+
+# ---------------------------------------------------------------- per-store mutex names
+# A Local\ named mutex is global to the logon session, not to a store. With the bare name, a
+# test run's sandbox compactor held the operator's live Local\ams-memory-compact and the real
+# `ams-store sync --once` exited 4 ("the per-PC lock is held"; 2026-09-23). The name is now
+# scoped to the state root, derived EXACTLY as ams-store derives it (internal/lock/scope.go
+# ScopedName): base + '-' + the first 16 hex digits of SHA-256 over the full state-root path
+# with backslashes, no trailing separator, lower case. Both suites pin the same golden vector;
+# if the two derivations ever differ, a Go pass and a compaction of one store stop excluding
+# each other.
+
+$script:AmCompactMutexBase = 'Local\ams-memory-compact'
+
+function Get-AmStoreMutexName {
+    param([Parameter(Mandatory)][string]$Base, [string]$StateRoot = (Join-Path $env:USERPROFILE '.claude\state\automemory'))
+    $canon = [System.IO.Path]::GetFullPath($StateRoot).Replace('/', '\').TrimEnd('\', '/').ToLowerInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash((Get-AmUtf8).GetBytes($canon)) } finally { $sha.Dispose() }
+    $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    return ($Base + '-' + $hex.Substring(0, 16))
+}
+
+# ---------------------------------------------------------------- store hub path (P4-1a)
+# ONE predicate for "this PC's hub path is proven": install/2-windows-config.ps1 step 1c uses it
+# to decide whether the sync hooks and the watcher are registered, step 1d uses the same answer
+# to retire (proven) or keep (not proven) the nightly PowerShell compactor task, and
+# Test-MemoryStack.ps1 R2c uses it to judge that task's absence. Two copies of this decision
+# drifted once: the self-test FAILed a replica right after a clean install because it still
+# expected the task the installer had retired on purpose.
+
+$script:AmHubUser         = 'ams-hub'
+$script:AmHubIdentityName = 'id_ed25519_ams_hub'
+
+function Get-AmHubHostKeyLines {
+    # The hub's host-key lines in a known_hosts file (`ssh-keygen -F`, comment lines dropped).
+    # Empty = the user has never accepted the hub's host key, or the file or ssh-keygen is absent.
+    param([string]$HubHost, [string]$UserKnownHosts)
+    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
+    if (-not $HubHost -or -not (Test-Path -LiteralPath $UserKnownHosts)) { return @() }
+    try {
+        $out = & ssh-keygen -F $HubHost -f $UserKnownHosts 2>$null
+        return @($out | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+    } catch { return @() }
+}
+
+function Get-AmHubPathGaps {
+    # What stands between this PC and a proven hub path; an EMPTY result means proven. Proven =
+    # a hub host is configured, the hub identity key is present, and the hub's host key is in the
+    # user's known_hosts (which the installer seeds into the binary's own known_hosts).
+    param([string]$HubHost, [string]$SshDir = (Join-Path $env:USERPROFILE '.ssh'))
+    if (-not $HubHost) { return @('no store hub configured (-HubHost / the receipt HubHost is empty)') }
+    $gaps = @()
+    $identity = Join-Path $SshDir $script:AmHubIdentityName
+    if (-not (Test-Path -LiteralPath $identity)) { $gaps += "identity key $identity is absent (provision this PC's key on the hub first)" }
+    $kh = Join-Path $SshDir 'known_hosts'
+    if (@(Get-AmHubHostKeyLines -HubHost $HubHost -UserKnownHosts $kh).Count -lt 1) {
+        $gaps += "the hub's host key is not in $kh (accept it once - ssh $($script:AmHubUser)@$HubHost - then re-run)"
+    }
+    return $gaps
+}
+
+function Get-AmCompactorTaskVerdict {
+    # The self-test row for the nightly PowerShell compactor task, mirroring installer step 1d:
+    # absent + hub proven = retired on purpose; absent + hub not proven = the legacy nightly the
+    # installer should have kept is missing; present = the deployed-copy action-shape checks.
+    param([bool]$Present, [string]$TaskArgs = '', [string]$TaskState = '', [string[]]$HubGaps = @())
+    $gaps = @($HubGaps | Where-Object { $_ })
+    if (-not $Present) {
+        if ($gaps.Count -eq 0) {
+            return [PSCustomObject]@{ Status = 'OK'; Detail = 'retired; ams-store gate + sync + hub judge replace it' }
+        }
+        return [PSCustomObject]@{ Status = 'FAIL'; Detail = ('not registered and the hub path is not proven (' + ($gaps -join '; ') + ') - re-run 2-windows-config.ps1 (it keeps the legacy nightly until the hub path is proven)') }
+    }
+    if ($TaskArgs -match '[/\\](Dev|repos|worktrees)[/\\]') {
+        return [PSCustomObject]@{ Status = 'FAIL'; Detail = "LIVE action executes a repo/worktree path, not the deployed copy: $TaskArgs" }
+    }
+    if ($TaskArgs -match 'memory-compact\.ps1') {
+        return [PSCustomObject]@{ Status = 'OK'; Detail = "state=$TaskState; action=deployed memory-compact.ps1" }
+    }
+    return [PSCustomObject]@{ Status = 'WARN'; Detail = "unrecognized action shape: $TaskArgs" }
+}

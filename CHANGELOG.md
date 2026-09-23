@@ -4,6 +4,67 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.3 — the self-test stops failing replicas for things the installer does on purpose; operator keys survive a re-run; a test HOME no longer holds the live store lock
+
+**The compactor row contradicted the installer.** Since 1.25.0, `install/2-windows-config.ps1`
+step 1d removes the nightly `ClaudeCode-MemoryCompactor-5am` task on a box whose store hub path is
+proven, and keeps it where that path is not proven. `Test-MemoryStack.ps1` still reported every
+absent task as `FAIL not registered`, so a replica with `HubHost` set got that FAIL right after a
+clean install (measured 2026-09-22).
+
+- The hub-path predicate now lives in one place, `Get-AmHubPathGaps` in `memory-store-lib.ps1`.
+  "Proven" means a hub host is configured, the hub identity key is present, and the hub's host key
+  is in the user's `known_hosts`. The installer's step 1c computes its refusal list from it, and its
+  known_hosts seeding reads the same `Get-AmHubHostKeyLines`. The self-test row calls it through
+  `Get-AmCompactorTaskVerdict`: absent with the hub path proven is OK (retired), absent without it
+  is FAIL and names the gap, and a present task gets the same action-shape checks as before.
+
+**A replica reported the drift guard dead from a file the brain no longer writes.** A replica
+still carries the `~/.mem0/consolidation-drift.jsonl` it wrote while it was the brain. That file's
+last `guard-dead` record made the `consolidation drift` row FAIL with "consolidations are running
+UNGUARDED", while the brain's guard compared 7/7 canaries every night with zero snapshot
+failures. The row now reads the local log on the brain only, the same rule as `drift guard
+liveness` and as the SessionStart banner since 1.28.4. On a replica it reports the brain's guard
+state from the authority's `/health/deep` for information; the capability manifest row is the one
+that FAILs a dead `drift-guard`.
+
+**`MEM0_BRAIN_SSH` was deleted by every installer re-run.** `wiki-index.sh` reads the brain alias
+from `~/.mem0/stack.env`. No flag sets it, so the operator adds it by hand, and each of the three
+writers rewrites the whole file. `install/stack-env.sh` now lists the operator-owned keys once
+(`STACK_ENV_OPERATOR_KEYS`), and `stack_env_carry` carries them over from the existing file. It
+takes the first occurrence, drops a CR from a hand edit, and the value is still checked as a plain
+token. `1-wsl-services.sh` (a Windows replica's WSL, where the wrapper runs), `linux-replica.sh`
+(a native replica) and `linux-authority.sh` all pass the carried keys to their write. Nothing on the
+brain reads the key today, but re-running that installer is the brain's only deploy path, and a
+deploy must not drop a line the operator wrote.
+
+**A test run held the live store's lock.** The Windows named mutexes `Local\ams-store`,
+`Local\ams-memory-compact` and `Local\ams-store-watch` are global to the logon session,
+whatever the state root. A Pester run's sandbox compactor, running with a temp `USERPROFILE`,
+held `Local\ams-memory-compact`, so the real `ams-store sync --once` exited 4 ("the per-PC lock
+is held") and `install/3-verify.ps1` failed (measured 2026-09-23). Every production mutex name is
+now scoped to its store: the base name, `-`, and the first 16 hex digits of SHA-256 over the
+canonical state root (full path, backslashes, no trailing separator, lower case). The Go side
+(`internal/lock/scope.go`, derived from the lock file's directory) and the compactor's GUARD 0
+(`Get-AmStoreMutexName` in `memory-store-lib.ps1`) derive the same name, and both suites pin one
+golden vector. One store still admits one holder, and two stores no longer exclude each other.
+GUARD 0 now also counts a mutex that already exists as held. `ams-store` opens the mutex without
+owning it (Go moves goroutines between threads), so `WaitOne` alone had let a compaction start
+beside a Go pass on the same store. The binary and the PowerShell scripts must be on the same
+release for the two to exclude each other; the installer puts both on the release `VERSION`
+names in one run.
+
+- Tests: `AmsStoreInstall.Tests.ps1` (the predicate on real `ssh-keygen` known_hosts, and the
+  verdict table), `internal/lock/scope_test.go` (two roots hold at once with the production
+  names, one root still excludes by the file and by the mutex alone, a compactor-held scoped
+  legacy mutex stops a Go pass on its own root only, one watcher per root, the golden vector),
+  `MemoryStoreLib.Tests.ps1` (the same golden vector from PowerShell), `MemoryCompact.Tests.ps1`
+  (GUARD 0 on the sandbox's scoped name, an unowned handle stops it, another store's mutex does
+  not), `InstallerParity.Tests.ps1` (the installer and the self-test both call the shared
+  predicate), `RegressionGuards.Tests.ps1` (the replica branch comes before the local drift log is
+  read), and `test_stack_env_writers.py` (a pre-existing `MEM0_BRAIN_SSH` survives a
+  `--render-only` re-run as a fixed point, `stack_env_carry` on a CRLF file, and every writer's wiring).
+
 ## 1.31.2 — `deploy.sh` refuses a native authority instead of breaking it
 
 **`deploy.sh` is the WSL deploy path, and it ran on the native brain.** On a box whose

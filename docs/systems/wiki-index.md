@@ -36,7 +36,7 @@ the mem0 corpus (a different collection with a different life cycle).
 | --- | --- | --- |
 | `scripts/wsl/wiki-index-build.py` | brain box or a replica's WSL | embeds a `wiki/` snapshot (`WIKI_ROOT`, default `~/wiki-index/wiki`) into `WIKI_QDRANT_HOST:PORT` (default the local loopback) |
 | `scripts/wsl/wiki-search.py` | same | query embedding + top-K JSON lines |
-| `scripts/wsl/wiki-index.sh` | a replica's WSL | `snapshot` (tar of `wiki/` on stdin), `build`, `search` — the last two through an SSH control-socket tunnel to the brain's loopback Qdrant (first free local port from `WIKI_TUNNEL_PORT`, default 16333; closed on exit). The brain alias resolves from `WIKI_BRAIN_SSH`, then `MEM0_BRAIN_SSH` in `stack.env`, then the `~/.ssh/config` Host whose `HostName` is the authority-url's host |
+| `scripts/wsl/wiki-index.sh` | a replica's WSL | `snapshot` (tar of `wiki/` on stdin), `build`, `search` — the last two through an SSH control-socket tunnel to the brain's loopback Qdrant (first free local port from `WIKI_TUNNEL_PORT`, default 16333; closed on exit). The brain alias resolves from `WIKI_BRAIN_SSH`, then `MEM0_BRAIN_SSH` in `stack.env` (no installer flag sets it; the operator adds the line by hand, and since 1.31.3 every `stack.env` writer carries it over on a re-run), then the `~/.ssh/config` Host whose `HostName` is the authority-url's host |
 | `scripts/wsl/wiki-index-nightly.sh` | brain box, chain step `wiki-index` | pulls `wiki/` from the first reachable PC in `MEM0_WIKI_SOURCES`, builds locally |
 | `systemd/ams-step-wiki-index.service` | brain box | `--guarded`, after `index-refresh`, before the stamping `stack-backup`; rendered only when `--wiki-sources` is configured |
 

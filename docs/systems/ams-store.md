@@ -539,7 +539,14 @@ What the Windows installer does, in order, and why the order matters:
    the `-CatchUp` child. A box that cannot prove its hub path keeps the legacy
    nightly, because a store with no judge at all only ever shrinks by truncation.
    `ams-store` takes the legacy mutex beside its own, so the two never race while
-   both exist.
+   both exist. Since 1.31.3 every mutex name is scoped to the store: base name, `-`, and the
+   first 16 hex digits of SHA-256 over the state root (full path, backslashes, no trailing
+   separator, lower case). The Go side is `internal/lock/scope.go` and the PowerShell side
+   is `Get-AmStoreMutexName` in `memory-store-lib.ps1`, and both suites pin one golden
+   vector. A bare `Local\` name is global to the logon session, so a test run's sandbox
+   compactor used to hold the live store's lock and the real `sync --once` exited 4. The
+   compactor also counts a mutex that already exists as held, because `ams-store` opens it
+   without owning it.
 4. **Hooks.** PostToolUse `Write|Edit` runs `ams-store gate` (registered over the two
    legacy markers, so the bash lint and the PowerShell gate are replaced in place);
    SessionStart runs `ams-store sync --once --hub-host <hub>` asynchronously (the

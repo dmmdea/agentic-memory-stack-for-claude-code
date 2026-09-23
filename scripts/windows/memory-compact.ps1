@@ -62,11 +62,16 @@ $ThrottleName = 'memory-compact'
 # Four instances hit one store in the same second, history.git/index.lock failed, and 243
 # receipts landed in nine hours. A named mutex (session-local, released by the OS if the holder
 # dies) makes every concurrent instance exit at once; the survivor does the whole run.
+# 2026-09-23: the name is scoped to THIS store's state root (Get-AmStoreMutexName, derived the
+# way ams-store derives it), so a sandbox or test HOME no longer holds the live store's lock. A
+# mutex that already EXISTS is held too: ams-store opens it without owning it (a Win32 mutex is
+# owned by a thread, and Go moves goroutines between threads), so WaitOne alone let a
+# compaction start while a Go pass held the store (decision Q9 assumed both directions).
 $script:AmInstanceMutex = $null
 try {
     $createdNew = $false
-    $script:AmInstanceMutex = New-Object System.Threading.Mutex($false, 'Local\ams-memory-compact', [ref]$createdNew)
-    if (-not $script:AmInstanceMutex.WaitOne(0)) {
+    $script:AmInstanceMutex = New-Object System.Threading.Mutex($false, (Get-AmStoreMutexName -Base $script:AmCompactMutexBase -StateRoot (Join-Path $env:USERPROFILE '.claude\state\automemory')), [ref]$createdNew)
+    if (-not $createdNew -or -not $script:AmInstanceMutex.WaitOne(0)) {
         Write-MemoryLog -Component $Component -Message ('another compactor instance holds the per-PC lock; exiting (pid ' + $PID + ')')
         $script:AmInstanceMutex.Dispose(); $script:AmInstanceMutex = $null
         exit 0

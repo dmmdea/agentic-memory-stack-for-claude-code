@@ -34,19 +34,22 @@ const StaleAfter = 10 * time.Minute
 // FileName is the lock file's name inside STATE_ROOT.
 const FileName = "ams-store.lock"
 
-// MutexName is the Windows named mutex ams-store itself holds alongside the file lock.
+// MutexName is the BASE of the Windows named mutex ams-store itself holds alongside the file
+// lock; the name actually taken is ScopedName(MutexName, <state root>) (scope.go).
 // COMPACT:60-77 is the precedent: four concurrent instances of the PowerShell compactor
 // produced 243 receipts in nine hours before the mutex existed.
 const MutexName = `Local\ams-store`
 
-// LegacyMutexName is the PowerShell compactor's own mutex. Decision Q9: while both
+// LegacyMutexName is the BASE of the PowerShell compactor's own mutex; both sides take
+// ScopedName(LegacyMutexName, <state root>). Decision Q9: while both
 // implementations exist (the PS originals are not deleted until Phase 5), ams-store
 // takes this one too, so a Go derive and a PowerShell compaction cannot run at once.
 // It is taken AFTER MutexName and released before it, so two processes taking both can
 // never deadlock on each other.
 const LegacyMutexName = `Local\ams-memory-compact`
 
-// WatchMutexName is the watcher's singleton mutex. DESIGN:178.
+// WatchMutexName is the BASE of the watcher's singleton mutex (scoped like the others when
+// SingletonOptions.Path names the state root). DESIGN:178.
 const WatchMutexName = `Local\ams-store-watch`
 
 // WatchFileName is the watcher's singleton lock file, flocked on Linux.
@@ -364,14 +367,18 @@ func writeExclusive(path string, h Holder) error {
 	return f.Close()
 }
 
+// mutexNames resolves the mutexes one Acquire takes. An empty override means the production
+// name SCOPED to this lock's store: the lock file lives in the state root, so its directory is
+// the root (ScopedName). An explicit override is used verbatim - tests isolate through it.
 func mutexNames(opt Options) []string {
+	root := filepath.Dir(opt.Path)
 	primary := opt.MutexName
 	if primary == "" {
-		primary = MutexName
+		primary = ScopedName(MutexName, root)
 	}
 	legacy := opt.LegacyMutexName
 	if legacy == "" {
-		legacy = LegacyMutexName
+		legacy = ScopedName(LegacyMutexName, root)
 	}
 	if legacy == "-" {
 		return []string{primary}

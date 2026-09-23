@@ -74,6 +74,8 @@ var Counterparts = []Counterpart{
 	{"MemoryStoreLib.Tests.ps1", 331, "TestHistory_PerFileRestoreLeavesNewerFiles", ""},
 	{"MemoryStoreLib.Tests.ps1", 345, "TestReceipts_LastJudgeUtcNewestCall", ""},
 	{"MemoryStoreLib.Tests.ps1", 359, "TestReceipts_LastJudgeUtcNilWhenNoCall", ""},
+	{"MemoryStoreLib.Tests.ps1", 367, "TestScopedName_GoldenVectorSharedWithPowerShell", ""},
+	{"MemoryStoreLib.Tests.ps1", 374, "TestScopedLock_TwoStateRootsHoldAtOnce", ""},
 
 	// ---------------- MemoryCompact.Tests.ps1 ----------------
 	{"MemoryCompact.Tests.ps1", 15, "TestDerive_BelowTriggerNoChange", ""},
@@ -90,12 +92,16 @@ var Counterparts = []Counterpart{
 	{"MemoryCompact.Tests.ps1", 176, "TestMigrate_ReadBackMismatchKeepsLine", ""},
 	{"MemoryCompact.Tests.ps1", 187, "TestDerive_HygieneWithoutJudge", ""},
 	{"MemoryCompact.Tests.ps1", 206, "TestFeasibility_ProtectedSetOverflow", ""},
-	{"MemoryCompact.Tests.ps1", 225, "TestLock_ContenderSkipsImmediately", ""},
-	{"MemoryCompact.Tests.ps1", 238, "TestLock_FreeLockRuns", ""},
-	{"MemoryCompact.Tests.ps1", 248, "TestJudge_OncePerStorePerWindow_Skips", ""},
-	{"MemoryCompact.Tests.ps1", 261, "TestJudge_OncePerStorePerWindow_Calls", ""},
-	{"MemoryCompact.Tests.ps1", 273, "TestNightly_HubOnceNightly", ""},
-	{"MemoryCompact.Tests.ps1", 287, "TestJudge_ForceBypassesWindow", ""},
+	{"MemoryCompact.Tests.ps1", 234, "TestLock_ContenderSkipsImmediately", ""},
+	// 2026-09-23: the compactor mutex is scoped to the state root, and an unowned handle (how
+	// ams-store holds it) counts as held. The Go side of both obligations:
+	{"MemoryCompact.Tests.ps1", 247, "TestScopedLock_SameStateRootExcludesByMutexAlone", ""},
+	{"MemoryCompact.Tests.ps1", 259, "TestScopedLock_LegacyMutexIsScopedTheWayTheCompactorNamesIt", ""},
+	{"MemoryCompact.Tests.ps1", 271, "TestLock_FreeLockRuns", ""},
+	{"MemoryCompact.Tests.ps1", 281, "TestJudge_OncePerStorePerWindow_Skips", ""},
+	{"MemoryCompact.Tests.ps1", 294, "TestJudge_OncePerStorePerWindow_Calls", ""},
+	{"MemoryCompact.Tests.ps1", 306, "TestNightly_HubOnceNightly", ""},
+	{"MemoryCompact.Tests.ps1", 320, "TestJudge_ForceBypassesWindow", ""},
 
 	// ---------------- MemoryCompactRobustness.Tests.ps1 ----------------
 	{"MemoryCompactRobustness.Tests.ps1", 9, "TestHygiene_UnparsablePointerNotDuplicatedNoGrowth", ""},

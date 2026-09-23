@@ -247,3 +247,49 @@ def test_every_sourcing_consumer_accepts_the_rendered_receipt_and_rejected_the_l
     bad = _source_like("deploy.sh", target)
     assert bad.returncode != 0
     assert "op@pc-b: command not found" in bad.stderr
+
+
+# --- (5) operator-owned keys survive a re-run ------------------------------------------------
+# MEM0_BRAIN_SSH (the brain's SSH alias for scripts/wsl/wiki-index.sh) is written by the operator
+# by hand; no installer flag sets it. Every writer rewrites the whole file, so before 1.31.3 any
+# re-run silently deleted it and the replica's wiki build/search lost its brain alias.
+
+def test_a_pre_existing_brain_ssh_survives_a_render_only_rerun(tmp_path):
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\nMEM0_BRAIN_SSH=op@brain-alias\n")
+    assert r.returncode == 0, r.stderr
+    assert "MEM0_BRAIN_SSH=op@brain-alias" in _lines(se)
+    assert "MEM0_BRAIN_SSH carried over from ~/.mem0/stack.env" in r.stdout
+    # a fixed point: re-running from the rendered file keeps it exactly once
+    (tmp_path / "home" / ".mem0" / "stack.env").write_text(se.read_text(encoding="utf-8"), encoding="utf-8")
+    r2, se2 = _render(tmp_path, name="render2")
+    assert r2.returncode == 0, r2.stderr
+    assert [ln for ln in _lines(se2) if ln.startswith("MEM0_BRAIN_SSH=")] == ["MEM0_BRAIN_SSH=op@brain-alias"]
+
+
+def test_no_brain_ssh_is_invented_when_the_receipt_has_none(tmp_path):
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\n")
+    assert r.returncode == 0, r.stderr
+    assert not any(ln.startswith("MEM0_BRAIN_SSH") for ln in _lines(se))
+
+
+def test_stack_env_carry_prints_only_recorded_operator_keys(tmp_path):
+    f = tmp_path / "stack.env"
+    # a hand edit in a Windows editor leaves a CR; the carried value must be the plain token
+    f.write_bytes(b"MEM0_ROLE=replica\r\nMEM0_BRAIN_SSH=op@brain\r\nMEM0_BRAIN_SSH=second\r\n")
+    out = subprocess.run([BASH, "-c", f'. "{LIB.as_posix()}"; stack_env_carry "{f.as_posix()}"'],
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "MEM0_BRAIN_SSH=op@brain\n"
+    none = subprocess.run([BASH, "-c", f'. "{LIB.as_posix()}"; stack_env_carry "{(tmp_path / "absent").as_posix()}"'],
+                          capture_output=True, text=True, timeout=30)
+    assert none.returncode == 0 and none.stdout == ""
+
+
+@pytest.mark.parametrize("writer", ["install/1-wsl-services.sh", "install/linux-authority.sh", "install/linux-replica.sh"])
+def test_every_writer_carries_the_operator_keys_into_its_write(writer):
+    """1-wsl-services.sh and linux-replica.sh cannot run hermetically here, so their wiring is
+    pinned by text: the carried keys must reach the stack_env_write argument list."""
+    text = (REPO_ROOT / writer).read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert re.search(r'stack_env_carry "\$[A-Z_]*(HOME|MEM0_DIR)[A-Z_]*/(\.mem0/)?stack\.env"', code), writer
+    assert '"${STACK_ENV_CARRY[@]}"' in code, f"{writer} must pass the carried keys to its stack.env write"

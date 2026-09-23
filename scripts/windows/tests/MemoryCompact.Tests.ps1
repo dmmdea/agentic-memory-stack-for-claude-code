@@ -222,18 +222,51 @@ Describe 'feasibility: protected-set overflow fails loud' {
 
 
 Describe 'GUARD 0: one compactor instance per PC' {
+    BeforeAll {
+        # The mutex is scoped to the sandbox's own state root (2026-09-23). These tests never
+        # touch the operator's live name: before the scoping, every compactor scenario in this
+        # file took the bare Local\ams-memory-compact and made the live `ams-store sync` exit 4.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1')
+        function script:Get-SandboxMutexName($Sandbox) {
+            Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot (Join-Path $Sandbox.Home '.claude\state\automemory')
+        }
+    }
     It 'exits 0 with no receipt and a log line when another instance holds the per-PC mutex' {
         $sb = New-Sandbox
         $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
         Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
         $created = $false
-        $m = New-Object System.Threading.Mutex($true, 'Local\ams-memory-compact', [ref]$created)
+        $m = New-Object System.Threading.Mutex($true, (script:Get-SandboxMutexName $sb), [ref]$created)
         try {
             $r = Invoke-Compactor -Sandbox $sb
         } finally { $m.ReleaseMutex(); $m.Dispose() }
         $r.ExitCode | Should -Be 0
         @($r.Receipts).Count | Should -Be 0
         (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'another compactor instance holds the per-PC lock'
+    }
+    It 'also yields to an UNOWNED handle on its store''s mutex (how ams-store holds it, decision Q9)' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $created = $false
+        $m = New-Object System.Threading.Mutex($false, (script:Get-SandboxMutexName $sb), [ref]$created)
+        try {
+            $r = Invoke-Compactor -Sandbox $sb
+        } finally { $m.Dispose() }
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 0 -Because 'a Go pass opens the mutex without owning it; WaitOne alone let the compaction run beside it'
+    }
+    It 'is NOT stopped by the mutex of ANOTHER store (a sandbox never blocks the live store, nor the reverse)' {
+        $sb = New-Sandbox
+        $other = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $created = $false
+        $m = New-Object System.Threading.Mutex($true, (script:Get-SandboxMutexName $other), [ref]$created)
+        try {
+            $r = Invoke-Compactor -Sandbox $sb
+        } finally { $m.ReleaseMutex(); $m.Dispose() }
+        @($r.Receipts).Count | Should -BeGreaterThan 0
     }
     It 'runs and writes a receipt when the mutex is free' {
         $sb = New-Sandbox

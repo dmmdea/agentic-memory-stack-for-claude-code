@@ -449,6 +449,21 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
         $src.IndexOf('Register-ScheduledTask -TaskName $dedupTaskName') | Should -BeLessThan $src.IndexOf('} # end brain-role gate')
     }
 
+    It 'the installer and Test-MemoryStack judge the retired compactor with ONE hub-path predicate (2026-09-22 drift)' {
+        # A replica with HubHost got "compactor task: not registered" FAIL right after a clean
+        # install: the installer retired the task (hub proven) while the self-test still demanded
+        # it. Both now call Get-AmHubPathGaps from memory-store-lib.ps1; neither may re-derive it.
+        $src = Get-Content $installerPath -Raw
+        $src | Should -Match ([regex]::Escape(". (Join-Path `$RepoRoot 'scripts\windows\memory-store-lib.ps1')"))
+        $src | Should -Match ([regex]::Escape('$missing = @(Get-AmHubPathGaps -HubHost $HubHost -SshDir $amsSshDir)'))
+        $src.IndexOf('$missing = @(Get-AmHubPathGaps') | Should -BeLessThan $src.IndexOf('$amsSyncReady = $true') -Because 'the predicate decides $amsSyncReady, which step 1d acts on'
+        $src | Should -Not -Match 'if \(\$seeded -lt 1\)' -Because 'the host-key half of the predicate lives in the lib only'
+        $tms = Get-Content $script:tmsPath -Raw
+        $tms | Should -Match 'Get-AmHubPathGaps -HubHost \$cHub'
+        $tms | Should -Match 'Get-AmCompactorTaskVerdict -Present \$false -HubGaps \$cGaps'
+        $tms | Should -Not -Match "'auto-memory compactor task' 'FAIL' 'not registered - re-run 2-windows-config\.ps1'" -Because 'an absent task is not a FAIL on a box whose hub path is proven'
+    }
+
     It 'the write-time index gate is the store binary (ams-store gate) on PostToolUse, registered over both legacy markers' {
         # 2026-09-03: the bash advisory was ignored live; 2026-09-16 (P4-1a): the Go gate replaces
         # the PowerShell gate in place - both legacy markers stay so the previous registrations are

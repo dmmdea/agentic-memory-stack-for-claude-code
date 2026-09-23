@@ -362,3 +362,20 @@ Describe 'Get-AmStoreRunHistory.LastJudgeUtc' {
         (Get-AmStoreRunHistory -ReceiptPath $p -Workspace 'ws').LastJudgeUtc | Should -BeNullOrEmpty
     }
 }
+
+Describe 'per-store mutex name (Get-AmStoreMutexName) - byte-identical to ams-store ScopedName' {
+    It 'matches the golden vector ams-store/internal/lock/scope_test.go pins, whatever the spelling of the root' {
+        # If this and the Go test ever disagree, a Go pass and a compaction of one store stop
+        # excluding each other.
+        foreach ($root in @('D:\Stores\Example\state\automemory', 'd:/stores/EXAMPLE/state/automemory/', 'D:\Stores\Example\state\automemory\')) {
+            Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot $root | Should -Be 'Local\ams-memory-compact-f870ee63903ab820'
+        }
+    }
+    It 'differs between two state roots and is stable for one' {
+        $a = Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot (Join-Path $TestDrive 'a')
+        $b = Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot (Join-Path $TestDrive 'b')
+        $a | Should -Not -Be $b
+        Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot (Join-Path $TestDrive 'a') | Should -Be $a
+        $a | Should -Match '^Local\\ams-memory-compact-[0-9a-f]{16}$'
+    }
+}

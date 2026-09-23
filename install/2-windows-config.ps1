@@ -675,9 +675,12 @@ if ($LASTEXITCODE -ne 0) {
 $amsStateRoot  = Join-Path $StateDir 'automemory'
 $amsHistoryDir = Join-Path $amsStateRoot 'history.git'
 $amsProjects   = Join-Path $ClaudeDir 'projects'
+# The hub-path predicate (Get-AmHubPathGaps) and its constants live in memory-store-lib.ps1 so
+# Test-MemoryStack.ps1 judges the retired compactor task with the same answer this block
+# acts on (steps 1c and 1d below). The lib only defines functions and constants at load.
+. (Join-Path $RepoRoot 'scripts\windows\memory-store-lib.ps1')
 $amsSshDir     = Join-Path $env:USERPROFILE '.ssh'
-$amsIdentity   = Join-Path $amsSshDir 'id_ed25519_ams_hub'
-$amsHubUser    = 'ams-hub'
+$amsHubUser    = $script:AmHubUser
 $amsHubRepo    = 'ams-store.git'
 
 function Set-AmsHubSshConfig {
@@ -709,13 +712,7 @@ function Initialize-AmsKnownHosts {
     # (`ssh-keygen -F`), overwriting the state copy so a rotated key converges. Returns the
     # number of key lines seeded; 0 = the user has never accepted the hub's host key.
     param([string]$HubHost, [string]$UserKnownHosts, [string]$StateKnownHosts)
-    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
-    if (-not (Test-Path -LiteralPath $UserKnownHosts)) { return 0 }
-    $lines = @()
-    try {
-        $out = & ssh-keygen -F $HubHost -f $UserKnownHosts 2>$null
-        $lines = @($out | Where-Object { $_ -and $_ -notmatch '^\s*#' })
-    } catch { return 0 }
+    $lines = @(Get-AmHubHostKeyLines -HubHost $HubHost -UserKnownHosts $UserKnownHosts)
     if ($lines.Count -eq 0) { return 0 }
     $dir = Split-Path -Parent $StateKnownHosts
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -769,9 +766,8 @@ if (-not $HubHost) {
         Write-Host "    ssh config: Match block current"
     }
     $seeded = Initialize-AmsKnownHosts -HubHost $HubHost -UserKnownHosts (Join-Path $amsSshDir 'known_hosts') -StateKnownHosts (Join-Path $amsStateRoot 'known_hosts')
-    $missing = @()
-    if (-not (Test-Path -LiteralPath $amsIdentity)) { $missing += "identity key $amsIdentity is absent (provision this PC's key on the hub first)" }
-    if ($seeded -lt 1) { $missing += "the hub's host key is not in $amsSshDir\known_hosts (accept it once - ssh $amsHubUser@$HubHost - then re-run)" }
+    # THE hub-path predicate, shared with Test-MemoryStack.ps1 R2c (memory-store-lib.ps1).
+    $missing = @(Get-AmHubPathGaps -HubHost $HubHost -SshDir $amsSshDir)
     if ($missing.Count -gt 0) {
         Write-Host "    REFUSED: sync hooks and the watcher are NOT registered on this box:" -ForegroundColor Red
         foreach ($m in $missing) { Write-Host "      - $m" -ForegroundColor Red }

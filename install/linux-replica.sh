@@ -177,8 +177,12 @@ BRAIN_BACKUP_DIR='$BRAIN_BACKUP_DIR'
 BRAIN_WSL='$BRAIN_WSL'
 REPLICA_CACHE='$MEM0_DIR/replica-snapshots'
 ENV
+    # 1.31.3: operator-owned keys (install/stack-env.sh) are carried over, or this rewrite deletes
+    # them: MEM0_BRAIN_SSH is the brain alias this replica's wiki-index.sh tunnels through.
+    mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$MEM0_DIR/stack.env")
+    for kv in "${STACK_ENV_CARRY[@]}"; do echo "    ${kv%%=*} carried over from $MEM0_DIR/stack.env: ${kv#*=}"; done
     stack_env_write "$MEM0_DIR/stack.env" MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native \
-        MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND=127.0.0.1 MEM0_ROLE=replica \
+        MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND=127.0.0.1 MEM0_ROLE=replica "${STACK_ENV_CARRY[@]}" \
         || fail "refusing to write $MEM0_DIR/stack.env (a value is not a plain token; see above)"
     umask 022
     echo "    role=replica; replica.env + stack.env written"

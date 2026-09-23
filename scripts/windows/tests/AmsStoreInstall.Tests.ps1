@@ -21,6 +21,9 @@ BeforeAll {
         if (-not $m.Success) { throw "function $Name not found in $Path" }
         $m.Value
     }
+    # The installer dot-sources memory-store-lib.ps1 for the shared hub-path predicate
+    # (Get-AmHubHostKeyLines / Get-AmHubPathGaps); the extracted functions need it too.
+    . (Join-Path $script:winDir 'memory-store-lib.ps1')
     foreach ($n in 'Get-AmsFileSha256', 'Read-AmsSumsHash', 'Set-AmsHubSshConfig', 'Initialize-AmsKnownHosts', 'Initialize-AmsHistoryRemote') {
         . ([scriptblock]::Create((script:Get-FunctionText -Path $script:installer -Name $n)))
     }
@@ -159,5 +162,65 @@ Describe 'Q-F: the PowerShell receipt reader tolerates the Go binary''s receipt 
         $h.LastStatus | Should -Be 'no-op' -Because 'the dry_run row is skipped and the Go no-op row is the newest real outcome'
         $h.SkipStreak | Should -Be 0
         $h.LastJudgeUtc | Should -Be ([DateTime]::Parse('2026-09-14T05:00:00.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal))
+    }
+}
+
+Describe 'store hub path predicate (Get-AmHubPathGaps) - one answer for the installer and the self-test' {
+    BeforeAll {
+        $script:haveKeygen = [bool](Get-Command ssh-keygen -ErrorAction SilentlyContinue)
+        function script:New-HubSshDir {
+            # An ssh dir holding (optionally) the hub identity and a known_hosts that (optionally)
+            # carries a real key line for the hub host.
+            param([string]$Name, [switch]$Identity, [switch]$HostKey)
+            $dir = Join-Path $TestDrive $Name
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            & ssh-keygen -q -t ed25519 -N '' -f (Join-Path $dir 'k') | Out-Null
+            $pub = (Get-Content -LiteralPath (Join-Path $dir 'k.pub') -Raw).Trim()
+            if ($Identity) { Copy-Item -LiteralPath (Join-Path $dir 'k') -Destination (Join-Path $dir 'id_ed25519_ams_hub') }
+            $kh = "other.test $pub`n"
+            if ($HostKey) { $kh += "hub.test $pub`n" }
+            [System.IO.File]::WriteAllText((Join-Path $dir 'known_hosts'), $kh)
+            return $dir
+        }
+    }
+    It 'no hub host is a gap on its own (the installer keeps the legacy nightly)' {
+        @(Get-AmHubPathGaps -HubHost '' -SshDir (Join-Path $TestDrive 'nothing')).Count | Should -Be 1
+        (Get-AmHubPathGaps -HubHost '' -SshDir (Join-Path $TestDrive 'nothing')) | Should -Match 'HubHost'
+    }
+    It 'is proven only with the identity key AND the hub host key in the user known_hosts' {
+        if (-not $script:haveKeygen) { Set-ItResult -Skipped -Because 'ssh-keygen is not on PATH'; return }
+        @(Get-AmHubPathGaps -HubHost 'hub.test' -SshDir (script:New-HubSshDir -Name 'hp-ok' -Identity -HostKey)).Count | Should -Be 0
+        $noId = @(Get-AmHubPathGaps -HubHost 'hub.test' -SshDir (script:New-HubSshDir -Name 'hp-noid' -HostKey))
+        $noId.Count | Should -Be 1
+        $noId[0] | Should -Match 'identity key'
+        $noKh = @(Get-AmHubPathGaps -HubHost 'hub.test' -SshDir (script:New-HubSshDir -Name 'hp-nokh' -Identity))
+        $noKh.Count | Should -Be 1
+        $noKh[0] | Should -Match 'host key'
+        @(Get-AmHubPathGaps -HubHost 'hub.test' -SshDir (script:New-HubSshDir -Name 'hp-none')).Count | Should -Be 2
+    }
+    It 'Get-AmHubHostKeyLines returns only the hub host''s lines (the count the installer seeds)' {
+        if (-not $script:haveKeygen) { Set-ItResult -Skipped -Because 'ssh-keygen is not on PATH'; return }
+        $d = script:New-HubSshDir -Name 'hp-lines' -Identity -HostKey
+        @(Get-AmHubHostKeyLines -HubHost 'hub.test' -UserKnownHosts (Join-Path $d 'known_hosts')).Count | Should -Be 1
+        @(Get-AmHubHostKeyLines -HubHost 'absent.test' -UserKnownHosts (Join-Path $d 'known_hosts')).Count | Should -Be 0
+        @(Get-AmHubHostKeyLines -HubHost 'hub.test' -UserKnownHosts (Join-Path $d 'no-such-file')).Count | Should -Be 0
+    }
+}
+
+Describe 'compactor task verdict (Get-AmCompactorTaskVerdict) mirrors installer step 1d' {
+    It 'absent + hub proven = OK: retired on purpose (the 2026-09-22 false FAIL on a replica)' {
+        $v = Get-AmCompactorTaskVerdict -Present $false -HubGaps @()
+        $v.Status | Should -Be 'OK'
+        $v.Detail | Should -Match 'retired'
+    }
+    It 'absent + hub NOT proven = FAIL, naming what is missing' {
+        $v = Get-AmCompactorTaskVerdict -Present $false -HubGaps @('identity key X is absent')
+        $v.Status | Should -Be 'FAIL'
+        $v.Detail | Should -Match 'identity key X is absent'
+    }
+    It 'present = the action-shape checks, whatever the hub state' {
+        (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\Stack\scripts\memory-compact.ps1' -TaskState 'Ready' -HubGaps @('g')).Status | Should -Be 'OK'
+        (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File D:\Dev\repo\scripts\windows\memory-compact.ps1' -HubGaps @()).Status | Should -Be 'FAIL'
+        (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\x\other.ps1' -HubGaps @()).Status | Should -Be 'WARN'
     }
 }
