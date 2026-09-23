@@ -106,6 +106,14 @@ The retry queue (`~/.claude/state/mem0-post-failures.jsonl`). Since v1.23 a fail
 
 The `episodic.db` SQLite + FTS5 sidecar that records one episode per session (goal, summary, state) linked to the mem0 facts it produced — the temporal/narrative layer that answers questions vector search cannot ("what was I working on last Tuesday?"). See [episodic.md](systems/episodic.md).
 
+## Machine Turn
+
+A `UserPromptSubmit` event that no person typed: a background task notification, whose prompt starts with `<task-notification>` whether it opens its own turn or was queued behind a running one. It keeps the episode checkpoint and gets no `[MEMORY CONTEXT]` block (C10). See [memory-retrieval.md](flows/memory-retrieval.md).
+
+## Session Injection State
+
+The per-session record (`~/.claude/state/mem0-injected-<session_id>.json`) of what the per-prompt block has already shown: hashes of the memory lines, plus one hash each for the goals and frontier-questions sections. Both prompt paths read it so a session is not shown the same line twice. PreCompact deletes it (SessionStart `compact` or `clear` repeats the delete as a backstop), because compaction discards the blocks it describes. When the delete fails, the reset overwrites the file with an empty state. When that fails too, it writes a compaction marker (`.compacted`), and the reader ignores any state saved before it. See [memory-retrieval.md](flows/memory-retrieval.md).
+
 ## Open Question
 
 A declarative uncertainty raised but left unanswered in a session, tracked cross-session in the open_questions registry (FTS5 search + open/resolved/abandoned/duplicate lifecycle). It operationalizes Epistemic Reachability — knowing what you don't know. See [open-questions.md](systems/open-questions.md).

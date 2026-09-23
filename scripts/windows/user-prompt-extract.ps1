@@ -334,6 +334,13 @@ if ($script:DaemonServedBundle) {
     # v0.20 A.5: the daemon already extracted it from the same transcript path
     $sessionId = $fastSession
 }
+if ((-not $sessionId) -and (Test-FunctionAvailable 'Get-TranscriptSessionId')) {
+    # C10 cleanup: the ONE lib derivation, shared with the daemon and the compaction reset, so the
+    # injection-state file is always keyed the same way. The inline copy below only serves a
+    # missing-lib deploy, where no state file is ever read or written.
+    $sessionId = Get-TranscriptSessionId -TranscriptPath ([string]$transcriptPath)
+    if ($sessionId -like 'unknown-*') { Write-Log "WARN: could not extract UUID session_id from path '$transcriptPath', using '$sessionId'" }
+}
 if ((-not $sessionId) -and $transcriptPath) {
     $basename = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
     # Transcript filename is the session UUID (e.g. a71c302b-ecb7-413c-874f-aacd5955e3c5)
@@ -424,6 +431,14 @@ if ($prompt -and $prompt.Length -gt 5) {
     $isTrivial = $wordCount -lt 3 -or $trivial -contains $promptForSearch.ToLower().Trim()
 }
 
+# C10 (2026-09-22): a background task notification is a machine turn. It keeps the 0.A checkpoint
+# (the checkpoint-only POST below, like a trivial prompt) and gets no block. Same lib predicate
+# as the daemon; with no lib there is no renderer either, so nothing could be emitted anyway.
+$isMachineTurn = $false
+if (Test-FunctionAvailable 'Test-MachineTurnPrompt') {
+    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt $prompt) } catch { $isMachineTurn = $false; Write-Log "0.D machine-turn classifier failed ($($_.Exception.Message)); treating the prompt as human" }
+}
+
 # v0.18 MED-16: proactive-search rate-limit (1s cooldown via state file).
 # Closes the rapid-fire DoS vector: each substantive prompt fires a mem0
 # search fan-out server-side; a prompt flood multiplies that load. When
@@ -461,10 +476,11 @@ try {
 $contextBlock = $null
 if ($sw.ElapsedMilliseconds -gt $BudgetMs) { Write-Log "H9: budget exceeded before network call ($($sw.ElapsedMilliseconds)ms)"; exit 0 }
 
-if ((-not $isTrivial) -and (-not $rateLimited)) {
+if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
     # v0.19 L2 (MED-16): consume the cooldown token HERE — only when proactive
     # surfacing actually fires, never for prompts that skip it.
     try { if ($rateLimitState) { [System.IO.File]::WriteAllText($rateLimitState, [string][System.DateTime]::Now.ToFileTimeUtc()) } } catch {}
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
     try {
         $bundleBody = $script:Jss.Serialize(@{
             session_id            = $sessionId
@@ -494,16 +510,20 @@ if ((-not $isTrivial) -and (-not $rateLimited)) {
 
         # Render [MEMORY CONTEXT] — client-side admission Layers 1/2/3 applied
         # inside (Select-AdmittedMemoryResults); rejection audit unchanged.
-        if (Test-FunctionAvailable 'Format-MemoryContextBlock') {
+        if (Test-FunctionAvailable 'Format-SessionMemoryContextBlock') {
             # v0.22 D: render per tier (resolved above: sidecar -> transcript ->
             # frontier). frontier/mid = full format; small = flat + legend.
+            # C10: session-deduped, from the same state file the daemon path uses.
+            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource -SessionId $sessionId -StateDir $stateDir -RequestStartTicks $reqStartTicks
+        } elseif (Test-FunctionAvailable 'Format-MemoryContextBlock') {
             $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $BundleSource
         }
     } catch {
         Write-Log "0.A/0.D bundle FAILED for session=$sessionId : $($_.Exception.Message)"
     }
 } else {
-    if ($rateLimited) { Write-Log "0.D rate-limited: proactive surfacing skipped (cooldown ${cooldownMs}ms)" }
+    if ($isMachineTurn) { Write-Log "0.D machine turn (task notification): checkpoint only, no block" }
+    elseif ($rateLimited) { Write-Log "0.D rate-limited: proactive surfacing skipped (cooldown ${cooldownMs}ms)" }
     try {
         $body = $script:Jss.Serialize(@{
             session_id            = $sessionId

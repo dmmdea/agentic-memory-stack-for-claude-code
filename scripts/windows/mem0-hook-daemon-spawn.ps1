@@ -48,6 +48,30 @@ try {
                 # throws here and the whole block fails open (no sidecar).
                 $ssScriptDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
                 . ([System.IO.Path]::Combine($ssScriptDir, 'user-prompt-lib.ps1'))
+                # C10 (2026-09-22): after a compaction the session has lost every block it was
+                # shown, so its per-prompt dedupe state is cleared and the next prompt re-surfaces
+                # everything. This is the backstop for the PreCompact reset in stop-extract.ps1
+                # (this hook is async, so it can land after the first post-compaction prompt; the
+                # cost is one extra re-surface, never a lost one). 'clear' resets too: the context
+                # is gone, and the reset is a no-op when the session id is a new one. 'resume' keeps
+                # the state, because a resumed context still holds the blocks it was shown.
+                try {
+                    $ssSource = $null
+                    try { $ssSource = [string]$ssEvent.source } catch { $ssSource = $null }
+                    if (($ssSource -eq 'compact') -or ($ssSource -eq 'clear')) {
+                        $ssTp = $null
+                        try { $ssTp = [string]$ssEvent.transcript_path } catch { $ssTp = $null }
+                        # each reset outcome (removed / truncated / invalidated / FAILED) is logged by the lib
+                        $ssOutcomes = @(Clear-SessionInjectionStateForHook -SessionId $ssSid -TranscriptPath $ssTp)
+                    }
+                } catch {
+                    try {
+                        $ssLogDir = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'logs')
+                        if (-not [System.IO.Directory]::Exists($ssLogDir)) { [void][System.IO.Directory]::CreateDirectory($ssLogDir) }
+                        [System.IO.File]::AppendAllText([System.IO.Path]::Combine($ssLogDir, 'user-prompt-extract.log'),
+                            '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] C10 SessionStart reset FAILED: ' + $_.Exception.Message + [System.Environment]::NewLine)
+                    } catch {}
+                }
                 $ssTier = Resolve-ModelTier -Model $ssModel -ConfigPath ([System.IO.Path]::Combine($ssScriptDir, 'model-tiers.json'))
                 if ([string]::IsNullOrWhiteSpace($ssTier)) { $ssTier = 'frontier' }
                 $ssInit = $null
@@ -67,7 +91,16 @@ try {
             }
         }
     }
-} catch {}
+} catch {
+    # C10 review: this block also hosts the compaction reset (it dot-sources the lib), so a failure
+    # here is logged, never swallowed. The daemon spawn below still runs.
+    try {
+        $ssLogDir2 = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'logs')
+        if (-not [System.IO.Directory]::Exists($ssLogDir2)) { [void][System.IO.Directory]::CreateDirectory($ssLogDir2) }
+        [System.IO.File]::AppendAllText([System.IO.Path]::Combine($ssLogDir2, 'user-prompt-extract.log'),
+            '[' + [System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + '] SessionStart sidecar/C10 reset block FAILED (no sidecar, no reset): ' + $_.Exception.Message + [System.Environment]::NewLine)
+    } catch {}
+}
 
 # v0.20 Final (adversarial-review HIGH): exe self-heal. settings.json registers
 # UserPromptSubmit at the bare exe path with no fallback command — on a DR

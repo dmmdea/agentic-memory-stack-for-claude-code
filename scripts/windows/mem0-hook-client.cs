@@ -47,6 +47,7 @@
 
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Cryptography;
@@ -60,6 +61,18 @@ static class HookClient
 
     static string ScriptDir;             // exe's own dir = deployed scripts dir
 
+    // C10 (2026-09-22): true when the hook stdin's top-level prompt is a background task
+    // notification (a MACHINE turn). Used on the DAEMON-SERVED path only: a block the daemon
+    // returns for a machine turn is withheld and the discard is logged (bytes + reason). This is
+    // defense in depth on the fast path: the matching-hash daemon applies the same lib predicate
+    // (an older daemon never gets here, the handshake sends it to the fallback), so a withheld
+    // block in the log means a daemon-side regression worth a look. The inline
+    // fallback is NOT double-gated: the child parsed the real JSON with the lib's own predicate
+    // and already emits nothing on a machine turn, so its output is relayed as is. The daemon
+    // transaction and the fallback still run either way (the 0.A checkpoint lives there).
+    static bool MachineTurn;
+    const string MachineTurnMarker = "<task-notification>";
+
     static int Main()
     {
         // Never block the prompt: a crash anywhere still exits 0 (empty output).
@@ -72,6 +85,8 @@ static class HookClient
 
         byte[] stdin = ReadAllStdin();
         if (stdin == null || stdin.Length == 0) return 0;  // PS inline also no-ops on empty stdin
+
+        MachineTurn = IsMachineTurnStdin(stdin);
 
         string pipeName = Environment.GetEnvironmentVariable("MEM0_HOOK_PIPE");
         if (string.IsNullOrEmpty(pipeName)) pipeName = "mem0-hook-daemon";
@@ -117,8 +132,14 @@ static class HookClient
 
         // SUCCESS: emit the daemon-rendered block (raw bytes + CRLF — the PS
         // client's [Console]::Out.WriteLine equivalent).
-        if (contextBytes != null && contextBytes.Length > 0) WriteAdditionalContext(contextBytes);
-        Log("0.A+0.D served by daemon (exe): session=" + (sid ?? "?") + " " + (diag ?? "") + " exe_ms=" + sw.ElapsedMilliseconds);
+        if (contextBytes != null && contextBytes.Length > 0)
+        {
+            if (MachineTurn)
+                Log("C10: withheld " + contextBytes.Length + " bytes of daemon context: the prompt is a task notification (machine turn); session=" + (sid ?? "?"));
+            else
+                WriteAdditionalContext(contextBytes);
+        }
+        Log("0.A+0.D served by daemon (exe): session=" + (sid ?? "?") + " " + (diag ?? "") + (MachineTurn ? " machine_turn=1" : "") + " exe_ms=" + sw.ElapsedMilliseconds);
 
         // Phase 0.B pre-gates: the decision verdict (needs_0b) is computed
         // DAEMON-side under the combined handshake (v0.21 Phase B M4) — the C#
@@ -446,6 +467,141 @@ static class HookClient
         }
         sb.Append('"');
         return sb.ToString();
+    }
+
+    // ------------------------------------------------------ C10 machine turn
+
+    // Is the hook's TOP-LEVEL prompt a background task notification? Mirrors lib
+    // Test-MachineTurnPrompt and hook_contract.is_machine_turn_prompt; tests\fixtures\
+    // machine-turn-prompts.json is the corpus all three are tested against. The exe does not load a
+    // JSON serializer (tens of ms on the hot path), so it walks the document itself:
+    //   - depth-aware: only a "prompt" key of the top-level object counts, so a nested "prompt"
+    //     (in any object or array, before or after) can never flip the verdict;
+    //   - leading whitespace (literal or \n \r \t \f \u000b \u0020 escapes) is skipped without
+    //     any length cap, exactly like the PS TrimStart / Python lstrip;
+    //   - the prompt string must be TERMINATED: truncated stdin fails open (read as human).
+    // Any failure reads as a human prompt, which keeps today's behavior, and is logged.
+    static bool IsMachineTurnStdin(byte[] stdin)
+    {
+        try
+        {
+            string s = Encoding.UTF8.GetString(stdin);
+            int valueStart = FindTopLevelStringValue(s, "prompt");
+            if (valueStart < 0) return false;
+            return JsonStringStartsWithMarker(s, valueStart);
+        }
+        catch (Exception ex)
+        {
+            Log("C10: machine-turn scan failed (" + ex.GetType().Name + ": " + ex.Message + "); treating the prompt as human");
+            return false;
+        }
+    }
+
+    static bool IsJsonWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+    static bool IsLeadingWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v'; }
+
+    // Index of the closing quote of the JSON string whose opening quote is at i; -1 if unterminated.
+    static int SkipJsonString(string s, int i)
+    {
+        int j = i + 1;
+        while (j < s.Length)
+        {
+            char c = s[j];
+            if (c == '\\') { j += 2; continue; }
+            if (c == '"') return j;
+            j++;
+        }
+        return -1;
+    }
+
+    // Index just past the opening quote of the string value of `key` in the TOP-LEVEL object, or -1
+    // (key absent, value not a string, document not an object, or malformed/truncated).
+    static int FindTopLevelStringValue(string s, string key)
+    {
+        int depth = 0;
+        bool topIsObject = false, expectKey = false;
+        int i = 0, n = s.Length;
+        while (i < n)
+        {
+            char c = s[i];
+            if (c == '"')
+            {
+                int end = SkipJsonString(s, i);
+                if (end < 0) return -1;
+                if (depth == 1 && topIsObject && expectKey)
+                {
+                    string k = s.Substring(i + 1, end - i - 1);   // raw key; "prompt" carries no escapes
+                    int j = end + 1;
+                    while (j < n && IsJsonWs(s[j])) j++;
+                    if (j >= n || s[j] != ':') return -1;
+                    expectKey = false;
+                    if (k == key)
+                    {
+                        j++;
+                        while (j < n && IsJsonWs(s[j])) j++;
+                        return (j < n && s[j] == '"') ? j + 1 : -1;
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                i = end + 1;
+                continue;
+            }
+            if (c == '{' || c == '[')
+            {
+                if (depth == 0) { topIsObject = (c == '{'); expectKey = topIsObject; }
+                else expectKey = false;
+                depth++;
+            }
+            else if (c == '}' || c == ']') { depth--; expectKey = false; }
+            else if (c == ',' && depth == 1 && topIsObject) expectKey = true;
+            i++;
+        }
+        return -1;
+    }
+
+    // Does the JSON string value starting at i (just past its opening quote) begin, after leading
+    // whitespace, with the machine-turn marker? False on an unterminated string or bad escape.
+    static bool JsonStringStartsWithMarker(string s, int i)
+    {
+        if (SkipJsonString(s, i - 1) < 0) return false;   // truncated stdin: fail open (human)
+        int matched = 0;
+        bool leading = true;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '"') return false;                    // the string ended before the marker did
+            char d;
+            if (c == '\\')
+            {
+                if (i + 1 >= s.Length) return false;
+                char e = s[i + 1];
+                if (e == 'u')
+                {
+                    if (i + 5 >= s.Length) return false;
+                    int cp;
+                    if (!int.TryParse(s.Substring(i + 2, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out cp)) return false;
+                    d = (char)cp; i += 6;
+                }
+                else
+                {
+                    if (e == '"' || e == '\\' || e == '/') d = e;
+                    else if (e == 'b') d = '\b';
+                    else if (e == 'f') d = '\f';
+                    else if (e == 'n') d = '\n';
+                    else if (e == 'r') d = '\r';
+                    else if (e == 't') d = '\t';
+                    else return false;
+                    i += 2;
+                }
+            }
+            else { d = c; i++; }
+            if (leading && IsLeadingWs(d)) continue;
+            leading = false;
+            if (d != MachineTurnMarker[matched]) return false;
+            if (++matched == MachineTurnMarker.Length) return true;
+        }
+        return false;
     }
 
     // --------------------------------------------------------------- misc

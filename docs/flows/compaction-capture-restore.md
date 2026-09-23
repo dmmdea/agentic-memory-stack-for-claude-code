@@ -40,6 +40,8 @@ wsl.exe [-d <DISTRO>] -e bash -lc "python3 /mnt/c/Users/<WIN_USER>/.claude/scrip
 
 That `|| true` is the **fail-open contract** — see *Invariants* for why it is load-bearing. Both hooks are best-effort by design and neither can block the compaction that is about to happen.
 
+`stop-extract.ps1` also clears the session's **per-prompt injection state** here (C10). The per-prompt hook keeps `~/.claude/state/mem0-injected-<session_id>.json` so that a session is not shown the same memory twice ([`memory-retrieval.md`](./memory-retrieval.md), Channel 1). A compaction discards every block that session was shown, so the state has to go with it. PreCompact is synchronous, so no prompt can run between the reset and the compaction, and the first prompt after it re-surfaces memories, goals and questions. The dispatcher dot-sources `user-prompt-lib.ps1` only on PreCompact. A reset that cannot delete the file overwrites it with an empty state, and if that fails too it writes a compaction marker that makes the stale file ignored. Every outcome is logged to `~/.claude/logs/user-prompt-extract.log`, including a missing lib and a total failure. `mem0-hook-daemon-spawn.ps1` repeats the reset on `SessionStart` with source `compact` (and on `clear`), which covers a PreCompact that did not run.
+
 ### 2 — The sidecar distills a redacted resume query
 
 `precompact_capture.py` receives the hook JSON on stdin. It:
@@ -87,11 +89,12 @@ Claude Code injects that stdout into the opening context, so the resumed session
 |---|---|---|
 | `~/.mem0/precompact-query.json` | **created** (atomic temp + `os.replace`) at PreCompact; **deleted** at the next SessionStart, always | sidecar writes; helper consumes |
 | `~/.mem0/precompact-query.json.tmp` | transient staging file for the atomic publish | sidecar |
+| `~/.claude/state/mem0-injected-<session_id>.json` | **deleted** at PreCompact (and again at SessionStart `compact` or `clear`), so the next prompt re-surfaces the block | `stop-extract.ps1`; `mem0-hook-daemon-spawn.ps1` |
 | the transcript file | **read-only tail** (last 256 KB); never modified | sidecar |
 | `/v1/context/bundle` (mem0) | a **non-checkpoint read** — `checkpoint:false`, so **no** episode row is written | helper |
 | the opening session context | one advisory `[recall]` block injected via SessionStart stdout | Claude Code |
 
-No memory is written by this flow. Capture produces exactly one small local file; restore consumes it and performs one read.
+No memory is written by this flow. Capture produces exactly one small local file and deletes the session's per-prompt injection state; restore consumes the file and performs one read.
 
 ## Success behavior
 

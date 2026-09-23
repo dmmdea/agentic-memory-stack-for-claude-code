@@ -310,3 +310,7 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - `POST /v1/memories/diagnose`: per-layer replay for one target; verdict names the first eating stage; read-only (pure admission evaluate).
 - `POST /v1/context/bundle`: forwards the three withheld-family counters.
 - Shim: `memory_diagnose` tool; `memory_search` adds `rerank_note` / `withheld_note`; `memory_recall` adds `withheld_note` + `age_summary` (bundle memories only).
+
+## C10 addition (machine turns)
+
+- `POST /v1/context/bundle`: a `prompt` that starts with `<task-notification>` (after leading whitespace; `hook_contract.is_machine_turn_prompt`) is a background task notification, not a human prompt. The episode checkpoint still runs, no search runs, and `memories` / `goals` / `open_questions` come back empty with `machine_turn: true`. The field is additive and absent on every other response.

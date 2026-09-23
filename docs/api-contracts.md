@@ -171,7 +171,7 @@ Returns one record by id: text, metadata (incl. tier), timestamps. Use before up
 | `GET /v1/episodes` | recent episodes (`recent`, `brand`) |
 | `GET /v1/episodes/count` | episode count |
 | `GET /v1/episodes/{episode_id}` | episode detail + linked mem0 memory ids |
-| `POST /v1/context/bundle` | one-round-trip bundle: episode checkpoint + gated memories + goals + open questions (the per-prompt hook / `memory_recall` wire) |
+| `POST /v1/context/bundle` | one-round-trip bundle: episode checkpoint + gated memories + goals + open questions (the per-prompt hook / `memory_recall` wire). A `prompt` that starts with `<task-notification>` is a machine turn: the checkpoint still runs, the sections come back empty and the response carries `machine_turn: true` (additive field, C10) |
 
 ---
 

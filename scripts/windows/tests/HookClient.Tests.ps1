@@ -123,7 +123,7 @@ exit 0
 
     # Run the exe exactly as Claude Code would: stdin piped, stdout captured.
     function script:Invoke-HookClient {
-        param([string]$Stdin, [string]$PipeName, [string]$RecordPath)
+        param([string]$Stdin, [string]$PipeName, [string]$RecordPath, [string]$UserProfile)
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
         $psi.FileName = $script:exePath
         $psi.UseShellExecute = $false
@@ -132,6 +132,8 @@ exit 0
         $psi.RedirectStandardError = $true
         $psi.EnvironmentVariables['MEM0_HOOK_PIPE'] = $PipeName
         $psi.EnvironmentVariables['HOOKCLIENT_RECORD'] = $RecordPath
+        # the exe's one-line log goes to %USERPROFILE%\.claude\logs; tests that read it sandbox it
+        if ($UserProfile) { $psi.EnvironmentVariables['USERPROFILE'] = $UserProfile }
         $p = [System.Diagnostics.Process]::Start($psi)
         $inBytes = [System.Text.Encoding]::UTF8.GetBytes($Stdin)
         $p.StandardInput.BaseStream.Write($inBytes, 0, $inBytes.Length)
@@ -293,6 +295,129 @@ Describe 'mem0-hook-client.exe fail-open matrix (real exe, scripted daemons, rec
         $r.ExitCode | Should -Be 0
         $r.StdOut | Should -BeNullOrEmpty
         Test-Path $script:recordPath | Should -BeFalse
+    }
+}
+
+Describe 'mem0-hook-client.exe C10: a task notification never gets a block (real exe, scripted daemons)' {
+    # The exe is the LAST emitter before Claude Code, so it carries its own machine-turn gate:
+    # even a daemon (or an inline fallback) that hands back a block for a task notification is
+    # not relayed. The daemon transaction itself still runs (the 0.A checkpoint lives there).
+    # The prompt is read from the raw stdin JSON; the corpus is the one the lib and the server
+    # gates are tested against.
+
+    BeforeAll {
+        $script:c10corpus = (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts
+        function script:New-C10Stdin([string]$Prompt, [string]$Escape = 'Default') {
+            # Real hook-input key order; prompt_id precedes prompt (a scanner must not match it).
+            $o = [ordered]@{
+                session_id      = '00000000-0000-4000-8000-00000000c10a'
+                transcript_path = 'C:\nope\00000000-0000-4000-8000-00000000c10a.jsonl'
+                cwd             = 'C:\nope'
+                prompt_id       = '11111111-2222-4333-8444-555555555555'
+                permission_mode = 'default'
+                hook_event_name = 'UserPromptSubmit'
+                prompt          = $Prompt
+            }
+            return ($o | ConvertTo-Json -Compress -EscapeHandling $Escape)
+        }
+        function script:New-BlockLine([string]$Block) {
+            return '{"ok":true,"served":true,"lib_hash":"' + $script:fixtureHash + '","sid_b64":"' + (B64 'sid-c10') +
+                   '","context_b64":"' + (B64 $Block) + '","prompt_b64":"","tpath_b64":"","brand_b64":"","diag_b64":""}'
+        }
+    }
+
+    BeforeEach {
+        $script:recordPath = Join-Path $TestDrive ("record-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'corpus <name>: daemon returns a block -> relayed only for a human prompt' -ForEach @((Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts | ForEach-Object { @{ name = $_.name; prompt = [string]$_.prompt; machine_turn = [bool]$_.machine_turn } }) {
+        $name2 = New-TestPipeName
+        $blk = '[MEMORY CONTEXT - c10-exe]'
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine $blk)
+        try {
+            $r = Invoke-HookClient -Stdin (New-C10Stdin $prompt) -PipeName $name2 -RecordPath $script:recordPath
+            $r.ExitCode | Should -Be 0
+            if ($machine_turn) {
+                $r.StdOut | Should -BeNullOrEmpty
+            } else {
+                ($r.StdOut.TrimEnd("`r", "`n") | ConvertFrom-Json).hookSpecificOutput.additionalContext | Should -Be $blk
+            }
+        } finally { Stop-FakeDaemon $fake }
+    }
+
+    It 'HTML-escaped stdin (\u003c for <) is still recognised as a task notification' {
+        $name2 = New-TestPipeName
+        $stdin = New-C10Stdin ($script:c10corpus[0].prompt) -Escape 'EscapeHtml'
+        $stdin | Should -Match '\\u003ctask-notification'   # the fixture really is escaped
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine '[MEMORY CONTEXT - c10-escaped]')
+        try {
+            $r = Invoke-HookClient -Stdin $stdin -PipeName $name2 -RecordPath $script:recordPath
+            $r.ExitCode | Should -Be 0
+            $r.StdOut | Should -BeNullOrEmpty
+        } finally { Stop-FakeDaemon $fake }
+    }
+
+    It 'review H3: no pipe + task notification -> the relay trusts the child (its JSON-parsed verdict), it does not double-gate' {
+        # The real user-prompt-extract.ps1 emits nothing on a machine turn (MachineTurnDedupe.Tests
+        # proves it end to end); the exe must not second-guess a child that parsed the real JSON.
+        $r = Invoke-HookClient -Stdin (New-C10Stdin ($script:c10corpus[0].prompt)) -PipeName (New-TestPipeName) -RecordPath $script:recordPath
+        $r.ExitCode | Should -Be 0
+        (Get-Record $script:recordPath).skip_daemon | Should -BeTrue
+        ($r.StdOut.TrimEnd("`r", "`n") | ConvertFrom-Json).hookSpecificOutput.additionalContext | Should -Be 'STUB-FALLBACK-RAN'
+    }
+
+    It 'review H3: a daemon block withheld on a machine turn is LOGGED with its byte count and the reason' {
+        $home2 = Join-Path $TestDrive ("exehome-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $home2 -Force | Out-Null
+        $blk = '[MEMORY CONTEXT - c10-withheld]'
+        $name2 = New-TestPipeName
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine $blk)
+        try {
+            $r = Invoke-HookClient -Stdin (New-C10Stdin ($script:c10corpus[0].prompt)) -PipeName $name2 -RecordPath $script:recordPath -UserProfile $home2
+        } finally { Stop-FakeDaemon $fake }
+        $r.StdOut | Should -BeNullOrEmpty
+        $log = Get-Content -Raw (Join-Path $home2 '.claude\logs\user-prompt-extract.log')
+        $log | Should -Match ("C10: withheld $([System.Text.Encoding]::UTF8.GetByteCount($blk)) bytes of daemon context: the prompt is a task notification")
+    }
+
+    It 'review H3a: a nested "prompt" key before the top-level one cannot flip the verdict (<case>)' -ForEach @(
+        @{ case = 'nested human, top-level notification -> withheld'; nested = 'a nested human value'; top = '<task-notification><task-id>x</task-id></task-notification>'; machine = $true }
+        @{ case = 'nested notification, top-level human -> relayed';  nested = '<task-notification>nested</task-notification>'; top = 'what is the state of the admission gate'; machine = $false }
+    ) {
+        $o = [ordered]@{ session_id = 's'; meta = [ordered]@{ prompt = $nested; list = @(@{ prompt = $nested }) }; hook_event_name = 'UserPromptSubmit'; prompt = $top }
+        $stdin = $o | ConvertTo-Json -Compress -Depth 5
+        $stdin.IndexOf('"prompt"') | Should -BeLessThan $stdin.LastIndexOf('"prompt"')   # the nested key really comes first
+        $name2 = New-TestPipeName
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine '[MEMORY CONTEXT - c10-nested]')
+        try { $r = Invoke-HookClient -Stdin $stdin -PipeName $name2 -RecordPath $script:recordPath } finally { Stop-FakeDaemon $fake }
+        if ($machine) { $r.StdOut | Should -BeNullOrEmpty } else { $r.StdOut | Should -Match 'c10-nested' }
+    }
+
+    It 'review H3b: <n> leading <kind> before the tag -> the exe agrees with the lib gate (no 4096-char cap)' -ForEach @(
+        @{ kind = 'spaces';           n = 5000; ws = ' ' }
+        @{ kind = 'escaped newlines'; n = 5000; ws = "`n" }
+    ) {
+        $prompt = ($ws * $n) + '<task-notification><task-id>x</task-id></task-notification>'
+        Test-MachineTurnPrompt -Prompt $prompt | Should -BeTrue    # the lib's verdict (the Python gate is the same lstrip)
+        $name2 = New-TestPipeName
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine '[MEMORY CONTEXT - c10-ws]')
+        try { $r = Invoke-HookClient -Stdin (New-C10Stdin $prompt) -PipeName $name2 -RecordPath $script:recordPath } finally { Stop-FakeDaemon $fake }
+        $r.StdOut | Should -BeNullOrEmpty
+    }
+
+    It 'review H3c: stdin truncated mid prompt-string (no closing quote) fails OPEN: read as human, block relayed' {
+        $stdin = '{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>trunc'
+        $name2 = New-TestPipeName
+        $fake = Start-FakeDaemon -PipeName $name2 -ResponseLine (New-BlockLine '[MEMORY CONTEXT - c10-trunc]')
+        try { $r = Invoke-HookClient -Stdin $stdin -PipeName $name2 -RecordPath $script:recordPath } finally { Stop-FakeDaemon $fake }
+        $r.ExitCode | Should -Be 0
+        $r.StdOut | Should -Match 'c10-trunc'
+    }
+
+    It 'no pipe + human prompt: the fallback output is relayed (control)' {
+        $r = Invoke-HookClient -Stdin (New-C10Stdin 'what is the state of the admission gate') -PipeName (New-TestPipeName) -RecordPath $script:recordPath
+        $r.ExitCode | Should -Be 0
+        ($r.StdOut.TrimEnd("`r", "`n") | ConvertFrom-Json).hookSpecificOutput.additionalContext | Should -Be 'STUB-FALLBACK-RAN'
     }
 }
 

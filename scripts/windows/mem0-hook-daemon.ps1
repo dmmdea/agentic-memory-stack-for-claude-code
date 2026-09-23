@@ -80,38 +80,14 @@ function ConvertTo-DaemonB64 {
     return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
 }
 
-function Limit-RepeatedGoalsOq {
-    <#
-    v1.12 HK-5: the SAME open goals + questions re-rendered on EVERY substantive
-    prompt (1.8-6.2 KB measured per injection; ~100-300 KB repeated context per
-    long session) on top of the SessionStart banner that already carried them.
-    The daemon is resident, so it can remember what each session already saw:
-    when the goals+OQ set is UNCHANGED since the last injection for this session,
-    blank those sections (Format-MemoryContextBlock omits empty sections) —
-    memories stay per-prompt fresh. Re-inject immediately when the set changes
-    (new goal, resolved question) and every 25th substantive prompt as a
-    (2026-09-02 context audit: 12 -> 25; the blank rate over 76 transcripts was 59% and
-    the re-inject exists only as a post-compaction/drift guard, which 25 still serves)
-    post-compaction/drift guard. Fail-open: any error = old behavior (re-inject).
-    #>
-    param($Bundle, [string]$SessionId)
-    if ($null -eq $Bundle -or [string]::IsNullOrWhiteSpace($SessionId)) { return $Bundle }
-    try {
-        $gSig = @($Bundle.goals | ForEach-Object { "$($_.id)|$($_.title)|$($_.status)" }) -join ';'
-        $qSig = @($Bundle.open_questions | ForEach-Object { "$($_.id)|$($_.question_text)|$($_.status)" }) -join ';'
-        $sig  = $gSig + '##' + $qSig
-        if ($null -eq $script:GoalsOqSeen) { $script:GoalsOqSeen = @{} }
-        $st = $script:GoalsOqSeen[$SessionId]
-        if ($null -ne $st -and $st.sig -eq $sig -and $st.n -lt 25) {
-            $st.n = $st.n + 1
-            $Bundle.goals = @()
-            $Bundle.open_questions = @()
-        } else {
-            $script:GoalsOqSeen[$SessionId] = @{ sig = $sig; n = 1 }
-        }
-    } catch { }
-    return $Bundle
-}
+# v1.12 HK-5's Limit-RepeatedGoalsOq (daemon-only, in-memory goals/OQ blanking with a fixed
+# 25-prompt re-inject standing in for a compaction signal) is superseded by C10 (2026-09-22):
+# Format-SessionMemoryContextBlock in the lib dedupes memories AND sections for both prompt
+# paths from one per-session state file, reset by the real compaction hooks.
+# The daemon keeps that state IN PROCESS (as HK-5 did) so a warm prompt pays no file read: the
+# file stays the persistence and the cross-process source, and any change to it (the inline path
+# writing, a compaction reset deleting, a marker appearing) changes its stamp and forces a reload.
+$script:InjectionStateCache = @{}
 
 function Invoke-DaemonRawBundle {
     <#
@@ -162,18 +138,10 @@ function Invoke-DaemonRawBundle {
     if ($hookEvent.hook_event_name -ne 'UserPromptSubmit') { return $resp }
     if (-not $prompt) { return $resp }
 
-    # --- mirror §2: session_id from transcript filename
-    $sessionId = $null
-    if ($transcriptPath) {
-        $basename = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
-        if ($basename -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $sessionId = $basename }
-    }
-    if (-not $sessionId) {
-        $fnwe = [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
-        if (-not $fnwe) { $fnwe = 'noop' }
-        $sessionId = "unknown-$fnwe"
-        Write-DaemonLog 'WARN: session_id fallback used (non-UUID transcript filename)'
-    }
+    # --- mirror §2: session_id from transcript filename (C10 cleanup: the ONE lib derivation the
+    # compaction reset also keys by)
+    $sessionId = Get-TranscriptSessionId -TranscriptPath ([string]$transcriptPath)
+    if ($sessionId -like 'unknown-*') { Write-DaemonLog 'WARN: session_id fallback used (non-UUID transcript filename)' }
 
     # --- mirror §3: brand inference (lib; $null = fail-closed downstream)
     $brand = $null
@@ -236,6 +204,15 @@ function Invoke-DaemonRawBundle {
         $isTrivial = $wordCount -lt 3 -or $trivial -contains $promptForSearch.ToLower().Trim()
     }
 
+    # --- mirror §4: C10 machine-turn gate (same lib predicate as the inline path). A background
+    # task notification keeps its checkpoint and gets no block: it takes the checkpoint-only
+    # branch below, exactly like a trivial prompt, and never consumes the surfacing cooldown.
+    $isMachineTurn = $false
+    try { $isMachineTurn = [bool](Test-MachineTurnPrompt -Prompt ([string]$prompt)) } catch {
+        $isMachineTurn = $false
+        Write-DaemonLog "0.D machine-turn classifier failed ($($_.Exception.Message)); treating the prompt as human"
+    }
+
     # --- mirror §4: per-session rate limit (1s cooldown, fail-open, stale sweep)
     # v0.20 Phase F (L9): same lib functions as the inline path (parity by
     # construction); corrupt-state logging routes through this file's Write-Log
@@ -263,7 +240,8 @@ function Invoke-DaemonRawBundle {
     }
 
     $swReq = [System.Diagnostics.Stopwatch]::StartNew()
-    if ((-not $isTrivial) -and (-not $rateLimited)) {
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
+    if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
         # consume cooldown token only when surfacing actually fires (v0.19 L2)
         try { if ($rateLimitState) { [System.IO.File]::WriteAllText($rateLimitState, [string][System.DateTime]::Now.ToFileTimeUtc()) } } catch {}
         try {
@@ -285,10 +263,10 @@ function Invoke-DaemonRawBundle {
             if (-not $post.ok) { $post = Invoke-BundleReplicaFailover -Body $bundleBody -ApiKey $apiKey -Failed $post }   # v1.23 P2-7
             if ($post.ok) {
                 $bundleR = ConvertFrom-HookJson $post.text
-                $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId $sessionId   # v1.12 HK-5
                 # v0.22 D: render per tier (resolved above from sidecar/transcript).
                 # frontier/mid = full format; small = flat + legend. Fail-open frontier.
-                $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource
+                # C10: session-deduped (memories + goals/OQ sections), same state file as the inline path.
+                $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir -Cache $script:InjectionStateCache -RequestStartTicks $reqStartTicks
                 $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
                 $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
                 if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
@@ -315,7 +293,7 @@ function Invoke-DaemonRawBundle {
             }
             $respText = Invoke-Mem0Post -Uri ($script:BaseUrl + '/v1/episodes/checkpoint') -Body $body -ApiKey $apiKey -TimeoutMs 1000
             $ckR = ConvertFrom-HookJson $respText
-            $reason = if ($rateLimited) { 'rate-limited' } else { 'trivial' }
+            $reason = if ($isMachineTurn) { 'machine-turn' } elseif ($rateLimited) { 'rate-limited' } else { 'trivial' }
             $resp.diag_b64 = ConvertTo-DaemonB64 ("checkpoint-only ($reason) episode_id=$($ckR.episode_id) action=$($ckR.action) daemon_ms=$($swReq.ElapsedMilliseconds)")
         } catch {
             $resp.diag_b64 = ConvertTo-DaemonB64 ('checkpoint_failed: ' + $_.Exception.Message)
@@ -378,6 +356,7 @@ function Invoke-DaemonRequest {
     if (-not $apiKey) { return @{ ok = $false; error = 'no_api_key'; lib_hash = $script:LibHash } }
 
     $swReq = [System.Diagnostics.Stopwatch]::StartNew()
+    $reqStartTicks = [System.DateTime]::UtcNow.Ticks   # C10 re-check L3: request start, captured BEFORE the bundle POST
     try {
         # Same body the inline path sends to POST /v1/context/bundle (A.3).
         # v0.22 D / v1.0 R2: forward the consuming-model tier + initiative the
@@ -407,12 +386,18 @@ function Invoke-DaemonRequest {
             return @{ ok = $false; error = $post.diag_prefix; lib_hash = $script:LibHash }
         }
         $bundleR = ConvertFrom-HookJson $post.text
-        $bundleR = Limit-RepeatedGoalsOq -Bundle $bundleR -SessionId ([string]$Req.session_id)   # v1.12 HK-5
 
         # Identical rendering to the inline path: lib Format-MemoryContextBlock
         # incl. client-side admission Layers 1/2/3 + the same rejected-candidate
         # audit file defaults. Tier-aware (v1.0 R2), fail-open frontier.
-        $contextBlock = Format-MemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource
+        # C10: a machine-turn prompt renders nothing (the server already returns empty sections for
+        # it; this is the client-side belt), and every other prompt renders session-deduped with
+        # the SAME -StateDir / -Cache wiring as op=bundle_raw (pinned by RegressionGuards).
+        $contextBlock = $null
+        $reqStateDir = $env:USERPROFILE + '\.claude\state'   # = Invoke-DaemonRawBundle's -StateDir default
+        if (-not (Test-MachineTurnPrompt -Prompt ([string]$Req.prompt))) {
+            $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $Req.brand -Tier $reqTier -Source $script:BundleSource -SessionId ([string]$Req.session_id) -StateDir $reqStateDir -Cache $script:InjectionStateCache -RequestStartTicks $reqStartTicks
+        }
 
         $diag = @{
             episode_id = $bundleR.checkpoint.episode_id

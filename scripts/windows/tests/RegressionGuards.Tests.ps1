@@ -477,13 +477,69 @@ Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' 
         $instCode.Contains("command = `$bashCapCheck; matcher = 'startup|clear|compact'") | Should -BeTrue -Because 'the banner entry must carry the matcher (resume excluded) at its source of truth'
     }
 
-    It 'HK-5 re-injects unchanged goals/questions every 25th prompt, not every 12th' {
-        # 2026-09-02 context audit: [MEMORY CONTEXT] is the second-largest injected class; the
-        # goals/questions half is blanked when unchanged and re-injected on a fixed cadence as a
-        # post-compaction guard. 25 keeps the guard and trims the routine repeat.
+    It 'C10 (supersedes HK-5): goals/questions re-render on a content change or a compaction reset, never on a cadence' {
+        # 2026-09-02 context audit: [MEMORY CONTEXT] is the second-largest injected class; HK-5
+        # blanked unchanged goals/questions in the DAEMON only and re-injected them every 25th
+        # prompt as a stand-in for a compaction signal. C10 (2026-09-22) replaces the stand-in
+        # with the real signal: a per-session state file both prompt paths share, reset by
+        # PreCompact and SessionStart source=compact. A cadence beside it would re-inject
+        # unchanged sections for no reason; a daemon-only dedupe would leave the inline path
+        # repeating them every prompt.
         $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
-        $daemon.Contains('$st.n -lt 25') | Should -BeTrue -Because 'the re-inject cadence is pinned at 25'
-        $daemon.Contains('$st.n -lt 12') | Should -BeFalse -Because 'the old 12 cadence must not linger beside the new one'
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        $daemon | Should -Not -Match '\$st\.n -lt \d+' -Because 'no fixed re-inject cadence may survive beside the compaction reset'
+        $daemon.Contains('Limit-RepeatedGoalsOq') | Should -BeFalse -Because 'the daemon-only in-memory dedupe is superseded'
+        ([regex]::Matches($daemon, 'Format-SessionMemoryContextBlock ')).Count | Should -Be 2 -Because 'both daemon render sites (bundle_raw and bundle) use the session-deduped render'
+        $inline.Contains('Format-SessionMemoryContextBlock ') | Should -BeTrue -Because 'the inline fallback must dedupe exactly like the daemon'
+        foreach ($hook in 'stop-extract.ps1', 'mem0-hook-daemon-spawn.ps1') {
+            (script:Get-CodeLines (Join-Path $script:winDir $hook)).Contains('Clear-SessionInjectionStateForHook ') | Should -BeTrue -Because "$hook carries a compaction reset"
+        }
+    }
+
+    It 'C10 review: both daemon render sites wire Format-SessionMemoryContextBlock with the SAME parameters (-StateDir, cache)' {
+        # LOW 6 / cleanup (4): the op=bundle site used to omit -StateDir and fall to a default the
+        # bundle_raw site overrides. Compare the parameter NAMES of the two call ASTs.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:winDir 'mem0-hook-daemon.ps1'), [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Format-SessionMemoryContextBlock' }, $true))
+        $calls.Count | Should -Be 2
+        $sets = @($calls | ForEach-Object { (@($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName }) | Sort-Object) -join ',' })
+        $sets[0] | Should -Be $sets[1] -Because 'the two daemon paths must key and cache the state identically'
+        $sets[0] | Should -Match 'StateDir' -Because 'both must name the state dir explicitly'
+        $sets[0] | Should -Match 'Cache' -Because 'both must use the in-process state cache'
+        $sets[0] | Should -Match 'RequestStartTicks' -Because 'a save must carry its REQUEST start, so one in flight across a reset is stale (re-check L3)'
+    }
+
+    It 'C10 re-check L3: the request start is captured BEFORE the bundle POST on every render path' {
+        $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        foreach ($pair in @(@{ n = 'daemon bundle_raw'; code = $daemon; post = "Invoke-BundlePostWithColdRetry -Uri (`$script:BaseUrl + '/v1/context/bundle')" },
+                            @{ n = 'inline';            code = $inline; post = '$bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle"' })) {
+            $cap = $pair.code.IndexOf('$reqStartTicks = [System.DateTime]::UtcNow.Ticks')
+            $post = $pair.code.IndexOf($pair.post)
+            $cap | Should -BeGreaterOrEqual 0 -Because "$($pair.n) must capture the request start"
+            $post | Should -BeGreaterThan $cap -Because "$($pair.n) must capture it before the POST"
+        }
+        $inline.Contains('-RequestStartTicks $reqStartTicks') | Should -BeTrue
+    }
+
+    It 'C10 review: the transcript -> session-id derivation lives in ONE helper (cleanup 1)' {
+        $uuidRx = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        $lib    = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-lib.ps1')
+        $daemon = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon.ps1')
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        ([regex]::Matches($lib, [regex]::Escape($uuidRx))).Count | Should -Be 1 -Because 'only Get-TranscriptSessionId may spell the UUID rule in the lib'
+        $daemon.Contains($uuidRx) | Should -BeFalse -Because 'the daemon must call Get-TranscriptSessionId, not re-derive'
+        $daemon.Contains('Get-TranscriptSessionId ') | Should -BeTrue
+        $inline.Contains('Get-TranscriptSessionId ') | Should -BeTrue -Because 'the inline path keys the state through the same helper'
+    }
+
+    It 'C10 review M5: every machine-turn classifier catch logs (inline and compiled client)' {
+        $inline = script:Get-CodeLines (Join-Path $script:winDir 'user-prompt-extract.ps1')
+        $inline | Should -Match 'catch \{[^}]*Write-Log "0\.D machine-turn classifier failed' -Because 'the inline catch must not be silent'
+        $cs = Get-Content -Raw (Join-Path $script:winDir 'mem0-hook-client.cs')
+        $cs.Contains('Log("C10: machine-turn scan failed') | Should -BeTrue -Because 'the exe scan catch must not be silent'
+        $spawn = script:Get-CodeLines (Join-Path $script:winDir 'mem0-hook-daemon-spawn.ps1')
+        $spawn.Contains('C10 SessionStart reset FAILED') | Should -BeTrue -Because 'the SessionStart reset catch must not be silent'
     }
 
     It 'the maintenance-liveness row measures the LIVE stores, not the lint snapshot' {
