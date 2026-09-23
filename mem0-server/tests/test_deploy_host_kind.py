@@ -12,8 +12,10 @@ The contract pinned here:
   2. the refusal comes before ANY write: every path and byte under the temp HOME is unchanged;
   3. the message names install/linux-authority.sh with --bind-ip / --secrets-dir taken from
      stack.env's MEM0_BIND / MEM0_SECRETS_DIR;
-  4. a WSL stack.env (and a missing MEM0_HOST_KIND) still gets past the gate;
-  5. the unit loop never installs an ams-* unit (no host kind reaches it that owns them).
+  4. the value is compared like the other readers (.strip().lower()): a CRLF receipt or a value
+     with surrounding whitespace is still native;
+  5. a WSL stack.env (and a missing MEM0_HOST_KIND) still gets past the gate;
+  6. the unit loop never installs an ams-* unit (no host kind reaches it that owns them).
 """
 from __future__ import annotations
 
@@ -91,6 +93,31 @@ def test_native_stack_env_is_refused_before_any_write(tmp_path, args):
     assert "==> deploy:" not in out
     assert "unit CHANGED" not in out
     assert "install/linux-authority.sh --bind-ip 192.0.2.9 --secrets-dir /srv/secrets" in r.stderr, out
+
+
+# The other MEM0_HOST_KIND readers (job_liveness, codex_shim_client) compare .strip().lower(); a
+# receipt that one of them calls native must be native here too. A CRLF file (hand-edited, copied
+# over SMB/SCP) sources as "native\r", and a quoted value can carry spaces or a tab; each one fell
+# through to the WSL pipeline (--dry-run exit 0 with the unit CHANGED list) before the strip.
+NATIVE_VARIANTS = {
+    "crlf-file": NATIVE_ENV.replace("\n", "\r\n"),
+    "crlf-host-kind-line": NATIVE_ENV.replace("MEM0_HOST_KIND=native\n", "MEM0_HOST_KIND=native\r\n"),
+    "spaces": NATIVE_ENV.replace("MEM0_HOST_KIND=native", 'MEM0_HOST_KIND="  native  "'),
+    "tab-and-cr": NATIVE_ENV.replace("MEM0_HOST_KIND=native", "MEM0_HOST_KIND=$'\\tNative \\r'"),
+}
+
+
+@pytest.mark.parametrize("args", [[], ["--dry-run"]], ids=["deploy", "dry-run"])
+@pytest.mark.parametrize("variant", sorted(NATIVE_VARIANTS))
+def test_native_with_cr_or_surrounding_whitespace_is_still_refused(tmp_path, variant, args):
+    r, home, before, log = _run(tmp_path, NATIVE_VARIANTS[variant], *args)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert _files(home) == before, f"deploy.sh wrote under HOME on a native box: {_files(home)}"
+    assert not log.exists(), log.read_text(encoding="utf-8")
+    assert "==> deploy:" not in out and "unit CHANGED" not in out, out
+    # the printed command is runnable as shown: no \r carried over from a CRLF receipt
+    assert "install/linux-authority.sh --bind-ip 192.0.2.9 --secrets-dir /srv/secrets\n" in r.stderr, repr(r.stderr)
 
 
 def test_native_host_kind_is_matched_case_insensitively(tmp_path):

@@ -18,8 +18,10 @@ so an operator who followed "run deploy.sh" broke the brain without any error.
   stops before any write, with `--dry-run` too, and exits 5. The message gives the command that
   does deploy there: `bash <checkout>/install/linux-authority.sh --bind-ip <MEM0_BIND>
   --secrets-dir <MEM0_SECRETS_DIR>`, with both values read from `stack.env`. The installer
-  inherits every other flag on a re-run. The match ignores case, as the other `MEM0_HOST_KIND`
-  readers do.
+  inherits every other flag on a re-run. The value is compared as the other `MEM0_HOST_KIND`
+  readers compare it (`.strip().lower()`): carriage returns are dropped and surrounding whitespace
+  is trimmed before a case-insensitive match. A CRLF receipt, which sources as `native` plus a CR,
+  is refused like any other native receipt.
 - The unit loop now skips `ams-*` units on every host. Its old native-only branch could no
   longer run.
 - The docs that tell an operator to run `deploy.sh` now say which hosts it applies to
@@ -27,8 +29,9 @@ so an operator who followed "run deploy.sh" broke the brain without any error.
 - `test_deploy_host_kind.py` runs `deploy.sh` against a temp `HOME` with recorder stubs for
   `systemctl`, `curl`, `cmd.exe` and `wslpath`. It checks that a native receipt exits non-zero
   and leaves `HOME` byte-for-byte as it was, with and without `--dry-run`, and that a WSL receipt
-  (or one without `MEM0_HOST_KIND`, or no receipt at all) gets past the check. With the check
-  removed, 4 of its tests fail.
+  (or one without `MEM0_HOST_KIND`, or no receipt at all) gets past the check. It also runs CRLF,
+  padded and tab/CR variants of the native receipt. With the check removed, 4 of its tests fail;
+  with only the strip removed, the 8 variant tests fail.
 
 WSL brains and replicas behave as before.
 

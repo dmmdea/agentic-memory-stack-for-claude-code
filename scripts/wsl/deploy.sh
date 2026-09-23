@@ -53,8 +53,24 @@ esac
 # Its --dry-run passed and listed that damage as "unit CHANGED". The native path is a re-run of the
 # installer, which inherits every other flag from stack.env. Refused here, before any write and on
 # --dry-run too, so nothing below this line ever runs on a native box.
-case "$(printf '%s' "${MEM0_HOST_KIND:-}" | tr '[:upper:]' '[:lower:]')" in
+#
+# The value is compared the way the other readers compare it (job_liveness.py and
+# codex_shim_client.py: .strip().lower()). A CRLF receipt (hand-edited, copied over SMB/SCP) sources
+# as "native\r", and a quoted value can carry spaces; without the strip either one fell through to
+# the WSL pipeline and --dry-run exited 0 with the unit CHANGED list. Pure parameter expansion:
+# every CR is dropped, then leading and trailing whitespace is trimmed.
+_strip() {  # $1 = value -> printed without CR and without leading/trailing whitespace
+    local v="${1//$'\r'/}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
+}
+_host_kind="$(_strip "${MEM0_HOST_KIND:-}")"
+case "$(printf '%s' "$_host_kind" | tr '[:upper:]' '[:lower:]')" in
     native)
+        # the same strip for the two values the printed command carries, so it is runnable as shown
+        MEM0_BIND="$(_strip "${MEM0_BIND:-}")"
+        MEM0_SECRETS_DIR="$(_strip "${MEM0_SECRETS_DIR:-}")"
         {
             echo "==> REFUSED: this box is a native Linux authority (~/.mem0/stack.env MEM0_HOST_KIND=native)."
             echo "    scripts/wsl/deploy.sh is the WSL deploy path; it cannot render this box's units"
