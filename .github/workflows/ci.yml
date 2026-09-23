@@ -114,6 +114,7 @@ jobs:
             mem0-server/tests/test_sessionstart_bundle_authority.py \
             mem0-server/tests/test_storage_cap_authority.py \
             mem0-server/tests/test_loopback_probe_pins.py \
+            mem0-server/tests/test_machine_turn_gate.py \
             mem0-server/tests/test_dream_consolidate.py \
             mem0-server/tests/test_judge_plan_schema.py \
             mem0-server/tests/test_linux_authority_installer.py \
