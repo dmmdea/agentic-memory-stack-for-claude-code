@@ -1080,19 +1080,53 @@ try {
     else               { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered on a brain - install incomplete; re-run 2-windows-config.ps1' }
 }
 
-# R2c: the 5am auto-memory compactor. Registered on EVERY role (workspace stores are
-# machine-local, unlike the shared mem0 corpus), so its absence is a FAIL on any box.
+# R2c: the 5am auto-memory compactor (workspace stores are machine-local, so this row runs on
+# every role). Since 1.25.0 (P4-1a) install/2-windows-config.ps1 step 1d RETIRES the task on a
+# box whose store hub path is proven and keeps it only where that path is not proven. This row
+# mirrors that decision with the SAME predicate (Get-AmHubPathGaps in memory-store-lib.ps1):
+# absent + proven = OK, absent + not proven = FAIL, present = the action-shape checks. Before
+# 1.31.3 it FAILed every absent task, so a clean install on a replica with HubHost reported FAIL.
 try {
-    $ctask = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction Stop
-    $cArgs = $ctask.Actions[0].Arguments
-    if ($cArgs -match '[/\\](Dev|repos|worktrees)[/\\]') {
-        Add-Check 'RECOVERY' 'auto-memory compactor task' 'FAIL' "LIVE action executes a repo/worktree path, not the deployed copy: $cArgs"
-    } elseif ($cArgs -match 'memory-compact\.ps1') {
-        Add-Check 'RECOVERY' 'auto-memory compactor task' 'OK' "state=$($ctask.State); action=deployed memory-compact.ps1"
-    } else {
-        Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "unrecognized action shape: $cArgs"
+    if (-not (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue)) {
+        # Sibling first (the deployed self-test sits beside the deployed lib; a repo run uses the
+        # repo lib), then the deployed path.
+        foreach ($libCand in @((Join-Path $PSScriptRoot 'memory-store-lib.ps1'), (Join-Path $env:USERPROFILE '.claude\scripts\memory-store-lib.ps1'))) {
+            if (Test-Path -LiteralPath $libCand) {
+                . $libCand
+                if (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue) { break }
+            }
+        }
     }
-} catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'FAIL' 'not registered - re-run 2-windows-config.ps1' }
+    if (-not (Get-Command Get-AmGitLockVerdict -ErrorAction SilentlyContinue)) {
+        Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' 'memory-store-lib.ps1 predates the hub-path predicate - cannot judge; re-run 2-windows-config.ps1'
+    } else {
+        $ctask = Get-ScheduledTask -TaskName 'ClaudeCode-MemoryCompactor-5am' -ErrorAction SilentlyContinue
+        $cHub = if ($TmsCfg -and $TmsCfg.HubHost) { ([string]$TmsCfg.HubHost).Trim() } else { '' }
+        $cGaps = @(Get-AmHubPathGaps -HubHost $cHub)
+        $cv = if ($ctask) {
+            Get-AmCompactorTaskVerdict -Present $true -TaskArgs ([string]$ctask.Actions[0].Arguments) -TaskState ([string]$ctask.State) -HubGaps $cGaps
+        } else {
+            Get-AmCompactorTaskVerdict -Present $false -HubGaps $cGaps
+        }
+        Add-Check 'RECOVERY' 'auto-memory compactor task' $cv.Status $cv.Detail
+        # 1.31.3: GUARD 0 skips silently when the store lock is held - the normal case for one
+        # night, but a WEDGED holder makes every nightly skip forever with exit 0. The compactor
+        # counts skipped nights in compact-lock-skips.json (cleared by a run that takes the lock).
+        $skipState = $null
+        try { $skipState = Read-AmJsonFile -Path (Join-Path $env:USERPROFILE '.claude\state\automemory\compact-lock-skips.json') } catch { $skipState = [pscustomobject]@{ skipped_nights = @(); skips = 0; holder = "unreadable skip file: $($_.Exception.Message)" } }
+        $sv = Get-AmCompactorSkipVerdict -State $skipState -TaskPresent ([bool]$ctask)
+        Add-Check 'RECOVERY' 'auto-memory compactor skipped nights' $sv.Status $sv.Detail
+        # 1.31.3: a process killed mid-git (the installer's forced stop) can leave index.lock or
+        # a ref lock that makes every later sync fail. The installer removes such locks when no
+        # git process for the repo is alive and records it; this row reports that, and any
+        # lock older than 10 minutes in a store git dir right now.
+        $glSr = Join-Path $env:USERPROFILE '.claude\state\automemory'
+        $glRec = $null
+        try { $glRec = Read-AmJsonFile -Path (Join-Path $glSr 'git-lock-recovery.json') } catch { $glRec = $null }
+        $glv = Get-AmGitLockVerdict -Record $glRec -StaleLocks @(Get-AmStaleGitLocks -StateRoot $glSr) -GitProcesses @(Get-AmCurrentUserGitProcesses)
+        Add-Check 'RECOVERY' 'store history git locks' $glv.Status $glv.Detail
+    }
+} catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "probe error: $($_.Exception.Message)" }
 
 # R2d: WATCH THE WATCHER. A registered task proves nothing: it can be pinned to a vanished
 # launcher, fail with LastTaskResult=1, or never fire because the box sleeps. If any store is
@@ -1558,7 +1592,21 @@ try {
 # kind='drift' (a canary became unretrievable / cross-run floor or HWM tripped) and
 # kind='guard-dead' (W3: the guard itself stopped comparing). Records without a kind
 # are legacy drift alarms (review F14). The file is ABSENT in the healthy steady state.
+# Brain only (F3, as R11 below and the banner since 1.28.4): a replica runs no dream, and the
+# file it still carries is residue from before the authority cutover. Its last guard-dead
+# record made every replica FAIL "consolidations are running UNGUARDED" (measured 2026-09-22)
+# while the brain's guard compared 7/7 each night. A replica reports the brain's own guard
+# state from the authority's /health/deep instead; the capability manifest row FAILs a dead
+# drift-guard there, so this row stays informational on a replica.
 try {
+    if ($TmsIsReplica) {
+        $rdb = if ($hd -and $hd.checks) { $hd.checks.retrieval_drift } else { $null }
+        if ($rdb -and $rdb.state_present) {
+            Add-Check 'RECOVERY' 'consolidation drift' 'OK' "replica role: judged on the brain (authority guard: last compare $($rdb.last_compare_ts), $($rdb.before_retrievable)/$($rdb.n_total) canaries, snapshot failures $([int]$rdb.consecutive_snapshot_failures), alarm=$([bool]$rdb.alarm)); the local drift log is pre-cutover residue"
+        } else {
+            Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'replica role: the dream and its drift guard run on the brain (see the capability manifest drift-guard verdict); the local drift log is not judged'
+        }
+    } else {
     $cdLog = "$TmsHomeUnc\.mem0\consolidation-drift.jsonl"
     if (Test-Path $cdLog) {
         $cdAll = @(Get-Content $cdLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ })
@@ -1585,6 +1633,7 @@ try {
     } else {
         Add-Check 'RECOVERY' 'consolidation drift' 'OK' 'no drift alarms (no flag file yet)'
     }
+    } # end brain-only local drift log
 } catch { Add-Check 'RECOVERY' 'consolidation drift' 'WARN' $_.Exception.Message }
 
 # R11 (W3, AMS-08): drift GUARD liveness — the 07-21/07-23 outage proved the guard

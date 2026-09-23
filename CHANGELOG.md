@@ -4,6 +4,153 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.31.3 — the self-test stops failing replicas for things the installer does on purpose; operator keys survive a re-run; a test HOME no longer holds the live store lock
+
+**The compactor row contradicted the installer.** Since 1.25.0, `install/2-windows-config.ps1`
+step 1d removes the nightly `ClaudeCode-MemoryCompactor-5am` task on a box whose store hub path is
+proven, and keeps it where that path is not proven. `Test-MemoryStack.ps1` still reported every
+absent task as `FAIL not registered`, so a replica with `HubHost` set got that FAIL right after a
+clean install (measured 2026-09-22).
+
+- The hub-path predicate now lives in one place, `Get-AmHubPathGaps` in `memory-store-lib.ps1`.
+  "Proven" means a hub host is configured, the hub identity key is present, and the hub's host key
+  is in the user's `known_hosts`. The installer's step 1c computes its refusal list from it, and its
+  known_hosts seeding reads the same `Get-AmHubHostKeyLines`. The self-test row calls it through
+  `Get-AmCompactorTaskVerdict`: absent with the hub path proven is OK (retired), absent without it
+  is FAIL and names the gap, and a present task gets the same action-shape checks as before.
+
+**A replica reported the drift guard dead from a file the brain no longer writes.** A replica
+still carries the `~/.mem0/consolidation-drift.jsonl` it wrote while it was the brain. That file's
+last `guard-dead` record made the `consolidation drift` row FAIL with "consolidations are running
+UNGUARDED", while the brain's guard compared 7/7 canaries every night with zero snapshot
+failures. The row now reads the local log on the brain only, the same rule as `drift guard
+liveness` and as the SessionStart banner since 1.28.4. On a replica it reports the brain's guard
+state from the authority's `/health/deep` for information; the capability manifest row is the one
+that FAILs a dead `drift-guard`.
+
+**`MEM0_BRAIN_SSH` was deleted by every installer re-run.** `wiki-index.sh` reads the brain alias
+from `~/.mem0/stack.env`. No flag sets it, so the operator adds it by hand, and each of the three
+writers rewrites the whole file. `install/stack-env.sh` now lists the operator-owned keys once
+(`STACK_ENV_OPERATOR_KEYS`), and `stack_env_carry` carries them over from the existing file. It
+takes the first occurrence, drops a CR from a hand edit, and the value is still checked as a plain
+token. `1-wsl-services.sh` (a Windows replica's WSL, where the wrapper runs), `linux-replica.sh`
+(a native replica) and `linux-authority.sh` all pass the carried keys to their write. Nothing on the
+brain reads the key today, but re-running that installer is the brain's only deploy path, and a
+deploy must not drop a line the operator wrote.
+
+**A test run held the live store's lock.** The Windows named mutexes `Local\ams-store`,
+`Local\ams-memory-compact` and `Local\ams-store-watch` are global to the logon session,
+whatever the state root. A Pester run's sandbox compactor, running with a temp `USERPROFILE`,
+held `Local\ams-memory-compact`, so the real `ams-store sync --once` exited 4 ("the per-PC lock
+is held") and `install/3-verify.ps1` failed (measured 2026-09-23). Every production mutex name is
+now scoped to its store: the base name, `-`, and the first 16 hex digits of SHA-256 over the
+canonical state root (full path, backslashes, no trailing separator, lower case). The Go side
+(`internal/lock/scope.go`, derived from the lock file's directory) and the compactor's GUARD 0
+(`Get-AmStoreMutexName` in `memory-store-lib.ps1`) derive the same name, and both suites pin one
+golden vector. One store still admits one holder, and two stores no longer exclude each other.
+GUARD 0 now also counts a mutex that already exists as held. `ams-store` opens the mutex without
+owning it (Go moves goroutines between threads), so `WaitOne` alone had let a compaction start
+beside a Go pass on the same store. The binary and the PowerShell scripts must be on the same
+release for the two to exclude each other; the installer puts both on the release `VERSION`
+names in one run.
+
+**Closing the upgrade window.** Moving to per-store names leaves a gap during the upgrade itself.
+The installer renames the running exe aside, and a pre-1.31.3 `sync --watch` kept running from
+`ams-store.exe.prev` on the bare names. On Windows the watcher singleton is a mutex only, so the
+next SessionStart would have started a second watcher on the scoped name, and a scoped compactor
+would have run beside the old one. Three changes close the gap, none of which takes the bare
+names:
+
+- Before the swap, the installer stops every `ams-store.exe` that serves this user's store. A
+  process qualifies when its image is the deployed exe or its `.prev`, its owner is this identity,
+  and its `--state-root` (or the default root) is this store. The resident watcher is stopped at
+  once. A derive or sync pass gets 20 s to finish, then is stopped. Each stop is logged. The
+  watcher is then restarted from the new image the way SessionStart starts it. If the hub path is
+  not proven, the log says the watcher starts at the next SessionStart. Another user's process,
+  another store's process and test binaries are left alone.
+- For this one release, a new watcher on the operator's default store refuses to start while a
+  bare-named `Local\ams-store-watch` is open, which means an old watcher is still alive. It
+  checks with `OpenMutex` and never creates or takes the name. The refusal goes to stderr and to
+  `watch-refused.log` in the state root, and the watcher exits non-zero. Scratch and test roots
+  never check the bare name.
+- The PowerShell compactor now also takes the Go file lock `ams-store.lock` in its state root.
+  It uses the same JSON holder (pid, process start time, host, `acquired_at`, reason), the same
+  10-minute staleness rule, the same `.breaking` guard for a dead holder, and releases the lock
+  only if it is still the holder. Exclusion between Go and PowerShell therefore no longer depends
+  on mutex names. Checked against the real binary: `ams-store lock status` reads a
+  PowerShell-held lock as live, `lock acquire` exits 4 against it, and PowerShell sees the lock
+  as held while Go holds it.
+
+**Stopping a process no longer risks orphaning git.** `TerminateProcess` does not run the
+tree kill in `gitx` (the one that ends git child processes), so a `git.exe` killed mid-commit or
+mid-gc on `history.git` could be left holding `index.lock` or a ref lock, and every later sync
+would fail on it. The stop step now works in this order:
+
+- **The watcher is asked first.** The installer writes `watch.stop` in the state root. A
+  1.31.3+ watcher sees it through the directory watch it already has and exits between passes,
+  never in the middle of one. A leftover stop file is cleared when a watcher starts. An older
+  image ignores the file.
+- **Anything still alive after its grace is killed as a tree.** The grace is 30 s for a watcher
+  and 20 s for a pass. The kill is `taskkill /PID <pid> /T /F`. Right before it, the pid's start
+  time is re-checked against the WMI snapshot. A pid that now names another process, or whose
+  start time cannot be read, is not killed.
+- **After a forced stop, stale git locks are checked, conservatively.**
+  - **Which dirs:** a git dir must be a direct child of the state root with `HEAD`, `objects\`
+    and `refs\`, and must not be a reparse point.
+  - **Which files:** only git's own lock names are candidates: `index.lock`, `HEAD.lock`,
+    `config.lock`, `packed-refs.lock` and `shallow.lock` at the top level, and `*.lock` under
+    `refs\`. The search never enters a junction or symlink. Every file deleted must resolve
+    inside the canonical state root with no reparse point on the way.
+  - **When:** a lock younger than 2 minutes is left alone. The installer waits that grace out
+    once after a forced stop.
+  - **Only with no git running:** a lock is removed only while no `git.exe` of the current user
+    is alive at all, and that is re-checked before each delete. Matching on the command line
+    would miss cwd-only, relative, `--work-tree`-only and `GIT_DIR` invocations and git's own
+    children, and Windows cannot read another process's working directory reliably.
+  - **Reporting:** the result goes to `git-lock-recovery.json`. The new Test-MemoryStack row
+    `store history git locks` FAILs on a lock older than 10 minutes when no `git.exe` is alive.
+    It WARNs, naming the pids, when an old lock coexists with a running git, since a long gc can
+    hold one. It also WARNs for 14 days after a recovery removed or kept locks.
+
+Three smaller fixes in the same step:
+
+- A process with no WMI image path is identified by `argv[0]` from its command line. One that
+  still cannot be identified gets its own line: "N ams-store.exe process(es) seen but could not
+  be identified (pid ...)".
+- A respawned watcher is checked 3 s later. A quiet exit 0 is reported as "no live session here,
+  it starts at the next SessionStart". A non-zero exit is reported with its code and the last
+  `watch-refused.log` line. The installer no longer says "watcher restarted" without checking.
+- Skipped nights now run noon to noon, local time. A catch-up retry across local midnight is no
+  longer counted as a second night.
+
+**A wedged lock holder is now loud.** GUARD 0 exits 0 without a receipt when the store lock is
+held, because a second instance is the normal case. A holder that is wedged rather than dead
+keeps its handle, though, and would silence every nightly run. Each skip is now recorded in
+`compact-lock-skips.json`: the distinct nights skipped since the last run that took the lock,
+plus the holder (the lock file's pid and reason, or this user's running `ams-store.exe`
+processes). A run that takes the lock clears the file. Test-MemoryStack's new
+`auto-memory compactor skipped nights` row WARNs at 2 nights and FAILs at 4, and names the
+holder. While the task is retired, the row does not judge the counter.
+
+- Tests: `AmsStoreInstall.Tests.ps1` (the predicate on real `ssh-keygen` known_hosts, and the
+  verdict table), `internal/lock/scope_test.go` (two roots hold at once with the production
+  names, one root still excludes by the file and by the mutex alone, a compactor-held scoped
+  legacy mutex stops a Go pass on its own root only, one watcher per root, the golden vector),
+  `MemoryStoreLib.Tests.ps1` (the same golden vector from PowerShell), `MemoryCompact.Tests.ps1`
+  (GUARD 0 on the sandbox's scoped name, an unowned handle stops it, another store's mutex does
+  not, a live Go holder of `ams-store.lock` stops it and a recycled-pid holder is broken, skips
+  are counted), `CompactorLock.Tests.ps1` (the PowerShell file lock and the skipped-night
+  thresholds), `internal/sync/watch_legacy_test.go` (a fake old watcher holding the bare-name
+  stand-in makes the new watcher refuse and log, and the check never creates the name),
+  `cli/legacywatch_internal_test.go` (only the default root checks the bare name),
+  `AmsStoreInstall.Tests.ps1` (the stop step selects this store's processes from a fake process
+  list and never another user's or another store's, a pass is given time to finish, and the stop
+  runs before the old image is renamed; mutants without the stop step or without its wiring go
+  red), `InstallerParity.Tests.ps1` (the installer and the self-test both call the shared
+  predicate), `RegressionGuards.Tests.ps1` (the replica branch comes before the local drift log is
+  read), and `test_stack_env_writers.py` (a pre-existing `MEM0_BRAIN_SSH` survives a
+  `--render-only` re-run as a fixed point, `stack_env_carry` on a CRLF file, and every writer's wiring).
+
 ## 1.31.2 — `deploy.sh` refuses a native authority instead of breaking it
 
 **`deploy.sh` is the WSL deploy path, and it ran on the native brain.** On a box whose

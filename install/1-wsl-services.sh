@@ -249,10 +249,17 @@ if [ -z "${MEM0_ROLE:-}" ] && [ -f "$USER_HOME/.mem0/role" ]; then
     MEM0_ROLE="$(tr -d '[:space:]' < "$USER_HOME/.mem0/role" || true)"
 fi
 MEM0_ROLE="${MEM0_ROLE:-brain}"
+# 1.31.3: operator-owned keys (install/stack-env.sh) are carried over, or this rewrite deletes
+# them: MEM0_BRAIN_SSH is the brain alias a Windows replica's wiki-index.sh tunnels through
+# (the wrapper's home is this WSL). Carried on every role: the writer cannot know the box's
+# next role, and a stale alias on a brain has no reader.
+mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")
+for kv in "${STACK_ENV_CARRY[@]}"; do echo "  ${kv%%=*} carried over from $USER_HOME/.mem0/stack.env: ${kv#*=}"; done
 # A Windows user name or repo path with a space would make every `. stack.env` run its second
 # word as a command (the 1.31.1 wiki-sources outage class), so such a value is refused here.
 if ! stack_env_write "$USER_HOME/.mem0/stack.env" MEM0_WSL_USER="$WSL_USER" MEM0_WIN_USER="$WIN_USER" \
-        MEM0_DISTRO="$DISTRO" MEM0_REPO_ROOT_WSL="$REPO_ROOT_WSL" MEM0_BIND="$MEM0_BIND" MEM0_ROLE="$MEM0_ROLE"; then
+        MEM0_DISTRO="$DISTRO" MEM0_REPO_ROOT_WSL="$REPO_ROOT_WSL" MEM0_BIND="$MEM0_BIND" MEM0_ROLE="$MEM0_ROLE" \
+        "${STACK_ENV_CARRY[@]}"; then
     echo "FATAL: refusing to write $USER_HOME/.mem0/stack.env (a value is not a plain token; see above)" >&2
     exit 1
 fi

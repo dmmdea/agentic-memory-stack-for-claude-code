@@ -45,3 +45,26 @@ func releaseMutex(h mutexHandle) {
 		windows.CloseHandle(h)
 	}
 }
+
+// MutexExists reports whether a named mutex is currently open anywhere on the desktop,
+// WITHOUT creating it: OpenMutex fails with ERROR_FILE_NOT_FOUND when no handle to the name
+// is open. It exists for the one-release transitional probe of the bare pre-1.31.3 watcher
+// name, which must never be created or taken by a new binary.
+func MutexExists(name string) (bool, error) {
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return false, err
+	}
+	h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, p)
+	if err == nil {
+		windows.CloseHandle(h)
+		return true, nil
+	}
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return false, nil
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return true, nil // it exists; this process may not open it
+	}
+	return false, err
+}

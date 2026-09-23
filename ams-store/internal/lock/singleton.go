@@ -8,7 +8,8 @@ import (
 
 // SingletonOptions configures a whole-PC "only one of me" claim.
 type SingletonOptions struct {
-	// Name is the Windows named mutex. Empty means WatchMutexName.
+	// Name is the Windows named mutex. Empty means WatchMutexName scoped to Path's directory
+	// (the state root), or the bare WatchMutexName when Path is empty.
 	Name string
 	// Path is the file flocked off Windows. Empty means no file claim, which on Linux
 	// means the claim always succeeds - so a caller that can run on Linux must set it.
@@ -36,6 +37,10 @@ func AcquireSingleton(opt SingletonOptions) (*Singleton, bool, error) {
 	name := opt.Name
 	if name == "" {
 		name = WatchMutexName
+		if opt.Path != "" {
+			// one watcher per STORE: the claim file lives in the state root
+			name = ScopedName(WatchMutexName, filepath.Dir(opt.Path))
+		}
 	}
 	if opt.Path != "" {
 		if err := os.MkdirAll(filepath.Dir(opt.Path), 0o755); err != nil {

@@ -192,6 +192,124 @@ function Get-AmsStoreVersionToken {
     return ''
 }
 
+function Get-AmsStoreProcesses {
+    # Every running ams-store.exe on the box: pid, image path, command line, owner (the
+    # DOMAIN\user WMI reports, compared with the current identity's name) and the start time in
+    # unix seconds. The start time is what makes a pid an identity: it is re-checked right
+    # before any kill, so a recycled pid is never killed.
+    $ErrorActionPreference = 'Continue'
+    $out = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='ams-store.exe'" -ErrorAction SilentlyContinue)) {
+        $owner = ''
+        try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop; if ($o.User) { $owner = "$($o.Domain)\$($o.User)" } } catch {}
+        $start = [int64]0
+        try { if ($p.CreationDate) { $start = [DateTimeOffset]::new(([datetime]$p.CreationDate).ToUniversalTime()).ToUnixTimeSeconds() } } catch {}
+        $out += [pscustomobject]@{ ProcessId = [int]$p.ProcessId; ExecutablePath = [string]$p.ExecutablePath; CommandLine = [string]$p.CommandLine; Owner = $owner; StartUnix = $start }
+    }
+    return $out
+}
+
+function Get-AmsArgv0 {
+    # The image path from a command line: its quoted or bare first token, or '' when absent.
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return '' }
+    $m = [regex]::Match($CommandLine.TrimStart(), '^(?:"([^"]+)"|(\S+))')
+    if (-not $m.Success) { return '' }
+    if ($m.Groups[1].Success) { return $m.Groups[1].Value }
+    return $m.Groups[2].Value
+}
+
+function Select-AmsStoreProcessesForStore {
+    # The ams-store.exe processes that serve THIS user's store: owner = $Owner, image = one of
+    # $ImagePaths (the deployed exe or its .prev; argv[0] when WMI returns no image path), and
+    # the state root it works on (its --state-root, else the default root) = $StateRoot.
+    # Returns @{ Selected; Unidentified }: Unidentified lists the pids of this user's (or an
+    # unknown owner's) ams-store.exe whose image could not be told at all - reported, never
+    # stopped. Another user's, another store's or another binary's process is left alone.
+    param($Processes, [string[]]$ImagePaths, [string]$StateRoot, [string]$DefaultStateRoot, [string]$Owner)
+    $want = ConvertTo-AmCanonicalRoot -Path $StateRoot
+    $images = @($ImagePaths | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).ToLowerInvariant() })
+    $sel = @(); $unknown = @()
+    foreach ($p in @($Processes)) {
+        if ($Owner -and $p.Owner -and ([string]$p.Owner -ne $Owner)) { continue }
+        $img = [string]$p.ExecutablePath
+        if (-not $img) { $img = Get-AmsArgv0 -CommandLine ([string]$p.CommandLine) }
+        if (-not $img -or -not [System.IO.Path]::IsPathRooted($img)) { $unknown += [int]$p.ProcessId; continue }
+        if ($images -notcontains [System.IO.Path]::GetFullPath($img).ToLowerInvariant()) { continue }
+        if ($Owner -and -not $p.Owner) { $unknown += [int]$p.ProcessId; continue }   # our image, owner unreadable: do not touch
+        $cl = [string]$p.CommandLine
+        $m = [regex]::Match($cl, '--state-root(?:=|\s+)(?:"([^"]+)"|(\S+))')
+        $root = if ($m.Success) { if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value } } else { $DefaultStateRoot }
+        try { if ((ConvertTo-AmCanonicalRoot -Path $root) -ne $want) { continue } } catch { continue }
+        $kind = if ($cl -match '\bsync\b' -and $cl -match '--watch\b') { 'watch' } else { 'pass' }
+        $sel += [pscustomobject]@{ ProcessId = [int]$p.ProcessId; Kind = $kind; CommandLine = $cl; ExecutablePath = $img; StartUnix = [int64]$p.StartUnix }
+    }
+    return [pscustomobject]@{ Selected = @($sel); Unidentified = @($unknown) }
+}
+
+function Stop-AmsStoreProcessesForStore {
+    # Stops the selected processes before the exe swap (1.31.3), gracefully first:
+    #   - a watcher is asked to stop through <state root>\watch.stop and exits BETWEEN passes
+    #     (a 1.31.3+ image; an older one ignores the file and is killed after the grace);
+    #   - a pass (sync/derive/gate) is given time to finish on its own.
+    # A process still alive after its grace is killed as a TREE (taskkill /T /F), so a git child
+    # mid-commit on history.git is not orphaned - but only after its start time is re-checked
+    # against the WMI snapshot: a pid that now names another process (or none) is never killed.
+    # Returns @{ Results; Forced } - Forced says a kill happened, so the caller checks the git
+    # dirs for stale locks. Every step is logged. The process calls are parameters so a test
+    # drives a fake process list and nothing real is killed.
+    param($Selected, [string]$StateRoot, [int]$WatcherGraceSeconds = 30, [int]$PassWaitSeconds = 20,
+        [scriptblock]$HasExited = { param($id) -not (Get-Process -Id $id -ErrorAction SilentlyContinue) },
+        [scriptblock]$GetStartUnix = { param($id) try { [DateTimeOffset]::new((Get-Process -Id $id -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeSeconds() } catch { [int64]0 } },
+        [scriptblock]$KillTree = { param($id) & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $id /T /F 2>&1 | Out-Null },
+        [scriptblock]$RequestWatcherStop = { param($root) [System.IO.File]::WriteAllText((Join-Path $root 'watch.stop'), '') },
+        [scriptblock]$ClearWatcherStop = { param($root) Remove-Item -LiteralPath (Join-Path $root 'watch.stop') -Force -ErrorAction SilentlyContinue },
+        [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms })
+    $results = @(); $forced = $false
+    $watchers = @($Selected | Where-Object { $_.Kind -eq 'watch' })
+    if ($watchers.Count -gt 0 -and $StateRoot) {
+        try { & $RequestWatcherStop $StateRoot; Write-Host "    asked the resident watcher to stop (watch.stop; it exits between passes)" } catch { Write-Host "    could not write watch.stop ($($_.Exception.Message))" -ForegroundColor Yellow }
+    }
+    foreach ($p in @($watchers) + @($Selected | Where-Object { $_.Kind -ne 'watch' })) {
+        $grace = if ($p.Kind -eq 'watch') { $WatcherGraceSeconds } else { $PassWaitSeconds }
+        $waited = 0
+        while (-not (& $HasExited $p.ProcessId) -and $waited -lt ($grace * 1000)) { & $Sleep 250; $waited += 250 }
+        if (& $HasExited $p.ProcessId) {
+            $how = if ($p.Kind -eq 'watch') { 'stopped cooperatively' } else { 'finished on its own' }
+            Write-Host "    ams-store $($p.Kind) pid $($p.ProcessId) $how before the swap"
+            $results += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = $p.Kind; Action = 'exited' }
+            continue
+        }
+        $now = [int64](& $GetStartUnix $p.ProcessId)
+        if ([int64]$p.StartUnix -eq 0 -or $now -ne [int64]$p.StartUnix) {
+            Write-Host "    NOT killed: pid $($p.ProcessId) no longer matches the ams-store.exe seen at the start (start time $($p.StartUnix) then, $now now) - a recycled pid or an unverifiable one" -ForegroundColor Yellow
+            $results += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = $p.Kind; Action = 'not-killed-identity' }
+            continue
+        }
+        & $KillTree $p.ProcessId
+        $forced = $true
+        Write-Host "    killed the ams-store $($p.Kind) pid $($p.ProcessId) and its child processes after ${grace}s ($($p.CommandLine))" -ForegroundColor Yellow
+        $results += [pscustomobject]@{ ProcessId = $p.ProcessId; Kind = $p.Kind; Action = 'killed' }
+    }
+    if ($watchers.Count -gt 0 -and $StateRoot) { try { & $ClearWatcherStop $StateRoot } catch {} }
+    return [pscustomobject]@{ Results = @($results); Forced = $forced }
+}
+
+function Confirm-AmsWatcherAlive {
+    # After the respawn: is the new watcher still running a few seconds later? A watcher exits
+    # 0 at once when no Claude session is live (normal when the installer runs outside one), and
+    # non-zero when it refused to start (watch-refused.log says why).
+    param($Process, [string]$RefusedLog, [int]$WaitSeconds = 3)
+    if ($Process.WaitForExit($WaitSeconds * 1000)) {
+        $code = $Process.ExitCode
+        if ($code -eq 0) { return [pscustomobject]@{ Alive = $false; Message = "the new watcher exited at once with code 0 (no live session here); it starts at the next SessionStart" } }
+        $why = ''
+        if ($RefusedLog -and (Test-Path -LiteralPath $RefusedLog)) { $why = ' - ' + (@(Get-Content -LiteralPath $RefusedLog) | Select-Object -Last 1) }
+        return [pscustomobject]@{ Alive = $false; Message = "the new watcher EXITED with code $code$why" }
+    }
+    return [pscustomobject]@{ Alive = $true; Message = "watcher restarted from the new image (pid $($Process.Id), alive after ${WaitSeconds}s)" }
+}
+
 function Install-AmsStoreBinary {
     # Returns @{ Sha256; Source; Version } or throws with the reason. Idempotent: a deployed exe
     # whose content hash equals the digest the release records is left alone (sidecar refreshed).
@@ -199,7 +317,10 @@ function Install-AmsStoreBinary {
     # own sidecar) | drop | drop-unverified.
     param(
         [string]$Tag, [string]$Asset, [string]$Dest, [string]$ReleaseRepo,
-        [string]$BinaryPath, [string]$BinarySums
+        [string]$BinaryPath, [string]$BinarySums,
+        # Runs right before the swap, only when the exe is actually replaced: the caller stops
+        # every ams-store.exe serving this store there (1.31.3), so no old image keeps running.
+        [scriptblock]$BeforeSwap
     )
     $ErrorActionPreference = 'Stop'
     $sidecar = $Dest + '.sha256'
@@ -262,6 +383,10 @@ function Install-AmsStoreBinary {
     # Swap in. A resident `sync --watch` may hold the old exe open: Windows refuses to overwrite a
     # running image but allows a rename, so the old file steps aside as .prev (deleted here when
     # nothing holds it, otherwise on the next run).
+    # 1.31.3: first stop every ams-store.exe that serves this store. Renaming a running image
+    # aside kept a pre-1.31.3 `sync --watch` alive on the bare mutex names while the next
+    # SessionStart started a new watcher on the per-store name: two watchers on one store.
+    if ($BeforeSwap) { & $BeforeSwap }
     $prev = $Dest + '.prev'
     if (Test-Path -LiteralPath $prev) { Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue }
     if (Test-Path -LiteralPath $Dest) { Move-Item -LiteralPath $Dest -Destination $prev -Force }
@@ -279,9 +404,36 @@ function Install-AmsStoreBinary {
     return @{ Sha256 = $have; Source = $source; Version = $ver }
 }
 
+# The shared predicates (the hub path, the canonical state root) live in memory-store-lib.ps1,
+# so Test-MemoryStack.ps1 judges with the same answers this installer acts on. The lib only
+# defines functions and constants at load.
+. (Join-Path $RepoRoot 'scripts\windows\memory-store-lib.ps1')
+$amsDefaultStateRoot = Join-Path $env:USERPROFILE '.claude\state\automemory'
+$script:amsStoppedWatcher = $false
+$amsStopForSwap = {
+    $amsSr = Join-Path $StateDir 'automemory'
+    $pick = Select-AmsStoreProcessesForStore -Processes (Get-AmsStoreProcesses) -ImagePaths @($amsStoreExe, ($amsStoreExe + '.prev')) `
+        -StateRoot $amsSr -DefaultStateRoot $amsDefaultStateRoot -Owner ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    if (@($pick.Unidentified).Count -gt 0) {
+        Write-Host "    $(@($pick.Unidentified).Count) ams-store.exe process(es) seen but could not be identified (pid $(@($pick.Unidentified) -join ', ')) - not stopped; if one serves this store, end it and re-run" -ForegroundColor Yellow
+    }
+    if (@($pick.Selected).Count -eq 0) {
+        if (@($pick.Unidentified).Count -eq 0) { Write-Host "    no running ams-store.exe serves this store" }
+        return
+    }
+    $stop = Stop-AmsStoreProcessesForStore -Selected $pick.Selected -StateRoot $amsSr
+    if (@($stop.Results | Where-Object { $_.Kind -eq 'watch' -and $_.Action -ne 'not-killed-identity' }).Count -gt 0) { $script:amsStoppedWatcher = $true }
+    if ($stop.Forced) {
+        # A killed process may have left a git lock behind; check every git dir in the store.
+        $rec = Invoke-AmGitLockRecovery -StateRoot $amsSr -WaitForGrace -Trigger 'installer forced stop'
+        foreach ($r in @($rec.removed)) { Write-Host "    removed stale git lock $r (no git process for that repo was alive)" -ForegroundColor Yellow }
+        foreach ($k in @($rec.kept)) { Write-Host "    KEPT git lock $($k.path): $($k.reason)" -ForegroundColor Yellow }
+        if (@($rec.removed).Count -eq 0 -and @($rec.kept).Count -eq 0) { Write-Host "    no git lock left behind in the store's git dirs" }
+    }
+}
 Write-Host "==> [1s] Installing ams-store.exe ($amsStoreTag from the release assets of $ReleaseRepo)"
 try {
-    $amsInstall = Install-AmsStoreBinary -Tag $amsStoreTag -Asset $amsStoreAsset -Dest $amsStoreExe -ReleaseRepo $ReleaseRepo -BinaryPath $BinaryPath -BinarySums $BinarySums
+    $amsInstall = Install-AmsStoreBinary -Tag $amsStoreTag -Asset $amsStoreAsset -Dest $amsStoreExe -ReleaseRepo $ReleaseRepo -BinaryPath $BinaryPath -BinarySums $BinarySums -BeforeSwap $amsStopForSwap
 } catch {
     Write-Host "FATAL: ams-store.exe not installed: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "       aborting before the receipt and before hook registration (settings.json and the scheduled tasks are untouched)" -ForegroundColor Red
@@ -675,9 +827,10 @@ if ($LASTEXITCODE -ne 0) {
 $amsStateRoot  = Join-Path $StateDir 'automemory'
 $amsHistoryDir = Join-Path $amsStateRoot 'history.git'
 $amsProjects   = Join-Path $ClaudeDir 'projects'
+# The hub-path predicate (Get-AmHubPathGaps) comes from memory-store-lib.ps1, dot-sourced
+# before step 1s (Test-MemoryStack.ps1 judges the retired compactor with the same answer).
 $amsSshDir     = Join-Path $env:USERPROFILE '.ssh'
-$amsIdentity   = Join-Path $amsSshDir 'id_ed25519_ams_hub'
-$amsHubUser    = 'ams-hub'
+$amsHubUser    = $script:AmHubUser
 $amsHubRepo    = 'ams-store.git'
 
 function Set-AmsHubSshConfig {
@@ -709,13 +862,7 @@ function Initialize-AmsKnownHosts {
     # (`ssh-keygen -F`), overwriting the state copy so a rotated key converges. Returns the
     # number of key lines seeded; 0 = the user has never accepted the hub's host key.
     param([string]$HubHost, [string]$UserKnownHosts, [string]$StateKnownHosts)
-    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
-    if (-not (Test-Path -LiteralPath $UserKnownHosts)) { return 0 }
-    $lines = @()
-    try {
-        $out = & ssh-keygen -F $HubHost -f $UserKnownHosts 2>$null
-        $lines = @($out | Where-Object { $_ -and $_ -notmatch '^\s*#' })
-    } catch { return 0 }
+    $lines = @(Get-AmHubHostKeyLines -HubHost $HubHost -UserKnownHosts $UserKnownHosts)
     if ($lines.Count -eq 0) { return 0 }
     $dir = Split-Path -Parent $StateKnownHosts
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -769,9 +916,8 @@ if (-not $HubHost) {
         Write-Host "    ssh config: Match block current"
     }
     $seeded = Initialize-AmsKnownHosts -HubHost $HubHost -UserKnownHosts (Join-Path $amsSshDir 'known_hosts') -StateKnownHosts (Join-Path $amsStateRoot 'known_hosts')
-    $missing = @()
-    if (-not (Test-Path -LiteralPath $amsIdentity)) { $missing += "identity key $amsIdentity is absent (provision this PC's key on the hub first)" }
-    if ($seeded -lt 1) { $missing += "the hub's host key is not in $amsSshDir\known_hosts (accept it once - ssh $amsHubUser@$HubHost - then re-run)" }
+    # THE hub-path predicate, shared with Test-MemoryStack.ps1 R2c (memory-store-lib.ps1).
+    $missing = @(Get-AmHubPathGaps -HubHost $HubHost -SshDir $amsSshDir)
     if ($missing.Count -gt 0) {
         Write-Host "    REFUSED: sync hooks and the watcher are NOT registered on this box:" -ForegroundColor Red
         foreach ($m in $missing) { Write-Host "      - $m" -ForegroundColor Red }
@@ -779,6 +925,27 @@ if (-not $HubHost) {
         Write-Host "    known_hosts: $seeded line(s) seeded into $amsStateRoot\known_hosts"
         $amsHubUrl = Initialize-AmsHistoryRemote -GitDir $amsHistoryDir -WorkTree $amsProjects -HubHost $HubHost -HubUser $amsHubUser -HubRepo $amsHubRepo
         $amsSyncReady = $true
+    }
+}
+# 1.31.3: a watcher stopped for the binary swap (step 1s) is started again from the NEW image,
+# exactly as memory-maintenance-spawn.ps1 starts it at SessionStart (hidden, same arguments).
+# It exits by itself when no session is live, so this costs nothing on an idle box.
+if ($script:amsStoppedWatcher) {
+    if ($amsSyncReady) {
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $amsStoreExe
+            $psi.Arguments = 'sync --watch --hub-host ' + $HubHost
+            $psi.UseShellExecute = $true
+            $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+            $wp = [System.Diagnostics.Process]::Start($psi)
+            $alive = Confirm-AmsWatcherAlive -Process $wp -RefusedLog (Join-Path $amsStateRoot 'watch-refused.log')
+            $fg = if ($alive.Alive) { 'Gray' } else { 'Yellow' }
+            Write-Host "    $($alive.Message)" -ForegroundColor $fg
+            $wp.Dispose()
+        } catch { Write-Host "    watcher not restarted ($($_.Exception.Message)); it starts at the next SessionStart" -ForegroundColor Yellow }
+    } else {
+        Write-Host "    the stopped watcher is not restarted here (hub path not proven); it starts at the next SessionStart once the path is proven" -ForegroundColor Yellow
     }
 }
 

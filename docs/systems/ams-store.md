@@ -539,7 +539,28 @@ What the Windows installer does, in order, and why the order matters:
    the `-CatchUp` child. A box that cannot prove its hub path keeps the legacy
    nightly, because a store with no judge at all only ever shrinks by truncation.
    `ams-store` takes the legacy mutex beside its own, so the two never race while
-   both exist.
+   both exist. Since 1.31.3 every mutex name is scoped to the store: base name, `-`, and the
+   first 16 hex digits of SHA-256 over the state root (full path, backslashes, no trailing
+   separator, lower case). The Go side is `internal/lock/scope.go` and the PowerShell side
+   is `Get-AmStoreMutexName` in `memory-store-lib.ps1`, and both suites pin one golden
+   vector. A bare `Local\` name is global to the logon session, so a test run's sandbox
+   compactor used to hold the live store's lock and the real `sync --once` exited 4. The
+   compactor also counts a mutex that already exists as held, because `ams-store` opens it
+   without owning it. The compactor also takes the Go file lock `ams-store.lock` in the same
+   JSON format, with the same staleness rule and the same break guard, so Go and PowerShell
+   exclude each other through the file too. It counts the nights it skips in
+   `compact-lock-skips.json`, which Test-MemoryStack WARNs on at 2 and FAILs on at 4. The
+   binary swap first stops every `ams-store.exe` serving this user's store. It asks the
+   watcher to stop through `watch.stop`, which a 1.31.3+ watcher honours between passes, and
+   gives a pass 20 s to finish. Anything still running after that is tree-killed
+   (`taskkill /T /F`) once its start time has been re-checked. After a forced stop, stale git lock files
+   in the store's git dirs are removed. Only git's own lock names qualify, and each must be
+   older than 2 minutes, inside the state root, and not reached through a reparse point. A lock
+   is removed only while no `git.exe` of this user is alive, re-checked before each delete. The result is recorded in `git-lock-recovery.json`, which the `store history git
+   locks` row reports. The swap then restarts the watcher from the new image and confirms it
+   is still alive. For the 1.31.3
+   transition, a watcher on the default store refuses to start while the bare
+   `Local\ams-store-watch` is open, logging the refusal to `watch-refused.log`.
 4. **Hooks.** PostToolUse `Write|Edit` runs `ams-store gate` (registered over the two
    legacy markers, so the bash lint and the PowerShell gate are replaced in place);
    SessionStart runs `ams-store sync --once --hub-host <hub>` asynchronously (the

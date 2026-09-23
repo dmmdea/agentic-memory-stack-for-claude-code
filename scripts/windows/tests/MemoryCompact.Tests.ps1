@@ -222,18 +222,77 @@ Describe 'feasibility: protected-set overflow fails loud' {
 
 
 Describe 'GUARD 0: one compactor instance per PC' {
+    BeforeAll {
+        # The mutex is scoped to the sandbox's own state root (2026-09-23). These tests never
+        # touch the operator's live name: before the scoping, every compactor scenario in this
+        # file took the bare Local\ams-memory-compact and made the live `ams-store sync` exit 4.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1')
+        function script:Get-SandboxMutexName($Sandbox) {
+            Get-AmStoreMutexName -Base 'Local\ams-memory-compact' -StateRoot (Join-Path $Sandbox.Home '.claude\state\automemory')
+        }
+    }
     It 'exits 0 with no receipt and a log line when another instance holds the per-PC mutex' {
         $sb = New-Sandbox
         $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
         Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
         $created = $false
-        $m = New-Object System.Threading.Mutex($true, 'Local\ams-memory-compact', [ref]$created)
+        $m = New-Object System.Threading.Mutex($true, (script:Get-SandboxMutexName $sb), [ref]$created)
         try {
             $r = Invoke-Compactor -Sandbox $sb
         } finally { $m.ReleaseMutex(); $m.Dispose() }
         $r.ExitCode | Should -Be 0
         @($r.Receipts).Count | Should -Be 0
         (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'another compactor instance holds the per-PC lock'
+        $skip = Get-Content -LiteralPath (Join-Path $sb.Home '.claude\state\automemory\compact-lock-skips.json') -Raw | ConvertFrom-Json
+        [int]$skip.skips | Should -Be 1 -Because 'a skip is counted, so a wedged holder cannot silence the nightly forever'
+        @($skip.skipped_nights).Count | Should -Be 1
+    }
+    It 'skips (counted, no receipt) while ams-store holds the Go file lock ams-store.lock, and runs once it is dead' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $sr = Join-Path $sb.Home '.claude\state\automemory'
+        [System.IO.Directory]::CreateDirectory($sr) | Out-Null
+        # A live holder in ams-store's own format: this Pester process, its real start time.
+        $me = Get-Process -Id $PID
+        $live = [ordered]@{ pid = $PID; start_time_unix = [DateTimeOffset]::new($me.StartTime.ToUniversalTime()).ToUnixTimeSeconds(); host = 'h'; acquired_at = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ'); reason = 'sync' }
+        [System.IO.File]::WriteAllText((Join-Path $sr 'ams-store.lock'), (($live | ConvertTo-Json -Compress) + "`n"))
+        $r = Invoke-Compactor -Sandbox $sb
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 0 -Because 'a live Go holder of the store file lock must stop the compactor'
+        (Get-Content -LiteralPath (Join-Path $sb.Home '.claude\logs\compact-test.log') -Raw) | Should -Match 'store file lock is held by pid'
+        (Get-Content -LiteralPath (Join-Path $sr 'compact-lock-skips.json') -Raw | ConvertFrom-Json).holder | Should -Match ('pid ' + $PID)
+        # The same file with a start time that does not match: a recycled pid, i.e. a dead holder.
+        $live.start_time_unix = 12345
+        [System.IO.File]::WriteAllText((Join-Path $sr 'ams-store.lock'), (($live | ConvertTo-Json -Compress) + "`n"))
+        $r2 = Invoke-Compactor -Sandbox $sb
+        @($r2.Receipts).Count | Should -BeGreaterThan 0 -Because 'a dead holder is broken and the run proceeds'
+        Test-Path -LiteralPath (Join-Path $sr 'ams-store.lock') | Should -BeFalse -Because 'the compactor releases the file lock it took'
+        Test-Path -LiteralPath (Join-Path $sr 'compact-lock-skips.json') | Should -BeFalse -Because 'a run that took the lock resets the skipped-night count'
+    }
+    It 'also yields to an UNOWNED handle on its store''s mutex (how ams-store holds it, decision Q9)' {
+        $sb = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $created = $false
+        $m = New-Object System.Threading.Mutex($false, (script:Get-SandboxMutexName $sb), [ref]$created)
+        try {
+            $r = Invoke-Compactor -Sandbox $sb
+        } finally { $m.Dispose() }
+        $r.ExitCode | Should -Be 0
+        @($r.Receipts).Count | Should -Be 0 -Because 'a Go pass opens the mutex without owning it; WaitOne alone let the compaction run beside it'
+    }
+    It 'is NOT stopped by the mutex of ANOTHER store (a sandbox never blocks the live store, nor the reverse)' {
+        $sb = New-Sandbox
+        $other = New-Sandbox
+        $facts = @{}; 1..60 | ForEach-Object { $facts["fact$_.md"] = (New-FactFile "fact$_" 'd') }
+        Add-SandboxStore -Sandbox $sb -Workspace 'ws' -IndexLines (New-BigIndexLines) -Facts $facts | Out-Null
+        $created = $false
+        $m = New-Object System.Threading.Mutex($true, (script:Get-SandboxMutexName $other), [ref]$created)
+        try {
+            $r = Invoke-Compactor -Sandbox $sb
+        } finally { $m.ReleaseMutex(); $m.Dispose() }
+        @($r.Receipts).Count | Should -BeGreaterThan 0
     }
     It 'runs and writes a receipt when the mutex is free' {
         $sb = New-Sandbox

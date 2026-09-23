@@ -39,6 +39,23 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
     printf '%s' "$out"
 }
 
+# Operator-owned keys: no installer flag sets them, the operator adds them by hand, and every
+# writer rewrites the whole file, so each writer carries them over from the existing file
+# (stack_env_carry) or a re-run deletes them silently. MEM0_BRAIN_SSH = the brain's SSH alias
+# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). A new hand-set key goes here.
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH"
+
+stack_env_carry() {  # $1 = the existing stack.env -> "KEY=VALUE" lines for the operator-owned keys it records
+    local k v
+    [ -f "$1" ] || return 0
+    for k in $STACK_ENV_OPERATOR_KEYS; do
+        # first occurrence, as every sed reader takes it; a CR from a hand edit is dropped
+        v="$(sed -n "s/^$k=//p" "$1" | head -n1 | tr -d '\r')"
+        [ -z "$v" ] || printf '%s=%s\n' "$k" "$v"
+    done
+    return 0
+}
+
 stack_env_write() {  # $1 = file, then KEY=VALUE ...; all checked before anything is written
     local file="$1" kv k v body=""
     shift

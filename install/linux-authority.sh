@@ -177,6 +177,14 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 # The wiki-index step reads both from here (docs/systems/wiki-index.md).
 [ -z "$WIKI_SOURCES" ] || STACK_ENV_ARGS+=(MEM0_WIKI_SOURCES="$WIKI_SOURCES")
 [ -z "$WIKI_PULL_KEY" ] || STACK_ENV_ARGS+=(MEM0_WIKI_PULL_KEY="$WIKI_PULL_KEY")
+# 1.31.3: operator-owned keys (install/stack-env.sh STACK_ENV_OPERATOR_KEYS) have no flag, so
+# they are carried over from the existing receipt or a re-run deletes them. Nothing on the brain
+# reads MEM0_BRAIN_SSH today (wiki-index.sh is the replica's wrapper), but this re-run is the
+# native brain's only deploy path (deploy.sh refuses a native host), and a deploy must never
+# drop a line the operator wrote.
+mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$HOME/.mem0/stack.env")
+for kv in "${STACK_ENV_CARRY[@]}"; do echo "    ${kv%%=*} carried over from ~/.mem0/stack.env: ${kv#*=}"; done
+STACK_ENV_ARGS+=("${STACK_ENV_CARRY[@]}")
 for kv in "${STACK_ENV_ARGS[@]}"; do
     stack_env_check "${kv%%=*}" "${kv#*=}" || fail "refusing to install: ~/.mem0/stack.env must parse the same for bash, sed and Python (fix the value above)"
 done

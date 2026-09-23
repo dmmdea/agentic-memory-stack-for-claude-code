@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 	amsync "github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/sync"
 )
 
@@ -142,6 +143,7 @@ func runSyncWatch(env Env, g globalOpts, opt amsync.Options) int {
 	// Each pass takes the per-PC lock through the same seam every other verb uses, so a
 	// test binary's lock names reach the watcher too (P5-10).
 	wo := amsync.WatchOptions{Options: opt}
+	wo.LegacyWatchName = legacyWatchNameFor(opt.Roots.StateRoot)
 	wo.AcquirePassLock = func(now time.Time) (func(), bool, error) {
 		return deriveLock{path: LockPath(opt.Roots.StateRoot), now: now}.TryAcquire("sync")
 	}
@@ -159,4 +161,19 @@ func runSyncWatch(env Env, g globalOpts, opt amsync.Options) int {
 	// runs is the normal case, not a fault, and a message here would print on every
 	// session start on every PC.
 	return ExitOK
+}
+
+// legacyWatchNameFor is the bare pre-1.31.3 watcher name for the operator's DEFAULT store and
+// "" for any other root. Only the default store ever had a bare-named watcher, and keeping the
+// probe off scratch roots means a test never looks at the real name (1.31.3 transitional;
+// remove with the next release).
+func legacyWatchNameFor(stateRoot string) string {
+	def, err := store.DefaultRoots()
+	if err != nil {
+		return ""
+	}
+	if lock.StateRootKey(stateRoot) != lock.StateRootKey(def.StateRoot) {
+		return ""
+	}
+	return lock.WatchMutexName
 }

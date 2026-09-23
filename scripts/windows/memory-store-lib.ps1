@@ -813,3 +813,462 @@ function Read-AmJsonFile {
     if ([string]::IsNullOrWhiteSpace($raw)) { throw ('state file is empty (truncated write?): ' + $Path) }
     return ($raw | ConvertFrom-Json)
 }
+
+# ---------------------------------------------------------------- per-store mutex names
+# A Local\ named mutex is global to the logon session, not to a store. With the bare name, a
+# test run's sandbox compactor held the operator's live Local\ams-memory-compact and the real
+# `ams-store sync --once` exited 4 ("the per-PC lock is held"; 2026-09-23). The name is now
+# scoped to the state root, derived EXACTLY as ams-store derives it (internal/lock/scope.go
+# ScopedName): base + '-' + the first 16 hex digits of SHA-256 over the full state-root path
+# with backslashes, no trailing separator, lower case. Both suites pin the same golden vector;
+# if the two derivations ever differ, a Go pass and a compaction of one store stop excluding
+# each other.
+
+$script:AmCompactMutexBase = 'Local\ams-memory-compact'
+
+function ConvertTo-AmCanonicalRoot {
+    # The one spelling of a state root both implementations hash and compare: full path,
+    # backslashes, no trailing separator, lower case (ams-store internal/lock/scope.go).
+    param([Parameter(Mandatory)][string]$Path)
+    return [System.IO.Path]::GetFullPath($Path).Replace('/', '\').TrimEnd('\', '/').ToLowerInvariant()
+}
+
+function Get-AmStoreMutexName {
+    param([Parameter(Mandatory)][string]$Base, [string]$StateRoot = (Join-Path $env:USERPROFILE '.claude\state\automemory'))
+    $canon = ConvertTo-AmCanonicalRoot -Path $StateRoot
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash((Get-AmUtf8).GetBytes($canon)) } finally { $sha.Dispose() }
+    $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    return ($Base + '-' + $hex.Substring(0, 16))
+}
+
+# ---------------------------------------------------------------- the Go file lock, from PowerShell
+# ams-store's per-PC lock is <state root>\ams-store.lock, created with O_EXCL and holding one JSON
+# object (internal/lock/lock.go Holder): pid, the holder PROCESS's start time in unix seconds,
+# host, acquired_at (RFC3339 UTC) and reason. A holder is live while it is younger than 10
+# minutes AND its pid runs with that start time. The compactor takes the same file so Go and
+# PowerShell exclude each other by the file too, not by mutex names alone: a pre-1.31.3 binary
+# still running from ams-store.exe.prev uses the bare names, and the file is the lock both sides
+# have always agreed on. A dead or stale holder is broken under the same `.breaking` guard Go
+# uses, then the create is retried exactly once. A contender never waits.
+
+$script:AmStoreLockFile   = 'ams-store.lock'
+$script:AmStoreLockStaleMinutes = 10
+
+function Get-AmProcessStartUnix {
+    param([int]$ProcessId)
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop
+        return [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+    } catch { return [int64]0 }
+}
+
+function Read-AmStoreLockHolder {
+    # $null when absent; throws when present but unparseable (absent and corrupt must not collapse).
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = [System.IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw ('lock file is empty: ' + $Path) }
+    return ($raw | ConvertFrom-Json)
+}
+
+function Test-AmStoreLockHolderLive {
+    param($Holder, [datetime]$NowUtc = [datetime]::UtcNow)
+    if (-not $Holder) { return $false }
+    $acq = ConvertTo-AmUtc $Holder.acquired_at
+    if ($null -eq $acq) { return $true }   # unreadable timestamp: treat as held, never break it
+    if (($NowUtc - $acq).TotalMinutes -ge $script:AmStoreLockStaleMinutes) { return $false }
+    $procId = [int]$Holder.pid
+    if ($procId -le 0) { return $false }
+    if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { return $false }
+    $want = [int64]$Holder.start_time_unix
+    if ($want -eq 0) { return $true }
+    $got = Get-AmProcessStartUnix -ProcessId $procId
+    if ($got -eq 0) { return $true }    # cannot read it (another user's process): assume alive
+    return ($got -eq $want)
+}
+
+function Test-AmSameLockHolder {
+    # Same pid and same acquisition instant. Compared as UTC instants: pwsh 7's ConvertFrom-Json
+    # turns acquired_at into a [DateTime], so a string compare would never match a re-read.
+    param($A, $B)
+    if (-not $A -or -not $B) { return $false }
+    if ([int]$A.pid -ne [int]$B.pid) { return $false }
+    $ta = ConvertTo-AmUtc $A.acquired_at; $tb = ConvertTo-AmUtc $B.acquired_at
+    if ($null -eq $ta -or $null -eq $tb) { return $false }
+    return ($ta.Ticks -eq $tb.Ticks)
+}
+
+function New-AmStoreLockFile {
+    # $true when this call created the file (it is ours), $false when it already existed.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Holder)
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    } catch [System.IO.IOException] { return $false }
+    try {
+        $b = (Get-AmUtf8).GetBytes((($Holder | ConvertTo-Json -Compress) + "`n"))
+        $fs.Write($b, 0, $b.Length)
+        $fs.Flush($true)
+    } finally { $fs.Dispose() }
+    return $true
+}
+
+function Enter-AmStoreFileLock {
+    # Returns @{ Held = $true; Path; Holder } when taken, or @{ Held = $false; Path; Holder = <the
+    # live holder or $null when unreadable> } when another process holds it.
+    param([Parameter(Mandatory)][string]$StateRoot, [string]$Reason = 'memory-compact', [datetime]$NowUtc = [datetime]::UtcNow)
+    if (-not (Test-Path -LiteralPath $StateRoot)) { [System.IO.Directory]::CreateDirectory($StateRoot) | Out-Null }
+    $path = Join-Path $StateRoot $script:AmStoreLockFile
+    $self = [ordered]@{
+        pid             = $PID
+        start_time_unix = (Get-AmProcessStartUnix -ProcessId $PID)
+        host            = [System.Environment]::MachineName
+        acquired_at     = $NowUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+        reason          = $Reason
+    }
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        if (New-AmStoreLockFile -Path $path -Holder $self) { return @{ Held = $true; Path = $path; Holder = [pscustomobject]$self } }
+        if ($attempt -eq 1) { break }
+        try { $existing = Read-AmStoreLockHolder -Path $path } catch { return @{ Held = $false; Path = $path; Holder = $null } }
+        if (-not $existing) { continue }
+        if (Test-AmStoreLockHolderLive -Holder $existing -NowUtc $NowUtc) { return @{ Held = $false; Path = $path; Holder = $existing } }
+        # Break the dead holder under the guard, re-reading it there (lock.go breakDead).
+        $guard = $path + '.breaking'
+        try {
+            $g = New-Object System.IO.FileStream($guard, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $g.Dispose()
+        } catch [System.IO.IOException] {
+            try { if (((Get-Date) - (Get-Item -LiteralPath $guard).LastWriteTime).TotalMinutes -gt 1) { Remove-Item -LiteralPath $guard -Force } } catch {}
+            return @{ Held = $false; Path = $path; Holder = $existing }
+        }
+        try {
+            $cur = $null
+            try { $cur = Read-AmStoreLockHolder -Path $path } catch { return @{ Held = $false; Path = $path; Holder = $existing } }
+            if ($cur -and -not (Test-AmSameLockHolder $cur $existing)) {
+                return @{ Held = $false; Path = $path; Holder = $cur }
+            }
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        } finally { Remove-Item -LiteralPath $guard -Force -ErrorAction SilentlyContinue }
+    }
+    return @{ Held = $false; Path = $path; Holder = $null }
+}
+
+function Exit-AmStoreFileLock {
+    # Removes the file only while it still records THIS holder: a lock broken as stale and
+    # re-taken belongs to its new holder.
+    param($Lock)
+    if (-not $Lock -or -not $Lock.Held) { return }
+    try {
+        $cur = Read-AmStoreLockHolder -Path $Lock.Path
+        if ($cur -and -not (Test-AmSameLockHolder $cur $Lock.Holder)) { return }
+    } catch {}
+    Remove-Item -LiteralPath $Lock.Path -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------- the compactor's skipped nights
+# GUARD 0 skips silently by design (a second instance is the normal case). But a WEDGED holder -
+# alive, not dead, keeping its handle - makes every nightly skip forever with exit 0. Each skip
+# is counted in <state root>\compact-lock-skips.json (distinct local dates since the last run
+# that took the lock, plus who held it); a run that takes the lock deletes the file, and
+# Test-MemoryStack WARNs at 2 skipped nights and FAILs at 4. A side file, not a receipt row:
+# compact-receipts.jsonl rows are per workspace, and its readers (lint, run history, the Go
+# receipt reader) would count a workspace-less row as a store run.
+
+$script:AmCompactSkipFile = 'compact-lock-skips.json'
+
+function Register-AmCompactorSkip {
+    param([Parameter(Mandatory)][string]$StateRoot, [string]$Holder = '', [datetime]$Now = (Get-Date))
+    $p = Join-Path $StateRoot $script:AmCompactSkipFile
+    $s = $null
+    try { $s = Read-AmJsonFile -Path $p } catch { $s = $null }
+    $nights = @()
+    if ($s -and $s.skipped_nights) { $nights = @($s.skipped_nights | ForEach-Object { [string]$_ }) }
+    # One NIGHT runs noon to noon (local): the 05:00 nightly and a catch-up retry at 23:50 or
+    # 00:10 are the same night, and a retry across local midnight is not a second night.
+    $today = $Now.AddHours(-12).ToString('yyyy-MM-dd')
+    if ($nights -notcontains $today) { $nights += $today }
+    $count = 1
+    if ($s -and $s.skips) { $count = [int]$s.skips + 1 }
+    if (-not (Test-Path -LiteralPath $StateRoot)) { [System.IO.Directory]::CreateDirectory($StateRoot) | Out-Null }
+    Write-AmJsonFile -Path $p -Object ([ordered]@{
+        skipped_nights = @($nights)
+        skips          = $count
+        last_skip_utc  = $Now.ToUniversalTime().ToString('o')
+        holder         = $Holder
+    })
+}
+
+function Clear-AmCompactorSkips {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    Remove-Item -LiteralPath (Join-Path $StateRoot $script:AmCompactSkipFile) -Force -ErrorAction SilentlyContinue
+}
+
+function Get-AmStoreLockHolderHint {
+    # Who holds this store, as far as can be told: the Go lock file's holder, else the running
+    # ams-store.exe processes of this user. '' when nothing is found (a mutex with no visible holder).
+    param([Parameter(Mandatory)][string]$StateRoot)
+    try {
+        $h = Read-AmStoreLockHolder -Path (Join-Path $StateRoot $script:AmStoreLockFile)
+        if ($h) {
+            $name = ''
+            try { $name = (Get-Process -Id ([int]$h.pid) -ErrorAction Stop).ProcessName } catch { $name = 'not running' }
+            return ('pid ' + $h.pid + ' (' + $name + ', reason ' + $h.reason + ', since ' + $h.acquired_at + ')')
+        }
+    } catch {}
+    try {
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name='ams-store.exe'" -ErrorAction Stop)
+        if ($procs.Count -gt 0) {
+            return ('ams-store.exe running: ' + (($procs | ForEach-Object { 'pid ' + $_.ProcessId + ' "' + (($_.CommandLine -replace '^"[^"]*"\s*', '') -replace '^\S+\s*', '') + '"' }) -join '; '))
+        }
+    } catch {}
+    return ''
+}
+
+function Get-AmCompactorSkipVerdict {
+    # The Test-MemoryStack row: WARN at 2 skipped nights, FAIL at 4, OK otherwise.
+    param($State, [bool]$TaskPresent = $true)
+    if (-not $TaskPresent) { return [PSCustomObject]@{ Status = 'OK'; Detail = 'compactor task retired; skipped-night counter not judged' } }
+    if (-not $State) { return [PSCustomObject]@{ Status = 'OK'; Detail = 'no skipped nights (the last run took the store lock)' } }
+    $n = @($State.skipped_nights).Count
+    $who = if ($State.holder) { [string]$State.holder } else { 'holder not identified (a named mutex with no lock file)' }
+    $detail = "$n consecutive night(s) skipped because the store lock was held ($([int]$State.skips) skip(s), last $($State.last_skip_utc)); held by: $who"
+    if ($n -ge 4) { return [PSCustomObject]@{ Status = 'FAIL'; Detail = ($detail + ' - a wedged holder keeps the compactor from ever running; end that process') } }
+    if ($n -ge 2) { return [PSCustomObject]@{ Status = 'WARN'; Detail = $detail } }
+    return [PSCustomObject]@{ Status = 'OK'; Detail = $detail }
+}
+
+# ---------------------------------------------------------------- git locks a killed process leaves
+# A process killed mid-commit or mid-gc (the installer's forced stop before an exe swap) can
+# leave index.lock or a ref .lock in a git dir ams-store drives; every later sync then fails on
+# it and nothing says why. The rules for removing one are deliberately conservative:
+#   - a git dir is a direct child of the state root holding HEAD, objects\ and refs\, and is
+#     not a reparse point; nothing is ever reached through a junction or symlink;
+#   - only git's own lock names: index.lock, HEAD.lock, config.lock, packed-refs.lock,
+#     shallow.lock at the top, and *.lock under refs\;
+#   - a lock younger than 2 minutes is left alone (a git that just started is not raced);
+#   - a lock is removed only while NO git.exe of the current user is alive at all, re-queried
+#     right before EACH delete. A command-line match would miss cwd-only, relative,
+#     --work-tree-only and GIT_DIR invocations and git's own children, and Windows cannot
+#     reliably read another process's cwd;
+#   - the file must resolve inside the canonical state root with no reparse point on the way.
+# The outcome is recorded in git-lock-recovery.json, and Test-MemoryStack reports it together
+# with any lock older than 10 minutes present now.
+
+$script:AmGitLockRecoveryFile = 'git-lock-recovery.json'
+$script:AmGitLockStaleMinutes = 10
+$script:AmGitLockGraceMinutes = 2
+$script:AmGitTopLockNames = @('index.lock', 'HEAD.lock', 'config.lock', 'packed-refs.lock', 'shallow.lock')
+
+function Test-AmReparsePoint {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $a = [System.IO.File]::GetAttributes($Path)
+        return (($a -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    } catch { return $true }   # cannot tell: treat as unsafe
+}
+
+function Test-AmPathInsideRoot {
+    # $true only when $Path (after normalising .. and separators) is strictly below the
+    # canonical $Root AND no component from the root down to the path itself is a reparse point.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    try { $root = ConvertTo-AmCanonicalRoot -Path $Root; $full = ConvertTo-AmCanonicalRoot -Path $Path } catch { return $false }
+    $sep = [string][char]92
+    if (-not $full.StartsWith($root + $sep)) { return $false }
+    $cur = [System.IO.Path]::GetFullPath($Path).TrimEnd([char]92, '/')
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char]92, '/')
+    while ($cur -and ($cur.Length -gt $rootFull.Length)) {
+        if (Test-Path -LiteralPath $cur) { if (Test-AmReparsePoint -Path $cur) { return $false } }
+        $cur = [System.IO.Path]::GetDirectoryName($cur)
+    }
+    return $true
+}
+
+function Get-AmStoreGitDirs {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    if (-not (Test-Path -LiteralPath $StateRoot)) { return @() }
+    return @(Get-ChildItem -LiteralPath $StateRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            -not (Test-AmReparsePoint -Path $_.FullName) -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'HEAD') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'objects') -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'refs') -PathType Container)
+        } | ForEach-Object { $_.FullName })
+}
+
+function Get-AmGitLockFiles {
+    # git's own lock files in one git dir, found without ever entering a reparse point.
+    param([Parameter(Mandatory)][string]$GitDir)
+    if (-not (Test-Path -LiteralPath $GitDir) -or (Test-AmReparsePoint -Path $GitDir)) { return @() }
+    $out = @()
+    foreach ($n in $script:AmGitTopLockNames) {
+        $p = Join-Path $GitDir $n
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and -not (Test-AmReparsePoint -Path $p)) { $out += Get-Item -LiteralPath $p }
+    }
+    $stack = New-Object System.Collections.Stack
+    $refs = Join-Path $GitDir 'refs'
+    if ((Test-Path -LiteralPath $refs -PathType Container) -and -not (Test-AmReparsePoint -Path $refs)) { $stack.Push($refs) }
+    while ($stack.Count -gt 0) {
+        $d = [string]$stack.Pop()
+        foreach ($e in @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)) {
+            if (Test-AmReparsePoint -Path $e.FullName) { continue }   # never recurse through, never delete
+            if ($e.PSIsContainer) { $stack.Push($e.FullName) }
+            elseif ($e.Name -like '*.lock') { $out += $e }
+        }
+    }
+    return $out
+}
+
+function Get-AmCurrentUserGitProcesses {
+    # Every running git.exe owned by the current user (or whose owner cannot be read: it might be).
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $out = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='git.exe'" -ErrorAction SilentlyContinue)) {
+        $owner = ''
+        try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop; if ($o.User) { $owner = "$($o.Domain)\$($o.User)" } } catch {}
+        if ($owner -and ($owner -ne $me)) { continue }
+        $out += [pscustomobject]@{ ProcessId = [int]$p.ProcessId; CommandLine = [string]$p.CommandLine }
+    }
+    return $out
+}
+
+function Invoke-AmGitLockRecovery {
+    param([Parameter(Mandatory)][string]$StateRoot,
+        [scriptblock]$GetGitProcesses = { Get-AmCurrentUserGitProcesses },
+        [string]$Trigger = '', [datetime]$NowUtc = [datetime]::UtcNow,
+        [switch]$WaitForGrace, [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms })
+    $grace = $script:AmGitLockGraceMinutes
+    $locks = @()
+    foreach ($gd in @(Get-AmStoreGitDirs -StateRoot $StateRoot)) { $locks += @(Get-AmGitLockFiles -GitDir $gd) }
+    if ($WaitForGrace -and $locks.Count -gt 0) {
+        # After a forced stop the killed git's lock is seconds old: wait out the grace once.
+        $youngest = ($locks | ForEach-Object { $_.LastWriteTimeUtc } | Sort-Object -Descending | Select-Object -First 1)
+        $left = [int][math]::Ceiling(($youngest.AddMinutes($grace) - $NowUtc).TotalMilliseconds)
+        if ($left -gt 0) { & $Sleep ([math]::Min($left, $grace * 60000)) }
+        $NowUtc = [datetime]::UtcNow
+        $locks = @(); foreach ($gd in @(Get-AmStoreGitDirs -StateRoot $StateRoot)) { $locks += @(Get-AmGitLockFiles -GitDir $gd) }
+    }
+    $removed = @(); $kept = @()
+    foreach ($l in $locks) {
+        $fi = Get-Item -LiteralPath $l.FullName -Force -ErrorAction SilentlyContinue
+        if (-not $fi) { continue }
+        if (($NowUtc - $fi.LastWriteTimeUtc).TotalMinutes -lt $grace) {
+            $kept += [ordered]@{ path = $l.FullName; reason = "younger than the $grace-minute grace (a git may have just started)" }; continue
+        }
+        if (-not (Test-AmPathInsideRoot -Path $l.FullName -Root $StateRoot)) {
+            $kept += [ordered]@{ path = $l.FullName; reason = 'does not resolve inside the state root without a reparse point' }; continue
+        }
+        $gits = @(& $GetGitProcesses)   # re-queried for EVERY delete
+        if ($gits.Count -gt 0) {
+            $kept += [ordered]@{ path = $l.FullName; reason = ('git.exe alive (pid ' + ((@($gits) | ForEach-Object { $_.ProcessId }) -join ', ') + ')') }; continue
+        }
+        try { Remove-Item -LiteralPath $l.FullName -Force -ErrorAction Stop; $removed += $l.FullName }
+        catch { $kept += [ordered]@{ path = $l.FullName; reason = ('could not remove: ' + $_.Exception.Message) } }
+    }
+    $rec = [ordered]@{ ts = $NowUtc.ToString('o'); trigger = $Trigger; removed = @($removed); kept = @($kept) }
+    if ($removed.Count -gt 0 -or $kept.Count -gt 0) {
+        Write-AmJsonFile -Path (Join-Path $StateRoot $script:AmGitLockRecoveryFile) -Object $rec
+    }
+    return [pscustomobject]$rec
+}
+
+function Get-AmStaleGitLocks {
+    # git lock files older than 10 minutes in the store's git dirs (same containment rules).
+    param([Parameter(Mandatory)][string]$StateRoot, [datetime]$NowUtc = [datetime]::UtcNow)
+    $out = @()
+    foreach ($gd in @(Get-AmStoreGitDirs -StateRoot $StateRoot)) {
+        foreach ($l in @(Get-AmGitLockFiles -GitDir $gd)) {
+            if (($NowUtc - $l.LastWriteTimeUtc).TotalMinutes -ge $script:AmGitLockStaleMinutes) { $out += $l.FullName }
+        }
+    }
+    return $out
+}
+
+function Get-AmGitLockVerdict {
+    # The Test-MemoryStack row.
+    #   FAIL: a git lock older than 10 minutes is present AND no git.exe of this user is alive -
+    #         nothing will ever release it, and every sync fails on it.
+    #   WARN: such a lock while some git is alive (a long gc or a slow push holds it
+    #         legitimately; the pids are named); or a recovery in the last 14 days removed or
+    #         kept locks after a forced stop.
+    param($Record, $StaleLocks = @(), $GitProcesses = @(), [datetime]$NowUtc = [datetime]::UtcNow)
+    $stale = @($StaleLocks)
+    $gits = @($GitProcesses)
+    if ($stale.Count -gt 0) {
+        $list = (($stale | ForEach-Object { [string]$_ }) -join '; ')
+        if ($gits.Count -eq 0) {
+            return [PSCustomObject]@{ Status = 'FAIL'; Detail = ('git lock(s) older than ' + $script:AmGitLockStaleMinutes + ' min with no git.exe alive - every sync fails on them: ' + $list) }
+        }
+        return [PSCustomObject]@{ Status = 'WARN'; Detail = ('git lock(s) older than ' + $script:AmGitLockStaleMinutes + ' min while git.exe is alive (pid ' + (($gits | ForEach-Object { $_.ProcessId }) -join ', ') + '): ' + $list) }
+    }
+    if ($Record) {
+        $ts = ConvertTo-AmUtc $Record.ts
+        $recent = ($null -ne $ts) -and (($NowUtc - $ts).TotalDays -le 14)
+        if ($recent -and (@($Record.removed).Count -gt 0 -or @($Record.kept).Count -gt 0)) {
+            $parts = @()
+            if (@($Record.removed).Count -gt 0) { $parts += ('removed ' + (@($Record.removed) -join '; ')) }
+            if (@($Record.kept).Count -gt 0) { $parts += ('kept ' + ((@($Record.kept) | ForEach-Object { [string]$_.path + ' (' + [string]$_.reason + ')' }) -join '; ')) }
+            return [PSCustomObject]@{ Status = 'WARN'; Detail = ('a forced stop left git lock(s) (' + $Record.ts + ', ' + $Record.trigger + '): ' + ($parts -join ' | ')) }
+        }
+    }
+    return [PSCustomObject]@{ Status = 'OK'; Detail = 'no git lock left in the store git dirs' }
+}
+
+# ---------------------------------------------------------------- store hub path (P4-1a)
+# ONE predicate for "this PC's hub path is proven": install/2-windows-config.ps1 step 1c uses it
+# to decide whether the sync hooks and the watcher are registered, step 1d uses the same answer
+# to retire (proven) or keep (not proven) the nightly PowerShell compactor task, and
+# Test-MemoryStack.ps1 R2c uses it to judge that task's absence. Two copies of this decision
+# drifted once: the self-test FAILed a replica right after a clean install because it still
+# expected the task the installer had retired on purpose.
+
+$script:AmHubUser         = 'ams-hub'
+$script:AmHubIdentityName = 'id_ed25519_ams_hub'
+
+function Get-AmHubHostKeyLines {
+    # The hub's host-key lines in a known_hosts file (`ssh-keygen -F`, comment lines dropped).
+    # Empty = the user has never accepted the hub's host key, or the file or ssh-keygen is absent.
+    param([string]$HubHost, [string]$UserKnownHosts)
+    $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false
+    if (-not $HubHost -or -not (Test-Path -LiteralPath $UserKnownHosts)) { return @() }
+    try {
+        $out = & ssh-keygen -F $HubHost -f $UserKnownHosts 2>$null
+        return @($out | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+    } catch { return @() }
+}
+
+function Get-AmHubPathGaps {
+    # What stands between this PC and a proven hub path; an EMPTY result means proven. Proven =
+    # a hub host is configured, the hub identity key is present, and the hub's host key is in the
+    # user's known_hosts (which the installer seeds into the binary's own known_hosts).
+    param([string]$HubHost, [string]$SshDir = (Join-Path $env:USERPROFILE '.ssh'))
+    if (-not $HubHost) { return @('no store hub configured (-HubHost / the receipt HubHost is empty)') }
+    $gaps = @()
+    $identity = Join-Path $SshDir $script:AmHubIdentityName
+    if (-not (Test-Path -LiteralPath $identity)) { $gaps += "identity key $identity is absent (provision this PC's key on the hub first)" }
+    $kh = Join-Path $SshDir 'known_hosts'
+    if (@(Get-AmHubHostKeyLines -HubHost $HubHost -UserKnownHosts $kh).Count -lt 1) {
+        $gaps += "the hub's host key is not in $kh (accept it once - ssh $($script:AmHubUser)@$HubHost - then re-run)"
+    }
+    return $gaps
+}
+
+function Get-AmCompactorTaskVerdict {
+    # The self-test row for the nightly PowerShell compactor task, mirroring installer step 1d:
+    # absent + hub proven = retired on purpose; absent + hub not proven = the legacy nightly the
+    # installer should have kept is missing; present = the deployed-copy action-shape checks.
+    param([bool]$Present, [string]$TaskArgs = '', [string]$TaskState = '', [string[]]$HubGaps = @())
+    $gaps = @($HubGaps | Where-Object { $_ })
+    if (-not $Present) {
+        if ($gaps.Count -eq 0) {
+            return [PSCustomObject]@{ Status = 'OK'; Detail = 'retired; ams-store gate + sync + hub judge replace it' }
+        }
+        return [PSCustomObject]@{ Status = 'FAIL'; Detail = ('not registered and the hub path is not proven (' + ($gaps -join '; ') + ') - re-run 2-windows-config.ps1 (it keeps the legacy nightly until the hub path is proven)') }
+    }
+    if ($TaskArgs -match '[/\\](Dev|repos|worktrees)[/\\]') {
+        return [PSCustomObject]@{ Status = 'FAIL'; Detail = "LIVE action executes a repo/worktree path, not the deployed copy: $TaskArgs" }
+    }
+    if ($TaskArgs -match 'memory-compact\.ps1') {
+        return [PSCustomObject]@{ Status = 'OK'; Detail = "state=$TaskState; action=deployed memory-compact.ps1" }
+    }
+    return [PSCustomObject]@{ Status = 'WARN'; Detail = "unrecognized action shape: $TaskArgs" }
+}

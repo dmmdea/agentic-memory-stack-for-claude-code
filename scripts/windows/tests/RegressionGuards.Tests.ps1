@@ -377,6 +377,17 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         $script:tmsCode.Contains("`$TmsRole -eq 'replica'") | Should -BeTrue -Because 'brain-only rows must be role-gated (F3) or a replica FAILs forever'
     }
 
+    It 'the consolidation drift row reads the local drift log on the brain only (2026-09-22 replica GUARD DEAD)' {
+        # A replica keeps ~/.mem0/consolidation-drift.jsonl from before the authority cutover. Its
+        # last guard-dead record made every replica self-test FAIL "consolidations are running
+        # UNGUARDED" while the brain's guard compared 7/7 every night. The banner was role-gated
+        # for the same residue in 1.28.4; this row was the missed surface.
+        $m = [regex]::Match($script:tmsCode, "(?s)try \{\s*if \(\`$TmsIsReplica\) \{.*?'consolidation drift' 'OK'.*?\} else \{\s*\`$cdLog = ")
+        $m.Success | Should -BeTrue -Because 'the replica branch must come BEFORE the local drift log is read'
+        $m.Value | Should -Match 'checks\.retrieval_drift' -Because 'a replica reports the brain''s own guard state from the authority''s /health/deep'
+        $m.Value | Should -Not -Match "'consolidation drift' 'FAIL'" -Because 'a replica judges brain machinery by design only; the capability manifest FAILs a dead drift-guard'
+    }
+
     It 'AMS-07: the Codex shim spawn is NOT gated on the flag nothing creates' {
         # The shim's spawn required ~/.claude/state/codex-shim.enabled — a flag
         # whose only documented creator was a manual "enable the NLI write-gate"
