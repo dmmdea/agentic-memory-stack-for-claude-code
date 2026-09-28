@@ -168,8 +168,8 @@ _SEG = r"[^\s\"',;)\]}<>|*?]"
 # constantly in this corpus and was invisible to a backslash-only pattern, so those
 # memories were reported as "names no path at all" - a false statement about the corpus,
 # not a silence. _translate already handled ":/" , proving they were meant to be in scope.
-# (?<![A-Za-z]) and the (?!/) both exist to keep URLs out: without them "http://qube:18791"
-# yields the "path" p://qube:18791, which never exists and was INVENTED as stale - it even
+# (?<![A-Za-z]) and the (?!/) both exist to keep URLs out: without them "http://node-a:18791"
+# yields the "path" p://node-a:18791, which never exists and was INVENTED as stale - it even
 # reached the canonical tier in a full run.
 WINPATH = re.compile(
     r"(?<![A-Za-z])[A-Za-z]:[\\/](?!/)(?:" + _SEG + r"|[ ](?=" + _SEG + r"*[\\/]))+")
@@ -178,7 +178,7 @@ WINPATH = re.compile(
 # roots. Anything not listed here is counted as an unmatched shape rather than folded
 # into "no path at all".
 # /dev and /proc are deliberately absent: they are prose fragments far more often than
-# path claims here ("/dev/peptidos/" came out of a sentence about workspaces and was
+# path claims here ("/dev/projects/" came out of a sentence about workspaces and was
 # scored stale). Roots are added only when they earn it.
 _POSIX_ROOTS = (r"~|/home/[A-Za-z0-9._-]+|/root|/mnt/[a-z]|/opt|/srv|/etc|/usr|/tmp"
                 r"|/var/log|/var/lib")

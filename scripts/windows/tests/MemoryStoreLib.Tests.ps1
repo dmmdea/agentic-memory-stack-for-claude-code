@@ -143,7 +143,7 @@ Describe 'review-round primitives' {
 Describe 'frontmatter and the doctrine hard rule' {
     It 'reads type NESTED under metadata (the shape every real fact file uses)' {
         $p = Join-Path $TestDrive 'fb.md'
-        [System.IO.File]::WriteAllText($p, (New-Fact -Name 'x' -Desc ('Daniel ' + $script:EmDash + ' "quoted" inner') -Type 'feedback'), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($p, (New-Fact -Name 'x' -Desc ('Operator ' + $script:EmDash + ' "quoted" inner') -Type 'feedback'), (New-Object System.Text.UTF8Encoding($false)))
         $fm = Read-AmFrontmatter -Path $p
         $fm.Type | Should -Be 'feedback'
         $fm.Name | Should -Be 'x'

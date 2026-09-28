@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Docs gate: (1) every relative Markdown link in docs/, AGENTS.md, ARCHITECTURE.md,
-README.md, CLAUDE.md resolves to a real file; (2) no operator-specific value (operator
-handles, machine names, brand names, LAN IPs, operator-local paths) appears in any of
-those same scanned files -- the repo's own canonical GitHub URL is sanctioned and is
-stripped out before the line is scanned, so it cannot mask an adjacent violation;
-(3) every top-level ADR in docs/architecture/decisions/ (subdirectories are not
-scanned) has valid frontmatter (status/date; superseded_by iff Superseded).
-Exit 1 on any violation."""
+README.md, CLAUDE.md resolves to a real file; (2) every top-level ADR in
+docs/architecture/decisions/ (subdirectories are not scanned) has valid frontmatter
+(status/date; superseded_by iff Superseded). Exit 1 on any violation.
+
+Personal/operator-specific values are NOT checked here: scripts/ci/privacy-gate.py owns that
+check for the whole tree, filenames and commit messages, and keeps its term list as keyed
+digests rather than plaintext."""
 import re, subprocess, sys
 from pathlib import Path
 
@@ -44,9 +44,6 @@ else:
         if (p.is_relative_to(ROOT / "docs") or p.name in _top and p.parent == ROOT) and p.exists()
     ]
 LINK = re.compile(r"\[[^\]]*\]\(([^)#\s]+)(?:#[^)\s]*)?\)")
-PII = re.compile(r"(?i)\b(aorus|qube|dmmdea|dmmde|daniel|readypep|eclipton|dojolife|danmar|peptidos|pepclick|intranet-pds)\b"
-                 r"|10\.0\.0\.\d+|D:\\Dev\\dmmdea|D:\\repos|/mnt/d/(Dev|repos)")
-SANCTIONED = ("github.com/dmmdea/agentic-memory-stack-for-claude-code",)
 ADR_STATUS = {"Proposed", "Accepted", "Superseded", "Deprecated", "Rejected"}
 errors = []
 
@@ -58,12 +55,6 @@ for f in DOC_FILES:
             continue
         if not (f.parent / target).resolve().is_file():
             errors.append(f"{f.relative_to(ROOT)}: broken link -> {target}")
-    for line_no, line in enumerate(text.splitlines(), 1):
-        scanned = line
-        for s in SANCTIONED:
-            scanned = scanned.replace(s, "")
-        if PII.search(scanned):
-            errors.append(f"{f.relative_to(ROOT)}:{line_no}: operator-specific value: {line.strip()[:80]}")
 
 for adr in (ROOT / "docs" / "architecture" / "decisions").glob("*.md"):
     if adr.name == "README.md":

@@ -7,7 +7,7 @@
 #   - Test-DecisionLikePrompt        (Phase 0.B decision-capture predicate)
 #   - Select-AdmittedMemoryResults   (Phase 0.D proactive-injection admission)
 #
-# Run: pwsh -NoProfile -Command "Invoke-Pester D:\repos\agentic-memory-stack\scripts\windows\tests\ -Output Detailed"
+# Run: pwsh -NoProfile -Command "Invoke-Pester <repo>\scripts\windows\tests\ -Output Detailed"
 
 BeforeAll {
     $libPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'user-prompt-lib.ps1'

@@ -208,7 +208,7 @@ Check "mem0 MCP server registered + args well-formed" {
 } "Re-run 2-windows-config.ps1 (it rewrites a correct single-path mem0 entry) — the ~/.claude.json mem0 args are missing or malformed (shim path split across array elements)"
 # 2026-07-24: bash-safety guard for hook COMMAND strings. Claude Code passes a hook command
 # with no `args` array to Git Bash, where an unquoted backslash is an escape character — so a
-# raw Windows path is silently shredded into `C:Usersdmmde...` and the hook dies exit 127 on
+# raw Windows path is silently shredded into `C:Users<user>...` and the hook dies exit 127 on
 # every single event, with nothing surfaced anywhere. That killed episodic capture for 9 days
 # (stop-extract.ps1) and memory injection for longer (mem0-hook-client.exe, ~1000 failures).
 # A hook WITH an `args` array is exec'd directly and is exempt — that asymmetry is exactly why

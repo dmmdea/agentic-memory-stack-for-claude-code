@@ -14,7 +14,7 @@ It replaces three PowerShell surfaces that ship today — the store library
 (`scripts/windows/memory-index-write-gate.ps1`) and the nightly compactor
 (`scripts/windows/memory-compact.ps1`) — with one implementation for every OS,
 and it is the tool the Linux authority runs on the hub. The design is
-`plans/2026-09-10-ams-v2-lenovo-authority-design.md` §5, §6; the phased build is
+the v2 authority design plan §5, §6; the phased build is
 register rows P3-* / P4-* / P5-*.
 
 ## Status

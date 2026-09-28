@@ -15,7 +15,7 @@
 #    kills the prompt pipeline). Functional test runs the REAL spawn script in
 #    a sandboxed USERPROFILE so the real deployment is never touched.
 #
-# Run: pwsh -NoProfile -Command "Invoke-Pester D:\repos\agentic-memory-stack\scripts\windows\tests\ -Output Detailed"
+# Run: pwsh -NoProfile -Command "Invoke-Pester <repo>\scripts\windows\tests\ -Output Detailed"
 
 BeforeAll {
     $script:winDir        = Split-Path -Parent $PSScriptRoot
@@ -160,9 +160,9 @@ Describe 'installer/verifier ship the A.5/A.6 chain (v0.20 Final)' {
         $src | Should -Match ([regex]::Escape("New-HookCommand 'codex-shim-spawn.ps1'"))
     }
 
-    It 'shim scripts carry NO dmmdea token (R9 byte-identical deploy)' {
+    It 'shim scripts carry NO raw user handle in a home path (R9 byte-identical deploy)' {
         foreach ($f in @('codex-shim.ps1', 'codex-shim-spawn.ps1')) {
-            (Get-Content (Join-Path $winDir $f) -Raw) | Should -Not -Match 'dmmdea' -Because "$f is R9 SHA256-tracked; a 'dmmdea' token would make the installer substitute it and break the deployed-vs-repo hash match"
+            (Get-Content (Join-Path $winDir $f) -Raw) | Should -Not -Match '/home/(?![$<_])[A-Za-z0-9._-]+' -Because "$f is R9 SHA256-tracked; a raw handle in a home path would make the installer substitute it and break the deployed-vs-repo hash match"
         }
     }
 
@@ -346,7 +346,7 @@ Describe 'installer is operator-agnostic: distro detect + receipt + no raw dev i
         foreach ($f in (Get-AstArrayStrings -Path $installerPath -VarName 'winScripts')) {
             $p = Join-Path $winDir $f
             if (Test-Path $p) {
-                (Get-Content $p -Raw) | Should -Not -Match 'D:\\repos\\agentic-memory-stack' -Because "$f must derive the repo root from the receipt, never hardcode D:\repos"
+                (Get-Content $p -Raw) | Should -Not -Match '[A-Za-z]:\\(Dev|repos)\\' -Because "$f must derive the repo root from the receipt, never hardcode a drive-rooted developer path"
             }
         }
     }
@@ -366,10 +366,10 @@ Describe 'installer is operator-agnostic: distro detect + receipt + no raw dev i
             $p = Join-Path $winDir $f
             if (Test-Path $p) {
                 $t = Get-Content $p -Raw
-                $t | Should -Not -Match 'dmmdea'                        -Because "$f must use the __WSL_USER__ sentinel (or receipt), not the raw handle"
+                $t | Should -Not -Match '/home/(?![$<_])[A-Za-z0-9._-]+' -Because "$f must use the __WSL_USER__ sentinel (or receipt), not the raw handle"
                 $t | Should -Not -Match '\\\\wsl\.localhost\\Ubuntu\\'  -Because "$f must use __WSL_DISTRO__ (or receipt) in UNC paths, not a literal Ubuntu"
-                $t | Should -Not -Match 'Users[\\/]dmmde\b'             -Because "$f must use __WIN_USER__ (or `$env:USERNAME), not the raw Windows handle"
-                $t | Should -Not -Match '/mnt/d/repos|D:\\repos'        -Because "$f must derive the repo path from the receipt, not hardcode it"
+                $t | Should -Not -Match 'Users[\\/](?![$<_%]|__)[A-Za-z0-9._-]+' -Because "$f must use __WIN_USER__ (or `$env:USERNAME), not the raw Windows handle"
+                $t | Should -Not -Match '/mnt/[a-z]/(Dev|repos)|[A-Za-z]:\\(Dev|repos)\\' -Because "$f must derive the repo path from the receipt, not hardcode it"
                 foreach ($pat in $piiPatterns) {
                     $t | Should -Not -Match $pat -Because "$f must not leak the operator-private pattern '$pat' (from pii-patterns.local.txt)"
                 }
@@ -393,7 +393,7 @@ Describe 'v1.16 deploy-layer-skew hardening: fail-open PreCompact, distro-agnost
 
     It 'hook wsl.exe commands are distro-agnostic when the AMS distro is the WSL default (no unconditional -d)' {
         # The shared/cross-machine settings.json must not be polluted with a machine-specific
-        # -d <distro> (box A=Ubuntu, box B=Ubuntu-ML share one file). -d is emitted ONLY when
+        # -d <distro> (box A=Ubuntu, box B=Ubuntu-Alt share one file). -d is emitted ONLY when
         # the AMS distro is not the box default.
         $src = Get-Content $installerPath -Raw
         $src | Should -Match '\$wslDistroArg' -Because 'hook commands must build on the conditional distro arg'

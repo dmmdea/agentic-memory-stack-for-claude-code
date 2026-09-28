@@ -44,7 +44,7 @@ def test_selfheal_unpoisons_once_and_returns_vector(monkeypatch):
     import sparse_health
     monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: True)
     store = _FakeStore(poisoned=True, heal_works=True)
-    assert encode_with_selfheal(store, "qube") is not None
+    assert encode_with_selfheal(store, "ws1") is not None
     assert store.init_attempts == 1
 
 
@@ -54,9 +54,9 @@ def test_selfheal_is_bounded_per_call(monkeypatch):
     import sparse_health
     monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: True)
     store = _FakeStore(poisoned=True, heal_works=False)
-    assert encode_with_selfheal(store, "qube") is None
+    assert encode_with_selfheal(store, "ws1") is None
     assert store.init_attempts == 1
-    assert encode_with_selfheal(store, "qube") is None
+    assert encode_with_selfheal(store, "ws1") is None
     assert store.init_attempts == 2
 
 
@@ -66,14 +66,14 @@ def test_selfheal_skips_reset_when_dep_missing(monkeypatch):
     import sparse_health
     monkeypatch.setattr(sparse_health, "_fastembed_available", lambda: False)
     store = _FakeStore(poisoned=True, heal_works=True)
-    assert encode_with_selfheal(store, "qube") is None
+    assert encode_with_selfheal(store, "ws1") is None
     assert store.init_attempts == 0
 
 
 def test_selfheal_no_reset_on_healthy_encoder():
     store = _FakeStore(poisoned=False, heal_works=True)
     store._bm25_encoder = object()  # already loaded
-    assert encode_with_selfheal(store, "qube") is not None
+    assert encode_with_selfheal(store, "ws1") is not None
     assert store.init_attempts == 0
 
 
@@ -84,7 +84,7 @@ def test_selfheal_never_raises():
         def _encode_bm25(self, text):
             raise RuntimeError("boom")
 
-    assert encode_with_selfheal(_Exploding(), "qube") is None
+    assert encode_with_selfheal(_Exploding(), "ws1") is None
 
 
 CANARY_OK = {"ran": True, "hit": True, "token": "qdrant"}

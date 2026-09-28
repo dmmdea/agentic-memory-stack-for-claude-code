@@ -721,7 +721,7 @@ func TestMerge_IndexIsNeverTracked(t *testing.T) {
 // TestMerge_UnrelatedHistoriesMergeOnEverySupportedGit is the FIRST sync of the fleet:
 // two PCs that each ran `git init` locally before either had ever pushed, so their
 // histories share no commit at all. It is the shape the seed produces on every PC after
-// the Qube's, and it happens exactly once per box - which is also why it can ship broken.
+// the first PC's, and it happens exactly once per box - which is also why it can ship broken.
 //
 // The failure it pins is VERSION-dependent, and therefore invisible on the machine it was
 // written on. The unrelated-histories path has to hand merge-tree a base; git 2.55 accepts

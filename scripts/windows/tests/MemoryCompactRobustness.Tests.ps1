@@ -397,8 +397,8 @@ Describe 'line floor, catch-up and synthesized hooks (2026-09-06)' {
             $facts['fact' + $i + '.md'] = (New-FactFile ('fact' + $i) ('desc ' + $i) 'reference' ('body ' + $i))
         }
         for ($i = 1; $i -le 3; $i++) {
-            $lines += ('- [Rule ' + $i + '](rule' + $i + '.md) ' + $script:EmDash + ' Daniel: never do thing ' + $i)
-            $facts['rule' + $i + '.md'] = (New-FactFile ('rule' + $i) ('Daniel: never do thing ' + $i) 'feedback' ('the rule ' + $i))
+            $lines += ('- [Rule ' + $i + '](rule' + $i + '.md) ' + $script:EmDash + ' Operator: never do thing ' + $i)
+            $facts['rule' + $i + '.md'] = (New-FactFile ('rule' + $i) ('Operator: never do thing ' + $i) 'feedback' ('the rule ' + $i))
         }
         $dir = Add-SandboxStore -Sandbox $sb -Workspace 'tall' -IndexLines $lines -Facts $facts
         # age: fact1..fact40 are the oldest (100 days back, ascending), the rest are fresh

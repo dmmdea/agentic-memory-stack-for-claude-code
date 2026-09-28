@@ -12,7 +12,7 @@ cannot collide with any real user.  A `finally` block deletes all 3 seeded
 records (and verifies they are gone) even on assertion failure.
 
 Run:
-  wsl.exe -e bash -lc "cd /mnt/d/repos/agentic-memory-stack && \
+  wsl.exe -e bash -lc "cd <repo-root> && \
     /home/youruser/apps/mem0-server/.venv/bin/python -m pytest \
     mem0-server/tests/test_shiplog_kslot_probe.py -v"
 """
