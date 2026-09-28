@@ -4,7 +4,6 @@ a throwaway key and repo (no real term, no real key). Run: python scripts/ci/tes
 import importlib.util
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
