@@ -11,6 +11,7 @@ class) and that the checkpoint side effect lands in episodic.db.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -47,7 +48,7 @@ _UNIT_SRC = (Path(__file__).resolve().parents[2] / "systemd" / "mem0.service").r
 
 
 def test_bundle_does_not_hardcode_developer_handle():
-    assert 'user_id": "dmmdea"' not in _APP_SRC, (
+    assert not re.search(r'user_id": "[A-Za-z][A-Za-z0-9_-]*"', _APP_SRC), (
         "the /v1/context/bundle search must not hardcode the developer handle as user_id "
         "(operator-agnostic regression — recon B2)"
     )

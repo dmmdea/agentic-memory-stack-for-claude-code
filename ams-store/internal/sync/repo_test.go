@@ -17,8 +17,8 @@ import (
 // TestSync_TracksTheSharedOverTriggerStamp is decision Q13's transport.
 //
 // The G7 metric is "hours over trigger without an applied decision", and it is only
-// meaningful fleet-wide: a store that has been over the trigger for two days on the Qube
-// and was first seen crossing on the Aorus must report the EARLIER time. That needs the
+// meaningful fleet-wide: a store that has been over the trigger for two days on the workstation
+// and was first seen crossing on the laptop must report the EARLIER time. That needs the
 // stamp in the synced tree. It lives outside every store, because nothing but MEMORY.md
 // and fact files may sit in a store.
 //

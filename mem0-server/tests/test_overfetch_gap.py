@@ -31,7 +31,7 @@ REGRESSION: no-retired search returns same top-K (over-fetch transparent).
 CLEANUP: all 5 records deleted unconditionally in finally block.
 
 Run:
-  wsl.exe -e bash -lc "cd /mnt/d/repos/agentic-memory-stack && \\
+  wsl.exe -e bash -lc "cd <repo-root> && \\
     /home/youruser/apps/mem0-server/.venv/bin/python -m pytest \\
     mem0-server/tests/test_overfetch_gap.py -v"
 """

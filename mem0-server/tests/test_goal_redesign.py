@@ -80,13 +80,13 @@ def test_intent_in_one_session_is_not_promoted(conn):
 
 
 def test_intent_across_two_sessions_is_promoted_with_session_brand(conn):
-    _ep(conn, "s1", 5, adv=[{"goal_title": "Ship The Widget", "unmatched": True}], brand="readypep")
-    _ep(conn, "s2", 2, blk=[{"goal_title": "ship the  widget", "unmatched": True}], brand="readypep")
+    _ep(conn, "s1", 5, adv=[{"goal_title": "Ship The Widget", "unmatched": True}], brand="acme")
+    _ep(conn, "s2", 2, blk=[{"goal_title": "ship the  widget", "unmatched": True}], brand="acme")
     groups = promote.mine_unmatched(conn, days=14)
     key = promote.normalize_title("Ship The Widget")
     assert key in groups and len(groups[key]["sessions"]) == 2, \
         "case/whitespace variants of one intent across two sessions must group"
-    assert promote.majority_brand(groups[key]["brands"]) == "readypep"
+    assert promote.majority_brand(groups[key]["brands"]) == "acme"
     # earliest occurrence's original casing wins
     assert groups[key]["original"] == "Ship The Widget"
 

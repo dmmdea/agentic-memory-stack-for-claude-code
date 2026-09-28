@@ -193,7 +193,7 @@ func TestGitX_StageIntoAndCommitTree(t *testing.T) {
 		t.Fatalf("b.md was not removed: %v", entries)
 	}
 
-	commit, err := CommitTree(ctx, opt, newTree, []string{head}, "test\n\nAms-Machine: qube-abc123\n")
+	commit, err := CommitTree(ctx, opt, newTree, []string{head}, "test\n\nAms-Machine: ws-abc123\n")
 	if err != nil {
 		t.Fatalf("commit-tree: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestGitX_StageIntoAndCommitTree(t *testing.T) {
 	if times["a.md"].OID != commit {
 		t.Fatalf("a.md's last change should be the merge commit, got %+v", times["a.md"])
 	}
-	if times["a.md"].Machine != "qube-abc123" {
+	if times["a.md"].Machine != "ws-abc123" {
 		t.Fatalf("the Ams-Machine trailer did not survive the one-pass log: %+v", times["a.md"])
 	}
 }

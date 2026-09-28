@@ -35,7 +35,7 @@ function Get-Mem0WslDistro {
          the other machine. A distro baked in on one box would be pulled onto the other.
       2. A User-scope env var is NOT inherited by hook children of a host process that started
          before the var was set — which is exactly how the L1a extractor silently failed on one box
-         (it fell through to 'Ubuntu' and never found the API key at the Ubuntu-ML UNC path).
+         (it fell through to 'Ubuntu' and never found the API key at the Ubuntu-Alt UNC path).
     Never throws; the receipt read is best-effort.
     #>
     if ($env:MEM0_WSL_DISTRO) { return $env:MEM0_WSL_DISTRO }

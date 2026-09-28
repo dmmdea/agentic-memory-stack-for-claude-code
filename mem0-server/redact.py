@@ -17,7 +17,7 @@ Design rules the pattern set obeys (each is a live defect this set fixed, 2026-0
 
 * **Left boundary, not `\\b`.** `sk-[A-Za-z0-9_-]{10,}` with no left anchor corrupted 12 live
   stored points: `task-notification` -> `ta[REDACTED_OPENAI_KEY]`, and likewise `disk-temperature`,
-  `02-disk-partition-runbook.md`, `ask-juan-...`, `Task-and-Session-Assistant`, `disk-constrained`.
+  `02-disk-partition-runbook.md`, `Task-and-Session-Assistant`, `disk-constrained`.
   `(?<![A-Za-z0-9])` is used instead of `\\b` because `_` is a word character: `\\b` would also
   refuse to fire on a genuine `MY_sk-...`, and (worse, see below) cannot match `API_KEY` after `_`.
 * **Prefix tolerance on the assignment rule.** `\\b(api[_-]?key|token|...)` cannot match `API_KEY`

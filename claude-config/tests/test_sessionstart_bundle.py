@@ -107,7 +107,7 @@ def test_helper_invoked_by_script():
 
 
 def _to_wsl_path(p: Path) -> str:
-    s = p.as_posix()  # e.g. D:/repos/...
+    s = p.as_posix()  # e.g. D:/src/...
     if len(s) > 1 and s[1] == ":":
         s = "/mnt/" + s[0].lower() + s[2:]
     return s

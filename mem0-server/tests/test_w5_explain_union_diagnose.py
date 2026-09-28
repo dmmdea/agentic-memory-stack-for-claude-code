@@ -297,7 +297,7 @@ def test_union_leg_rescues_production_corpus_target():
     record, or the target drifted dense-reachable). Zero writes."""
     target = "e0ee87be"  # id prefix of the known keyword-only target
     r = httpx.post(f"{URL}/v1/memories/search", headers=HDR, json={
-        "query": "18792", "filters": {"user_id": "dmmdea"}, "limit": 10,
+        "query": "18792", "filters": {"user_id": USER}, "limit": 10,
         "threshold": 0.1, "rerank": False}, timeout=60)
     if r.status_code != 200:
         pytest.skip("search unavailable")
@@ -305,7 +305,7 @@ def test_union_leg_rescues_production_corpus_target():
     if target in dense_ids:
         pytest.skip("corpus drifted: target now dense-reachable — case gone")
     r2 = httpx.post(f"{URL}/v1/memories/search", headers=HDR, json={
-        "query": "18792", "filters": {"user_id": "dmmdea"}, "limit": 10,
+        "query": "18792", "filters": {"user_id": USER}, "limit": 10,
         "threshold": 0.1, "rerank": True}, timeout=120)
     r2.raise_for_status()
     body = r2.json()
@@ -458,7 +458,7 @@ def test_retrieval_log_top_ids_widened_to_ten():
     assert "(results.get(\"results\") or [])[:10]]" in app_src, \
         "returned_top_ids is no longer sliced at [:10]"
     r = httpx.post(f"{URL}/v1/memories/search", headers=HDR, json={
-        "query": "memoria del sistema", "filters": {"user_id": "dmmdea"},
+        "query": "memoria del sistema", "filters": {"user_id": USER},
         "limit": 12, "threshold": 0.0, "rerank": False}, timeout=60)
     r.raise_for_status()
     n = len(r.json().get("results", []))

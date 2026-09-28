@@ -46,7 +46,7 @@ def test_unreachable_root_is_undecidable_never_stale(monkeypatch):
     missing and invented staleness. A root we cannot see is a COVERAGE gap."""
     monkeypatch.setattr(sp.platform, "system", lambda: "Linux")
     monkeypatch.setattr(sp.Path, "is_dir", lambda self: False)
-    verdict, resolved = sp.classify_path(r"G:\My Drive\AI Ecosystem\thing.md",
+    verdict, resolved = sp.classify_path(r"G:\My Drive\Notes\thing.md",
                                          "A note about thing.md")
     assert verdict == "root-unavailable"
     assert resolved is None
@@ -65,7 +65,7 @@ def test_root_unavailable_excluded_from_the_rate():
 
 @pytest.mark.parametrize("text", [
     "The ops checkout at C:\\dev\\ops-sre runs on the buildbox.",
-    "On the sidecar node, the repos live at D:\\repos\\thing.",
+    "On the sidecar node, the repos live at D:\\src\\thing.",
 ])
 def test_foreign_host_paths_are_undecidable(text, monkeypatch):
     monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
@@ -84,8 +84,8 @@ def test_local_host_mention_beats_foreign_host(monkeypatch):
     monkeypatch.setattr(sp, "_translate", lambda p: "/nonexistent/x")
     monkeypatch.setattr(sp, "FOREIGN_HOSTS", sp._host_pattern(["buildbox"]))
     monkeypatch.setattr(sp, "LOCAL_HOST", sp._host_pattern(["thisbox"]))
-    text = "On thisbox the binary is at D:\\Dev\\thing\\app.exe; also sent to the buildbox."
-    verdict, _ = sp.classify_path("D:\\Dev\\thing\\app.exe", text)
+    text = "On thisbox the binary is at D:\\work\\thing\\app.exe; also sent to the buildbox."
+    verdict, _ = sp.classify_path("D:\\work\\thing\\app.exe", text)
     assert verdict == "missing-unexplained"
 
 
@@ -113,7 +113,7 @@ def test_host_pattern_is_none_when_empty():
     "The GLM model was deleted from V:\\models\\glm to reclaim space.",
     "Laguna weights removed from V:\\models\\laguna (72.1 GB reclaimed).",
     "gpt-oss-20b GGUF was purged from V:\\models\\oss.",
-    "The worktree at D:\\Dev\\worktrees\\old was retired 2026-07-01.",
+    "The worktree at D:\\work\\worktrees\\old was retired 2026-07-01.",
     "Config no longer lives at C:\\old\\path\\conf.yaml.",
     "The build dir D:\\tmp\\build was cleaned up after the release.",
     "Weights migrated from D:\\models\\a to V:\\models\\a.",
@@ -128,7 +128,7 @@ def test_recorded_removal_is_not_stale(text, monkeypatch):
 
 
 @pytest.mark.parametrize("text,path", [
-    ("Outputs went to D:\\Dev\\deadpath\\gone.md today.", "D:\\Dev\\deadpath\\gone.md"),
+    ("Outputs went to D:\\work\\deadpath\\gone.md today.", "D:\\work\\deadpath\\gone.md"),
     ("The report lives at D:\\archive\\2026\\report.md.", "D:\\archive\\2026\\report.md"),
     ("Weights are at V:\\models\\deleted-experiments\\a.gguf.",
      "V:\\models\\deleted-experiments\\a.gguf"),
@@ -154,15 +154,15 @@ def test_plain_missing_path_is_stale(monkeypatch):
     """The control for the test above: no removal vocabulary => genuinely stale."""
     monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
     monkeypatch.setattr(sp, "_translate", lambda p: "/nonexistent/x")
-    text = "The task report is at D:\\repos\\thing\\report.md and covers phase 2."
-    verdict, _ = sp.classify_path("D:\\repos\\thing\\report.md", text)
+    text = "The task report is at D:\\src\\thing\\report.md and covers phase 2."
+    verdict, _ = sp.classify_path("D:\\src\\thing\\report.md", text)
     assert verdict == "missing-unexplained"
 
 
 # --- parse artifacts -------------------------------------------------------------
 
 @pytest.mark.parametrize("bad", [
-    "C:\\\\Users\\\\dmmde",      # double-escaped in the stored JSON
+    "C:\\\\Users\\\\someone",      # double-escaped in the stored JSON
     "C:\\Users\\...",            # truncated
     "C:\\a`b",                   # markdown fence residue
     "C:\\x",                     # too short
@@ -174,27 +174,27 @@ def test_artifacts_are_not_path_claims(bad):
 
 
 def test_real_path_is_not_an_artifact():
-    assert sp._artifact("D:\\Dev\\worktrees\\ams-deploy3\\mem0-server\\app.py") is False
+    assert sp._artifact("D:\\work\\worktrees\\ams-deploy3\\mem0-server\\app.py") is False
 
 
 # --- cross-runtime translation (one run must decide everything) ------------------
 
 def test_windows_maps_mnt_back_to_drive(monkeypatch):
     monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
-    assert sp._translate("/mnt/c/Users/dmmde") == "C:/Users/dmmde"
+    assert sp._translate("/mnt/c/Users/someone") == "C:/Users/someone"
 
 
 def test_windows_reaches_wsl_home_over_unc(monkeypatch):
     monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(sp, "_UNC_ROOT", "//wsl.localhost/Ubuntu-ML")
-    assert sp._translate("/home/dmmdea/.mem0") == "//wsl.localhost/Ubuntu-ML/home/dmmdea/.mem0"
+    monkeypatch.setattr(sp, "_UNC_ROOT", "//wsl.localhost/Ubuntu-Alt")
+    assert sp._translate("/home/me/.mem0") == "//wsl.localhost/Ubuntu-Alt/home/me/.mem0"
 
 
 def test_windows_without_wsl_share_is_undecidable(monkeypatch):
     """No WSL share => POSIX paths are UNDECIDABLE, never stale."""
     monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
     monkeypatch.setattr(sp, "_UNC_ROOT", None)
-    assert sp._translate("/home/dmmdea/.mem0") is None
+    assert sp._translate("/home/me/.mem0") is None
 
 
 def test_wsl_maps_drive_to_mnt(monkeypatch):
@@ -203,7 +203,7 @@ def test_wsl_maps_drive_to_mnt(monkeypatch):
     # green under WSL, red under the recommended Windows interpreter.
     monkeypatch.setattr(sp.platform, "system", lambda: "Linux")
     monkeypatch.setattr(sp.os.path, "ismount", lambda p: True)
-    assert sp._translate("C:\\Users\\dmmde") == "/mnt/c/Users/dmmde"
+    assert sp._translate("C:\\Users\\someone") == "/mnt/c/Users/someone"
 
 
 # --- memory-level precedence ------------------------------------------------------
@@ -213,12 +213,12 @@ def test_memory_with_one_stale_path_is_stale(monkeypatch):
     outcome wins, otherwise a single surviving path would whitewash the record."""
     monkeypatch.setattr(sp, "_translate", lambda p: p)
     monkeypatch.setattr(sp.os.path, "exists", lambda p: "alive" in p)
-    text = "Outputs went to D:\\Dev\\alive\\out.md and D:\\Dev\\deadpath\\gone.md today."
+    text = "Outputs went to D:\\work\\alive\\out.md and D:\\work\\deadpath\\gone.md today."
     assert sp.classify_memory(text)["verdict"] == "missing-unexplained"
 
 
 def test_memory_with_no_path_is_no_path():
-    assert sp.classify_memory("Daniel prefers concise answers.")["verdict"] == "no-path"
+    assert sp.classify_memory("The user prefers concise answers.")["verdict"] == "no-path"
 
 
 def test_memory_with_only_artifacts_is_not_stale():
@@ -321,11 +321,11 @@ def test_unlabelled_worksheet_reports_nothing_to_summarise(tmp_path, monkeypatch
 # Each of these reproduces a bug that was measured on the live corpus, not imagined.
 
 @pytest.mark.parametrize("text,expected", [
-    (r"Spec lives at G:\My Drive\AI Ecosystem\spec.md today.",
-     r"G:\My Drive\AI Ecosystem\spec.md"),
+    (r"Spec lives at G:\My Drive\Notes\spec.md today.",
+     r"G:\My Drive\Notes\spec.md"),
     (r"Installed at C:\Program Files\Foo\bar.exe on this box.",
      r"C:\Program Files\Foo\bar.exe"),
-    (r"Ports live in P:\Port Directory\ports.md here.", r"P:\Port Directory\ports.md"),
+    (r"Ports live in P:\Port Files\ports.md here.", r"P:\Port Files\ports.md"),
 ])
 def test_paths_with_spaces_are_not_truncated(text, expected):
     """Stopping at the first space truncated this estate's most-cited roots. The stub
@@ -622,14 +622,14 @@ def test_alias_accepts_the_mnt_form(monkeypatch):
 
 
 def test_alias_never_excuses_a_path_outside_the_shared_dir(monkeypatch):
-    """D:\\Dev\\... is NOT on the shared Drive; a missing file there must stay stale
+    """D:\\work\\... is NOT on the shared Drive; a missing file there must stay stale
     even when shared roots exist locally. The alias is a normalisation, not a pardon."""
     monkeypatch.setattr(sp.platform, "system", lambda: "Windows")
     monkeypatch.setattr(sp, "_SHARED_ROOTS", ["g"])
     monkeypatch.setattr(sp, "_translate", lambda p: p.replace("\\", "/"))
     monkeypatch.setattr(sp.os.path, "exists", lambda p: False)
-    verdict, _ = sp.classify_path(r"D:\Dev\thing\report.md",
-                                  r"The report is at D:\Dev\thing\report.md today.")
+    verdict, _ = sp.classify_path(r"D:\work\thing\report.md",
+                                  r"The report is at D:\work\thing\report.md today.")
     assert verdict == "missing-unexplained"
 
 
@@ -646,7 +646,7 @@ def test_shared_path_missing_under_every_root_is_still_stale(monkeypatch):
 
 
 def test_alias_ignores_non_path_shapes():
-    assert sp._alias_hit("http://qube:18791") is None
+    assert sp._alias_hit("http://node-a:18791") is None
     assert sp._alias_hit("relative/My Drive/x") is None
 
 
@@ -692,8 +692,8 @@ def test_zero_shared_roots_makes_shared_claims_undecidable(monkeypatch):
         < sp.PRECEDENCE.index("shared-root-unavailable") \
         < sp.PRECEDENCE.index("missing-recorded")
     # control: a NON-shared path on the same rootless box still decides normally
-    verdict2, _ = sp.classify_path(r"D:\Dev\thing\report.md",
-                                   r"Report at D:\Dev\thing\report.md today.")
+    verdict2, _ = sp.classify_path(r"D:\work\thing\report.md",
+                                   r"Report at D:\work\thing\report.md today.")
     assert verdict2 == "missing-unexplained"
 
 

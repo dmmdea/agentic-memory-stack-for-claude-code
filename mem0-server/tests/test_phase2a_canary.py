@@ -140,7 +140,7 @@ class TestDeclarativePassthrough:
 
     def test_never_used_descriptor(self):
         assert is_imperative_canonical(
-            "The Lenovo node was never used for Claude Code directly."
+            "The edge node was never used for Claude Code directly."
         ) is False
 
     def test_forbidden_in_descriptor(self):

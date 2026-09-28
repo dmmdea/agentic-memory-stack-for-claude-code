@@ -1056,7 +1056,7 @@ function New-HookExeCommand {
     # WHY THIS EXISTS (2026-07-24): the 2026-07-22 bash-safe pass converted the five .ps1 hook
     # commands and MISSED this one, because it is the only hook whose command is a bare exe
     # path. It stayed on the raw backslash form and was destroyed by bash on every prompt:
-    #   /usr/bin/bash: line 1: C:Usersdmmde.claudescriptsmem0-hook-client.exe: command not found
+    #   /usr/bin/bash: line 1: C:Users<user>.claudescriptsmem0-hook-client.exe: command not found
     # exit 127, silently, ~1000 times. Memory injection (Phase 0.A/0.D) reached no prompt.
     #
     # It hid so long because the SIBLING hook on the same event kept working and made the event

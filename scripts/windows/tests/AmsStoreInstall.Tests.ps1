@@ -220,7 +220,7 @@ Describe 'compactor task verdict (Get-AmCompactorTaskVerdict) mirrors installer 
     }
     It 'present = the action-shape checks, whatever the hub state' {
         (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\Stack\scripts\memory-compact.ps1' -TaskState 'Ready' -HubGaps @('g')).Status | Should -Be 'OK'
-        (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File D:\Dev\repo\scripts\windows\memory-compact.ps1' -HubGaps @()).Status | Should -Be 'FAIL'
+        (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File D:\worktrees\repo\scripts\windows\memory-compact.ps1' -HubGaps @()).Status | Should -Be 'FAIL'
         (Get-AmCompactorTaskVerdict -Present $true -TaskArgs '-File C:\x\other.ps1' -HubGaps @()).Status | Should -Be 'WARN'
     }
 }

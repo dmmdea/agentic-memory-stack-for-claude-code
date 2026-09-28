@@ -143,6 +143,37 @@ jobs:
       - name: Check docs
         run: python scripts/ci/check-docs.py
 
+  privacy-gate:
+    name: Privacy gate (tree, filenames, commit messages)
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Gate self-test (planted term must fail)
+        run: python scripts/ci/test_privacy_gate.py
+      - name: Scan
+        env:
+          PRIVACY_GATE_KEY: ${{ secrets.PRIVACY_GATE_KEY }}
+          # The secret is absent on fork PRs; require it wherever it exists.
+          PRIVACY_GATE_REQUIRE_KEY: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '0' }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          RANGE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/${BASE_REF}..${HEAD_SHA}"
+          elif [ -n "$BEFORE" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE}..${GITHUB_SHA}"
+          fi
+          if [ -n "$RANGE" ]; then python scripts/ci/privacy-gate.py --range "$RANGE"; else python scripts/ci/privacy-gate.py; fi
+
   pester:
     name: Pester (Windows product suites)
     if: github.ref_type != 'tag'

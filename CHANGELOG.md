@@ -387,7 +387,7 @@ Windows-side catch-up read that as a permanent "long gap" and, every 6 h throttl
 full consolidation FROM the replica: insights posted to the authority on top of the brain's own
 night, the drift snapshot failing against the dormant loopback server (a standing "DRIFT GUARD
 DEAD" in every session banner), the index build failing the same way and never marking its
-throttle, ~28k Codex tokens a run. Measured on the Qube 2026-09-19: two runs a day since the
+throttle, ~28k Codex tokens a run. Measured on the reference workstation 2026-09-19: two runs a day since the
 cutover.
 
 The catch-up, the standalone index refresh and the consolidator itself now read the installer's
@@ -448,7 +448,7 @@ A Linux box could read the corpus but never contribute to it: the L1a capture pa
 PreCompact / SessionStart hook spawning a worker that reads the finished transcript, asks Codex for
 durable facts and posts them to the authority — was written in PowerShell against Windows. That left
 the register's own invariant *"first-class on every OS"* unmet and it was the last thing between the
-Vivobook and its row's gate.
+the ultrabook node and its row's gate.
 
 The scripts now branch on host kind rather than assuming Windows, using the same test the Python
 side already uses (`$PSVersionTable.Platform`, absent on PowerShell 5.1, so its absence reads as
@@ -489,7 +489,7 @@ plan; removing the forward makes it fail with the exact symptom.
 ## 1.27.0 — a Linux client can join the fleet store (register P4-3)
 
 `linux-client.sh` installed the MCP shim and the outbox and nothing else, so a native Linux box
-could not join the fleet store at all: no binary, no hub transport, no hooks. The Vivobook row had
+could not join the fleet store at all: no binary, no hub transport, no hooks. The ultrabook row had
 nothing to deploy. With `--ams-hub` the client now installs all three; without it the block is
 skipped and a thin client installs exactly as before. `linux-replica.sh` builds on this file, so
 both roles inherit it.
@@ -1420,8 +1420,8 @@ probes are skipped (server invariants the brain proves daily; they would also ne
 canonical key the replica does not serve), brain-only machinery reports "by design", the
 dream/dedup task rows flip polarity (present on a replica = FAIL), and a new `memory
 authority (one-brain)` row FAILs a replica pointed at itself. The brain path is unchanged.
-Regression guards pin the single loopback literal and the role gates. Proof: the Aorus
-replica went 14 FAIL → 0 FAIL (46 PASS, 2 genuine WARNs); the Qube brain run is unchanged.
+Regression guards pin the single loopback literal and the role gates. Proof: the laptop-node
+replica went 14 FAIL → 0 FAIL (46 PASS, 2 genuine WARNs); the reference-workstation brain run is unchanged.
 
 ## v1.20.4 (2026-08-28) — installer: the replica fix, fixed for replicas
 
