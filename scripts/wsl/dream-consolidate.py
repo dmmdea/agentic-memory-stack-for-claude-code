@@ -862,8 +862,9 @@ class Dream:
             reasons.append(f"posted-{self.posted}-of-{self.consolidated}")
         if self.replay_failed:
             reasons.append(f"replay-failed-{self.replay_failed}")
-        elif spool_depth > self.spooled:
-            # queued insights from earlier nights that this night never tried (no signals, phase 3 not reached)
+        elif not self.dry and spool_depth > self.spooled:
+            # queued insights from earlier nights that this night never tried (no signals, phase 3 not reached);
+            # a dry run skips the replay by design, so the queue it left alone is not a degraded night
             reasons.append(f"spool-backlog-{spool_depth - self.spooled}")
         if self.drift_snapshot_failed:
             reasons.append("drift-snapshot-failed")

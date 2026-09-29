@@ -178,6 +178,17 @@ def test_a_drained_backlog_reads_ok_again(home, m):
                                      "replay_failed": 0, "spool_depth": 0})
 
 
+def test_dry_run_with_a_standing_spool_does_not_read_as_a_backlog(home, m):
+    """A dry run skips the replay by design, so the queue it left alone is not a degraded night."""
+    _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS3, PROMO))
+    assert len(_spool(home)) == 3
+    (home / "outcome").unlink()
+    _run(m, ["--dry-run"], mem0=Mem0(EV), judge=_judge(SIG, INS3, PROMO))
+    head, work = _outcome(home)
+    assert head == "ok", head
+    assert work["spool_depth"] == 3 and work["replayed"] == 0
+
+
 def test_dry_run_never_touches_the_spool(home, m):
     _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS, PROMO))
     before = _spool(home)
