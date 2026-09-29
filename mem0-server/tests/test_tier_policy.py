@@ -168,6 +168,55 @@ def _delete_canonical(mid: str, reason: str = "v017-test-cleanup") -> None:
         pass
 
 
+def _demote_headers(mid: str, reason: str) -> dict:
+    """Format-2 'demote' token (<ts>|<nonce>|demote|<mid>|<reason>), nonce included."""
+    assert _CANON_KEY, "canonical key unavailable (runtime tmpfs / dpapi / plaintext all absent)"
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    nonce = str(uuid.uuid4())
+    msg = f"{ts}|{nonce}|demote|{mid}|{reason}".encode()
+    token = base64.b64encode(hmac.new(_CANON_KEY.encode(), msg, hashlib.sha256).digest()).decode().strip()
+    return {"X-User-Direct-Token": token, "X-User-Direct-Ts": ts, "X-User-Direct-Nonce": nonce}
+
+
+def _tier_of(mid: str) -> str:
+    r = httpx.get(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    return j.get("tier") or (j.get("metadata") or {}).get("tier")
+
+
+@pytest.mark.skipif(_CANON_KEY is None, reason="canonical-key not present")
+def test_demote_canonical_requires_signed_demote_token():
+    """Moving a record OUT of canonical needs the operator's signed 'demote' token: without it a
+    key holder could demote and then PUT/DELETE ungated. Unsigned -> 403 and the tier holds;
+    a promote-signed token -> 403; a demote-signed token -> 200."""
+    mid = _add_evidence(f"s12-demote-canonical-{uuid.uuid4()}")
+    _promote_to_canonical(mid, reason="s12 demote test setup")
+    try:
+        r = httpx.patch(f"{URL}/v1/memories/{mid}/tier",
+                        json={"tier": "evidence", "actor": "claude-autonomous", "reason": "unsigned"},
+                        headers=H, timeout=10)
+        assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text}"
+        assert "--action demote" in r.text, r.text
+        assert _tier_of(mid) == "canonical"
+        wrong = _canonical_headers(mid, "promote-signed")
+        r = httpx.patch(f"{URL}/v1/memories/{mid}/tier",
+                        json={"tier": "evidence", "actor": "user-direct", "reason": "promote-signed"},
+                        headers={**H, **wrong}, timeout=10)
+        assert r.status_code == 403, f"a promote token must not demote: {r.status_code} {r.text}"
+        assert _tier_of(mid) == "canonical"
+        r = httpx.patch(f"{URL}/v1/memories/{mid}/tier",
+                        json={"tier": "evidence", "actor": "user-direct", "reason": "s12 signed demote"},
+                        headers={**H, **_demote_headers(mid, "s12 signed demote")}, timeout=10)
+        assert r.status_code == 200, r.text
+        assert _tier_of(mid) == "evidence"
+    finally:
+        if _tier_of(mid) == "evidence":
+            httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        else:
+            _delete_canonical(mid, reason="s12 demote test cleanup")
+
+
 @pytest.mark.skipif(_CANON_KEY is None, reason="canonical-key not present")
 def test_put_canonical_without_token_rejected():
     """v0.17 Phase A: PUT text on a canonical record without HMAC → 403; text unchanged."""

@@ -128,7 +128,25 @@ INSIGHT_ALLOWED_ACTORS: Set[str] = {
 # promotion — closes the v0.18 LOW-4 residual 300s replay window). v0.20
 # Phase G: format-1 (<ts>|<mid>|<reason>, no nonce) is rejected outright —
 # "promote" format-2 is the only tier-promotion token format.
-VALID_HMAC_ACTIONS = {"put", "delete", "patch_metadata", "merge_goals", "promote"}
+# "demote" (PATCH /v1/memories/{mid}/tier moving a record OUT of canonical): without it an
+# API-key holder could demote a canonical record and then PUT or DELETE it ungated, a two-step
+# bypass of the canonical write gate. Its own action word keeps a promote token from being
+# replayed as a demotion.
+VALID_HMAC_ACTIONS = {"put", "delete", "patch_metadata", "merge_goals", "promote", "demote"}
+
+
+def tier_change_hmac_action(current_tier: Optional[str], target_tier: str) -> Optional[str]:
+    """The signed user-direct action a PATCH /tier needs, or None when none is required.
+
+    Any move INTO canonical signs "promote" (unchanged since v0.19 Phase G). Any move OUT of
+    canonical signs "demote". current_tier is the record's tier now (None when the record is
+    unknown, which never requires "demote").
+    """
+    if target_tier == "canonical":
+        return "promote"
+    if current_tier == "canonical":
+        return "demote"
+    return None
 
 # H8: actors trusted to PATCH normally-gated metadata on canonical/insight
 # records via the mem0 API, each restricted to an EXACT per-actor key allowlist
@@ -317,7 +335,7 @@ def validate_hmac_user_direct(
     Signed payload format (nonce REQUIRED since v0.18 MED-7):
       <ts>|<nonce>|<action>|<memory_id>|<reason>
 
-    action ∈ VALID_HMAC_ACTIONS = {"put", "delete", "patch_metadata", "merge_goals", "promote"}.
+    action ∈ VALID_HMAC_ACTIONS = {"put", "delete", "patch_metadata", "merge_goals", "promote", "demote"}.
 
     v0.18 MED-7: x_user_direct_nonce is REQUIRED. The v0.17 no-nonce backward-compat
     format (<ts>|<action>|<memory_id>|<reason>) is removed — it allowed token replay

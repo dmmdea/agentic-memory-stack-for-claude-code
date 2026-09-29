@@ -10,6 +10,9 @@
 #   bash mem0-canonize.sh --action delete         <memory_id> "<reason>"
 #   bash mem0-canonize.sh --action delete         <memory_id> "<reason>" --cascade
 #   bash mem0-canonize.sh --action patch_metadata <memory_id> "<reason>" --metadata-json '<json>'
+#   bash mem0-canonize.sh --action demote         <memory_id> "<reason>" [--tier evidence|stable|temporal]
+#     (moves a record OUT of canonical; default target tier evidence. The server refuses any
+#      unsigned demotion of a canonical record, so this is the only way to do it.)
 #
 # Requires:
 #   ~/.mem0/api-key — regular mem0 API key
@@ -28,7 +31,7 @@
 #   The nonce (uuid4 via uuidgen) is always generated and sent as:
 #     X-User-Direct-Nonce header
 #   This enables server-side replay protection (~/.mem0/canonical-replay.jsonl).
-#   where action ∈ {promote, put, delete, patch_metadata}
+#   where action ∈ {promote, put, delete, patch_metadata, demote}
 #   Tier promotion (no --action flag) signs action="promote" (v0.19 Phase G).
 #   Server validates via security_invariants.validate_hmac_user_direct().
 #
@@ -94,11 +97,12 @@ fi
 
 # ─── Argument parsing ────────────────────────────────────────────────────────
 
-ACTION=""        # empty → tier-promotion (v0.14 compat), or one of: put, delete, patch_metadata
+ACTION=""        # empty → tier-promotion (v0.14 compat), or one of: put, delete, patch_metadata, demote
 ACTOR=""         # Phase 2 autonomous: --actor flag for tier promotion body (default: user-direct)
 TEXT=""          # required for --action put
 METADATA_JSON="" # required for --action patch_metadata
 CASCADE=0        # v0.17 F.1.4: pass ?cascade=true to DELETE when set
+DEMOTE_TIER=""   # --action demote target tier (default evidence)
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
@@ -122,6 +126,10 @@ while [[ $# -gt 0 ]]; do
     --cascade)
       CASCADE=1
       shift
+      ;;
+    --tier)
+      DEMOTE_TIER="$2"
+      shift 2
       ;;
     --help|-h)
       grep '^#' "$0" | head -50 | sed 's/^# \?//'
@@ -147,10 +155,26 @@ REASON="${POSITIONAL[1]}"
 # Validate --action value if supplied
 if [[ -n "$ACTION" ]]; then
   case "$ACTION" in
-    put|delete|patch_metadata) ;;
+    put|delete|patch_metadata|demote) ;;
     *)
-      echo "Error: --action must be one of: put, delete, patch_metadata" >&2
+      echo "Error: --action must be one of: put, delete, patch_metadata, demote" >&2
       echo "  (For tier promotion, omit --action entirely.)" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# Validate --tier: only with demote, never back to canonical
+if [[ -n "$DEMOTE_TIER" && "$ACTION" != "demote" ]]; then
+  echo "Error: --tier is only valid with --action demote" >&2
+  exit 2
+fi
+if [[ "$ACTION" == "demote" ]]; then
+  DEMOTE_TIER="${DEMOTE_TIER:-evidence}"
+  case "$DEMOTE_TIER" in
+    evidence|stable|temporal) ;;
+    *)
+      echo "Error: --action demote --tier must be one of: evidence, stable, temporal (not canonical)" >&2
       exit 2
       ;;
   esac
@@ -318,6 +342,24 @@ print(json.dumps({'metadata': metadata, 'actor': 'user-direct', 'reason': reason
   echo "  token=${TOKEN:0:20}..."
 
   curl -fsS -X PATCH "$MEM0/v1/memories/$MID/metadata" \
+    -H "X-API-Key: $API_KEY" \
+    "${HMAC_HEADERS[@]}" \
+    -H "Content-Type: application/json" \
+    -d "$BODY" | python3 -m json.tool
+
+elif [[ "$ACTION" == "demote" ]]; then
+  # ── PATCH /tier OUT of canonical: signs action="demote" ─────────────────
+  BODY="$(python3 -c "
+import json, sys
+print(json.dumps({'tier': sys.argv[1], 'actor': 'user-direct', 'reason': sys.argv[2]}))
+" "$DEMOTE_TIER" "$REASON")"
+
+  echo "Demoting memory $MID to $DEMOTE_TIER (action=demote)..."
+  echo "  ts=$TS"
+  echo "  nonce=${NONCE}"
+  echo "  token=${TOKEN:0:20}..."
+
+  curl -fsS -X PATCH "$MEM0/v1/memories/$MID/tier" \
     -H "X-API-Key: $API_KEY" \
     "${HMAC_HEADERS[@]}" \
     -H "Content-Type: application/json" \

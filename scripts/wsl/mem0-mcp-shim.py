@@ -434,7 +434,10 @@ def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = N
     """Demote a memory's trust tier (e.g., stable -> evidence when wrong).
     For full removal use memory_delete. Writes a tier-ledger entry.
     actor is always 'claude-autonomous' when called via MCP.
-    reason is recommended for audit clarity."""
+    reason is recommended for audit clarity.
+    A CANONICAL record cannot be demoted from here: the server requires the operator's
+    signed token for any move out of canonical (403). The operator path is
+    `mem0-canonize.sh --action demote <id> "<reason>"` on the authority."""
     payload = {"tier": tier, "actor": "claude-autonomous", "reason": reason}
     try:
         return _authority_only("PATCH", f"/v1/memories/{memory_id}/tier", json=payload)

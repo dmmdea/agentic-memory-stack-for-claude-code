@@ -2118,6 +2118,25 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     reason = (b.reason or "").strip()
     if not actor:
         raise HTTPException(400, "actor is required (e.g., 'user-direct', 'c1-consolidator', 'claude-autonomous')")
+    # Canonical DEMOTION gate: a move OUT of canonical signs its own "demote" action. Without
+    # it an API-key holder could demote a canonical record and then PUT or DELETE it with no
+    # token, because assert_writable gates those only while the record is still canonical.
+    # fetch_current_tier fails closed: a store error is a 503, and a point with no tier field
+    # reads as canonical.
+    current_tier = None
+    if b.tier != "canonical":
+        from security_invariants import fetch_current_tier, tier_change_hmac_action, _NOT_FOUND
+        _ct = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+        current_tier = None if _ct == _NOT_FOUND else _ct
+        if tier_change_hmac_action(current_tier, b.tier) == "demote":
+            if not reason:
+                raise HTTPException(400, "demoting a canonical record requires non-empty 'reason' (audit-trail policy)")
+            from security_invariants import validate_hmac_user_direct
+            validate_hmac_user_direct(
+                mid, "demote", reason,
+                x_user_direct_token, x_user_direct_ts,
+                x_user_direct_nonce=x_user_direct_nonce,
+            )
     if b.tier == "canonical":
         if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct" and actor not in CANONICAL_AUTOPROMOTE_ALLOWED:
             raise HTTPException(403,
@@ -2184,6 +2203,8 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     if b.tier == "canonical" and actor in CANONICAL_AUTOPROMOTE_ALLOWED:
         transport = "autonomous"
     elif b.tier == "canonical" and x_user_direct_token:
+        transport = "cli-user-direct"
+    elif current_tier == "canonical" and x_user_direct_token:
         transport = "cli-user-direct"
     else:
         transport = "rest-api"

@@ -130,7 +130,8 @@ v0.17 Phase A closes all three side doors by wiring the same HMAC credential req
 | canonical | PUT (update text) | HMAC user-direct token (format 2) |
 | canonical | DELETE | HMAC user-direct token (format 2) |
 | canonical | PATCH /metadata | HMAC user-direct token (format 2) |
-| canonical | PATCH /tier (promote/demote/re-promote) | HMAC user-direct token (format 2, action `promote`, since v0.19 G); nonce-less format-1 **rejected since v0.20 G** (403) |
+| canonical | PATCH /tier (re-promote) | HMAC user-direct token (format 2, action `promote`, since v0.19 G); nonce-less format-1 **rejected since v0.20 G** (403) |
+| canonical | PATCH /tier (demote to any lower tier) | HMAC user-direct token (format 2, action `demote`); `mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence\|stable\|temporal]`. Before this gate an API-key holder could demote a canonical record and then PUT or DELETE it with no token (the side doors above only guard a record while it is canonical) |
 | insight | PUT | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
 | insight | DELETE | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
 | insight | PATCH /metadata | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
@@ -329,7 +330,7 @@ Fetch the record and read `metadata.source_memory_ids`. These are the evidence r
 
 ### Step 3 — Decide: demote or delete
 
-**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token — only canonical promotions need it. The MCP shim's `memory_demote` works for this:
+**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token. Moving a record into or out of `canonical` does: promotion signs `promote`, demotion signs `demote` (`mem0-canonize.sh --action demote`); `memory_demote` from the MCP shim gets a 403 on a canonical record. The MCP shim's `memory_demote` works for this:
 
 ```python
 memory_demote(memory_id="<id>", tier="evidence", reason="bad insight: <reason>")
