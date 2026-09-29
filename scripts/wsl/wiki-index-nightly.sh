@@ -19,13 +19,14 @@
 # WIKI_MAX_STALE_H, WIKI_FRESH_H, WIKI_PY.
 #
 # Freshness, not pull age: the index is as fresh as the NEWER of two brain stamps,
-# ~/wiki-index/last-pull (this script's pull) and ~/wiki-index/last-build (the last successful
+# ~/wiki-index/last-pull (this script's pull, stamped only after its build succeeds) and ~/wiki-index/last-build (the last successful
 # build by EITHER path: this script, or a session's `wiki-index.sh build`). Nothing here retries
 # a missed night: a PC that was off at 03:00 is covered by its own session-side refresh (the
 # replica's SessionStart catch-up), and this step makes the aging visible instead of green.
 #
 # Exit policy (receipted by ams-step.sh; outcome contract C1 through AMS_OUTCOME_FILE):
-#   pulled + built                            -> exit 0, `ok`, last-build stamped.
+#   pulled + built                            -> exit 0, `ok`, last-pull and last-build stamped.
+#   pulled, build failed                      -> exit 1, no stamp moves (the index did not get the pages).
 #   no source reachable, freshness <= 24 h    -> exit 0, `ok`; each source's ssh exit and stderr
 #                                                ride in the outcome JSON.
 #   no source reachable, freshness > 24 h     -> exit 0, `degraded:no-source-fresh-<h>h`.
@@ -105,7 +106,7 @@ for src in "${SOURCE_LIST[@]}"; do
     if [ "$tar_rc" -eq 0 ]; then
         n="$(find "$tmp" -name '*.md' | wc -l)"
         if [ "$n" -gt 0 ]; then
-            rm -rf "$SNAP"; mv "$tmp" "$SNAP"; date +%s > "$STAMP"
+            rm -rf "$SNAP"; mv "$tmp" "$SNAP"
             pulled="$src"; pulled_n="$n"; echo "wiki-index: pulled $n pages from $src"
             break
         fi
@@ -146,7 +147,9 @@ fi
 WIKI_ROOT="$SNAP" "$PY" "$DIR/wiki-index-build.py"
 rc=$?
 if [ "$rc" -eq 0 ]; then
-    date +%s > "$BUILD_STAMP"
+    # Both stamps move only once Qdrant has the pages: a pull whose build failed must not make the
+    # next skip night report a fresh index.
+    now_ok="$(date +%s)"; echo "$now_ok" > "$STAMP"; echo "$now_ok" > "$BUILD_STAMP"
     outcome "ok {\"pulled\":$pulled_n,\"source\":\"$(json_esc "$pulled")\",\"fresh_age_h\":0}"
 fi
 exit "$rc"

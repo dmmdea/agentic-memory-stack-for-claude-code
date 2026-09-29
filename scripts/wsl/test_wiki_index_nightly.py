@@ -325,3 +325,29 @@ def test_escapes_are_kept_whole_when_the_text_fits(tmp_path):
     assert r.returncode == 0, r.stderr
     _, work = _outcome(tmp_path)
     assert work["sources"][0]["stderr"] == 'C:\\bin "x" caf\u00e9'
+
+
+def test_a_pull_whose_build_fails_does_not_refresh_the_stamp_and_the_next_skip_night_says_so(tmp_path):
+    """Pull ok + builder exit 1: Qdrant never got the pages, so no stamp may move; the following
+    skip night must measure the OLD stamp (degraded, 60 h), not report a fresh index."""
+    tar = _wiki_tar(tmp_path, 2)
+    home = tmp_path / "home"
+    _stamp(home, "last-pull", 60)
+    _stamp(home, "last-build", 60)
+    before = {n: (home / "wiki-index" / n).read_text() for n in ("last-pull", "last-build")}
+    b = _fake_bin(tmp_path, f'cat "{tar}"\n')
+    (b / "fakepy").write_text('#!/usr/bin/env bash\nexit 1\n', encoding="utf-8")
+    env = dict(os.environ, HOME=str(home), PATH=f"{b}{os.pathsep}{os.environ['PATH']}",
+               WIKI_PY=str(b / "fakepy"), WIKI_PULL_KEY=str(tmp_path / "nokey"), WIKI_SOURCES="op@up",
+               AMS_OUTCOME_FILE=str(tmp_path / "outcome"))
+    r = subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=env, timeout=60, check=False)
+    assert r.returncode == 1, r.stderr
+    after = {n: (home / "wiki-index" / n).read_text() for n in ("last-pull", "last-build")}
+    assert after == before, "a failed build must leave both stamps alone"
+    assert _outcome(tmp_path) == (None, None), "a failed build writes no ok outcome"
+    # the next night: no source reachable -> measures the old stamp, degraded, not fresh
+    r2, _, _ = _run(tmp_path, "op@down", DOWN, extra_env=_down_env(tmp_path))
+    assert r2.returncode == 0, r2.stderr
+    status, work = _outcome(tmp_path)
+    assert status == "degraded:no-source-fresh-60h" and work["fresh_age_h"] == 60

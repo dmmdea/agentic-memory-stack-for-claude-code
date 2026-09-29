@@ -72,7 +72,7 @@ duplicate and either can restore what the other left.
 ## Freshness
 
 The index is as fresh as the newer of two stamps on the brain: `~/wiki-index/last-pull` (the
-nightly's own pull) and `~/wiki-index/last-build` (the last successful build by either path: the
+nightly's own pull, stamped only after its build succeeds) and `~/wiki-index/last-build` (the last successful build by either path: the
 nightly, or a session's `wiki-index.sh build` from any PC). `fresh_age_h` is the age of that
 newer stamp. The nightly's 72 h failure limit measures `fresh_age_h`, not the pull, so a fresh
 session-side refresh keeps a night with every PC off from reading red, and
@@ -95,7 +95,7 @@ a tar would fail the extraction and be reported as "unreachable or empty".
 | no source reachable, `fresh_age_h` <= 24 | 0 | `ok`: the index is kept as-is; the outcome JSON carries each source's ssh exit and stderr |
 | no source reachable, 24 h < `fresh_age_h` <= 72 h (`WIKI_MAX_STALE_H`) | 0 | `degraded:no-source-fresh-<h>h`: a skipped night is visible the first night the index ages past a day, not only at the limit |
 | no source reachable, `fresh_age_h` > 72 h, or no stamp ever recorded | 1 | `failed`; the note names the age |
-| the build failed after a pull | the builder's | `failed`; `last-build` is not stamped |
+| the build failed after a pull | the builder's | `failed`; neither `last-pull` nor `last-build` is stamped, so the next night measures the old stamp |
 | `MEM0_WIKI_SOURCES` unset while the unit exists | 1 | a misinstall, loud on purpose |
 | an empty tar | treated as unreachable | the previous snapshot is kept |
 
