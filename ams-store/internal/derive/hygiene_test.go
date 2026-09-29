@@ -528,3 +528,47 @@ func TestHygiene_DuplicateSlugCountsAgainstTheBlastCap(t *testing.T) {
 		t.Error("the index was modified although the run aborted on the blast cap")
 	}
 }
+
+// A store whose LAST fact was legitimately migrated enumerates cleanly, empty, with the
+// index still listing it. The history explains every indexed slug, so the dangling lines
+// are dropped - refusing forever ("aborted-no-fact-files" on every sync) helps nobody.
+func TestDerive_EmptiedStoreExplainedByMigrationsDropsTheDanglingLines(t *testing.T) {
+	e := newEnv(t, "ws", []string{"# Memory Index", "", "- [Gone](gone.md) " + emDash + " migrated away", "- [Also](also.md)"}, map[string]string{})
+
+	res, err := e.run(func(o *Options) {
+		o.Migrated = &fakeMigrated{ids: map[string]string{"gone.md": "id-1", "also.md": "id-2"}}
+	})
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+
+	if res.Status != StatusApplied {
+		t.Fatalf("status = %q, want %q (note: %s)", res.Status, StatusApplied, res.Note)
+	}
+	if res.Dedangled != 2 || res.DedangledMigrated != 2 {
+		t.Errorf("dedangled=%d dedangled_migrated=%d, want 2 and 2", res.Dedangled, res.DedangledMigrated)
+	}
+	if text := e.indexText(); strings.Contains(text, "gone.md") || strings.Contains(text, "also.md") {
+		t.Errorf("the dangling lines are still in the index: %q", text)
+	}
+}
+
+// ...but only when the history explains EVERY indexed slug. One line nothing explains keeps
+// the fail-closed abort: an unreadable or wiped store must never be spellable as "empty".
+func TestDerive_EmptiedStoreWithAnUnexplainedSlugStillAborts(t *testing.T) {
+	e := newEnv(t, "ws", []string{"- [Gone](gone.md)", "- [Unknown](unknown.md)"}, map[string]string{})
+	before := e.indexBytes()
+
+	res, err := e.run(func(o *Options) {
+		o.Migrated = &fakeMigrated{ids: map[string]string{"gone.md": "id-1"}}
+	})
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedNoFactFiles {
+		t.Fatalf("status = %q, want %q", res.Status, StatusAbortedNoFactFiles)
+	}
+	if string(e.indexBytes()) != string(before) {
+		t.Error("the index was rewritten during an abort")
+	}
+}

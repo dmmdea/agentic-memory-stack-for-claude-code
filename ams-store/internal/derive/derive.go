@@ -262,7 +262,13 @@ func Run(opt Options) (*Result, error) {
 	entries := idx.Entries()
 
 	// ---- 2. an index with entries over a store that enumerates nothing ---------------
-	if len(entries) > 0 && len(names) == 0 {
+	// The one legitimate way to get here is a store whose last fact the judge migrated:
+	// the directory enumerated cleanly (FactFiles already failed closed on an unreadable
+	// one), it is empty, and the history explains EVERY slug the index still names by a
+	// Migrated trailer. Then the lines are dangling pointers to facts that live in the
+	// corpus, and dropping them is what the blast cap already exempts. Any slug the history
+	// cannot explain keeps the abort: "empty" must never be spellable as "wiped".
+	if len(entries) > 0 && len(names) == 0 && !migrationsExplainEveryLink(opt, idx, logf) {
 		res.Status = StatusAbortedNoFactFiles
 		res.Note = "the index has entries but the store enumerated no fact files; refusing to treat every line as dangling"
 		logf("%s", res.Note)
@@ -706,6 +712,31 @@ func harvestReindexed(dir string, keep []*index.Record, res *Result, logf func(s
 			res.Harvested++
 		}
 	}
+}
+
+// migrationsExplainEveryLink reports whether the history has a Migrated trailer for every
+// fact file the index links to. No lookup, an empty index or a lookup error explains
+// nothing: the caller then keeps its fail-closed abort.
+func migrationsExplainEveryLink(opt Options, idx *index.Index, logf func(string, ...any)) bool {
+	if opt.Migrated == nil {
+		return false
+	}
+	linked := index.LinkedSlugs(idx.Records)
+	if len(linked) == 0 {
+		return false
+	}
+	for slug := range linked {
+		id, ok, err := opt.Migrated.MigratedID(opt.Store, slug)
+		if err != nil {
+			logf("migrated lookup %s: %v", slug, err)
+			return false
+		}
+		if !ok || id == "" {
+			return false
+		}
+	}
+	logf("the store is empty and the history explains all %d indexed slug(s) as migrated; dropping the dangling lines", len(linked))
+	return true
 }
 
 // explainedDangling counts the dangling pointers the history explains: a slug with a
