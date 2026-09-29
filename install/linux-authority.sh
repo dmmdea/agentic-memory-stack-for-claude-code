@@ -48,6 +48,11 @@
 #                  from the rendered set, like the store judge without a hub.
 #   --wiki-pull-key: the identity the step pulls with (default ~/.ssh/id_ed25519_wiki_pull;
 #                  stack.env MEM0_WIKI_PULL_KEY). Pin it on each PC to the forced tar command.
+#   --promotion-gate-mode: shadow | enforce, written to stack.env as MEM0_PROMOTION_GATE_MODE
+#                  (the dream's canonical promotion gate; the code default is shadow). Omit it and
+#                  a recorded value is carried over unchanged; nothing is invented on a first
+#                  install, because enforce makes a gate error fail safe and the operator
+#                  calibrates first. An explicit empty value drops the line (back to shadow).
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 #   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
@@ -60,10 +65,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # 1.31.1: the ONE stack.env writer (plain-token values only, comma lists); see the file.
 . "$SCRIPT_DIR/stack-env.sh"
+# The release sha stamp (DEPLOYED_SHA) the backup manifest reads; the deployed tree has no .git.
+. "$SCRIPT_DIR/deploy-stamp.sh"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
 # P4-1b: the store hub's own checkout and the binary that judges it.
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
 WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
+PROMOTION_GATE_MODE=""; SET_PROMOTION_GATE_MODE=0
 AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
 SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
@@ -87,6 +95,7 @@ while [ $# -gt 0 ]; do
         --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
         --wiki-sources) WIKI_SOURCES="${2:-}"; SET_WIKI_SOURCES=1; shift 2 ;;
         --wiki-pull-key) WIKI_PULL_KEY="${2:-}"; SET_WIKI_PULL_KEY=1; shift 2 ;;
+        --promotion-gate-mode) PROMOTION_GATE_MODE="${2:-}"; SET_PROMOTION_GATE_MODE=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -182,7 +191,18 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 # reads MEM0_BRAIN_SSH today (wiki-index.sh is the replica's wrapper), but this re-run is the
 # native brain's only deploy path (deploy.sh refuses a native host), and a deploy must never
 # drop a line the operator wrote.
-mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$HOME/.mem0/stack.env")
+# --promotion-gate-mode is the one operator key with a flag: given (even empty, which drops the
+# line), it replaces the recorded value, so the carry skips that key and it is written once.
+CARRY_SKIP=()
+if [ "$SET_PROMOTION_GATE_MODE" = 1 ]; then
+    CARRY_SKIP+=(MEM0_PROMOTION_GATE_MODE)
+    case "$PROMOTION_GATE_MODE" in
+        shadow|enforce) STACK_ENV_ARGS+=(MEM0_PROMOTION_GATE_MODE="$PROMOTION_GATE_MODE") ;;
+        "") echo "    --promotion-gate-mode cleared (explicit empty value; not inherited)" ;;
+        *) fail "--promotion-gate-mode must be shadow or enforce, got '$PROMOTION_GATE_MODE'" ;;
+    esac
+fi
+mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$HOME/.mem0/stack.env" ${CARRY_SKIP[@]+"${CARRY_SKIP[@]}"})
 for kv in "${STACK_ENV_CARRY[@]}"; do echo "    ${kv%%=*} carried over from ~/.mem0/stack.env: ${kv#*=}"; done
 STACK_ENV_ARGS+=("${STACK_ENV_CARRY[@]}")
 for kv in "${STACK_ENV_ARGS[@]}"; do
@@ -445,6 +465,9 @@ if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; depl
     # first install, `validate_plan` returned "the judge-plan schema is not deployed beside this
     # script" and no plan would ever have been written.
     cp "$REPO_ROOT/docs/schemas/judge-plan.schema.json" "$SCRIPTS_DIR/judge-plan.schema.json"
+    # The release sha, beside the app's VERSION and beside the scripts: stack-backup-manifest.sh runs
+    # from here and the tree has no .git, so its git_sha reads this stamp (it was "unknown").
+    deploy_stamp_write "$REPO_ROOT" "$MEM0_APP" "$SCRIPTS_DIR"
     systemctl --user daemon-reload
     # One chain (spec §4): any per-job timer a previous install enabled is turned off, never deleted.
     for t in decay-scan stack-backup goals-stale-sweep contradiction-sweep retrieval-pairs episodic-reconcile goal-recurrence-promote egemma-rollback-prune offline-watcher; do
