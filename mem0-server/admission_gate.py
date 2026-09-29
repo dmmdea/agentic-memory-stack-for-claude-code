@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -70,13 +71,81 @@ def _count_rejection(reason: str) -> None:
 
 
 def admission_rejections_today(top_n: int = 8) -> dict:
-    """Snapshot for /health/deep: {date, total, reasons} with the top_n reason
-    families by count. Zero-I/O; informational — never flips health ok."""
+    """Snapshot for /health/deep: {date, total, reasons, stamps} with the top_n reason
+    families by count. Zero-I/O; informational — never flips health ok. `stamps` carries the
+    contradiction-stamp resolution counters (see resolve_stamp_tiers)."""
     reasons = dict(sorted(
         admission_rejection_stats["reasons"].items(), key=lambda kv: -kv[1])[:top_n])
     return {"date": admission_rejection_stats["date"],
             "total": admission_rejection_stats["total"],
-            "reasons": reasons}
+            "reasons": reasons,
+            "stamps": {"stamp_target_unresolved": stamp_resolution_stats["stamp_target_unresolved"],
+                       "stamp_ignored_not_canonical": stamp_resolution_stats["stamp_ignored_not_canonical"]}}
+
+
+# WP-4 (session-12 audit): a contradicts_canonical stamp is a bare id. The gate used to enforce it
+# forever, without asking whether the target is still canonical, so stamps against targets that had
+# since been demoted (or were never canonical-worthy) kept later, correct records hidden from durable
+# and operational recall. The gate now resolves each stamp target's CURRENT tier and enforces the
+# stamp only while the target is canonical.
+#   * ONE batched lookup per search (all stamp targets among the results), cached STAMP_TIER_TTL_S.
+#   * fail-open: a target that cannot be resolved (lookup error) ignores the stamp and bumps
+#     stamp_target_unresolved. Hiding a live record on a guess is the worse error; the counter is the
+#     signal that the lookup is down.
+#   * a target that is gone (no such point) is dangling: the stamp is ignored, not counted as an error.
+#   * the lookup is injected (set_stamp_tier_fetcher) so this module stays qdrant-free and headless.
+#     With no fetcher registered (library use, unit tests) the pre-WP-4 contract holds: a stamp hides.
+STAMP_TIER_TTL_S = 600.0
+_STAMP_TIER_FETCHER = None
+_stamp_tier_cache: dict = {}       # target id -> (monotonic expiry, tier | None)
+stamp_resolution_stats: dict = {"date": None, "stamp_target_unresolved": 0,
+                                "stamp_ignored_not_canonical": 0}
+
+
+def set_stamp_tier_fetcher(fn) -> None:
+    """Register fn(ids: list[str]) -> {id: tier}, one batched lookup. Ids it does not return are
+    treated as missing (dangling). It may raise: the gate then fails open. None unregisters."""
+    global _STAMP_TIER_FETCHER
+    _STAMP_TIER_FETCHER = fn
+
+
+def _count_stamp(kind: str) -> None:
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    if stamp_resolution_stats["date"] != today:
+        stamp_resolution_stats["date"] = today
+        stamp_resolution_stats["stamp_target_unresolved"] = 0
+        stamp_resolution_stats["stamp_ignored_not_canonical"] = 0
+    stamp_resolution_stats[kind] += 1
+
+
+def resolve_stamp_tiers(target_ids) -> Optional[dict]:
+    """Current tier of each stamp target: {id: tier or None (target gone)}.
+
+    Returns None when no fetcher is registered (caller keeps the legacy enforce-any-stamp rule).
+    An id whose lookup failed is ABSENT from the result (unresolved -> fail-open by the caller);
+    failures are never cached, so the next search retries."""
+    if _STAMP_TIER_FETCHER is None:
+        return None
+    now = time.monotonic()
+    out: dict = {}
+    missing = []
+    for tid in sorted({str(t) for t in target_ids if t}):
+        hit = _stamp_tier_cache.get(tid)
+        if hit is not None and hit[0] > now:
+            out[tid] = hit[1]
+        else:
+            missing.append(tid)
+    if missing:
+        try:
+            found = _STAMP_TIER_FETCHER(missing) or {}
+        except Exception:   # noqa: BLE001 - any lookup failure is fail-open, never a 500 on search
+            log.warning("stamp-target tier lookup failed (stamps ignored this search)", exc_info=True)
+            return out
+        for tid in missing:
+            tier = found.get(tid)
+            _stamp_tier_cache[tid] = (now + STAMP_TIER_TTL_S, tier)
+            out[tid] = tier
+    return out
 
 
 @dataclass
@@ -103,7 +172,8 @@ class AdmissionPolicy:
     # ADDS a within-brand weak-match cut. Populated from MEM0_BRAND_COHERENCE_THRESHOLD.
     brand_coherence_floor: Optional[float] = None
 
-    def evaluate(self, result: dict, scope: dict, query_class: str) -> AdmissionDecision:
+    def evaluate(self, result: dict, scope: dict, query_class: str,
+                 stamp_tiers: Optional[dict] = None) -> AdmissionDecision:
         meta = result.get("metadata") or {}
         # 1. Tier check
         tier = meta.get("tier")
@@ -130,8 +200,15 @@ class AdmissionPolicy:
             # verdict) is DELIBERATELY NOT read — a local verdict must never hide a live
             # record (model-routing rule: no local judgment on the retrieval path). A
             # Codex re-judge promotes pending -> contradicts_canonical before it enforces.
+            #
+            # WP-4: the stamp is a bare id, so it is enforced only while its target is STILL
+            # canonical. `stamp_tiers` is the resolved {target id: current tier} map from
+            # resolve_stamp_tiers; None means no resolution was attempted (pure/unit use), which
+            # keeps the old enforce-any-stamp rule. A target that is not in the map (its lookup
+            # failed) or whose tier is anything but canonical (demoted, or gone) ignores the stamp.
             contradicts = meta.get("contradicts_canonical")
-            if contradicts:
+            if contradicts and (stamp_tiers is None
+                                or stamp_tiers.get(str(contradicts)) == "canonical"):
                 return AdmissionDecision(False, f"contradicts_canonical:{contradicts}")
         # 2. Brand match (v0.19 M4+M14: fail-closed + case-insensitive)
         # v0.20 Phase F (M14): brands are stripped BEFORE the falsiness checks —
@@ -371,11 +448,24 @@ def apply_admission(results: Iterable[dict], scope: dict, query_class: str, laye
     reads the whole dict."""
     qc = (query_class or "durable").strip().lower() or "durable"
     policy = default_policy_for_class(qc)
+    results = list(results)
+    stamp_tiers = None
+    if not policy.forensic:
+        targets = [(r.get("metadata") or {}).get("contradicts_canonical") for r in results]
+        targets = [t for t in targets if t]
+        if targets:
+            stamp_tiers = resolve_stamp_tiers(targets)
     admitted = []
     for r in results:
-        d = policy.evaluate(r, scope, qc)
+        d = policy.evaluate(r, scope, qc, stamp_tiers=stamp_tiers)
         if d.admit:
             admitted.append(r)
+            stamp = (r.get("metadata") or {}).get("contradicts_canonical")
+            if stamp and stamp_tiers is not None and not policy.forensic:
+                # an admitted stamped record: its stamp was ignored, either because the target is no
+                # longer canonical (the fix working) or because the lookup failed (fail-open)
+                _count_stamp("stamp_ignored_not_canonical" if str(stamp) in stamp_tiers
+                             else "stamp_target_unresolved")
         else:
             _count_rejection(d.reason)
             if stats_out is not None:

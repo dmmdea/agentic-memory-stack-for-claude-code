@@ -25,6 +25,10 @@ from reranker import rerank as bge_rerank
 # but cold-load + llama-swap spawn can still exceed the deploy gate's window.
 from reranker import rerank_health as _rerank_health
 from admission_gate import apply_admission
+# WP-4: contradicts_canonical stamps are enforced only while their target is still canonical; the
+# gate resolves targets through this fetcher (registered below, once `mem` exists).
+from admission_gate import set_stamp_tier_fetcher as _set_stamp_tier_fetcher
+from admission_gate import resolve_stamp_tiers as _resolve_stamp_tiers
 # W5 T1.3: the PURE evaluate path for the diagnose endpoint — never
 # apply_admission there (it mutates the MEM-8 counters + audit log).
 from admission_gate import default_policy_for_class
@@ -167,6 +171,17 @@ mem = Memory.from_config(build_config())
 from config import build_embedder
 mem.embedding_model = build_embedder()
 log.info("mem0 initialized (embedder: EmbeddingGemma-300m prefix-shim, collection: mem0_egemma_768)")
+
+def _stamp_tier_fetch(ids):
+    """One batched retrieve of the CURRENT tier of each contradicts_canonical target (payload-only,
+    no vectors). Ids absent from Qdrant are simply not returned (the gate reads that as dangling)."""
+    recs = mem.vector_store.client.retrieve(
+        collection_name=mem.vector_store.collection_name, ids=list(ids),
+        with_payload=["tier"], with_vectors=False)
+    return {str(r.id): (getattr(r, "payload", None) or {}).get("tier") for r in recs}
+
+
+_set_stamp_tier_fetcher(_stamp_tier_fetch)
 
 # v0.29 R4: ensure the semantic episode collection exists (idempotent). Non-fatal
 # — if it fails, the raw-trace fallback search simply no-ops (fail-soft).
@@ -1806,7 +1821,12 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                       "created_at": payload.get("created_at")}
         scope = {"user_id": user_id, "brand": b.brand,
                  "allow_cross_brand": b.allow_cross_brand}
-        adm = default_policy_for_class(qc).evaluate(adm_record, scope, qc)
+        # WP-4: same stamp-target resolution as the live gate, or the verdict diverges from what
+        # search really does (a stamp against a demoted target is ignored there).
+        _stamp = target_meta.get("contradicts_canonical")
+        adm = default_policy_for_class(qc).evaluate(
+            adm_record, scope, qc,
+            stamp_tiers=(_resolve_stamp_tiers([_stamp]) if _stamp else None))
         # -- probe 4: rerank delta, bounded to the overfetch-sized pool
         # (review: NEVER the 500-pool — multi-minute CPU) --
         rerank_probe = {"requested": bool(b.rerank), "ran": False,
