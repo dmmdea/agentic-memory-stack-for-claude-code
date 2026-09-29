@@ -147,3 +147,29 @@ Describe 'no hook hard-codes a brand or workspace constant (C3)' {
         $code | Should -Not -Match "'ai-ecosystem'" -Because "$f must take brand and workspace from Get-BrandFromTranscriptPath, never a constant"
     }
 }
+
+Describe 'Select-AdmittedMemoryResults treats shared brands as neutral (C3 client backstop)' {
+    BeforeAll {
+        function script:New-Hit([string]$Id, $Brand) {
+            return [pscustomobject]@{ id = $Id; memory = "memory $Id"; metadata = [pscustomobject]@{ tier = 'evidence'; brand = $Brand } }
+        }
+    }
+    BeforeEach { $env:MEM0_SHARED_BRANDS = 'shared-a'; $script:audit = Join-Path $TestDrive ('adm-' + [guid]::NewGuid().ToString('N') + '.jsonl') }
+    AfterAll { Remove-Item Env:MEM0_SHARED_BRANDS -ErrorAction SilentlyContinue }
+
+    It 'a brandless session sees neutral and shared-brand memories, never another brand''s' {
+        $hits = @((New-Hit 'n' $null), (New-Hit 's' 'shared-a'), (New-Hit 'b' 'brand-a'))
+        $ids = @(Select-AdmittedMemoryResults -Hits $hits -Brand '' -AuditPath $script:audit | ForEach-Object { $_.id })
+        $ids | Should -Be @('n', 's')
+    }
+    It 'a brand-scoped session sees its own, neutral and shared-brand memories, never another brand''s' {
+        $hits = @((New-Hit 'n' $null), (New-Hit 's' 'Shared-A'), (New-Hit 'own' 'brand-b'), (New-Hit 'other' 'brand-a'))
+        $ids = @(Select-AdmittedMemoryResults -Hits $hits -Brand 'brand-b' -AuditPath $script:audit | ForEach-Object { $_.id })
+        $ids | Should -Be @('n', 's', 'own')
+    }
+    It 'with no shared brands configured the fail-closed behavior is unchanged' {
+        Remove-Item Env:MEM0_SHARED_BRANDS -ErrorAction SilentlyContinue
+        $hits = @((New-Hit 'n' $null), (New-Hit 's' 'shared-a'))
+        @(Select-AdmittedMemoryResults -Hits $hits -Brand '' -AuditPath $script:audit | ForEach-Object { $_.id }) | Should -Be @('n')
+    }
+}

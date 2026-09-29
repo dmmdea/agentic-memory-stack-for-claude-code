@@ -102,6 +102,11 @@ class AdmissionPolicy:
     # fail-CLOSED brand-mismatch / brandless rules below are unchanged — this only
     # ADDS a within-brand weak-match cut. Populated from MEM0_BRAND_COHERENCE_THRESHOLD.
     brand_coherence_floor: Optional[float] = None
+    # C3 shared brands (lower-cased labels): a record carrying one of these is written as-is but
+    # is NEUTRAL for admission - visible to every scope, brandless included - exactly like a
+    # null-brand record. An unlisted brand stays fail-closed. Populated from MEM0_SHARED_BRANDS
+    # (env, else ~/.mem0/stack.env) by default_policy_for_class; empty = today's behavior.
+    shared_brands: tuple[str, ...] = ()
 
     def evaluate(self, result: dict, scope: dict, query_class: str) -> AdmissionDecision:
         meta = result.get("metadata") or {}
@@ -140,6 +145,8 @@ class AdmissionPolicy:
         # via [string]::IsNullOrWhiteSpace in user-prompt-lib.ps1).
         req_brand = str(scope.get("brand") or "").strip()
         res_brand = str(meta.get("brand") or "").strip()
+        if res_brand and res_brand.lower() in self.shared_brands:
+            res_brand = ""   # shared label: neutral for admission (C3)
         if req_brand and res_brand and req_brand.lower() != res_brand.lower():
             # M14: case-insensitive compare aligns with the client layer
             # (PowerShell -eq); empty/whitespace brands are falsy -> legacy, admitted.
@@ -260,6 +267,44 @@ def _brand_coherence_floor_from_env() -> Optional[float]:
     return val
 
 
+_stack_env_cache: dict = {}
+
+
+def _stack_env_value(key: str) -> Optional[str]:
+    """KEY from ~/.mem0/stack.env (KEY=VALUE lines, '#' comments), or None when the file or the
+    key is absent. The server unit does not load stack.env into its environment, so the operator
+    keys the gate reads are fetched here. Cached on the file's (mtime, size): a search request
+    builds a policy per call and must not re-read the file each time."""
+    path = Path.home() / ".mem0" / "stack.env"
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    stamp = (str(path), st.st_mtime_ns, st.st_size)
+    if _stack_env_cache.get("stamp") != stamp:
+        kv: dict = {}
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    kv.setdefault(k.strip(), v.strip())
+        except OSError:
+            return None
+        _stack_env_cache["stamp"] = stamp
+        _stack_env_cache["kv"] = kv
+    return _stack_env_cache["kv"].get(key)
+
+
+def _shared_brands_from_env() -> tuple[str, ...]:
+    """C3: MEM0_SHARED_BRANDS - comma-separated brand labels every scope may see. The process
+    environment wins; stack.env is the fallback. Absent/empty -> () (no shared brands)."""
+    raw = os.environ.get("MEM0_SHARED_BRANDS")
+    if raw is None:
+        raw = _stack_env_value("MEM0_SHARED_BRANDS") or ""
+    return tuple(sorted({b.strip().lower() for b in raw.split(",") if b.strip()}))
+
+
 def default_policy_for_class(query_class: str) -> AdmissionPolicy:
     """v0.18 default policy mapping by query_class.
 
@@ -287,17 +332,18 @@ def default_policy_for_class(query_class: str) -> AdmissionPolicy:
     # (durable/operational/canonical), NOT history (forensic queries want weak
     # branded matches back too). Default None -> no behavior change.
     _bcf = _brand_coherence_floor_from_env()
+    _shared = _shared_brands_from_env()
     if qc == "operational":
         return AdmissionPolicy(allowed_tiers=("stable", "evidence", "insight"), max_age_days=180,
-                               relevance_floor=_relevance_floor_from_env(), brand_coherence_floor=_bcf)
+                               relevance_floor=_relevance_floor_from_env(), brand_coherence_floor=_bcf, shared_brands=_shared)
     if qc == "canonical":
         return AdmissionPolicy(allowed_tiers=("stable", "canonical"), max_age_days=None,
-                               brand_coherence_floor=_bcf)
+                               brand_coherence_floor=_bcf, shared_brands=_shared)
     if qc == "history":
         return AdmissionPolicy(allowed_tiers=("stable", "evidence", "insight", "canonical"),
-                               max_age_days=None, forensic=True)
+                               max_age_days=None, forensic=True, shared_brands=_shared)
     return AdmissionPolicy(allowed_tiers=("stable", "evidence", "insight"), max_age_days=None,
-                           brand_coherence_floor=_bcf)
+                           brand_coherence_floor=_bcf, shared_brands=_shared)
 
 
 def log_rejected(memory_id: str, reason: str, layer: str, target_path: Optional[Path] = None) -> None:

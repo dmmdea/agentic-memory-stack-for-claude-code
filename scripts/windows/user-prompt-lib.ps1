@@ -1410,15 +1410,19 @@ function Select-AdmittedMemoryResults {
     # brand treated as legacy/null on both client and server layers).
     # v0.20 Phase F (M14): IsNullOrWhiteSpace — a whitespace-only brand ('  ')
     # normalizes to legacy-empty here exactly like the server gate's strip.
+    # C3: a brand in shared_brands (brands.json / MEM0_SHARED_BRANDS) is NEUTRAL here, exactly as
+    # the server gate treats it, or this backstop would drop what the server just admitted.
+    $sharedBrands = @()
+    try { $sharedBrands = @(Get-SharedBrands -Map (Get-BrandMap)) } catch { $sharedBrands = @() }
     if ($Brand) {
         $filteredResults = @($filteredResults | Where-Object {
             $memBrand = $_.metadata.brand
-            [string]::IsNullOrWhiteSpace([string]$memBrand) -or ($memBrand -eq $Brand)
+            [string]::IsNullOrWhiteSpace([string]$memBrand) -or ($memBrand -eq $Brand) -or ($sharedBrands -contains ([string]$memBrand).Trim())
         })
     } else {
         # Fail closed: session brand unknown -> never surface brand-tagged memories
         $filteredResults = @($filteredResults | Where-Object {
-            [string]::IsNullOrWhiteSpace([string]$_.metadata.brand)
+            [string]::IsNullOrWhiteSpace([string]$_.metadata.brand) -or ($sharedBrands -contains ([string]$_.metadata.brand).Trim())
         })
     }
 

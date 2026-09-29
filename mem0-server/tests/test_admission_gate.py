@@ -769,3 +769,84 @@ def test_rejections_today_caps_top_n(tmp_path, monkeypatch):
     snap = admission_rejections_today(top_n=3)
     assert list(snap["reasons"].values()) == [10, 9, 8], "top families by count, capped"
     assert snap["total"] == 55
+
+
+# --- C3 shared brands: MEM0_SHARED_BRANDS labels are neutral for admission ---------------------
+
+def _shared_home(tmp_path, monkeypatch, stack_env=None):
+    """A sandboxed HOME (the gate reads ~/.mem0/stack.env) with no MEM0_SHARED_BRANDS in the env."""
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("MEM0_SHARED_BRANDS", raising=False)
+    (tmp_path / ".mem0").mkdir(exist_ok=True)
+    if stack_env is not None:
+        (tmp_path / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
+
+
+def test_shared_brand_admitted_for_brandless_and_other_brand_search(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-a")
+    policy = default_policy_for_class("durable")
+    r = _result(brand="shared-a")
+    assert policy.evaluate(r, scope={}, query_class="durable").admit is True, "brandless search"
+    assert policy.evaluate(r, scope={"brand": "brand-b"}, query_class="durable").admit is True, "other-brand search"
+    assert policy.evaluate(r, scope={"brand": "shared-a"}, query_class="durable").admit is True, "own-label search"
+
+
+def test_unlisted_brand_stays_fail_closed_when_shared_brands_are_set(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-a")
+    policy = default_policy_for_class("durable")
+    r = _result(brand="brand-a")
+    d = policy.evaluate(r, scope={}, query_class="durable")
+    assert (d.admit, d.reason) == (False, "brand_scope_required:brand-a")
+    d = policy.evaluate(r, scope={"brand": "brand-b"}, query_class="durable")
+    assert d.admit is False and d.reason.startswith("brand_mismatch")
+
+
+def test_a_search_scoped_to_a_shared_label_still_isolates_other_brands(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-a")
+    policy = default_policy_for_class("durable")
+    d = policy.evaluate(_result(brand="brand-a"), scope={"brand": "shared-a"}, query_class="durable")
+    assert d.admit is False and d.reason.startswith("brand_mismatch")
+
+
+def test_shared_brands_are_case_insensitive_and_tolerate_blanks(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", " Shared-A , ,shared-b,")
+    policy = default_policy_for_class("operational")
+    assert policy.shared_brands == ("shared-a", "shared-b")
+    assert policy.evaluate(_result(brand="SHARED-a"), scope={}, query_class="operational").admit is True
+
+
+def test_shared_brands_fall_back_to_stack_env_and_the_environment_wins(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch, stack_env="MEM0_DISTRO=x\nMEM0_SHARED_BRANDS=shared-a,shared-c\n")
+    assert default_policy_for_class("durable").shared_brands == ("shared-a", "shared-c")
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-b")
+    assert default_policy_for_class("durable").shared_brands == ("shared-b",)
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "")
+    assert default_policy_for_class("durable").shared_brands == (), "an explicit empty env disables the list"
+
+
+def test_no_shared_brands_configured_is_todays_behavior(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    for qc in ("durable", "operational", "canonical", "history"):
+        assert default_policy_for_class(qc).shared_brands == ()
+    d = default_policy_for_class("durable").evaluate(_result(brand="brand-a"), scope={}, query_class="durable")
+    assert d.reason == "brand_scope_required:brand-a"
+
+
+def test_shared_brand_skips_the_brand_coherence_floor(tmp_path, monkeypatch):
+    """A shared record is neutral, and the floor targets BRANDED results (same as a null brand)."""
+    _shared_home(tmp_path, monkeypatch)
+    policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
+                             brand_coherence_floor=0.20, shared_brands=("shared-a",))
+    r = _result(brand="shared-a"); r["score"] = 0.01
+    assert policy.evaluate(r, scope={"brand": "brand-b"}, query_class="durable").admit is True
