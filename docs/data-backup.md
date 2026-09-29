@@ -58,11 +58,20 @@ the API; a copy that fails verification is removed and nothing server-side is de
 `qdrant-*.snapshot` one-offs older than 14 days are swept. Before this the store kept every
 nightly snapshot, roughly a second full copy of the vectors per day.
 
+A failed server-side list, DELETE or sweep, or a secondary collection whose snapshot could not be
+taken, does not turn the night red (a red night makes the off-box copy refuse the primary set)
+but it does not read as a clean success either: the step writes a `degraded` outcome
+(`secondary-snapshot-failed` and/or `server-prune-failed`, with counts), so the receipt and
+`/health/maintenance` show it. The entities collection has no rebuild path, so a missing
+`qcol-entities-*` snapshot is a real gap, not noise.
+
 ### Manifest fields
 
-`app_version` and `git_sha` come from the `VERSION` and `DEPLOYED_SHA` stamps that `deploy.sh`
-writes beside the server modules (the deployed tree has no `.git`); `unknown` means the stamp is
-absent. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
+`app_version` and `git_sha` come from the `VERSION` and `DEPLOYED_SHA` stamps written beside the
+server modules (the deployed tree has no `.git`): by `deploy.sh` on a WSL host, and by the
+installers (`install/linux-authority.sh`, `install/1-wsl-services.sh`) on every install and
+refresh, because `deploy.sh` refuses a native host. An install from a tree with no `.git` removes
+the stamp rather than leave a stale one; `unknown` means the stamp is absent. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
 key (`grep '^KEY='`), never sourced, so a malformed line cannot stop the writer.
 
 **Deliberately excluded** (so nobody re-litigates; the secondary Qdrant collections are no longer

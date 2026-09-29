@@ -121,6 +121,10 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # the only reason the missed step was found at all. deploy.sh already stamps it; every path
     # that deploys the modules must, or the runtimes it installs are born unable to answer.
     cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
+    # ...and the commit it came from: stack-backup-manifest.sh reads <app>/DEPLOYED_SHA for the manifest git_sha.
+    # deploy.sh stamps it but refuses a native host, so an install that does not stamp it leaves "unknown" on every
+    # manifest. No .git (a tarball install): drop the stamp rather than leave a stale sha that names the wrong commit.
+    if _deployed_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null); then printf '%s\n' "$_deployed_sha" > "$MEM0_DIR/DEPLOYED_SHA"; else rm -f "$MEM0_DIR/DEPLOYED_SHA"; fi
     cd "$MEM0_DIR"
     python3 -m venv .venv
     ./.venv/bin/pip install --quiet --upgrade pip
@@ -148,6 +152,10 @@ else
     # A REFRESH must restamp too: an upgrade that leaves the old VERSION in place is exactly
     # how a runtime ends up reporting a release it is no longer running.
     cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
+    # ...and the commit it came from: stack-backup-manifest.sh reads <app>/DEPLOYED_SHA for the manifest git_sha.
+    # deploy.sh stamps it but refuses a native host, so an install that does not stamp it leaves "unknown" on every
+    # manifest. No .git (a tarball install): drop the stamp rather than leave a stale sha that names the wrong commit.
+    if _deployed_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null); then printf '%s\n' "$_deployed_sha" > "$MEM0_DIR/DEPLOYED_SHA"; else rm -f "$MEM0_DIR/DEPLOYED_SHA"; fi
     # v0.29.1: enforce the security floors on existing installs too (idempotent —
     # a no-op when already satisfied). Without this, a re-run only refreshes code
     # and an existing venv stays on a CVE-vulnerable starlette/cryptography.

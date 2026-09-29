@@ -470,3 +470,67 @@ def test_the_judge_apply_wrapper_syncs_the_checkout_before_it_applies():
     assert "pre_sync_exit=$pre_rc" in w, "the receipt line names the pre-apply sync's exit"
     assert 'case "$pre_rc" in 0|6) ;; *) exit "$pre_rc" ;; esac' in w, \
         "a stale checkout must leave the script non-zero, after the deterministic sync"
+
+
+# ------------------------------------------------------------- DEPLOYED_SHA stamp (backup manifest)
+WSL_INSTALLER = REPO_ROOT / "install" / "1-wsl-services.sh"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _sha_stamp_lines(installer: Path, app_var: str) -> list[str]:
+    """The installer's own DEPLOYED_SHA stamp lines, with the runtime-dir variable pinned to APP."""
+    out = []
+    for line in installer.read_text(encoding="utf-8").splitlines():
+        if "rev-parse HEAD" in line and "DEPLOYED_SHA" in line:
+            out.append(line.strip().replace(f'"${app_var}', '"$APP'))
+    return out
+
+
+@pytest.mark.parametrize("installer,app_var,sites", [(SCRIPT, "MEM0_APP", 1), (WSL_INSTALLER, "MEM0_DIR", 2)])
+def test_installers_stamp_the_deployed_sha_beside_every_version_stamp(installer, app_var, sites):
+    """The backup manifest reads git_sha from <app>/DEPLOYED_SHA. deploy.sh writes it but refuses a
+    native host, so on the native authority every manifest said "unknown" until the installer
+    stamped it. Every VERSION stamp site needs a sha stamp beside it (fresh install AND refresh)."""
+    text = installer.read_text(encoding="utf-8")
+    assert text.count('cp "$REPO_ROOT/VERSION"') == sites
+    assert len(_sha_stamp_lines(installer, app_var)) == sites
+
+
+@pytest.mark.parametrize("installer,app_var", [(SCRIPT, "MEM0_APP"), (WSL_INSTALLER, "MEM0_DIR")])
+def test_the_sha_stamp_writes_head_and_never_leaves_a_stale_or_empty_stamp(tmp_path, installer, app_var):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git not available")
+    lines = _sha_stamp_lines(installer, app_var)
+    assert lines, "no DEPLOYED_SHA stamp line found"
+    app = tmp_path / "app"
+    app.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "c"]):
+        subprocess.run([git, "-C", str(checkout), *args], check=True, env=env, capture_output=True)
+    head = subprocess.run([git, "-C", str(checkout), "rev-parse", "HEAD"], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+    def stamp(repo_root: Path):
+        # the installers run under `set -euo pipefail`: the stamp must be safe there
+        script = "set -euo pipefail\nREPO_ROOT=%s\nAPP=%s\n%s\n" % (
+            _q(repo_root), _q(app), "\n".join(lines))
+        return subprocess.run([BASH, "-c", script], env=env, capture_output=True, text=True)
+
+    r = stamp(checkout)
+    assert r.returncode == 0, r.stderr
+    assert (app / "DEPLOYED_SHA").read_text().strip() == head and SHA_RE.match(head)
+
+    # a source tree with no .git (a tarball install): no failure, and no stale sha left to lie
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    r = stamp(bare)
+    assert r.returncode == 0, r.stderr
+    assert not (app / "DEPLOYED_SHA").exists()
+
+
+def _q(p: Path) -> str:
+    return "'" + str(p).replace("\\", "/").replace("'", "'\''") + "'"

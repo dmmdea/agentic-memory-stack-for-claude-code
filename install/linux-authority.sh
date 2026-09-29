@@ -319,6 +319,10 @@ if plan "venv with $SERVER_PY; pip install $PIP_SPECS; deploy $(echo "$MEM0_MODU
     # Stamp the release beside app.py (see linux-replica.sh: a runtime that cannot say which
     # release it runs is how a missed deploy step hides).
     cp "$REPO_ROOT/VERSION" "$MEM0_APP/VERSION"
+    # ...and the commit it came from: stack-backup-manifest.sh reads <app>/DEPLOYED_SHA for the manifest git_sha.
+    # deploy.sh stamps it but refuses a native host, so an install that does not stamp it leaves "unknown" on every
+    # manifest. No .git (a tarball install): drop the stamp rather than leave a stale sha that names the wrong commit.
+    if _deployed_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null); then printf '%s\n' "$_deployed_sha" > "$MEM0_APP/DEPLOYED_SHA"; else rm -f "$MEM0_APP/DEPLOYED_SHA"; fi
     [ -x "$MEM0_APP/.venv/bin/python" ] || "$SERVER_PY" -m venv "$MEM0_APP/.venv"
     "$MEM0_APP/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
     eval "\"$MEM0_APP/.venv/bin/pip\" install --quiet --disable-pip-version-check $PIP_SPECS"
