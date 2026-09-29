@@ -201,7 +201,7 @@ try {
 # L4: EmbeddingGemma-300m embedder on llama-swap :11436 (v0.22 migration: replaced the
 # Ollama :11435 nomic-embed-text backend; Ollama fully decommissioned 2026-06-13).
 # Must return a 768-dim vector via the OpenAI-compatible /v1/embeddings endpoint.
-# 2026-07-22: these two probes hit CPU-only llama.cpp upstreams (--n-gpu-layers 0), which are
+# 2026-07-22: these two probes hit llama.cpp upstreams that were CPU-only at the time, which were
 # slow for two legitimate reasons: a lazy first load after any llama-swap restart (measured
 # ~7.4s) and box-wide CPU contention (embeddings latency has been observed spiking from a
 # ~15-40ms baseline to 12s). The old 20s client timeout aborted such runs and reported FAIL,

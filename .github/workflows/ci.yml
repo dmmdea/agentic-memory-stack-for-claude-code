@@ -129,7 +129,10 @@ jobs:
             scripts/wsl/test_ship_log_reclassify.py \
             scripts/wsl/test_wiki_index.py \
             scripts/wsl/test_wiki_index_nightly.py \
-            scripts/wsl/test_wiki_index_wrapper.py
+            scripts/wsl/test_wiki_index_wrapper.py \
+            scripts/tests/test_dependency_floors.py \
+            scripts/tests/test_docs_gate_guard.py \
+            scripts/tests/test_upgrade_check.py
 
   docs-gate:
     name: Docs gate (links, operator-neutral, ADR frontmatter)

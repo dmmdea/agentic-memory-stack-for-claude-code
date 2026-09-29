@@ -1,6 +1,6 @@
 """bge-reranker-v2-m3 HTTP client + reorder helper.
 
-Server: llama-swap @ http://127.0.0.1:11436 (always_loaded persistent group).
+Server: llama-swap @ http://127.0.0.1:11436 (support group, ttl 300).
 Endpoint: POST /v1/rerank   (llama-server `--reranking` flag exposes this).
 
 Failure policy (lens A4): any error from the reranker (timeout, 5xx,
