@@ -144,9 +144,15 @@ function Invoke-DaemonRawBundle {
     if ($sessionId -like 'unknown-*') { Write-DaemonLog 'WARN: session_id fallback used (non-UUID transcript filename)' }
 
     # --- mirror §3: brand inference (lib; $null = fail-closed downstream)
+    # C3: brand AND workspace come from the one resolver; the workspace is the transcript dir
+    # (it was the constant 'ai-ecosystem', wrong for every other project's sessions).
     $brand = $null
-    if ($transcriptPath) { $brand = Get-InferredBrandFromPath -Path $transcriptPath }
-    $workspace = 'ai-ecosystem'
+    $workspace = $null
+    if ($transcriptPath) {
+        $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)
+        $brand = $brandInfo.brand
+        $workspace = $brandInfo.workspace
+    }
     $project = $null
     # v0.22 Pillar 1 + Pillar 2 (B latency fix): resolve initiative + tier from
     # the per-session sidecar FIRST (written at SessionStart). The sidecar caches

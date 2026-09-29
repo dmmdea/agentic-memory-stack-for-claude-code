@@ -1080,30 +1080,109 @@ function Release-CodexLock {
     } catch { return }
 }
 
-function Get-BrandFromTranscriptPath {
-    # Infer brand/workspace/project from a Claude Code transcript path.
-    # Claude Code stores transcripts under a directory whose name encodes the project path,
-    # e.g. "d--My-Drive-AI-Ecosystem" or "D--repos-myapp-platform".
-    # Returns a hashtable with keys: brand, workspace, project.
+# ---------------------------------------------------------------- C3 brand map resolver
+# ONE resolver, two pinned copies: this block lives byte-identical (comment-stripped) in
+# memory-common.ps1 and user-prompt-lib.ps1, which do not dot-source each other
+# (BrandRouting.Tests.ps1 pins them). The Python resolver (scripts/wsl/brand_routing.py) and the Go
+# judge run the same corpus, tests/fixtures/brand-routing-cases.jsonl. The contract and the map
+# shape are in docs/systems/brands.md. PS 5.1-safe: no ?? / ?. / ternary.
+function ConvertTo-BrandPath {
     param([string]$Path)
-    $segs = $Path -split '[\\/]'
-    # Find the segment that looks like a project-dir encoding (contains '--')
-    $proj = $segs | Where-Object { $_ -match '^[a-zA-Z]--' } | Select-Object -First 1
-    if (-not $proj) { return @{ brand = $null; workspace = $null; project = $null } }
-    $lower = $proj.ToLower()
-    # v1.0 Phase 7B: operator-agnostic brand routing — rules from the deployed
-    # brands.json (beside this lib), neutral default fallback. No private brand
-    # names hardcoded in source; operators add their own in brands.json.
-    $brand = $null
-    $brandCfg = Join-Path $PSScriptRoot 'brands.json'
-    $brandRules = $null
-    try { if (Test-Path -LiteralPath $brandCfg) { $brandRules = (Get-Content -LiteralPath $brandCfg -Raw | ConvertFrom-Json).rules } } catch {}
-    if (-not $brandRules) { $brandRules = @([pscustomobject]@{ pattern = 'ai-ecosystem|agentic-memory|mem0'; brand = 'ai-ecosystem' }) }
-    foreach ($r in $brandRules) { if ($r.pattern -and ($lower -match $r.pattern)) { $brand = $r.brand; break } }
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    return [regex]::Replace($Path, '[\\/ ]', '-')
+}
+
+function ConvertTo-BrandPattern {
+    param([string]$Pattern)
+    return [regex]::Replace($Pattern, '\\\\|\\/|\\ |[/ ]', '-')
+}
+
+function Test-BrandPattern {
+    param($Pattern, [string]$Text, [switch]$IsPath)
+    if (($Pattern -isnot [string]) -or [string]::IsNullOrEmpty($Pattern)) { return $false }
+    try {
+        $p = $Pattern
+        if ($IsPath) { $p = ConvertTo-BrandPattern $Pattern }
+        return [regex]::IsMatch($Text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    } catch { return $false }
+}
+
+function Get-BrandMapList {
+    param($Map, [string]$Key)
+    if ($null -eq $Map) { return @() }
+    $v = $null
+    if ($Map -is [System.Collections.IDictionary]) {
+        if ($Map.Contains($Key)) { $v = $Map[$Key] }
+    } elseif ($Map.PSObject.Properties[$Key]) {
+        $v = $Map.PSObject.Properties[$Key].Value
+    }
+    if ($null -eq $v) { return @() }
+    return @($v)
+}
+
+function Resolve-BrandFromMap {
+    param($Map, [string]$Path, [string]$Text = '')
+    $hay = ConvertTo-BrandPath $Path
+    if (-not $hay) { return $null }
+    foreach ($r in @(Get-BrandMapList $Map 'rules')) {
+        if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $hay -IsPath)) { return [string]$r.brand }
+    }
+    $contentWorkspace = $false
+    foreach ($p in @(Get-BrandMapList $Map 'content_rule_workspaces')) {
+        if (Test-BrandPattern $p $hay -IsPath) { $contentWorkspace = $true; break }
+    }
+    if (-not $contentWorkspace) { return $null }
+    $found = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in @(Get-BrandMapList $Map 'content_rules')) {
+        if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $Text)) { [void]$found.Add([string]$r.brand) }
+    }
+    if ($found.Count -eq 1) { return [string]@($found)[0] }
+    return $null
+}
+
+function Get-BrandMap {
+    param([string]$Path)
+    if (-not $Path) { $Path = Join-Path $PSScriptRoot 'brands.json' }
+    $map = $null
+    try { if (Test-Path -LiteralPath $Path) { $map = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } } catch { $map = $null }
+    if ($map -isnot [System.Management.Automation.PSCustomObject]) { $map = $null }
+    $rules = @(Get-BrandMapList $map 'rules' | Where-Object { $_ })
+    if ($rules.Count -gt 0) { return $map }
+    return [pscustomobject]@{
+        rules                   = @([pscustomobject]@{ pattern = 'ai-ecosystem|agentic-memory|mem0'; brand = 'ai-ecosystem' })
+        shared_brands           = @(Get-BrandMapList $map 'shared_brands')
+        content_rule_workspaces = @(Get-BrandMapList $map 'content_rule_workspaces')
+        content_rules           = @(Get-BrandMapList $map 'content_rules')
+    }
+}
+
+function Get-SharedBrands {
+    param($Map)
+    $out = New-Object 'System.Collections.Generic.HashSet[string]'
+    $names = @(Get-BrandMapList $Map 'shared_brands') + @(([string]$env:MEM0_SHARED_BRANDS) -split ',')
+    foreach ($b in $names) {
+        $t = ([string]$b).Trim().ToLowerInvariant()
+        if ($t) { [void]$out.Add($t) }
+    }
+    return @($out)
+}
+
+function Get-BrandFromTranscriptPath {
+    param([string]$Path, [string]$Text = '', $Map = $null)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @{ brand = $null; workspace = $null; project = $null } }
+    if ($null -eq $Map) { $Map = Get-BrandMap }
+    $slug = $null
+    foreach ($seg in ($Path -split '[\\/]')) {
+        if ($seg -match '^[a-zA-Z]--') { $slug = $seg; break }
+    }
+    $workspace = $slug
+    if (-not $workspace) {
+        try { $workspace = [string](Split-Path -Leaf (Split-Path -Parent $Path)) } catch { $workspace = $null }
+    }
     return @{
-        brand     = $brand
-        workspace = $proj
-        project   = $proj
+        brand     = (Resolve-BrandFromMap -Map $Map -Path $Path -Text $Text)
+        workspace = $workspace
+        project   = $slug
     }
 }
 

@@ -361,7 +361,7 @@ if (-not $sessionId) {
 # ---------------------------------------------------------------------------
 
 $brand     = $null
-$workspace = 'ai-ecosystem'
+$workspace = $null
 $project   = $null
 
 # v0.19 M14/L10: inference extracted to user-prompt-lib.ps1 (Pester-testable);
@@ -370,8 +370,12 @@ $project   = $null
 # brand memories only; brand-tagged ones never leak into an unrecognized session).
 if ($script:DaemonServedBundle) {
     $brand = $fastBrand   # v0.20 A.5: same inference, done daemon-side
-} elseif ($transcriptPath -and (Test-FunctionAvailable 'Get-InferredBrandFromPath')) {
-    $brand = Get-InferredBrandFromPath -Path $transcriptPath
+} elseif ($transcriptPath -and (Test-FunctionAvailable 'Get-BrandFromTranscriptPath')) {
+    # C3: one resolver for brand AND workspace. The workspace is the transcript dir; it was the
+    # constant 'ai-ecosystem', wrong for every other project's sessions.
+    $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)
+    $brand = $brandInfo.brand
+    $workspace = $brandInfo.workspace
 }
 
 # v0.22 Pillar 1 + Pillar 2 (B latency fix): resolve initiative + tier for the
@@ -661,23 +665,26 @@ if ($questionPreview) {
 
     # POST to mem0 as tier=evidence user-decision
     $sessionShort = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
+    $decisionMeta = @{
+        source           = 'user-decision'
+        kind             = 'decision'
+        tier             = 'evidence'   # POST /v1/memories only accepts evidence|temporal; promote to stable/canonical via CLI if durable
+        _stable_intent   = $true        # flag: this decision SHOULD be promoted to stable after review
+                                        # v0.19 L3: renamed from 'stable_intent' to the underscore =
+                                        # server-internal convention (mem0-mcp-shim's _canonical_intent /
+                                        # _insight_intent); server strips BOTH spellings (_INTENT_KEYS)
+                                        # so pre-v0.19 records need no migration
+        question_preview = $decision.question_preview.Substring(0, [Math]::Min(200, $decision.question_preview.Length))
+        session_id       = $sessionId
+    }
+    # C3: the write carries the session's routed brand and nothing else. An unrouted session
+    # stays brand-neutral; it used to be stamped with a hard-coded brand here.
+    if ($brand) { $decisionMeta['brand'] = $brand }
     $memBody = $script:Jss.Serialize(@{
         messages = "User decision (session $sessionShort at $($decision.ts.Substring(0,16))): Q: $($decision.question_preview.Substring(0,[Math]::Min(200,$decision.question_preview.Length))) | A: $($decision.answer)"
         user_id  = '__WSL_USER__'
         infer    = $false
-        metadata = @{
-            source           = 'user-decision'
-            kind             = 'decision'
-            tier             = 'evidence'   # POST /v1/memories only accepts evidence|temporal; promote to stable/canonical via CLI if durable
-            _stable_intent   = $true        # flag: this decision SHOULD be promoted to stable after review
-                                            # v0.19 L3: renamed from 'stable_intent' to the underscore =
-                                            # server-internal convention (mem0-mcp-shim's _canonical_intent /
-                                            # _insight_intent); server strips BOTH spellings (_INTENT_KEYS)
-                                            # so pre-v0.19 records need no migration
-            question_preview = $decision.question_preview.Substring(0, [Math]::Min(200, $decision.question_preview.Length))
-            session_id       = $sessionId
-            brand            = if ($brand) { $brand } else { 'ai-ecosystem' }
-        }
+        metadata = $decisionMeta
     })
 
     if ($sw.ElapsedMilliseconds -le $BudgetMs) {
