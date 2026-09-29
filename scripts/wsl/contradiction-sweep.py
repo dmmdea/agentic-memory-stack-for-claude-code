@@ -370,21 +370,8 @@ def parse_verdict(content: str) -> Optional[bool]:
     return None
 
 
-def dense_vector(point: dict) -> Optional[list]:
-    """Extract the unnamed dense vector from a Qdrant point. The collection
-    carries the default unnamed 768-d vector plus a named 'bm25' sparse vector,
-    so with_vector=true returns a dict keyed by name ('' = dense)."""
-    v = point.get("vector")
-    if isinstance(v, list):
-        return v
-    if isinstance(v, dict):
-        dense = v.get("")
-        if isinstance(dense, list):
-            return dense
-        for val in v.values():  # defensive: first list-valued entry
-            if isinstance(val, list):
-                return val
-    return None
+# WP-4: the one shared extractor (ams_env.dense_vector); the name stays for the callers below.
+dense_vector = ams_env.dense_vector
 
 
 def parse_created(point: dict) -> Optional[dt.datetime]:

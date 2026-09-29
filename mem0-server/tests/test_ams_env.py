@@ -100,3 +100,32 @@ def test_canonize_reads_the_systemd_credential_first():
     i_cred = body.index("CREDENTIALS_DIRECTORY")
     i_xdg = body.index("XDG_RUNTIME_DIR")
     assert i_cred < i_xdg, "the credential path must be resolved before the tmpfs/plaintext paths"
+
+
+# ---- WP-4 task 4.1: dense_vector() is the one extractor for a Qdrant point's dense vector ----
+
+REAL_SHAPE = {"": [0.25] * 768, "bm25": {"indices": [3, 9, 27], "values": [0.5, 0.25, 0.125]}}
+
+
+def test_dense_vector_real_named_vector_shape():
+    """The live collection returns {"": [768 floats], "bm25": {"indices": [...], "values": [...]}}
+    for with_vector=true. The dense leg is the unnamed key; the sparse dict must never be returned."""
+    m = _load()
+    vec = m.dense_vector({"vector": REAL_SHAPE})
+    assert vec == [0.25] * 768
+    assert len(vec) == 768
+
+
+def test_dense_vector_bare_list_and_fallbacks():
+    m = _load()
+    assert m.dense_vector({"vector": [1.0, 2.0]}) == [1.0, 2.0]
+    # the unnamed entry wins even when another list-valued entry comes first
+    assert m.dense_vector({"vector": {"other": [9.0], "": [1.0, 2.0]}}) == [1.0, 2.0]
+    # no "" key: first list-valued entry, skipping a sparse dict
+    assert m.dense_vector({"vector": {"bm25": {"indices": [1], "values": [1.0]}, "dense": [4.0]}}) == [4.0]
+    # sparse only / empty / missing / wrong types -> None (callers count it, never guess)
+    assert m.dense_vector({"vector": {"bm25": {"indices": [1], "values": [1.0]}}}) is None
+    assert m.dense_vector({"vector": {}}) is None
+    assert m.dense_vector({}) is None
+    assert m.dense_vector({"vector": "nope"}) is None
+    assert m.dense_vector(None) is None
