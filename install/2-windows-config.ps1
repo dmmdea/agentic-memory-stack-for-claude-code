@@ -120,6 +120,37 @@ function Write-StackFile {
     [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
 }
 
+# WP-8: deploy the session-side wiki index refresh driver WITHOUT silently replacing an operator's own.
+# The repo copy is operator-neutral (vault from WIKI_VAULT or ~\.mem0\wiki-vault) and carries an
+# `ams-managed` marker line. A deployed copy with the marker is ours and is refreshed; a deployed copy
+# without it is the operator's hand-written script (the docs name it as the last step of every ingest)
+# and is kept byte-for-byte, with a notice saying how to migrate. Returns 'installed' | 'kept'.
+function Install-AmsWikiRefreshDriver {
+    param([string]$Src, [string]$Dst, [string]$HomeDir = $env:USERPROFILE)
+    if (Test-Path -LiteralPath $Dst) {
+        $existing = Get-Content -LiteralPath $Dst -Raw
+        $incoming = Get-Content -LiteralPath $Src -Raw
+        if (($existing -notmatch '(?m)^# ams-managed: wiki-index-refresh') -and ($existing -ne $incoming)) {
+            Write-Host "    NOTICE: kept your existing $Dst (it has no 'ams-managed' marker, so it is yours)." -ForegroundColor Yellow
+            Write-Host "            The neutral driver is $Src; to switch, copy it over your script and put the" -ForegroundColor Yellow
+            Write-Host "            vault directory in WIKI_VAULT or the first line of $HomeDir\.mem0\wiki-vault." -ForegroundColor Yellow
+            Write-Host "            Until then the SessionStart catch-up runs YOUR script, which may not stamp last-wiki-refresh." -ForegroundColor Yellow
+            return 'kept'
+        }
+    }
+    Copy-Item -LiteralPath $Src -Destination $Dst -Force
+    $raw = Get-Content -LiteralPath $Dst -Raw
+    if ($raw -match '__WSL_USER__|__WIN_USER__|__WSL_DISTRO__') {
+        Write-StackFile $Dst (Resolve-StackTokens $raw)
+    }
+    Write-Host "    installed: wiki-index-refresh.sh (from claude-config)"
+    $vaultConf = Join-Path $HomeDir '.mem0\wiki-vault'
+    if (-not $env:WIKI_VAULT -and -not (Test-Path -LiteralPath $vaultConf)) {
+        Write-Host "    NOTICE: wiki-index-refresh.sh has no vault yet: set WIKI_VAULT or write the vault directory to $vaultConf; until then it exits 1 and the PC catch-up does nothing." -ForegroundColor Yellow
+    }
+    return 'installed'
+}
+
 function Backup-File {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
@@ -743,12 +774,7 @@ if (Test-Path -LiteralPath $idxLintSrc) {
 $wikiRefreshSrc = Join-Path $RepoRoot 'claude-config\wiki-index-refresh.sh'
 $wikiRefreshDst = Join-Path $ScriptsDir 'wiki-index-refresh.sh'
 if (Test-Path -LiteralPath $wikiRefreshSrc) {
-    Copy-Item -LiteralPath $wikiRefreshSrc -Destination $wikiRefreshDst -Force
-    $raw = Get-Content -LiteralPath $wikiRefreshDst -Raw
-    if ($raw -match '__WSL_USER__|__WIN_USER__|__WSL_DISTRO__') {
-        Write-StackFile $wikiRefreshDst (Resolve-StackTokens $raw)
-    }
-    Write-Host "    installed: wiki-index-refresh.sh (from claude-config)"
+    Install-AmsWikiRefreshDriver -Src $wikiRefreshSrc -Dst $wikiRefreshDst | Out-Null
 } else {
     Write-Host "    WARN: $wikiRefreshSrc not found" -ForegroundColor Yellow
 }

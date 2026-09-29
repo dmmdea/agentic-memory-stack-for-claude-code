@@ -62,9 +62,14 @@ fi
 
 mkdir -p "$(dirname "$SNAP")"
 
-# A JSON string body: control characters dropped, backslash and quote escaped, length capped.
+# A JSON string body: control characters dropped, length capped at 200 bytes, then escaped. The cap
+# comes BEFORE the escaping so it can never split a backslash or quote pair (a lone trailing backslash
+# breaks the JSON), and `iconv -c` drops an incomplete or invalid UTF-8 sequence (a byte cap can cut a
+# multibyte character) so the outcome line stays valid UTF-8. LC_ALL=C keeps tr and head byte-wise.
 json_esc() {
-    printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | cut -c1-200
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037' | LC_ALL=C head -c 200 \
+        | { iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true; } \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 # One outcome line (contract C1) when the chain step asked for one; a hand run has no file.

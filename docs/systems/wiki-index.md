@@ -128,6 +128,13 @@ correct rebuild.
   time. A `wiki-index-build.py` that finds no `WIKI_ROOT` reports the path it looked for.
 - `tr`/`sed` with backslashes sent through SSH into a Windows shell lose the backslash; deploy
   the scripts by copying files, then compare hashes.
+- An operator who already has a hand-written `~/.claude/scripts/wiki-index-refresh.sh` (vault path baked in)
+  keeps it: the installer refreshes a deployed copy only while it carries the `# ams-managed:
+  wiki-index-refresh` marker line, and otherwise leaves it byte-for-byte and prints a NOTICE. To migrate
+  to the neutral driver, copy `claude-config/wiki-index-refresh.sh` over it and put the vault directory
+  in `WIKI_VAULT` or the first line of `~/.mem0/wiki-vault`; until a vault is configured the neutral
+  driver exits 1 ("no vault configured") and the installer prints a notice saying so. The catch-up runs
+  whichever script is deployed; only the neutral one stamps `last-wiki-refresh`.
 - Two sessions may hold tunnels at once; the port range handles it, `ExitOnForwardFailure`
   makes a busy port fail fast rather than serve nothing.
 

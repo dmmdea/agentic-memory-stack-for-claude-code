@@ -283,3 +283,45 @@ def test_a_hand_run_without_an_outcome_file_still_works(tmp_path):
     env = {"AMS_OUTCOME_FILE": ""}
     r, _, _ = _run(tmp_path, "op@down", DOWN, extra_env=env)
     assert r.returncode == 0, r.stderr
+
+
+# ---- WP-8 fix round 1: the outcome JSON survives hostile ssh stderr ---------------------------
+_HOSTILE = {
+    # a cut at 200 characters lands between the two characters of an escaped backslash
+    "backslash_at_the_cap": b"a" * 199 + b"\\" + b"b" * 50,
+    "quote_at_the_cap": b"a" * 199 + b'"' + b"b" * 50,
+    "windows_path_and_quotes": rb'D:\tools\wiki\wiki-tar.cmd: "vault not found" \\host\share ' * 6,
+    # a 200-byte cap or the 300-byte tail lands inside a two-byte character
+    "multibyte_at_the_head_cap": b"a" * 199 + "\u00e9".encode() + b"b" * 50,
+    "multibyte_at_the_tail_cut": b"x" + "\u00e9".encode() * 200,
+    "lone_invalid_byte": b"denied \xff\xfe by host " + b"c" * 250,
+    "mixed_long": (rb'ssh: "no\such" ' + "\u00e9\u00fc".encode() + b"\\") * 40,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_HOSTILE))
+def test_hostile_ssh_stderr_still_yields_parsable_utf8_json(tmp_path, name):
+    home = tmp_path / "home"
+    _stamp(home, "last-pull", 50)   # degraded night: the per-source detail is the whole point
+    errfile = tmp_path / "stderr.bin"
+    errfile.write_bytes(_HOSTILE[name])
+    body = f'cat "{errfile}" >&2; exit 255\n'
+    r, _, _ = _run(tmp_path, "op@down", body, extra_env=_down_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    raw = (tmp_path / "outcome").read_bytes()
+    raw.decode("utf-8")                       # strict: an invalid sequence raises here
+    status, work = _outcome(tmp_path)
+    assert status == "degraded:no-source-fresh-50h", "the night must not read outcome-unparsable"
+    assert work["sources"][0]["source"] == "op@down" and work["sources"][0]["exit"] == 255
+    assert 0 < len(work["sources"][0]["stderr"].encode("utf-8")) <= 200
+
+
+def test_escapes_are_kept_whole_when_the_text_fits(tmp_path):
+    home = tmp_path / "home"
+    _stamp(home, "last-pull", 10)
+    errfile = tmp_path / "stderr.bin"
+    errfile.write_bytes(('C:\\bin "x" caf\u00e9').encode())
+    r, _, _ = _run(tmp_path, "op@down", f'cat "{errfile}" >&2; exit 255\n', extra_env=_down_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    _, work = _outcome(tmp_path)
+    assert work["sources"][0]["stderr"] == 'C:\\bin "x" caf\u00e9'

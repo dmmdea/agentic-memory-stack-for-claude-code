@@ -273,3 +273,69 @@ Describe 'wiki-index catch-up: wiring' {
         $code | Should -Not -Match '\s\?\s.+\s:\s'
     }
 }
+
+# WP-8 fix round 1: the installer must not silently replace an operator's own session refresh script.
+Describe 'installer: wiki-index-refresh.sh deploy (Install-AmsWikiRefreshDriver)' {
+    BeforeAll {
+        $repo = Split-Path -Parent (Split-Path -Parent $script:winDir)
+        $script:repoSrc = Join-Path $repo 'claude-config\wiki-index-refresh.sh'
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'install\2-windows-config.ps1'), [ref]$tokens, [ref]$errs)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-AmsWikiRefreshDriver' }, $true)
+        $script:fnText = if ($fn) { $fn.Extent.Text } else { $null }
+        function New-DeploySandbox {
+            $d = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path (Join-Path $d 'scripts'), (Join-Path $d 'home\.mem0') -Force | Out-Null
+            [pscustomobject]@{ Dst = (Join-Path $d 'scripts\wiki-index-refresh.sh'); Home = (Join-Path $d 'home') }
+        }
+        function Invoke-Deploy($sb) {
+            . ([scriptblock]::Create($script:fnText))
+            $out = Install-AmsWikiRefreshDriver -Src $script:repoSrc -Dst $sb.Dst -HomeDir $sb.Home 6>&1 | Out-String
+            $out
+        }
+    }
+
+    It 'the repo driver carries the ams-managed marker' {
+        (Get-Content $script:repoSrc -Raw) | Should -Match '(?m)^# ams-managed: wiki-index-refresh'
+    }
+
+    It 'the installer defines the function and calls it' {
+        $script:fnText | Should -Not -BeNullOrEmpty
+        $repo = Split-Path -Parent (Split-Path -Parent $script:winDir)
+        (Get-Content (Join-Path $repo 'install\2-windows-config.ps1') -Raw) | Should -Match 'Install-AmsWikiRefreshDriver\s+-Src'
+    }
+
+    It 'a first install copies the driver and says the vault is still to configure' {
+        $sb = New-DeploySandbox
+        $out = Invoke-Deploy $sb
+        (Get-Content $sb.Dst -Raw) | Should -Be (Get-Content $script:repoSrc -Raw)
+        $out | Should -Match 'wiki-vault'
+    }
+
+    It 'a first install with a vault already configured prints no configure notice' {
+        $sb = New-DeploySandbox
+        Set-Content -Path (Join-Path $sb.Home '.mem0\wiki-vault') -Value 'X:\vault' -Encoding ASCII
+        $out = Invoke-Deploy $sb
+        (Test-Path $sb.Dst) | Should -BeTrue
+        $out | Should -Not -Match 'NOTICE'
+    }
+
+    It 'a re-install refreshes a copy that carries the marker' {
+        $sb = New-DeploySandbox
+        Set-Content -Path $sb.Dst -Value "#!/usr/bin/env bash`n# ams-managed: wiki-index-refresh`n# old version`n" -Encoding ASCII
+        Invoke-Deploy $sb | Out-Null
+        (Get-Content $sb.Dst -Raw) | Should -Be (Get-Content $script:repoSrc -Raw)
+    }
+
+    It 'an operator-owned script (no marker) is kept byte-for-byte and the notice names the migration' {
+        $sb = New-DeploySandbox
+        $own = "#!/usr/bin/env bash`n# my own refresh, vault baked in`ntar -C /g/vault -cf - wiki | wsl.exe -e true`n"
+        [System.IO.File]::WriteAllText($sb.Dst, $own)
+        $before = (Get-FileHash $sb.Dst -Algorithm SHA256).Hash
+        $out = Invoke-Deploy $sb
+        (Get-FileHash $sb.Dst -Algorithm SHA256).Hash | Should -Be $before
+        $out | Should -Match 'NOTICE'
+        $out | Should -Match 'kept'
+        $out | Should -Match 'wiki-index-refresh\.sh'
+    }
+}

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# ams-managed: wiki-index-refresh (the installer refreshes a deployed copy only while this marker line is present; delete it to take ownership of your copy)
 # wiki-index-refresh.sh — the session-side refresh of the LLM Wiki's semantic index
 # (docs/systems/wiki-index.md, "Two refresh paths"). Runs on a PC that mounts the vault, from Git Bash.
 #
