@@ -42,8 +42,10 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 # Operator-owned keys: no installer flag sets them, the operator adds them by hand, and every
 # writer rewrites the whole file, so each writer carries them over from the existing file
 # (stack_env_carry) or a re-run deletes them silently. MEM0_BRAIN_SSH = the brain's SSH alias
-# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH"
+# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). MEM0_SHARED_BRANDS = brand labels the
+# admission gate treats as neutral, MEM0_BRAND_MAP = the path of the brain's brands.json
+# (docs/systems/brands.md). A new hand-set key goes here.
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_SHARED_BRANDS MEM0_BRAND_MAP"
 
 stack_env_carry() {  # $1 = the existing stack.env -> "KEY=VALUE" lines for the operator-owned keys it records
     local k v
