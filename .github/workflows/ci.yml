@@ -105,6 +105,7 @@ jobs:
             mem0-server/tests/test_jobs_queue.py \
             mem0-server/tests/test_pair_cache.py \
             mem0-server/tests/test_reranker.py \
+            mem0-server/tests/test_support_tier.py \
             mem0-server/tests/test_shim_offline.py \
             mem0-server/tests/test_sparse_health.py \
             mem0-server/tests/test_systemd_parity.py \

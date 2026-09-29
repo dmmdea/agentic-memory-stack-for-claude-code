@@ -1,6 +1,8 @@
 """bge-reranker-v2-m3 HTTP client + reorder helper.
 
-Server: llama-swap @ http://127.0.0.1:11436 (always_loaded persistent group).
+Server: llama-swap @ http://127.0.0.1:11436, the `support` group, GPU-served (-ngl 99). The model
+is NOT resident: like every seat it unloads after its 300 s TTL, so the first rerank after an idle
+spell pays a cold load inside the caller's timeout (see the cold-start retry below).
 Endpoint: POST /v1/rerank   (llama-server `--reranking` flag exposes this).
 
 Failure policy (lens A4): any error from the reranker (timeout, 5xx,
@@ -10,7 +12,7 @@ track consecutive failures and log on the 1st + every 10th.
 
 W4 / review F11 — PASSIVE liveness, never an active probe. The capability
 manifest needs a reranker verdict, but an ACTIVE rerank probe must NOT live in
-/health/deep: this is a CPU cross-encoder (Test-MemoryStack budgets it 90s and
+/health/deep: a cold model can take seconds to load (Test-MemoryStack budgets it 90s and
 still WARNs on cold-model timeouts), and scripts/wsl/deploy.sh gates on
 /health/deep immediately after a restart — an active probe there would hang
 deploys on a cold or contended model. So ``rerank_stats`` below is bumped from
@@ -33,6 +35,13 @@ log = logging.getLogger("mem0-server.reranker")
 RERANK_URL = "http://127.0.0.1:11436/v1/rerank"
 RERANK_MODEL = "bge-reranker-v2-m3"  # v0.14: upgraded from base (ctx 512) to v2-m3 (ctx 8192)
 RERANK_TIMEOUT_S = 8.0
+# Cold start: the reranker unloads after its 300 s TTL, and the first request after that waits for
+# the model to load. Measured cold requests take ~1-6 s, and two of ~21 cold loads outlived the 8 s
+# timeout. So a ReadTimeout on the first attempt is retried ONCE with this longer allowance (the
+# load is usually underway or done by then) before search degrades to dense order.
+RERANK_COLD_RETRY_TIMEOUT_S = 20.0
+# rerank_status values that mean "the cross-encoder scored this search".
+RAN_STATUSES = ("ran", "ok-after-cold-retry")
 # Don't bother reranking trivially small or very confident result sets.
 RERANK_MIN_N = 3
 RERANK_SKIP_IF_TOP_SCORE = 0.92
@@ -53,6 +62,7 @@ rerank_stats: dict = {
     "ok_total": 0,
     "fail_total": 0,
     "last_error": None,
+    "cold_retry_total": 0,   # first attempts that timed out and were retried with the longer allowance
 }
 _failure_lock = threading.Lock()
 
@@ -80,6 +90,29 @@ def rerank_health() -> dict:
         return dict(rerank_stats)
 
 
+def _post_rerank(query: str, docs: list[str], timeout: float) -> dict:
+    r = httpx.post(
+        RERANK_URL,
+        json={"model": RERANK_MODEL, "query": query, "documents": docs, "top_n": len(docs)},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def warm() -> dict:
+    """Load the reranker with a one-document rerank (SessionStart pre-warm target, so the first
+    deliberate search of a session does not pay the cold load). Waits up to the cold-start
+    allowance, never raises, and touches none of the passive search counters: a warm-up is not
+    search traffic and must not read as reranker liveness. -> {ok, warm_ms} or {ok: False, error}."""
+    t0 = time.perf_counter()
+    try:
+        _post_rerank("warm", ["warm"], RERANK_COLD_RETRY_TIMEOUT_S)
+    except (httpx.HTTPError, ValueError) as e:
+        return {"ok": False, "error": f"{e.__class__.__name__}: {e}"[:160]}
+    return {"ok": True, "warm_ms": int((time.perf_counter() - t0) * 1000)}
+
+
 def rerank(query: str, results: list[dict], text_key: str = "memory", *,
            force: bool = False, status_out: dict | None = None) -> list[dict]:
     """Reorder `results` by bge-reranker scores. Idempotent; original list is not mutated.
@@ -89,7 +122,9 @@ def rerank(query: str, results: list[dict], text_key: str = "memory", *,
 
     W5 T1.2/T5.3 (out-param, house stats_out pattern — the list-return
     signature is pinned): ``status_out['status']`` is set to one of
-    ran | skipped_small_n | skipped_confident | failed_fallback_dense.
+    ran | ok-after-cold-retry | skipped_small_n | skipped_confident | failed_fallback_dense
+    (`ok-after-cold-retry`: the first attempt hit ReadTimeout while the model cold-loaded and the
+    one retry with RERANK_COLD_RETRY_TIMEOUT_S succeeded; use RAN_STATUSES to test "it scored").
     ``force=True`` bypasses BOTH skip heuristics — the union leg passes it
     when lexical_only candidates are present, because a silent skip would
     delete every lexical rescue via the fail-closed drop (exactly the
@@ -101,14 +136,17 @@ def rerank(query: str, results: list[dict], text_key: str = "memory", *,
             status_out["status"] = f"skipped_{reason}"
         return list(results)
     docs = [str(r.get(text_key, "") or "")[:RERANK_DOC_MAX_CHARS] for r in results]
+    cold_retried = False
     try:
-        r = httpx.post(
-            RERANK_URL,
-            json={"model": RERANK_MODEL, "query": query, "documents": docs, "top_n": len(docs)},
-            timeout=RERANK_TIMEOUT_S,
-        )
-        r.raise_for_status()
-        body = r.json()
+        try:
+            body = _post_rerank(query, docs, RERANK_TIMEOUT_S)
+        except httpx.ReadTimeout:
+            # Cold load in progress: one retry with the longer allowance. Only a read timeout
+            # qualifies; a start failure (5xx) or a refused connection is not a slow load.
+            cold_retried = True
+            with _failure_lock:
+                rerank_stats["cold_retry_total"] += 1
+            body = _post_rerank(query, docs, RERANK_COLD_RETRY_TIMEOUT_S)
         items = body.get("results") or body.get("data") or []
         # llama-server returns [{"index": int, "relevance_score": float}, ...]
         ordered = sorted(items, key=lambda x: float(x.get("relevance_score", 0.0)), reverse=True)
@@ -129,7 +167,7 @@ def rerank(query: str, results: list[dict], text_key: str = "memory", *,
             rerank_stats["last_rerank_ok_ts"] = time.time()
             rerank_stats["ok_total"] += 1
         if status_out is not None:
-            status_out["status"] = "ran"
+            status_out["status"] = "ok-after-cold-retry" if cold_retried else "ran"
         return out
     except (httpx.HTTPError, ValueError, KeyError) as e:
         with _failure_lock:
