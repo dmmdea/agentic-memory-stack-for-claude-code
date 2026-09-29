@@ -218,6 +218,23 @@ $turns
     # facts (Test-IsShipLog=true) fold into the episode summary, not mem0 records.
     $split = Split-FactsByShipLog -Facts $facts
 
+    # C3: resolve the brand BEFORE the facts loop. The episode below used to be the only record
+    # that carried a brand (the call sat after the loop), so every fact was brand-neutral and
+    # surfaced in every brand's recall. The map is read once; each fact is routed with its own
+    # text, which only matters in a content-rule workspace (a path rule wins first). NOTE: plain
+    # $TranscriptPath, NOT ($TranscriptPath ?? '') - the ?? null-coalescing operator is PS7-only
+    # and the Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
+    # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
+    # $TranscriptPath is a [string] param (defaults '', never $null), so ?? was redundant.
+    $brandMap = $null
+    $brandInfo = @{ brand = $null; workspace = $null; project = $null }
+    try {
+        $brandMap = Get-BrandMap
+        $brandInfo = Get-BrandFromTranscriptPath -Path $TranscriptPath -Map $brandMap
+    } catch {
+        Write-MemoryLog -Component 'l1a' -Message "  brand routing failed (facts post brand-neutral): $_"
+    }
+
     $posted = 0
     $postedMemoryIds = [System.Collections.Generic.List[string]]::new()
     # Only evergreen facts POST to mem0 and populate linked_memory_ids (durable-only).
@@ -230,11 +247,15 @@ $turns
         # OVERSIZE line (1200) and embeds many topics into one vector.
         foreach ($fact in (Split-OversizeFact -Fact $rawFact)) {
             if ([string]::IsNullOrWhiteSpace($fact)) { continue }
-            $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata @{
+            $factMeta = @{
                 event = $EventName
                 tier = 'evidence'
                 extracted_at = (Get-Date).ToString('o')
             }
+            $factBrand = $null
+            try { $factBrand = Resolve-BrandFromMap -Map $brandMap -Path $TranscriptPath -Text $fact } catch { $factBrand = $null }
+            if ($factBrand) { $factMeta['brand'] = $factBrand }   # unrouted stays brand-neutral: no key at all
+            $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata $factMeta
             if ($memId) {
                 $posted++
                 if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
@@ -277,12 +298,7 @@ $turns
             }
             if (-not $sessionId) { $sessionId = [System.Guid]::NewGuid().ToString() }
 
-            # Infer brand/workspace/project from transcript path. NOTE: plain $TranscriptPath,
-            # NOT ($TranscriptPath ?? '') — the ?? null-coalescing operator is PS7-only and the
-            # Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
-            # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
-            # $TranscriptPath is a [string] param (defaults '', never $null), so ?? was redundant.
-            $brandInfo = Get-BrandFromTranscriptPath -Path $TranscriptPath
+            # brand/workspace/project: $brandInfo was resolved above, before the facts loop.
 
             # Best-effort started_at: use transcript file mtime as a proxy for session start
             $sessionStartedAt = (Get-Date).ToString('o')
