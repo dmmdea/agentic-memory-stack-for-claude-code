@@ -586,7 +586,7 @@ Describe 'Acquire-CodexLockWithWait (L1a waits for the codex lock instead of ski
     }
 }
 
-Describe 'Invoke-CodexSubagent: auth mode and failure tail (qube-codex-401-windows, capture-l1a-codex-lock-skips-and-failures)' {
+Describe 'Invoke-CodexSubagent: auth mode and failure tail (capture-l1a-codex-lock-skips-and-failures)' {
     BeforeEach {
         $script:savedEnv = @{ O = $env:OPENAI_API_KEY; C = $env:CODEX_API_KEY; H = $env:CODEX_HOME }
         Get-ChildItem -LiteralPath $script:LogDir -Filter '*.log' -ErrorAction SilentlyContinue | Remove-Item -Force
