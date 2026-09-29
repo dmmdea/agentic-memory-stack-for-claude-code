@@ -1159,7 +1159,21 @@ function Redact-Secrets {
         @('(?-i:(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16})', '[REDACTED_AWS_KEY]'),
         @('(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)', '[REDACTED_JWT]'),
         @('(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@', '$1:[REDACTED]@'),
-        @('(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
+        @('(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
+        # Session-12 additions (vcp_/sbp_/cfut_/sk_live_/re_/tskey-/whsec_/AIza/Telegram, 'API key <tok>', '<label> is <tok>',
+        # 'login <user> / <password>'), APPENDED so the generic rules keep their index; rationale in mem0-server/redact.py.
+        @('(?-i:(?<![A-Za-z0-9])vcp_[A-Za-z0-9]{20,})', '[REDACTED_VERCEL_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])sbp_[A-Za-z0-9]{20,})', '[REDACTED_SUPABASE_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])cfut_[A-Za-z0-9]{20,})', '[REDACTED_CLOUDFLARE_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])sk_live_[A-Za-z0-9]{16,})', '[REDACTED_STRIPE_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9_])re_(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]{24,})', '[REDACTED_RESEND_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])tskey-[A-Za-z0-9-]{20,})', '[REDACTED_TAILSCALE_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])whsec_[A-Za-z0-9]{16,})', '[REDACTED_STRIPE_WEBHOOK_SECRET]'),
+        @('(?-i:(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{30,})', '[REDACTED_GOOGLE_API_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])[0-9]{8,10}:AA[A-Za-z0-9_-]{30,})', '[REDACTED_TELEGRAM_TOKEN]'),
+        @('(?i)((?<![A-Za-z0-9])(?:api|access|auth|secret|private)[ \t]+(?:key|token)[ \t]*[:=]?[ \t]*[\x22\x27\x60]?)(?=[A-Za-z0-9]{0,200}[0-9])[A-Za-z0-9]{20,200}', '$1[REDACTED]'),
+        @('(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_ \t-]?key|token|password|passwd|secret)(?:[ \t]*\([^)\r\n]{0,40}\))?[ \t]+(?:value[ \t]+)?is[ \t]+[\x22\x27\x60]?)(?=[A-Za-z0-9]{0,200}[0-9])[A-Za-z0-9]{20,200}', '$1[REDACTED]'),
+        @('(?i)((?<![A-Za-z0-9])login[ \t]+(?:[^\s/@]{1,64}@[^\s/]{1,64}[ \t]*/[ \t]*|[^\s/@]{1,64}[ \t]*/[ \t]*(?=\S*[0-9!@#$%^&*])))[^\s\x22\x27\x60]{4,128}', '$1[REDACTED]')
     )
     foreach ($r in $rules) { $Text = $Text -replace $r[0], $r[1] }
     return $Text
