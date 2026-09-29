@@ -25,6 +25,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "storage-cap-check.sh"
 
 FAKE_CURL = r"""#!/bin/bash
@@ -295,14 +297,19 @@ def test_health_line_only_the_alarming_pool_part(tmp_path):
     assert lines == ["[AMS] brain NOT OK — pool 91.0% ONLINE"]
 
 
-def test_health_line_malformed_json_prints_nothing_and_never_crashes(tmp_path):
-    for raw in ("{not json", "", "[]", '"a string"', '{"ok": false, "failed_steps": 7, "pool": "x"}'):
-        box = Box(tmp_path / str(abs(hash(raw))), "replica")
-        box.authority(up=True, raw_maintenance=raw, episodes=[])
-        out = box.run()  # run() asserts exit 0
-        if raw.startswith('{"ok": false'):
-            continue  # ok:false with garbage parts: a NOT OK line with no parts is acceptable, a crash is not
-        assert "[AMS]" not in out, (raw, out)
+@pytest.mark.parametrize("raw", ["{not json", "", "[]", '"a string"', "null", "7"])
+def test_health_line_malformed_json_prints_nothing_and_never_crashes(tmp_path, raw):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, raw_maintenance=raw, episodes=[])
+    assert "[AMS]" not in box.run()  # run() asserts exit 0
+
+
+def test_health_line_with_garbage_parts_degrades_to_the_bare_line(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, raw_maintenance='{"ok": false, "failed_steps": 7, "pool": "x", "stale_steps": [1, null]}',
+                  episodes=[])
+    lines = [ln for ln in box.run().splitlines() if ln.startswith("[AMS]")]
+    assert lines == ["[AMS] brain NOT OK"]
 
 
 def test_health_call_is_bounded(tmp_path):
