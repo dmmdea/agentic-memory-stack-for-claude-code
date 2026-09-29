@@ -10,6 +10,7 @@ import (
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/frontmatter"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 	amsync "github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/sync"
 )
@@ -343,16 +344,21 @@ func MergeFindings(stateRoot, projectsRoot string, since time.Time) []Finding {
 			if seen[key] {
 				continue
 			}
+			detail := "kept by the modify/delete rule: one side edited it while the other deleted it"
 			if projectsRoot != "" {
 				if _, statErr := os.Stat(filepath.Join(projectsRoot, filepath.FromSlash(p))); os.IsNotExist(statErr) {
-					continue
+					// Gone from the store. Healed - unless a first sync set the file aside
+					// because the hub had already deleted it: that copy still waits for a
+					// human to restore or drop it.
+					if _, qErr := os.Stat(filepath.Join(stateRoot, merge.QuarantineDir, filepath.FromSlash(p))); qErr != nil {
+						continue
+					}
+					detail = "quarantined by a first sync: the hub's history had already deleted it; the copy is under " +
+						merge.QuarantineDir + "/ in the state root"
 				}
 			}
 			seen[key] = true
-			out = append(out, Finding{
-				Store: workspaceOf(p), Kind: KindResurrected, File: p,
-				Detail: "kept by the modify/delete rule: one side edited it while the other deleted it",
-			})
+			out = append(out, Finding{Store: workspaceOf(p), Kind: KindResurrected, File: p, Detail: detail})
 		}
 		for _, c := range r.ConflictsInHistory {
 			out = append(out, Finding{

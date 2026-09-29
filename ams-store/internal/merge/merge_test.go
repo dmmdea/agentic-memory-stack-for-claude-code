@@ -879,3 +879,62 @@ func TestMerge_OverTriggerJSON_ClearSurvivesAPCThatStillCarriesTheStamp(t *testi
 			*h, crossed.Format(time.RFC3339))
 	}
 }
+
+// TestMerge_FirstJoinCannotResurrectWhatTheHubDeleted is the replica whose history repo is
+// new (a reinstall, a lost state root) while its projects still hold older fact files. The
+// merge base is the empty tree, so a file the hub deleted long ago falls into "added on our
+// side only" and would be pushed straight back. Every local-only path the hub's HISTORY
+// deleted is quarantined instead: reported `resurrected`, kept out of the merge, out of the
+// hub, and copied aside so nothing is lost.
+func TestMerge_FirstJoinCannotResurrectWhatTheHubDeleted(t *testing.T) {
+	f := newFleet(t, "a", "b")
+	a, b := f.pcs["a"], f.pcs["b"]
+
+	a.write(ws, "a.md", fact("Doomed", "the judge migrated it", "doomed hook", "doomed body\n"))
+	a.write(ws, "keep.md", fact("Keep", "kept", "keep hook", "keep body\n"))
+	a.syncOnce("seed", a.mo(), ws)
+	a.tick(time.Minute)
+	a.remove(ws, "a.md")
+	a.syncOnce("the judge deletes a.md", a.mo(), ws)
+
+	// B is a fresh history holding the stale a.md, plus a fact of its own the hub never had.
+	stale := fact("Doomed", "the judge migrated it", "doomed hook", "doomed body\n")
+	b.write(ws, "a.md", stale)
+	b.write(ws, "b-own.md", fact("Own", "only on B", "own hook", "own body\n"))
+	b.commit("B's first commit", ws)
+
+	rep := b.mergeOnly(b.mo())
+	if rep.Commit == "" {
+		t.Fatalf("nothing was merged: %+v", rep)
+	}
+	if !contains(rep.Resurrected, ws+"/memory/a.md") {
+		t.Errorf("the hub-deleted path must be reported resurrected, got %v", rep.Resurrected)
+	}
+	if len(rep.Resurrected) != 1 {
+		t.Errorf("only the hub-deleted path is quarantined, got %v", rep.Resurrected)
+	}
+	tree := b.git("ls-tree", "-r", "--name-only", rep.MergedTree)
+	if strings.Contains(tree, "a.md") {
+		t.Errorf("the merged tree carries the deleted fact and would push it back:\n%s", tree)
+	}
+	for _, keep := range []string{"keep.md", "b-own.md"} {
+		if !strings.Contains(tree, keep) {
+			t.Errorf("%s is missing from the merged tree:\n%s", keep, tree)
+		}
+	}
+	if b.exists(ws, "a.md") {
+		t.Error("the quarantined fact is still in B's store; a next sync would stage it again")
+	}
+	quarantined := filepath.Join(b.stateDir, "quarantine", ws, "memory", "a.md")
+	if got, err := os.ReadFile(quarantined); err != nil || string(got) != stale {
+		t.Errorf("the quarantined fact must be kept aside byte for byte: %v %q", err, got)
+	}
+	if r := b.push(); !r.OK {
+		t.Fatalf("B could not push: %s", r.Stderr)
+	}
+	a.fetch()
+	hubTree := a.git("ls-tree", "-r", "--name-only", "refs/remotes/"+hubRemote+"/main")
+	if strings.Contains(hubTree, "a.md") {
+		t.Errorf("the hub received the resurrected fact:\n%s", hubTree)
+	}
+}

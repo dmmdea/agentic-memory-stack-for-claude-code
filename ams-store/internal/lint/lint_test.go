@@ -1152,3 +1152,34 @@ func TestLint_RunHistoryReadsAcrossARotation(t *testing.T) {
 		t.Errorf("compactor-unproductive = %d, want 1: two rows in generation 1 plus one live make three", n)
 	}
 }
+
+// A path a first sync quarantined is gone from the store but still waits for a human: its
+// finding stays while the copy under the state root exists, and says why.
+func TestLint_AQuarantinedResurrectionStaysVisible(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	if err := amsync.AppendReceipt(sb.StateRoot, amsync.Receipt{
+		TS: fixedNow.Add(-time.Hour), Kind: "once", Status: amsync.StatusPushed,
+		Resurrected: []string{"ws/memory/quarantined.md", "ws/memory/healed.md"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	qdir := filepath.Join(sb.StateRoot, "quarantine", "ws", "memory")
+	if err := os.MkdirAll(qdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qdir, "quarantined.md"), []byte("kept aside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sum := runLint(t, sb, "")
+	var got []lint.Finding
+	for _, f := range sum.Findings {
+		if f.Kind == lint.KindResurrected {
+			got = append(got, f)
+		}
+	}
+	if len(got) != 1 || got[0].File != "ws/memory/quarantined.md" || !strings.Contains(got[0].Detail, "quarantined") {
+		t.Fatalf("resurrected findings = %+v, want only the quarantined path (the other is healed)", got)
+	}
+}

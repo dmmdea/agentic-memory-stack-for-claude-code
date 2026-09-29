@@ -3,9 +3,12 @@ package merge
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/atomic"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
 )
 
@@ -35,8 +38,13 @@ type Report struct {
 	Clean bool `json:"clean"`
 	// FastForward is true when there was nothing of ours to merge in.
 	FastForward bool `json:"fast_forward"`
-	// Resurrected names files kept because one side modified what the other deleted.
+	// Resurrected names files kept because one side modified what the other deleted, and
+	// files a first sync quarantined because the hub's history had already deleted them.
 	Resurrected []string `json:"resurrected,omitempty"`
+	// Quarantined is the subset of Resurrected a first sync set aside instead of pushing:
+	// local-only paths the hub's history had deleted. The bytes are under
+	// <state root>/quarantine/<path>.
+	Quarantined []string `json:"quarantined,omitempty"`
 	// Conflicts are the conflict-in-history findings, each with the loser's commit id.
 	Conflicts []Conflict `json:"conflicts,omitempty"`
 	// Deferred, Materialized and Deleted mirror the materialize report. Deferred keeps
@@ -191,7 +199,29 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 		return nil, err
 	}
 
+	// A first sync against a hub that already has history (no merge base) treats every
+	// local-only file as an addition. That is the fleet bootstrap and it is intentional -
+	// but a file the hub's history DELETED is not an addition, it is a resurrection: a
+	// replica whose history repo was recreated still holding older fact files would push
+	// back every fact the judge migrated away. Those paths are found once, here.
+	var hubDeleted map[string]bool
+	if !hasBase {
+		hubDeleted, err = gitx.DeletedPaths(ctx, e.opt(), theirs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	paths := auditPaths(trees, baseTree, oursTree, theirsTree, mt)
+	// merge-tree adds a local-only file to the merged tree without a conflict, so the audit
+	// does not list it; the hub-deleted ones are added to the audit by hand.
+	for p := range hubDeleted {
+		_, inOurs := trees[oursTree][p]
+		_, inTheirs := trees[theirsTree][p]
+		if inOurs && !inTheirs {
+			paths = appendUnique(paths, p)
+		}
+	}
 	// The shared state stamp is reduced with MIN whatever git made of it: git's own
 	// three-way would happily take "the side that changed it", which is not the same
 	// answer as "the earliest crossing".
@@ -227,6 +257,20 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 		theirSide, err := load(theirsTree, p)
 		if err != nil {
 			return nil, err
+		}
+		if !hasBase && ourSide.present && !theirSide.present && !baseSide.present &&
+			workspaceOf(p) != "" && hubDeleted[p] {
+			// Quarantine: report it, keep it out of the merge and out of the hub, and set
+			// the bytes aside first - nothing is lost, and nothing is pushed.
+			if err := e.quarantine(p, ourSide.data, ro.Materialize); err != nil {
+				return nil, err
+			}
+			rep.Resurrected = append(rep.Resurrected, p)
+			rep.Quarantined = append(rep.Quarantined, p)
+			if _, inMerged := trees[mt.Tree][p]; inMerged {
+				changes = append(changes, gitx.IndexChange{Path: p})
+			}
+			continue
 		}
 		oc, hasOC := oursTimes[p]
 		tc, hasTC := theirsTimes[p]
@@ -288,6 +332,27 @@ func (e *Engine) Round(ctx context.Context, ro RoundOptions) (*Report, error) {
 	}
 	rep.Commit, rep.MergedTree = commit, newTree
 	return rep, e.applyMaterialize(ctx, rep, oursTree, newTree, ro.Materialize)
+}
+
+// QuarantineDir is where a first sync sets aside the local copies of facts the hub had
+// already deleted, under the state root and outside every store.
+const QuarantineDir = "quarantine"
+
+// quarantine writes a local-only file's bytes under <state root>/quarantine/<rel>. With no
+// state root configured (a fixture) there is nowhere to put them and the file is still kept
+// out of the merge: the deletion that follows lands in local history, which holds the bytes.
+func (e *Engine) quarantine(rel string, data []byte, mo MaterializeOptions) error {
+	if mo.StateRoot == "" {
+		return nil
+	}
+	dest := filepath.Join(mo.StateRoot, QuarantineDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("quarantine %s: %w", rel, err)
+	}
+	if err := atomic.WriteBytes(dest, data); err != nil {
+		return fmt.Errorf("quarantine %s: %w", rel, err)
+	}
+	return nil
 }
 
 func (e *Engine) applyMaterialize(ctx context.Context, rep *Report, prevTree, newTree string, mo MaterializeOptions) error {

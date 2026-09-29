@@ -347,10 +347,17 @@ func reportToResult(rep *merge.Report) amsync.MergeResult {
 		UpToDate:     rep.Commit == "" && !rep.FastForward,
 		Materialized: append(append([]string(nil), rep.Materialized...), rep.Deleted...),
 	}
+	quarantined := map[string]bool{}
+	for _, p := range rep.Quarantined {
+		quarantined[p] = true
+	}
+	out.Quarantined = rep.Quarantined
 	for _, p := range rep.Resurrected {
-		out.Resurrected = append(out.Resurrected, amsync.Resurrection{
-			Path: p, Side: "ours", Reason: "modified here, deleted there",
-		})
+		reason := "modified here, deleted there"
+		if quarantined[p] {
+			reason = "first join: deleted in the hub's history, quarantined and not pushed"
+		}
+		out.Resurrected = append(out.Resurrected, amsync.Resurrection{Path: p, Side: "ours", Reason: reason})
 	}
 	for _, c := range rep.Conflicts {
 		out.ConflictsInHistory = append(out.ConflictsInHistory, amsync.ConflictRef{

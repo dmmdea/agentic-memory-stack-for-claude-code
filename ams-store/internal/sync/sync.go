@@ -261,6 +261,9 @@ func Once(ctx context.Context, opt Options) Result {
 				res.Receipt.Resurrected = append(res.Receipt.Resurrected, r.Path)
 			}
 			res.Receipt.ConflictsInHistory = append(res.Receipt.ConflictsInHistory, merged.ConflictsInHistory...)
+			if n := len(merged.Quarantined); n > 0 {
+				res.Receipt.Note = fmt.Sprintf("first join: %d local-only fact file(s) the hub's history had deleted were quarantined and not pushed", n)
+			}
 			for _, d := range merged.Deferred {
 				res.Receipt.Deferred = append(res.Receipt.Deferred, DeferredRef{Path: d.Path, Op: d.Op})
 			}
