@@ -212,7 +212,7 @@ def test_no_other_file_writes_stack_env():
 # --- the sourcing consumers, and the legacy line as a negative control -----------------------
 
 SOURCERS = ["scripts/wsl/deploy.sh", "claude-config/storage-cap-check.sh",
-            "scripts/wsl/stack-backup-manifest.sh", "scripts/wsl/ensure-codex-shim.sh"]
+            "scripts/wsl/ensure-codex-shim.sh"]
 
 
 def test_the_sourcing_consumers_are_the_ones_listed():
