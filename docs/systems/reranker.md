@@ -6,7 +6,7 @@
 
 `bge-reranker-base` is a cross-encoder reranking model from BAAI. It scores query-document pairs by joint attention (vs. the embedder's independent encoding), which catches semantic relevance that cosine similarity misses — especially for short, ambiguous queries.
 
-The model is already loaded in llama-swap's `always_loaded` persistent group on `127.0.0.1:11436`, consuming ~250MB VRAM at all times. No cold-start latency for reranking calls.
+The model is served by llama-swap in the non-exclusive support group on `127.0.0.1:11436` (ttl 300, every layer on the GPU), consuming ~250MB VRAM while loaded and unloading after 5 idle minutes. The first call after an idle unload pays a short cold start.
 
 Context window: 512 tokens. For memories well under the 1500-char limit, this is sufficient for full-text cross-encoding.
 
@@ -60,9 +60,9 @@ The search response is identical in shape whether reranking succeeded or failed;
 | Context | 512 tokens | 8192 tokens |
 | VRAM (Q4_K_M GGUF) | ~250MB | ~419MB |
 | BEIR benchmark | Strong | Best-in-class small model |
-| Current status | `always_loaded` persistent | On disk; TTL-load only |
+| Current status | support group, ttl 300 | On disk; TTL-load only |
 
-Decision for v0.13: keep base in `always_loaded`. The 250MB persistent cost is already paid; adding v2-m3 at ~419MB would push the always-loaded group close to the 700MB practical limit on the Mobile RTX 3070 (8GB VRAM shared with other always-loaded models). Re-evaluate after Phase C re-extraction lands and retrieval quality can be measured empirically with a blind eval set.
+Decision for v0.13: keep base in the support group. Adding v2-m3 at ~419MB would push the support group close to the 700MB practical limit on the Mobile RTX 3070 (8GB VRAM shared with the other support models). Re-evaluate after Phase C re-extraction lands and retrieval quality can be measured empirically with a blind eval set.
 
 ## W5 (ADOPT-2/AMS-56): rerank_status, force, and the union-leg contract
 
