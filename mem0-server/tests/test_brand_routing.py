@@ -88,3 +88,15 @@ def test_routable_brands():
           "shared_brands": ["shared-a"]}
     assert brand_routing.routable_brands(bm) == {"brand-a", "brand-b", "shared-a"}
     assert brand_routing.routable_brands({}) == set()
+
+
+def test_separator_class_pattern_compiles_without_a_regex_warning():
+    """A pattern spelling the separator class `[\\/ -]` normalizes to a class of dashes; that must
+    not reach re.compile as `[----]` (a FutureWarning today, an error in a later Python)."""
+    import warnings
+    m = {"rules": [{"pattern": "alpha[\\/ -]+shop", "brand": "alpha"}]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert brand_routing.resolve(m, r"C:\Work\alpha shop\x") == "alpha"
+        assert brand_routing.resolve(m, "C--Work-alpha-shop") == "alpha"
+        assert brand_routing.resolve(m, "C--Work-alphashop") is None

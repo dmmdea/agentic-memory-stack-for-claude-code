@@ -53,8 +53,14 @@ def norm_path(path: Optional[str]) -> str:
     return _PATH_SEP.sub("-", path or "")
 
 
+_CLASS = re.compile(r"\[[^\]]*\]")
+
+
 def norm_pattern(pattern: str) -> str:
-    return _PATTERN_SEP.sub("-", pattern)
+    out = _PATTERN_SEP.sub("-", pattern)
+    # A separator class such as [\\/ -] becomes [----] here; Python warns on that ("possible set
+    # difference") and a later release will reject it, so a run of dashes inside a class is one dash.
+    return _CLASS.sub(lambda m: re.sub(r"-{2,}", "-", m.group(0)), out)
 
 
 def _matches(pattern, haystack: str, *, is_path: bool) -> bool:
