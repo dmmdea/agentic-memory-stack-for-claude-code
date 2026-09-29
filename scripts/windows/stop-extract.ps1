@@ -21,12 +21,14 @@ if (-not (Test-Path $Worker)) { exit 0 }
 # Primary: read hook event JSON from stdin (Claude Code's actual delivery mechanism)
 $trans = $null
 $evt = $null
+$sessionId = $null
 try {
     $stdinRaw = [Console]::In.ReadToEnd()
     if ($stdinRaw) {
         $hookEvent = $stdinRaw | ConvertFrom-Json -ErrorAction Stop
         $trans = $hookEvent.transcript_path
         $evt   = $hookEvent.hook_event_name
+        $sessionId = $hookEvent.session_id
         # v0.17 F.3.3: save payload fixture for hook contract regression corpus (v0.18 MED-14: 1-in-10 sampling)
         # v0.19 L13: write $stdinRaw bytes VERBATIM (no JSON round-trip that normalizes
         # key order/escapes and silently truncates at -Depth 16; no Out-File BOM) —
@@ -92,10 +94,25 @@ if ($evt -eq 'PreCompact') {
 }
 
 # For PreCompact, snapshot the transcript before it gets mutated by compaction
+# The worker derives the episode's session id from the transcript file NAME, and the snapshot's name
+# is not a session (precompact-snap-<PID>): every compaction posted its episode under a phantom
+# session with no workspace or brand. So the hook's real session id, and the original transcript path
+# (workspace/brand are read from it), travel beside the snapshot.
+$originTrans = $null
 if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
     $snap = Join-Path $TempDirPath "precompact-snap-$PID.jsonl"
     Copy-Item -Path $trans -Destination $snap -ErrorAction SilentlyContinue
-    if (Test-Path $snap) { $trans = $snap }
+    if (Test-Path $snap) { $originTrans = $trans; $trans = $snap }
+}
+# Only a plain token goes on a command line; anything else is dropped and the worker falls back to
+# the file name, as before.
+if ($sessionId -isnot [string] -or $sessionId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { $sessionId = $null }
+$sidArgs = @()
+if ($sessionId) { $sidArgs += @('-SessionId', $sessionId) }
+$originArgsUnix = @(); $originArgsWin = @()
+if ($originTrans) {
+    $originArgsUnix = @('-OriginTranscriptPath', $originTrans)
+    $originArgsWin  = @('-OriginTranscriptPath', "`"$originTrans`"")
 }
 
 # Spawn detached - claude.cmd auth works in this context on Windows (verified). On Unix there is
@@ -104,20 +121,20 @@ if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
 if ($IsUnixHost) {
     try {
         Start-Process -FilePath 'pwsh' `
-            -ArgumentList '-NoProfile','-File',$Worker,'-TranscriptPath',$trans,'-EventName',$evt `
+            -ArgumentList (@('-NoProfile','-File',$Worker,'-TranscriptPath',$trans,'-EventName',$evt) + $sidArgs + $originArgsUnix) `
             -ErrorAction SilentlyContinue | Out-Null
     } catch { }
 } else {
     try {
         Start-Process -FilePath 'pwsh.exe' `
-            -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt `
+            -ArgumentList (@('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt) + $sidArgs + $originArgsWin) `
             -WindowStyle Hidden `
             -ErrorAction SilentlyContinue | Out-Null
     } catch {
         # If pwsh.exe missing, fall back to powershell.exe (Windows PS 5.1)
         try {
             Start-Process -FilePath 'powershell.exe' `
-                -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt `
+                -ArgumentList (@('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt) + $sidArgs + $originArgsWin) `
                 -WindowStyle Hidden `
                 -ErrorAction SilentlyContinue | Out-Null
         } catch { }
