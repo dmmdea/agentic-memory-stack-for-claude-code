@@ -13,13 +13,22 @@ BACKUP_DIR="$HOME/.mem0/backups"
 MANIFEST="$BACKUP_DIR/manifest-$TS.json"
 # DR fix (2026-06-20): count the LIVE collection, not the frozen pre-egemma "memories".
 QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
+QDRANT_URL="${MEM0_QDRANT_URL:-http://127.0.0.1:6333}"
+
+# stack.env is read BY KEY, never sourced: it is operator-edited, and an unquoted value with a
+# space made bash execute the second word (set -e then killed this writer on the 09-21 and
+# 09-22 nights, leaving those sets without a manifest).
+stack_env_get() {
+    [ -f "$HOME/.mem0/stack.env" ] || return 0
+    { grep -m1 "^$1=" "$HOME/.mem0/stack.env" || true; } | cut -d= -f2- | tr -d '\r' | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
 
 # ---------------------------------------------------------------------------
 # 1. Qdrant points count from live state at backup time
 # ---------------------------------------------------------------------------
 
 QDRANT_POINTS=0
-qdrant_raw=$(curl -fsS "http://127.0.0.1:6333/collections/$QDRANT_COLLECTION" 2>/dev/null || true)
+qdrant_raw=$(curl -fsS "$QDRANT_URL/collections/$QDRANT_COLLECTION" 2>/dev/null || true)
 if [ -n "$qdrant_raw" ]; then
     QDRANT_POINTS=$(echo "$qdrant_raw" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('points_count',0))" \
@@ -73,16 +82,35 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Git SHA from the agentic-memory-stack repo
+# 3. Release stamp of the DEPLOYED tree: VERSION and DEPLOYED_SHA beside the server modules
 # ---------------------------------------------------------------------------
+# The brain has no .git: deploy.sh stamps VERSION and DEPLOYED_SHA into the app dir, so those
+# two files ARE the deployed release. (A hard-coded "v0.17" and an "unknown" sha sat in every
+# manifest for months.) A checkout with a .git is only the fallback for the sha.
 
+APP_DIR="${MEM0_APP_DIR:-$HOME/apps/mem0-server}"
+APP_VERSION="unknown"
+if [ -s "$APP_DIR/VERSION" ]; then
+    v=$(head -n1 "$APP_DIR/VERSION" | tr -d '[:space:]')
+    case "$v" in
+        ""|*[!0-9A-Za-z._+-]*) ;;
+        *) APP_VERSION="v${v#v}" ;;
+    esac
+fi
 GIT_SHA="unknown"
-# v1.0 Phase 7A: resolve the repo from the operator receipt (~/.mem0/stack.env),
-# falling back to this script's own location — never hardcode a developer repo path.
-[ -f "$HOME/.mem0/stack.env" ] && . "$HOME/.mem0/stack.env"
-REPO="${MEM0_REPO_ROOT_WSL:-$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)}"
-if [ -n "$REPO" ] && [ -d "$REPO/.git" ]; then
-    GIT_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+if [ -s "$APP_DIR/DEPLOYED_SHA" ]; then
+    sha=$(head -n1 "$APP_DIR/DEPLOYED_SHA" | tr -d '[:space:]')
+    case "$sha" in
+        ""|*[!0-9a-f]*) ;;
+        *) GIT_SHA="$sha" ;;
+    esac
+fi
+if [ "$GIT_SHA" = "unknown" ]; then
+    REPO="${MEM0_REPO_ROOT_WSL:-$(stack_env_get MEM0_REPO_ROOT_WSL)}"
+    [ -n "$REPO" ] || REPO="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)"
+    if [ -n "$REPO" ] && [ -d "$REPO/.git" ]; then
+        GIT_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -111,7 +139,7 @@ cat > "$MANIFEST.tmp" <<EOF
 {
   "ts": "$TS_ISO",
   "backup_ts_raw": "$TS",
-  "app_version": "v0.17",
+  "app_version": "$APP_VERSION",
   "schema_version": "$SCHEMA_VERSION",
   "git_sha": "$GIT_SHA",
   "files": {
@@ -125,9 +153,12 @@ cat > "$MANIFEST.tmp" <<EOF
     "l10_flags": $(mf "l10-flags-$TS.jsonl"),
     "l10_state": $(mf "l10-state-$TS.json"),
     "promote_review": $(mf "promote-review-$TS.jsonl"),
-    "stale_worksheet": $(mf "stale-worksheet-$TS.jsonl")
+    "stale_worksheet": $(mf "stale-worksheet-$TS.jsonl"),
+    "qdrant_episodes": $(mf "qcol-episodes-$TS.snapshot"),
+    "qdrant_entities": $(mf "qcol-entities-$TS.snapshot"),
+    "qdrant_wiki": $(mf "qcol-wiki-$TS.snapshot")
   },
-  "deliberately_excluded": "pair-verdict-cache.db (TTL'd rebuildable cache), jobs.db (transient queue), canonical-replay.jsonl (anti-replay nonce ledger; signed tokens carry a 300s skew gate and the ledger GCs at 600s, so a lost ledger reopens at most a 10-minute window), telemetry ledgers (retrieval-log, admission-rejected, receipts) - see docs/data-backup.md",
+  "deliberately_excluded": "pair-verdict-cache.db (TTL'd rebuildable cache), jobs.db (transient queue), canonical-replay.jsonl (anti-replay nonce ledger; signed tokens carry a 300s skew gate and the ledger GCs at 600s, so a lost ledger reopens at most a 10-minute window), telemetry ledgers (retrieval-log, admission-rejected, receipts). The three secondary Qdrant collections (episodes, entities, wiki) are snapshotted into the set when present; if one is missing, rebuild episodes with episode-embed-backfill.py (from episodic.db) and wiki with wiki-index-build.py - entities is written by the mem0 library and has no rebuild path, its snapshot is the only copy. See docs/data-backup.md",
   "counts": {
     "qdrant_points": $QDRANT_POINTS,
     "episodic_sessions": $EPISODIC_SESSIONS,
@@ -137,6 +168,26 @@ cat > "$MANIFEST.tmp" <<EOF
   }
 }
 EOF
+# Per-file size + sha256 (bit-rot is otherwise detectable only by sqlite/tar checks). Kept in a
+# separate `checksums` map keyed by file name so `files` stays name-only for stack-restore.
+python3 - "$BACKUP_DIR" "$MANIFEST.tmp" <<'PYSUMS'
+import hashlib, json, os, sys
+backup_dir, path = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    m = json.load(fh)
+sums = {}
+for name in (v for v in m["files"].values() if isinstance(v, str)):
+    full = os.path.join(backup_dir, name)
+    h = hashlib.sha256()
+    with open(full, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    sums[name] = {"size": os.path.getsize(full), "sha256": h.hexdigest()}
+m["checksums"] = sums
+with open(path, "w") as fh:
+    json.dump(m, fh, indent=2)
+    fh.write("\n")
+PYSUMS
 # Refuse to publish a manifest that does not parse (a malformed manifest is worse
 # than none — stack-restore trusts it).
 python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$MANIFEST.tmp" || {
