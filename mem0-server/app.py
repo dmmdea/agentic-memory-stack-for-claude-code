@@ -2226,16 +2226,33 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             "audit ledger unavailable (intent append failed); tier change refused "
             f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
         )
+    class _TierRaced(Exception):
+        """The record became canonical between the gate's read and this write."""
+
     try:
         # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
         # without this, a promotion landing inside the PUT window was silently
         # demoted by the PUT's stale-tier upsert (store and ledger disagreed).
         with _mid_write_lock(mid):
+            # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
+            # between would let this unsigned change move a record that is canonical NOW, so a
+            # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            if b.tier != "canonical" and current_tier != "canonical":
+                if fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid) == "canonical":
+                    raise _TierRaced()
             mem.vector_store.client.set_payload(
                 collection_name=mem.vector_store.collection_name,
                 payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
                 points=[mid],
             )
+    except _TierRaced:
+        raise HTTPException(409, (
+            "the record became canonical while this tier change was in flight; retry. "
+            "Moving it out of canonical needs the signed 'demote' token "
+            "(mem0-canonize.sh --action demote)."
+        ))
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("tier-update failed")
         raise _upstream_error(e)
