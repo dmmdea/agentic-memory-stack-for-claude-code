@@ -41,8 +41,6 @@ from _test_cleanup import delete_memory  # noqa: E402
 
 CANONICAL_KEY: Optional[str] = CanonicalKeyProvider().get_key()
 
-REPLAY_STORE = Path.home() / ".mem0" / "canonical-replay.jsonl"
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,7 +94,7 @@ def _get_episodic_db_path() -> Path:
 # H2/H7 — concurrent nonce writes
 # ---------------------------------------------------------------------------
 
-def test_h2_h7_concurrent_nonce_writes_no_loss():
+def test_h2_h7_concurrent_nonce_writes_no_loss(tmp_path, monkeypatch):
     """H2/H7: 50 concurrent threads with distinct nonces all land in the replay store.
 
     Each thread calls _check_and_record_nonce with a unique nonce. After all threads
@@ -106,67 +104,61 @@ def test_h2_h7_concurrent_nonce_writes_no_loss():
     import sys
     # Import the module directly (not via HTTP) for unit-level testing
     sys.path.insert(0, str(Path(__file__).parent.parent))
-    from security_invariants import _check_and_record_nonce, REPLAY_STORE
+    import security_invariants
+    from security_invariants import _check_and_record_nonce
 
-    # Save original store content and restore after test
-    orig_content = REPLAY_STORE.read_text(encoding="utf-8") if REPLAY_STORE.exists() else None
+    # The server module's own nonce store lives under the real ~/.mem0; truncating it (even with a
+    # restore) opens the replay window on a box running the live server. Point the module at a
+    # scratch file for the duration of the test instead.
+    REPLAY_STORE = tmp_path / "canonical-replay.jsonl"
+    monkeypatch.setattr(security_invariants, "REPLAY_STORE", REPLAY_STORE)
 
-    try:
-        # Clear the store for a clean test
-        REPLAY_STORE.parent.mkdir(parents=True, exist_ok=True)
-        REPLAY_STORE.write_text("", encoding="utf-8")
+    REPLAY_STORE.write_text("", encoding="utf-8")
 
-        ts_base = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        nonces = [f"test-concurrent-{i}-{uuid.uuid4()}" for i in range(50)]
-        results = []
-        errors = []
+    ts_base = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    nonces = [f"test-concurrent-{i}-{uuid.uuid4()}" for i in range(50)]
+    results = []
+    errors = []
 
-        def worker(nonce: str) -> None:
-            try:
-                r = _check_and_record_nonce(nonce, ts_base)
-                results.append((nonce, r))
-            except Exception as e:
-                errors.append((nonce, str(e)))
+    def worker(nonce: str) -> None:
+        try:
+            r = _check_and_record_nonce(nonce, ts_base)
+            results.append((nonce, r))
+        except Exception as e:
+            errors.append((nonce, str(e)))
 
-        threads = [threading.Thread(target=worker, args=(n,)) for n in nonces]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+    threads = [threading.Thread(target=worker, args=(n,)) for n in nonces]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-        assert not errors, f"Errors during concurrent nonce writes: {errors}"
+    assert not errors, f"Errors during concurrent nonce writes: {errors}"
 
-        # All 50 should have returned True (fresh nonce)
-        true_results = [r for _, r in results if r]
-        assert len(true_results) == 50, (
-            f"Expected all 50 nonces accepted as fresh; got {len(true_results)} accepted, "
-            f"{50 - len(true_results)} rejected (indicating a race or truncation loss)"
-        )
+    # All 50 should have returned True (fresh nonce)
+    true_results = [r for _, r in results if r]
+    assert len(true_results) == 50, (
+        f"Expected all 50 nonces accepted as fresh; got {len(true_results)} accepted, "
+        f"{50 - len(true_results)} rejected (indicating a race or truncation loss)"
+    )
 
-        # All 50 nonces must be present in the store
-        store_content = REPLAY_STORE.read_text(encoding="utf-8")
-        stored_nonces = set()
-        for line in store_content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                stored_nonces.add(entry.get("nonce", ""))
-            except Exception:
-                continue
+    # All 50 nonces must be present in the store
+    store_content = REPLAY_STORE.read_text(encoding="utf-8")
+    stored_nonces = set()
+    for line in store_content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            stored_nonces.add(entry.get("nonce", ""))
+        except Exception:
+            continue
 
-        missing = set(nonces) - stored_nonces
-        assert not missing, (
-            f"H2/H7: {len(missing)} nonces lost from replay store (truncation race): {list(missing)[:5]}"
-        )
-
-    finally:
-        # Restore original store content
-        if orig_content is not None:
-            REPLAY_STORE.write_text(orig_content, encoding="utf-8")
-        else:
-            REPLAY_STORE.unlink(missing_ok=True)
+    missing = set(nonces) - stored_nonces
+    assert not missing, (
+        f"H2/H7: {len(missing)} nonces lost from replay store (truncation race): {list(missing)[:5]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +273,7 @@ def test_h5_fetch_current_tier_fail_closed_when_tier_missing():
 
     # Build a mock Qdrant client that returns a point with no tier field in payload
     mock_record = MagicMock()
-    mock_record.payload = {"memory": "some text", "user_id": "test"}  # no 'tier' key
+    mock_record.payload = {"memory": "some text", "user_id": "test-h"}  # no 'tier' key
     mock_record.id = str(uuid.uuid4())
 
     mock_client = MagicMock()

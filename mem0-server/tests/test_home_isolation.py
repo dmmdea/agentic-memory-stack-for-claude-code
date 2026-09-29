@@ -100,3 +100,24 @@ def test_no_suite_redirects_HOME_alone():
     lives outside this directory. Scans mem0-server/tests, claude-config/tests and scripts/wsl."""
     offenders = _home_only_offenders()
     assert not offenders, f"HOME-only redirect (use tests/_home_isolation.py): {offenders}"
+
+
+def test_h2_h7_replay_store_test_never_touches_the_real_replay_store(tmp_path):
+    """test_h_fixes' H2/H7 test used to truncate and rewrite the server module's own
+    ~/.mem0/canonical-replay.jsonl (opening the replay window on a box with a live server).
+    Run it in a child whose home holds a DIRECTORY at that path: any write to the real store
+    path fails, so the test can only pass by redirecting REPLAY_STORE to a scratch file."""
+    home = tmp_path / "home"
+    (home / ".mem0" / "canonical-replay.jsonl").mkdir(parents=True)
+    env = home_env(home)
+    env.pop("MEM0_URL", None)
+    env["MEM0_KEY"] = "not-a-real-key"
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(HERE / "test_h_fixes.py") + "::test_h2_h7_concurrent_nonce_writes_no_loss"],
+        capture_output=True, text=True, env=env, timeout=180, cwd=str(tmp_path),
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "1 passed" in out, out
+    assert (home / ".mem0" / "canonical-replay.jsonl").is_dir(), "the real store path was replaced"

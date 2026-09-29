@@ -9,8 +9,10 @@ from. Not exporting MEM0_URL used to be the only protection. This module is the 
                       out loud that it means it (AMS_ALLOW_LIVE_PROD_TESTS=1);
   * a tenant check  - the suites write under `test-*` tenants only, never the stack's own
                       tenant (MEM0_DEFAULT_USER_ID, stack.env, or the login user the systemd
-                      unit substitutes), and a request carrying that tenant is refused
-                      before it leaves the process.
+                      unit substitutes). Per request to the target: a user_id that is the
+                      stack's tenant or does not start with `test-` is refused, and so is an
+                      add with no user_id (server default tenant), all before the request
+                      leaves the process. Reads and by-id calls that carry no tenant pass.
 
 conftest.py runs the target check at session start (before collection imports a single suite)
 and again from a session-scoped autouse fixture, and wraps httpx so the tenant check applies to
@@ -173,18 +175,28 @@ def _user_ids(node: object) -> Iterator[str]:
             yield from _user_ids(v)
 
 
-def check_request(url: str, body: Optional[bytes], env: Optional[Mapping[str, str]] = None) -> None:
-    """Refuse a request to the live target that carries the stack's own tenant. Runs before the
-    request is sent; requests to anything else (mock transports, fixtures) are not judged."""
+_ADD_PATHS = ("/v1/memories", "/memories")
+
+
+def check_request(url: str, body: Optional[bytes], env: Optional[Mapping[str, str]] = None,
+                  method: str = "GET") -> None:
+    """Refuse, before it is sent, a request to the live target that is not confined to a test
+    tenant: one carrying the stack's own tenant, one carrying any user_id that is not `test-*`,
+    and an add (POST /v1/memories) carrying no user_id at all (it would land in the server's
+    default tenant, which on a brain is the operator's). Requests to anything else (mock
+    transports, fixtures) are not judged. Other calls without a user_id (health, by-id reads,
+    deletes, tier patches, diagnose) are legitimate and pass: the tenant is not on the wire."""
     e = _env(env)
     target = urlsplit(target_url(e))
     req = urlsplit(url)
     if (req.hostname, req.port) != (target.hostname, target.port):
         return
     seen = [v for k, v in parse_qsl(req.query) if k == "user_id"]
+    parsed: object = None
     if body:
         try:
-            seen.extend(_user_ids(json.loads(body)))
+            parsed = json.loads(body)
+            seen.extend(_user_ids(parsed))
         except (ValueError, UnicodeDecodeError):
             pass
     tenants = stack_tenants(e)
@@ -194,6 +206,17 @@ def check_request(url: str, body: Optional[bytes], env: Optional[Mapping[str, st
                 f"refusing a request carrying user_id {uid!r}: that is the stack's own tenant, "
                 f"and a live suite must only touch {TEST_PREFIX}* tenants"
             )
+        if not uid.startswith(TEST_PREFIX):
+            raise LiveGuardRefused(
+                f"refusing a request carrying user_id {uid!r}: a live suite must only touch "
+                f"{TEST_PREFIX}* tenants"
+            )
+    if (not seen and method.upper() == "POST" and isinstance(parsed, dict)
+            and req.path.rstrip("/") in _ADD_PATHS):
+        raise LiveGuardRefused(
+            f"refusing an add with no user_id: it would land in the server's default tenant; "
+            f"a live suite must name a {TEST_PREFIX}* tenant (live_test_tenant())"
+        )
 
 
 @contextlib.contextmanager
@@ -207,7 +230,14 @@ def request_guard() -> Iterator[None]:
     original = httpx.Client.send
 
     def guarded(self, request, *args, **kwargs):
-        check_request(str(request.url), request.content)
+        # A streamed body is not readable here (RequestNotRead); the tenant then rides in the
+        # URL or not at all, so judge the URL only. httpx.AsyncClient is not wrapped: no live
+        # suite uses it.
+        try:
+            body = request.content
+        except httpx.RequestNotRead:
+            body = None
+        check_request(str(request.url), body, method=request.method)
         return original(self, request, *args, **kwargs)
 
     httpx.Client.send = guarded

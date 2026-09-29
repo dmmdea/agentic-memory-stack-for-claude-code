@@ -145,6 +145,79 @@ def test_request_with_a_test_tenant_or_another_host_is_left_alone(tmp_path):
     guard.check_request("http://127.0.0.1:18791/x", b"not json", env)
 
 
+_LITERAL_TENANT = re.compile(r"""["']user_id["']\s*:\s*["'](?!test-)([\w-]*)["']""")
+_LIVE_SUITE = re.compile(r"""=\s*os\.environ\.get\(\s*["']MEM0_URL["']""")
+
+
+def test_no_live_suite_hard_codes_a_tenant_outside_test_prefix():
+    """check_request refuses a present user_id that is not test-*, so a live suite carrying a
+    literal like "test" or "u" would be refused at run time; catch it here, headlessly."""
+    offenders = []
+    for path in sorted(HERE.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        if not _LIVE_SUITE.search(text):
+            continue
+        for m in _LITERAL_TENANT.finditer(text):
+            offenders.append(f"{path.name}:{text.count(chr(10), 0, m.start()) + 1} {m.group(1)!r}")
+    assert not offenders, f"live suites with a non-test-* tenant literal: {offenders}"
+
+
+@pytest.mark.parametrize("body", [
+    {"messages": "x", "user_id": "test"},
+    {"messages": "x", "user_id": "u"},
+    {"query": "x", "filters": {"user_id": "someone-else"}},
+    {"a": [{"metadata": {"user_id": "Test-upper"}}]},
+    {"messages": "x", "user_id": ""},
+])
+def test_request_under_a_non_test_tenant_is_refused(tmp_path, body):
+    env = _env(tmp_path, MEM0_URL="http://127.0.0.1:18791")
+    with pytest.raises(guard.LiveGuardRefused, match="test-"):
+        guard.check_request("http://127.0.0.1:18791/v1/memories", json.dumps(body).encode(), env)
+
+
+def test_query_string_tenant_must_also_be_a_test_tenant(tmp_path):
+    env = _env(tmp_path, MEM0_URL="http://127.0.0.1:18791")
+    guard.check_request("http://127.0.0.1:18791/v1/memories?user_id=test-inv&limit=5", None, env)
+    with pytest.raises(guard.LiveGuardRefused, match="test-"):
+        guard.check_request("http://127.0.0.1:18791/v1/memories?user_id=somebody", None, env)
+
+
+@pytest.mark.parametrize("path", ["/v1/memories", "/memories", "/v1/memories/"])
+def test_an_add_without_a_tenant_is_refused(tmp_path, path):
+    """POST /v1/memories with no user_id lands in the SERVER's default tenant, which on a brain
+    is the operator's namespace - the exact debris this guard exists to prevent."""
+    env = _env(tmp_path, MEM0_URL="http://127.0.0.1:18791")
+    with pytest.raises(guard.LiveGuardRefused, match="no user_id"):
+        guard.check_request("http://127.0.0.1:18791" + path, b'{"messages": "x"}', env, method="POST")
+    guard.check_request("http://127.0.0.1:18791" + path, b'{"messages": "x", "user_id": "test-inv"}',
+                        env, method="POST")
+
+
+def test_requests_that_carry_no_tenant_by_design_are_left_alone(tmp_path):
+    """Reads, by-id calls and other endpoints legitimately omit user_id; only the add is judged."""
+    env = _env(tmp_path, MEM0_URL="http://127.0.0.1:18791")
+    base = "http://127.0.0.1:18791"
+    guard.check_request(base + "/health", None, env, method="GET")
+    guard.check_request(base + "/v1/memories/abc-123", None, env, method="GET")
+    guard.check_request(base + "/v1/memories/abc-123", None, env, method="DELETE")
+    guard.check_request(base + "/v1/memories/abc-123/tier", b'{"tier": "insight"}', env, method="PATCH")
+    guard.check_request(base + "/v1/memories/diagnose", b'{"query": "q"}', env, method="POST")
+    guard.check_request(base + "/v1/memories", None, env, method="GET")
+
+
+def test_a_streamed_body_is_not_a_crash_and_other_hosts_are_not_read(monkeypatch, tmp_path):
+    httpx = pytest.importorskip("httpx")
+    for k, v in _env(tmp_path, MEM0_URL="http://127.0.0.1:18791").items():
+        monkeypatch.setenv(k, v)
+    sent = []
+    transport = httpx.MockTransport(lambda req: (sent.append(req), httpx.Response(200))[1])
+    with guard.request_guard():
+        with httpx.Client(transport=transport) as c:
+            req = c.build_request("POST", "http://other.invalid/upload", content=iter([b"a", b"b"]))
+            c.send(req)
+    assert len(sent) == 1
+
+
 def test_request_guard_wraps_httpx_send_and_restores_it(monkeypatch, tmp_path):
     httpx = pytest.importorskip("httpx")
     for k, v in _env(tmp_path, MEM0_URL="http://127.0.0.1:18791").items():

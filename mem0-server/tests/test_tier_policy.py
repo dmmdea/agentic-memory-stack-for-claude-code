@@ -119,7 +119,7 @@ def test_post_memory_canonical_message_includes_canonize_hint():
     """v0.16.1: rejection message tells caller what to do instead of just NO."""
     r = httpx.post(f"{URL}/v1/memories", json={
         "messages": "test canonical hint",
-        "user_id": "test",
+        "user_id": "test-tier",
         "infer": False,
         "metadata": {"tier": "canonical"},
     }, headers=H, timeout=10)
@@ -132,7 +132,7 @@ def test_post_memory_insight_message_includes_dream_hint():
     """v0.16.1: insight rejection points at dream consolidator workflow."""
     r = httpx.post(f"{URL}/v1/memories", json={
         "messages": "test insight hint",
-        "user_id": "test",
+        "user_id": "test-tier",
         "infer": False,
         "metadata": {"tier": "insight", "source": "manual-user"},
     }, headers=H, timeout=10)
