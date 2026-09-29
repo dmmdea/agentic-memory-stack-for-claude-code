@@ -598,6 +598,9 @@ _WINPROFILE=""
 case "${BASH_SOURCE[0]:-}" in
   /mnt/c/Users/*) _WINPROFILE="$(echo "${BASH_SOURCE[0]}" | sed -E 's#^(/mnt/c/Users/[^/]+)/.*#\1#')" ;;
 esac
+# Test seam: honoured only when set. The tests run this script from the repo path, never from
+# /mnt/c/Users/*, so without it the morning-summary counter (and its role gate) is unreachable.
+[ -n "${AMS_WINPROFILE_OVERRIDE:-}" ] && _WINPROFILE="$AMS_WINPROFILE_OVERRIDE"
 if [ "$_ROLE" = brain ] && [ -n "$_WINPROFILE" ]; then
   _MS="$_WINPROFILE/.claude/state/dream/morning-summary.md"
   if [ -f "$_MS" ]; then

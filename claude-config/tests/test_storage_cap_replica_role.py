@@ -62,6 +62,7 @@ class Box:
         self.home = tmp / "home"
         self.fake = tmp / "fake"
         self.bin = tmp / "bin"
+        self.winprofile = tmp / "winprofile"
         for d in (self.home / ".mem0", self.fake, self.bin):
             d.mkdir(parents=True, exist_ok=True)
         (self.bin / "curl").write_text(FAKE_CURL)
@@ -90,6 +91,10 @@ class Box:
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "CLAUDE_CWD": "/tmp",
             "FAKE_DIR": str(self.fake),
+            # The morning-summary counter only runs when the script lives under /mnt/c/Users/*, which
+            # no repo-path test run does; this override (honoured by the script only when set) points
+            # it at the fixture profile so the role gate on that block is actually exercised.
+            "AMS_WINPROFILE_OVERRIDE": str(self.winprofile),
         }
         res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
         assert res.returncode == 0, f"script must always exit 0: {res.stderr}"
@@ -128,6 +133,11 @@ def _plant_brain_artifacts(home: Path) -> None:
     (m / "contradiction-sweep.jsonl").write_text(
         "".join('{"outcome": "no-op:codex-shim-unreachable"}\n' for _ in range(3)))
     (m / "stack.env").write_text("MEM0_REPO_ROOT_WSL=/nonexistent-repo\n")
+    # The Windows-profile morning-summary the counter reads: a section stamped "now", so a
+    # brain counts it and a replica must not.
+    ms = home.parent / "winprofile" / ".claude" / "state" / "dream" / "morning-summary.md"
+    ms.parent.mkdir(parents=True, exist_ok=True)
+    ms.write_text(f"## {time.strftime('%Y-%m-%d %H:%M')} dream\n- something to review\n")
     apps = home / "apps" / "mem0-scripts"
     apps.mkdir(parents=True, exist_ok=True)
     (apps / "ensure-codex-shim.sh").write_text(ENSURE_SHIM)
@@ -151,6 +161,7 @@ BRAIN_ONLY_MARKERS = [
     "contradiction verdict(s) await review",
     "contradiction sweep: 3+ consecutive no-op",
     "FROZEN-LOCAL-GOAL",
+    "morning-summary section(s)",
     "[heartbeat]",
     "[storage-cap]",
 ]
@@ -201,7 +212,7 @@ def test_brain_still_prints_its_artifacts_and_spawns_the_rejudge(tmp_path):
     out = box.run()
     for marker in ("MEMORY.md stale", "L10 audit-flags", "brand-scope:", "job-queue mirror STALE",
                    "contradiction verdict(s) await review", "contradiction sweep: 3+ consecutive no-op",
-                   "FROZEN-LOCAL-GOAL"):
+                   "morning-summary section(s) in last 48h", "FROZEN-LOCAL-GOAL"):
         assert marker in out, f"brain lost {marker!r}:\n{out}"
     assert _wait_for(box, "nohup"), box.calls()
 
