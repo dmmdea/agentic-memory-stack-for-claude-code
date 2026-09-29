@@ -41,7 +41,7 @@ def _stamp(tmp_path, payload, curl_exit=0):
 def test_green_night_prints_the_verdict_and_exits_zero(tmp_path):
     r, stamp = _stamp(tmp_path, BASE)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.splitlines()[0] == "health ok=True failed=- degraded=- pool 71.4% ONLINE"
+    assert r.stdout.splitlines()[-1] == "health ok=True failed=- degraded=- pool 71.4% ONLINE"
     assert json.loads(stamp.read_text(encoding="utf-8"))["ok"] is True
 
 
@@ -50,14 +50,14 @@ def test_failed_step_prints_and_turns_the_stamp_red(tmp_path):
              degraded_steps=[{"step": "dream", "ts": "t", "note": "posted-0-of-3"}])
     r, stamp = _stamp(tmp_path, p)
     assert r.returncode != 0, "a bad night must end the chain in a red step"
-    assert r.stdout.splitlines()[0] == "health ok=False failed=wiki-index,stack-backup degraded=dream pool 71.4% ONLINE"
+    assert r.stdout.splitlines()[-1] == "health ok=False failed=wiki-index,stack-backup degraded=dream pool 71.4% ONLINE"
     assert stamp.exists(), "the stamp file is written before the verdict exits (the morning summary and Gatus read it)"
 
 
 def test_degraded_pool_turns_the_stamp_red(tmp_path):
     p = dict(BASE, ok=False, pool=dict(BASE["pool"], health="DEGRADED", health_alarm=True))
     r, _ = _stamp(tmp_path, p)
-    assert r.returncode != 0 and r.stdout.splitlines()[0] == "health ok=False failed=- degraded=- pool 71.4% DEGRADED"
+    assert r.returncode != 0 and r.stdout.splitlines()[-1] == "health ok=False failed=- degraded=- pool 71.4% DEGRADED"
 
 
 def test_degraded_step_alone_is_reported_not_red(tmp_path):
@@ -71,7 +71,7 @@ def test_payload_from_an_older_server_still_prints(tmp_path):
     old = {"ok": True, "stale_steps": [], "pool": {"used_pct": 50.0}, "boots_7d": []}
     r, _ = _stamp(tmp_path, old)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.splitlines()[0] == "health ok=True failed=- degraded=- pool 50.0% unknown"
+    assert r.stdout.splitlines()[-1] == "health ok=True failed=- degraded=- pool 50.0% unknown"
 
 
 def test_curl_failure_is_still_a_failed_step(tmp_path):
@@ -121,3 +121,25 @@ def test_summary_marks_a_receipt_without_status_by_its_ok_flag(tmp_path):
     legacy = {"ts": "2099-01-01T08:00:00Z", "step": "dream", "ok": True, "exit": 0, "duration_ms": 5, "receipt_id": "x", "note": ""}
     t = _summary(tmp_path, [legacy])
     assert "- dream ok 5ms" in t
+
+
+def test_red_night_receipt_note_carries_the_verdict_line(tmp_path):
+    """Run through ams-step: the stamp exits 2 with empty stderr, so the receipt note is its LAST stdout line,
+    which must be the verdict (with the step names), not the legacy detail line."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    canned = tmp_path / "canned.json"
+    canned.write_text(json.dumps(dict(BASE, ok=False, failed_steps=[{"step": "wiki-index", "ts": "t", "note": "n"}])), encoding="utf-8")
+    fake = bindir / "curl"
+    fake.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n' f'cp "{canned}" "$out"\n', encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{os.environ['PATH']}")
+    env.pop("MEM0_URL", None)
+    r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), "health-stamp", BASH, str(SCRIPTS / "ams-health-stamp.sh")],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 2
+    row = json.loads((home / ".mem0" / "maintenance" / "receipts.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["ok"] is False and row["status"] == "failed"
+    assert row["note"] == "health ok=False failed=wiki-index degraded=- pool 71.4% ONLINE"
