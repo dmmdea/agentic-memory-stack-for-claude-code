@@ -164,6 +164,8 @@ type DeriveResult struct {
 	Changed     bool
 	BeforeBytes int
 	AfterBytes  int
+	// AfterLines is the index's line count after the pass, for the over-trigger clock.
+	AfterLines int
 	// Floored is how many hooks the convergence floor truncated.
 	Floored int
 	// Converged is AfterBytes < the sync limit.

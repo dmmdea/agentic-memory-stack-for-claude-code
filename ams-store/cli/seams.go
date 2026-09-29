@@ -213,6 +213,7 @@ func (d deriverAdapter) Derive(_ context.Context, opts amsync.DeriveOptions) (am
 		if res.AfterBytes != nil {
 			out.AfterBytes = *res.AfterBytes
 		}
+		out.AfterLines = resultLines(res.BeforeLines, res.AfterLines)
 		out.Floored = res.Floored
 		out.Converged = !res.Unconverged
 		out.OverInjectLimit = res.OverInjectLimit
@@ -500,13 +501,24 @@ func judgeRenderIndex(roots store.Roots, storeDir string, now time.Time) func([]
 //
 // A dry run never stamps: a rehearsal that started the clock would report a debt the
 // operator never incurred.
-func recordOverTrigger(roots store.Roots, workspace string, bytes int, dryRun bool, now time.Time, log io.Writer) {
+//
+// The store is over trigger on bytes OR lines (store.OverTrigger). Testing bytes alone left a
+// store past the 160-line trigger with no clock at all.
+func recordOverTrigger(roots store.Roots, workspace string, bytes, lines int, dryRun bool, now time.Time, log io.Writer) {
 	if dryRun || workspace == "" {
 		return
 	}
-	if _, err := lint.RecordOverTrigger(roots.ProjectsRoot, workspace, bytes >= store.TriggerBytes, now); err != nil && log != nil {
+	if _, err := lint.RecordOverTrigger(roots.ProjectsRoot, workspace, store.OverTrigger(bytes, lines), now); err != nil && log != nil {
 		fmt.Fprintf(log, "ams-store: over-trigger stamp for %s: %v\n", workspace, err)
 	}
+}
+
+// resultLines is resultBytes for the line count.
+func resultLines(before int, after *int) int {
+	if after != nil {
+		return *after
+	}
+	return before
 }
 
 // resultBytes is the size the clock is judged on: what the index IS after the run, or what

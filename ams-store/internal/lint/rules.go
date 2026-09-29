@@ -136,7 +136,7 @@ func MeasureStore(s store.Store) (Stats, error) {
 		Lines:       lines,
 		Entries:     len(ix.Entries()),
 		Files:       len(files),
-		OverTrigger: len(data) >= store.TriggerBytes || lines >= store.TriggerLines,
+		OverTrigger: store.OverTrigger(len(data), lines),
 	}, nil
 }
 
