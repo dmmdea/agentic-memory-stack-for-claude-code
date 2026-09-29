@@ -43,13 +43,14 @@ class FakeQdrant:
     plus the sha256 `.checksum` file Qdrant writes beside it."""
 
     def __init__(self, snap_root: Path, collections, corrupt_checksum: bool = False,
-                 fail_delete: bool = False, fail_create=(), fail_collection_list: bool = False):
+                 fail_delete: bool = False, fail_create=(), fail_collection_list: bool = False, fail_snapshot_list: bool = False):
         self.snap_root = snap_root
         self.collections = list(collections)
         self.corrupt_checksum = corrupt_checksum
         self.fail_delete = fail_delete  # every snapshot DELETE answers 500
         self.fail_create = set(fail_create)  # collections whose snapshot POST answers 500
         self.fail_collection_list = fail_collection_list  # GET /collections answers 500
+        self.fail_snapshot_list = fail_snapshot_list  # GET /collections/<c>/snapshots answers 500
         self.deleted: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []
         self._n = 0
@@ -77,6 +78,8 @@ class FakeQdrant:
                 if len(parts) == 2 and parts[1] in fake.collections:
                     return self._send({"result": {"points_count": 42}})
                 if len(parts) == 3 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    if fake.fail_snapshot_list:
+                        return self._send({"status": "boom"}, 500)
                     return self._send({"result": fake.list_snapshots(parts[1])})
                 self._send({"status": "not found"}, 404)
 
@@ -333,6 +336,26 @@ def test_failed_server_prune_reads_degraded_not_ok(home, tmp_path):
         assert status == "degraded" and "server-prune-failed" in reason
         assert counts["server_prune_failed"] >= 1
         assert len(fake.remaining(PRIMARY)) > 2, "the failed DELETEs left the old snapshots in place"
+    finally:
+        fake.close()
+
+
+def test_failed_server_snapshot_list_reads_degraded_not_ok(home, tmp_path):
+    """The prune's own GET /collections/<c>/snapshots failing must not read as "nothing to prune":
+    curl's failure used to be swallowed by the pipe into jq (no pipefail), so the step printed
+    no WARN and wrote no outcome while the store grew unbounded again."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY], fail_snapshot_list=True)
+    try:
+        for i in range(1, 6):
+            fake.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        assert "could not list server-side snapshots" in r.stderr, r.stderr
+        status, reason, counts = _outcome_line(out)
+        assert status == "degraded" and "server-prune-failed" in reason
+        assert counts["server_prune_failed"] >= 1
+        assert len(fake.remaining(PRIMARY)) > 2, "nothing was pruned"
     finally:
         fake.close()
 

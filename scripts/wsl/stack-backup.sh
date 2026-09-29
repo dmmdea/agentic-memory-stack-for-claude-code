@@ -223,9 +223,11 @@ QDRANT_SNAP_ROOT="${MEM0_QDRANT_SNAPSHOT_DIR:-$HOME/qdrant-server/snapshots}"
 # API error must not turn the night red (which would also make the off-box copy refuse the
 # set), but a DELETE that fails every night must not read ok either.
 prune_server_snapshots() {  # <collection> <snapshot just verified>
-  local coll="$1" cur="$2" name names
-  if ! names=$(curl -sf "$QDRANT_URL/collections/$coll/snapshots" \
-        | jq -r --arg cur "$cur" '(.result // []) | sort_by([(.creation_time // ""), .name]) | reverse | .[2:][]?.name | select(. != $cur)'); then
+  local coll="$1" cur="$2" name names body
+  # curl and jq are separated on purpose: this script has no pipefail, so `curl | jq` reports jq's
+  # status alone and a failed list (empty stdin, jq exits 0) would read as "nothing to prune".
+  if ! body=$(curl -sf "$QDRANT_URL/collections/$coll/snapshots") \
+     || ! names=$(printf '%s' "$body" | jq -r --arg cur "$cur" '(.result // []) | sort_by([(.creation_time // ""), .name]) | reverse | .[2:][]?.name | select(. != $cur)'); then
     echo "WARN: could not list server-side snapshots of $coll - not pruned" >&2
     DEG_PRUNE=$((DEG_PRUNE + 1))
     return 0
