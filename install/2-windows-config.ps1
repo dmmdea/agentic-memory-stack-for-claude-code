@@ -655,7 +655,7 @@ try {
 # is the shared primitive library; memory-lint.ps1 is the read-only SessionStart child
 # (spawned by memory-maintenance-spawn.ps1); memory-compact.ps1 is the nightly task registered
 # in section 5c. None are R9 hash-tracked.
-$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'codex-usage-report.ps1', 'memory-index-write-gate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
+$winScripts = @('memory-common.ps1', 'l1a-extract.ps1', 'dream-consolidate.ps1', 'dream-catchup.ps1', 'memory-index-refresh.ps1', 'wiki-index-catchup.ps1', 'memory-maintenance-spawn.ps1', 'memory-store-lib.ps1', 'memory-lint.ps1', 'memory-compact.ps1', 'codex-usage-report.ps1', 'memory-index-write-gate.ps1', 'autopromote-lib.ps1', 'stop-extract.ps1', 'sessionstart-capture.ps1', 'user-prompt-extract.ps1', 'user-prompt-lib.ps1', 'mem0-hook-daemon.ps1', 'mem0-hook-daemon-spawn.ps1', 'mem0-hook-client.cs', 'build-hook-client.ps1', 'Test-MemoryStack.ps1', 'codex-shim.ps1', 'codex-shim-spawn.ps1', 'run-hidden.vbs')
 # AMS-16: the copy loop is add-only, so a retired script must be deleted
 # explicitly or it lingers deployed forever (the AMS-50 orphan class).
 foreach ($retired in @('pre-tool-check.ps1')) {
@@ -735,6 +735,22 @@ if (Test-Path -LiteralPath $idxLintSrc) {
     Write-Host "    installed: memory-index-write-lint.sh (from claude-config)"
 } else {
     Write-Host "    WARN: $idxLintSrc not found" -ForegroundColor Yellow
+}
+
+# WP-8: the session-side wiki index refresh driver, run by wiki-index-catchup.ps1 (SessionStart,
+# replica PCs) and by hand after an ingest. Operator-neutral: the vault directory comes from
+# WIKI_VAULT or ~\.mem0\wiki-vault, never from this file. bash file - BOM-safe write.
+$wikiRefreshSrc = Join-Path $RepoRoot 'claude-config\wiki-index-refresh.sh'
+$wikiRefreshDst = Join-Path $ScriptsDir 'wiki-index-refresh.sh'
+if (Test-Path -LiteralPath $wikiRefreshSrc) {
+    Copy-Item -LiteralPath $wikiRefreshSrc -Destination $wikiRefreshDst -Force
+    $raw = Get-Content -LiteralPath $wikiRefreshDst -Raw
+    if ($raw -match '__WSL_USER__|__WIN_USER__|__WSL_DISTRO__') {
+        Write-StackFile $wikiRefreshDst (Resolve-StackTokens $raw)
+    }
+    Write-Host "    installed: wiki-index-refresh.sh (from claude-config)"
+} else {
+    Write-Host "    WARN: $wikiRefreshSrc not found" -ForegroundColor Yellow
 }
 
 # B1 (2026-06-28): SessionStart durable/evidence bundle enrichment helper, invoked by
