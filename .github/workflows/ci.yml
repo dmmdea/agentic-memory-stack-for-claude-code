@@ -117,6 +117,7 @@ jobs:
             mem0-server/tests/test_machine_turn_gate.py \
             mem0-server/tests/test_dream_consolidate.py \
             mem0-server/tests/test_brand_routing.py \
+            mem0-server/tests/test_brand_backfill.py \
             mem0-server/tests/test_judge_plan_schema.py \
             mem0-server/tests/test_linux_authority_installer.py \
             mem0-server/tests/test_linux_client_store.py \

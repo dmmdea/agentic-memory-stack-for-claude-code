@@ -84,11 +84,21 @@ def resolve(brand_map, path: Optional[str], text: Optional[str] = "") -> Optiona
         if isinstance(r, dict) and r.get("brand") and _matches(r.get("pattern"), hay, is_path=True):
             return str(r["brand"])
     if any(_matches(p, hay, is_path=True) for p in _entries(brand_map, "content_rule_workspaces")):
-        found = {str(r["brand"]) for r in _entries(brand_map, "content_rules")
-                 if isinstance(r, dict) and r.get("brand") and _matches(r.get("pattern"), text or "", is_path=False)}
-        if len(found) == 1:
-            return found.pop()
+        return resolve_by_content(brand_map, text)
     return None
+
+
+def content_brands(brand_map, text: Optional[str]) -> set[str]:
+    """Every distinct brand whose `content_rules` pattern matches the text (case-insensitive)."""
+    return {str(r["brand"]) for r in _entries(brand_map, "content_rules")
+            if isinstance(r, dict) and r.get("brand") and _matches(r.get("pattern"), text or "", is_path=False)}
+
+
+def resolve_by_content(brand_map, text: Optional[str]) -> Optional[str]:
+    """The content-rule step on its own, for a fact with no path (a stored record): exactly one
+    distinct brand matched -> that brand; none or several -> None."""
+    found = content_brands(brand_map, text)
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def _stack_env_value(key: str) -> str:
