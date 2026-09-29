@@ -835,7 +835,7 @@ if ($key) {
     try {
         $body = @{query='health probe'; filters=@{user_id=$TmsWslUser}; limit=5; threshold=0.1; rerank=$true} | ConvertTo-Json
         $r = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/memories/search" -Method Post `
-            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 25
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' -Headers @{'X-API-Key'=$key} -TimeoutSec 30
         $reranked = $r.reranked
         $count    = if ($r.results) { @($r.results).Count } else { 0 }
         if ($reranked -or $count -lt 3) { Add-Check 'INVARIANTS' 'search rerank=True' 'OK'   "count=$count reranked=$reranked" }

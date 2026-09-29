@@ -166,12 +166,62 @@ def rerank_env(fake, clean_stats, monkeypatch):
     monkeypatch.setattr(rr, "RERANK_URL", fake.base + "/v1/rerank")
     monkeypatch.setattr(rr, "RERANK_TIMEOUT_S", 0.4)
     monkeypatch.setattr(rr, "RERANK_COLD_RETRY_TIMEOUT_S", 3.0)
+    monkeypatch.setattr(rr, "RERANK_RETRY_MIN_S", 0.1)   # scaled with the sub-second timeouts above
     return fake
 
 
 def test_shipped_timeouts():
     assert rr.RERANK_TIMEOUT_S == 8.0
     assert rr.RERANK_COLD_RETRY_TIMEOUT_S == 20.0
+    assert rr.RERANK_TOTAL_BUDGET_S == 20.0
+    # the retry needs real room after the first attempt, or the cold-start allowance is a fiction
+    assert rr.RERANK_TOTAL_BUDGET_S - rr.RERANK_TIMEOUT_S >= 5.0
+
+
+def _caller_read_budgets() -> dict[str, float]:
+    """The wall-clock budgets of the callers that search WITH rerank, read from their source."""
+    import re
+    root = Path(__file__).resolve().parents[2]
+    shim = (root / "scripts/wsl/mem0-mcp-shim.py").read_text(encoding="utf-8")
+    tms = (root / "scripts/windows/Test-MemoryStack.ps1").read_text(encoding="utf-8")
+    m_shim = re.search(r"^_READ_TIMEOUT\s*=\s*([0-9.]+)", shim, re.M)
+    m_tms = re.search(r"rerank=\$true\}.*?-TimeoutSec\s+(\d+)", tms, re.S)
+    assert m_shim and m_tms, "caller timeout lines moved: update this pin, do not drop it"
+    return {"mcp shim read timeout": float(m_shim.group(1)),
+            "Test-MemoryStack rerank=True search": float(m_tms.group(1))}
+
+
+def test_rerank_budget_fits_every_caller_timeout():
+    """A read timeout is not a failover in the shim: a search that outlives the caller turns the
+    graceful dense-order fallback into a caller-side error. Worst case = a cold embed (measured
+    ~3.4 s) + the vector/lexical legs + the whole rerank budget; keep 8 s of room for the non-rerank
+    part so the pin fails when either side moves."""
+    non_rerank_allowance_s = 8.0
+    for name, budget in _caller_read_budgets().items():
+        assert rr.RERANK_TOTAL_BUDGET_S + non_rerank_allowance_s <= budget, name
+
+
+def test_total_rerank_time_is_bounded_by_the_budget(rerank_env, clean_stats, monkeypatch):
+    monkeypatch.setattr(rr, "RERANK_TOTAL_BUDGET_S", 0.9)   # first attempt 0.4 s -> retry gets ~0.5 s, not 3.0 s
+    rerank_env.plan = [(3.0, 200, None), (3.0, 200, None)]
+    st: dict = {}
+    t0 = time.perf_counter()
+    out = rr.rerank("q", DOCS, status_out=st)
+    took = time.perf_counter() - t0
+    assert st["status"] == "failed_fallback_dense"
+    assert [d["memory"] for d in out] == ["a", "b", "c", "d"]
+    assert len(rerank_env.rerank_calls) == 2
+    assert took < 1.4, f"rerank stage took {took:.2f}s against a 0.9 s budget"
+
+
+def test_no_retry_when_the_budget_is_already_spent(rerank_env, clean_stats, monkeypatch):
+    monkeypatch.setattr(rr, "RERANK_TOTAL_BUDGET_S", 0.4)   # nothing left after the first 0.4 s attempt
+    rerank_env.plan = [(1.0, 200, None), (0.0, 200, None)]
+    st: dict = {}
+    rr.rerank("q", DOCS, status_out=st)
+    assert st["status"] == "failed_fallback_dense"
+    assert len(rerank_env.rerank_calls) == 1, "no budget left: fall back at once, do not start a doomed retry"
+    assert clean_stats["cold_retry_total"] == 0 and clean_stats["fail_total"] == 1
 
 
 def test_warm_reranker_first_attempt_is_plain_ran(rerank_env):

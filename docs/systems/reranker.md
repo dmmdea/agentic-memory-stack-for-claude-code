@@ -56,9 +56,16 @@ document is cut to `RERANK_DOC_MAX_CHARS = 6000` characters before it is sent.
 
 **Timeouts and the cold-start retry.** The first attempt uses `RERANK_TIMEOUT_S = 8.0`. If it
 raises `httpx.ReadTimeout` (the model is loading), `rerank` retries **once** with
-`RERANK_COLD_RETRY_TIMEOUT_S = 20.0`. Only a read timeout is retried: a start failure (an
-HTTP 5xx from llama-swap) or a refused connection is not a slow load and is not repeated. The
-worst case for one search is therefore about 28 s, paid only on a cold or failing reranker.
+up to `RERANK_COLD_RETRY_TIMEOUT_S = 20.0`, capped by what is left of the whole-stage ceiling
+`RERANK_TOTAL_BUDGET_S = 20.0` (so the shipped retry waits 12 s, and a stage with under
+`RERANK_RETRY_MIN_S = 1.0` left does not retry at all). Only a read timeout is retried: a start
+failure (an HTTP 5xx from llama-swap) or a refused connection is not a slow load and is not
+repeated. The worst case for the rerank stage is therefore 20 s, paid only on a cold or failing
+reranker. The ceiling exists because callers wait a fixed time: the MCP shim reads for 30 s and a
+read timeout is not a failover there, and `Test-MemoryStack`'s rerank search waits 30 s. A cold
+embed (about 3.4 s measured) plus the ceiling stays inside both, so a failing reranker degrades
+to dense order instead of surfacing as a caller-side timeout. A test pins the relation to both
+callers, so raising either side fails it. `warm()` is not on a search path and keeps the plain 20 s.
 
 **Fail policy (fail-open).** Any error that survives the retry (timeout, 5xx, connection
 refused) logs a WARNING (first occurrence and every tenth after), returns the results in dense
@@ -76,7 +83,7 @@ resident; the models stay on the five-minute TTL.
 | Value | Meaning |
 |---|---|
 | `ran` | The cross-encoder scored this search on the first attempt. |
-| `ok-after-cold-retry` | The first attempt timed out while the model cold-loaded and the single 20 s retry succeeded. The search is scored exactly like `ran`. |
+| `ok-after-cold-retry` | The first attempt timed out while the model cold-loaded and the single budget-bounded retry succeeded. The search is scored exactly like `ran`. |
 | `skipped_small_n` / `skipped_confident` | A skip rule fired; the transport was not touched. |
 | `failed_fallback_dense` | The transport failed (after the retry, for timeouts); results are in dense order and any lexical-only rescue candidates were dropped fail-closed. |
 

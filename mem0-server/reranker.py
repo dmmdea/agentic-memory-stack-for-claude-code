@@ -40,6 +40,16 @@ RERANK_TIMEOUT_S = 8.0
 # timeout. So a ReadTimeout on the first attempt is retried ONCE with this longer allowance (the
 # load is usually underway or done by then) before search degrades to dense order.
 RERANK_COLD_RETRY_TIMEOUT_S = 20.0
+# Hard ceiling on the WHOLE rerank stage (first attempt + retry). The retry gets
+# min(RERANK_COLD_RETRY_TIMEOUT_S, budget - elapsed), so with the shipped values it waits 12 s, and
+# a stage that has no budget left does not retry at all. Why a ceiling: the callers that search with
+# rerank wait a fixed time (MCP shim read timeout 30 s, Test-MemoryStack 25 s -> 30 s) and a read
+# timeout is NOT a failover in the shim; a cold embed (~3.4 s measured) + 8 s + 20 s would outlive
+# them and turn the graceful dense-order fallback into a caller-side error. Pinned against those
+# callers in tests/test_support_tier.py (test_rerank_budget_fits_every_caller_timeout).
+RERANK_TOTAL_BUDGET_S = 20.0
+# A retry with less than this left cannot cover even a warm request: fall back instead.
+RERANK_RETRY_MIN_S = 1.0
 # rerank_status values that mean "the cross-encoder scored this search".
 RAN_STATUSES = ("ran", "ok-after-cold-retry")
 # Don't bother reranking trivially small or very confident result sets.
@@ -137,16 +147,23 @@ def rerank(query: str, results: list[dict], text_key: str = "memory", *,
         return list(results)
     docs = [str(r.get(text_key, "") or "")[:RERANK_DOC_MAX_CHARS] for r in results]
     cold_retried = False
+    t_start = time.monotonic()
     try:
         try:
             body = _post_rerank(query, docs, RERANK_TIMEOUT_S)
         except httpx.ReadTimeout:
-            # Cold load in progress: one retry with the longer allowance. Only a read timeout
-            # qualifies; a start failure (5xx) or a refused connection is not a slow load.
+            # Cold load in progress: one retry with the longer allowance, bounded by what is left
+            # of RERANK_TOTAL_BUDGET_S. Only a read timeout qualifies; a start failure (5xx) or a
+            # refused connection is not a slow load. No budget left -> the timeout propagates to
+            # the fail-open handler below (dense order), with no doomed retry.
+            retry_s = min(RERANK_COLD_RETRY_TIMEOUT_S,
+                          RERANK_TOTAL_BUDGET_S - (time.monotonic() - t_start))
+            if retry_s < RERANK_RETRY_MIN_S:
+                raise
             cold_retried = True
             with _failure_lock:
                 rerank_stats["cold_retry_total"] += 1
-            body = _post_rerank(query, docs, RERANK_COLD_RETRY_TIMEOUT_S)
+            body = _post_rerank(query, docs, retry_s)
         items = body.get("results") or body.get("data") or []
         # llama-server returns [{"index": int, "relevance_score": float}, ...]
         ordered = sorted(items, key=lambda x: float(x.get("relevance_score", 0.0)), reverse=True)
