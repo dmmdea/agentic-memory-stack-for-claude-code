@@ -572,3 +572,28 @@ func TestDerive_EmptiedStoreWithAnUnexplainedSlugStillAborts(t *testing.T) {
 		t.Error("the index was rewritten during an abort")
 	}
 }
+
+// A wedged store repeats one abort on every sync; the receipts file records it once with a
+// repeat count instead of growing by a row per sync.
+func TestDerive_ConsecutiveIdenticalAbortsCollapseIntoOneRow(t *testing.T) {
+	e := newEnv(t, "ws", bigIndexLines(60), map[string]string{})
+	for i := 0; i < 3; i++ {
+		res, err := e.run()
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		if res.Status != StatusAbortedNoFactFiles {
+			t.Fatalf("status = %q, want the abort the scenario is about", res.Status)
+		}
+	}
+	rows := e.receipts()
+	if len(rows) != 1 {
+		t.Fatalf("receipts = %d rows, want 1 collapsed row: %v", len(rows), rows)
+	}
+	if rows[0]["repeat"] != float64(3) {
+		t.Errorf("repeat = %v, want 3", rows[0]["repeat"])
+	}
+	if _, ok := rows[0]["first_ts"]; !ok {
+		t.Error("the collapsed row must keep when the run started")
+	}
+}

@@ -1124,3 +1124,31 @@ func TestLint_LastStatusIsClearedWhenTheStoreHasNoRecentReceipt(t *testing.T) {
 		}
 	}
 }
+
+// A collapsed run of identical aborted rows (one row with a repeat count) still counts as
+// the run it was: three aborts in a row are unproductive whether they are three rows or one.
+func TestLint_UnproductiveCountsACollapsedRunAsItsRepeatCount(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	overTriggerStore(t, sb, "lt")
+	ts := fixedNow.Add(-time.Hour).Format(time.RFC3339Nano)
+	row := `{"ts":"` + ts + `","workspace":"lt","status":"aborted-no-fact-files","dry_run":false,"repeat":3}` + "\n"
+	if err := os.WriteFile(receiptPath(sb), []byte(row), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := countKind(runLint(t, sb, ""), lint.KindUnproductive); n != 1 {
+		t.Errorf("compactor-unproductive = %d, want 1 for a row standing for three aborts", n)
+	}
+}
+
+// The tail readers reach across a rotation: when the live receipts file was just rotated
+// and holds one row, the history of the store still comes from the newest generation.
+func TestLint_RunHistoryReadsAcrossARotation(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	overTriggerStore(t, sb, "lt")
+	rp := receiptPath(sb)
+	seedReceipts(t, rp+".1", "lt", []string{"rejected-no-shrink", "rejected-no-shrink"}, 3)
+	seedReceipts(t, rp, "lt", []string{"rejected-no-shrink"}, 1)
+	if n := countKind(runLint(t, sb, ""), lint.KindUnproductive); n != 1 {
+		t.Errorf("compactor-unproductive = %d, want 1: two rows in generation 1 plus one live make three", n)
+	}
+}

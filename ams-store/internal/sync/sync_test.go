@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/testutil"
 )
@@ -386,4 +388,38 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[p:])
+}
+
+// The sync receipts file is size-bounded: past the limit it rotates and only three rotated
+// generations are kept, and the row-count tail still reads across the rotation.
+func TestSync_ReceiptsRotateAndTheTailReadsAcrossTheRotation(t *testing.T) {
+	old := receiptlog.MaxBytes
+	receiptlog.MaxBytes = 1500
+	t.Cleanup(func() { receiptlog.MaxBytes = old })
+	state := t.TempDir()
+	for i := 0; i < 40; i++ {
+		if err := AppendReceipt(state, Receipt{TS: time.Unix(int64(i), 0).UTC(), Machine: "pc", Kind: "once", Status: StatusUpToDate, Stores: i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := ReceiptPath(state)
+	if fi, err := os.Stat(path); err != nil || fi.Size() > 1500+400 {
+		t.Fatalf("the live receipts file was not bounded: %v %v", fi, err)
+	}
+	for n := 1; n <= receiptlog.Keep; n++ {
+		if _, err := os.Stat(receiptlog.Generation(path, n)); err != nil {
+			t.Errorf("generation %d missing: %v", n, err)
+		}
+	}
+	if _, err := os.Stat(receiptlog.Generation(path, receiptlog.Keep+1)); err == nil {
+		t.Errorf("more than %d rotated generations kept", receiptlog.Keep)
+	}
+	rows, err := ReadReceipts(path, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 12 || rows[len(rows)-1].Stores != 39 || rows[0].Stores != 28 {
+		t.Errorf("tail of 12 = %d rows, first stores=%d last stores=%d; want rows 28..39 across the rotation",
+			len(rows), rows[0].Stores, rows[len(rows)-1].Stores)
+	}
 }

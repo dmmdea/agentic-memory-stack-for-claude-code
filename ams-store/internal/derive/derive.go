@@ -2,7 +2,6 @@ package derive
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/frontmatter"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -890,6 +890,10 @@ func touchDirty(opt Options, logf func(string, ...any)) {
 // never fatal and never silent: this file IS the audit trail, and both watchdogs read its
 // mtime, so a failure here otherwise masquerades as "the maintainer is dead" and sends the
 // operator to the wrong subsystem.
+//
+// The file is size-rotated, and consecutive identical aborted-* rows for one store collapse
+// into one row carrying a repeat count: a store wedged in one abort wrote 231 identical
+// rows in a week.
 func writeReceipt(opt Options, res *Result, logf func(string, ...any)) {
 	path := opt.ReceiptPath
 	if path == "" {
@@ -898,22 +902,7 @@ func writeReceipt(opt Options, res *Result, logf func(string, ...any)) {
 		}
 		path = filepath.Join(opt.Roots.StateRoot, ReceiptFile)
 	}
-	b, err := json.Marshal(res)
-	if err != nil {
-		logf("RECEIPT ENCODE FAILED: %v", err)
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
-		return
-	}
-	defer f.Close()
-	if _, err := f.Write(append(b, '\n')); err != nil {
+	if err := receiptlog.AppendCollapsing(path, res, receiptlog.SameAbortedRow); err != nil {
 		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
 	}
 }

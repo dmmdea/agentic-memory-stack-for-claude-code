@@ -124,6 +124,8 @@ type DrainResult struct {
 	Resurrected []string
 	// StillQueued is what a live session still blocks.
 	StillQueued []string
+	// Gone is a queued deletion whose file another pass had already removed.
+	Gone []string
 }
 
 // Deriver is the derive engine, declared here for the same reason as Merger: derive is

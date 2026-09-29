@@ -8,11 +8,11 @@
 package lint
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
-	"strings"
 	"time"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 )
 
 // ReceiptFile is the compactor/maintenance receipts JSONL under STATE_ROOT.
@@ -64,6 +64,9 @@ type ReceiptRow struct {
 	DryRun      bool      `json:"dry_run"`
 	JudgeCalled bool      `json:"judge_called"`
 	SkipStreak  int       `json:"skip_streak"`
+	// Repeat is the count a collapsed run of identical aborted rows carries (0 or 1 for
+	// a row that stands alone).
+	Repeat int `json:"repeat"`
 }
 
 // RunHistory is what the receipts say about ONE store.
@@ -168,25 +171,8 @@ func FileAgeHours(path string, now time.Time) *float64 {
 }
 
 func readRows(path string, tail int) []ReceiptRow {
-	f, err := os.Open(path)
+	lines, err := receiptlog.ReadTailLines(path, tail)
 	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l == "" {
-			continue
-		}
-		lines = append(lines, l)
-		if tail > 0 && len(lines) > tail {
-			lines = lines[1:]
-		}
-	}
-	if err := sc.Err(); err != nil {
 		return nil
 	}
 	out := make([]ReceiptRow, 0, len(lines))
@@ -196,7 +182,14 @@ func readRows(path string, tail int) []ReceiptRow {
 		if err := json.Unmarshal([]byte(l), &r); err != nil {
 			continue
 		}
-		out = append(out, r)
+		// A collapsed run (repeat > 1) stands for that many rows, so the "last three runs
+		// all failed" window still sees the run it was. Capped: the windows are small.
+		for n := min(receiptlog.Expand(r.Repeat), maxExpand); n > 0; n-- {
+			out = append(out, r)
+		}
 	}
 	return out
 }
+
+// maxExpand bounds how many rows one collapsed row stands for when a window is computed.
+const maxExpand = 5

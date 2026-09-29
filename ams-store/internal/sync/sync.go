@@ -355,14 +355,54 @@ func drainDeferred(ctx context.Context, opt Options, workspaces []string, res *R
 		if err != nil {
 			return fmt.Errorf("apply the deferred queue of %s: %w", ws, err)
 		}
+		// The audit trail must name what became of EVERY entry that was pending, whatever
+		// the engine did or did not say: 37 queued deletions once left no outcome row at
+		// all. The queue before and after the drain is the ground truth, so an entry the
+		// engine's report leaves out is classified from it - still queued, or gone.
+		after, err := merge.QueuedPaths(opt.Roots.StateRoot, ws)
+		if err != nil {
+			return fmt.Errorf("the deferred queue of %s cannot be read after the drain: %w", ws, err)
+		}
+		out = accountFor(pending, after, out)
 		res.Receipt.DeferredApplied = append(res.Receipt.DeferredApplied, out.Applied...)
 		res.Receipt.Resurrected = append(res.Receipt.Resurrected, out.Resurrected...)
-		if len(out.Applied) > 0 || len(out.Resurrected) > 0 {
-			fmt.Fprintf(logw, "sync: %s: applied %d deferred change(s), %d still queued, %d resurrected\n",
-				ws, len(out.Applied), len(out.StillQueued), len(out.Resurrected))
+		res.Receipt.DeferredStillQueued = append(res.Receipt.DeferredStillQueued, out.StillQueued...)
+		res.Receipt.DeferredGone = append(res.Receipt.DeferredGone, out.Gone...)
+		if len(out.Applied) > 0 || len(out.Resurrected) > 0 || len(out.Gone) > 0 {
+			fmt.Fprintf(logw, "sync: %s: applied %d deferred change(s), %d still queued, %d resurrected, %d already gone\n",
+				ws, len(out.Applied), len(out.StillQueued), len(out.Resurrected), len(out.Gone))
 		}
 	}
 	return nil
+}
+
+// accountFor returns the drain result with every path that was pending before the drain in
+// exactly one outcome list. A path the engine reported keeps the engine's word; one it
+// omitted is "still queued" when the queue after the drain still holds it and "gone" when
+// it does not (some other path resolved it).
+func accountFor(pending, after []string, out DrainResult) DrainResult {
+	reported := map[string]bool{}
+	for _, list := range [][]string{out.Applied, out.Resurrected, out.StillQueued, out.Gone} {
+		for _, p := range list {
+			reported[p] = true
+		}
+	}
+	stillHeld := make(map[string]bool, len(after))
+	for _, p := range after {
+		stillHeld[p] = true
+	}
+	for _, p := range pending {
+		if reported[p] {
+			continue
+		}
+		reported[p] = true
+		if stillHeld[p] {
+			out.StillQueued = append(out.StillQueued, p)
+		} else {
+			out.Gone = append(out.Gone, p)
+		}
+	}
+	return out
 }
 
 // SSHCommand builds the GIT_SSH_COMMAND every network call runs under (DESIGN:184).

@@ -331,6 +331,7 @@ func (d drainerAdapter) ApplyDeferred(ctx context.Context, opts amsync.DrainOpti
 		Merged:      rep.Merged,
 		Resurrected: rep.Resurrected,
 		StillQueued: rep.StillQueued,
+		Gone:        rep.Gone,
 	}, nil
 }
 
