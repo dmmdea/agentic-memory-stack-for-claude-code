@@ -3,6 +3,10 @@
 # (Initialize-MemoryEnv is NOT called — load defines functions only).
 BeforeAll {
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-common.ps1')
+    # Invoke-CodexSubagent logs the auth mode it runs under: keep that (and every other
+    # Write-MemoryLog line these tests trigger) out of the operator's real ~/.claude/logs.
+    $script:LogDir = Join-Path $TestDrive 'ams-logs'
+    New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
 }
 
 Describe 'Get-RecentTranscriptTurns pathological-transcript guard (v0.23)' {
@@ -532,5 +536,126 @@ Describe 'codex -o last-message parse hardening (2026-09-07)' {
         $a = New-CodexLastMessagePath; $b = New-CodexLastMessagePath
         $a | Should -Not -Be $b
         Remove-CodexLastMessagePath -Path $a   # must not throw on a file that never existed
+    }
+}
+
+Describe 'Acquire-CodexLockWithWait (L1a waits for the codex lock instead of skipping)' {
+    BeforeEach {
+        $script:savedProfile = $env:USERPROFILE
+        $env:USERPROFILE = Join-Path $TestDrive ('w' + [guid]::NewGuid().ToString('N'))
+        $script:stateDir = Join-Path $env:USERPROFILE '.claude\state'
+        New-Item -ItemType Directory -Force -Path $script:stateDir | Out-Null
+        $script:lock = Join-Path $script:stateDir 'codex.lock'
+        # a LIVE holder (this process): Acquire-CodexLock never reclaims it
+        Set-Content -LiteralPath $script:lock -Value ('c1 x pid=' + $PID) -Encoding ASCII -NoNewline
+    }
+    AfterEach { $env:USERPROFILE = $script:savedProfile }
+
+    It 'acquires at once when the lock is free, without sleeping' {
+        Remove-Item -LiteralPath $script:lock -Force
+        $script:slept = 0
+        $r = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds 20 -Sleep { param($s) $script:slept += $s }
+        $r.acquired | Should -BeTrue
+        $r.waited | Should -Be 0
+        $script:slept | Should -Be 0
+        Release-CodexLock
+    }
+    It 'acquires as soon as the holder releases, having waited only that long' {
+        $script:polls = 0
+        $r = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds 20 -PollSeconds 2 -Sleep {
+            param($s)
+            $script:polls++
+            if ($script:polls -eq 3) { Remove-Item -LiteralPath $script:lock -Force }   # released during the 3rd wait
+        }
+        $r.acquired | Should -BeTrue
+        $r.waited | Should -Be 6
+        Release-CodexLock
+    }
+    It 'gives up after the bounded wait when the holder never releases' {
+        $script:slept = 0
+        $r = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds 20 -PollSeconds 2 -Sleep { param($s) $script:slept += $s }
+        $r.acquired | Should -BeFalse
+        $r.waited | Should -Be 20
+        $script:slept | Should -Be 20
+    }
+    It 'never sleeps past the bound when the poll does not divide it' {
+        $script:slept = 0
+        $r = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds 5 -PollSeconds 2 -Sleep { param($s) $script:slept += $s }
+        $r.waited | Should -Be 5
+        $script:slept | Should -Be 5
+    }
+}
+
+Describe 'Invoke-CodexSubagent: auth mode and failure tail (qube-codex-401-windows, capture-l1a-codex-lock-skips-and-failures)' {
+    BeforeEach {
+        $script:savedEnv = @{ O = $env:OPENAI_API_KEY; C = $env:CODEX_API_KEY; H = $env:CODEX_HOME }
+        Get-ChildItem -LiteralPath $script:LogDir -Filter '*.log' -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+    AfterEach {
+        foreach ($p in @(@('OPENAI_API_KEY', 'O'), @('CODEX_API_KEY', 'C'), @('CODEX_HOME', 'H'))) {
+            if ($script:savedEnv[$p[1]]) { Set-Item -Path ('Env:' + $p[0]) -Value $script:savedEnv[$p[1]] } else { Remove-Item -Path ('Env:' + $p[0]) -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'a service-account API key in the parent environment never reaches codex, so the ChatGPT login is used' {
+        $fake = Join-Path $TestDrive 'codex-env.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo SEEN=[%OPENAI_API_KEY%][%CODEX_API_KEY%]')
+        $script:CodexCmd = $fake
+        $env:OPENAI_API_KEY = 'fake-parent-key-one'
+        $env:CODEX_API_KEY = 'fake-parent-key-two'
+        $out = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30
+        $out | Should -Match 'SEEN=\[\]\[\]'
+        $out | Should -Not -Match 'fake-parent-key'
+        $env:OPENAI_API_KEY | Should -Be 'fake-parent-key-one' -Because 'only the child is scrubbed, never the caller'
+        $env:CODEX_API_KEY | Should -Be 'fake-parent-key-two'
+    }
+
+    It 'logs the auth mode from auth.json and names the env keys it cleared' {
+        $home_ = Join-Path $TestDrive 'codexhome'
+        New-Item -ItemType Directory -Force -Path $home_ | Out-Null
+        Set-Content -LiteralPath (Join-Path $home_ 'auth.json') -Value '{"auth_mode":"chatgpt","tokens":{"access_token":"never-logged"}}' -Encoding ASCII
+        $env:CODEX_HOME = $home_
+        $env:OPENAI_API_KEY = 'fake-parent-key-one'
+        Remove-Item Env:CODEX_API_KEY -ErrorAction SilentlyContinue
+        $fake = Join-Path $TestDrive 'codex-ok2.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo fine')
+        $script:CodexCmd = $fake
+        $null = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30
+        $log = Get-Content -Raw (Join-Path $script:LogDir 'codex.log')
+        $log | Should -Match 'codex auth: mode=chatgpt'
+        $log | Should -Match 'cleared OPENAI_API_KEY'
+        $log | Should -Not -Match 'CODEX_API_KEY' -Because 'only keys that were actually set are named'
+        $log | Should -Not -Match 'never-logged|fake-parent-key' -Because 'the log names a mode, never a credential'
+    }
+
+    It 'logs mode=unknown when there is no auth.json' {
+        $env:CODEX_HOME = Join-Path $TestDrive 'no-such-codex-home'
+        Remove-Item Env:OPENAI_API_KEY, Env:CODEX_API_KEY -ErrorAction SilentlyContinue
+        $fake = Join-Path $TestDrive 'codex-ok3.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo fine')
+        $script:CodexCmd = $fake
+        $null = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30
+        (Get-Content -Raw (Join-Path $script:LogDir 'codex.log')) | Should -Match 'codex auth: mode=unknown'
+    }
+
+    It 'a non-zero exit carries the LAST three lines of codex output, where the error is, not the header' {
+        $fake = Join-Path $TestDrive 'codex-tail.cmd'
+        Set-Content -Path $fake -Encoding ASCII -Value @('@echo off', 'echo OpenAI Codex v9.9.9', 'echo --------', 'echo workdir: somewhere',
+            'echo ERROR: unexpected status 401 Unauthorized', 'echo Incorrect API key provided', 'exit /b 1')
+        $script:CodexCmd = $fake
+        $msg = ''
+        try { $null = Invoke-CodexSubagent -Prompt 'hi' -TimeoutSeconds 30 } catch { $msg = "$_" }
+        $msg | Should -Match 'codex exited 1'
+        $msg | Should -Match 'workdir: somewhere'
+        $msg | Should -Match '401 Unauthorized'
+        $msg | Should -Match 'Incorrect API key provided'
+        $msg | Should -Not -Match 'OpenAI Codex v9.9.9' -Because 'the header is the first line; the tail is the last three'
+        $msg | Should -Not -Match "`n" -Because 'one log line'
+    }
+
+    It 'Get-OutputTail keeps the last N non-empty lines on one line' {
+        Get-OutputTail -Text "a`r`nb`n`n c `nd`n" -Lines 3 | Should -Be 'b | c | d'
+        Get-OutputTail -Text '' -Lines 3 | Should -Be ''
+        Get-OutputTail -Text 'only' -Lines 3 | Should -Be 'only'
     }
 }

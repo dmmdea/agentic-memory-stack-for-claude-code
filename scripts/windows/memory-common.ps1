@@ -567,6 +567,31 @@ function Drain-Mem0DeadLetter {
     return @{ drained = $drained; remaining = $still.Count; quarantined = $poisoned; dropped = $dropped }
 }
 
+function Get-OutputTail {
+    # The last $Lines non-empty lines of $Text, trimmed and joined with ' | ' - one log line.
+    param([string]$Text, [int]$Lines = 3)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $kept = @($Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($kept.Count -eq 0) { return '' }
+    if ($kept.Count -gt $Lines) { $kept = @($kept[($kept.Count - $Lines)..($kept.Count - 1)]) }
+    return ($kept -join ' | ')
+}
+
+function Get-CodexAuthMode {
+    # auth_mode from the codex auth.json ($env:CODEX_HOME, else ~/.codex): 'chatgpt' or 'apikey'.
+    # 'unknown' when the file is absent or unreadable. Reads ONE field; no token is ever returned.
+    $dir = $env:CODEX_HOME
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Join-Path (Get-AmsHomeDir) '.codex' }
+    try {
+        $f = Join-Path $dir 'auth.json'
+        if (Test-Path -LiteralPath $f) {
+            $m = ((Get-Content -LiteralPath $f -Raw -ErrorAction Stop) | ConvertFrom-Json).auth_mode
+            if ($m -and ([string]$m -match '^[A-Za-z0-9_-]{1,32}$')) { return [string]$m }
+        }
+    } catch { }
+    return 'unknown'
+}
+
 function Invoke-CodexSubagent {
     param(
         [Parameter(Mandatory)][string]$Prompt,
@@ -654,6 +679,21 @@ exit $LASTEXITCODE
     $psi.EnvironmentVariables['MEM0_CODEX_MODEL'] = $Model
     $psi.EnvironmentVariables['MEM0_CODEX_LASTMSG'] = $LastMessagePath
 
+    # An API-key credential in the launching environment PREEMPTS the ChatGPT login this stack
+    # authenticates with: 83 "POST /judge -> 401 Incorrect API key provided: <service-account key>"
+    # since July, and 9 dropped L1a extractions on 2026-09-25. The CHILD must never see one, so the
+    # login in auth.json is what is used. Only the child is scrubbed; the caller's environment is
+    # untouched. The log names the auth mode and which keys were cleared, never a credential.
+    $clearedKeys = @()
+    foreach ($k in @('OPENAI_API_KEY', 'CODEX_API_KEY')) {
+        if ($psi.EnvironmentVariables.ContainsKey($k)) { $psi.EnvironmentVariables.Remove($k); $clearedKeys += $k }
+    }
+    try {
+        $authLine = 'codex auth: mode=' + (Get-CodexAuthMode)
+        if ($clearedKeys.Count -gt 0) { $authLine += '; cleared ' + ($clearedKeys -join ', ') + ' from the child environment' }
+        Write-MemoryLog -Component 'codex' -Message $authLine
+    } catch { }   # a log failure never costs the call
+
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
         $promptBytes = [System.Text.Encoding]::UTF8.GetBytes($Prompt)
@@ -681,7 +721,9 @@ exit $LASTEXITCODE
         $errText = $errTask.Result
         if ($p.ExitCode -ne 0) {
             $detail = if ($output) { $output } else { $errText }
-            throw "codex exited $($p.ExitCode) : $detail"
+            # The error is at the END of codex's output, after a metadata header: the first line is
+            # only the version banner (nine 09-25 failures were logged as just "OpenAI Codex v0.155.1").
+            throw "codex exited $($p.ExitCode); last output lines: $(Get-OutputTail -Text $detail -Lines 3)"
         }
         return $output
     } finally {
@@ -1063,6 +1105,29 @@ function Acquire-CodexLock {
     } catch {
         return $false
     }
+}
+
+function Acquire-CodexLockWithWait {
+    # Acquire-CodexLock, but a held lock is WAITED on (polling every $PollSeconds, up to
+    # $WaitSeconds) before giving up. The shared mutex serializes L1a, C1 and the dream; a loser
+    # used to skip at once, so a session whose last Stop lost the race was never extracted (24% of
+    # L1a runs in one week). Returns @{ acquired = <bool>; waited = <seconds slept> }. -Sleep is
+    # injectable so a test does not really wait.
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [int]$WaitSeconds = 20,
+        [int]$PollSeconds = 2,
+        [scriptblock]$Sleep = { param($s) Start-Sleep -Seconds $s }
+    )
+    if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = 0 } }
+    $waited = 0
+    while ($waited -lt $WaitSeconds) {
+        $step = [Math]::Min($PollSeconds, $WaitSeconds - $waited)
+        & $Sleep $step
+        $waited += $step
+        if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = $waited } }
+    }
+    return @{ acquired = $false; waited = $waited }
 }
 
 function Release-CodexLock {

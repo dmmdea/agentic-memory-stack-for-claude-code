@@ -144,3 +144,77 @@ Describe 'L1a facts carry a brand (C3)' {
         (Invoke-L1a $other -CodexJson (New-CodexJson @('the supplier invoices monthly'))).Records[0].metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
     }
 }
+
+Describe 'L1a codex lock: wait and retry instead of skipping (capture-l1a-codex-lock-skips-and-failures)' {
+    BeforeAll {
+        # The lock file names a LIVE holder: this Pester process. Acquire-CodexLock never robs a live
+        # holder, so the child sees "held" exactly as it does when another worker is mid-codex-call.
+        function script:Hold-CodexLock($Sb) {
+            $lock = Join-Path $Sb.Home '.claude\state\codex.lock'
+            Set-Content -LiteralPath $lock -Value ('c1 ' + (Get-Date).ToString('o') + ' pid=' + $PID) -Encoding ASCII -NoNewline
+            return $lock
+        }
+    }
+
+    It 'a lock released while the run waits is acquired and the extraction goes ahead' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $lock = Hold-CodexLock $sb
+        $rel = Start-Process -FilePath 'pwsh' -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Start-Sleep -Seconds 3; Remove-Item -LiteralPath '$lock' -Force"
+        $env:AMS_L1A_LOCK_WAIT_SECONDS = '15'
+        try { $r = Invoke-L1a $sb -CodexJson (New-CodexJson @('the supplier invoices monthly')) } finally { Remove-Item Env:AMS_L1A_LOCK_WAIT_SECONDS -ErrorAction SilentlyContinue }
+        $null = $rel.WaitForExit(20000)
+        $r.Records.Count | Should -Be 1 -Because 'the run must wait for the holder instead of skipping'
+        $r.Log | Should -Match 'codex lock acquired after \d+s wait'
+        $r.Log | Should -Not -Match 'skipping this extraction'
+    }
+
+    It 'a lock that is never released is waited on for the bounded time, then the run skips and says so' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $null = Hold-CodexLock $sb
+        $env:AMS_L1A_LOCK_WAIT_SECONDS = '4'
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-L1a $sb -CodexJson (New-CodexJson @('the supplier invoices monthly'))
+            $sw.Stop()
+        } finally { Remove-Item Env:AMS_L1A_LOCK_WAIT_SECONDS -ErrorAction SilentlyContinue }
+        $r.ExitCode | Should -Be 0
+        $r.Records.Count | Should -Be 0
+        $r.Log | Should -Match 'codex lock held by another worker; skipping this extraction'
+        $r.Log | Should -Match 'waited 4s'
+        $sw.Elapsed.TotalSeconds | Should -BeGreaterThan 3.5 -Because 'the run waited before giving up'
+    }
+
+    It 'the default wait is 20 seconds' {
+        (Get-Content (Join-Path $script:winDir 'l1a-extract.ps1') -Raw) | Should -Match '\$lockWaitSeconds = 20'
+    }
+}
+
+Describe 'L1a codex failure logging' {
+    It 'a codex failure logs the tail of its output, not just the first line' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $fail = 'codex exited 1; last output lines: workdir: x | ERROR: unexpected status 401 Unauthorized | Incorrect API key provided'
+        $r = Invoke-L1a $sb -CodexFail $fail
+        $r.ExitCode | Should -Be 0
+        $r.Log | Should -Match 'codex subagent failed: codex exited 1'
+        $r.Log | Should -Match '401 Unauthorized'
+    }
+}
+
+Describe 'the extraction prompt keeps the episode for a session with substantive turns' {
+    It 'no longer ties the episode to having facts (an empty-facts run used to be told to emit episode:null)' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $r = Invoke-L1a $sb -CodexJson (New-CodexJson @())
+        $r.Prompt | Should -Not -BeNullOrEmpty
+        $r.Prompt | Should -Match 'Facts and the episode are independent'
+        $r.Prompt | Should -Match 'even when no fact'
+        $r.Prompt | Should -Not -Match 'If facts is empty \(truly trivial chat with no durable signal\), output'
+        $r.Prompt | Should -Not -Match 'every session with at least one extracted fact must produce'
+        $r.Episodes.Count | Should -Be 1 -Because 'an episode returned with no facts is still posted'
+    }
+    It 'still lets a truly trivial exchange skip the episode' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $r = Invoke-L1a $sb -CodexJson '{"facts":[],"episode":null}'
+        $r.Episodes.Count | Should -Be 0
+        $r.Prompt | Should -Match '"episode":null'
+    }
+}

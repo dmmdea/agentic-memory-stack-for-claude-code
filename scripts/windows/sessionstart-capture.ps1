@@ -101,8 +101,37 @@ try {
 } catch {}
 if (-not $prior) { exit 0 }
 
-# Watermark: skip if this exact transcript@mtime was already captured by a previous SessionStart.
 $stateDir = Join-Path $HomeDirPath (Join-Path '.claude' 'state')
+
+# Per-session same-second guard. 19% of SessionStart spawns were exact duplicates: two hooks fire
+# for one session in the same second and both pass the watermark below (neither has written it
+# yet), so both spawn an extractor and race for the codex lock. The first start creates a marker
+# atomically (CreateNew); a start that finds a marker younger than $dupWindowSeconds is the
+# duplicate and exits. An older marker is a genuine later start of the same session (a resume):
+# it is refreshed and goes ahead. Fail-open: any error here just skips the guard.
+$dupWindowSeconds = 3
+$dupKey = $curSid
+if (-not $dupKey) { $dupKey = $prior.BaseName }
+$dupKey = ($dupKey -replace '[^A-Za-z0-9._-]', '_')
+$spawnMarker = Join-Path $stateDir ('sessionstart-spawn-' + $dupKey)
+try {
+    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+    $mfs = [System.IO.File]::Open($spawnMarker, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $mfs.Close()
+} catch [System.IO.IOException] {
+    $markerAge = $dupWindowSeconds + 1
+    try { $markerAge = ((Get-Date) - (Get-Item -LiteralPath $spawnMarker).LastWriteTime).TotalSeconds } catch {}
+    if ($markerAge -lt $dupWindowSeconds) { exit 0 }
+    try { (Get-Item -LiteralPath $spawnMarker).LastWriteTime = Get-Date } catch {}
+} catch {}
+# housekeeping: markers are one tiny file per session start; drop the ones older than a day
+try {
+    $dayAgo = (Get-Date).AddDays(-1)
+    Get-ChildItem -Path $stateDir -Filter 'sessionstart-spawn-*' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $dayAgo } | Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+
+# Watermark: skip if this exact transcript@mtime was already captured by a previous SessionStart.
 $wm = Join-Path $stateDir 'last-sessionstart-capture'
 $sig = $prior.FullName + '|' + $prior.LastWriteTimeUtc.Ticks
 try {
