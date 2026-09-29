@@ -42,10 +42,14 @@ class FakeQdrant:
     list/create/delete snapshots. A created snapshot is a real file under the snapshot root
     plus the sha256 `.checksum` file Qdrant writes beside it."""
 
-    def __init__(self, snap_root: Path, collections, corrupt_checksum: bool = False):
+    def __init__(self, snap_root: Path, collections, corrupt_checksum: bool = False,
+                 fail_delete: bool = False, fail_create=(), fail_collection_list: bool = False):
         self.snap_root = snap_root
         self.collections = list(collections)
         self.corrupt_checksum = corrupt_checksum
+        self.fail_delete = fail_delete  # every snapshot DELETE answers 500
+        self.fail_create = set(fail_create)  # collections whose snapshot POST answers 500
+        self.fail_collection_list = fail_collection_list  # GET /collections answers 500
         self.deleted: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []
         self._n = 0
@@ -67,6 +71,8 @@ class FakeQdrant:
             def do_GET(self):
                 parts = self.path.strip("/").split("/")
                 if parts == ["collections"]:
+                    if fake.fail_collection_list:
+                        return self._send({"status": "boom"}, 500)
                     return self._send({"result": {"collections": [{"name": c} for c in fake.collections]}})
                 if len(parts) == 2 and parts[1] in fake.collections:
                     return self._send({"result": {"points_count": 42}})
@@ -77,12 +83,16 @@ class FakeQdrant:
             def do_POST(self):
                 parts = self.path.strip("/").split("/")
                 if len(parts) == 3 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    if parts[1] in fake.fail_create:
+                        return self._send({"status": "boom"}, 500)
                     return self._send({"result": {"name": fake.create_snapshot(parts[1])}})
                 self._send({"status": "not found"}, 404)
 
             def do_DELETE(self):
                 parts = self.path.strip("/").split("/")
                 if len(parts) == 4 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    if fake.fail_delete:
+                        return self._send({"status": "boom"}, 500)
                     fake.delete_snapshot(parts[1], parts[3])
                     return self._send({"result": True})
                 self._send({"status": "not found"}, 404)
@@ -292,6 +302,93 @@ def test_secondary_collections_are_snapshotted_into_the_set(home, qdrant):
     assert "rebuild" in m["deliberately_excluded"]
     # each secondary is trimmed server-side like the primary (only the fresh one is there: nothing to delete)
     assert sorted(c for c, _ in qdrant.created) == sorted([PRIMARY, *SECONDARIES])
+
+
+def _outcome(tmp_path: Path) -> Path:
+    return tmp_path / "outcome"
+
+
+def _outcome_line(path: Path):
+    """The C1 outcome: one line, `<status>[:<reason>] <json counts>`; None when the job wrote none."""
+    if not path.exists() or not path.read_text().strip():
+        return None
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1, f"exactly one outcome line, got {lines!r}"
+    head, _, counts = lines[0].partition(" ")
+    status, _, reason = head.partition(":")
+    return status, reason, json.loads(counts)
+
+
+def test_failed_server_prune_reads_degraded_not_ok(home, tmp_path):
+    """A DELETE that fails every night restores the unbounded server-side growth: the step still
+    exits 0 (the backup is done) but its receipt must say degraded, not a bare ok."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY], fail_delete=True)
+    try:
+        for i in range(1, 6):
+            fake.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        status, reason, counts = _outcome_line(out)
+        assert status == "degraded" and "server-prune-failed" in reason
+        assert counts["server_prune_failed"] >= 1
+        assert len(fake.remaining(PRIMARY)) > 2, "the failed DELETEs left the old snapshots in place"
+    finally:
+        fake.close()
+
+
+def test_failed_secondary_snapshot_reads_degraded_not_ok(home, tmp_path):
+    """The _entities snapshot is the only copy of that collection: its silent absence is degraded."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES],
+                      fail_create={"mem0_egemma_768_entities"})
+    try:
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        status, reason, counts = _outcome_line(out)
+        assert status == "degraded" and "secondary-snapshot-failed" in reason
+        assert counts["secondary_snapshot_failed"] == 1
+        assert not list((home / ".mem0" / "backups").glob("qcol-entities-*.snapshot"))
+    finally:
+        fake.close()
+
+
+def test_secondary_collection_listing_failure_reads_degraded(home, tmp_path):
+    """If GET /collections fails, no secondary is snapshotted at all: that is not a clean night."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES], fail_collection_list=True)
+    try:
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        status, reason, _ = _outcome_line(out)
+        assert status == "degraded" and "secondary-snapshot-failed" in reason
+    finally:
+        fake.close()
+
+
+def test_both_failures_share_one_outcome_line(home, tmp_path):
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES],
+                      fail_delete=True, fail_create={"wiki_pages_egemma_768"})
+    try:
+        for i in range(1, 5):
+            fake.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        status, reason, counts = _outcome_line(out)  # asserts a single line
+        assert status == "degraded"
+        assert "secondary-snapshot-failed" in reason and "server-prune-failed" in reason
+        assert counts["secondary_snapshot_failed"] == 1 and counts["server_prune_failed"] >= 1
+    finally:
+        fake.close()
+
+
+def test_clean_run_writes_no_degraded_outcome(home, qdrant, tmp_path):
+    out = _outcome(tmp_path)
+    r = _run(BACKUP, home, qdrant, AMS_OUTCOME_FILE=str(out))
+    assert r.returncode == 0, r.stderr
+    line = _outcome_line(out)
+    assert line is None or line[0] == "ok"
 
 
 # --------------------------------------------------------------------------- 3.3 manifest

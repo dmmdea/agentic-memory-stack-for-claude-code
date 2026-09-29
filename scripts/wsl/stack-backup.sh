@@ -14,6 +14,11 @@ TS=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR="$HOME/.mem0/backups"
 mkdir -p "$BACKUP_DIR"
 rc=0
+# Failures that must not turn the night red (a red night makes the off-box copy refuse the
+# primary set) but must not read as a clean ok either: counted here, reported once at the end
+# as the step's `degraded` outcome (see write_outcome).
+DEG_SECONDARY=0   # secondary-collection snapshots that were not taken
+DEG_PRUNE=0       # server-side snapshot list/DELETE/sweep failures (unbounded growth if nightly)
 
 # DR fix (2026-06-20): the LIVE mem0 vector collection is mem0_egemma_768 (config.py).
 # It was "memories" before the EmbeddingGemma migration; the old collection still exists
@@ -214,22 +219,25 @@ QDRANT_SNAP_ROOT="${MEM0_QDRANT_SNAPSHOT_DIR:-$HOME/qdrant-server/snapshots}"
 # always among them), delete the rest through the API (which removes the .checksum too), and
 # sweep hand-made qdrant-*.snapshot one-offs older than 14 days. Before this the store grew
 # ~150 MB a night, a second full copy of the vectors that nothing ever deleted. A failure here
-# only WARNs: the backup itself is done, and a transient API error must not turn the night red
-# (which would also make the off-box copy refuse the set).
+# only WARNs and counts toward the degraded outcome: the backup itself is done, and a transient
+# API error must not turn the night red (which would also make the off-box copy refuse the
+# set), but a DELETE that fails every night must not read ok either.
 prune_server_snapshots() {  # <collection> <snapshot just verified>
   local coll="$1" cur="$2" name names
   if ! names=$(curl -sf "$QDRANT_URL/collections/$coll/snapshots" \
         | jq -r --arg cur "$cur" '(.result // []) | sort_by([(.creation_time // ""), .name]) | reverse | .[2:][]?.name | select(. != $cur)'); then
     echo "WARN: could not list server-side snapshots of $coll - not pruned" >&2
+    DEG_PRUNE=$((DEG_PRUNE + 1))
     return 0
   fi
   for name in $names; do
-    case "$name" in *[!A-Za-z0-9._-]*|.*) echo "WARN: odd server-side snapshot name '$name' - not deleted" >&2; continue ;; esac
+    case "$name" in *[!A-Za-z0-9._-]*|.*) echo "WARN: odd server-side snapshot name '$name' - not deleted" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); continue ;; esac
     curl -sf -X DELETE "$QDRANT_URL/collections/$coll/snapshots/$name" >/dev/null \
       && echo "qdrant: deleted old server-side snapshot $coll/$name" \
-      || echo "WARN: could not delete server-side snapshot $coll/$name" >&2
+      || { echo "WARN: could not delete server-side snapshot $coll/$name" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); }
   done
-  find "$QDRANT_SNAP_ROOT/$coll" -maxdepth 1 -name 'qdrant-*.snapshot*' -mtime +14 -delete 2>/dev/null
+  find "$QDRANT_SNAP_ROOT/$coll" -maxdepth 1 -name 'qdrant-*.snapshot*' -mtime +14 -delete 2>/dev/null \
+    || { echo "WARN: could not sweep old one-off snapshots under $QDRANT_SNAP_ROOT/$coll" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); }
   return 0
 }
 
@@ -281,9 +289,15 @@ else
   snapshot_collection "$QDRANT_COLLECTION" "$BACKUP_DIR/qdrant-$TS.snapshot" || rc=1
   # The three small secondary collections ride in the same set (episodes_*, *_entities,
   # wiki_pages_*), under a distinct qcol-<kind> prefix so the qdrant-* prune glob stays
-  # disjoint. They are rebuildable, so a failure WARNs but does not fail the night.
+  # disjoint. A failure WARNs and reads `degraded` but does not fail the night: episodes and
+  # wiki are rebuildable, while the entities snapshot is the ONLY copy of that collection.
   seen=""
-  for coll in $(curl -sf "$QDRANT_URL/collections" | jq -r '.result.collections[]?.name' | sort); do
+  colls=""
+  if body=$(curl -sf "$QDRANT_URL/collections") && colls=$(printf '%s' "$body" | jq -r '.result.collections[]?.name' | sort); then :; else
+    echo "WARN: could not list Qdrant collections - secondary collections NOT snapshotted" >&2
+    DEG_SECONDARY=$((DEG_SECONDARY + 1)); colls=""
+  fi
+  for coll in $colls; do
     case "$coll" in *[!A-Za-z0-9._-]*) continue ;; esac
     [ "$coll" = "$QDRANT_COLLECTION" ] && continue
     case "$coll" in
@@ -293,11 +307,11 @@ else
       *) continue ;;
     esac
     case " $seen " in
-      *" $kind "*) echo "WARN: a second $kind collection ($coll) is not snapshotted - one per kind" >&2; continue ;;
+      *" $kind "*) echo "WARN: a second $kind collection ($coll) is not snapshotted - one per kind" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); continue ;;
     esac
     seen="$seen $kind"
     snapshot_collection "$coll" "$BACKUP_DIR/qcol-$kind-$TS.snapshot" \
-      || echo "WARN: $coll snapshot failed (rebuildable; the set is still complete)" >&2
+      || { echo "WARN: $coll snapshot failed (the set is missing this collection)" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); }
   done
 fi
 
@@ -350,6 +364,20 @@ fi
 # Manifests age out with their sets (a manifest for a deleted set is a restore point that lies):
 # pruned AFTER tonight's is written so the window is the same 8 as every other kind.
 prune_kind manifest json
+
+# The step outcome (contract C1, ams-step.sh exports AMS_OUTCOME_FILE): the run exits 0 when the
+# primary set is whole, but a swallowed secondary-snapshot or server-prune failure must not read
+# as a clean ok. One line, `degraded:<reasons> <counts>`; no line means ok. Unset outside a step.
+write_outcome() {
+  [ -n "${AMS_OUTCOME_FILE:-}" ] || return 0
+  local reasons=""
+  if [ "$DEG_SECONDARY" -gt 0 ]; then reasons="secondary-snapshot-failed"; fi
+  if [ "$DEG_PRUNE" -gt 0 ]; then reasons="${reasons:+$reasons,}server-prune-failed"; fi
+  [ -n "$reasons" ] || return 0
+  printf 'degraded:%s {"secondary_snapshot_failed":%d,"server_prune_failed":%d}\n' \
+    "$reasons" "$DEG_SECONDARY" "$DEG_PRUNE" > "$AMS_OUTCOME_FILE"
+}
+write_outcome
 
 echo "stack-backup: complete (rc=$rc)"
 exit $rc
