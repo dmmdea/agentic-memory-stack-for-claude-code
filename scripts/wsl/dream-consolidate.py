@@ -43,6 +43,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402
 import autopromote_lib as ap  # noqa: E402
+import brand_routing  # noqa: E402
 import codex_usage  # noqa: E402
 
 # The server package (codex_shim_client, redact) lives beside the scripts in the repo and under
@@ -339,6 +340,26 @@ def _mem_text(e: dict) -> str:
 
 def _tier(e: dict):
     return (e.get("metadata") or {}).get("tier")
+
+
+def insight_brand(source_ids: list, by_id: dict, shared: set) -> str | None:
+    """The brand an insight is written under: the brand held by MORE THAN HALF of the memories it
+    cites (neutral sources count in the denominator), unless that brand is a shared label. No
+    majority -> None, and the insight stays brand-neutral. Insights used to carry no brand at all,
+    so a client brand's facts leaked into every other brand's recall through them."""
+    if not source_ids:
+        return None
+    counts: dict[str, int] = {}
+    for sid in source_ids:
+        b = str(((by_id.get(str(sid)) or {}).get("metadata") or {}).get("brand") or "").strip()
+        if b:
+            counts[b] = counts.get(b, 0) + 1
+    if not counts:
+        return None
+    brand, n = max(counts.items(), key=lambda kv: kv[1])
+    if n * 2 <= len(source_ids) or brand.lower() in shared:
+        return None
+    return brand
 
 
 def _lines(items) -> str:
@@ -1002,6 +1023,12 @@ class Dream:
         self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
 
         if ins_list and not self.dry:
+            evidence_by_id = {str(e.get("id")): e for e in evidence}
+            try:
+                shared_brands = brand_routing.shared_brands(brand_routing.load_brand_map())
+            except Exception as e:  # noqa: BLE001 - brand routing must never cost an insight
+                log(f"  brand map unreadable ({e}); insights post brand-neutral")
+                shared_brands = set()
             for ins in ins_list:
                 text = str(ins.get("text") or "").strip()
                 if not text:
@@ -1024,11 +1051,15 @@ class Dream:
                     conf = float(ins.get("confidence")) if ins.get("confidence") is not None else None
                 except (TypeError, ValueError):
                     conf = None
+                meta = {"tier": "insight", "category": "insight", "confidence": conf,
+                        "source_memory_ids": lineage, "window_evidence_count": len(evidence),
+                        "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
+                        "dream_phase": "consolidate", "source": "dream-consolidator"}
+                ib = insight_brand(lineage, evidence_by_id, shared_brands)
+                if ib:
+                    meta["brand"] = ib
                 try:
-                    ok = self.mem0.add(text, {"tier": "insight", "category": "insight", "confidence": conf,
-                                              "source_memory_ids": lineage, "window_evidence_count": len(evidence),
-                                              "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
-                                              "dream_phase": "consolidate", "source": "dream-consolidator"})
+                    ok = self.mem0.add(text, meta)
                 except Exception as e:  # noqa: BLE001
                     log(f"  insight post failed (non-fatal): {e}")
                     ok = False

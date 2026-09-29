@@ -642,3 +642,58 @@ def test_store_judge_prompt_names_only_offered_slugs(home):
     assert "ws-a" in p and "a.md" in p and "b.md" in p
     assert "STRICT JSON" in p and "Never invent a slug" in p
     assert "- (none)" in m.store_judge_prompt("ws-b", [], [])
+
+
+# --- C3: an insight carries the majority brand of its source memories --------------------------
+
+def _branded(mid, brand):
+    md = {"tier": "evidence", "source": "l1a-extractor"}
+    if brand:
+        md["brand"] = brand
+    return {"id": mid, "memory": f"fact {mid}", "created_at": "2026-09-11T06:00:00+00:00", "metadata": md}
+
+
+def _insight_metadata(m, monkeypatch, brands, sources=None):
+    """Run one cycle over evidence e1..eN carrying `brands` and return the posted insight's metadata."""
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, ""))
+    ev = [_branded(f"e{i + 1}", b) for i, b in enumerate(brands)]
+    ids = sources or [e["id"] for e in ev]
+    ins = json.dumps({"insights": [{"text": "a consolidated insight", "source_memory_ids": ids, "confidence": 0.8}]})
+    fm = FakeMem0(ev)
+    _run(m, ["--force"], mem0=fm, judge=_judge(SIG, ins, "[]"))
+    assert len(fm.added) == 1
+    return fm.added[0][1]
+
+
+def test_insight_takes_the_majority_brand_of_its_sources(home, monkeypatch):
+    m = _mod()
+    md = _insight_metadata(m, monkeypatch, ["brand-x", "brand-x", None])
+    assert md["brand"] == "brand-x", "2 of 3 sources are brand-x and the third is neutral"
+
+
+def test_insight_has_no_brand_when_no_brand_holds_a_majority(home, monkeypatch):
+    m = _mod()
+    assert "brand" not in _insight_metadata(m, monkeypatch, ["brand-x", "brand-y"]), "1 x + 1 y is a tie"
+    assert "brand" not in _insight_metadata(m, monkeypatch, ["brand-x", None]), "exactly half is not more than half"
+    assert "brand" not in _insight_metadata(m, monkeypatch, [None, None, None]), "all neutral stays neutral"
+
+
+def test_insight_never_takes_a_shared_brand(home, monkeypatch):
+    m = _mod()
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-a")
+    assert "brand" not in _insight_metadata(m, monkeypatch, ["shared-a", "shared-a", "shared-a"])
+    assert _insight_metadata(m, monkeypatch, ["shared-a", "brand-x", "brand-x"])["brand"] == "brand-x"
+
+
+def test_insight_shared_brand_comes_from_the_brand_map_too(home, monkeypatch):
+    m = _mod()
+    bm = home / "brands.json"
+    bm.write_text(json.dumps({"shared_brands": ["shared-a"]}), encoding="utf-8")
+    monkeypatch.setenv("MEM0_BRAND_MAP", str(bm))
+    assert "brand" not in _insight_metadata(m, monkeypatch, ["shared-a", "shared-a"])
+
+
+def test_insight_brand_counts_only_the_lineage_it_cites(home, monkeypatch):
+    m = _mod()
+    md = _insight_metadata(m, monkeypatch, ["brand-y", "brand-x", "brand-x"], sources=["e2", "e3"])
+    assert md["brand"] == "brand-x", "e1 (brand-y) is in the window but is not a source of this insight"
