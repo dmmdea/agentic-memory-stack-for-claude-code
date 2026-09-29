@@ -81,10 +81,16 @@ inside `cmd` on every platform.)
 
 `ttl: 300` on both, not `ttl: 0`. An idle model that never unloads holds its weights for the
 rest of the day on a box you may also want for something else; 300 s is long enough that a
-working session never pays a reload and short enough that an idle box gives the memory back.
-The `support` group above is what keeps the 300 s from costing you anything — the models
-co-reside rather than fighting a chat seat for the slot, so a reload is a cold start, not a
-queue behind someone else's model.
+working session rarely pays a reload and short enough that an idle box gives the memory back.
+The `support` group above keeps the models from fighting a chat seat for the slot — they
+co-reside, so a reload is a cold start, not a queue behind someone else's model.
+
+The 300 s is not free, though: the first embed or rerank after an idle spell pays that cold
+start. The memory server absorbs it (an embedder that cannot answer yet gets a `503` +
+`Retry-After` so writes queue and retry; a reranker that times out is retried once with a
+longer allowance, then search falls back to dense order), and the SessionStart hook pre-warms
+both through `GET /health/embedder?warm=rerank`. See
+[`docs/systems/reranker.md`](../docs/systems/reranker.md).
 
 ## 5. Run it as a service (systemd user unit)
 
