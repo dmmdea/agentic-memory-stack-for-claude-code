@@ -19,13 +19,14 @@ BeforeAll {
         Copy-Item (Join-Path $script:winDir 'sessionstart-capture.ps1') $bin
         Set-Content -LiteralPath (Join-Path $bin 'l1a-extract.ps1') -Encoding ASCII -Value @(
             'param([string]$TranscriptPath = "", [string]$EventName = "")'
-            'Add-Content -LiteralPath (Join-Path $env:USERPROFILE "spawns.log") -Value ($EventName + " " + $TranscriptPath)'
+            '# one file per spawn: concurrent workers appending to one log lose lines and hide a duplicate'
+            'Set-Content -LiteralPath (Join-Path $env:USERPROFILE ("spawn-" + [guid]::NewGuid().ToString("N") + ".txt")) -Value ($EventName + " " + $TranscriptPath)'
         )
         # the embedder pre-warm must never reach a real authority
         Set-Content -LiteralPath (Join-Path $home_ '.mem0\authority-url') -Value 'http://127.0.0.1:1' -Encoding ASCII -NoNewline
         $prior = Join-Path $proj ([guid]::NewGuid().ToString() + '.jsonl')
         Set-Content -LiteralPath $prior -Value '{"message":{"role":"user","content":"hello"}}' -Encoding UTF8
-        return @{ Root = $root; Home = $home_; Bin = $bin; Prior = $prior; Spawns = (Join-Path $home_ 'spawns.log'); State = (Join-Path $home_ '.claude\state') }
+        return @{ Root = $root; Home = $home_; Bin = $bin; Prior = $prior; Spawns = $home_; State = (Join-Path $home_ '.claude\state') }
     }
 
     function script:Start-Capture($Sb, [string]$SessionId) {
@@ -49,10 +50,11 @@ BeforeAll {
         foreach ($p in $Procs) { if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch {}; throw 'sessionstart-capture.ps1 did not exit' } }
     }
 
-    # spawned workers are detached: poll for the record, then give a would-be duplicate time to show up.
-    # A read can race the worker's own append, so an unreadable file counts as "not yet".
+    # Spawned workers are detached: poll for their records, then give a would-be duplicate time to show up.
     function script:Read-SpawnLines($Sb) {
-        try { return @(if (Test-Path $Sb.Spawns) { Get-Content $Sb.Spawns -ErrorAction Stop | Where-Object { $_ } }) } catch { return @() }
+        return @(Get-ChildItem -LiteralPath $Sb.Spawns -Filter 'spawn-*.txt' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            try { (Get-Content -LiteralPath $_.FullName -ErrorAction Stop | Select-Object -First 1) } catch { 'unreadable' }
+        })
     }
     function script:Get-SpawnLines($Sb, [int]$MinLines, [int]$SettleSeconds = 5) {
         $deadline = (Get-Date).AddSeconds(20)
@@ -61,10 +63,7 @@ BeforeAll {
             Start-Sleep -Milliseconds 300
         }
         Start-Sleep -Seconds $SettleSeconds
-        for ($i = 0; $i -lt 5; $i++) {
-            try { return @(if (Test-Path $Sb.Spawns) { Get-Content $Sb.Spawns -ErrorAction Stop | Where-Object { $_ } }) } catch { Start-Sleep -Milliseconds 300 }
-        }
-        return @()
+        return @(Read-SpawnLines $Sb)
     }
 
     $script:haveFive1 = Test-Path -LiteralPath $script:ps51
