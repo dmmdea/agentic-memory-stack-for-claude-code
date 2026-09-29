@@ -1,6 +1,7 @@
 {
   "sanctioned": [
     "github.com/dmmdea/agentic-memory-stack-for-claude-code",
-    "dmmdea/agentic-memory-stack-for-claude-code"
+    "dmmdea/agentic-memory-stack-for-claude-code",
+    "Copyright 2026 dmmdea"
   ]
 }
