@@ -129,16 +129,21 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # is decommissioned from mem0's path.
     # v0.29.1: explicit security floors so fresh installs get the CVE-remediated
     # transitive deps — starlette>=1.3.1 (CVE-2026-54282/54283, FastAPI request path),
-    # cryptography>=48.0.1,<49 (GHSA-537c-gmf6-5ccf; capped <49 so a fresh install
-    # reproduces the as-tested 48.x major — bump the cap via UPGRADE.md for 49.x).
-    # Both deps come in transitively otherwise.
+    # cryptography>=50.0.1 (GHSA-g6cj-pr64-35w5 fixed in 50.0.0, GHSA-jwv3-5hgf-82ww and
+    # GHSA-m2h6-j472-rp4c fixed in 49.0.0). Both deps come in transitively otherwise.
+    # These are FLOORS, never caps or exact pins (house rule: updatable, not pinned into
+    # staleness): a cap on cryptography once kept a reinstall from taking a security fix.
+    # mem0ai[nlp]>=2.0.4 likewise; mem0-server/requirements.txt documents the same set
+    # and tests/test_dependency_floors.py holds the two together.
+    # pip-audit is part of the venv (upgrade-check.sh and the invariants check need it; a
+    # hand-installed scanner is how the scan went blind).
     # AMS-09 (2026-08-07): fastembed is the BM25 sparse-leg encoder. mem0ai puts
     # it under the `extras` extra (NOT `nlp`, which is spacy-only), so it was
     # never installed and every fresh install shipped a silently dead lexical
     # leg (mem0 fail-softs to dense-only with one log warning). Floor-only, no
     # cap (house rule); the /health/deep sparse_leg canary — not a version pin
     # — is the defense against a future breaking fastembed release.
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' pip-audit
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -158,7 +163,7 @@ else
     # a live box actually takes on re-run. Adding it only to the fresh-install
     # line would never heal an existing venv (that is exactly how the leg died:
     # a venv rebuild dropped it and nothing re-installed it).
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=48.0.1,<49' fastembed 'fastmcp>=3' || \
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 
@@ -174,11 +179,32 @@ mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
-"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=48.0.1, an importable fastmcp, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
-import sys
-from importlib.metadata import version
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
+import os, subprocess, sys
+from importlib.metadata import PackageNotFoundError, version
 from packaging.version import Version as V
-ok = V(version("starlette")) >= V("1.3.1") and V(version("cryptography")) >= V("48.0.1")
+ok = True
+# Floors, not pins: anything at or above these carries the security fixes.
+for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "mem0ai": "2.0.4"}.items():
+    try:
+        have = version(name)
+    except PackageNotFoundError:
+        print(f"  {name} is not installed (floor {floor})", file=sys.stderr)
+        ok = False
+        continue
+    if V(have) < V(floor):
+        print(f"  {name} {have} is below the floor {floor}", file=sys.stderr)
+        ok = False
+# A venv whose requirements contradict each other passes every import and fails later.
+chk = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
+if chk.returncode != 0:
+    print("  pip check is not clean:\n" + chk.stdout + chk.stderr, file=sys.stderr)
+    ok = False
+# The vulnerability scanner must be in the venv (upgrade-check.sh runs it from here).
+audit = os.path.join(os.path.dirname(sys.executable), "pip-audit")
+if not (os.path.isfile(audit) and os.access(audit, os.X_OK)):
+    print(f"  pip-audit is not installed at {audit}", file=sys.stderr)
+    ok = False
 # The MCP shim runs on this venv's python; without fastmcp it dies on import and
 # the client only ever shows "Failed to connect". Same silent class as AMS-09:
 # a green installer over a shim that can never start.
@@ -200,7 +226,7 @@ except Exception as e:
     ok = False
 sys.exit(0 if ok else 1)
 PYEOF
-echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=48.0.1,<49, fastmcp importable, fastembed BM25 encoder loadable)"
+echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, pip check clean, pip-audit present, fastmcp importable, fastembed BM25 encoder loadable)"
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the
@@ -333,14 +359,16 @@ if curl -sf -m 20 -X POST http://127.0.0.1:11436/v1/embeddings \
     echo "  EmbeddingGemma reachable on :11436 (768-dim embedder OK)"
 else
     echo "  WARN: EmbeddingGemma not reachable on :11436. Add this model entry to your"
-    echo "        llama-swap config (always_loaded group) and restart llama-swap —"
-    echo "        see SKILL.md 'llama-swap.yaml' section:"
+    echo "        llama-swap config (in a non-exclusive, non-swapping support group) and"
+    echo "        restart llama-swap — see install/llama-swap-setup.md section 4:"
+    echo "          groups:"
+    echo "            support: {swap: false, exclusive: false, members: [embeddinggemma]}"
     echo "          embeddinggemma:"
     echo "            cmd: <llama.cpp>/llama-server --model $EGEMMA_GGUF \\"
-    echo "                 --embeddings --pooling mean --n-gpu-layers 0 \\"
+    echo "                 --embeddings --pooling mean --n-gpu-layers 999 \\"
     echo "                 --ctx-size 2048 --batch-size 2048 --ubatch-size 2048 \\"
     echo "                 --port \${PORT} --host 127.0.0.1"
-    echo "            ttl: 0"
+    echo "            ttl: 300"
     echo "            aliases: [\"embeddinggemma\", \"egemma\", \"embeddinggemma-300m\"]"
 fi
 
