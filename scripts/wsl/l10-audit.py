@@ -168,7 +168,16 @@ _PROVIDER_PREFIX_RE = re.compile(
     r"(?-i:(?<![A-Za-z0-9])(?:sk-|sk_live_|sk_test_|pk_live_|rk_live_|whsec_|gh[pousr]_|github_pat_|"
     r"glpat-|xox[baprs]-|nvapi-|hf_|npm_|vcp_|sbp_|cfut_|tskey-|AIza)[A-Za-z0-9_-]{12,})")
 _RANDOM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9/.\\])[A-Za-z0-9]{32,}(?![A-Za-z0-9])")
-ENTROPY_MIN_BITS = 4.6          # random base62 sits near 4.9-5.0; English CamelCase ids top out ~4.4
+# Entropy alone cannot separate secrets from identifiers at the 32-char floor: a random 32-char
+# base62 token measures only ~4.54 bits at the median (p10 4.37, capped at log2(32) = 5.0), while
+# English CamelCase ids reach 4.4-4.5 at 40-46 chars. A fixed 4.6 floor therefore caught ~39% of
+# exactly-32-char secrets (~90% at 40, ~99% at 48). So the entropy floor is low (4.2) and a second
+# statistic carries the separation: the class-transition ratio (share of adjacent character pairs
+# that change class among digit / UPPER / lower). Random base62 is ~0.62 (p10 ~0.5 at 32 chars);
+# CamelCase ids are ~0.27-0.46, because their words are lowercase runs. Measured (seeded, upper+
+# lower+digit tokens): flagged 94-98% at 32-64 chars; benign ids stay unflagged.
+ENTROPY_MIN_BITS = 4.2
+TRANSITION_MIN_RATIO = 0.48
 _BENIGN_VALUE_START = ("$", "<", "{", "%", "/", "~", "./", "../", "[REDACTED")
 _ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 
@@ -179,6 +188,14 @@ def _entropy_bits(s: str) -> float:
     for ch in s:
         counts[ch] = counts.get(ch, 0) + 1
     return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+def _class_transition_ratio(s: str) -> float:
+    def cls(ch: str) -> int:
+        return 0 if ch.isdigit() else (1 if ch.isupper() else 2)
+    if len(s) < 2:
+        return 0.0
+    return sum(cls(a) != cls(b) for a, b in zip(s, s[1:])) / (len(s) - 1)
 
 
 def _benign_generic_value(value: str) -> bool:
@@ -201,7 +218,8 @@ def has_credential(text: str) -> bool:
     for m in _RANDOM_TOKEN_RE.finditer(text):
         tok = m.group(0)
         if (any(c.isdigit() for c in tok) and any(c.isupper() for c in tok)
-                and any(c.islower() for c in tok) and _entropy_bits(tok) >= ENTROPY_MIN_BITS):
+                and any(c.islower() for c in tok) and _entropy_bits(tok) >= ENTROPY_MIN_BITS
+                and _class_transition_ratio(tok) >= TRANSITION_MIN_RATIO):
             return True
     return False
 

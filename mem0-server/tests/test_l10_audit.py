@@ -212,9 +212,33 @@ def test_high_entropy_token_flags_but_ids_and_prose_do_not():
         "row 023e105f-4ece-4d5e-8f90-a1b2c3d4e5f6 in the table",             # uuid
         "see WarehouseOrdersOffPlatformGapInvestigation2026 for details",      # long CamelCase identifier
         "the path /mnt/x/dev/worktrees/AbCd1234EfGh5678IjKl9012MnOp3456QrSt/docs",  # token inside a path
+        "class InvestigationWarehouseOrdersGap2026Q3 handles it",              # CamelCase, 37 chars
+        "getUserAccountSettingsFromDatabase2026 is the helper",                 # camelCase, 38 chars
+        "ReadyPepPrefilledPensOrderFulfillmentQueue3 runs nightly",            # CamelCase, 43 chars
+        "MemoryAuditPostHocFlagsJsonlWriterV2Impl is the writer",              # CamelCase, 40 chars
+        "ProductVariantInventoryLevelSyncJobRunner9 is the runner",            # CamelCase, 42 chars
     ]
     for t in benign:
         assert "possible-credential" not in l10.heuristic_flags(_payload(t)), t
+
+
+def test_random_base62_tokens_are_flagged_at_every_length():
+    """The entropy signal must catch random secrets, not one hand-picked string. A 32-char random
+    base62 token has a median Shannon entropy of only ~4.54 bits (capped at log2(32) = 5.0), so a
+    fixed 4.6 floor missed ~60% of exactly-32-char secrets. Seeded sample: at each length, >= 90%
+    of random tokens that carry all three character classes must flag."""
+    import random
+    import string
+    alphabet = string.ascii_letters + string.digits
+    rng = random.Random(20260929)
+    for length in (32, 36, 40, 48, 64):
+        tokens = []
+        while len(tokens) < 500:
+            t = "".join(rng.choice(alphabet) for _ in range(length))
+            if any(c.isdigit() for c in t) and any(c.isupper() for c in t) and any(c.islower() for c in t):
+                tokens.append(t)
+        hit = sum(l10.has_credential("the value " + t + " was pasted") for t in tokens)
+        assert hit / len(tokens) >= 0.90, (length, hit / len(tokens))
 
 
 def test_provider_prefix_tripwire_catches_short_shapes_the_rules_size_out():
