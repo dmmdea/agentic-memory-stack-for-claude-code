@@ -138,7 +138,9 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # leg (mem0 fail-softs to dense-only with one log warning). Floor-only, no
     # cap (house rule); the /health/deep sparse_leg canary — not a version pin
     # — is the defense against a future breaking fastembed release.
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
+    # numpy: scripts/wsl/semantic-dedup.py scores duplicate pairs with blocked matrix products
+    # (it arrives transitively with fastembed today; the dedup must not depend on that).
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]==2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=48.0.1,<49'
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
