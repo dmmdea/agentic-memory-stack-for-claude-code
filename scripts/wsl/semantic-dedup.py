@@ -197,6 +197,7 @@ BLOCK_ROWS = 1024
 DEFAULT_MAX_DELETIONS = 50   # per run: the backlog drains over a few nights instead of in one
 DEGRADE_MIN_SCANNED = 1000   # below this, "compared nothing" is a small corpus, not a defect
 DEGRADE_SKIP_FRACTION = 0.01
+DEGRADE_DELETE_FAIL_FRACTION = 0.5   # more than this share of the planned deletes refused = degraded
 
 
 def _is_operator_insight(payload) -> bool:
@@ -320,7 +321,8 @@ def plan_dedup(pts, max_deletions=DEFAULT_MAX_DELETIONS):
         })
     stats.update({
         "candidates": len(decisions),
-        "deleted": sum(1 for d in decisions if d["within_cap"]),
+        "deleted": sum(1 for d in decisions if d["within_cap"]),   # planned; _run replaces it with what happened
+        "planned": sum(1 for d in decisions if d["within_cap"]),
         "protected_skips": protected_skips,
         "max_deletions": max_deletions,
         "capped": any(not d["within_cap"] for d in decisions),
@@ -332,6 +334,12 @@ def run_outcome(stats) -> str:
     """'ok' or 'degraded:<reason>' from the run's own work counts. Exit-0-but-did-nothing is the
     failure this job had for weeks, so the counts decide, not the exit code."""
     scanned = stats.get("scanned", 0)
+    # planned versus done: a run whose every DELETE was refused did none of the work it planned
+    planned, done = stats.get("planned", 0), stats.get("deleted", 0)
+    if planned > 0 and done == 0:
+        return "degraded:deletes-refused"
+    if planned > 0 and stats.get("delete_failed", 0) / planned > DEGRADE_DELETE_FAIL_FRACTION:
+        return "degraded:deletes-failing"
     if scanned > DEGRADE_MIN_SCANNED and stats.get("compared_pairs", 0) == 0:
         return "degraded:compared-0"
     if scanned and stats.get("skipped_no_vector", 0) / scanned > DEGRADE_SKIP_FRACTION:
@@ -371,6 +379,7 @@ def main(argv=None):
 
 def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
     deletions = 0
+    failures = 0
     # Preflight: confirm both backends are reachable
     try:
         with httpx.Client(timeout=5.0) as probe:
@@ -413,6 +422,7 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
                 report.flush()
                 r = c.delete(f"{MEM0}/v1/memories/{rid}")
                 if r.status_code != 200:
+                    failures += 1
                     report.write(json.dumps({"deleted_id": rid, "delete_failed": r.status_code}) + "\n")
                 else:
                     deletions += 1
@@ -429,6 +439,7 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
         _append_summary(f"degraded:aborted:{type(e).__name__}", deletions=deletions, dry_run=dry_run, counts=stats)
         return 1
     stats["deleted"] = deletions   # what actually happened (a failed API delete is not a deletion)
+    stats["delete_failed"] = failures
     outcome = run_outcome(stats)
     label = "DRY-RUN would_delete" if dry_run else "deletions"
     print(f"semantic-dedup: {label}={deletions}, outcome={outcome}, tier_thresholds={TIER_THRESHOLDS}, report={report_path}")

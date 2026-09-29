@@ -1389,7 +1389,7 @@ def test_default_user_id_is_the_corpus_tenant(monkeypatch):
     assert sweep.resolve_user_id(None) is None         # no tenant configured: unchanged behaviour
 
 
-def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fail=()):
+def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fail=(), marker_fail=()):
     """Drive the real canonical sweep leg with fakes for Qdrant, the judge and mem0."""
     monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace())
     monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
@@ -1411,10 +1411,14 @@ def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fa
     monkeypatch.setattr(sweep, "stamp_candidate",
                         lambda http, cid, ts, contradicts=None, clear=False, justification="", pending=False: (
                             stamps.append({"id": cid, "contradicts": contradicts, "clear": clear}) or True))
+    # marker_fail: ids whose rotation-marker PATCH fails; "all" fails every one
     monkeypatch.setattr(sweep, "mark_canonical_checked",
-                        lambda http, cid, ts: (stamps.append({"id": cid, "marker": True}) or True))
+                        lambda http, cid, ts: (stamps.append({"id": cid, "marker": True})
+                                               or not (marker_fail == "all" or cid in marker_fail)))
     monkeypatch.setattr(sweep, "append_review_queue", lambda path, rec: (queued.append(rec) or True))
     monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    # the queue prune reads the real review file and asks Qdrant: never from a unit test
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: 0)
     return stamps, queued, summaries, seen_user
 
 
@@ -1550,3 +1554,168 @@ def test_rejudge_clears_a_stamp_whose_target_is_no_longer_canonical(monkeypatch)
     assert reasons["r-demoted"] == "target-demoted:stable"
     assert reasons["r-retired"] == "target-retired"
     assert reasons["r-gone"] == "dangling-canonical"
+
+
+# ---------------------------------------------------------------------------
+# WP-4 fix round F1: marker failures, the zero-canonical tenant trap, the C1 outcome line
+# ---------------------------------------------------------------------------
+
+def test_failed_rotation_marker_is_not_counted_as_checked_and_degrades(monkeypatch):
+    """A failing marker PATCH leaves every canonical never-checked, so next week the sweep takes the
+    same id-ordered head again (the original bug). The summary used to say N/N and outcome ok."""
+    cans = [_can("c1"), _can("c2"), _can("c3")]
+    _, _, summaries, _ = _sweep_rig(monkeypatch, cans, marker_fail="all")
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 0 and s["marker_failed"] == 3
+    assert s["weeks_for_full_pass"] is None, "no rotation progress must not read as a finite pass"
+    assert s["outcome"].startswith("degraded:marker-failed") and rc == 1
+
+
+def test_a_single_failed_marker_is_counted_and_degrades(monkeypatch):
+    """Fail loud: a canonical whose marker keeps failing would sit at the front of the rotation and
+    eat a slot every week, visible nowhere but here."""
+    cans = [_can("c1"), _can("c2"), _can("c3")]
+    _, _, summaries, _ = _sweep_rig(monkeypatch, cans, marker_fail=("c2",))
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 2 and s["marker_failed"] == 1
+    assert s["outcome"].startswith("degraded:marker-failed") and rc == 1
+
+
+def test_a_no_vector_canonical_whose_marker_fails_is_counted_too(monkeypatch):
+    blind = dict(_can("c1"), vector=None)
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [blind, _can("c2")], marker_fail=("c1",))
+    sweep.main(["--apply", "--judge", "codex"])
+    assert summaries[-1]["marker_failed"] == 1 and summaries[-1]["canonicals_checked"] == 1
+
+
+def test_dry_run_reports_no_marker_failures_and_counts_the_pass(monkeypatch):
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1"), _can("c2")], marker_fail="all")
+    rc = sweep.main(["--judge", "codex"])      # dry run: no marker is attempted
+    s = summaries[-1]
+    assert s["marker_failed"] == 0 and s["canonicals_checked"] == 2 and s["outcome"] == "ok" and rc == 0
+
+
+def test_zero_canonicals_under_a_defaulted_tenant_degrades_but_an_explicit_scope_does_not(monkeypatch):
+    """--user-id defaults to the corpus tenant; a wrong tenant scopes to zero canonicals, which used
+    to exit 0 as no-op:zero-canonicals and read ok."""
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [])
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    assert summaries[-1]["outcome"] == "degraded:zero-canonicals-defaulted-tenant"
+    assert summaries[-1]["user_id"] == "u1"
+    for extra in (["--user-id", "someone"], ["--user-id", ""]):     # operator chose the scope
+        assert sweep.main(["--apply", "--judge", "codex", *extra]) == 0
+        assert summaries[-1]["outcome"] == "no-op:zero-canonicals"
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")       # no tenant configured: unscoped
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0
+    assert summaries[-1]["outcome"] == "no-op:zero-canonicals"
+
+
+def test_run_outcome_new_guards_and_precedence():
+    assert sweep.run_outcome(5, 1, 0, None, marker_failed=1) == "degraded:marker-failed:1"
+    assert sweep.run_outcome(0, 0, 0, None, user_id_defaulted=True) == "degraded:zero-canonicals-defaulted-tenant"
+    assert sweep.run_outcome(0, 0, 0, None, user_id_defaulted=False) == "no-op:zero-canonicals"
+    # a marker failure outranks the benign no-op, an abort outranks the marker failure
+    assert sweep.run_outcome(5, 4, 4, None, marker_failed=2).startswith("degraded:marker-failed")
+    assert sweep.run_outcome(5, 4, 4, "ReadTimeout", marker_failed=2).startswith("degraded:aborted:")
+
+
+_REAL_APPEND_SUMMARY = sweep._append_summary
+
+
+def _real_summary(monkeypatch, tmp_path):
+    """Undo the rig's summary stub: the C1 line is written from the real _append_summary."""
+    tmp_path.mkdir(exist_ok=True)
+    monkeypatch.setattr(sweep, "SWEEP_LOG", tmp_path / "sweep.jsonl")
+    monkeypatch.setattr(sweep, "_append_summary", _REAL_APPEND_SUMMARY)
+    out = tmp_path / "outcome.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    return out
+
+
+def test_the_sweep_writes_the_c1_outcome_line(monkeypatch, tmp_path):
+    cans = [_can("c1"), _can("c2")]
+    _sweep_rig(monkeypatch, cans, marker_fail=("c1",))
+    out = _real_summary(monkeypatch, tmp_path / "a")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    text = out.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    assert status == "degraded:marker-failed:1"
+    counts = json.loads(body)
+    assert counts["marker_failed"] == 1 and counts["canonicals_checked"] == 1 and counts["canonical_total"] == 2
+    assert len(text.splitlines()) == 1, "exactly one line"
+    # a healthy run writes a bare ok
+    _sweep_rig(monkeypatch, cans)
+    out2 = _real_summary(monkeypatch, tmp_path / "b")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0
+    assert out2.read_text(encoding="utf-8").startswith("ok {")
+
+
+def test_c1_status_mapping_and_the_defaulted_tenant_line(monkeypatch, tmp_path):
+    assert sweep._c1_status("ok") == "ok"
+    assert sweep._c1_status("no-op:zero-canonicals") == "ok:no-op:zero-canonicals"
+    assert sweep._c1_status("fatal:codex-bridge-missing") == "failed:codex-bridge-missing"
+    # the abort grammar carries a space; the C1 status token ends at the first space
+    assert " " not in sweep._c1_status("degraded:judge-lock-contended: lock held 40 min")
+    _sweep_rig(monkeypatch, [])
+    out = _real_summary(monkeypatch, tmp_path / "c")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    assert out.read_text(encoding="utf-8").startswith("degraded:zero-canonicals-defaulted-tenant {")
+
+
+def test_outcome_line_never_downgrades_within_a_chained_run(monkeypatch, tmp_path):
+    """main() runs the sweep and then the stamped re-judge against ONE outcome file; the second
+    pass finishing ok must not overwrite the first pass's degraded line."""
+    out = tmp_path / "o.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    sweep._write_outcome("degraded:marker-failed:2", {"a": 1})
+    sweep._write_outcome("ok", {"b": 2})
+    assert out.read_text(encoding="utf-8").startswith("degraded:marker-failed:2 ")
+    sweep._write_outcome("failed:boom", {})
+    assert out.read_text(encoding="utf-8").startswith("failed:boom ")     # worse still wins
+    monkeypatch.delenv("AMS_OUTCOME_FILE")
+    sweep._write_outcome("ok", {})                                         # by hand: nothing to write, nothing raised
+
+
+def test_summary_paths_that_never_reach_the_sweep_loop_write_the_line_too(monkeypatch, tmp_path):
+    """Every terminal path goes through _append_summary, so a failed preflight is a degraded line too."""
+    monkeypatch.setattr(sweep, "SWEEP_LOG", tmp_path / "s.jsonl")
+    out = tmp_path / "o.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    _REAL_APPEND_SUMMARY({"outcome": "degraded:qdrant-unreachable", "skipped": "x"})
+    assert out.read_text(encoding="utf-8").startswith("degraded:qdrant-unreachable ")
+
+
+def test_canonical_stale_route_queues_even_when_the_candidate_is_already_queued(monkeypatch, tmp_path):
+    """End to end through the sweep leg with the REAL queue: a candidate already queued for promote
+    used to swallow its canonical-possibly-stale record."""
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    cans = [_can("c1", created="2026-07-01T00:00:00+00:00")]
+    cands = {"c1": [_cand("newer", created="2026-09-01T00:00:00+00:00")]}
+    _sweep_rig(monkeypatch, cans, cands, {"candidate newer": (True, "YES conflict")})
+    monkeypatch.setattr(sweep, "append_review_queue", _REAL_APPEND_REVIEW_QUEUE)
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "newer", "canonical_id": "c9"})
+    sweep.main(["--apply", "--judge", "codex"])
+    recs = [json.loads(ln) for ln in q.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert [(r.get("kind"), r["memory_id"]) for r in recs] == [(None, "newer"), ("canonical-possibly-stale", "newer")]
+
+
+_REAL_APPEND_REVIEW_QUEUE = sweep.append_review_queue
+
+
+def test_the_sweep_prunes_stale_queue_entries_in_apply_mode_only(monkeypatch, tmp_path):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "m1", "stale_canonical_id": "gone",
+                                       "kind": "canonical-possibly-stale"})
+    _sweep_rig(monkeypatch, [_can("c1")])
+    calls = []
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
+    sweep.main(["--judge", "codex"])                      # dry run: the queue is not touched
+    assert calls == []
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1")])
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
+    sweep.main(["--apply", "--judge", "codex"])
+    assert calls == [str(q)] and summaries[-1]["stale_review_pruned"] == 3

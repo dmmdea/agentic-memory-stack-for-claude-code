@@ -512,18 +512,27 @@ def model_available(models_json, model: str) -> bool:
 
 
 def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
-                aborted: Optional[str], all_no_vector: bool = False) -> str:
+                aborted: Optional[str], all_no_vector: bool = False,
+                marker_failed: int = 0, user_id_defaulted: bool = False) -> str:
     """v0.20 M7: classify a completed run for the JSONL summary + R6c.
     'ok' | 'degraded:<reason>' (exit nonzero) | 'no-op:<reason>' (exit 0,
     R6c WARNs). pairs_checked==0 with canonicals present is 'ok' — the
-    idempotent steady state where every candidate was checked recently."""
+    idempotent steady state where every candidate was checked recently.
+
+    Zero canonicals is a quiet no-op only when the operator chose the scope: --user-id defaults to
+    the corpus tenant, and a wrong tenant scopes to zero canonicals, which exited 0 and read ok.
+    Any failed rotation-marker write degrades (unlike a Qdrant query blip, it is a broken write path,
+    and a canonical whose marker keeps failing stays at the front of the rotation every week)."""
     if aborted:
         return _outcome_for_abort(aborted)
     if canonical_total == 0:
-        return "no-op:zero-canonicals"
+        return ("degraded:zero-canonicals-defaulted-tenant" if user_id_defaulted
+                else "no-op:zero-canonicals")
     if all_no_vector:
         # every canonical in the run lacked a dense vector: a shape change, not a quiet week
         return "degraded:no-vectors"
+    if marker_failed > 0:
+        return f"degraded:marker-failed:{marker_failed}"
     if pairs_checked > 0 and skipped_pairs == pairs_checked:
         return "no-op:all-pairs-skipped"
     return "ok"
@@ -888,9 +897,19 @@ def resolve_action(verdict: Optional[bool], was_pending: bool, no_auto_promote: 
     return "queue-review" if no_auto_promote else "promote"
 
 
-def _queued_ids(path) -> set:
-    """memory_ids already in the review queue (for idempotent append)."""
-    ids: set = set()
+STALE_KIND = "canonical-possibly-stale"
+
+
+def _queue_key(rec: dict) -> tuple:
+    """Idempotency key of a review-queue line: (memory_id, kind, stale canonical). A promote line has
+    no kind and no stale canonical; the stale kind names the canonical it doubts. Keying on memory_id
+    alone let a candidate already queued for promote swallow its canonical-possibly-stale record."""
+    return (rec.get("memory_id"), rec.get("kind") or "", rec.get("stale_canonical_id") or "")
+
+
+def _queued_keys(path) -> set:
+    """Keys (see _queue_key) already in the review queue, for idempotent append."""
+    keys: set = set()
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -898,21 +917,21 @@ def _queued_ids(path) -> set:
                 if not line:
                     continue
                 try:
-                    ids.add(json.loads(line).get("memory_id"))
-                except ValueError:
+                    keys.add(_queue_key(json.loads(line)))
+                except (ValueError, AttributeError):
                     pass
     except OSError:
         pass
-    return ids
+    return keys
 
 
 def append_review_queue(path, record: dict) -> bool:
-    """Append a YES-promote candidate to the human-review queue (one JSON line), IDEMPOTENT by
-    memory_id so a re-flagged candidate isn't duplicated across weekly runs. Never raises —
-    returns False on any write failure (the queue is advisory, must not crash the sweep)."""
+    """Append a candidate to the human-review queue (one JSON line), IDEMPOTENT by _queue_key so a
+    re-flagged candidate isn't duplicated across weekly runs while a different kind of record for the
+    same memory still lands. Never raises: returns False on any write failure (the queue is advisory,
+    must not crash the sweep)."""
     try:
-        mid = record.get("memory_id")
-        if mid and mid in _queued_ids(path):
+        if record.get("memory_id") and _queue_key(record) in _queued_keys(path):
             return True  # already queued -> idempotent no-op
         record.setdefault("ts", _iso_now())
         p = Path(path)
@@ -924,9 +943,9 @@ def append_review_queue(path, record: dict) -> bool:
         return False
 
 
-def remove_from_review_queue(path, memory_id) -> int:
-    """Drop all queue lines for memory_id (called after a human --promote, so the review count
-    reflects only OUTSTANDING candidates). Returns lines removed. Never raises."""
+def _drop_queue_lines(path, should_drop) -> int:
+    """Rewrite the queue without the lines should_drop(record) accepts; returns lines removed.
+    Unparseable lines are kept verbatim. Never raises."""
     try:
         p = Path(path)
         if not p.is_file():
@@ -942,7 +961,7 @@ def remove_from_review_queue(path, memory_id) -> int:
                 except ValueError:
                     kept.append(s)
                     continue
-                if rec.get("memory_id") == memory_id:
+                if isinstance(rec, dict) and should_drop(rec):
                     removed += 1
                 else:
                     kept.append(s)
@@ -953,6 +972,46 @@ def remove_from_review_queue(path, memory_id) -> int:
         return removed
     except OSError:
         return 0
+
+
+def remove_from_review_queue(path, memory_id, exclude_kinds: tuple = ()) -> int:
+    """Drop the queue lines for memory_id (called after a human --promote or --dismiss, so the review
+    count reflects only OUTSTANDING candidates), except lines whose kind is in exclude_kinds. Returns
+    lines removed. Never raises."""
+    return _drop_queue_lines(
+        path, lambda rec: rec.get("memory_id") == memory_id and (rec.get("kind") or "") not in exclude_kinds)
+
+
+def prune_stale_review_entries(http: httpx.Client, path) -> int:
+    """Drop canonical-possibly-stale lines whose stale canonical is no longer a live canonical (demoted,
+    retired or gone): the doubt they record is settled, and nothing else ever removed them, so the queue
+    only grew and pending_contradiction_reviews trended to permanent degraded. A canonical that cannot be
+    looked up (transport or HTTP error) keeps its lines: absent and errored are different answers, as in
+    fetch_point_info. Returns lines removed."""
+    wanted: set = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("kind") == STALE_KIND and rec.get("stale_canonical_id"):
+                    wanted.add(str(rec["stale_canonical_id"]))
+    except OSError:
+        return 0
+    settled: set = set()
+    for cid in sorted(wanted):
+        try:
+            info = fetch_point_info(http, cid)
+        except (httpx.HTTPError, OSError, ValueError):
+            continue
+        if info is None or info["tier"] != "canonical" or info["retired"]:
+            settled.add(cid)
+    if not settled:
+        return 0
+    return _drop_queue_lines(
+        path, lambda rec: rec.get("kind") == STALE_KIND and str(rec.get("stale_canonical_id")) in settled)
 
 
 def _acquire_lock(path, stale_s: int = 3600) -> bool:
@@ -1002,12 +1061,26 @@ def run_promote(mem0_http: httpx.Client, memory_id: str) -> int:
     ok = stamp_candidate(mem0_http, memory_id, _iso_now(), contradicts=str(canonical_id),
                          justification="human-confirmed promote from review queue", pending=False)
     if ok:
-        remove_from_review_queue(str(REVIEW_QUEUE), memory_id)  # outstanding-only review count
+        # outstanding-only review count; the stale record for the same memory is a different question
+        remove_from_review_queue(str(REVIEW_QUEUE), memory_id, exclude_kinds=(STALE_KIND,))
         print(f"contradiction-sweep: --promote {memory_id}: ENFORCED (hidden) vs canonical "
               f"{canonical_id} — human-confirmed", flush=True)
         return 0
     print(f"contradiction-sweep: --promote {memory_id}: stamp FAILED", flush=True)
     return 1
+
+
+def run_dismiss(memory_id: str) -> int:
+    """--dismiss <memory_id>: the operator's answer to a review-queue line that needs no stamp, chiefly
+    canonical-possibly-stale (--promote refuses it: it has no canonical_id). Drops every queue line for
+    memory_id. Exit 0 when something was removed, 1 when nothing matched."""
+    removed = remove_from_review_queue(str(REVIEW_QUEUE), memory_id)
+    if not removed:
+        print(f"contradiction-sweep: --dismiss {memory_id}: not found in review queue "
+              f"({REVIEW_QUEUE}) - nothing to dismiss", flush=True)
+        return 1
+    print(f"contradiction-sweep: --dismiss {memory_id}: removed {removed} review-queue line(s)", flush=True)
+    return 0
 
 
 def run_unstamp(mem0_http: httpx.Client, memory_id: str) -> int:
@@ -1132,6 +1205,44 @@ def query_similar(http: httpx.Client, vector: list, user_id: str,
 # Main sweep
 # ---------------------------------------------------------------------------
 
+_OUTCOME_RANK = {"ok": 0, "degraded": 1, "failed": 2}
+
+
+def _c1_status(outcome: str) -> str:
+    """The sweep's outcome vocabulary in the C1 grammar (status is ok | degraded | failed, and the
+    status token ends at the first space): no-op:<r> -> ok:no-op:<r> (a quiet no-op stays ok),
+    fatal:<r> -> failed:<r>, whitespace inside a reason folded to '_'."""
+    o = "_".join(str(outcome).split())[:160] or "ok"
+    if o.startswith("no-op:"):
+        return "ok:" + o
+    if o.startswith("fatal:"):
+        return "failed:" + o[len("fatal:"):]
+    return o
+
+
+def _write_outcome(outcome: str, record: dict) -> None:
+    """The step-outcome line ams-step.sh reads: '<status>[:<reason>] <compact json counts>' written to
+    AMS_OUTCOME_FILE. One line per run, and never a downgrade: main() chains the sweep and the stamped
+    re-judge against ONE file, and the second pass finishing ok must not overwrite a degraded first pass.
+    The counts are the summary's scalar fields."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    status = _c1_status(outcome)
+    try:
+        p = Path(path)
+        try:
+            prior = p.read_text(encoding="utf-8").split(" ", 1)[0].split(":", 1)[0]
+        except OSError:
+            prior = ""
+        if _OUTCOME_RANK.get(prior, -1) > _OUTCOME_RANK.get(status.split(":", 1)[0], 0):
+            return
+        counts = {k: v for k, v in record.items() if isinstance(v, (int, float))}
+        p.write_text(f"{status} {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"contradiction-sweep: outcome file write failed (non-fatal): {e}", flush=True)
+
+
 def _append_summary(record: dict) -> None:
     record.setdefault("ts", _iso_now())
     record.setdefault("schema_version", "v20")  # v0.20 Phase C: outcome + canonical_total
@@ -1146,6 +1257,10 @@ def _append_summary(record: dict) -> None:
             f.write(json.dumps(record) + "\n")
     except OSError as e:  # advisory log must never crash the sweep
         print(f"contradiction-sweep: summary append failed (non-fatal): {e}", flush=True)
+    # every terminal path (preflight failures, no-ops, all four legs) goes through here, so this is
+    # the one place the C1 outcome line is written
+    if record.get("outcome"):
+        _write_outcome(str(record["outcome"]), record)
 
 
 # ---------------------------------------------------------------------------
@@ -1974,6 +2089,10 @@ def _main(argv=None) -> int:
                         help="human-confirm a queued review candidate: enforce (HIDE) MEMORY_ID against "
                              "the canonical recorded in the review queue, then exit. The reviewed-and-"
                              "approved counterpart to the safe auto-CLEAR loop.")
+    parser.add_argument("--dismiss", default=None, metavar="MEMORY_ID",
+                        help="drop every review-queue line for MEMORY_ID, then exit. The way out for a "
+                             "canonical-possibly-stale line, which --promote refuses (no canonical_id); "
+                             "the sweep also prunes such lines by itself once the canonical is demoted.")
     parser.add_argument("--evidence-sweep", action="store_true",
                         help="evidence-vs-evidence mode: anchor on the most-recent NON-canonical facts, "
                              "find OLDER near-duplicate neighbors, judge contradiction (newer wins), and "
@@ -2010,7 +2129,9 @@ def _main(argv=None) -> int:
                              "--resolve-supersede)")
     args = parser.parse_args(argv)
     dry_run = not args.apply
+    user_id_defaulted = args.user_id is None      # the operator did not choose a scope
     args.user_id = resolve_user_id(args.user_id)
+    user_id_defaulted = user_id_defaulted and args.user_id is not None
 
     if args.resolve_supersede:
         if not args.winner:
@@ -2086,6 +2207,9 @@ def _main(argv=None) -> int:
         with httpx.Client(headers={"X-API-Key": api_key,
                                    "Content-Type": "application/json"}) as mem0_http:
             return run_unstamp(mem0_http, args.unstamp)
+
+    if args.dismiss:
+        return run_dismiss(args.dismiss)      # queue file only: no backend, no judge
 
     if args.promote:
         # human-confirmed enforce from the review queue — no sweep, no judging, no shim needed.
@@ -2174,6 +2298,8 @@ def _main(argv=None) -> int:
     canonicals_checked = 0         # WP-4: swept end to end this run (the rotation marker was written)
     canonicals_query_failed = 0    # candidate query failed: NOT marked, keeps its place at the front
     skipped_no_vector = 0          # WP-4: no dense vector - counted, never a silent continue
+    marker_written = marker_failed = 0   # rotation-marker PATCH results (apply mode only)
+    stale_review_pruned = 0        # canonical-possibly-stale queue lines whose canonical is gone
     stale_routed = 0               # YES pairs whose candidate is NEWER than the canonical
     aborted: Optional[str] = None
     try:
@@ -2205,7 +2331,10 @@ def _main(argv=None) -> int:
                 if not dry_run:
                     # marked anyway: a canonical that can never be swept would otherwise sit at the
                     # front of the rotation forever and eat the budget every week
-                    mark_canonical_checked(mem0_http, can_id, _iso_now())
+                    if mark_canonical_checked(mem0_http, can_id, _iso_now()):
+                        marker_written += 1
+                    else:
+                        marker_failed += 1
                 continue
             try:
                 raw = query_similar(qdrant_http, vec, can_user, can_id,
@@ -2327,9 +2456,21 @@ def _main(argv=None) -> int:
             if not aborted:
                 # the canonical was swept end to end (0 eligible candidates counts): advance its
                 # rotation marker, or order_canonicals would put it first again next week
-                canonicals_checked += 1
-                if not dry_run:
-                    mark_canonical_checked(mem0_http, can_id, _iso_now())
+                # (apply mode: only when the marker landed, or a failing marker would report full
+                # coverage while the rotation never advanced and the same head is re-taken)
+                if dry_run:
+                    canonicals_checked += 1
+                elif mark_canonical_checked(mem0_http, can_id, _iso_now()):
+                    canonicals_checked += 1
+                    marker_written += 1
+                else:
+                    marker_failed += 1
+        if not dry_run and not aborted:
+            # the queue only ever grew: drop stale-canonical doubts whose canonical is no longer canonical
+            try:
+                stale_review_pruned = prune_stale_review_entries(qdrant_http, str(REVIEW_QUEUE))
+            except (httpx.HTTPError, OSError, ValueError) as e:
+                print(f"contradiction-sweep: review-queue prune failed (non-fatal): {e}", flush=True)
     except (httpx.HTTPError, OSError) as e:
         # Mid-run backend failure: degrade with partial counts, never crash.
         aborted = f"{type(e).__name__}: {str(e)[:120]}"
@@ -2341,7 +2482,8 @@ def _main(argv=None) -> int:
         mem0_http.close()
 
     outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted,
-                          all_no_vector=bool(canonicals) and skipped_no_vector == len(canonicals))
+                          all_no_vector=bool(canonicals) and skipped_no_vector == len(canonicals),
+                          marker_failed=marker_failed, user_id_defaulted=user_id_defaulted)
     summary = {
         "ts": run_ts,
         "dry_run": dry_run,
@@ -2355,6 +2497,9 @@ def _main(argv=None) -> int:
         **sweep_coverage(canonical_total, canonicals_checked),   # WP-4: checked/total + weeks for a full pass
         "user_id": args.user_id,
         "skipped_no_vector": skipped_no_vector,
+        "marker_written": marker_written,
+        "marker_failed": marker_failed,
+        "stale_review_pruned": stale_review_pruned,
         "canonicals_query_failed": canonicals_query_failed,
         "stale_canonical_routed": stale_routed,
         "pairs_checked": pairs_checked,

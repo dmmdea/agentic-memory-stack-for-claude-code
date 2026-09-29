@@ -279,3 +279,37 @@ def test_failed_delete_is_not_counted_and_the_restore_record_is_written_first(ri
     assert [r for r in lines if "delete_failed" in r] == [{"deleted_id": "e1-new", "delete_failed": 500}]
     row = json.loads((tmp / "dedup-summary.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["deleted"] == 1 and row["candidates"] == 2
+    assert row["planned"] == 2 and row["delete_failed"] == 1
+    assert row["outcome"] == "ok", "one refusal of two is within tolerance"
+
+
+def test_outcome_degrades_when_the_api_refuses_the_deletes():
+    """Planned versus done: the run used to report ok while every DELETE was refused."""
+    base = {"scanned": 5000, "compared_pairs": 12_000_000, "skipped_no_vector": 0}
+    assert sd.run_outcome(dict(base, planned=50, deleted=0, delete_failed=50)) == "degraded:deletes-refused"
+    assert sd.run_outcome(dict(base, planned=3, deleted=1, delete_failed=2)) == "degraded:deletes-failing"
+    assert sd.run_outcome(dict(base, planned=4, deleted=2, delete_failed=2)) == "ok"     # half is tolerated
+    assert sd.run_outcome(dict(base, planned=0, deleted=0, delete_failed=0)) == "ok"     # nothing planned
+    assert sd.run_outcome(dict(base, planned=50, deleted=50, delete_failed=0)) == "ok"
+
+
+def test_run_reports_degraded_when_mem0_refuses_every_delete(rig, monkeypatch):
+    tmp, outcome, deleted = rig
+    monkeypatch.setattr(sd, "scroll_all_with_vectors", _twin_corpus)
+    _FAILING.update({"e1-new", "e2-new"})
+    assert sd._run(dry_run=False, max_deletions=50) == 0
+    assert deleted == []
+    row = json.loads((tmp / "dedup-summary.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["outcome"] == "degraded:deletes-refused"
+    assert (row["planned"], row["deleted"], row["delete_failed"]) == (2, 0, 2)
+    status, _, body = outcome.read_text(encoding="utf-8").partition(" ")
+    assert status == "degraded:deletes-refused"
+    assert json.loads(body)["delete_failed"] == 2
+
+
+def test_dry_run_never_reads_as_refused(rig, monkeypatch):
+    tmp, outcome, deleted = rig
+    monkeypatch.setattr(sd, "scroll_all_with_vectors", _twin_corpus)
+    _FAILING.update({"e1-new", "e2-new"})           # irrelevant: a dry run issues no DELETE
+    sd._run(dry_run=True, max_deletions=50)
+    assert outcome.read_text(encoding="utf-8").startswith("ok ")

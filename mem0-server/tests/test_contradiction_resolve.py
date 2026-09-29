@@ -9,6 +9,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import httpx
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "wsl" / "contradiction-sweep.py"
 _spec = importlib.util.spec_from_file_location("contradiction_sweep", SCRIPT)
@@ -99,6 +101,96 @@ def test_remove_from_review_queue(tmp_path):
     assert len(lines) == 1 and json.loads(lines[0])["memory_id"] == "b"
     assert sweep.remove_from_review_queue(str(q), "nope") == 0  # absent -> 0
     assert sweep.remove_from_review_queue(str(tmp_path / "missing.jsonl"), "a") == 0  # no file -> 0
+
+
+# --- canonical-possibly-stale entries: keyed by (memory_id, kind, stale canonical), removable, pruned ---
+
+STALE = "canonical-possibly-stale"
+
+
+def _stale(mid, can):
+    return {"memory_id": mid, "stale_canonical_id": can, "kind": STALE}
+
+
+def _lines(q):
+    return [json.loads(ln) for ln in q.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_a_queued_promote_record_does_not_swallow_the_stale_record_for_the_same_memory(tmp_path):
+    """append_review_queue was idempotent by memory_id alone, so a candidate already queued for
+    promote silently dropped the canonical-possibly-stale record the sweep then tried to add."""
+    q = tmp_path / "q.jsonl"
+    assert sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"}) is True
+    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) is True
+    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) is True      # still idempotent
+    assert sweep.append_review_queue(str(q), _stale("m1", "c3")) is True      # another stale canonical
+    assert [(r.get("kind"), r.get("stale_canonical_id")) for r in _lines(q)] == [
+        (None, None), (STALE, "c2"), (STALE, "c3")]
+
+
+def test_promote_removal_leaves_the_stale_record_alone(tmp_path):
+    """--promote acts on canonical_id records only; the stale record is a different question (is
+    the canonical stale?) and stays until it is dismissed or its canonical is demoted."""
+    q = tmp_path / "q.jsonl"
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"})
+    sweep.append_review_queue(str(q), _stale("m1", "c2"))
+    assert sweep.remove_from_review_queue(str(q), "m1", exclude_kinds=(STALE,)) == 1
+    assert [r["kind"] for r in _lines(q)] == [STALE]
+
+
+def test_run_promote_keeps_the_stale_record_of_the_same_memory(tmp_path, monkeypatch):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    monkeypatch.setattr(sweep, "stamp_candidate", lambda *a, **k: True)
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"})
+    sweep.append_review_queue(str(q), _stale("m1", "c2"))
+    assert sweep.run_promote(None, "m1") == 0
+    assert [r.get("kind") for r in _lines(q)] == [STALE]
+
+
+def test_dismiss_removes_every_queue_line_for_the_memory(tmp_path, monkeypatch):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"})
+    sweep.append_review_queue(str(q), _stale("m1", "c2"))
+    sweep.append_review_queue(str(q), _stale("m2", "c2"))
+    assert sweep.run_dismiss("m1") == 0
+    assert [r["memory_id"] for r in _lines(q)] == ["m2"]
+    assert sweep.run_dismiss("m1") == 1          # nothing left to dismiss: not silent success
+
+
+def test_main_dismiss_needs_no_backend(tmp_path, monkeypatch):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    sweep.append_review_queue(str(q), _stale("m1", "c2"))
+    assert sweep.main(["--dismiss", "m1"]) == 0
+    assert _lines(q) == []
+
+
+def _info_client(tiers):
+    """Fake Qdrant points lookup: id -> tier (None = absent; 'ERR' = server error)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        pid = json.loads(request.content)["ids"][0]
+        t = tiers.get(pid)
+        if t == "ERR":
+            return httpx.Response(500, json={})
+        if t is None:
+            return httpx.Response(200, json={"result": []})
+        return httpx.Response(200, json={"result": [{"id": pid, "payload": {"data": "x", "tier": t}}]})
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_prune_drops_stale_records_whose_canonical_is_no_longer_canonical(tmp_path):
+    """Without this the queue only grew: nothing removed a stale line, the depth count degraded the
+    review-queue capability above 50, and it stayed degraded for good."""
+    q = tmp_path / "q.jsonl"
+    sweep.append_review_queue(str(q), {"memory_id": "p1", "canonical_id": "c9"})   # a promote record
+    for mid, can in (("m-demoted", "c-stable"), ("m-gone", "c-gone"), ("m-live", "c-live"),
+                     ("m-blip", "c-blip")):
+        sweep.append_review_queue(str(q), _stale(mid, can))
+    http = _info_client({"c-stable": "stable", "c-gone": None, "c-live": "canonical", "c-blip": "ERR"})
+    assert sweep.prune_stale_review_entries(http, str(q)) == 2
+    assert sorted(r["memory_id"] for r in _lines(q)) == ["m-blip", "m-live", "p1"]   # an error is never absence
 
 
 # --- evidence-vs-evidence detection: recency (the NEWER fact wins; only an OLDER neighbor loses) ---

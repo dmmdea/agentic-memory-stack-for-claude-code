@@ -48,7 +48,7 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 systemctl --user list-timers --all | grep -E "decay|backup|goals|contradiction|reconcile|l10"
 ```
 
-**Reading the semantic-dedup receipt** (`~/.mem0/dedup-summary.jsonl`, last row; also the step's `work` counts): `scanned`, `skipped_no_vector`, `compared_pairs`, `candidates`, `deleted`, `protected_skips`, `max_deletions`, `capped`. A run that scanned over 1000 points and compared no pair (or skipped over 1 % for want of a vector) reads `degraded:compared-0` / `degraded:skipped-no-vector`, and so does the `dedup-job` capability. Each run deletes at most `--max-deletions` (default 50, highest cosine first), so a backlog drains over a few nights; `--dry-run` writes every candidate to `~/.mem0/dedup-report.dryrun.jsonl` for review before any live run. Canonical, automemory-migrated and operator-sourced insight records are never deleted.
+**Reading the semantic-dedup receipt** (`~/.mem0/dedup-summary.jsonl`, last row; also the step's `work` counts): `scanned`, `skipped_no_vector`, `compared_pairs`, `candidates`, `deleted`, `protected_skips`, `max_deletions`, `capped`, plus `planned` (deletions the run meant to make) and `delete_failed` (refused by mem0). A run that scanned over 1000 points and compared no pair (or skipped over 1 % for want of a vector) reads `degraded:compared-0` / `degraded:skipped-no-vector`, and so does the `dedup-job` capability. A run whose every planned delete was refused reads `degraded:deletes-refused`, and one where more than half were refused `degraded:deletes-failing`; the restore record marks each refused id (`delete_failed`). Each run deletes at most `--max-deletions` (default 50, highest cosine first), so a backlog drains over a few nights; `--dry-run` writes every candidate to `~/.mem0/dedup-report.dryrun.jsonl` for review before any live run. Canonical, automemory-migrated and operator-sourced insight records are never deleted.
 
 **Reading the episodic-reconcile receipt** (`~/.mem0/episodic-reconciliation.jsonl`): the Sunday run also abandons `in_progress` episodes untouched for 7 days (`abandoned_stale_in_progress`) and embeds up to 500 missing episode summaries per run (`embedding_backfill`, newest first, skipped while `/health/embedder` is down); embedding coverage under 90 % of eligible episodes reads `degraded:embedding-coverage-<pct>` (a catching-up backlog: outcome and step status, exit 0). An
 *orphaned link* is an episode→memory link whose memory is gone from Qdrant. Since 2026-08-24
@@ -87,6 +87,11 @@ $PY ~/apps/mem0-scripts/contradiction-sweep.py --unstamp <memory_id>
 
 # Re-judge everything currently flagged (auto-CLEARS false positives; never auto-hides)
 $PY ~/apps/mem0-scripts/contradiction-sweep.py --rejudge-stamped --judge codex --apply
+
+# A `kind: canonical-possibly-stale` line has no canonical_id, so --promote refuses it. Once you have refreshed or
+# demoted the canonical (or decided it is fine), drop the line; the weekly sweep also drops it by itself when its
+# stale_canonical_id is no longer a live canonical
+$PY ~/apps/mem0-scripts/contradiction-sweep.py --dismiss <memory_id>
 ```
 
 The Codex judge needs the Windows shim up (`:18792`; it self-starts at session start when enabled, idle-stops after 4 h). Since 2026-08-24 every judged run brings it up on demand itself — the units' `ExecStartPre` spawns it (inlining `codex-shim-spawn.ps1` + a curl health poll) and the sweep has an in-run backstop (`ensure-codex-shim.sh`, WSL interop, which invokes that same spawn ps1) — so `outcome=no-op:codex-shim-unreachable` now means the bring-up **also** failed (the receipt's `ensure_attempted` says whether it ran): check `~/.claude/logs/codex-shim.log`, then run `bash ~/apps/mem0-scripts/ensure-codex-shim.sh` by hand. It deliberately refuses to fall back to a local judge.
