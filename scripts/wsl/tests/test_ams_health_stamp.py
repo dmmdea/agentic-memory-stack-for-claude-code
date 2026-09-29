@@ -60,6 +60,23 @@ def test_degraded_pool_turns_the_stamp_red(tmp_path):
     assert r.returncode != 0 and r.stdout.splitlines()[-1] == "health ok=False failed=- degraded=- pool 71.4% DEGRADED"
 
 
+def test_acked_degraded_pool_keeps_the_stamp_green_and_says_so(tmp_path):
+    """Planned maintenance: the server clears health_alarm while the dated ack is active, so the stamp reads
+    that flag (not the raw health) and ends green; the line names the ack so nobody reads it as ONLINE."""
+    ack = {"state": "DEGRADED", "until": "2026-10-06", "active": True}
+    p = dict(BASE, pool=dict(BASE["pool"], health="DEGRADED", health_alarm=False, health_ack=ack))
+    r, _ = _stamp(tmp_path, p)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[-1] == "health ok=True failed=- degraded=- pool 71.4% DEGRADED (acked until 2026-10-06)"
+
+
+def test_an_expired_ack_leaves_the_stamp_red(tmp_path):
+    ack = {"state": "DEGRADED", "until": "2026-09-01", "active": False, "reason": "expired"}
+    p = dict(BASE, ok=False, pool=dict(BASE["pool"], health="DEGRADED", health_alarm=True, health_ack=ack))
+    r, _ = _stamp(tmp_path, p)
+    assert r.returncode != 0 and r.stdout.splitlines()[-1] == "health ok=False failed=- degraded=- pool 71.4% DEGRADED"
+
+
 def test_degraded_step_alone_is_reported_not_red(tmp_path):
     """The brief's exit rule is failed_steps or pool.health_alarm; degraded is loud in the line and the summary."""
     r, _ = _stamp(tmp_path, dict(BASE, ok=False, degraded_steps=[{"step": "dream", "ts": "t", "note": "x"}]))
@@ -109,6 +126,16 @@ def test_summary_lists_degraded_steps_with_note_and_work(tmp_path):
     assert "- stack-backup FAILED 1000ms -- manifest missing" in t
     assert "- index-refresh ok 1000ms\n" in t, "no work object, no brackets"
     assert "degraded=dream" in t and "pool 71.4% usage 12%" in t and "ONLINE" in t
+
+
+def test_summary_names_an_active_pool_ack(tmp_path):
+    pool = dict(BASE["pool"], health="DEGRADED", health_alarm=False,
+                health_ack={"state": "DEGRADED", "until": "2026-10-06", "active": True})
+    t = _summary(tmp_path, [_row("dream")], health=dict(BASE, pool=pool))
+    assert "pool-health DEGRADED (acked until 2026-10-06)" in t
+    (tmp_path / "second").mkdir()
+    t2 = _summary(tmp_path / "second", [_row("dream")], health=BASE)   # the summary appends: a fresh HOME
+    assert "pool-health ONLINE\n" in t2 and "acked" not in t2
 
 
 def test_summary_health_line_survives_an_old_stamp(tmp_path):

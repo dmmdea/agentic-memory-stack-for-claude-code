@@ -31,9 +31,12 @@ def work(o):
 lines = [f"- {o.get('step')} {label(o)} {o.get('duration_ms', 0)}ms{(' -- ' + o['note']) if o.get('note') else ''}{work(o)}" for o in rows] or ["- (no receipts in the last 24 h)"]
 def names(h, key):
     return ",".join(str(x.get("step")) for x in h.get(key) or []) or "-"
+def acked(h):
+    a = (h.get("pool") or {}).get("health_ack") or {}
+    return f" (acked until {a.get('until')})" if a.get("active") else ""
 try:
     h = json.loads((d / "health-maintenance.json").read_text(encoding="utf-8"))
-    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} failed={names(h, 'failed_steps')} degraded={names(h, 'degraded_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}% pool-health {(h.get('pool') or {}).get('health', 'unknown')}")
+    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} failed={names(h, 'failed_steps')} degraded={names(h, 'degraded_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}% pool-health {(h.get('pool') or {}).get('health', 'unknown')}{acked(h)}")
 except (OSError, ValueError): lines.append("- health stamp unavailable")
 try:
     g = json.loads((d / "dream" / "gather.json").read_text(encoding="utf-8"))

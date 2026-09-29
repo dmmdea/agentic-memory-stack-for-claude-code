@@ -9,6 +9,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import maintenance_health as mh  # noqa: E402
 
@@ -163,6 +165,125 @@ def test_zpool_health_reader_asks_zpool_for_the_pool_root(monkeypatch):
     monkeypatch.setattr(mh.subprocess, "run", run)
     assert mh.zpool_health_reader("tank/apps/ams")() == "DEGRADED"
     assert calls == [["zpool", "list", "-H", "-o", "health", "tank"]]
+
+
+# ---- pool-health acknowledgment: a known, dated DEGRADED pool (planned maintenance) --------
+# MEM0_POOL_HEALTH_ACK=<STATE>:<YYYY-MM-DD>. Active iff it parses, today's UTC date <= the date and the
+# live health equals STATE. Active: reported, health_alarm false, `ok` ignores the pool health.
+def _ack(tmp_path, live, ack, now=FRIDAY):
+    return _build(tmp_path, [], now=now, pool_health_reader=lambda: live, pool_ack_reader=lambda: ack)
+
+
+def test_acked_degraded_pool_is_reported_but_does_not_flip_ok(tmp_path):
+    out = _ack(tmp_path, "DEGRADED", "DEGRADED:2026-10-06")
+    assert out["pool"]["health"] == "DEGRADED", "the live value stays visible"
+    assert out["pool"]["health_alarm"] is False and out["ok"] is True
+    assert out["pool"]["health_ack"] == {"state": "DEGRADED", "until": "2026-10-06", "active": True}
+
+
+def test_ack_is_case_insensitive_and_active_on_its_last_day(tmp_path):
+    out = _ack(tmp_path, "degraded", "degraded:2026-09-11")   # FRIDAY is 2026-09-11 UTC
+    assert out["pool"]["health_alarm"] is False and out["pool"]["health_ack"]["active"] is True
+
+
+def test_expired_ack_alarms_and_says_why(tmp_path):
+    out = _ack(tmp_path, "DEGRADED", "DEGRADED:2026-09-10")
+    assert out["pool"]["health_alarm"] is True and out["ok"] is False
+    assert out["pool"]["health_ack"] == {"state": "DEGRADED", "until": "2026-09-10", "active": False, "reason": "expired"}
+
+
+def test_ack_for_a_different_state_than_the_live_one_alarms(tmp_path):
+    out = _ack(tmp_path, "FAULTED", "DEGRADED:2026-10-06")
+    assert out["pool"]["health_alarm"] is True and out["ok"] is False
+    assert out["pool"]["health_ack"] == {"state": "DEGRADED", "until": "2026-10-06", "active": False, "reason": "mismatch"}
+
+
+def test_ack_naming_the_exact_state_may_mask_faulted(tmp_path):
+    out = _ack(tmp_path, "FAULTED", "FAULTED:2026-10-06")
+    assert out["pool"]["health_alarm"] is False and out["pool"]["health_ack"]["active"] is True
+
+
+def test_malformed_ack_alarms_and_says_why(tmp_path):
+    for bad in ("DEGRADED", "DEGRADED:soon", "DEGRADED:2026-13-40", "DEGRADED:20261006", ":2026-10-06", "DEGRADED 2026-10-06",
+                "DEGRADED:2026-10-06:x"):
+        out = _ack(tmp_path, "DEGRADED", bad)
+        assert out["pool"]["health_alarm"] is True and out["ok"] is False, bad
+        ack = out["pool"]["health_ack"]
+        assert ack["active"] is False and ack["reason"] == "malformed" and ack["value"] == bad, bad
+
+
+def test_an_ack_never_makes_an_online_pool_alarm(tmp_path):
+    for ack in ("DEGRADED:2026-10-06", "DEGRADED:2026-09-01", "garbage"):
+        out = _ack(tmp_path, "ONLINE", ack)
+        assert out["pool"]["health_alarm"] is False and out["ok"] is True, ack
+        assert out["pool"]["health_ack"]["active"] is False
+    out = _build(tmp_path, [], pool_health_reader=lambda: "unknown", pool_ack_reader=lambda: "DEGRADED:2026-10-06")
+    assert out["pool"]["health_alarm"] is False and out["pool"]["health_ack"]["active"] is False
+
+
+def test_an_acked_pool_still_counts_capacity_and_steps(tmp_path):
+    out = _build(tmp_path, [_r("2026-09-11T07:00:00Z", "dream", ok=False, status="failed")], pool_reader=lambda: (90, 10),
+                 pool_health_reader=lambda: "DEGRADED", pool_ack_reader=lambda: "DEGRADED:2026-10-06")
+    assert out["pool"]["alarm"] is True and out["ok"] is False and out["pool"]["health_alarm"] is False
+
+
+def test_no_ack_key_changes_nothing(tmp_path):
+    for reader in (None, lambda: None, lambda: "", lambda: "   "):
+        out = _build(tmp_path, [], pool_health_reader=lambda: "DEGRADED", pool_ack_reader=reader)
+        assert "health_ack" not in out["pool"] and out["pool"]["health_alarm"] is True and out["ok"] is False
+
+
+def test_an_ack_reader_that_raises_reads_as_no_ack(tmp_path):
+    def boom():
+        raise OSError("unreadable")
+    out = _build(tmp_path, [], pool_health_reader=lambda: "DEGRADED", pool_ack_reader=boom)
+    assert "health_ack" not in out["pool"] and out["pool"]["health_alarm"] is True
+
+
+# ---- where the ack comes from: env first, then stack.env, read on EACH call -----------------
+@pytest.fixture
+def stack_env(tmp_path, monkeypatch):
+    """A sandboxed ~/.mem0/stack.env: the server unit does not load it into its environment, so the
+    reader must open it itself. Nothing here touches the real home."""
+    import job_liveness
+    path = tmp_path / "stack.env"
+    monkeypatch.setattr(job_liveness, "STACK_ENV_PATH", path)
+    monkeypatch.delenv("MEM0_POOL_HEALTH_ACK", raising=False)
+    return path
+
+
+def test_ack_from_stack_env_alone_works(stack_env):
+    stack_env.write_text("MEM0_ROLE=brain\nMEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06\n", encoding="utf-8")
+    assert mh.read_pool_ack() == "DEGRADED:2026-10-06"
+
+
+def test_env_beats_stack_env(stack_env, monkeypatch):
+    stack_env.write_text("MEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06\n", encoding="utf-8")
+    monkeypatch.setenv("MEM0_POOL_HEALTH_ACK", "DEGRADED:2026-11-01")
+    assert mh.read_pool_ack() == "DEGRADED:2026-11-01"
+
+
+def test_no_key_anywhere_reads_none(stack_env):
+    assert mh.read_pool_ack() is None                      # no file
+    stack_env.write_text("MEM0_ROLE=brain\n", encoding="utf-8")
+    assert mh.read_pool_ack() is None                      # file without the key
+
+
+def test_the_ack_is_read_on_each_call_never_cached(stack_env, tmp_path):
+    reader = mh.read_pool_ack
+    stack_env.write_text("MEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06\n", encoding="utf-8")
+    assert _build(tmp_path, [], pool_health_reader=lambda: "DEGRADED", pool_ack_reader=reader)["pool"]["health_alarm"] is False
+    stack_env.write_text("MEM0_ROLE=brain\n", encoding="utf-8")   # the operator cleared it
+    assert _build(tmp_path, [], pool_health_reader=lambda: "DEGRADED", pool_ack_reader=reader)["pool"]["health_alarm"] is True
+
+
+def test_the_route_wires_the_ack_reader():
+    """app.py cannot be imported headless (it needs the mem0 library), so pin the wiring by its source:
+    without this argument the ack is a silent no-op in production."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"), encoding="utf-8").read()
+    route = src[src.index("def health_maintenance"):]
+    route = route[:route.index("@app.get", 1)]
+    assert "pool_ack_reader=_mh.read_pool_ack" in route
 
 
 # ---- the rest of C2: drift and wiki are reported, never folded into ok ----------------------

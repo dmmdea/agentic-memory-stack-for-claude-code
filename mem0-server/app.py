@@ -906,6 +906,8 @@ def health_maintenance() -> dict:
                      usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
                      # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
                      pool_health_reader=_mh.zpool_health_reader(ds) if ds else None,
+                     # The operator's dated pool-health ack (env, else stack.env), read on every call.
+                     pool_ack_reader=_mh.read_pool_ack,
                      wiki_stamp_dir=Path.home() / "wiki-index",
                      drift_reader=drift_state_health)
 

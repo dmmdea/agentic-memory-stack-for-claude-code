@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
+
+from job_liveness import read_stack_env
 
 POOL_ALARM_PCT = 85
 STALE_AFTER_H = 48             # a daily step with no success in two nights
@@ -143,6 +147,50 @@ def zpool_health_reader(dataset: str) -> Callable[[], str]:
     return read
 
 
+POOL_ACK_KEY = "MEM0_POOL_HEALTH_ACK"
+_POOL_ACK_RE = re.compile(r"^([A-Za-z]+):(\d{4}-\d{2}-\d{2})$")
+
+
+def read_pool_ack(environ=None) -> Optional[str]:
+    """The operator's pool-health acknowledgment (`<STATE>:<YYYY-MM-DD>`), read on EVERY call: the process
+    environment first, then ~/.mem0/stack.env through the server's own parser (the server unit does not
+    load stack.env into its environment, so an env-only read would be a silent no-op in production).
+    None when neither names it; a blank value is None."""
+    environ = os.environ if environ is None else environ
+    raw = environ.get(POOL_ACK_KEY)
+    if raw is None or not str(raw).strip():
+        raw = read_stack_env().get(POOL_ACK_KEY)
+    raw = None if raw is None else str(raw).strip()
+    return raw or None
+
+
+def _pool_ack(raw: Optional[str], live_health: str, today: dt.date) -> Optional[dict]:
+    """The `pool.health_ack` object for an ack value against the live pool health, or None for no ack.
+    Active iff it parses, `today` (UTC) <= its date, and the live health equals its STATE. Otherwise the
+    object says why: malformed | expired | mismatch."""
+    if raw is None or not raw.strip():
+        return None
+    raw = raw.strip()
+    m = _POOL_ACK_RE.match(raw)
+    until: Optional[dt.date] = None
+    if m:
+        try:
+            until = dt.date.fromisoformat(m.group(2))
+        except ValueError:
+            until = None
+    if not m or until is None:
+        return {"state": None, "until": None, "active": False, "reason": "malformed", "value": raw[:80]}
+    state = m.group(1).upper()
+    ack = {"state": state, "until": m.group(2), "active": False}
+    if today > until:
+        ack["reason"] = "expired"
+    elif live_health.upper() != state:
+        ack["reason"] = "mismatch"
+    else:
+        ack["active"] = True
+    return ack
+
+
 def _is_no_op(r: dict) -> bool:
     return str(r.get("note") or "").startswith(NO_OP_NOTE_PREFIXES)
 
@@ -196,6 +244,7 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
           boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
           usage_reader: Optional[Callable[[], dict]] = None,
           pool_health_reader: Optional[Callable[[], str]] = None,
+          pool_ack_reader: Optional[Callable[[], Optional[str]]] = None,
           wiki_stamp_dir: Optional[Path] = None,
           drift_reader: Optional[Callable[[], dict]] = None) -> dict:
     by_step: dict[str, list[dict]] = {}
@@ -269,6 +318,20 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
             health = "unknown"
     pool = {"used_pct": pct, "alarm": bool(pct is not None and pct >= POOL_ALARM_PCT), "threshold_pct": POOL_ALARM_PCT,
             "health": health, "health_alarm": health != "unknown" and health.upper() != "ONLINE"}
+    # A known, dated, non-ONLINE pool (a planned disk swap) is acknowledged by the operator: reported, not
+    # alarmed, until the date passes. The ack is read per call; a reader that fails reads as no ack (the alarm
+    # stays). It can only lower an alarm for exactly the state it names; it never raises one.
+    raw_ack: Optional[str] = None
+    if pool_ack_reader is not None:
+        try:
+            raw_ack = pool_ack_reader()
+        except Exception:  # noqa: BLE001
+            raw_ack = None
+    ack = _pool_ack(raw_ack, health, now.astimezone(dt.timezone.utc).date())
+    if ack is not None:
+        pool["health_ack"] = ack
+        if ack["active"]:
+            pool["health_alarm"] = False
     usage: dict = {"used_percent": None, "resets_in_days": None, "probed_at": None, "note": "no probe yet"}
     if usage_reader is not None:
         try:
