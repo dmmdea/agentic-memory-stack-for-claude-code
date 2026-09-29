@@ -47,6 +47,73 @@ def classify(exc: BaseException) -> Optional[int]:
     return None
 
 
+# llama-swap reports a model whose llama-server died at load as HTTP 500 with this message
+# (measured: no VRAM headroom beside a resident vLLM seat). A bare 500 can also be a real
+# error (context overflow), so the marker is what tells "cannot start right now" apart.
+_START_FAILURE_MARKER = "exited prematurely"
+_GATEWAY_STATUSES = (502, 503, 504)
+
+
+def _status_of(exc: BaseException) -> Optional[int]:
+    """HTTP status carried by an openai.APIStatusError or httpx.HTTPStatusError, else None."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _upstream_text(exc: BaseException) -> str:
+    """The exception message plus the upstream response body, best effort (never raises)."""
+    parts = [str(exc)]
+    try:
+        parts.append(str(getattr(getattr(exc, "response", None), "text", "") or ""))
+    except Exception:  # a streamed/closed response has no readable body
+        pass
+    return " ".join(parts).lower()
+
+
+def retry_later(exc: BaseException) -> Optional[int]:
+    """Seconds to wait when `exc` means the embedder cannot serve RIGHT NOW, else None.
+
+    Narrower than `classify` on purpose: this is the mapper the endpoints use for exceptions
+    they caught themselves, and a 503 there tells the shim to queue the write. Retryable are
+    a refused/timed-out connection, a gateway status (502/503/504) and llama-swap's
+    500 'upstream command exited prematurely' (the seat could not start). Every other 500
+    (context overflow, a coding error) stays a 500: replaying it only doubles the damage."""
+    if isinstance(exc, _HTTPX_OUTAGES):
+        return RETRY_AFTER_S
+    ot = _openai_types()
+    if ot and isinstance(exc, ot[:2]):  # APIConnectionError (incl. APITimeoutError)
+        return RETRY_AFTER_S
+    status = _status_of(exc)
+    if status in _GATEWAY_STATUSES:
+        return RETRY_AFTER_S
+    if status == 500 and _START_FAILURE_MARKER in _upstream_text(exc):
+        return RETRY_AFTER_S
+    return None
+
+
+_LOADED_STATES = ("loaded", "ready", "running")
+
+
+def listing_loaded(entry: dict) -> Optional[bool]:
+    """Whether a llama-swap /v1/models entry says the model is loaded; None when it does not say.
+
+    Two schemas: the flat one (`state` or `status` is a string) and llama-swap >= v256, where
+    `status` is an object `{"value": "loaded"}`."""
+    state = entry.get("state")
+    if state is None:
+        state = entry.get("status")
+    if isinstance(state, dict):
+        state = state.get("value")
+    if state is None:
+        return None
+    return str(state).lower() in _LOADED_STATES
+
+
 def install(app: FastAPI) -> None:
     """Register one handler for every outage-shaped exception type; non-outages re-raise."""
     async def _handler(request: Request, exc: Exception):
