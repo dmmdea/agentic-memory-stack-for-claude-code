@@ -352,3 +352,86 @@ func TestCLI_JudgeApplyBrandMapMissingIsNeutral(t *testing.T) {
 		})
 	}
 }
+
+// The scratch/temp exclusion lives in Enumerate, but the hub's judge does not enumerate: it
+// takes an explicit store directory. A scratch store already in the hub checkout (pushed by a
+// PC on an older binary) must still never be offered or migrated into the corpus.
+func TestCLI_JudgeApplyRefusesAScratchWorkspace(t *testing.T) {
+	for _, ws := range []string{"proj-scratchpad-demo", "proj-AppData-Local-Temp-claude-x"} {
+		t.Run(ws, func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			dir := sb.AddStore(ws, testutil.BigIndex(3), testutil.BigIndexFacts(3))
+			before, err := os.ReadFile(filepath.Join(dir, "MEMORY.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mem := testutil.NewFakeMem0(t, testutil.Mem0OK)
+			plan := writePlan(t, sb.Root,
+				`{"version":1,"stores":[{"workspace":"`+ws+`","decisions":[{"slug":"fact1.md","verb":"MIGRATE"}]}]}`)
+
+			code, stdout, stderr := run(t, "judge-apply", "--hub", "--json",
+				"--state-root", sb.StateRoot, "--projects-root", sb.ProjectsRoot,
+				"--store", dir, "--workspace", ws, "--plan", plan,
+				"--mem0-url", mem.URL(), "--mem0-user", "tester")
+
+			if code != cli.ExitOK {
+				t.Fatalf("exit = %d, want 0 (stderr %s)", code, stderr)
+			}
+			var out struct {
+				Status   string `json:"status"`
+				Migrated int    `json:"migrated"`
+				Offered  int    `json:"offered"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+				t.Fatalf("stdout is not one JSON document: %v\n%s", err, stdout)
+			}
+			if out.Status != "excluded-scratch" || out.Migrated != 0 || out.Offered != 0 {
+				t.Errorf("result = %+v, want status excluded-scratch and nothing offered or migrated", out)
+			}
+			if posts := mem.Posts(); len(posts) != 0 {
+				t.Fatalf("a scratch workspace was written to the corpus: %+v", posts)
+			}
+			after, _ := os.ReadFile(filepath.Join(dir, "MEMORY.md"))
+			if string(after) != string(before) {
+				t.Error("the scratch store's index was rewritten")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "fact1.md")); err != nil {
+				t.Error("the scratch store's fact file was removed")
+			}
+
+			// The offer set the plan is written from is empty too, so no judge call is spent.
+			code, stdout, stderr = run(t, "judge-apply", "--hub", "--candidates", "--json",
+				"--state-root", sb.StateRoot, "--projects-root", sb.ProjectsRoot,
+				"--store", dir, "--workspace", ws)
+			if code != cli.ExitOK {
+				t.Fatalf("candidates exit = %d (stderr %s)", code, stderr)
+			}
+			var cs struct {
+				Shorten []json.RawMessage `json:"shorten"`
+				Migrate []json.RawMessage `json:"migrate"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &cs); err != nil {
+				t.Fatalf("candidates stdout: %v\n%s", err, stdout)
+			}
+			if len(cs.Shorten) != 0 || len(cs.Migrate) != 0 {
+				t.Errorf("a scratch workspace offered candidates: %s", stdout)
+			}
+		})
+	}
+}
+
+// The exclusion list is the hub's own policy: a custom list replaces the defaults, and a
+// workspace it does not name is judged as usual.
+func TestCLI_JudgeApplyHonoursThePolicyExcludeList(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	dir := sb.AddStore("throwaway-lab", testutil.BigIndex(3), testutil.BigIndexFacts(3))
+	sb.WriteFile("projects/.ams/policy.json", `{"store_exclude":["throwaway"]}`)
+	code, stdout, stderr := run(t, "judge-apply", "--hub", "--candidates", "--json",
+		"--state-root", sb.StateRoot, "--projects-root", sb.ProjectsRoot, "--store", dir)
+	if code != cli.ExitOK {
+		t.Fatalf("exit = %d (stderr %s)", code, stderr)
+	}
+	if strings.Contains(stdout, "fact1.md") {
+		t.Errorf("a policy-excluded workspace offered candidates: %s", stdout)
+	}
+}

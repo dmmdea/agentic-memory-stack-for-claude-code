@@ -1031,28 +1031,34 @@ func TestLint_DecoratedPointersParseAndUnparsedOnesAreFindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MeasureStore: %v", err)
 	}
-	if st.Entries != 3 {
-		t.Errorf("Entries = %d, want 3 (the marked pointer, the Shipped line and the plain one)", st.Entries)
+	if st.Entries != 2 {
+		t.Errorf("Entries = %d, want 2 (the marked pointer and the plain one; the multi-link Shipped line is a finding)", st.Entries)
 	}
 	found, err := lint.StoreFindings(s)
 	if err != nil {
 		t.Fatalf("StoreFindings: %v", err)
 	}
 	k := kinds(found)
-	if len(k[lint.KindUnparsedPointer]) != 1 {
-		t.Fatalf("unparsed-pointer findings = %v, want exactly the two-marker-word line", k[lint.KindUnparsedPointer])
+	if len(k[lint.KindUnparsedPointer]) != 2 {
+		t.Fatalf("unparsed-pointer findings = %v, want the multi-link Shipped line and the two-marker-word line", k[lint.KindUnparsedPointer])
 	}
-	for _, f := range found {
-		if f.Kind == lint.KindUnparsedPointer && !strings.Contains(f.Detail, "line 3") {
-			t.Errorf("detail = %q, want the index line number 3", f.Detail)
+	for _, want := range []string{"line 2", "line 3"} {
+		hit := false
+		for _, f := range found {
+			if f.Kind == lint.KindUnparsedPointer && strings.Contains(f.Detail, want) {
+				hit = true
+			}
+		}
+		if !hit {
+			t.Errorf("no unparsed-pointer finding names %q", want)
 		}
 	}
 	if !lint.Actionable(lint.KindUnparsedPointer) {
 		t.Error("unparsed-pointer must be actionable, or it reaches no surface")
 	}
 	sum := runLint(t, sb, "")
-	if sum.Counts.UnparsedPointer != 1 {
-		t.Errorf("counts.unparsed_pointer = %d, want 1", sum.Counts.UnparsedPointer)
+	if sum.Counts.UnparsedPointer != 2 {
+		t.Errorf("counts.unparsed_pointer = %d, want 2", sum.Counts.UnparsedPointer)
 	}
 }
 

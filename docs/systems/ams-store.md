@@ -191,11 +191,15 @@ once left 133 of one live store's 135 pointer lines as opaque text, so every per
 fleet's largest store. The marker is kept in `Record.Prefix` with its trailing whitespace
 and every renderer (`index.RecordLine`, used by the floor, hygiene, the judge's shorten and
 both index renders) puts it back byte for byte, so shortening a line never strips its
-decoration and the marker's bytes count against the line cap. A `Word:` marker followed by
-several links on one line is still one entry that carries a second link: both stay
-reachable and the second is checked by the dangling rules. A bullet line that links a
-`.md` file and still does not parse (two marker words, a `*` bullet) is the actionable lint
-finding `unparsed-pointer` rather than prose nobody sees.
+decoration and the marker's bytes count against the line cap. A **decorated line that
+carries more than one `.md` link** (a `Shipped:` line listing two pointers) is deliberately
+not read as an entry: the second link would become part of the hook, harvested into the
+fact file as `hook:`, and a rebuild would reshape the line. It stays opaque text, kept
+byte for byte, both links still count for reachability (neither target reads as an
+orphan), and it is reported like any other unparsed pointer. A canonical line (no marker)
+with an inline second link is unchanged: still one entry. A bullet line that links a
+`.md` file and does not parse (a multi-link decorated line, two marker words, a `*`
+bullet) is the actionable lint finding `unparsed-pointer` rather than prose nobody sees.
 
 ### The floor and the injection cap
 
@@ -349,7 +353,14 @@ skips a workspace whose slug lies under the encoded OS temp dir or contains one 
 exclude fragments - by default `-AppData-Local-Temp-` and `-scratchpad-`. The list is
 configurable in `<projects root>/.ams/policy.json` (`{"store_exclude": ["-fragment-"]}`,
 case-insensitive; it replaces the defaults, and a missing or malformed file fails open to
-them). Enumeration is the one place, so sync, derive, lint and the judge all agree.
+them). The rules (`store.LoadExcludeRules`) are shared by two places. Enumeration applies
+them, so sync, derive and lint agree. The hub's judge does **not** enumerate - the wrapper
+and the dream step hand `judge-apply` an explicit store directory - so `judge-apply`
+applies the same rules to its `--workspace` itself: an excluded workspace gets an empty
+offer set from `--candidates` (no judge call is spent) and, on apply, status
+`excluded-scratch` with exit 0, nothing written to the corpus, the index or the receipts.
+That is what keeps a scratch store already in the hub checkout, or pushed by a PC still on
+an older binary, out of the production corpus.
 
 ### A first join cannot resurrect what the hub deleted
 
@@ -575,7 +586,12 @@ record is gone falls back to a plain add. An update the corpus refuses, or a sta
 record that cannot be read, **keeps the line and does not fall back to an add** - a
 refused update followed by an add is the second record this exists to prevent - and
 counts as a write failure. An updated record is never deleted by an undo: it is not this
-run's to remove.
+run's to remove. The stamp names an id, not an owner: a server-deduplicated add keeps a
+PRE-EXISTING record's id and derive stamps it like any other, so before a PUT the judge
+reads the record's `source` and updates it only when it is exactly this slug's
+`automemory:<workspace>/<slug>` tag. A record of any other source (an operator fact with
+none, another slug's identical text) is left untouched and the fact is added as its own
+record.
 
 **Brand.** `--brand-map <path>` loads the operator's `brands.json` (contract C3, resolver
 in `internal/brand`, shared corpus `tests/fixtures/brand-routing-cases.jsonl` run by every
@@ -588,7 +604,9 @@ gate's job. A missing, empty or malformed map is brand-neutral and never an erro
 
 **Counts and the nightly wrapper.** `judge-apply --json` reports `offered` (migration
 candidates the store presented), `migrated`, `updated` and `add_failed` (corpus writes -
-add or update - that failed, including "no corpus client configured"). The chain step's
+add or update - that failed, including "no corpus client configured" and a write the
+corpus accepted with an id but that failed its read-back, whether the record was then
+removed or could not be). The chain step's
 wrapper `scripts/wsl/ams-store-judge-apply.sh` sums them and writes the step outcome
 (contract C1) when the chain exports `AMS_OUTCOME_FILE`: one line
 `<status>[:<reason>] {"stores","offered","migrated","add_failed","updated","actionable","unparsed_pointer"}`.

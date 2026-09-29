@@ -364,18 +364,33 @@ func TestParse_DecoratedPointersAreEntries(t *testing.T) {
 	}
 }
 
-// A multi-link "Shipped:" line is an entry that carries a second link, never dropped: the
-// extra slug keeps its target reachable and visible to the dangling rules.
-func TestParse_MultiLinkShippedLineKeepsBothLinks(t *testing.T) {
-	line := "- Shipped: [a](x.md) \u00b7 [b](y.md)"
-	ix := index.Parse(line)
-	es := ix.Entries()
-	if len(es) != 1 || es[0].Slug != "x.md" || len(es[0].ExtraSlugs) != 1 || es[0].ExtraSlugs[0] != "y.md" {
-		t.Fatalf("entries = %+v, want one entry x.md with the extra link y.md", es)
+// A decorated line that carries more than one .md link is not read as an entry: its
+// second link would be harvested into a fact file as part of the hook, and a rebuild
+// would reshape it. It stays opaque text (byte for byte) and lint reports it as an
+// unparsed pointer, while BOTH targets stay reachable so neither reads as an orphan.
+func TestParse_MultiLinkDecoratedLineIsAnUnparsedPointer(t *testing.T) {
+	for _, line := range []string{
+		"- Shipped: [a](x.md) \u00b7 [b](y.md)",
+		"- \U0001F6D1 [a](x.md) " + em + " see also [b](y.md)",
+	} {
+		ix := index.Parse(line)
+		if es := ix.Entries(); len(es) != 0 {
+			t.Fatalf("%q parsed as %d entries, want 0 (a decorated multi-link line is not an entry)", line, len(es))
+		}
+		if !ix.Records[0].UnparsedPointer() {
+			t.Errorf("%q must be an unparsed pointer", line)
+		}
+		linked := index.LinkedSlugs(ix.Records)
+		if !linked["x.md"] || !linked["y.md"] {
+			t.Errorf("%q: both links must count for reachability, got %v", line, linked)
+		}
+		if got := index.RenderVerbatim(ix.Records, ix.Newline); got != line {
+			t.Errorf("opaque line not preserved: got %q want %q", got, line)
+		}
 	}
-	linked := index.LinkedSlugs(ix.Records)
-	if !linked["x.md"] || !linked["y.md"] {
-		t.Errorf("both links must count for reachability, got %v", linked)
+	// A canonical line with an inline second link is unchanged by this rule.
+	if es := index.Parse("- [a](x.md) " + em + " see [b](y.md)").Entries(); len(es) != 1 || len(es[0].ExtraSlugs) != 1 {
+		t.Errorf("canonical multi-link line changed shape: %+v", es)
 	}
 }
 
@@ -419,8 +434,8 @@ func TestIndex_DecoratedGoldenRoundTrips(t *testing.T) {
 	}
 	text := string(raw)
 	ix := index.Parse(text)
-	if got := len(ix.Entries()); got != 6 {
-		t.Fatalf("golden entries = %d, want 6", got)
+	if got := len(ix.Entries()); got != 5 {
+		t.Fatalf("golden entries = %d, want 5 (the multi-link Shipped line stays opaque)", got)
 	}
 	if got := index.RenderVerbatim(ix.Records, ix.Newline); got != text {
 		t.Fatalf("untouched render is not byte-identical\n got %q\nwant %q", got, text)
@@ -428,15 +443,10 @@ func TestIndex_DecoratedGoldenRoundTrips(t *testing.T) {
 	for _, e := range ix.Entries() {
 		e.Dirty = true
 	}
-	// Every canonical-separator line is rebuilt exactly. The Shipped line's hook starts
-	// with a middle dot, which is not a separator, so it is the one place the rebuild adds
-	// the em-dash the author never typed: assert everything else is unchanged.
+	// Every entry is rebuilt exactly, and the opaque multi-link line is untouched.
 	rebuilt := strings.Split(index.RenderVerbatim(ix.Records, ix.Newline), "\n")
 	orig := strings.Split(text, "\n")
 	for i := range orig {
-		if strings.HasPrefix(orig[i], "- Shipped:") {
-			continue
-		}
 		if rebuilt[i] != orig[i] {
 			t.Errorf("line %d rebuilt differently\n got %q\nwant %q", i+1, rebuilt[i], orig[i])
 		}

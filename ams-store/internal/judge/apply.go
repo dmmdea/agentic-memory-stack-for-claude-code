@@ -104,8 +104,10 @@ type Result struct {
 	// Updated is the subset of Migrated that reached an existing record by id (the fact
 	// carried `migrated: <id>`) instead of adding a new one.
 	Updated int
-	// AddFailed counts corpus writes (add or update) that failed, so a night whose every
-	// write failed can be told apart from a night with nothing to migrate.
+	// AddFailed counts corpus writes (add or update) that failed OR failed verification
+	// (the corpus returned an id but the read-back mismatched, or the write could not be
+	// confirmed), so a night whose every write failed can be told apart from a night
+	// with nothing to migrate.
 	AddFailed int
 	// Mem0 carries "<id> | <slug> | <the line as it stood in the index>" per migrated
 	// fact. The third field is never empty: it is the only record of what the index said
@@ -420,6 +422,12 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 
 			// A slug derive stamped `migrated: <id>` is a fact the corpus already holds:
 			// update that record instead of adding a second variant of it.
+			//
+			// The stamp names an id, not an owner: a server-deduplicated Add keeps a
+			// PRE-EXISTING record's id, and derive stamps it like any other. An update
+			// PUTs over whatever the id names, so it goes only to a record whose source
+			// is this slug's own; any other record (an operator fact, another slug's
+			// identical text) is left untouched and the fact is added as its own record.
 			if id := strings.TrimSpace(m.FM.Migrated); id != "" {
 				cur, getErr := opt.Mem0.Get(ctx, id)
 				if getErr != nil {
@@ -428,6 +436,11 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 					res.Mem0Orphan = append(res.Mem0Orphan, id+" | "+d.Slug+" | line kept: cannot read the stamped record: "+getErr.Error())
 					opt.logf("%s: migration %s: stamped record %s unreadable; line kept (%s)", opt.Workspace, d.Slug, id, getErr)
 					continue
+				}
+				if cur.Found && cur.Source != SourceTag(opt.Workspace, d.Slug) {
+					opt.logf("%s: migration %s: stamped record %s is not this slug's own (source %q); adding instead of updating",
+						opt.Workspace, d.Slug, id, cur.Source)
+					cur.Found = false
 				}
 				if cur.Found {
 					if upErr := opt.Mem0.Update(ctx, id, text, meta); upErr != nil {
@@ -456,7 +469,8 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 					}
 					continue
 				}
-				// The stamped record is gone: fall through to a plain add.
+				// The stamped record is gone or is not this slug's own: fall through to a
+				// plain add.
 			}
 
 			w, err := opt.Mem0.Add(ctx, text, SourceTag(opt.Workspace, d.Slug), meta)
@@ -486,6 +500,9 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 				}
 				continue
 			}
+			// From here the corpus took the write but it did not verify: a failed write, and
+			// counted as one so a night of nothing but these cannot read as a quiet night.
+			res.AddFailed++
 			if w.Deduplicated {
 				// The id belongs to a PRE-EXISTING record this run did not create -
 				// an L1a fact, or an earlier migration. Never delete it.

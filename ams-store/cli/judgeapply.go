@@ -29,7 +29,10 @@ and protected-set overflow. Hub-only.
 
   --plan <file>          the plan file to apply
   --store <dir>          the store (memory directory) to apply it to
-  --workspace <slug>     the workspace id; default: the store directory's parent name
+  --workspace <slug>     the workspace id; default: the store directory's parent name.
+                         A scratch or temp workspace (the store exclude rules) is not a
+                         store: --candidates prints an empty offer set and an apply
+                         reports excluded-scratch, exit 0, writing nothing
   --dry-run              report what would be applied; write nothing, post nothing
   --max-migrations <n>   cap the migrations one plan may perform (default 5)
   --force                bypass the 20 h one-attempt-per-store window, and only that
@@ -140,6 +143,15 @@ func runJudgeApply(env Env, args []string) int {
 	if workspace == "" || workspace == "." || workspace == string(filepath.Separator) {
 		fmt.Fprintln(env.Stderr, "ams-store judge-apply: cannot infer a workspace from --store; pass --workspace")
 		return ExitUsage
+	}
+
+	// A scratch or temp workspace is never a store, and the hub's judge does not enumerate
+	// (it takes the directory it is given), so the exclusion is applied here as well: a
+	// scratch store already in the hub checkout, or pushed by a PC on an older binary, must
+	// not be offered or migrated into the corpus. Both the offer set the plan is written
+	// from and the apply come through here.
+	if store.LoadExcludeRules(roots.ProjectsRoot).Excludes(workspace) {
+		return excludedWorkspace(env, workspace, f)
 	}
 
 	now := time.Time{}
@@ -264,6 +276,33 @@ func runJudgeApply(env Env, args []string) int {
 	}
 	return ExitOK
 }
+
+// excludedWorkspace answers judge-apply for a scratch or temp workspace: nothing offered,
+// nothing applied, no receipt, exit 0 (an excluded store is not a failed one).
+func excludedWorkspace(env Env, workspace string, f judgeApplyFlags) int {
+	if f.candidates {
+		if f.asJSON {
+			_ = json.NewEncoder(env.Stdout).Encode(map[string]any{
+				"workspace": workspace, "shorten": []any{}, "migrate": []any{}})
+		}
+		return ExitOK
+	}
+	if f.asJSON {
+		_ = json.NewEncoder(env.Stdout).Encode(map[string]any{
+			"workspace": workspace, "status": StatusExcludedScratch,
+			"note":    "a scratch or temp workspace is not a store; nothing offered, nothing applied",
+			"offered": 0, "migrated": 0, "updated": 0, "add_failed": 0,
+			"shortened": 0, "line_floored": 0, "mem0": []string{}, "mem0_orphan": []string{},
+		})
+		return ExitOK
+	}
+	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (a scratch or temp workspace is not a store)\n", workspace, StatusExcludedScratch)
+	return ExitOK
+}
+
+// StatusExcludedScratch is judge-apply's answer for an excluded workspace. It is not a
+// receipt status: no receipt is written for a workspace that is not a store.
+const StatusExcludedScratch = "excluded-scratch"
 
 func runJudgeCandidates(env Env, roots store.Roots, dir, workspace string, asJSON bool) int {
 	wsState, err := roots.WorkspaceStateDir(workspace)

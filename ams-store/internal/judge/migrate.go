@@ -37,6 +37,10 @@ type Record struct {
 	// Retrievable is the server's own reachability flag. A record that is stored but not
 	// retrievable is not a place a fact may be moved to.
 	Retrievable *bool
+	// Source is the record's source tag ("automemory:<workspace>/<slug>" for a judge
+	// migration), "" when the server reports none. An update is only ever sent to a record
+	// whose source is the slug's own: the stamp names an id, not an owner.
+	Source string
 	// Found is false when the id could not be read at all.
 	Found bool
 }
@@ -250,6 +254,13 @@ func (m *HTTPMem0) Get(ctx context.Context, id string) (Record, error) {
 	if v, ok := doc["retrievable"]; ok {
 		if b, ok := v.(bool); ok {
 			rec.Retrievable = &b
+		}
+	}
+	if s, ok := doc["source"].(string); ok {
+		rec.Source = s
+	} else if md, ok := doc["metadata"].(map[string]any); ok {
+		if s, ok := md["source"].(string); ok {
+			rec.Source = s
 		}
 	}
 	return rec, nil

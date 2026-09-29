@@ -120,12 +120,26 @@ func Parse(text string) *Index {
 		if !inFence {
 			m = reEntry.FindStringSubmatch(ln)
 		}
+		var extra []string
+		if m != nil {
+			for _, lm := range reLink.FindAllStringSubmatch(m[5], -1) {
+				extra = append(extra, lm[1])
+			}
+			// A DECORATED line (a marker token before the link) that carries a second .md
+			// link is ambiguous: reading it as an entry would make the second link part of
+			// the hook (harvested into a fact file) and a rebuild would reshape the line.
+			// It stays opaque text, kept byte for byte, and lint reports it as an
+			// unparsed pointer for a human to split. Both links still count for
+			// reachability (LinkedSlugs reads every link on an opaque line).
+			if m[2] != "" && len(extra) > 0 {
+				m = nil
+			}
+		}
 		if m != nil {
 			rest := m[5]
 			summary := strings.TrimRightFunc(reSep.ReplaceAllString(rest, ""), unicode.IsSpace)
-			extra := []string{}
-			for _, lm := range reLink.FindAllStringSubmatch(rest, -1) {
-				extra = append(extra, lm[1])
+			if extra == nil {
+				extra = []string{}
 			}
 			records = append(records, &Record{
 				Index:      i,

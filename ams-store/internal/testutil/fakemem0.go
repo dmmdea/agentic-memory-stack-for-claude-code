@@ -66,6 +66,10 @@ type FakeMem0 struct {
 	// index write, say - without a seam into the code under test.
 	OnAdd func(post Mem0Post)
 
+	// DeleteStatus, when non-zero, makes every delete answer with that HTTP status and
+	// remove nothing - a corpus that cannot take back an unverified write.
+	DeleteStatus int
+
 	// PutStatus, when non-zero, makes every update answer with that HTTP status and change
 	// nothing - a corpus that refuses a write (a protected tier, an unavailable embedder).
 	PutStatus int
@@ -77,12 +81,13 @@ type FakeMem0 struct {
 	posts   []Mem0Post
 	deleted []string
 	byID    map[string]string
+	bySrc   map[string]string
 }
 
 // NewFakeMem0 starts a fake corpus and stops it when the test ends.
 func NewFakeMem0(t *testing.T, mode Mem0Mode) *FakeMem0 {
 	t.Helper()
-	f := &FakeMem0{mode: mode, byID: map[string]string{}}
+	f := &FakeMem0{mode: mode, byID: map[string]string{}, bySrc: map[string]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/memories", f.handleCollection)
 	mux.HandleFunc("/v1/memories/", f.handleItem)
@@ -108,11 +113,17 @@ func (f *FakeMem0) Puts() []Mem0Put {
 	return append([]Mem0Put(nil), f.puts...)
 }
 
-// Seed stores a record under a chosen id, the way an earlier night's migration left it.
-func (f *FakeMem0) Seed(id, text string) {
+// Seed stores a record under a chosen id with NO source, the way a hand-written or
+// foreign record looks to the judge.
+func (f *FakeMem0) Seed(id, text string) { f.SeedWithSource(id, text, "") }
+
+// SeedWithSource stores a record under a chosen id with a source tag, the way an earlier
+// night's migration left it (the tag is "automemory:<workspace>/<slug>").
+func (f *FakeMem0) SeedWithSource(id, text, source string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.byID[id] = text
+	f.bySrc[id] = source
 }
 
 // Text returns a stored record's current text.
@@ -164,6 +175,7 @@ func (f *FakeMem0) handleCollection(w http.ResponseWriter, r *http.Request) {
 	post := Mem0Post{ID: id, Text: payload.Messages, Source: payload.Metadata["source"], Metadata: payload.Metadata, APIKey: r.Header.Get("X-API-Key")}
 	f.posts = append(f.posts, post)
 	f.byID[id] = payload.Messages
+	f.bySrc[id] = payload.Metadata["source"]
 	mode := f.mode
 	f.mu.Unlock()
 
@@ -187,8 +199,9 @@ func (f *FakeMem0) handleItem(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/memories/")
 	f.mu.Lock()
 	text, ok := f.byID[id]
+	src := f.bySrc[id]
 	mode := f.mode
-	if r.Method == http.MethodDelete && ok {
+	if r.Method == http.MethodDelete && ok && f.DeleteStatus == 0 {
 		f.deleted = append(f.deleted, id)
 		delete(f.byID, id)
 	}
@@ -196,6 +209,10 @@ func (f *FakeMem0) handleItem(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodDelete:
+		if f.DeleteStatus != 0 {
+			w.WriteHeader(f.DeleteStatus)
+			return
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -232,6 +249,9 @@ func (f *FakeMem0) handleItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		doc := map[string]any{"id": id, "memory": text, "retrievable": true}
+		if src != "" {
+			doc["source"] = src
+		}
 		if mode == Mem0Mismatch || mode == Mem0DedupMismatch {
 			doc["memory"] = "a near-duplicate of the same fact, reworded"
 		}
