@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from test_dream_consolidate import EV, INS, SIG, FakeMem0, _judge, _mod, _run, home  # noqa: F401
+from test_dream_consolidate import EV, INS, SIG, FakeMem0, _judge, _mod, _run
 
 INS3 = json.dumps({"insights": [
     {"text": f"Insight number {i} about the authority", "source_memory_ids": ["e1"], "confidence": 0.7} for i in (1, 2, 3)]})
@@ -43,14 +43,21 @@ class Mem0(FakeMem0):
         return super().add(text, metadata)
 
 
-@pytest.fixture(autouse=True)
-def _env(home, monkeypatch):  # noqa: F811
-    monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
-    monkeypatch.setenv("AMS_OUTCOME_FILE", str(home / "outcome"))
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """HOME under tmp_path so nothing touches a real ~/.mem0; the step's outcome file lives beside it."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".mem0").mkdir()
+    for v in ("MEM0_PROMOTION_GATE_MODE", "MEM0_EVAL_ROOT", "MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE",
+              "AMS_STORE_CHECKOUT", "AMS_STORE_BIN"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(tmp_path / "outcome"))
+    return tmp_path
 
 
 @pytest.fixture
-def m(monkeypatch):
+def m(home, monkeypatch):
     mod = _mod()
     monkeypatch.setattr(mod, "_run_deployed", lambda script, env=None: (0, "ok"))
     mod.sleeps = []
