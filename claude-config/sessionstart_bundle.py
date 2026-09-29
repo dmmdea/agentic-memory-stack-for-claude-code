@@ -41,6 +41,10 @@ DEFAULT_LIMIT = 120  # per-fact char cap (matches the canonical/episode banner l
 DEFAULT_K = 1        # boot precision: at most the single highest-ranked durable/evidence fact
 MARKER_NAME = "precompact-query.json"  # written by precompact_capture.py (B1 Phase 2)
 MARKER_MAX_AGE = 300  # s — a marker older than this is stale (the post-compact boot fires seconds later)
+# The batched /v1/context/bundle wire contract (mem0-server/hook_contract.py KNOWN_HOOK_CONTRACT_VERSIONS;
+# the hook daemon stamps the same). An unstamped call is counted by /health/deep hook_contract.missing,
+# and this caller was most of that count, which hid any real hook regression behind known-benign traffic.
+BUNDLE_HOOK_CONTRACT_VERSION = "20.0"
 
 
 # --- pure logic (unit-tested) -------------------------------------------------
@@ -162,7 +166,8 @@ def load_and_consume_marker(path: str, now, max_age: int = MARKER_MAX_AGE) -> "s
 def fetch_bundle(url: str, key: str, query: str, brand, initiative, tier: str = "small", timeout: float = 6.0) -> list:
     """POST /v1/context/bundle (checkpoint:false). tier scales K at the calibrated 0.30 gate
     (small=>K<=1, frontier=>K<=2). Returns memories[] or [] on any error."""
-    payload = {"session_id": "sessionstart-enrich", "prompt": query, "checkpoint": False, "tier": tier}
+    payload = {"session_id": "sessionstart-enrich", "prompt": query, "checkpoint": False, "tier": tier,
+               "hook_contract_version": BUNDLE_HOOK_CONTRACT_VERSION}
     if brand:
         payload["brand"] = brand
     if initiative:
