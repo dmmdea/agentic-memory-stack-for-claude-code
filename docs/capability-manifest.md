@@ -67,9 +67,16 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `brand-isolation` | brand-scoped retrieval isolation | checks.admission_probe.brand_rejected (read half) + job_liveness.brand_scope_misscoped/brand_scope_age_h (nightly write-side audit) | both | F17 |
 | `offline-outbox` | shim outbox queue/replay when the authority is unreachable | job_liveness.outbox_depth + outbox_replayed_age_h + outbox_drain_log_age_h — evaluated on the REPLICA only (F8 keeps it non-convicting on a brain box) | replica | F17 |
 | `job-queue` | durable two-phase job queue (jobs.py): claim/receipt/reap for adopted scheduled jobs | job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h | optional | W6 |
+| `promotion-gate` | canonical auto-promotion gate enforces (not only shadows) on the brain | checks.promotion_gate.mode (env MEM0_PROMOTION_GATE_MODE > stack.env > shadow default, the dream's own resolution); degraded on a brain that is not enforcing | brain | WP-4 |
 
 Verdict rules per probe family (all thresholds live in `capabilities.py`):
 
+- **`promotion-gate`** reports the 4C promotion gate's effective mode (`checks.promotion_gate.mode`, also
+  echoed as the top-level `promotion_gate_mode` on `/health/deep`), resolved the way the dream does:
+  `MEM0_PROMOTION_GATE_MODE` in the environment, else `stack.env`, else the `shadow` default.
+  `alive` when the brain enforces; `degraded` (the WARN state, never `dead_required`) when the brain
+  only shadows or has the gate off; `unknown` on a replica or with no check. The value itself is set by
+  the installer and the operator, not by this row.
 - **`dedup-job`** reads the job's own work summary (`~/.mem0/dedup-summary.jsonl`, last row), not
   the mtime of a report it rewrites on every run (that proved "ran", and the job compared nothing
   for weeks behind it). `degraded` when: no summary exists, the summary is older than 36 h, the

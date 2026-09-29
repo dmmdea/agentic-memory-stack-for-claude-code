@@ -50,6 +50,7 @@ GREEN_CHECKS = {
     "mojibake": {"ok": True, "scanned": 100, "hits": 0, "sample_ids": [],
                  "elapsed_ms": 12},
     "pending_contradiction_reviews": 0,
+    "promotion_gate": {"role": "brain", "mode": "enforce", "source": "stack.env"},
     "reranker": {"last_rerank_ok_ts": NOW_S - 3600, "consecutive_rerank_failures": 0,
                  "ok_total": 12, "fail_total": 0, "last_error": None},
     "admission_probe": {"ok": True, "tier_rejected": True, "brand_rejected": True,
@@ -91,6 +92,7 @@ PROBE_BACKED = [
     "memory-index", "sweep-job", "codex-auth",
 ]
 # W4: formerly 'none -- W4' (always unknown), now each with a real evaluator.
+WP4_ROWS = ["promotion-gate"]
 W4_REVIVED = [
     "reranker", "l1a-extraction", "sessionstart-banner", "mcp-shim",
     "admission-gate", "tier-policy", "brand-isolation", "offline-outbox",
@@ -117,7 +119,7 @@ def _ev(checks, role="brain", **kw):
 def test_GREEN_CHECKS_truth_table():
     out = _ev(GREEN_CHECKS)
     assert out["role"] == "brain"
-    for cid in PROBE_BACKED + W4_REVIVED:
+    for cid in PROBE_BACKED + W4_REVIVED + WP4_ROWS:
         assert out["states"][cid] == "alive", cid
     assert out["dead_required"] == []
     assert out["unknown"] == []
@@ -717,3 +719,45 @@ def test_new_rows_never_raise_on_a_legacy_checks_dict():
     for cid in W4_REVIVED:
         assert out["states"][cid] == "unknown", cid
     assert out["dead_required"] == []
+
+
+# ======================================================================
+# WP-4 -- the promotion gate's effective mode is visible
+# ======================================================================
+#
+# The dream resolves the 4C promotion gate as env > stack.env > 'shadow'. On the brain nothing set it,
+# so every verdict was only logged and uncorroborated facts were promoted to canonical anyway - with
+# nothing on /health/deep saying so. The row makes the effective mode visible and reads 'degraded'
+# (the WARN state) for a brain that is not enforcing. The VALUE is set by the installer, not here.
+
+def test_promotion_gate_mode_precedence_env_then_stack_env_then_default(tmp_path):
+    from capabilities import promotion_gate_health
+    stack = tmp_path / "stack.env"
+    stack.write_text("MEM0_ROLE=brain\nMEM0_PROMOTION_GATE_MODE=enforce\n", encoding="utf-8")
+    assert promotion_gate_health("brain", environ={"MEM0_PROMOTION_GATE_MODE": " Shadow "},
+                                 stack_env_path=stack) == {"role": "brain", "mode": "shadow", "source": "env"}
+    assert promotion_gate_health("brain", environ={}, stack_env_path=stack) == {
+        "role": "brain", "mode": "enforce", "source": "stack.env"}
+    assert promotion_gate_health("brain", environ={}, stack_env_path=tmp_path / "missing.env") == {
+        "role": "brain", "mode": "shadow", "source": "default"}
+
+
+def test_promotion_gate_row_warns_on_a_brain_that_only_shadows():
+    def state(mode, role="brain", check=True):
+        checks = _checks(promotion_gate={"role": role, "mode": mode, "source": "default"})
+        if not check:
+            checks.pop("promotion_gate")
+        return _ev(checks, role=role)["states"]["promotion-gate"]
+
+    assert state("enforce") == "alive"
+    assert state("shadow") == "degraded"          # the finding: brain + shadow
+    assert state("off") == "degraded"             # a disabled gate is not enforcing either
+    assert state("shadow", role="replica") == "unknown"   # the dream (and the gate) run on the brain only
+    assert state("enforce", check=False) == "unknown"
+    # a WARN, never a conviction: degraded rows are not dead_required
+    out = _ev(_checks(promotion_gate={"role": "brain", "mode": "shadow", "source": "default"}))
+    assert "promotion-gate" not in out["dead_required"]
+
+
+def test_promotion_gate_row_is_documented():
+    assert "promotion-gate" in _doc_table_ids()

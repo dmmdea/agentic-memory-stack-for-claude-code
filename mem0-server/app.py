@@ -49,6 +49,7 @@ from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
 from capabilities import evaluate as evaluate_capabilities  # W3: capability manifest (informational)
+from capabilities import promotion_gate_health as _promotion_gate_health  # WP-4: effective gate mode
 # W4: in-process admission self-probe. Calls AdmissionPolicy.evaluate() DIRECTLY —
 # never apply_admission, which would bump the MEM-8 daily counters this endpoint
 # reports and append to ~/.mem0/admission-rejected.jsonl on every health read.
@@ -1124,6 +1125,9 @@ def health_deep() -> dict:
         out["checks"]["admission_probe"] = {"ok": False, "error": str(e)[:120]}
     try:
         _cap_role = (out["checks"].get("job_liveness") or {}).get("role")
+        # WP-4: the effective 4C promotion-gate mode (env > stack.env > shadow) and its WARN row
+        out["checks"]["promotion_gate"] = _promotion_gate_health(_cap_role)
+        out["promotion_gate_mode"] = out["checks"]["promotion_gate"]["mode"]
         out["checks"]["capabilities"] = evaluate_capabilities(
             out["checks"], _cap_role, stack_version=STACK_VERSION)
     except Exception as e:

@@ -49,8 +49,10 @@ tests/test_capabilities.py pins the doc's ids against CAPABILITIES.
 """
 
 import datetime as _dt
+import os
 
 from admission_gate import AdmissionPolicy, default_policy_for_class
+from job_liveness import read_stack_env
 
 # Freshness thresholds for the nightly receipts (dream, prune/gather, backup
 # manifest, dedup report — all daily cadence). One missed night is tolerated
@@ -205,6 +207,13 @@ CAPABILITIES = [
      "probe": ("job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + "
                "jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h"),
      "required": "optional", "escalation_documented": True},
+    # WP-4: the effective 4C promotion-gate mode was invisible, and on the brain it silently sat at the
+    # code default (shadow: log only) after the cutover, so uncorroborated facts were promoted to canonical.
+    {"id": "promotion-gate",
+     "what": "canonical auto-promotion gate enforces (not only shadows) on the brain",
+     "probe": ("checks.promotion_gate.mode (env MEM0_PROMOTION_GATE_MODE > stack.env > shadow default, "
+               "the dream's own resolution); degraded on a brain that is not enforcing"),
+     "required": "brain", "escalation_documented": True},
 ]
 
 _ROLES = ("brain", "replica")
@@ -648,7 +657,32 @@ def _state_for(row, checks, stack_version=None, now_s=None):
         return _offline_outbox_state(jl)
     if cid == "job-queue":
         return _job_queue_state(jl)
+    if cid == "promotion-gate":
+        return _promotion_gate_state(checks.get("promotion_gate"))
     return "unknown"           # a row without an evaluator is a named blind spot
+
+
+def promotion_gate_health(role, environ=None, stack_env_path=None) -> dict:
+    """The effective 4C promotion-gate mode: {role, mode, source}. Resolution is the dream's own
+    (scripts/wsl/dream-consolidate.py): env MEM0_PROMOTION_GATE_MODE, else stack.env, else 'shadow'.
+    Never raises. Informational input to the promotion-gate capability row."""
+    environ = os.environ if environ is None else environ
+    raw = (environ.get("MEM0_PROMOTION_GATE_MODE") or "").strip()
+    source = "env"
+    if not raw:
+        raw = (read_stack_env(stack_env_path).get("MEM0_PROMOTION_GATE_MODE") or "").strip()
+        source = "stack.env"
+    if not raw:
+        raw, source = "shadow", "default"
+    return {"role": role, "mode": raw.lower(), "source": source}
+
+
+def _promotion_gate_state(check):
+    """alive when the brain enforces; degraded (the WARN state) when the brain only shadows or has the
+    gate off; unknown elsewhere - the dream, and so the gate, runs on the brain alone."""
+    if not isinstance(check, dict) or check.get("role") != "brain":
+        return "unknown"
+    return "alive" if check.get("mode") == "enforce" else "degraded"
 
 
 def _job_queue_state(jl):
