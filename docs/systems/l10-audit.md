@@ -12,11 +12,21 @@ L10 is a heuristic post-hoc audit pass that scans every Qdrant point (bypassing 
 
 | Flag | Trigger |
 |---|---|
-| `oversize` | `len(text) > 1200 chars` |
+| `oversize` | `len(text) > 1200 chars`; `> 4000` (the migration cap, `Mem0MaxChars`) for `source: automemory:*` records, which the judge stores verbatim |
 | `possible-injection` | text contains "ignore previous instructions" or similar |
-| `possible-credential` | text contains `password:`, `api_key:`, `bearer `, etc. |
+| `possible-credential` | a credential shape: any match of the shared redaction rules (`mem0-server/redact.py`, minus env-var references, paths, placeholders and already-redacted markers), a provider-prefix tripwire (`vcp_`, `sbp_`, `ghp_`, `AIza`, ... + 12 chars), or a 32+ character random-looking alphanumeric token (upper + lower + digit, Shannon entropy >= 4.2 bits/char, and a class-transition ratio >= 0.48 that keeps CamelCase identifiers out; a seeded sample flags 94-98% of random 32-64 character tokens, so it is a screen, not a guarantee) |
 | `missing-provenance` | no `source` field in payload |
 | `canonical-without-actor` | tier=canonical but no `tier_actor` recorded |
+
+### Retired points
+
+`retrievable=false` points are skipped for every flag except `possible-credential`: a retired point is
+still a readable row in Qdrant and in every backup, so a literal credential in one is an exposure
+until the row is scrubbed, whatever its retrieval status. Retired points are never durable candidates.
+The flags file stores a redacted preview (redacted first, then cut to 120 characters), never the
+credential itself. The detector is advisory: it routes a point to review, it does not judge it.
+Reviewing a flag never removes the credential; a real one needs the row scrubbed or retired and the
+credential rotated.
 
 ## Incremental operation
 

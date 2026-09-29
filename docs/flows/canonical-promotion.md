@@ -48,7 +48,7 @@ After the nightly consolidation writes its insights, phase 3.5 may autonomously 
    - **Source-weighted corroboration:** a `trusted` source (operator-asserted — `operator-decision` / `user-decision`) fast-tracks on the contradiction gate alone; **every other source class is treated as untrusted** and needs `≥ MinCorroboration` (default **2**) independent observations. Anything not on the trusted allowlist is untrusted by construction.
 4. **Promote the survivors** by calling `mem0-canonize.sh --actor dream-autopromote <id> "<reason>"` — the *same* HMAC door as path A, signed with the *same* key. The actor label only distinguishes the two in the ledger.
 
-**The gate ships in shadow mode by default — it does not block by default.** `MEM0_PROMOTION_GATE_MODE ∈ {off, shadow, enforce}`, defaulting to `shadow` when neither the env var nor the receipt's persistent `PromotionGateMode` is set (`dream-consolidate.ps1`, ~line 640–642):
+**The gate ships in shadow mode by default — it does not block by default.** (On the native Linux brain the Python dream resolves the mode from the `MEM0_PROMOTION_GATE_MODE` environment variable, then `~/.mem0/stack.env`, then `shadow`; the Windows receipt's `PromotionGateMode` is not read there. `install/linux-authority.sh --promotion-gate-mode enforce` writes the line and every later re-run carries it, see [installer-and-deploy](../systems/installer-and-deploy.md).) `MEM0_PROMOTION_GATE_MODE ∈ {off, shadow, enforce}`, defaulting to `shadow` when neither the env var nor the receipt's persistent `PromotionGateMode` is set (`dream-consolidate.ps1`, ~line 640–642):
 
 | Mode | What the gate does to the promotion |
 |---|---|
