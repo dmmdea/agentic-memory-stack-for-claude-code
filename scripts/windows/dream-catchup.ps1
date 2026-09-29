@@ -12,9 +12,11 @@
 # nudge it. Its own 6h throttle stops multiple session-starts in a morning from hammering.
 #
 # Debt = anything the dream would consolidate that has piled up:
-#   - >=1 pending learn-rule (~/.mem0/learn-rules.jsonl), OR
 #   - >=1 queued promotion (~/.mem0/promote-queue.jsonl), OR
 #   - last dream run >48h ago (long gap: catch up regardless of visible debt).
+# Pending learn-rules (~/.mem0/learn-rules.jsonl) are NOT debt: the dream never read them, so
+# counting them only ran a full consolidation for nothing. learn-rules-drain.ps1 posts them to the
+# authority (spawned by memory-maintenance-spawn.ps1 on every role).
 # If the dream ran <30h ago it's fresh — no catch-up. Stale (30-48h) but no debt -> skip.
 
 $ErrorActionPreference = 'Continue'
@@ -75,7 +77,7 @@ try {
         exit 0
     }
 
-    # (c) Debt check: pending learn-rules OR queued promotions OR a long (>48h) gap.
+    # (c) Debt check: queued promotions OR a long (>48h) gap (learn-rules belong to the drain).
     function Test-JsonlHasLine {
         param([string]$Path)
         if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -86,18 +88,16 @@ try {
         } catch { return $false }
         return $false
     }
-    $learnPath   = Join-Path $env:USERPROFILE '.mem0\learn-rules.jsonl'
     $promotePath = Join-Path $env:USERPROFILE '.mem0\promote-queue.jsonl'
-    $hasLearn   = Test-JsonlHasLine -Path $learnPath
     $hasPromote = Test-JsonlHasLine -Path $promotePath
     $longGap    = ($ageHours -gt 48)
 
-    if (-not ($hasLearn -or $hasPromote -or $longGap)) {
+    if (-not ($hasPromote -or $longGap)) {
         Write-MemoryLog -Component 'dream-catchup' -Message ("stale but no debt (last dream {0:N1}h ago); skipping catch-up" -f $ageHours)
         exit 0
     }
 
-    Write-MemoryLog -Component 'dream-catchup' -Message ("debt detected (last dream {0:N1}h ago, learn={1} promote={2} longGap={3}); invoking dream-consolidate.ps1" -f $ageHours, $hasLearn, $hasPromote, $longGap)
+    Write-MemoryLog -Component 'dream-catchup' -Message ("debt detected (last dream {0:N1}h ago, promote={1} longGap={2}); invoking dream-consolidate.ps1" -f $ageHours, $hasPromote, $longGap)
 
     # Invoke the real consolidator. Its OWN 24h throttle + Codex lock already prevent a
     # double-run against the nightly scheduled task or a concurrent session, so we pass
