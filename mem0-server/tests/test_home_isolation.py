@@ -61,19 +61,42 @@ def test_a_child_process_sees_the_redirected_home(tmp_path):
 _HOME_ONLY = re.compile(r"""(?:"HOME"\s*[:,]|'HOME'\s*[:,]|\bHOME\s*=\s*str\(|\[["']HOME["']\]\s*=)""")
 
 
-def test_no_suite_here_redirects_HOME_alone():
+# Every directory whose pytest files CI runs: a HOME-only child env in any of them is the same
+# defect, so the static guard scans them all (not just this directory).
+_SCANNED_DIRS = (
+    HERE,
+    REPO_ROOT / "claude-config" / "tests",
+    REPO_ROOT / "scripts" / "wsl",
+)
+
+
+def _home_only_offenders():
+    offenders = []
+    for base in _SCANNED_DIRS:
+        for path in sorted(base.glob("test_*.py")):
+            if path.name == Path(__file__).name:
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for i, line in enumerate(lines):
+                if not _HOME_ONLY.search(line):
+                    continue
+                window = " ".join(lines[max(0, i - 3): i + 4])
+                if "USERPROFILE" not in window:
+                    offenders.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{i + 1}")
+    return offenders
+
+
+def test_scanned_dirs_exist_and_hold_suites():
+    """A moved directory must not turn the static guard below into a silent no-op."""
+    for base in _SCANNED_DIRS:
+        assert base.is_dir(), base
+        assert any(base.glob("test_*.py")), base
+
+
+def test_no_suite_redirects_HOME_alone():
     """A test that sets HOME by hand and never USERPROFILE is the class that leaked a receipt into
     the real Windows profile. Redirecting goes through _home_isolation (home_env / apply_home /
-    the isolated_home fixture), which sets all of them."""
-    offenders = []
-    for path in sorted(HERE.glob("test_*.py")):
-        if path.name == Path(__file__).name:
-            continue
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            if not _HOME_ONLY.search(line):
-                continue
-            window = " ".join(lines[max(0, i - 3): i + 4])
-            if "USERPROFILE" not in window:
-                offenders.append(f"{path.name}:{i + 1}")
+    the isolated_home fixture), or sets USERPROFILE and HOMEDRIVE/HOMEPATH inline where the suite
+    lives outside this directory. Scans mem0-server/tests, claude-config/tests and scripts/wsl."""
+    offenders = _home_only_offenders()
     assert not offenders, f"HOME-only redirect (use tests/_home_isolation.py): {offenders}"

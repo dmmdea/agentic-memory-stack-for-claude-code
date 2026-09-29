@@ -51,7 +51,10 @@ def _run(tmp_path: Path, sources: str, ssh_body: str, extra_env=None, stack_env:
     b = _fake_bin(tmp_path, ssh_body)
     log = tmp_path / "builder.log"
     env = dict(os.environ)
-    env.update({"HOME": str(home), "PATH": f"{b}{os.pathsep}{env['PATH']}", "FAKE_LOG": str(log),
+    drive, tail = os.path.splitdrive(str(home))
+    # HOME plus the Windows variables, so no platform resolves ~ to the real profile.
+    env.update({"HOME": str(home), "USERPROFILE": str(home), "HOMEDRIVE": drive, "HOMEPATH": tail,
+                "PATH": f"{b}{os.pathsep}{env['PATH']}", "FAKE_LOG": str(log),
                 "WIKI_PY": str(b / "fakepy"), "WIKI_PULL_KEY": str(tmp_path / "nokey")})
     if sources is not None:
         env["WIKI_SOURCES"] = sources

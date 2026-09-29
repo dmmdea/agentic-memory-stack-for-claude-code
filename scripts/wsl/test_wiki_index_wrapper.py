@@ -41,7 +41,10 @@ def _env(tmp_path: Path, extra=None):
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
     log = tmp_path / "calls.log"
     env = dict(os.environ)
-    env.update({"HOME": str(home), "PATH": f"{b}{os.pathsep}{env['PATH']}", "FAKE_LOG": str(log),
+    drive, tail = os.path.splitdrive(str(home))
+    # HOME plus the Windows variables, so no platform resolves ~ to the real profile.
+    env.update({"HOME": str(home), "USERPROFILE": str(home), "HOMEDRIVE": drive, "HOMEPATH": tail,
+                "PATH": f"{b}{os.pathsep}{env['PATH']}", "FAKE_LOG": str(log),
                 "WIKI_PY": str(b / "fakepy")})
     env.pop("WIKI_BRAIN_SSH", None)
     env.update(extra or {})
