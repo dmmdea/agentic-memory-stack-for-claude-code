@@ -407,10 +407,15 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
                 if not d["within_cap"]:
                     continue             # over the cap: stays for a later night, not in the restore record
                 rid = d["deleted_id"]
+                # the restore record is written (and flushed) BEFORE the delete: a crash between the
+                # two must never leave a deleted record with no payload on file
+                report.write(json.dumps(report_rec) + "\n")
+                report.flush()
                 r = c.delete(f"{MEM0}/v1/memories/{rid}")
-                if r.status_code == 200:
+                if r.status_code != 200:
+                    report.write(json.dumps({"deleted_id": rid, "delete_failed": r.status_code}) + "\n")
+                else:
                     deletions += 1
-                    report.write(json.dumps(report_rec) + "\n")
                     # Lens S2: every destructive op appends to the central tier-ledger
                     _append_ledger({
                         "event": "decay-delete", "memory_id": rid,

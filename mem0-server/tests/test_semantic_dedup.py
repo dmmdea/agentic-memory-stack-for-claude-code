@@ -172,6 +172,9 @@ def test_outcome_says_degraded_when_it_compared_nothing_or_skipped_too_much():
 # End to end through _run(): summary counts, outcome file, cap, only evidence deleted.
 # ---------------------------------------------------------------------------
 
+_FAILING: set = set()   # ids the fake mem0 refuses to delete (500), set per test
+
+
 @pytest.fixture()
 def rig(tmp_path, monkeypatch):
     for name, fname in (("REPORT", "dedup-report.jsonl"), ("REPORT_DRY", "dedup-report.dryrun.jsonl"),
@@ -181,10 +184,14 @@ def rig(tmp_path, monkeypatch):
     outcome = tmp_path / "outcome.txt"
     monkeypatch.setenv("AMS_OUTCOME_FILE", str(outcome))
     deleted: list = []
+    _FAILING.clear()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "DELETE":
-            deleted.append(request.url.path.rsplit("/", 1)[-1])
+            rid = request.url.path.rsplit("/", 1)[-1]
+            if rid in _FAILING:
+                return httpx.Response(500, json={})
+            deleted.append(rid)
         return httpx.Response(200, json={})
 
     real = httpx.Client
@@ -257,3 +264,18 @@ def test_no_outcome_file_is_fine(rig, monkeypatch):
     monkeypatch.setattr(sd, "scroll_all_with_vectors", _twin_corpus)
     assert sd._run(dry_run=True, max_deletions=50) == 0
     assert not outcome.exists()
+
+
+def test_failed_delete_is_not_counted_and_the_restore_record_is_written_first(rig, monkeypatch):
+    """The payload goes to the restore report BEFORE the delete call; a delete the API refuses is
+    marked in the report and is not counted as a deletion."""
+    tmp, outcome, deleted = rig
+    monkeypatch.setattr(sd, "scroll_all_with_vectors", _twin_corpus)
+    _FAILING.add("e1-new")
+    assert sd._run(dry_run=False, max_deletions=50) == 0
+    assert deleted == ["e2-new"]
+    lines = [json.loads(x) for x in (tmp / "dedup-report.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {r["deleted_id"] for r in lines if "deleted_full_payload" in r} == {"e1-new", "e2-new"}
+    assert [r for r in lines if "delete_failed" in r] == [{"deleted_id": "e1-new", "delete_failed": 500}]
+    row = json.loads((tmp / "dedup-summary.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["deleted"] == 1 and row["candidates"] == 2

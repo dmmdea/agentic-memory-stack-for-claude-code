@@ -42,6 +42,9 @@ class Fetcher:
 def isolated(monkeypatch, tmp_path):
     from pathlib import Path
     monkeypatch.setattr(Path, "home", lambda: tmp_path)          # audit log stays out of ~/.mem0
+    # other suites leave rejection counters behind (a stale day, or ten families that push a new one
+    # out of the top-N snapshot); start from zero
+    monkeypatch.setattr(ag, "admission_rejection_stats", {"date": None, "total": 0, "reasons": {}})
     monkeypatch.setattr(ag, "_STAMP_TIER_FETCHER", None)
     monkeypatch.setattr(ag, "_stamp_tier_cache", {})
     monkeypatch.setattr(ag, "stamp_resolution_stats",
