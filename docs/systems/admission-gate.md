@@ -82,6 +82,17 @@ workspace/project enforcement is still deferred.
    in durable/operational. No LLM runs at retrieval time — the gate only reads
    the stamp. `contradiction_checked_at` alone (the sweep's NO verdict /
    idempotency marker) never rejects. Skipped for `forensic` policies.
+   **The stamp is enforced only while its target is still canonical.** A stamp is
+   a bare id, and it used to hide the record forever even after the target was
+   demoted (98 % of the audited rejections named such a target). The gate now
+   resolves each stamp target's *current* tier - one batched Qdrant retrieve per
+   search, cached 10 minutes (`admission_gate.resolve_stamp_tiers`, wired at
+   server start-up) - and ignores the stamp unless the target is `canonical`. A
+   target that no longer exists is dangling and ignored. A lookup that fails is
+   **fail-open** (the stamp is ignored for that search) and counted: `/health/deep`
+   `checks.admission_rejections_today.stamps` carries `stamp_target_unresolved`
+   (lookup down) and `stamp_ignored_not_canonical` (the fix working). The diagnose
+   endpoint uses the same resolution.
 6. **Task-relevance floor (I.2)** — operational class ONLY, and only when the
    result carries a `rerank_score` (the raw bge-reranker-v2-m3 cross-encoder
    logit attached by `reranker.rerank()` when the caller passed
@@ -226,7 +237,8 @@ previously omitted `schema_version`):
 | audit log unwritable | **fail-open for availability** — WARN, search proceeds (v0.19 M6/M11) | audit must never break retrieval |
 | `superseded_by` truthy (durable/operational) | **fail-closed** — `superseded_by:<mid>` (v0.19 I.1) | the newer record should surface instead; `history` class admits |
 | `superseded_by` null/absent | **fail-open** — admitted | legacy data carries no supersession pointer |
-| `contradicts_canonical` truthy (durable/operational) | **fail-closed** — `contradicts_canonical:<mid>` (v0.19 I.3) | contradiction of locked ground truth; `history` class admits |
+| `contradicts_canonical` truthy, target still `canonical` (durable/operational) | **fail-closed** — `contradicts_canonical:<mid>` (v0.19 I.3) | contradiction of locked ground truth; `history` class admits |
+| `contradicts_canonical` truthy, target demoted / gone / lookup failed | **fail-open** — admitted; counted in `stamps` | a stamp against a non-canonical target is stale (WP-4); an unresolved lookup must not hide a live record |
 | `contradiction_checked_at` alone (sweep NO verdict) | **fail-open** — admitted | idempotency marker, not a verdict |
 | `rerank_score` absent (operational, floor set) | **fail-open** — admitted (v0.19 I.2) | rerank off / reranker down must not empty results |
 | `rerank_score` below floor (operational, floor set) | **fail-closed** — `relevance_floor:<score>_below_<floor>` | the only relevance-aware rejection; disabled by default |

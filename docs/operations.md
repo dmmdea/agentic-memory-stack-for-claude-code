@@ -48,7 +48,9 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 systemctl --user list-timers --all | grep -E "decay|backup|goals|contradiction|reconcile|l10"
 ```
 
-**Reading the episodic-reconcile receipt** (`~/.mem0/episodic-reconciliation.jsonl`): an
+**Reading the semantic-dedup receipt** (`~/.mem0/dedup-summary.jsonl`, last row; also the step's `work` counts): `scanned`, `skipped_no_vector`, `compared_pairs`, `candidates`, `deleted`, `protected_skips`, `max_deletions`, `capped`. A run that scanned over 1000 points and compared no pair (or skipped over 1 % for want of a vector) reads `degraded:compared-0` / `degraded:skipped-no-vector`, and so does the `dedup-job` capability. Each run deletes at most `--max-deletions` (default 50, highest cosine first), so a backlog drains over a few nights; `--dry-run` writes every candidate to `~/.mem0/dedup-report.dryrun.jsonl` for review before any live run. Canonical, automemory-migrated and operator-sourced insight records are never deleted.
+
+**Reading the episodic-reconcile receipt** (`~/.mem0/episodic-reconciliation.jsonl`): the Sunday run also abandons `in_progress` episodes untouched for 7 days (`abandoned_stale_in_progress`) and embeds up to 500 missing episode summaries per run (`embedding_backfill`, newest first, skipped while `/health/embedder` is down); embedding coverage under 90 % of eligible episodes reads `degraded:embedding-coverage-<pct>` (a catching-up backlog: outcome and step status, exit 0). An
 *orphaned link* is an episode→memory link whose memory is gone from Qdrant. Since 2026-08-24
 the receipt splits them by deletion evidence — `orphaned_explained_count` (a DELETE row in
 `history.db` **or** a `delete`/`decay-delete` event in the tier-ledger: the semantic-dedup and
