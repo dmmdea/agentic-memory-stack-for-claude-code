@@ -425,3 +425,24 @@ def test_installer_explicit_empty_flag_clears_the_inherited_value(tmp_path):
     assert r.returncode == 0, r.stderr + r.stdout
     assert "--brain-backup-dir cleared (explicit empty value; not inherited)" in r.stdout
     assert "--brain-backup-dir inherited" not in r.stdout
+
+
+@pytestmark_bash
+def test_installer_ams_hub_reaches_the_client_from_the_receipt_and_clears_when_told(tmp_path):
+    """session-12 WP-12: a replica is a client plus a dormant brain; a re-run without --ams-hub
+    must keep the hub the client receipt recorded (it used to skip the fleet store, exit 0, and
+    blank the hub), and an explicit empty value must still reach the client to clear it."""
+    home, env = _scratch_home(tmp_path)
+    hub = "ams-hub@hubbox:ams-store.git"
+    (home / ".mem0" / "client-receipt.json").write_text(
+        '{"role":"replica","user_id":"t","ams_hub":"%s"}\n' % hub, encoding="utf-8")
+    base = [BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--brain-ssh", "brain", "--user-id", "t", "--dry-run"]
+    r = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert f"--ams-hub inherited from ~/.mem0/client-receipt.json: {hub}" in r.stdout
+    assert f"wire the hub transport for {hub}" in r.stdout
+    r = subprocess.run(base + ["--ams-hub", ""], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "--ams-hub cleared (explicit empty value; not inherited)" in r.stdout
+    assert "WARN: no --ams-hub" in r.stdout
+    assert "--ams-hub inherited" not in r.stdout

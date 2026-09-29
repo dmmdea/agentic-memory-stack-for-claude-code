@@ -59,6 +59,31 @@ _SECRET_PATTERNS = tuple(
         (r"(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@", r"\1:[REDACTED]@"),
         (r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
          "[REDACTED_PRIVATE_KEY]"),
+        # Session-12 additions, APPENDED so the generic rules keep their 'pattern_<index>' telemetry
+        # keys. Provider families first: Vercel / Supabase / Cloudflare / Stripe / Resend / Tailscale /
+        # Google, each shape seen live and unredacted.
+        (r"(?-i:(?<![A-Za-z0-9])vcp_[A-Za-z0-9]{20,})", "[REDACTED_VERCEL_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])sbp_[A-Za-z0-9]{20,})", "[REDACTED_SUPABASE_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])cfut_[A-Za-z0-9]{20,})", "[REDACTED_CLOUDFLARE_TOKEN]"),
+        (r"(?-i:(?<![A-Za-z0-9])sk_live_[A-Za-z0-9]{16,})", "[REDACTED_STRIPE_KEY]"),
+        # re_ is a two-letter prefix, so it also needs a digit AND an uppercase letter and a left
+        # boundary that refuses `_` (re_search_results_2026_09_28 stays)
+        (r"(?-i:(?<![A-Za-z0-9_])re_(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]{24,})", "[REDACTED_RESEND_KEY]"),
+        (r"(?-i:(?<![A-Za-z0-9])tskey-[A-Za-z0-9-]{20,})", "[REDACTED_TAILSCALE_KEY]"),
+        (r"(?-i:(?<![A-Za-z0-9])whsec_[A-Za-z0-9]{16,})", "[REDACTED_STRIPE_WEBHOOK_SECRET]"),
+        (r"(?-i:(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{30,})", "[REDACTED_GOOGLE_API_KEY]"),
+        # Telegram bot token: 8-10 digit bot id, colon, `AA`, 30+ url-safe chars
+        (r"(?-i:(?<![A-Za-z0-9])[0-9]{8,10}:AA[A-Za-z0-9_-]{30,})", "[REDACTED_TELEGRAM_TOKEN]"),
+        # `API key <tok>` / `API key: <tok>` with a SPACE inside the keyword (the assignment rule's
+        # `api[_-]?key` never matched it). The token is 20+ alphanumerics with a digit, no `-`/`_`/`/`,
+        # so kebab slugs and paths after the label stay
+        (r"(?i)((?<![A-Za-z0-9])(?:api|access|auth|secret|private)[ \t]+(?:key|token)[ \t]*[:=]?[ \t]*[\x22\x27\x60]?)(?=[A-Za-z0-9]{0,200}[0-9])[A-Za-z0-9]{20,200}", r"\1[REDACTED]"),
+        # `<label> is <tok>` / `<label> value is <tok>` / `<label> (note) is <tok>`, same token class as
+        # above
+        (r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_ \t-]?key|token|password|passwd|secret)(?:[ \t]*\([^)\r\n]{0,40}\))?[ \t]+(?:value[ \t]+)?is[ \t]+[\x22\x27\x60]?)(?=[A-Za-z0-9]{0,200}[0-9])[A-Za-z0-9]{20,200}", r"\1[REDACTED]"),
+        # `login <user> / <password>`: a `@` in the user is enough; a bare user needs a digit or symbol
+        # in the password so `login page / logout flow` stays
+        (r"(?i)((?<![A-Za-z0-9])login[ \t]+(?:[^\s/@]{1,64}@[^\s/]{1,64}[ \t]*/[ \t]*|[^\s/@]{1,64}[ \t]*/[ \t]*(?=\S*[0-9!@#$%^&*])))[^\s\x22\x27\x60]{4,128}", r"\1[REDACTED]"),
     )
 )
 

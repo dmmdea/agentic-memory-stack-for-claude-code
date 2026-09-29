@@ -152,8 +152,8 @@ LLAMA_SWAP = "http://127.0.0.1:11436"
 # model `offload-e4b` (gemma-4-E4B QAT). WHY: the v0.19 bake-off picked the 14B
 # purely on a tiny 8-9-pair verdict-quality sample and ignored the binding
 # hardware constraint. The 14B GGUF is 8.24 GB on an 8.19 GB (RTX 3070) card;
-# with --n-gpu-layers 999 it overflows the ~6 GB free after the PERSISTENT
-# always_loaded group (nomic-embed + bge-reranker-v2-m3 + gemma-3-270m, ~950 MB)
+# with --n-gpu-layers 999 it overflows the ~6 GB free after the
+# support group (nomic-embed + bge-reranker-v2-m3 + gemma-3-270m, ~950 MB)
 # and triage_tier, so loading it spills to RAM and thrashes the VRAM ceiling —
 # the weekly sweep was knocking the live retrieval reranker off the GPU.
 # `offload-e4b` (~4-4.5 GB, swappable_offload group) fits inside that free

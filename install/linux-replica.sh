@@ -22,7 +22,8 @@
 #        [--brain-wsl <distro>:<user>] [--brain-backup-dir <remote dir>] \
 #        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run] \n#        [--ams-hub <user@host:repo.git>] [--ams-store-binary <file>] [--ams-store-sums <file>]
 #   --ams-hub and its two companions are forwarded verbatim to install/linux-client.sh, which
-#                is where the fleet store is installed; a replica joins the store as a client.
+#                is where the fleet store is installed; a replica joins the store as a client. An
+#                omitted --ams-hub inherits the recorded hub (client-receipt.json); "" clears it.
 #   --brain-wsl: the Brain keeps its stack inside WSL on a Windows host; snapshot commands run
 #                through wsl.exe on that host (the usual Windows+WSL install).
 #   --qdrant-storage-gb: size of the ext4 image that backs Qdrant's storage when the home
@@ -36,12 +37,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # 1.31.1: the ONE stack.env writer (plain-token values only; bash, sed and Python must agree).
 . "$SCRIPT_DIR/stack-env.sh"
+# the release sha stamp (DEPLOYED_SHA) beside VERSION; see deploy-stamp.sh.
+. "$SCRIPT_DIR/deploy-stamp.sh"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""; SET_BRAIN_WSL=0; SET_BRAIN_BACKUP_DIR=0
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
 # Fleet-store flags: a replica is a client plus a dormant brain, so these belong to the
 # client install and are forwarded to it verbatim. Without the forward the client would
 # skip its store block and the replica would silently never join the fleet.
-AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
+AMS_HUB=""; SET_AMS_HUB=0; AMS_BINARY=""; AMS_SUMS=""
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
 CLIENT_DIR="${MEM0_CLIENT_DIR:-$HOME/apps/mem0-client}"
@@ -61,7 +64,7 @@ while [ $# -gt 0 ]; do
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
         --qdrant-storage-gb) QDRANT_STORAGE_GB="${2:-}"; shift 2 ;;
-        --ams-hub) AMS_HUB="${2:-}"; shift 2 ;;
+        --ams-hub) AMS_HUB="${2:-}"; SET_AMS_HUB=1; shift 2 ;;
         --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
         --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -157,7 +160,9 @@ fi
 say "[1] thin client (install/linux-client.sh)"
 CLIENT_ARGS=(--authority "$AUTHORITY" --user-id "$USER_ID")
 [ -n "$API_KEY_FILE" ] && CLIENT_ARGS+=(--api-key-file "$API_KEY_FILE")
-[ -n "$AMS_HUB" ] && CLIENT_ARGS+=(--ams-hub "$AMS_HUB")
+# Forwarded when given, EMPTY included: `--ams-hub ""` is the explicit clear. When omitted nothing
+# is forwarded and the client inherits the hub from ~/.mem0/client-receipt.json itself.
+[ "$SET_AMS_HUB" = 1 ] && CLIENT_ARGS+=(--ams-hub "$AMS_HUB")
 [ -n "$AMS_BINARY" ] && CLIENT_ARGS+=(--ams-store-binary "$AMS_BINARY")
 [ -n "$AMS_SUMS" ] && CLIENT_ARGS+=(--ams-store-sums "$AMS_SUMS")
 [ "$DRY_RUN" = 1 ] && CLIENT_ARGS+=(--dry-run)
@@ -256,6 +261,7 @@ if plan "venv with $SERVER_PY; pip install $PIP_SPECS; deploy $(echo "$MEM0_MODU
     # the only reason the missed step was found at all. deploy.sh already stamps it; every path
     # that deploys the modules must, or the runtimes it installs are born unable to answer.
     cp "$REPO_ROOT/VERSION" "$MEM0_APP/VERSION"
+    deploy_stamp_write "$REPO_ROOT" "$MEM0_APP"
     tr -d "\r" < "$REPO_ROOT/scripts/wsl/dpapi-fetch-key.sh" > "$MEM0_APP/dpapi-fetch-key.sh"; chmod +x "$MEM0_APP/dpapi-fetch-key.sh"
     [ -x "$MEM0_APP/.venv/bin/python" ] || "$SERVER_PY" -m venv "$MEM0_APP/.venv"
     "$MEM0_APP/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip

@@ -138,3 +138,62 @@ def test_tenant_inherits_from_the_client_receipt_on_a_rerun(tmp_path):
     r, _ = _run(["--authority", "http://brain-host:18791", "--user-id", "tenant-new", "--dry-run"], tmp_path)
     assert r.returncode == 0, r.stderr
     assert "user_id (mem0 tenant): tenant-new" in r.stdout and "tenant inherited" not in r.stdout
+
+
+# ---- --ams-hub inherits from the previous receipt (session-12 WP-12) ---------------------------
+# The Windows installer inherits every flag it records; the Linux client inherited the tenant but
+# not the hub, so a re-run without --ams-hub skipped the fleet store with exit 0 and rewrote the
+# receipt with an empty hub. Explicit flag > receipt > nothing; an explicit empty value clears.
+HUB = "ams-hub@hubbox:ams-store.git"
+
+
+def _receipt(tmp_path, body):
+    mem0 = tmp_path / "home" / ".mem0"
+    mem0.mkdir(parents=True, exist_ok=True)
+    (mem0 / "client-receipt.json").write_text(body, encoding="utf-8")
+
+
+def test_ams_hub_inherits_from_the_receipt_when_the_flag_is_omitted(tmp_path):
+    _receipt(tmp_path, '{"role":"client","user_id":"t","ams_hub":"%s","ams_store_sha256":"abc"}\n' % HUB)
+    r, _ = _run(["--authority", "http://brain-host:18791", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"--ams-hub inherited from ~/.mem0/client-receipt.json: {HUB}" in r.stdout
+    assert f"wire the hub transport for {HUB}" in r.stdout
+    assert "skipped" not in r.stdout
+
+
+def test_an_explicit_ams_hub_wins_over_the_receipt(tmp_path):
+    _receipt(tmp_path, '{"user_id":"t","ams_hub":"%s"}\n' % HUB)
+    r, _ = _run(["--authority", "http://brain-host:18791", "--ams-hub", "ams-hub@other:x.git", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "--ams-hub inherited" not in r.stdout
+    assert "wire the hub transport for ams-hub@other:x.git" in r.stdout
+
+
+def test_an_explicit_empty_ams_hub_clears_the_recorded_hub_with_a_warning(tmp_path):
+    _receipt(tmp_path, '{"user_id":"t","ams_hub":"%s"}\n' % HUB)
+    r, _ = _run(["--authority", "http://brain-host:18791", "--ams-hub", "", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "--ams-hub cleared (explicit empty value; not inherited)" in r.stdout
+    assert "--ams-hub inherited" not in r.stdout
+    assert "WARN: no --ams-hub" in r.stdout
+
+
+def test_skipping_the_fleet_store_is_a_warning_not_a_quiet_line(tmp_path):
+    r, _ = _run(["--authority", "http://brain-host:18791", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "WARN: no --ams-hub" in r.stdout and "skipped" in r.stdout
+    assert "inherited" not in r.stdout
+
+
+def test_a_recorded_hub_that_cannot_be_read_fails_instead_of_dropping_it(tmp_path):
+    """The receipt names a hub but the value cannot be parsed out (truncated JSON): inheriting an
+    empty string here would rewrite the receipt without the hub, exactly the silent loss this
+    inheritance exists to stop."""
+    _receipt(tmp_path, '{"user_id":"t","ams_hub":"%s"\n' % HUB)   # no closing brace
+    r, _ = _run(["--authority", "http://brain-host:18791", "--dry-run"], tmp_path)
+    assert r.returncode != 0
+    assert "records an ams_hub" in r.stderr
+    # ...and an explicit flag is the operator's way out, so it is not refused
+    r, _ = _run(["--authority", "http://brain-host:18791", "--ams-hub", HUB, "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr

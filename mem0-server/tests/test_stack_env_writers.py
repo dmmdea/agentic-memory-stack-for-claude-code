@@ -294,3 +294,80 @@ def test_every_writer_carries_the_operator_keys_into_its_write(writer):
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert re.search(r'stack_env_carry "\$[A-Z_]*(HOME|MEM0_DIR)[A-Z_]*/(\.mem0/)?stack\.env"', code), writer
     assert '"${STACK_ENV_CARRY[@]}"' in code, f"{writer} must pass the carried keys to its stack.env write"
+
+
+# --- (6) the promotion-gate switches survive a re-run (session-12 WP-12) ---------------------
+# The 4C promotion gate was set to enforce in the Windows receipt; the brain's stack.env carried
+# nothing, so the dream fell back to shadow and three uncorroborated facts became canonical. The
+# switches are operator-owned (no installer flag before --promotion-gate-mode), so every writer
+# carries them; the brain installer additionally takes the gate mode as a flag.
+
+GATE_KEYS = {
+    "MEM0_PROMOTION_GATE_MODE": "enforce",
+    "MEM0_SHARED_BRANDS": "shared-a,shared-b",
+    "MEM0_BRAND_MAP": "/srv/ams/brands.json",
+    "MEM0_NLI_GATE_ENABLED": "1",
+}
+
+
+@pytest.mark.parametrize("key,value", sorted(GATE_KEYS.items()))
+def test_the_gate_and_brand_switches_are_operator_owned_and_carried(tmp_path, key, value):
+    r, se = _render(tmp_path, stack_env=f"MEM0_WSL_USER=tenant\n{key}={value}\n")
+    assert r.returncode == 0, r.stderr
+    assert f"{key}={value}" in _lines(se)
+    assert f"{key} carried over from ~/.mem0/stack.env: {value}" in r.stdout
+
+
+def _gate_lines(se):
+    return [ln for ln in _lines(se) if ln.startswith("MEM0_PROMOTION_GATE_MODE")]
+
+
+def test_a_rerun_without_the_flag_keeps_the_promotion_gate_mode(tmp_path):
+    r, se = _render(tmp_path, "--promotion-gate-mode", "enforce", stack_env="MEM0_WSL_USER=tenant\n")
+    assert r.returncode == 0, r.stderr
+    assert _gate_lines(se) == ["MEM0_PROMOTION_GATE_MODE=enforce"]
+    # the rendered receipt becomes the next run's input; the flag is now omitted
+    (tmp_path / "home" / ".mem0" / "stack.env").write_text(se.read_text(encoding="utf-8"), encoding="utf-8")
+    r2, se2 = _render(tmp_path, name="render2")
+    assert r2.returncode == 0, r2.stderr
+    assert _gate_lines(se2) == ["MEM0_PROMOTION_GATE_MODE=enforce"]
+
+
+def test_the_flag_overrides_the_recorded_mode_and_is_written_once(tmp_path):
+    r, se = _render(tmp_path, "--promotion-gate-mode", "shadow",
+                    stack_env="MEM0_WSL_USER=tenant\nMEM0_PROMOTION_GATE_MODE=enforce\n")
+    assert r.returncode == 0, r.stderr
+    assert _gate_lines(se) == ["MEM0_PROMOTION_GATE_MODE=shadow"]
+
+
+def test_no_gate_mode_is_invented_on_a_first_install(tmp_path):
+    """Enforce makes a gate error fail-safe, so the operator calibrates before choosing it: an
+    installer that picked a mode by itself would decide that for him."""
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\n")
+    assert r.returncode == 0, r.stderr
+    assert _gate_lines(se) == []
+
+
+@pytest.mark.parametrize("bad", ["strict", "ENFORCE", "on", "enforce,shadow"])
+def test_promotion_gate_mode_accepts_only_shadow_or_enforce(tmp_path, bad):
+    r, se = _render(tmp_path, "--promotion-gate-mode", bad)
+    assert r.returncode != 0
+    assert "--promotion-gate-mode must be shadow or enforce" in r.stderr
+    assert not se.exists()
+
+
+def test_an_explicit_empty_gate_mode_clears_the_recorded_one(tmp_path):
+    r, se = _render(tmp_path, "--promotion-gate-mode", "",
+                    stack_env="MEM0_WSL_USER=tenant\nMEM0_PROMOTION_GATE_MODE=enforce\n")
+    assert r.returncode == 0, r.stderr
+    assert "--promotion-gate-mode cleared (explicit empty value; not inherited)" in r.stdout
+    assert _gate_lines(se) == []
+
+
+def test_the_shared_operator_key_list_holds_the_gate_and_brand_switches():
+    """1-wsl-services.sh and linux-replica.sh cannot run hermetically, so what pins them is the
+    shared list in install/stack-env.sh (their calls to stack_env_carry are asserted above)."""
+    lib = LIB.read_text(encoding="utf-8")
+    m = re.search(r'^STACK_ENV_OPERATOR_KEYS="([^"]*)"', lib, re.M)
+    assert m, "STACK_ENV_OPERATOR_KEYS must be one quoted list"
+    assert set(GATE_KEYS) <= set(m.group(1).split())
