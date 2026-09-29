@@ -1,8 +1,10 @@
 """maintenance_health.py — GET /health/maintenance (spec §9, P1-5).
 
 Each chain step's last success, last run, duration and receipt id (from the receipts
-ams-step.sh appends to ~/.mem0/maintenance/receipts.jsonl); the judge transport; pool usage
-with the 85 % alarm; the box's boot ids for the last 7 days. Pure functions with injected
+ams-step.sh appends to ~/.mem0/maintenance/receipts.jsonl); the steps whose LATEST run failed or
+degraded (the receipt's `status`, outcome contract C1); the judge transport; pool usage with the
+85 % alarm and the pool's HEALTH; the retrieval-drift and wiki-freshness readings; the box's boot
+ids for the last 7 days. Pure functions with injected
 readers so the endpoint is testable without a chain, a pool or a journal; the route wires the
 real readers. A health endpoint never raises on a reader: a failed reader reads as unknown."""
 from __future__ import annotations
@@ -14,7 +16,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 POOL_ALARM_PCT = 85
-STALE_AFTER_H = 48
+STALE_AFTER_H = 48             # a daily step with no success in two nights
+WEEKLY_STALE_AFTER_H = 8 * 24  # a --weekly step: a week and a day of slack
+WEEKLY_PROBE = 3               # receipts inspected to decide "this is a weekly step"
+# ams-step.sh writes these notes for a run that did not run the job (`--weekly` off-day, boot guard).
+NO_OP_NOTE_PREFIXES = ("weekly:", "guard:")
+# The step that PRINTS this verdict exits non-zero on a bad one. The endpoint reads the previous
+# night's receipt before tonight's stamp runs, so folding it back in (failed OR stale) would keep a night red.
+VERDICT_STEPS = frozenset({"health-stamp"})
 MAX_RECEIPT_LINES = 2000
 
 
@@ -122,24 +131,123 @@ def journal_boots_reader(now_fn=lambda: dt.datetime.now(dt.timezone.utc)) -> Cal
     return read
 
 
+def zpool_health_reader(dataset: str) -> Callable[[], str]:
+    """`zpool list -H -o health <pool>` -> ONLINE | DEGRADED | FAULTED | ... for the pool that holds
+    `dataset` (the capacity reader's pool). Raises on a missing zpool: build() reads that as unknown."""
+    pool = dataset.split("/", 1)[0]
+
+    def read() -> str:
+        cp = subprocess.run(["zpool", "list", "-H", "-o", "health", pool],
+                            capture_output=True, text=True, timeout=5, check=True)
+        return cp.stdout.strip()
+    return read
+
+
+def _is_no_op(r: dict) -> bool:
+    return str(r.get("note") or "").startswith(NO_OP_NOTE_PREFIXES)
+
+
+def _status(r: dict) -> str:
+    """The receipt's outcome: `status` (C1), else derived from `ok` for a pre-contract receipt."""
+    st = str(r.get("status") or "")
+    return st if st in ("ok", "degraded", "failed") else ("ok" if r.get("ok") else "failed")
+
+
+def _is_weekly(recent: list[dict]) -> bool:
+    """A `--weekly` step: it receipts a `weekly:` no-op on every off-day, or (no no-ops on file)
+    its last few receipts all fall on a Sunday. A daily step never writes a `weekly:` note."""
+    if any(str(r.get("note") or "").startswith("weekly:") for r in recent):
+        return True
+    tail = recent[-WEEKLY_PROBE:]
+    return bool(tail) and all(_parse_ts(r["ts"]).weekday() == 6 for r in tail)
+
+
+def _age_h(epoch_file: Path, now: dt.datetime) -> Optional[float]:
+    try:
+        return round((now.timestamp() - float(Path(epoch_file).read_text(encoding="utf-8").strip())) / 3600.0, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def _wiki(stamp_dir: Optional[Path], now: dt.datetime) -> dict:
+    """Wiki-index freshness (C4): `last-pull` (existing) and `last-build` (any successful build) are
+    epoch stamps beside the snapshot; `fresh_age_h` is the newer of the two. Reported, never folded
+    into ok: the wiki-index step's own status carries that."""
+    pull = built = None
+    if stamp_dir is not None:
+        pull, built = _age_h(Path(stamp_dir) / "last-pull", now), _age_h(Path(stamp_dir) / "last-build", now)
+    known = [a for a in (pull, built) if a is not None]
+    return {"last_pull_age_h": pull, "last_build_age_h": built, "fresh_age_h": min(known) if known else None}
+
+
+def _drift(reader: Optional[Callable[[], dict]]) -> dict:
+    out: dict = {"alarm": None, "before": None, "n_total": None}
+    if reader is None:
+        return out
+    try:
+        d = dict(reader())
+        out = {"alarm": d.get("alarm"), "before": d.get("before_retrievable"), "n_total": d.get("n_total")}
+    except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
+        pass
+    return out
+
+
 def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple],
           boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
-          usage_reader: Optional[Callable[[], dict]] = None) -> dict:
-    steps: dict[str, dict] = {}
+          usage_reader: Optional[Callable[[], dict]] = None,
+          pool_health_reader: Optional[Callable[[], str]] = None,
+          wiki_stamp_dir: Optional[Path] = None,
+          drift_reader: Optional[Callable[[], dict]] = None) -> dict:
+    by_step: dict[str, list[dict]] = {}
     for r in read_receipts(Path(receipts_path)):
-        s = steps.setdefault(r["step"], {"last_success": None, "last_run": None, "duration_ms": None,
-                                         "receipt_id": None, "ok": False})
-        ts = _parse_ts(r["ts"])
-        if s["last_run"] is None or ts >= _parse_ts(s["last_run"]):
-            s["last_run"] = r["ts"]
-            s["ok"] = bool(r.get("ok"))
-            s["duration_ms"] = r.get("duration_ms")
-            s["receipt_id"] = r.get("receipt_id")
-        if r.get("ok") and (s["last_success"] is None or ts >= _parse_ts(s["last_success"])):
-            s["last_success"] = r["ts"]
-    stale = sorted(n for n, s in steps.items()
-                   if s["last_success"] is None
-                   or (now - _parse_ts(s["last_success"])) > dt.timedelta(hours=STALE_AFTER_H))
+        by_step.setdefault(r["step"], []).append(r)
+    steps: dict[str, dict] = {}
+    stale: list[str] = []
+    failed_steps: list[dict] = []
+    degraded_steps: list[dict] = []
+    for name, rows in by_step.items():
+        s = steps[name] = {"last_success": None, "last_run": None, "duration_ms": None,
+                           "receipt_id": None, "ok": False, "status": "failed"}
+        real_success: Optional[dt.datetime] = None   # latest ok receipt that actually ran the job
+        latest_run: Optional[dict] = None            # latest receipt that actually ran the job
+        for r in rows:
+            ts = _parse_ts(r["ts"])
+            if s["last_run"] is None or ts >= _parse_ts(s["last_run"]):
+                s["last_run"] = r["ts"]
+                s["ok"] = bool(r.get("ok"))
+                s["status"] = _status(r)
+                s["duration_ms"] = r.get("duration_ms")
+                s["receipt_id"] = r.get("receipt_id")
+            if r.get("ok") and (s["last_success"] is None or ts >= _parse_ts(s["last_success"])):
+                s["last_success"] = r["ts"]
+            if _is_no_op(r):
+                continue
+            if r.get("ok") and (real_success is None or ts > real_success):
+                real_success = ts
+            if latest_run is None or ts >= _parse_ts(latest_run["ts"]):
+                latest_run = r
+        # A step is judged on its LATEST real run (a later ok run clears it). The weekly / guard
+        # no-ops are ok:true rows but not runs: Monday's off-day receipt must not erase Sunday's failure.
+        if latest_run is not None and name not in VERDICT_STEPS:
+            st = _status(latest_run)
+            entry = {"step": name, "ts": latest_run["ts"], "note": str(latest_run.get("note") or "")}
+            if st == "failed":
+                failed_steps.append(entry)
+            elif st == "degraded":
+                degraded_steps.append(entry)
+        # Staleness: 48 h for a daily step; a weekly step is judged on its real runs against 8 days
+        # (its off-day no-ops would otherwise read "alive" for a Sunday run that never happened).
+        if _is_weekly(rows[-10:]):
+            ref = real_success or (_parse_ts(s["last_success"]) if s["last_success"] else None)
+            limit_h = WEEKLY_STALE_AFTER_H
+        else:
+            ref = _parse_ts(s["last_success"]) if s["last_success"] else None
+            limit_h = STALE_AFTER_H
+        if name not in VERDICT_STEPS and (ref is None or (now - ref) > dt.timedelta(hours=limit_h)):
+            stale.append(name)
+    stale.sort()
+    failed_steps.sort(key=lambda e: e["step"])
+    degraded_steps.sort(key=lambda e: e["step"])
     dataset: Optional[dict] = None
     try:
         used, avail, *ds = pool_reader()   # 2-tuple (disk usage) or 4-tuple (pool + dataset)
@@ -150,7 +258,17 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
                        "used_pct": round(100.0 * du / (du + da), 1) if (du + da) > 0 else None}
     except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
         pct = None
-    pool = {"used_pct": pct, "alarm": bool(pct is not None and pct >= POOL_ALARM_PCT), "threshold_pct": POOL_ALARM_PCT}
+    # Pool HEALTH is a different fact from pool CAPACITY: a mirror with a leg offline is 40 % full and
+    # DEGRADED. Anything but ONLINE alarms; an unreadable pool reads "unknown" and does not (fail-open on
+    # the reader, loud in the value).
+    health = "unknown"
+    if pool_health_reader is not None:
+        try:
+            health = str(pool_health_reader()).strip() or "unknown"
+        except Exception:  # noqa: BLE001
+            health = "unknown"
+    pool = {"used_pct": pct, "alarm": bool(pct is not None and pct >= POOL_ALARM_PCT), "threshold_pct": POOL_ALARM_PCT,
+            "health": health, "health_alarm": health != "unknown" and health.upper() != "ONLINE"}
     usage: dict = {"used_percent": None, "resets_in_days": None, "probed_at": None, "note": "no probe yet"}
     if usage_reader is not None:
         try:
@@ -165,8 +283,11 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
         jt = str(judge_transport())
     except Exception:  # noqa: BLE001
         jt = "none"
-    ok = not pool["alarm"] and not stale
-    out = {"ok": ok, "steps": steps, "stale_steps": stale, "judge_transport": jt, "pool": pool,
+    ok = (not pool["alarm"] and not pool["health_alarm"] and not stale
+          and not failed_steps and not degraded_steps)
+    out = {"ok": ok, "steps": steps, "stale_steps": stale, "failed_steps": failed_steps,
+           "degraded_steps": degraded_steps, "judge_transport": jt, "pool": pool,
+           "drift": _drift(drift_reader), "wiki": _wiki(wiki_stamp_dir, now),
            "usage": usage, "boots_7d": boots, "generated": now.isoformat()}
     if dataset is not None:
         out["dataset"] = dataset
