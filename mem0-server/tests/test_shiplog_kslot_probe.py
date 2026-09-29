@@ -7,7 +7,7 @@ Property under test:
   atomic facts re-fill the top-2 slot — with threshold=0 and rerank=False
   (no threshold/rerank change; that is a hard master-plan constraint).
 
-All records are seeded under a throwaway user_id `zzz-probe-<uuid8>` that
+All records are seeded under a throwaway user_id `test-probe-<uuid8>` that
 cannot collide with any real user.  A `finally` block deletes all 3 seeded
 records (and verifies they are gone) even on assertion failure.
 
@@ -138,7 +138,7 @@ def test_shiplog_kslot_crowding_and_cure():
     """
 
     # Unique throwaway user_id so no real data can be touched.
-    probe_user = f"zzz-probe-{uuid.uuid4().hex[:8]}"
+    probe_user = f"test-probe-{uuid.uuid4().hex[:8]}"
 
     id_a1 = id_a2 = id_s = None
     try:

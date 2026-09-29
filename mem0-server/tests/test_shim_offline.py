@@ -10,6 +10,9 @@ SHIM_PATH = REPO_ROOT / "scripts" / "wsl" / "mem0-mcp-shim.py"
 APP_PATH = REPO_ROOT / "mem0-server" / "app.py"
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 def test_no_endpoint_raises_a_bare_500_for_an_unclassified_exception():
     """The shim's 503 handling below is only worth anything if the server actually
     SENDS 503 rather than a flat 500. Every endpoint's generic handler must route
@@ -29,7 +32,7 @@ def test_no_endpoint_raises_a_bare_500_for_an_unclassified_exception():
 def shim(monkeypatch, tmp_path):
     monkeypatch.setenv("MEM0_URL", "http://authority.invalid:18791")
     # api-key file is required at import; point HOME at a tmp dir with one
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     (tmp_path / ".mem0" / "api-key").write_text("test-key", encoding="utf-8")
     try:
@@ -179,7 +182,7 @@ def test_offline_search_merges_pending_adds(shim, monkeypatch, tmp_path):
 def _load_shim(tmp_path, monkeypatch, env_url, file_url):
     """Import a fresh shim with HOME pointed at tmp_path, and MEM0_URL / the authority file set
     (or absent) as specified. Returns the module, or skips if fastmcp is unavailable."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     mem0 = tmp_path / ".mem0"
     mem0.mkdir(exist_ok=True)
     (mem0 / "api-key").write_text("test-key", encoding="utf-8")

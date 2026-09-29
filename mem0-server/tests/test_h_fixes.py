@@ -37,6 +37,7 @@ H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 # v0.19 Phase H: key via provider (runtime tmpfs > dpapi-on-win > plaintext) —
 # conftest.py inserts mem0-server/ into sys.path before this module loads.
 from canonical_key_provider import CanonicalKeyProvider  # noqa: E402
+from _test_cleanup import delete_memory  # noqa: E402
 
 CANONICAL_KEY: Optional[str] = CanonicalKeyProvider().get_key()
 
@@ -81,31 +82,14 @@ def _promote_to_canonical(mid: str) -> None:
 
 
 def _force_delete(mid: str) -> None:
-    if CANONICAL_KEY is None:
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
-        return
-    try:
-        # v0.18 MED-7: nonce required — format <ts>|<nonce>|<action>|<mid>|<reason>
-        ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        nonce = str(uuid.uuid4())
-        msg = f"{ts}|{nonce}|delete|{mid}|test cleanup".encode()
-        token = base64.b64encode(
-            _hmac.new(CANONICAL_KEY.encode(), msg, hashlib.sha256).digest()
-        ).decode().strip()
-        httpx.delete(
-            f"{URL}/v1/memories/{mid}",
-            params={"actor": "user-direct", "reason": "test cleanup"},
-            headers={**H, "X-User-Direct-Token": token, "X-User-Direct-Ts": ts,
-                     "X-User-Direct-Nonce": nonce},
-            timeout=10,
-        )
-    except Exception:
-        pass
+    """Delete through the signed path (any tier) and assert the point is gone."""
+    delete_memory(URL, H, mid, canonical_key=CANONICAL_KEY, reason="test cleanup")
 
 
 def _get_episodic_db_path() -> Path:
     """Return the path to the episodic SQLite DB."""
-    return Path.home() / ".mem0" / "episodic.db"
+    from _debris_patterns import episodic_db_path
+    return episodic_db_path()   # honours EPISODIC_DB_PATH
 
 
 # ---------------------------------------------------------------------------

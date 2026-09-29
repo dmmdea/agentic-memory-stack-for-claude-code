@@ -11,11 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import codex_shim_client as csc  # noqa: E402
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("MEM0_KEY", "k")
     monkeypatch.setenv("MEM0_CODEX_TRANSPORT", "native")
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     monkeypatch.setattr(csc, "NATIVE_LOCK_PATH", str(tmp_path / ".mem0" / "codex-native.lock"))
     monkeypatch.setattr(csc.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
 

@@ -35,6 +35,7 @@ H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 from canonical_key_provider import CanonicalKeyProvider  # noqa: E402
 # MEM-16: ledger row counts span legacy tier-ledger.jsonl + monthly segments.
 from _ledger_paths import ledger_line_count  # noqa: E402
+from _test_cleanup import delete_memory  # noqa: E402
 
 CANONICAL_KEY: Optional[str] = CanonicalKeyProvider().get_key()
 
@@ -115,7 +116,12 @@ def _promote_to_canonical(mid: str, reason: str = "test setup") -> None:
 
 
 def _post_insight(text: str) -> str:
-    """Create an insight-tier memory via consolidator actor (the only path)."""
+    """Create an insight-tier memory via consolidator actor (the only path).
+
+    An insight point can only be removed through the signed delete, so a box without the
+    canonical key skips rather than seed something it could never clean up."""
+    if CANONICAL_KEY is None:
+        pytest.skip("canonical-key not configured; an insight seed could not be cleaned up")
     r = httpx.post(
         f"{URL}/v1/memories",
         json={
@@ -129,22 +135,11 @@ def _post_insight(text: str) -> str:
 
 
 def _force_delete(mid: str) -> None:
-    """Cleanup helper: delete via HMAC (format 2 / delete action). Best-effort."""
-    if CANONICAL_KEY is None:
-        # Fallback: try plain delete (works for non-canonical tiers)
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
-        return
-    try:
-        token, ts, nonce = _sign_hmac(mid, "delete", "test cleanup")
-        httpx.delete(
-            f"{URL}/v1/memories/{mid}",
-            params={"actor": "user-direct", "reason": "test cleanup"},
-            headers={**H, "X-User-Direct-Token": token, "X-User-Direct-Ts": ts,
-                     "X-User-Direct-Nonce": nonce},
-            timeout=10,
-        )
-    except Exception:
-        pass
+    """Cleanup helper: delete through the signed (format-2 / delete) path so canonical and insight
+    seeds are removable too, then assert the delete took and the point is gone. It used to swallow
+    every failure and fell back to a plain DELETE for a keyless box - which the server refuses
+    for insight - so insight seeds leaked on every run."""
+    delete_memory(URL, H, mid, canonical_key=CANONICAL_KEY, reason="test cleanup")
 
 
 def _get_memory_text(mid: str) -> Optional[str]:
@@ -366,7 +361,7 @@ def test_evidence_put_no_token_accepted():
         # Cleanup: plain DELETE works for evidence (no HMAC needed). In finally
         # (AMS-01 hardening): this test PUTs the record, and the pre-fix suite
         # leaked PUT-damaged records into the live store when an assertion fired.
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        _force_delete(mid)
 
 
 # ---------- (regression: valid HMAC PUT succeeds + ledger records it) ----------
@@ -481,7 +476,7 @@ def test_canonical_intent_excluded_from_default_search(marker):
         )
     finally:
         # Cleanup — evidence tier, no HMAC needed
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        _force_delete(mid)
 
 
 # ---------- v0.17 Phase F.2.5: PUT strips tier regression ----------
@@ -611,7 +606,7 @@ def test_ams01_put_preserves_custom_payload_metadata():
     finally:
         # Evidence tier: plain-key DELETE. MUST run even when assertions fail —
         # the pre-fix suite leaked PUT-damaged records into the live store.
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        _force_delete(mid)
 
 
 # ---------- v0.17 Phase F.1.1: nonce replay protection ----------
@@ -917,7 +912,7 @@ def test_med6_get_by_id_strips_intent_keys():
         # Control: non-intent metadata must still be returned
         assert md.get("source") == "test-med6", f"non-intent metadata must survive the filter: {md}"
     finally:
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
+        _force_delete(mid)
 
 
 def test_m12_search_strips_intent_keys_from_metadata():
@@ -998,8 +993,8 @@ def test_m12_search_strips_intent_keys_from_metadata():
             f"M12: _canonical_intent marker leaked via opt-in search metadata: {md_b}"
         )
     finally:
-        httpx.delete(f"{URL}/v1/memories/{mid_a}", headers=H, timeout=10)
-        httpx.delete(f"{URL}/v1/memories/{mid_b}", headers=H, timeout=10)
+        _force_delete(mid_a)
+        _force_delete(mid_b)
 
 
 # ---------- v0.18 MED-10: log files chmod 600 ----------

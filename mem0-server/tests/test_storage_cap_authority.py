@@ -9,6 +9,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SH = REPO_ROOT / "claude-config" / "storage-cap-check.sh"
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def test_no_loopback_literal_in_server_calls():
     src = SH.read_text(encoding="utf-8")
     hits = [ln for ln in src.splitlines() if "127.0.0.1:18791" in ln and not ln.lstrip().startswith("#")]
@@ -23,7 +26,7 @@ def test_ams_authority_url_precedence(tmp_path):
     (tmp_path / ".mem0" / "authority-url").write_text("\n# x\n http://brain.invalid:18791/ \n", encoding="utf-8")
     m = re.search(r"ams_authority_url\(\) \{.*?\n\}\n", SH.read_text(encoding="utf-8"), re.S)
     assert m, "ams_authority_url() must be defined in storage-cap-check.sh"
-    env = {"HOME": str(tmp_path), "MEM0_URL": "http://env.invalid:18791", "PATH": os.environ["PATH"]}
+    env = {**home_env(tmp_path, base={}), "MEM0_URL": "http://env.invalid:18791", "PATH": os.environ["PATH"]}
     out = subprocess.run(["bash", "-c", m.group(0) + "ams_authority_url"], env=env,
                          capture_output=True, text=True, check=True).stdout.strip()
     assert out == "http://brain.invalid:18791"

@@ -9,8 +9,14 @@ H = {"X-API-Key": KEY, "Content-Type": "application/json"}
 # v0.19 Phase H: key via provider (runtime tmpfs > dpapi-on-win > plaintext) —
 # conftest.py inserts mem0-server/ into sys.path before this module loads.
 from canonical_key_provider import CanonicalKeyProvider  # noqa: E402
+from _test_cleanup import delete_memory  # noqa: E402
 
 _CANON_KEY = CanonicalKeyProvider().get_key()
+
+def _cleanup(mid: str, reason: str = "tier-policy test cleanup") -> None:
+    """Delete a seeded point whatever tier the test left it in, and assert it is gone."""
+    delete_memory(URL, H, mid, canonical_key=_CANON_KEY, reason=reason)
+
 
 def _add_evidence(text: str) -> str:
     r = httpx.post(f"{URL}/v1/memories", json={
@@ -74,7 +80,7 @@ def test_promote_canonical_requires_user_direct():
         "tier": "canonical", "actor": "claude-autonomous", "reason": "test",
     }, headers=H, timeout=10)
     assert r.status_code == 403, r.text
-    httpx.delete(f"{URL}/v1/memories/{mid}", headers=H)  # cleanup on 403 path
+    _cleanup(mid)  # the 403 left it evidence-tier; still asserted gone
 
 @pytest.mark.skipif(_CANON_KEY is None, reason="canonical key unavailable (runtime tmpfs / dpapi / plaintext all absent)")
 def test_promote_canonical_user_direct_succeeds():
@@ -89,8 +95,8 @@ def test_promote_canonical_user_direct_succeeds():
     assert body["tier"] == "canonical"
     assert body["actor"] == "user-direct"
     assert "ts" in body
-    # No change_id required anymore
-    httpx.delete(f"{URL}/v1/memories/{mid}", headers=H)
+    # No change_id required anymore. The record is canonical now: only the signed delete removes it.
+    _cleanup(mid, "promote test cleanup")
 
 def test_insight_bypass_substring_rejected():
     """v0.14 C: substring check replaced with exact-allowlist — fake-c1-bypass must be rejected."""
@@ -107,7 +113,7 @@ def test_insight_bypass_substring_rejected():
     assert r.status_code == 403, r.text
     body_text = r.text.lower()
     assert "insight" in body_text, f"error message should mention 'insight': {r.text}"
-    httpx.delete(f"{URL}/v1/memories/{mid}", headers=H)
+    _cleanup(mid)
 
 def test_post_memory_canonical_message_includes_canonize_hint():
     """v0.16.1: rejection message tells caller what to do instead of just NO."""
@@ -134,19 +140,6 @@ def test_post_memory_insight_message_includes_dream_hint():
     body = r.text.lower()
     assert "consolidator" in body or "dream" in body or "allowlist" in body, body
 
-def _action_headers(mid: str, action: str, reason: str) -> dict:
-    """Build HMAC headers for v0.17 format-2 actions (put/delete/patch_metadata).
-    Signed payload: <ts>|<action>|<memory_id>|<reason>
-    """
-    assert _CANON_KEY, "canonical key unavailable (runtime tmpfs / dpapi / plaintext all absent)"
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    msg = f"{ts}|{action}|{mid}|{reason}".encode()
-    token = base64.b64encode(
-        hmac.new(_CANON_KEY.encode(), msg, hashlib.sha256).digest()
-    ).decode().strip()
-    return {"X-User-Direct-Token": token, "X-User-Direct-Ts": ts}
-
-
 def _promote_to_canonical(mid: str, reason: str = "v017-test-setup") -> None:
     """Promote a memory to canonical tier using HMAC (requires canonical-key)."""
     r = httpx.patch(f"{URL}/v1/memories/{mid}/tier", json={
@@ -156,16 +149,11 @@ def _promote_to_canonical(mid: str, reason: str = "v017-test-setup") -> None:
 
 
 def _delete_canonical(mid: str, reason: str = "v017-test-cleanup") -> None:
-    """Delete a canonical memory using HMAC (requires canonical-key). Best-effort."""
-    try:
-        action_hdrs = _action_headers(mid, "delete", reason)
-        httpx.delete(
-            f"{URL}/v1/memories/{mid}?actor=user-direct&reason={reason}",
-            headers={**H, **action_hdrs},
-            timeout=10,
-        )
-    except Exception:
-        pass
+    """Delete a canonical memory through the signed path and assert it is gone. It used to
+    swallow every failure - and signed without the nonce the server has required since v0.18, so
+    every delete was a silent 403 and the point stayed canonical forever."""
+    assert _CANON_KEY, "canonical key unavailable: cannot remove a canonical test point"
+    delete_memory(URL, H, mid, canonical_key=_CANON_KEY, reason=reason)
 
 
 @pytest.mark.skipif(_CANON_KEY is None, reason="canonical-key not present")
@@ -273,4 +261,4 @@ def test_ledger_write_ahead_intent_then_completion_per_promote():
         assert rec.get("tier") == "stable"
         assert rec.get("actor") == "claude-autonomous"
 
-    httpx.delete(f"{URL}/v1/memories/{mid}", headers=H)
+    _cleanup(mid)

@@ -184,8 +184,15 @@ SWEEP_LOG = Path.home() / ".mem0" / "contradiction-sweep.jsonl"
 REVIEW_QUEUE = Path.home() / ".mem0" / "contradiction-promote-review.jsonl"
 # Single-runner mutex for the rejudge: two concurrent SessionStart triggers (two terminals/IDE
 # windows opened together) must not launch two --apply runs against the same store (2026-06-30).
-REJUDGE_LOCK = Path.home() / ".mem0" / ".rejudge-stamped.lock"
-EVIDENCE_LOCK = Path.home() / ".mem0" / ".evidence-sweep.lock"  # evidence-vs-evidence sweep mutex
+def _lock_path(env_var: str, default_name: str) -> Path:
+    """A single-runner lock lives under ~/.mem0 unless the environment moves it: a test (or a
+    second instance on the same host) must be able to take the lock without touching the real one."""
+    override = (os.environ.get(env_var) or "").strip()
+    return Path(override) if override else Path.home() / ".mem0" / default_name
+
+
+REJUDGE_LOCK = _lock_path("MEM0_REJUDGE_LOCK", ".rejudge-stamped.lock")
+EVIDENCE_LOCK = _lock_path("MEM0_EVIDENCE_LOCK", ".evidence-sweep.lock")  # evidence-vs-evidence sweep mutex
 PAIR_TIMEOUT_S = 30.0
 COLD_LOAD_TIMEOUT_S = 120.0
 PROMPT_TEXT_MAX_CHARS = 1500  # MAX_MEMORY_CHARS — payloads never legally exceed it
@@ -1456,7 +1463,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     return exit_code_for(outcome)
 
 
-PAIRS_LOCK = Path.home() / ".mem0" / ".retrieval-pairs.lock"
+PAIRS_LOCK = _lock_path("MEM0_PAIRS_LOCK", ".retrieval-pairs.lock")
 PAIRS_RECEIPT = Path.home() / ".mem0" / "retrieval-pairs-yield.json"
 RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
 

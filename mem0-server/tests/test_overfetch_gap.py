@@ -11,7 +11,7 @@ Setup:
     so their cosine similarity to the nonce query exceeds the 2 atomic facts.
   * 2 short atomic facts (A1, A2) — also contain OVRFETCH9 but have more
     non-nonce tokens, giving a slightly lower cosine than the pure-nonce logs.
-  * All 5 records belong to a throwaway user_id `zzz-overfetch-<rand>`.
+  * All 5 records belong to a throwaway user_id `test-overfetch-<rand>`.
 
 Bug trace (pre-fix):
   _search_core fetches top_k=capped_limit=2 from Qdrant → returns [S1, S2].
@@ -156,7 +156,7 @@ def test_overfetch_gap_fix_k2_with_3_retired():
       top_k=2+50=52 from Qdrant → [S1,S2,S3,A1,A2,...] → retired filter strips
       S1-S3 → [A1, A2, ...] → trim to 2 → [A1, A2].  Exactly 2, no gap.
     """
-    probe_user = f"zzz-overfetch-{uuid.uuid4().hex[:8]}"
+    probe_user = f"test-overfetch-{uuid.uuid4().hex[:8]}"
 
     id_s1 = id_s2 = id_s3 = id_a1 = id_a2 = None
     try:
@@ -273,7 +273,7 @@ def test_overfetch_regression_no_retired_returns_same_top_k():
     we get <= K results back.  The count and order must not be distorted
     by the over-fetch buffer.
     """
-    probe_user = f"zzz-overfetch-{uuid.uuid4().hex[:8]}"
+    probe_user = f"test-overfetch-{uuid.uuid4().hex[:8]}"
     LIMIT = 3
 
     # Unique sub-nonce so this test's records don't interfere with the main test
@@ -333,7 +333,7 @@ def test_overfetch_rerank_bounds_and_heals_gap():
     With limit=2 + buffer=10 → overfetch_limit=12, which is easily enough
     to capture all 5 records; gap heals even with the smaller pool.
     """
-    probe_user = f"zzz-overfetch-rerank-{uuid.uuid4().hex[:8]}"
+    probe_user = f"test-overfetch-rerank-{uuid.uuid4().hex[:8]}"
 
     id_s1 = id_s2 = id_s3 = id_a1 = id_a2 = None
     try:

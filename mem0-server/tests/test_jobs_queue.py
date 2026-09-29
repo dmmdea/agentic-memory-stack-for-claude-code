@@ -24,6 +24,9 @@ jobs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(jobs)
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 @pytest.fixture(autouse=True)
 def _tmp_home(monkeypatch, tmp_path):
     monkeypatch.setattr(jobs, "DB_PATH", tmp_path / "jobs.db")
@@ -341,9 +344,7 @@ def test_cli_parses_the_shipped_call_site_token_order(_tmp_home, monkeypatch):
     child = _writer_argv(receipt)
     argv = [sys.executable, str(SCRIPT), "run", "cli-probe",
             "--receipt", str(receipt), "--stale-after", "10800", "--"] + child
-    env = dict(os.environ)
-    env["HOME"] = str(_tmp_home)          # isolate: never touch the real ~/.mem0
-    env["USERPROFILE"] = str(_tmp_home)
+    env = home_env(_tmp_home)             # isolate: never touch the real ~/.mem0
     proc = sp.run(argv, env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, (
         f"CLI failed on the shipped token order: rc={proc.returncode} "

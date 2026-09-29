@@ -21,6 +21,9 @@ WSL_INSTALLER = REPO_ROOT / "install" / "1-wsl-services.sh"
 BASH = shutil.which("bash")
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 @pytest.fixture(scope="module")
 def ow():
     spec = importlib.util.spec_from_file_location("offline_watcher_ut", WATCHER)
@@ -111,7 +114,7 @@ def _scratch_home(tmp_path, role="replica", authority="http://brain-host:18791")
         s = bindir / name
         s.write_text("#!/usr/bin/env bash\necho stub-$0\nexit 0\n", encoding="utf-8")
         s.chmod(s.stat().st_mode | stat.S_IEXEC)
-    env = dict(os.environ, HOME=str(home), PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    env = dict(home_env(home), PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
     return home, env
 
 
