@@ -56,7 +56,7 @@ def _run(tmp_path: Path, sources: str, ssh_body: str, extra_env=None, stack_env:
     if sources is not None:
         env["WIKI_SOURCES"] = sources
     env.update(extra_env or {})
-    r = subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True, env=env, timeout=60, check=False)
+    r = subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=60, check=False)
     return r, home, (log.read_text(encoding="utf-8") if log.exists() else "")
 
 
