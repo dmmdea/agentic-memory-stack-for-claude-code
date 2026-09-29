@@ -22,6 +22,11 @@
 #   * The queue is rewritten with temp + File.Replace (one .bak kept). Capture appends to the
 #     queue WITHOUT the lock, so the commit re-reads the file and carries forward every line
 #     that is not one this run processed; a correction typed during the POSTs is not lost.
+#   * A commit that fails after the POSTs succeeded (capture's Add-Content handle open without
+#     delete-share, an AV or ACL lock, a full disk) is retried -CommitRetries times, each time
+#     re-reading the queue. Every accepted POST is also journaled at once to <queue>.pending-commit
+#     (line -> stamped line); the next run applies the journal before it posts anything, so a line
+#     the authority already has is never posted twice. The journal is deleted after a good commit.
 #   * A malformed line is preserved byte for byte.
 #   * Text is redacted here as well as at capture, because lines written before capture
 #     redacted may still hold a pasted credential.
@@ -32,7 +37,7 @@
 # map in brands.json); a record whose path resolves to nothing keeps the brand it was captured
 # with, and a record with neither carries no brand key.
 #
-# Test seams: -QueuePath, -AuthorityUrl, -ApiKey and -Force (skip the 1 h throttle). Production
+# Test seams: -QueuePath, -AuthorityUrl, -ApiKey, -CommitRetries/-CommitRetryMs and -Force (skip the 1 h throttle). Production
 # passes none of them; the API key is then read from the authority host on first use.
 param(
     [string]$QueuePath = '',
@@ -40,6 +45,8 @@ param(
     [string]$ApiKey = '',
     [int]$Max = 50,
     [int]$RetainDays = 30,
+    [int]$CommitRetries = 5,
+    [int]$CommitRetryMs = 200,
     [switch]$Force
 )
 
@@ -146,8 +153,83 @@ function Send-DrainMemory {
     }
 }
 
+function Add-DrainJournal {
+    # Best effort: one JSON line per accepted POST, written the moment it is accepted.
+    param([string]$Journal, [string]$Raw, [string]$NewRaw)
+    try {
+        $j = ConvertTo-Json -InputObject ([pscustomobject]@{ k = $Raw; v = $NewRaw }) -Compress
+        [System.IO.File]::AppendAllText($Journal, $j + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch { Write-DrainLog "journal write failed (non-fatal): $($_.Exception.Message)" }
+}
+
+function Read-DrainJournal {
+    # raw line -> queue of stamped lines, or an empty dictionary. A malformed journal line is skipped.
+    param([string]$Journal)
+    $d = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Queue]'
+    if (-not (Test-Path -LiteralPath $Journal)) { return $d }
+    try {
+        foreach ($l in [System.IO.File]::ReadAllLines($Journal, (New-Object System.Text.UTF8Encoding($false)))) {
+            if ([string]::IsNullOrWhiteSpace($l)) { continue }
+            try {
+                $e = $l | ConvertFrom-Json
+                $k = Get-DrainString $e 'k'; $v = Get-DrainString $e 'v'
+                if (-not $k -or -not $v) { continue }
+                if (-not $d.ContainsKey($k)) { $d[$k] = New-Object System.Collections.Queue }
+                $d[$k].Enqueue($v)
+            } catch {}
+        }
+    } catch { Write-DrainLog "journal unreadable (non-fatal): $($_.Exception.Message)" }
+    return $d
+}
+
+function Get-DrainCommitPlan {
+    # Re-read the queue (capture may have appended meanwhile), apply the stamped lines, prune.
+    # Pure with respect to $Replace: it walks a private per-line index.
+    param([string]$Queue, $Replace, [int]$RetainDays)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $current = @([System.IO.File]::ReadAllLines($Queue, $utf8))
+    $cutoff = (Get-Date).ToUniversalTime().AddDays(-$RetainDays)
+    $final = New-Object System.Collections.Generic.List[string]
+    $used = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+    $changed = $false; $pruned = 0; $pending = 0
+    foreach ($raw in $current) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $line = $raw
+        if ($Replace.ContainsKey($raw)) {
+            $i = 0
+            if ($used.ContainsKey($raw)) { $i = $used[$raw] }
+            if ($i -lt $Replace[$raw].Count) {
+                $line = [string]$Replace[$raw][$i]
+                $used[$raw] = $i + 1
+                $changed = $true
+            }
+        }
+        $keep = $true
+        try {
+            $r2 = $line | ConvertFrom-Json
+            $st = (Get-DrainString $r2 'status').ToLowerInvariant()
+            if (@('drained', 'dropped', 'rejected') -contains $st) {
+                $stamp = $null
+                foreach ($n in 'resolved_at', 'ts') {
+                    $t = Get-DrainRawTimestamp $line $n
+                    if (-not $stamp -and $t) {
+                        try { $stamp = ([datetime]::Parse($t, [System.Globalization.CultureInfo]::InvariantCulture,
+                            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)) } catch {}
+                    }
+                }
+                if ($stamp -and $stamp -lt $cutoff) { $keep = $false }
+            } elseif ($st -eq 'pending') {
+                $pending++
+            }
+        } catch {}
+        if ($keep) { $final.Add($line) } else { $pruned++; $changed = $true }
+    }
+    return @{ final = $final; changed = $changed; pruned = $pruned; pending = $pending }
+}
+
 function Invoke-LearnRulesDrain {
-    param([string]$Queue, [string]$Url, [string]$Key, [int]$MaxPerRun, [int]$RetainDays, [bool]$IgnoreThrottle)
+    param([string]$Queue, [string]$Url, [string]$Key, [int]$MaxPerRun, [int]$RetainDays, [bool]$IgnoreThrottle,
+          [int]$Retries = 5, [int]$RetryMs = 200)
 
     if (-not (Test-Path -LiteralPath $Queue)) { return (New-DrainSummary 'empty') }
 
@@ -173,7 +255,10 @@ function Invoke-LearnRulesDrain {
         # raw line -> replacement raw line, in file order per raw text (duplicates are legal).
         # Ordinal dictionary: a PowerShell @{} is case-insensitive and would merge two lines that
         # differ only in case.
-        $replace = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Queue]'
+        $replace = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]'
+        # A previous run's POSTs that were accepted but never committed to the queue.
+        $journalPath = $Queue + '.pending-commit'
+        $journal = Read-DrainJournal $journalPath
         $posted = 0
         $abort = ''
         foreach ($raw in $snapshot) {
@@ -183,6 +268,13 @@ function Invoke-LearnRulesDrain {
             if (-not $rec) { $summary.malformed++; continue }
             $status = (Get-DrainString $rec 'status').ToLowerInvariant()
             if ($status -ne 'pending') { continue }
+            # Already accepted by the authority in an earlier run whose commit failed: apply the
+            # stamped line at this run's commit, never post it again.
+            if ($journal.ContainsKey($raw) -and $journal[$raw].Count -gt 0) {
+                if (-not $replace.ContainsKey($raw)) { $replace[$raw] = New-Object 'System.Collections.Generic.List[string]' }
+                $replace[$raw].Add([string]$journal[$raw].Dequeue())
+                continue
+            }
             $kind = Get-DrainRecordKind $rec
             # A pending line whose status token cannot be patched is never posted: it could not be
             # marked, and would be posted again on every run.
@@ -241,50 +333,50 @@ function Invoke-LearnRulesDrain {
             if (-not $newStatus) { continue }
 
             $newRaw = Set-DrainStatus -Raw $raw -Status $newStatus -ResolvedAt $nowIso -Extra $extra
-            if (-not $replace.ContainsKey($raw)) { $replace[$raw] = New-Object System.Collections.Queue }
-            $replace[$raw].Enqueue($newRaw)
+            if (-not $replace.ContainsKey($raw)) { $replace[$raw] = New-Object 'System.Collections.Generic.List[string]' }
+            $replace[$raw].Add($newRaw)
+            # The authority has this line now (or refused it for good): remember it before anything
+            # else can fail, so no later run posts it again.
+            if ($newStatus -eq 'drained' -or $newStatus -eq 'rejected') { Add-DrainJournal $journalPath $raw $newRaw }
         }
 
         # ---- commit: re-read (capture may have appended meanwhile), merge, prune, swap ----
-        $current = @([System.IO.File]::ReadAllLines($Queue, $utf8))
-        $cutoff = (Get-Date).ToUniversalTime().AddDays(-$RetainDays)
-        $final = New-Object System.Collections.Generic.List[string]
-        $changed = $false
-        foreach ($raw in $current) {
-            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-            $line = $raw
-            if ($replace.ContainsKey($raw) -and $replace[$raw].Count -gt 0) {
-                $line = [string]$replace[$raw].Dequeue()
-                $changed = $true
-            }
-            $keep = $true
+        # File.Replace fails while another process holds the queue open without delete-share (the
+        # capture append does, briefly), so it is retried; every attempt re-plans from a fresh read
+        # so a line appended during the wait is carried over, not lost.
+        $tmp = $Queue + '.tmp'
+        $bak = $Queue + '.bak'
+        $committed = $false
+        $commitErr = ''
+        for ($attempt = 1; $attempt -le [Math]::Max(1, $Retries); $attempt++) {
+            if ($attempt -gt 1) { Start-Sleep -Milliseconds $RetryMs }
             try {
-                $r2 = $line | ConvertFrom-Json
-                $st = (Get-DrainString $r2 'status').ToLowerInvariant()
-                if (@('drained', 'dropped', 'rejected') -contains $st) {
-                    $stamp = $null
-                    foreach ($n in 'resolved_at', 'ts') {
-                        $t = Get-DrainRawTimestamp $line $n
-                        if (-not $stamp -and $t) {
-                            try { $stamp = ([datetime]::Parse($t, [System.Globalization.CultureInfo]::InvariantCulture,
-                                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)) } catch {}
-                        }
-                    }
-                    if ($stamp -and $stamp -lt $cutoff) { $keep = $false }
-                } elseif ($st -eq 'pending') {
-                    $summary.pending++
+                $plan = Get-DrainCommitPlan -Queue $Queue -Replace $replace -RetainDays $RetainDays
+                $summary.pruned = $plan.pruned
+                $summary.pending = $plan.pending
+                # A queue this run only inspected is left byte for byte as it was.
+                if ($plan.changed) {
+                    $text = ''
+                    if ($plan.final.Count -gt 0) { $text = ($plan.final -join "`n") + "`n" }
+                    [System.IO.File]::WriteAllText($tmp, $text, $utf8)
+                    [System.IO.File]::Replace($tmp, $Queue, $bak)
                 }
-            } catch {}
-            if ($keep) { $final.Add($line) } else { $summary.pruned++; $changed = $true }
+                $committed = $true
+                break
+            } catch {
+                $commitErr = [string]$_.Exception.Message
+                try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch {}
+            }
         }
-        # A queue this run only inspected is left byte for byte as it was.
-        if ($changed) {
-            $tmp = $Queue + '.tmp'
-            $bak = $Queue + '.bak'
-            $text = ''
-            if ($final.Count -gt 0) { $text = ($final -join "`n") + "`n" }
-            [System.IO.File]::WriteAllText($tmp, $text, $utf8)
-            [System.IO.File]::Replace($tmp, $Queue, $bak)
+        if ($committed) {
+            try { if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction Stop } }
+            catch { Write-DrainLog "journal not removed (non-fatal): $($_.Exception.Message)" }
+        } else {
+            # The journal keeps what the authority accepted; the next run applies it without posting.
+            Write-DrainLog "commit failed after $Retries attempts: $commitErr; the accepted lines stay in the journal"
+            $summary.status = 'aborted'
+            $summary.reason = 'commit-failed: ' + $commitErr
+            return $summary
         }
 
         if ($abort) {
@@ -309,7 +401,7 @@ try {
     $AuthorityUrl = $AuthorityUrl.TrimEnd('/')
 
     if (-not (Test-Path -LiteralPath $QueuePath)) { return (New-DrainSummary 'empty') }
-    return (Invoke-LearnRulesDrain -Queue $QueuePath -Url $AuthorityUrl -Key $ApiKey -MaxPerRun $Max -RetainDays $RetainDays -IgnoreThrottle ([bool]$Force))
+    return (Invoke-LearnRulesDrain -Queue $QueuePath -Url $AuthorityUrl -Key $ApiKey -MaxPerRun $Max -RetainDays $RetainDays -IgnoreThrottle ([bool]$Force) -Retries $CommitRetries -RetryMs $CommitRetryMs)
 } catch {
     Write-DrainLog "drain aborted (non-fatal): $_"
     return (New-DrainSummary 'aborted' ([string]$_.Exception.Message))

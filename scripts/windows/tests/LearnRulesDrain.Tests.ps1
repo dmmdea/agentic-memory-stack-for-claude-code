@@ -105,13 +105,15 @@ BeforeAll {
     }
 
     function script:Invoke-Drain {
-        param($Sb, [string]$Url, [switch]$Force, [int]$Max = 50)
+        param($Sb, [string]$Url, [switch]$Force, [int]$Max = 50, [int]$CommitRetries = 0, [int]$CommitRetryMs = 0)
         $saved = $env:USERPROFILE; $savedUrl = $env:MEM0_URL
         try {
             $env:USERPROFILE = $Sb.Root
             Remove-Item Env:MEM0_URL -ErrorAction SilentlyContinue
             $args_ = @{ QueuePath = $Sb.Queue; AuthorityUrl = $Url; ApiKey = 'test-key'; Max = $Max }
             if ($Force) { $args_['Force'] = $true }
+            if ($CommitRetries -gt 0) { $args_['CommitRetries'] = $CommitRetries }
+            if ($CommitRetryMs -gt 0) { $args_['CommitRetryMs'] = $CommitRetryMs }
             return (& $Sb.Drain @args_)
         } finally {
             $env:USERPROFILE = $saved
@@ -354,6 +356,99 @@ Describe 'learn-rules-drain: the rewrite is safe' {
         (script:Invoke-Drain $sb $mock.Url).status | Should -Be 'ok'
         Add-Content -LiteralPath $sb.Queue -Value (script:New-QueueLine -Text 'two') -Encoding UTF8
         (script:Invoke-Drain $sb $mock.Url).status | Should -Be 'throttled'
+        (script:Get-MockRequests $mock).Count | Should -Be 1
+    }
+}
+
+Describe 'learn-rules-drain: a failed commit never re-posts what the authority already has' {
+    BeforeEach { $script:sb = script:New-DrainSandbox; $script:mock = $null; $script:held = $null }
+    AfterEach  {
+        if ($script:held) { $script:held.Dispose() }
+        script:Stop-MockAuthority $script:mock
+    }
+
+    It 'keeps the stamped results in a journal when File.Replace keeps failing, and applies them on the next run without posting again' {
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value @(
+            (script:New-QueueLine -Text 'first correction' -Session 'sid-1')
+            (script:New-QueueLine -Text 'second correction' -Session 'sid-2')
+        )
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        # A handle without delete-share on the queue (what capture's Add-Content holds while it writes):
+        # File.Replace cannot swap the file for as long as it is open.
+        $script:held = New-Object System.IO.FileStream($sb.Queue, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+
+        $r1 = script:Invoke-Drain $sb $mock.Url -CommitRetries 3 -CommitRetryMs 20
+        $r1.status | Should -Be 'aborted'
+        $r1.reason | Should -Match 'commit-failed'
+        (script:Get-MockRequests $mock).Count | Should -Be 2
+        Test-Path ($sb.Queue + '.pending-commit') | Should -BeTrue
+        Test-Path ($sb.Queue + '.tmp') | Should -BeFalse
+        @(script:Read-Queue $sb | Where-Object { $_.status -eq 'pending' }).Count | Should -Be 2   # swap did not happen
+
+        $script:held.Dispose(); $script:held = $null
+        # Next run (the throttle is open again: -Force stands in for the elapsed hour).
+        $r2 = script:Invoke-Drain $sb $mock.Url -Force -CommitRetries 3 -CommitRetryMs 20
+        $r2.status | Should -Be 'ok'
+        (script:Get-MockRequests $mock).Count | Should -Be 2       # not one extra POST
+        $rows = script:Read-Queue $sb
+        $rows.Count | Should -Be 2
+        foreach ($row in $rows) { $row.status | Should -Be 'drained' }
+        $rows[0].mem0_id | Should -Be 'mem-1'                      # the id of the first run's POST survived
+        $rows[1].mem0_id | Should -Be 'mem-2'
+        Test-Path ($sb.Queue + '.pending-commit') | Should -BeFalse
+    }
+
+    It 'a journaled line does not hide a correction captured after the failed run' {
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value (script:New-QueueLine -Text 'posted once' -Session 'sid-1')
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        $script:held = New-Object System.IO.FileStream($sb.Queue, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [void](script:Invoke-Drain $sb $mock.Url -CommitRetries 2 -CommitRetryMs 20)
+        $script:held.Dispose(); $script:held = $null
+        Add-Content -LiteralPath $sb.Queue -Value (script:New-QueueLine -Text 'typed later' -Session 'sid-2') -Encoding UTF8
+
+        $r = script:Invoke-Drain $sb $mock.Url -Force -CommitRetries 2 -CommitRetryMs 20
+        $r.status | Should -Be 'ok'
+        $reqs = script:Get-MockRequests $mock
+        $reqs.Count | Should -Be 2
+        $reqs[1].json.messages | Should -Be 'typed later'
+        $rows = script:Read-Queue $sb
+        $rows[0].status | Should -Be 'drained'
+        $rows[0].mem0_id | Should -Be 'mem-1'
+        $rows[1].status | Should -Be 'drained'
+    }
+
+    It 'retries File.Replace and commits normally when the handle is released within the retry window' {
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value (script:New-QueueLine -Text 'no, wrong')
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        # Another process holds the queue open for ~1.5 s, then lets go while the drain is retrying.
+        $ready = Join-Path $sb.Root 'holder.ready'
+        $holder = Start-Job -ScriptBlock {
+            param($q, $ready)
+            $fs = New-Object System.IO.FileStream($q, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            Set-Content -LiteralPath $ready -Value 'ready'
+            Start-Sleep -Milliseconds 600
+            # Capture appends while the drain is stuck in its retry loop.
+            Add-Content -LiteralPath $q -Value '{"ts":"2026-09-29T10:00:00Z","kind":"correction","correction":"typed during the commit","session_id":"sid-late","status":"pending"}' -Encoding UTF8
+            Start-Sleep -Milliseconds 900
+            $fs.Dispose()
+        } -ArgumentList $sb.Queue, $ready
+        try {
+            foreach ($i in 1..100) { if (Test-Path -LiteralPath $ready) { break }; Start-Sleep -Milliseconds 100 }
+            Test-Path -LiteralPath $ready | Should -BeTrue
+            $r = script:Invoke-Drain $sb $mock.Url -Force -CommitRetries 40 -CommitRetryMs 100
+        } finally { Remove-Job $holder -Force -ErrorAction SilentlyContinue }
+        $r.status | Should -Be 'ok'
+        $rows = script:Read-Queue $sb
+        $rows.Count | Should -Be 2                                # the line appended during the retries survived the swap
+        $rows[0].status | Should -Be 'drained'
+        $rows[1].status | Should -Be 'pending'
+        $rows[1].session_id | Should -Be 'sid-late'
+        Test-Path ($sb.Queue + '.pending-commit') | Should -BeFalse
         (script:Get-MockRequests $mock).Count | Should -Be 1
     }
 }
