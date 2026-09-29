@@ -2101,7 +2101,8 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
                 x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce")):
     """Update a memory's tier. Server-enforced actor requirements per tier.
-    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B).
+    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B),
+    and so does a move OUT of canonical (session 12: signed action "demote"; see the gate below).
     v0.19 Phase G: the token is validated as format-2
     (<ts>|<nonce>|promote|<mid>|<reason>) via security_invariants —
     nonce + replay protection, HMAC verified before the nonce is burned (MED-8).
@@ -2122,12 +2123,14 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     # it an API-key holder could demote a canonical record and then PUT or DELETE it with no
     # token, because assert_writable gates those only while the record is still canonical.
     # fetch_current_tier fails closed: a store error is a 503, and a point with no tier field
-    # reads as canonical.
+    # reads as canonical. A point that does not exist is a 404 (nothing to change).
     current_tier = None
     if b.tier != "canonical":
         from security_invariants import fetch_current_tier, tier_change_hmac_action, _NOT_FOUND
         _ct = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
-        current_tier = None if _ct == _NOT_FOUND else _ct
+        if _ct == _NOT_FOUND:
+            raise HTTPException(404, f"memory {mid} not found")
+        current_tier = _ct
         if tier_change_hmac_action(current_tier, b.tier) == "demote":
             if not reason:
                 raise HTTPException(400, "demoting a canonical record requires non-empty 'reason' (audit-trail policy)")
@@ -2208,24 +2211,6 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         transport = "cli-user-direct"
     else:
         transport = "rest-api"
-    # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
-    # change can never complete without an audit trace. If this append fails the
-    # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
-    # would be worse than useless (the tier would already have changed).
-    try:
-        _append_ledger({
-            "ts": now, "event": "tier-change-intent", "memory_id": mid,
-            "tier": b.tier, "actor": actor, "reason": reason or None,
-            "transport": transport, "status": "intent",
-            "judge_model": (b.judge_model or None), "schema_version": "v18",
-        })
-    except Exception as e:
-        log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
-        raise HTTPException(
-            503,
-            "audit ledger unavailable (intent append failed); tier change refused "
-            f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
-        )
     class _TierRaced(Exception):
         """The record became canonical between the gate's read and this write."""
 
@@ -2240,6 +2225,26 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             if b.tier != "canonical" and current_tier != "canonical":
                 if fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid) == "canonical":
                     raise _TierRaced()
+            # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
+            # change can never complete without an audit trace. If this append fails the
+            # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
+            # would be worse than useless (the tier would already have changed). It sits
+            # after the re-check so a refused (409) change leaves no unpaired intent line;
+            # PUT appends its ledger line under the same lock, so the lock order matches.
+            try:
+                _append_ledger({
+                    "ts": now, "event": "tier-change-intent", "memory_id": mid,
+                    "tier": b.tier, "actor": actor, "reason": reason or None,
+                    "transport": transport, "status": "intent",
+                    "judge_model": (b.judge_model or None), "schema_version": "v18",
+                })
+            except Exception as e:
+                log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
+                raise HTTPException(
+                    503,
+                    "audit ledger unavailable (intent append failed); tier change refused "
+                    f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
+                )
             mem.vector_store.client.set_payload(
                 collection_name=mem.vector_store.collection_name,
                 payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},

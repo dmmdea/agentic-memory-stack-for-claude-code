@@ -189,11 +189,13 @@ All new gate logic lives in `mem0-server/security_invariants.py`. Key exports:
 - `validate_insight_actor(actor, token, ts, memory_id, action, reason)` — insight allowlist OR HMAC
 - `assert_writable(client, collection_name, memory_id, action, token, ts, actor, reason)` — policy matrix orchestrator
 
-The PATCH /tier gate routes through `security_invariants.validate_hmac_user_direct()` (format 2, action `promote`) for every canonical promotion (v0.19 G). v0.20 Phase G removed the nonce-less format-1 inline gate from app.py — a promotion without `X-User-Direct-Nonce` is rejected 403 before any validation, and the `warn_deprecated_format1_tier_promotion` helper was retired with it.
+The PATCH /tier gate routes through `security_invariants.validate_hmac_user_direct()` (format 2, action `promote`) for every canonical promotion (v0.19 G), and (session 12) with action `demote` for every move out of canonical; `tier_change_hmac_action(current, target)` decides which, from a fail-closed tier read. v0.20 Phase G removed the nonce-less format-1 inline gate from app.py — a promotion without `X-User-Direct-Nonce` is rejected 403 before any validation, and the `warn_deprecated_format1_tier_promotion` helper was retired with it.
 
 ### TOCTOU note (accepted risk, v0.18+)
 
 `fetch_current_tier` and the actual mutation are not a single atomic Qdrant operation. A theoretical race exists where tier changes between the fetch and the mutation. This is accepted risk for v0.17: exploiting it requires both the regular API key AND the canonical-key simultaneously — an attacker with both could edit the record directly. v0.18+ may address this with optimistic locking.
+
+The asymmetry since session 12: PATCH `/tier` re-reads the tier under the record's write lock (`_mid_write_lock`) and answers `409` when a record it saw as non-canonical became canonical in between, so an unsigned tier change cannot land on a record promoted mid-flight. PUT and PATCH `/metadata` still check the tier before taking that lock, and DELETE does not take it; that window stays the accepted risk above.
 
 ---
 

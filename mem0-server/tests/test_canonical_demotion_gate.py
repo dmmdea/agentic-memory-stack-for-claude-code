@@ -161,3 +161,214 @@ def test_canonize_demote_honours_target_tier_and_refuses_canonical(tmp_path):
     assert json.loads(args[args.index("-d") + 1])["tier"] == "stable"
     r2 = _run(sb, "--action", "demote", "--tier", "canonical", "mid-9", "why")
     assert r2.returncode != 0 and "canonical" in r2.stderr
+
+
+@bash_required
+def test_canonize_signs_the_stripped_reason(tmp_path):
+    """The server verifies the HMAC over reason.strip(); the CLI must sign the same string."""
+    sb = _sandbox(tmp_path)
+    r = _run(sb, "--action", "demote", "mid-9", "  padded reason \n")
+    assert r.returncode == 0, r.stderr
+    args = sb["rec"].read_text(encoding="utf-8").splitlines()
+    assert json.loads(args[args.index("-d") + 1])["reason"] == "padded reason"
+    hdr = {a.split(": ", 1)[0]: a.split(": ", 1)[1] for a in args if ": " in a}
+    ts, nonce, tok = hdr["X-User-Direct-Ts"], hdr["X-User-Direct-Nonce"], hdr["X-User-Direct-Token"]
+    assert tok == _sign("k" * 43, ts, nonce, "demote", "mid-9", "padded reason")
+
+
+@bash_required
+def test_canonize_help_prints_the_whole_header(tmp_path):
+    sb = _sandbox(tmp_path)
+    r = _run(sb, "--help")
+    assert r.returncode == 0, r.stderr
+    block = []
+    for ln in CANON.read_text(encoding="utf-8").splitlines()[1:]:   # after the shebang
+        if not ln.startswith("#"):
+            break
+        block.append(ln)
+    assert len(r.stdout.splitlines()) == len(block), "help must print the whole leading comment block"
+    assert "Irreversible." in r.stdout   # the line a fixed 50-line cap used to cut
+
+
+# ---- the handler wiring itself (app.py update_tier), headless -------------------------------
+# The pure policy above can be right while the handler stops calling it. These tests pin the
+# call site: first by source order, then by running the real update_tier (extracted from app.py
+# with ast, decorators dropped) against a fake vector store.
+
+def _update_tier_src() -> str:
+    src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
+    t = src.find("def update_tier(")
+    assert t != -1
+    return src[t:src.find("\n@app.", t + 10)]
+
+
+def test_update_tier_wiring_order_is_pinned():
+    body = _update_tier_src()
+    i_policy = body.find("tier_change_hmac_action(")
+    i_val = body.find("validate_hmac_user_direct(", i_policy)
+    i_word = body.find('"demote"', i_val)
+    i_lock = body.find("_mid_write_lock(")
+    i_reread = body.find("fetch_current_tier(", i_lock)
+    i_intent = body.find('"tier-change-intent"')
+    i_set = body.find("set_payload(")
+    assert -1 not in (i_policy, i_val, i_word, i_lock, i_reread, i_intent, i_set), body[:200]
+    assert i_word - i_val < 80, "the validator call right after the policy must sign 'demote'"
+    assert i_policy < i_val < i_lock < i_reread < i_intent < i_set, (
+        "order must be: policy -> signed demote -> write lock -> tier re-read -> intent -> write")
+    assert "raise _TierRaced" in body
+    i_http = body.find("except HTTPException:\n        raise")
+    i_generic = body.find('log.exception("tier-update failed")')
+    assert i_http != -1 and i_generic != -1 and i_http < i_generic, (
+        "HTTPExceptions raised under the lock (503/409) must pass through, not become 5xx upstream errors")
+
+
+_MISSING = object()   # a point with no tier field
+_ABSENT = object()    # no point at all
+
+
+class _FakeStore:
+    """retrieve() answers from `tiers`, one entry per call (the last one repeats); an index in
+    `fail_on` raises instead. set_payload() is recorded."""
+
+    def __init__(self, tiers, fail_on=()):
+        self.tiers, self.fail_on, self.n, self.writes = list(tiers), set(fail_on), 0, []
+
+    def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
+        i, self.n = self.n, self.n + 1
+        if i in self.fail_on:
+            raise RuntimeError("store down")
+        t = self.tiers[min(i, len(self.tiers) - 1)]
+        if t is _ABSENT:
+            return []
+        payload = {"data": "a fact"} if t is _MISSING else {"data": "a fact", "tier": t}
+        return [type("Rec", (), {"id": ids[0], "payload": payload})()]
+
+    def set_payload(self, collection_name, payload, points):
+        self.writes.append((payload, points))
+
+
+def _handler(store: _FakeStore):
+    import ast
+    import logging
+    import threading
+    import types
+    from typing import Optional
+
+    from fastapi import Header, HTTPException
+    from pydantic import BaseModel
+
+    tree = ast.parse((SERVER_DIR / "app.py").read_text(encoding="utf-8"))
+    nodes = [n for n in tree.body
+             if (isinstance(n, ast.FunctionDef) and n.name == "update_tier")
+             or (isinstance(n, ast.ClassDef) and n.name == "TierIn")]
+    assert len(nodes) == 2
+    for n in nodes:
+        n.decorator_list = []
+    ledger: list = []
+    ns = {
+        "HTTPException": HTTPException, "Header": Header, "BaseModel": BaseModel,
+        "Optional": Optional, "_dt": dt, "log": logging.getLogger("test-update-tier"),
+        "auth": lambda key: None,
+        "PROMOTE_ALLOWED_TIERS": {"evidence", "stable", "canonical", "insight", "temporal"},
+        "CANONICAL_REQUIRES_USER_DIRECT": True,
+        "CANONICAL_AUTOPROMOTE_ALLOWED": {"dream-autopromote"},
+        "INSIGHT_REQUIRES_C1": True,
+        "INSIGHT_ALLOWED_ACTORS": {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"},
+        "is_imperative_canonical": lambda text: False,
+        "mem": types.SimpleNamespace(vector_store=types.SimpleNamespace(client=store, collection_name="memories")),
+        "_append_ledger": ledger.append,
+        "_mid_write_lock": lambda mid: threading.Lock(),
+        "_upstream_error": lambda e: HTTPException(502, f"upstream: {e}"),
+    }
+    # dont_inherit: this test module's `from __future__ import annotations` would otherwise turn
+    # TierIn's annotations into strings pydantic cannot resolve outside app.py's namespace.
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py:update_tier", "exec", dont_inherit=True), ns)
+    tier_in, fn = ns["TierIn"], ns["update_tier"]
+
+    def call(tier, actor="claude-autonomous", reason="why", token=None, ts=None, nonce=None):
+        return fn("mid-1", tier_in(tier=tier, actor=actor, reason=reason), x_api_key="k",
+                  x_user_direct_token=token, x_user_direct_ts=ts, x_user_direct_nonce=nonce)
+
+    return call, ledger
+
+
+def _status(call, *a, **kw) -> int:
+    with pytest.raises(fastapi.HTTPException) as e:
+        call(*a, **kw)
+    return e.value.status_code
+
+
+def _intents(ledger) -> list:
+    return [r for r in ledger if r.get("event") == "tier-change-intent"]
+
+
+def test_handler_refuses_unsigned_demotion_of_a_canonical(signing):
+    store = _FakeStore(["canonical"])
+    call, ledger = _handler(store)
+    assert _status(call, "evidence") == 403
+    assert store.writes == [] and _intents(ledger) == []
+
+
+def test_handler_treats_a_tierless_record_as_canonical(signing):
+    store = _FakeStore([_MISSING])
+    call, ledger = _handler(store)
+    assert _status(call, "stable") == 403
+    assert store.writes == [] and ledger == []
+
+
+def test_handler_answers_404_for_a_missing_record(signing):
+    store = _FakeStore([_ABSENT])
+    call, ledger = _handler(store)
+    assert _status(call, "evidence") == 404
+    assert store.writes == [] and ledger == []
+
+
+def test_handler_store_outage_before_the_lock_is_503_without_an_intent(signing):
+    store = _FakeStore(["stable"], fail_on={0})
+    call, ledger = _handler(store)
+    assert _status(call, "evidence") == 503
+    assert store.writes == [] and ledger == []
+
+
+def test_handler_refuses_a_record_promoted_mid_flight_with_409(signing):
+    store = _FakeStore(["evidence", "canonical"])
+    call, ledger = _handler(store)
+    assert _status(call, "stable") == 409
+    assert store.writes == [], "an unsigned change must not land on a record that is canonical now"
+    assert _intents(ledger) == [], "a refused change must not leave an unpaired intent line"
+
+
+def test_handler_store_outage_on_the_reread_is_503(signing):
+    store = _FakeStore(["evidence", "evidence"], fail_on={1})
+    call, ledger = _handler(store)
+    assert _status(call, "stable") == 503
+    assert store.writes == []
+
+
+def test_handler_allows_an_unsigned_move_between_non_canonical_tiers(signing):
+    store = _FakeStore(["stable", "stable"])
+    call, ledger = _handler(store)
+    out = call("evidence")
+    assert out["ok"] is True and out["tier"] == "evidence"
+    assert store.writes and store.writes[0][0]["tier"] == "evidence"
+    assert [r["event"] for r in ledger] == ["tier-change-intent", "tier-change"]
+
+
+def test_handler_accepts_a_signed_demotion(signing):
+    store = _FakeStore(["canonical"])
+    call, ledger = _handler(store)
+    ts, nonce = _now(), str(uuid.uuid4())
+    tok = _sign(signing, ts, nonce, "demote", "mid-1", "stale fact")
+    out = call("evidence", actor="user-direct", reason="stale fact", token=tok, ts=ts, nonce=nonce)
+    assert out["ok"] is True
+    assert store.writes and store.writes[0][0]["tier"] == "evidence"
+    assert _intents(ledger) and _intents(ledger)[0]["transport"] == "cli-user-direct"
+
+
+def test_handler_refuses_a_promote_token_for_a_demotion(signing):
+    store = _FakeStore(["canonical"])
+    call, ledger = _handler(store)
+    ts, nonce = _now(), str(uuid.uuid4())
+    tok = _sign(signing, ts, nonce, "promote", "mid-1", "stale fact")
+    assert _status(call, "evidence", actor="user-direct", reason="stale fact", token=tok, ts=ts, nonce=nonce) == 403
+    assert store.writes == []

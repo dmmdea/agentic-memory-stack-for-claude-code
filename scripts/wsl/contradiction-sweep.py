@@ -1517,7 +1517,8 @@ def resolve_supersede_precheck(loser_id: str, winner_id: str,
         return "loser and winner are the same record"
     if loser_payload.get("tier") == "canonical":
         return ("loser is CANONICAL — canonicals are never superseded by this "
-                "path (demote first via the tier API if that is really intended)")
+                "path (if that is really intended, the operator demotes it first: "
+                "mem0-canonize.sh --action demote <id> \"<reason>\")")
     if loser_payload.get("superseded_by"):
         return (f"loser already superseded by {loser_payload.get('superseded_by')} "
                 "— refusing to overwrite an existing resolution")

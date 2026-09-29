@@ -4,7 +4,10 @@ v0.17 Final fix-pass: H2/H7 nonce threading.Lock+fsync+atomic-rename; H5 fail-cl
 
 The policy matrix (current_tier × action):
 - canonical × PUT/DELETE/PATCH-metadata  → require HMAC user-direct token
-- canonical × PATCH-tier-demote          → already enforced by v0.14 inline gate (untouched)
+- canonical × PATCH-tier-demote          → require HMAC user-direct token signed for action "demote"
+                                           (session 12; tier_change_hmac_action). Before it, PATCH /tier
+                                           gated only promotions, so an API-key holder could demote a
+                                           canonical record and then PUT/DELETE it with no token.
 - insight   × PUT/DELETE/PATCH-metadata  → require actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct
 - stable / evidence / temporal × any     → no extra gate (existing flow unchanged)
 
@@ -353,6 +356,8 @@ def validate_hmac_user_direct(
     - app.py merge_goals_endpoint when source goal has >100 episode_links (MED-9)
     - app.py update_tier (PATCH /tier) for every canonical promotion
       (v0.19 Phase G, action="promote"; sole path since v0.20 removed format-1)
+    - app.py update_tier (PATCH /tier) for every move OUT of canonical
+      (session 12, action="demote"; see tier_change_hmac_action)
     """
     # v0.20 Phase D (L1): truthiness, not is-not-None — '' must read as keyless.
     if not _get_canonical_key():

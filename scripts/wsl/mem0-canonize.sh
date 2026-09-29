@@ -132,7 +132,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --help|-h)
-      grep '^#' "$0" | head -50 | sed 's/^# \?//'
+      # The whole leading comment block (a fixed line count truncated it as the header grew).
+      awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
       exit 0
       ;;
     *)
@@ -150,7 +151,9 @@ if [[ ${#POSITIONAL[@]} -lt 2 ]]; then
 fi
 
 MID="${POSITIONAL[0]}"
-REASON="${POSITIONAL[1]}"
+# Strip surrounding whitespace exactly as the server does (Python str.strip): it verifies the
+# HMAC over the stripped reason, so an unstripped one signed here fails as an HMAC mismatch.
+REASON="$(python3 -c 'import sys; sys.stdout.write(sys.argv[1].strip())' "${POSITIONAL[1]}")"
 
 # Validate --action value if supplied
 if [[ -n "$ACTION" ]]; then
