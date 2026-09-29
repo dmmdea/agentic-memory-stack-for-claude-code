@@ -179,7 +179,7 @@ mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
-"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — re-run with network access to remediate."; exit 1; }
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — the lines above name the failing check: a missing package needs network access, a pip check conflict does not (pip install -U the package it names in $MEM0_DIR/.venv), then re-run."; exit 1; }
 import os, subprocess, sys
 from importlib.metadata import PackageNotFoundError, version
 from packaging.version import Version as V
@@ -199,11 +199,16 @@ for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "mem0ai": "2
 chk = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
 if chk.returncode != 0:
     print("  pip check is not clean:\n" + chk.stdout + chk.stderr, file=sys.stderr)
+    print("  remedy: this is a dependency conflict inside the venv, not a network problem.\n"
+          "  Run '" + sys.executable + " -m pip check' to see it, clear it with\n"
+          "  '" + sys.executable + " -m pip install -U <the package it names>', then re-run the installer.",
+          file=sys.stderr)
     ok = False
 # The vulnerability scanner must be in the venv (upgrade-check.sh runs it from here).
 audit = os.path.join(os.path.dirname(sys.executable), "pip-audit")
 if not (os.path.isfile(audit) and os.access(audit, os.X_OK)):
-    print(f"  pip-audit is not installed at {audit}", file=sys.stderr)
+    print(f"  pip-audit is not installed at {audit}\n"
+          f"  remedy: {sys.executable} -m pip install pip-audit (needs an index), then re-run.", file=sys.stderr)
     ok = False
 # The MCP shim runs on this venv's python; without fastmcp it dies on import and
 # the client only ever shows "Failed to connect". Same silent class as AMS-09:

@@ -93,3 +93,87 @@ def test_unit_descriptions_carry_no_version_numbers():
             if ln.startswith("Description=")
         )
         assert not re.search(r"\bv?\d+\.\d+", desc), f"{unit}: {desc!r} hard-codes a version that goes stale"
+
+
+# ---- the post-condition, executed (not only text-pinned) ----------------------------------
+
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+
+def _postcondition_source() -> str:
+    m = re.search(r"<<'PYEOF'[^\n]*\n(.*?)\nPYEOF\n", INSTALLER.split("Post-conditions for BOTH branches", 1)[1], re.S)
+    assert m, "post-condition block not found"
+    return m.group(1)
+
+
+def _run_postcondition(tmp_path, versions, pip_check_rc=0, pip_check_out="", with_audit=True):
+    """Run the installer's real post-condition block against a stubbed venv.
+
+    The block reads installed versions (importlib.metadata), runs `python -m pip check`, looks
+    for pip-audit beside sys.executable, and imports fastmcp/fastembed. Each is replaced by a
+    stub so the LOGIC (which combinations exit non-zero, and what is printed) is what runs.
+    """
+    tmp_path = Path(tempfile.mkdtemp(dir=tmp_path))  # one private venv dir per call
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "python").write_text("", encoding="utf-8")
+    if with_audit:
+        audit = bindir / "pip-audit"
+        audit.write_text("#!/bin/sh\n", encoding="utf-8")
+        audit.chmod(0o755)
+    prelude = textwrap.dedent(f"""
+        import importlib.metadata as md, subprocess, sys, types
+        _v = {versions!r}
+        def _version(name):
+            if name not in _v:
+                raise md.PackageNotFoundError(name)
+            return _v[name]
+        md.version = _version
+        sys.executable = {str(bindir / "python")!r}
+        _real_run = subprocess.run
+        def _run(cmd, *a, **k):
+            if list(cmd)[1:4] == ["-m", "pip", "check"]:
+                return subprocess.CompletedProcess(cmd, {pip_check_rc}, stdout={pip_check_out!r}, stderr="")
+            return _real_run(cmd, *a, **k)
+        subprocess.run = _run
+        fm = types.ModuleType("fastmcp"); fm.FastMCP = object; sys.modules["fastmcp"] = fm
+        fe = types.ModuleType("fastembed")
+        class SparseTextEmbedding:
+            def __init__(self, **kw): pass
+        fe.SparseTextEmbedding = SparseTextEmbedding; sys.modules["fastembed"] = fe
+    """)
+    script = tmp_path / "postcondition.py"
+    script.write_text(prelude + _postcondition_source(), encoding="utf-8")
+    return subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+
+
+MET = {"starlette": "1.6.0", "cryptography": "50.0.1", "mem0ai": "2.1.0"}
+
+
+def test_postcondition_passes_when_floors_met_pip_check_clean_and_audit_present(tmp_path):
+    r = _run_postcondition(tmp_path, MET)
+    assert r.returncode == 0, r.stderr
+
+
+def test_postcondition_fails_on_each_broken_leg(tmp_path):
+    below = _run_postcondition(tmp_path, {**MET, "cryptography": "48.0.1"})
+    assert below.returncode == 1 and "cryptography 48.0.1 is below the floor 50.0.1" in below.stderr
+    absent = _run_postcondition(tmp_path, {k: v for k, v in MET.items() if k != "mem0ai"})
+    assert absent.returncode == 1 and "mem0ai is not installed" in absent.stderr
+    dirty = _run_postcondition(tmp_path, MET, pip_check_rc=1, pip_check_out="thinc 8.3 has requirement x")
+    assert dirty.returncode == 1 and "pip check is not clean" in dirty.stderr
+    noaudit = _run_postcondition(tmp_path, MET, with_audit=False)
+    assert noaudit.returncode == 1 and "pip-audit is not installed" in noaudit.stderr
+
+
+def test_a_conflict_or_missing_scanner_names_its_remedy_not_just_the_network(tmp_path):
+    """An unrelated resolver conflict fails every re-run; the message must say how to clear it."""
+    dirty = _run_postcondition(tmp_path, MET, pip_check_rc=1, pip_check_out="thinc 8.3 has requirement x")
+    assert "not a network problem" in dirty.stderr and "pip install" in dirty.stderr
+    noaudit = _run_postcondition(tmp_path, MET, with_audit=False)
+    assert "pip install pip-audit" in noaudit.stderr
+    fatal = re.search(r'PYEOF\' \|\| \{ echo "([^"]*)"', INSTALLER).group(1)
+    assert "pip check" in fatal and "network" in fatal and "conflict" in fatal
