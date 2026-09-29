@@ -11,6 +11,7 @@ The design rule this page records: **the banner reads the box's role first, and 
 | Block | Brain | Replica / client |
 |---|---|---|
 | Recent sessions | local `episodic.db` | the authority (below) |
+| Enrichment recency seed (`sessionstart_bundle.py`) | local `episodic.db` | the authority (below) |
 | `MEMORY.md` age | yes | never |
 | L10 unreviewed-flag count | yes | never |
 | Brand-scope status | yes | never |
@@ -38,11 +39,13 @@ The heartbeat digest (`[heartbeat]`) stays file-read-only and brain-only; `/heal
 
 `claude-config/sessionstart_bundle.py` (the `Recently-relevant memory` precis) posts to `/v1/context/bundle` with `hook_contract_version` stamped, like every other bundle caller. The server counts each bundle body without the field in `hook_contract.missing` (`GET /health/deep` → `checks.hook_contract`); that counter is cumulative since the last server restart, so compare it only within one uptime window.
 
+The query is seeded by the newest episode goal ("what was I last doing"), and the seed follows the role, like the recent-sessions block above. The brain reads its own `episodic.db`. A replica or client asks the authority, `GET /v1/episodes?recent=20&brand=<brand>` (1.5 s, `X-API-Key`; `brand` only when the session has one), and takes the newest row with a non-blank goal for that brand; a brand with no episode gets no seed, never another brand's goal. When that read fails, times out or returns nothing usable there is no seed and the query falls back to the brand and initiative tokens. A replica never falls back to its own `episodic.db`, which froze at the cutover and would rank today's facts against a weeks-old goal. A fresh PreCompact marker outranks the seed, so the seed is not fetched at all then.
+
 ## Tests
 
 - `claude-config/tests/test_storage_cap_replica_role.py` runs the real script under bash with a fixture `HOME`, a recording `curl` and `nohup` on `PATH`, and asserts each row of the table above plus the three authority reads.
 - `claude-config/tests/test_storage_cap_drift_role.py` covers the drift block.
-- `claude-config/tests/test_sessionstart_bundle.py` covers the bundle payload stamp.
+- `claude-config/tests/test_sessionstart_bundle.py` covers the bundle payload stamp and, driving `main()` against a fixture `HOME` and a fake authority, where the recency seed comes from on each role (replica, authority down, brain, brand filter, marker).
 
 ## See also
 

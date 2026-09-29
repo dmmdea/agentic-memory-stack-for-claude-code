@@ -13,6 +13,9 @@ Design (frontier-grounded; see docs/research and the B1 plan item):
     durable-fact search is BRAND-scoped server-side (fail-closed); `initiative` is forwarded
     (it scopes the bundle's goals) and seeds the pseudo-query fallback. The query text only seeds
     RANKING, so an off-topic recency goal degrades to silence (safe abstention), never a leak.
+  - THE SEED FOLLOWS THE ROLE (One-Brain Rule): the brain reads its own episodic.db; a replica's
+    copy froze at the authority cutover, so a replica/client asks the authority (GET /v1/episodes)
+    and, when that read fails, has NO seed — it never falls back to the frozen copy.
   - PRECISION OVER RECALL at boot (worst pollution regime: no query to disambiguate, brand-scoped
     facts are mutually-similar distractors, length alone taxes accuracy). We pass tier="small" so
     the server returns K<=1 at its calibrated 0.30 semantic gate — the "tighter K" lever using the
@@ -34,6 +37,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 HEADER = "Recently-relevant memory (verify before acting):"
@@ -43,6 +47,8 @@ DEFAULT_LIMIT = 120  # per-fact char cap (matches the canonical/episode banner l
 DEFAULT_K = 1        # boot precision: at most the single highest-ranked durable/evidence fact
 MARKER_NAME = "precompact-query.json"  # written by precompact_capture.py (B1 Phase 2)
 MARKER_MAX_AGE = 300  # s — a marker older than this is stale (the post-compact boot fires seconds later)
+RECENT_EPISODES = 20  # rows asked of the authority for the recency seed (GET /v1/episodes?recent=N)
+EPISODES_TIMEOUT = 1.5  # s — the bound the banner's shell half puts on this same endpoint
 
 
 # --- pure logic (unit-tested) -------------------------------------------------
@@ -102,6 +108,19 @@ def resolve_authority_url(home: str) -> str:
     return (env or "http://127.0.0.1:18791").rstrip("/")
 
 
+def resolve_role(home: str) -> str:
+    """This box's One-Brain role from ~/.mem0/role, read the way the banner's shell half reads it
+    (storage-cap-check.sh): absent, unreadable or blank is the brain, because a single-machine install
+    is its own authority. Anything else ('replica', 'client') means the local mirrors are frozen.
+    Case-folded, like the other Python readers of this file."""
+    try:
+        with open(os.path.join(home, ".mem0", "role"), encoding="utf-8", errors="replace") as fh:
+            role = fh.read().strip().lower()
+    except OSError:
+        role = ""
+    return role or "brain"
+
+
 def choose_query_and_params(marker_query, recency_query):
     """Pick the retrieval query + bundle params. A fresh PreCompact marker (real conversation query)
     wins → tier=frontier, K=2 (a real query justifies the second slot + ranks it). Otherwise the
@@ -112,7 +131,27 @@ def choose_query_and_params(marker_query, recency_query):
     return (recency_query or "").strip(), "small", 1
 
 
-# --- I/O (exercised by the live e2e, not unit-tested) -------------------------
+def pick_authority_goal(rows, brand) -> "str | None":
+    """The authority-side twin of recent_goal_for_brand, over the GET /v1/episodes rows. The endpoint
+    returns them newest first (ended_at DESC, the order the local query sorts by), so the seed is the
+    first row with a non-blank goal. When a brand is given only that brand's rows count and a brand with
+    no episode ABSTAINS (None): a foreign-brand goal weakens precision, exactly as in the local rule.
+    Junk rows and non-list bodies are skipped, never raised on."""
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        goal = row.get("goal_text")
+        if not isinstance(goal, str) or not goal.strip():
+            continue
+        if brand and row.get("brand") != brand:
+            continue
+        return goal
+    return None
+
+
+# --- I/O (real-server behaviour: the live e2e; seed source per role: claude-config/tests) ------
 
 def recent_goal_for_brand(db_path: str, brand) -> "str | None":
     """Most-recent episode goal_text. When a brand is given this is BRAND-SCOPED and ABSTAINS
@@ -135,6 +174,38 @@ def recent_goal_for_brand(db_path: str, brand) -> "str | None":
         return row["g"] if row else None
     except Exception:
         return None
+
+
+def fetch_recent_goal_from_authority(url: str, key: str, brand, limit: int = RECENT_EPISODES,
+                                     timeout: float = EPISODES_TIMEOUT) -> "str | None":
+    """GET /v1/episodes?recent=<limit>[&brand=<brand>] and pick the seed (pick_authority_goal). The brand
+    is forwarded so the server's window is THAT brand's newest episodes (the local query's `s.brand = ?`,
+    not the newest few across every brand), and pick_authority_goal re-checks it, so an authority that
+    ignores the parameter still cannot lend another brand's goal. None on any error, timeout or malformed
+    body: no seed, never an exception, and a session start waits `timeout` at most."""
+    params = {"recent": limit}
+    if brand:
+        params["brand"] = brand
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/v1/episodes?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote),
+            headers={"X-API-Key": key},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return pick_authority_goal(json.load(r), brand)
+    except Exception:
+        return None
+
+
+def recency_seed(home: str, url: str, key: str, brand) -> "str | None":
+    """The recency seed, from the source the box's role makes true (One-Brain Rule). The brain reads its
+    own episodic.db. A replica's or thin client's copy froze at the authority cutover, so seeding from it
+    ranked today's facts against a weeks-old goal: it asks the authority instead, and when that fails it
+    has NO seed. It never falls back to the frozen copy."""
+    if resolve_role(home) == "brain":
+        return recent_goal_for_brand(os.path.join(home, ".mem0", "episodic.db"), brand)
+    return fetch_recent_goal_from_authority(url, key, brand)
 
 
 def load_and_consume_marker(path: str, now, max_age: int = MARKER_MAX_AGE) -> "str | None":
@@ -212,20 +283,23 @@ def main(argv=None) -> int:
         if not key:
             return 0  # no key -> the server would reject; stay silent
 
+        # v1.23 P2-3: the per-host file first (the shim's precedence), MEM0_URL only as fallback.
+        # Env-only resolution left this silently injecting NOTHING on a replica — the whole function
+        # is wrapped in `except: pass`, so a connection refusal to a dead loopback looks identical
+        # to "no memories matched". Resolved before the seed: a replica's seed is read from it too.
+        url = resolve_authority_url(home)
+
         # Phase 2: a FRESH PreCompact marker (post-compaction) supplies a real conversation query
         # -> frontier K=2; otherwise the cold-boot recency pseudo-query -> precision-first small K=1.
+        # The recency seed's source follows the role (recency_seed); a marker outranks the seed, so
+        # when one is present the seed is not fetched at all (no round-trip for a discarded value).
         marker_query = load_and_consume_marker(os.path.join(home, ".mem0", MARKER_NAME), now=int(time.time()))
-        recent_goal = recent_goal_for_brand(os.path.join(home, ".mem0", "episodic.db"), brand)
+        recent_goal = None if marker_query else recency_seed(home, url, key, brand)
         recency_query = build_boot_query(recent_goal, brand, initiative)
         query, tier, k = choose_query_and_params(marker_query, recency_query)
         if not query:
             return 0  # no signal -> inject nothing
 
-        # v1.23 P2-3: the per-host file first (the shim's precedence), MEM0_URL only as fallback.
-        # Env-only resolution left this silently injecting NOTHING on a replica — the whole function
-        # is wrapped in `except: pass`, so a connection refusal to a dead loopback looks identical
-        # to "no memories matched".
-        url = resolve_authority_url(home)
         memories = fetch_bundle(url, key, query, brand, initiative, tier=tier)
         block = format_block(select_facts(memories, k=k), source="authority:" + url.split("://", 1)[-1])
         if block:
