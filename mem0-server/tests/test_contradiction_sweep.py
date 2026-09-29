@@ -933,8 +933,10 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
         v = fetch_map[pid]
         if isinstance(v, Exception):
             raise v
-        return v
-    monkeypatch.setattr(sweep, "fetch_point_text", fake_fetch)
+        # the rejudge reads text AND current tier through fetch_point_info; a plain text fixture
+        # means "a live canonical with this text"
+        return None if v is None else {"text": v, "tier": "canonical", "retired": False}
+    monkeypatch.setattr(sweep, "fetch_point_info", fake_fetch)
     monkeypatch.setattr(sweep, "judge_dispatch",
                         # **kw absorbs the W5 cache kwargs (use_cache/cache_stats)
                         lambda mode, http, model, can, cand, t, **kw: verdict_map[cand])
@@ -1340,3 +1342,211 @@ def test_rejudge_early_scroll_failure_still_writes_the_receipt(monkeypatch):
     assert rc == 1
     assert summaries and summaries[-1]["outcome"].startswith("degraded:aborted:")
     assert summaries[-1]["stamped_found"] == 0
+
+
+# ---------------------------------------------------------------------------
+# WP-4 (session-12 audit): sweep coverage, direction, and the stamped re-judge on the brain
+# ---------------------------------------------------------------------------
+
+def _can(cid, checked=None, created="2026-07-01T00:00:00+00:00", vec=None, user="u1"):
+    pl = {"data": "canonical " + cid, "user_id": user, "tier": "canonical", "created_at": created}
+    if checked:
+        pl["contradiction_checked_at"] = checked
+    return {"id": cid, "payload": pl, "vector": {"": vec if vec is not None else [0.1, 0.2],
+                                                 "bm25": {"indices": [1], "values": [1.0]}}}
+
+
+def _cand(cid, created="2026-06-01T00:00:00+00:00"):
+    return {"id": cid, "payload": {"data": "candidate " + cid, "user_id": "u1", "tier": "evidence",
+                                   "created_at": created}}
+
+
+def test_order_canonicals_never_checked_first_then_oldest_check():
+    """Rotation: --limit is a budget, not a permanent cut. Never-checked canonicals come first, then
+    the ones checked longest ago; ties break on id so a run is reproducible."""
+    cans = [_can("c-recent", checked="2026-09-20T00:00:00+00:00"),
+            _can("c-old", checked="2026-08-01T00:00:00+00:00"),
+            _can("c-never-b"), _can("c-never-a"),
+            _can("c-garbage", checked="not-a-date")]
+    ordered = [c["id"] for c in sweep.order_canonicals(cans)]
+    assert ordered == ["c-garbage", "c-never-a", "c-never-b", "c-old", "c-recent"]
+
+
+def test_sweep_coverage_reports_weeks_for_a_full_pass():
+    assert sweep.sweep_coverage(total=43, processed=25) == {"canonicals_checked": 25, "canonical_total": 43,
+                                                            "weeks_for_full_pass": 2}
+    assert sweep.sweep_coverage(total=43, processed=43)["weeks_for_full_pass"] == 1
+    assert sweep.sweep_coverage(total=0, processed=0)["weeks_for_full_pass"] == 0
+    assert sweep.sweep_coverage(total=10, processed=0)["weeks_for_full_pass"] is None   # no progress
+
+
+def test_default_user_id_is_the_corpus_tenant(monkeypatch):
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "tenant-1")
+    assert sweep.resolve_user_id(None) == "tenant-1"
+    assert sweep.resolve_user_id("other") == "other"
+    assert sweep.resolve_user_id("") is None           # explicit empty = every user
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")
+    assert sweep.resolve_user_id(None) is None         # no tenant configured: unchanged behaviour
+
+
+def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fail=()):
+    """Drive the real canonical sweep leg with fakes for Qdrant, the judge and mem0."""
+    monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace())
+    monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
+    monkeypatch.setattr(sweep.httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(sweep, "_api_key_or_raise", lambda: "k")
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "u1")
+    seen_user = []
+    monkeypatch.setattr(sweep, "scroll_canonicals",
+                        lambda http, user_id=None: (seen_user.append(user_id) or list(canonicals)))
+
+    def fake_query(http, vec, user, exclude_id, fetch_n):
+        if exclude_id in query_fail:
+            raise httpx.ConnectError("blip")
+        return list((candidates or {}).get(exclude_id, []))
+    monkeypatch.setattr(sweep, "query_similar", fake_query)
+    monkeypatch.setattr(sweep, "judge_dispatch",
+                        lambda mode, http, model, can, cand, t, **kw: (verdicts or {}).get(cand, (False, "NO")))
+    stamps, queued, summaries = [], [], []
+    monkeypatch.setattr(sweep, "stamp_candidate",
+                        lambda http, cid, ts, contradicts=None, clear=False, justification="", pending=False: (
+                            stamps.append({"id": cid, "contradicts": contradicts, "clear": clear}) or True))
+    monkeypatch.setattr(sweep, "mark_canonical_checked",
+                        lambda http, cid, ts: (stamps.append({"id": cid, "marker": True}) or True))
+    monkeypatch.setattr(sweep, "append_review_queue", lambda path, rec: (queued.append(rec) or True))
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    return stamps, queued, summaries, seen_user
+
+
+def test_limited_sweep_rotates_and_marks_every_canonical_it_processed(monkeypatch):
+    """The finding: the weekly --limit 50 swept the same first 50 ids forever. With rotation the run
+    takes the never-checked and longest-unchecked canonicals, and WRITES the marker back onto each,
+    otherwise the ordering would never change."""
+    cans = [_can("c1", checked="2026-09-20T00:00:00+00:00"), _can("c2"), _can("c3", checked="2026-08-01T00:00:00+00:00")]
+    stamps, queued, summaries, seen_user = _sweep_rig(monkeypatch, cans, candidates={"c2": [_cand("x1")]})
+    rc = sweep.main(["--apply", "--limit", "2", "--judge", "codex"])
+    assert rc == 0
+    assert seen_user == ["u1"], "the corpus tenant is the default scope"
+    markers = [s["id"] for s in stamps if s.get("marker")]
+    assert markers == ["c2", "c3"], "never-checked first, then the longest-unchecked; c1 waits for next week"
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 2 and s["canonical_total"] == 3 and s["weeks_for_full_pass"] == 2
+    assert s["user_id"] == "u1"
+
+
+def test_canonical_with_no_candidates_is_still_marked_but_a_failed_query_is_not(monkeypatch):
+    cans = [_can("c-empty"), _can("c-failed")]
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, cans, query_fail=("c-failed",))
+    sweep.main(["--apply", "--judge", "codex"])
+    markers = [s["id"] for s in stamps if s.get("marker")]
+    assert markers == ["c-empty"], "a canonical whose candidate query failed keeps its place at the front"
+    assert summaries[-1]["canonicals_checked"] == 1
+    assert summaries[-1]["canonicals_query_failed"] == 1
+
+
+def test_dry_run_marks_nothing(monkeypatch):
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1")], candidates={"c1": [_cand("x1")]},
+                                         verdicts={"candidate x1": (True, "YES")})
+    sweep.main(["--judge", "codex"])          # no --apply
+    assert stamps == []
+
+
+def test_yes_pair_whose_candidate_is_newer_than_the_canonical_is_routed_not_stamped(monkeypatch):
+    """The sweep assumed the canonical is the truth. When the candidate is NEWER than the canonical it
+    may be the correction and the canonical the stale one, so it goes to the review queue as
+    canonical-possibly-stale instead of hiding the newer fact. Only the checked-at marker is written
+    (so the pair is not re-judged every week)."""
+    cans = [_can("c1", created="2026-07-01T00:00:00+00:00")]
+    cands = {"c1": [_cand("newer", created="2026-09-01T00:00:00+00:00"),
+                    _cand("older", created="2026-06-01T00:00:00+00:00")]}
+    verdicts = {"candidate newer": (True, "YES conflict"), "candidate older": (True, "YES conflict")}
+    stamps, queued, summaries, _ = _sweep_rig(monkeypatch, cans, cands, verdicts)
+    sweep.main(["--apply", "--judge", "codex"])
+    by = {s["id"]: s for s in stamps if not s.get("marker")}
+    assert by["older"]["contradicts"] == "c1", "an older contradicting candidate is stamped as before"
+    assert by["newer"]["contradicts"] is None and by["newer"]["clear"] is False, \
+        "a newer candidate gets ONLY the checked-at marker, never the enforced stamp"
+    assert [q["memory_id"] for q in queued] == ["newer"]
+    assert queued[0]["kind"] == "canonical-possibly-stale"
+    assert queued[0]["stale_canonical_id"] == "c1"
+    assert "canonical_id" not in queued[0], "must not be promotable via --promote (which would HIDE the newer fact)"
+    s = summaries[-1]
+    assert s["stale_canonical_routed"] == 1 and s["stamped_count"] >= 1
+
+
+def test_no_vector_canonicals_are_counted_and_all_skipped_degrades(monkeypatch):
+    """A future vector-shape change must not read as 'canonicals=50 pairs=0 ok'."""
+    blind = [dict(_can("c1"), vector={"bm25": {"indices": [1], "values": [1.0]}}),
+             dict(_can("c2"), vector=None)]
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, blind)
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["skipped_no_vector"] == 2
+    assert s["outcome"] == "degraded:no-vectors" and rc == 1
+
+
+def test_weekly_unit_runs_the_stamped_rejudge_pass_after_the_sweep():
+    text = (REPO_ROOT / "systemd" / "ams-step-contradiction-sweep.service").read_text(encoding="utf-8")
+    exec_line = next(ln for ln in text.splitlines() if ln.startswith("ExecStart="))
+    assert "--judge codex" in exec_line and "--judge local" not in exec_line
+    assert "--then-rejudge-stamped" in exec_line
+
+
+def test_then_rejudge_runs_both_passes_and_reports_the_worse_exit(monkeypatch):
+    calls = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 0 if "--rejudge-stamped" not in argv else 1
+    monkeypatch.setattr(sweep, "_main", fake_main)
+    rc = sweep.main(["--apply", "--limit", "50", "--judge", "codex", "--then-rejudge-stamped"])
+    assert calls == [["--apply", "--limit", "50", "--judge", "codex"],
+                     ["--apply", "--limit", "50", "--judge", "codex", "--rejudge-stamped"]]
+    assert rc == 1
+    calls.clear()
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0 and len(calls) == 1
+    # a dry run does not chain the rejudge: it would only print the same decisions twice
+    calls.clear()
+    sweep.main(["--judge", "codex", "--then-rejudge-stamped"])
+    assert len(calls) == 1
+
+
+def _rejudge_with_tiers(monkeypatch, records, info_map, verdict_map):
+    calls, summaries = _rejudge_env(monkeypatch, records, {}, verdict_map)
+
+    def fake_info(http, pid):
+        v = info_map[pid]
+        if isinstance(v, Exception):
+            raise v
+        return v
+    monkeypatch.setattr(sweep, "fetch_point_info", fake_info)
+    return calls, summaries
+
+
+def test_rejudge_clears_a_stamp_whose_target_is_no_longer_canonical(monkeypatch):
+    """98 % of the audited rejections named a target that had since been demoted. The gate now
+    ignores such stamps; the weekly rejudge also clears them from the record, without a judge call
+    (there is no canonical left to contradict)."""
+    records = [
+        {"id": "r-demoted", "payload": {"data": "cand d", "contradicts_canonical": "t-stable"}},
+        {"id": "r-retired", "payload": {"data": "cand r", "contradicts_canonical": "t-retired"}},
+        {"id": "r-live",    "payload": {"data": "cand l", "contradicts_canonical": "t-canon"}},
+        {"id": "r-gone",    "payload": {"data": "cand g", "contradicts_canonical": "t-gone"}},
+    ]
+    info = {"t-stable": {"text": "T1", "tier": "stable", "retired": False},
+            "t-retired": {"text": "T2", "tier": "canonical", "retired": True},
+            "t-canon": {"text": "T3", "tier": "canonical", "retired": False},
+            "t-gone": None}
+    # only the live pair reaches the judge: a KeyError on any other candidate proves no judge call
+    calls, summaries = _rejudge_with_tiers(monkeypatch, records, info, {"cand l": (True, "YES")})
+    rc = sweep.run_rejudge_stamped(_types.SimpleNamespace(judge="codex", model="m"), dry_run=False)
+    assert rc == 0
+    by = {c["id"]: c for c in calls}
+    assert by["r-demoted"]["clear"] is True and by["r-retired"]["clear"] is True and by["r-gone"]["clear"] is True
+    assert by["r-live"]["contradicts"] == "t-canon" and by["r-live"]["clear"] is False
+    s = summaries[-1]
+    assert s["cleared"] == 3
+    reasons = {c["memory_id"]: c["reason"] for c in s["cleared_ids"]}
+    assert reasons["r-demoted"] == "target-demoted:stable"
+    assert reasons["r-retired"] == "target-retired"
+    assert reasons["r-gone"] == "dangling-canonical"

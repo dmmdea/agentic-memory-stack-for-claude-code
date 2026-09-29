@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import subprocess
 import sys
@@ -394,6 +395,45 @@ def is_older(neighbor: dict, anchor: dict) -> bool:
     return bool(nc and ac and nc < ac)
 
 
+def _checked_epoch(point: dict) -> float:
+    """contradiction_checked_at of a point as an epoch, -inf when absent or unparseable (so a
+    never-checked canonical sorts before every checked one)."""
+    raw = (point.get("payload") or {}).get("contradiction_checked_at")
+    if not raw:
+        return float("-inf")
+    try:
+        return dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return float("-inf")
+
+
+def order_canonicals(canonicals: list[dict]) -> list[dict]:
+    """Rotation order: never-checked first, then the longest-unchecked, ties on id. With --limit this
+    makes the cut a rotating budget. The sweep used to take the same first N ids in scroll order
+    every week, so the canonicals sorting after that cut were never judged."""
+    return sorted(canonicals, key=lambda p: (_checked_epoch(p), str(p.get("id"))))
+
+
+def sweep_coverage(total: int, processed: int) -> dict:
+    """{canonicals_checked, canonical_total, weeks_for_full_pass}: how many canonicals this run
+    covered and how many weekly runs a full pass takes at that rate (None = no progress)."""
+    if total <= 0:
+        weeks = 0
+    elif processed <= 0:
+        weeks = None
+    else:
+        weeks = math.ceil(total / processed)
+    return {"canonicals_checked": processed, "canonical_total": total, "weeks_for_full_pass": weeks}
+
+
+def resolve_user_id(arg: Optional[str]) -> Optional[str]:
+    """--user-id defaulting to the corpus tenant (ams_env.user_id()). An explicit empty string means
+    every user; with no tenant configured the sweep is unscoped, as before."""
+    if arg is None:
+        return ams_env.user_id() or None
+    return arg or None
+
+
 def same_brand_scope(canonical_brand, candidate_brand) -> bool:
     """Brand scoping: compare only within the same brand or null-brand —
     a pair with two DIFFERENT truthy brands is never judged (multi-brand
@@ -472,7 +512,7 @@ def model_available(models_json, model: str) -> bool:
 
 
 def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
-                aborted: Optional[str]) -> str:
+                aborted: Optional[str], all_no_vector: bool = False) -> str:
     """v0.20 M7: classify a completed run for the JSONL summary + R6c.
     'ok' | 'degraded:<reason>' (exit nonzero) | 'no-op:<reason>' (exit 0,
     R6c WARNs). pairs_checked==0 with canonicals present is 'ok' — the
@@ -481,6 +521,9 @@ def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
         return _outcome_for_abort(aborted)
     if canonical_total == 0:
         return "no-op:zero-canonicals"
+    if all_no_vector:
+        # every canonical in the run lacked a dense vector: a shape change, not a quiet week
+        return "degraded:no-vectors"
     if pairs_checked > 0 and skipped_pairs == pairs_checked:
         return "no-op:all-pairs-skipped"
     return "ok"
@@ -811,6 +854,26 @@ def stamp_candidate(http: httpx.Client, candidate_id: str, checked_at: str,
     return True
 
 
+def mark_canonical_checked(http: httpx.Client, canonical_id: str, checked_at: str) -> bool:
+    """Write the sweep's rotation marker (contradiction_checked_at) onto a CANONICAL point through the
+    trusted-actor PATCH. order_canonicals sorts on it, so without this write the rotation would never
+    advance: the marker used to exist only on candidates."""
+    try:
+        r = http.patch(
+            f"{MEM0}/v1/memories/{canonical_id}/metadata",
+            json={"metadata": {"contradiction_checked_at": checked_at}, "actor": ACTOR,
+                  "reason": f"contradiction sweep rotation marker: canonical swept @ {checked_at}"},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as e:
+        print(f"contradiction-sweep: MARK EXCEPTION {canonical_id}: {e}", flush=True)
+        return False
+    if r.status_code != 200:
+        print(f"contradiction-sweep: MARK FAIL {canonical_id}: mem0={r.status_code} body={r.text[:200]}", flush=True)
+        return False
+    return True
+
+
 def resolve_action(verdict: Optional[bool], was_pending: bool, no_auto_promote: bool) -> str:
     """What a rejudge verdict does. SAFE policy (no_auto_promote=True, 2026-06-30): a YES on an
     advisory-pending record is QUEUED for human review, never auto-hidden — Codex over-promotes
@@ -1121,6 +1184,14 @@ def fetch_point_text(http: httpx.Client, point_id: str) -> Optional[str]:
     / HTTP / parse failure — the caller MUST NOT treat that as absence: conflating a transient
     Qdrant blip with a missing canonical would let run_rejudge_stamped CLEAR a real contradiction
     flag on a hiccup (audit v0.27.3 HIGH). 'absent' and 'errored' must be distinguishable."""
+    info = fetch_point_info(http, point_id)
+    return None if info is None else info["text"]
+
+
+def fetch_point_info(http: httpx.Client, point_id: str) -> Optional[dict]:
+    """{text, tier, retired} for a point, or None when it is CONFIRMED ABSENT. Same absent-versus-
+    errored contract as fetch_point_text (RAISES on a transport/HTTP/parse failure). The tier and the
+    retired flag let the stamped re-judge treat a demoted or retired target as no canonical at all."""
     r = http.post(f"{QDRANT}/collections/{COLLECTION}/points",
                   json={"ids": [point_id], "with_payload": True}, timeout=15.0)
     r.raise_for_status()
@@ -1128,7 +1199,8 @@ def fetch_point_text(http: httpx.Client, point_id: str) -> Optional[str]:
     if not pts:
         return None  # confirmed absent
     pl = pts[0].get("payload") or {}
-    return pl.get("data") or pl.get("memory") or ""
+    return {"text": pl.get("data") or pl.get("memory") or "", "tier": pl.get("tier"),
+            "retired": bool(pl.get("retrievable") is False or pl.get("retired_at"))}
 
 
 def run_rejudge_stamped(args, dry_run: bool) -> int:
@@ -1204,19 +1276,33 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             # canonical is also a skip (no verdict possible), never a dangling-clear. Only a
             # confirmed-absent canonical clears (a verdict isn't possible against a gone record).
             try:
-                can_text = fetch_point_text(qdrant_http, str(canonical_id))
+                can_info = fetch_point_info(qdrant_http, str(canonical_id))
             except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
                 skipped += 1
                 print(f"  SKIP {cid}: transient fetch error for canonical {canonical_id} — NOT clearing "
                       f"({type(e).__name__}: {str(e)[:80]})", flush=True)
                 continue
-            if can_text is None:
+            if can_info is None:
                 print(f"  CLEAR {cid}: referenced canonical {canonical_id} CONFIRMED absent (dangling)", flush=True)
                 if not dry_run and stamp_candidate(mem0_http, cid, _iso_now(), clear=True,
                                                    justification="rejudge: referenced canonical confirmed absent"):
                     cleared += 1
                 cleared_ids.append({"memory_id": cid, "reason": "dangling-canonical"})
                 continue
+            # WP-4: a stamp is only meaningful against a LIVE canonical. A target that has been retired
+            # or demoted (stable / evidence / ...) is treated like a dangling reference: nothing left to
+            # contradict, so the stamp is cleared without spending a judge call. (The admission gate
+            # already ignores such stamps; this removes them from the record.)
+            _dead = ("target-retired" if can_info.get("retired")
+                     else (f"target-demoted:{can_info.get('tier')}" if can_info.get("tier") != "canonical" else None))
+            if _dead:
+                print(f"  CLEAR {cid}: referenced canonical {canonical_id} is no longer live ({_dead})", flush=True)
+                if not dry_run and stamp_candidate(mem0_http, cid, _iso_now(), clear=True,
+                                                   justification=f"rejudge: {_dead}"):
+                    cleared += 1
+                cleared_ids.append({"memory_id": cid, "canonical_id": str(canonical_id), "reason": _dead})
+                continue
+            can_text = can_info["text"]
             if not str(can_text).strip():
                 skipped += 1
                 print(f"  SKIP {cid}: canonical {canonical_id} present but empty text — NOT clearing", flush=True)
@@ -1352,6 +1438,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
+    ev_skipped_no_vector = 0   # WP-4: counted, never a silent continue
     ev_cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     consec_fail = 0  # fail fast if the judge dies mid-run (mirrors the canonical sweep)
     aborted = None
@@ -1369,6 +1456,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
             a_text = a_pl.get("data") or a_pl.get("memory")
             a_user = a_pl.get("user_id")
             vec = dense_vector(anchor)
+            if vec is None:
+                ev_skipped_no_vector += 1
             if not a_text or not a_user or vec is None:
                 continue
             try:
@@ -1435,7 +1524,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     outcome = _outcome_for_abort(aborted) if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
                      "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
-                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome,
+                     "skipped": skipped, "skipped_no_vector": ev_skipped_no_vector,
+                     "queued_ids": queued_ids, "outcome": outcome,
                      "cache_hits": int(ev_cache_stats.get("cache_hits", 0)),
                      "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
@@ -1645,6 +1735,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         eligible = []
         canonical_member = 0
         ineligible = 0
+        nv_skipped_no_vector = 0   # WP-4: novelty-baseline anchors with no dense vector (counted)
         for pair, qhs in ranked:
             a, b = payloads.get(pair[0]), payloads.get(pair[1])
             if not a or not b:
@@ -1683,6 +1774,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                 can_id = str(can.get("id"))
                 vec = dense_vector(can)
                 can_user = (can.get("payload") or {}).get("user_id")
+                if vec is None:
+                    nv_skipped_no_vector += 1
                 if vec is None or not can_user:
                     continue
                 for nb in query_similar(qdrant_http, vec, can_user, can_id,
@@ -1698,6 +1791,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                 a_id = str(anchor.get("id"))
                 a_user = (anchor.get("payload") or {}).get("user_id")
                 vec = dense_vector(anchor)
+                if vec is None:
+                    nv_skipped_no_vector += 1
                 if vec is None or not a_user:
                     continue
                 for nb in query_similar(qdrant_http, vec, a_user, a_id,
@@ -1779,6 +1874,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
             "pairs_canonical_member": canonical_member,
             "pairs_ineligible": ineligible,
             "pairs_novel_vs_storage_sweep": novel,
+            "novelty_skipped_no_vector": nv_skipped_no_vector,
             "novelty_baseline": "canonical-neighborhood UNION evidence-sweep reach",
             "ids_source": ("returned_top_ids (top-3 per row until the [:10] "
                            "widening deploys — co-occurrence is a lower bound)"),
@@ -1817,7 +1913,21 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
     return exit_code_for(outcome)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """Entry point. --then-rejudge-stamped chains the stamped re-judge (--rejudge-stamped, same
+    --judge/--apply) AFTER the sweep in the same process, so the weekly unit runs both under ONE chain
+    step and one receipt (a second step would need its own name in the chain). The worse exit wins.
+    A dry run does not chain: it would only print the same decisions twice."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    chain = "--then-rejudge-stamped" in argv
+    argv = [a for a in argv if a != "--then-rejudge-stamped"]
+    rc = _main(argv)
+    if chain and "--apply" in argv and "--rejudge-stamped" not in argv:
+        rc = max(rc, _main(argv + ["--rejudge-stamped"]))
+    return rc
+
+
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="v0.19 I.3: offline contradiction sweep")
     parser.add_argument("--apply", action="store_true",
                         help="stamp verdicts (default: dry-run, print only)")
@@ -1836,7 +1946,12 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"llama-swap judge model (default {DEFAULT_MODEL})")
     parser.add_argument("--user-id", default=None,
-                        help="restrict the sweep to one user_id's canonicals")
+                        help="restrict the sweep to one user_id's canonicals (default: the corpus tenant, "
+                             "ams_env.user_id(); pass an empty string for every user)")
+    parser.add_argument("--then-rejudge-stamped", action="store_true",
+                        help="after the sweep, also run --rejudge-stamped with the same --judge and "
+                             "--apply (handled by main(); clears NO-verdict, dangling and demoted-target "
+                             "stamps). The weekly unit uses this to run both passes under one chain step.")
     parser.add_argument("--unstamp", default=None, metavar="MEMORY_ID",
                         help="clear a false-positive contradicts_canonical stamp "
                              "on this memory via the trusted-actor PATCH "
@@ -1893,8 +2008,9 @@ def main() -> int:
     parser.add_argument("--winner", metavar="WINNER_ID",
                         help="the newer record LOSER_ID is superseded by (required with "
                              "--resolve-supersede)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     dry_run = not args.apply
+    args.user_id = resolve_user_id(args.user_id)
 
     if args.resolve_supersede:
         if not args.winner:
@@ -2055,10 +2171,16 @@ def main() -> int:
     consecutive_llm_failures = 0   # v0.20 M7: dead/loading judge -> abort, not N skips
     canonicals: list[dict] = []
     canonical_total = 0            # v0.20 L6: pre-slice total (truncation surfaced)
+    canonicals_checked = 0         # WP-4: swept end to end this run (the rotation marker was written)
+    canonicals_query_failed = 0    # candidate query failed: NOT marked, keeps its place at the front
+    skipped_no_vector = 0          # WP-4: no dense vector - counted, never a silent continue
+    stale_routed = 0               # YES pairs whose candidate is NEWER than the canonical
     aborted: Optional[str] = None
     try:
         canonicals = scroll_canonicals(qdrant_http, user_id=args.user_id)
         canonical_total = len(canonicals)
+        # WP-4 rotation: never-checked first, then longest-unchecked, so --limit is a budget
+        canonicals = order_canonicals(canonicals)
         if args.limit > 0:
             canonicals = canonicals[: args.limit]
         if canonical_total > len(canonicals):
@@ -2078,12 +2200,19 @@ def main() -> int:
             vec = dense_vector(can)
             if not can_text or not can_user or vec is None:
                 print(f"  canonical {can_id}: missing text/user_id/vector — skipped", flush=True)
+                if vec is None:
+                    skipped_no_vector += 1
+                if not dry_run:
+                    # marked anyway: a canonical that can never be swept would otherwise sit at the
+                    # front of the rotation forever and eat the budget every week
+                    mark_canonical_checked(mem0_http, can_id, _iso_now())
                 continue
             try:
                 raw = query_similar(qdrant_http, vec, can_user, can_id,
                                     fetch_n=max(args.top_k * 3, args.top_k))
             except (httpx.HTTPError, OSError) as e:
                 print(f"  canonical {can_id}: candidate query failed — {e}", flush=True)
+                canonicals_query_failed += 1
                 continue
             candidates = []
             for pt in raw:
@@ -2142,7 +2271,28 @@ def main() -> int:
                 print(f"    {label} {cand_id} ({str(cand_text)[:60]!r}): {detail}"
                       + (" [re-judge of stamped candidate]" if was_stamped else ""),
                       flush=True)
-                if not dry_run:
+                # WP-4 direction: the sweep assumed the canonical is the truth. A YES whose candidate is
+                # NEWER than the canonical may be the CORRECTION (the canonical the stale one), so it is
+                # routed to the review queue instead of hiding the newer fact. Only the checked-at
+                # marker is written on the candidate (so it is not re-judged every week); an existing
+                # stamp is left as it is. The queue entry deliberately has no canonical_id: --promote
+                # (which would HIDE the candidate) must not be able to act on it.
+                route_stale = bool(verdict) and is_older(can, cand)
+                if route_stale:
+                    stale_routed += 1
+                    print(f"    CANONICAL-POSSIBLY-STALE {can_id}: candidate {cand_id} is NEWER than the "
+                          f"canonical - routed to review, not stamped", flush=True)
+                if not dry_run and route_stale:
+                    append_review_queue(str(REVIEW_QUEUE), {
+                        "memory_id": cand_id, "stale_canonical_id": can_id,
+                        "kind": "canonical-possibly-stale",
+                        "candidate_text": str(cand_text)[:300],
+                        "justification": ("contradiction sweep: newer fact judged to contradict an older "
+                                          f"canonical - the canonical may be stale: {detail[:160]}")})
+                    if stamp_candidate(mem0_http, cand_id, _iso_now(),
+                                       justification="routed to review: canonical possibly stale"):
+                        stamped_count += 1
+                elif not dry_run:
                     checked_at = _iso_now()
                     clear = was_stamped and not verdict  # NO on a stamped record
                     # v0.29.4: a LOCAL (advisory) judge stamps the PENDING key — the
@@ -2174,6 +2324,12 @@ def main() -> int:
                                 "cleared_stamp": _was,
                                 "justification": detail[:200]})
                             print(f"    CLEARED stale stamp on {cand_id} (was {_was})", flush=True)
+            if not aborted:
+                # the canonical was swept end to end (0 eligible candidates counts): advance its
+                # rotation marker, or order_canonicals would put it first again next week
+                canonicals_checked += 1
+                if not dry_run:
+                    mark_canonical_checked(mem0_http, can_id, _iso_now())
     except (httpx.HTTPError, OSError) as e:
         # Mid-run backend failure: degrade with partial counts, never crash.
         aborted = f"{type(e).__name__}: {str(e)[:120]}"
@@ -2184,7 +2340,8 @@ def main() -> int:
         llm_http.close()
         mem0_http.close()
 
-    outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted)
+    outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted,
+                          all_no_vector=bool(canonicals) and skipped_no_vector == len(canonicals))
     summary = {
         "ts": run_ts,
         "dry_run": dry_run,
@@ -2195,6 +2352,11 @@ def main() -> int:
         "model": args.model,
         "canonical_total": canonical_total,   # v0.20 L6: pre-slice total
         "canonical_count": len(canonicals),   # processed (post --limit slice)
+        **sweep_coverage(canonical_total, canonicals_checked),   # WP-4: checked/total + weeks for a full pass
+        "user_id": args.user_id,
+        "skipped_no_vector": skipped_no_vector,
+        "canonicals_query_failed": canonicals_query_failed,
+        "stale_canonical_routed": stale_routed,
         "pairs_checked": pairs_checked,
         "yes_count": yes_count,
         "no_count": no_count,
@@ -2214,7 +2376,9 @@ def main() -> int:
         summary["aborted"] = aborted
     _append_summary(summary)
     print(f"contradiction-sweep: done. outcome={outcome} "
-          f"canonicals={len(canonicals)}/{canonical_total} pairs={pairs_checked} "
+          f"canonicals={canonicals_checked}/{canonical_total} "
+          f"(full pass in {sweep_coverage(canonical_total, canonicals_checked)['weeks_for_full_pass']} weekly runs) "
+          f"pairs={pairs_checked} "
           f"yes={yes_count} no={no_count} skipped={skipped_pairs} "
           f"stamped={stamped_count} cleared={cleared_count} (dry_run={dry_run}) "
           f"summary -> {SWEEP_LOG}", flush=True)
