@@ -95,6 +95,33 @@ Describe 'user-prompt-lib Redact-Secrets copy follows the shared fixture (WP-17)
     }
 }
 
+Describe 'Get-LearnRulesQueueStats (Test-MemoryStack pending-corrections row, WP-17)' {
+    BeforeEach {
+        $script:q = Join-Path $TestDrive ("q-" + [guid]::NewGuid().ToString('N') + '.jsonl')
+        $script:now = [datetime]::Parse('2026-09-29T12:00:00Z', [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+    }
+    It 'counts pending corrections and those older than 48 h, and ignores everything else' {
+        Set-Content -LiteralPath $q -Encoding UTF8 -Value @(
+            '{"ts":"2026-09-26T12:00:00Z","kind":"correction","correction":"old","status":"pending"}'      # 72 h
+            '{"ts":"2026-09-27T11:00:00Z","kind":"correction","correction":"older","status":"pending"}'    # 49 h
+            '{"ts":"2026-09-29T09:00:00Z","kind":"correction","correction":"fresh","status":"pending"}'    # 3 h
+            '{"ts":"2026-09-01T09:00:00Z","kind":"correction","correction":"done","status":"drained"}'
+            '{"ts":"2026-09-01T09:00:00Z","kind":"test-failure","correction":"x","status":"pending"}'
+            'not json at all'
+        )
+        $st = Get-LearnRulesQueueStats -QueuePath $q -NowUtc $now
+        $st.pending  | Should -Be 3
+        $st.stale    | Should -Be 2
+        [Math]::Round($st.oldest_hours) | Should -Be 72
+    }
+    It 'reports zero for a missing queue' {
+        $st = Get-LearnRulesQueueStats -QueuePath (Join-Path $TestDrive 'nope.jsonl') -NowUtc $now
+        $st.pending | Should -Be 0
+        $st.stale   | Should -Be 0
+    }
+}
+
 Describe 'Phase 0.B decision-capture predicate (Test-DecisionLikePrompt)' {
 
     It 'matches decision-like prompt "<_>"' -ForEach @(

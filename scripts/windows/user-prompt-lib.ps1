@@ -354,6 +354,41 @@ function Add-LearnRuleCapture {
     } catch { return $false }
 }
 
+function Get-LearnRulesQueueStats {
+    <#
+    .SYNOPSIS
+    Read-only health of the correction queue for Test-MemoryStack: how many `correction` lines are
+    still `pending`, how many of those are older than -StaleHours (default 48), and the age in hours
+    of the oldest. learn-rules-drain.ps1 empties the queue hourly, so a stale line means the drain
+    is not running or cannot reach the authority. Test-failure lines and finished lines are not
+    counted. Timestamps are read from the raw line, never through ConvertFrom-Json, because pwsh 7
+    turns an ISO string into a [datetime]. Never throws; PS 5.1-safe.
+    #>
+    param(
+        [string]$QueuePath = ((Get-AmsHomeDir) + '\.mem0\learn-rules.jsonl'),
+        [datetime]$NowUtc = ((Get-Date).ToUniversalTime()),
+        [int]$StaleHours = 48
+    )
+    $stats = [pscustomobject]@{ pending = 0; stale = 0; oldest_hours = 0.0 }
+    try {
+        if (-not (Test-Path -LiteralPath $QueuePath)) { return $stats }
+        foreach ($line in [System.IO.File]::ReadLines($QueuePath)) {
+            if ($line -notmatch '"kind"\s*:\s*"correction"') { continue }
+            if ($line -notmatch '"status"\s*:\s*"pending"') { continue }
+            $stats.pending++
+            $m = [regex]::Match($line, '"ts"\s*:\s*"([^"\\]*)"')
+            if (-not $m.Success) { continue }
+            $ts = [datetime]::MinValue
+            if (-not [datetime]::TryParse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$ts)) { continue }
+            $age = ($NowUtc.ToUniversalTime() - $ts).TotalHours
+            if ($age -gt $stats.oldest_hours) { $stats.oldest_hours = $age }
+            if ($age -gt $StaleHours) { $stats.stale++ }
+        }
+    } catch {}
+    return $stats
+}
+
 function Get-StackBrandRules {
     <#
     .SYNOPSIS

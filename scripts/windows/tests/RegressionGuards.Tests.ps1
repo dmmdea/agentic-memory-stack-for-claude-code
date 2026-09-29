@@ -318,6 +318,12 @@ Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10
         $script:tmsCode | Should -Match '(?s)finally\s*\{\s*if \(\$psMid\)' -Because 'the PUT-survival probe must delete its record on every path'
     }
 
+    It 'WP-17: Test-MemoryStack has a corrections-drain row fed by Get-LearnRulesQueueStats, warning at 48h' {
+        $script:tmsCode | Should -Match "Add-Check 'RECOVERY' 'corrections drain' 'WARN'" -Because 'a pending correction older than 48h means the drain is not running'
+        $script:tmsCode | Should -Match 'Get-LearnRulesQueueStats' -Because 'the row reads the queue through the tested helper'
+        $script:tmsCode | Should -Not -Match "'learn-rules\.jsonl', 'promote-queue\.jsonl'" -Because 'the old debt probe read a state path nothing writes; the drain owns the queue'
+    }
+
     It 'the new headless suites actually gate CI (silent-not-gating is the W1 failure class)' {
         foreach ($t in 'test_payload_carryover.py', 'test_sparse_health.py', 'test_mojibake_check.py',
                        'test_capabilities.py', 'test_job_liveness.py') {
@@ -602,10 +608,18 @@ Describe 'Compactor throttle + catch-up (2026-09-06)' {
         $code | Should -Not -Match '(?-i)-CatchUp\b' -Because 'case-sensitive on purpose: dream-catchup.ps1 stays and must not satisfy this'
         $code | Should -Match "'sync --watch --hub-host '" -Because 'the watcher is the singleton the design names'
         $code | Should -Match 'Import-PowerShellDataFile' -Because 'the hub comes from the receipt, never a literal'
-        foreach ($n in @('dream-catchup.ps1', 'memory-index-refresh.ps1')) { $code | Should -Match ([regex]::Escape($n)) }
+        foreach ($n in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'learn-rules-drain.ps1')) { $code | Should -Match ([regex]::Escape($n)) }
         # P4-1c: the lint child is the binary's lint; the PowerShell lint is the fallback branch only.
         $code | Should -Match "'lint --summary-out " -Because 'the store lint writes the G7 clock the banner reports'
         $code | Should -Match "elseif \(Test-Path \(Join-Path \`$ScriptDir 'memory-lint\.ps1'\)\)" -Because 'memory-lint.ps1 runs only when ams-store.exe is absent'
+    }
+    It 'the spawner starts the corrections drain on every role: no role gate in the spawner (WP-17)' {
+        # The queue is written on every PC (the per-prompt hook), so a replica must drain it too;
+        # dream-catchup.ps1 gates itself on the role, the drain deliberately does not.
+        $code = script:CodeOf $script:spawnPath
+        $code | Should -Match 'learn-rules-drain\.ps1'
+        $code | Should -Not -Match 'Get-Mem0Role' -Because 'a replica writes corrections and must drain them'
+        (script:CodeOf (Join-Path (Split-Path -Parent $PSScriptRoot) 'learn-rules-drain.ps1')) | Should -Not -Match 'Get-Mem0Role'
     }
     It 'an attributed statement is doctrine; a topic prefix or an all-caps label is not' {
         . (Join-Path (Split-Path -Parent $PSScriptRoot) 'memory-store-lib.ps1')
