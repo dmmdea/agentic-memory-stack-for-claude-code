@@ -3212,8 +3212,11 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # (fail-closed) before deriving only_brand_neutral — `not "  "` is False
             # otherwise, dropping the gate to admit-all (audit MED, goals/OQ variant).
             _bb = b.brand.strip() if isinstance(b.brand, str) else b.brand
-            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"])
-            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"])
+            # WP-4: never serve a session its OWN goals/open questions (they are minted from the
+            # session you are in, so they were echoed straight back: 41 % of prompts), and rank what
+            # is left by how recently an episode touched it rather than by priority alone.
+            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
+            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
     except Exception:
         log.exception("bundle: goals/open_questions failed (non-fatal)")
         out.setdefault("goals", [])

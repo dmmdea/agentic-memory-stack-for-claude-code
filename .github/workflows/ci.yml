@@ -76,6 +76,7 @@ jobs:
             mem0-server/tests/test_admission_gate.py \
             mem0-server/tests/test_ams01_history_window.py \
             mem0-server/tests/test_ams57_counts.py \
+            mem0-server/tests/test_bundle_self_echo.py \
             mem0-server/tests/test_automemory_dedup_exemption.py \
             mem0-server/tests/test_autopromote_actor.py \
             mem0-server/tests/test_canonical_key_provider.py \
@@ -108,6 +109,7 @@ jobs:
             mem0-server/tests/test_reranker.py \
             mem0-server/tests/test_semantic_dedup.py \
             mem0-server/tests/test_shim_offline.py \
+            mem0-server/tests/test_stamp_tier_resolution.py \
             mem0-server/tests/test_sparse_health.py \
             mem0-server/tests/test_systemd_parity.py \
             mem0-server/tests/test_tier_parity.py \
