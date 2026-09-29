@@ -25,6 +25,8 @@
 #
 # --user-id is the mem0 tenant the Brain stores your memories under (its own install's WSL
 # username). It defaults to this box's login name, which is only right when the two match.
+# --ams-hub <user@host:repo.git> joins the fleet store. An omitted flag inherits the hub recorded in
+# ~/.mem0/client-receipt.json; --ams-hub "" clears it; with none the store is skipped with a WARN.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +35,7 @@ AUTHORITY=""
 API_KEY_FILE=""
 USER_ID=""
 DRY_RUN=0
-AMS_HUB=""
+AMS_HUB=""; SET_AMS_HUB=0
 AMS_BINARY=""
 AMS_SUMS=""
 AMS_RELEASE_REPO="dmmdea/agentic-memory-stack-for-claude-code"
@@ -52,7 +54,7 @@ while [ $# -gt 0 ]; do
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
-        --ams-hub) AMS_HUB="${2:-}"; shift 2 ;;
+        --ams-hub) AMS_HUB="${2:-}"; SET_AMS_HUB=1; shift 2 ;;
         --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
         --ams-store-sums) AMS_SUMS="${2:-}"; shift 2 ;;
         --ams-release-repo) AMS_RELEASE_REPO="${2:-}"; shift 2 ;;
@@ -93,6 +95,21 @@ if [ -z "$USER_ID" ] && [ -f "$MEM0_DIR/client-receipt.json" ]; then
     [ -z "$USER_ID" ] || echo "    tenant inherited from $MEM0_DIR/client-receipt.json: $USER_ID"
 fi
 [ -n "$USER_ID" ] || USER_ID="${USER:-$(id -un)}"
+# The fleet-store hub INHERITS the same way (the Windows installer inherits every flag it
+# records; this one used to be a pure pass-through, so a re-run without --ams-hub skipped the
+# store with exit 0 and rewrote the receipt with an empty hub). Explicit flag > receipt >
+# nothing; an EXPLICIT empty value clears it. A receipt that names a hub the parse cannot
+# recover fails the run, because carrying on would erase the hub from the receipt.
+if [ "$SET_AMS_HUB" = 1 ]; then
+    [ -n "$AMS_HUB" ] || echo "    --ams-hub cleared (explicit empty value; not inherited)"
+elif [ -z "$AMS_HUB" ] && [ -f "$MEM0_DIR/client-receipt.json" ]; then
+    AMS_HUB="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ams_hub") or "")' "$MEM0_DIR/client-receipt.json" 2>/dev/null || true)"
+    if [ -n "$AMS_HUB" ]; then
+        echo "    --ams-hub inherited from ~/.mem0/client-receipt.json: $AMS_HUB"
+    elif grep -Eq '"ams_hub"[[:space:]]*:[[:space:]]*"[^"]' "$MEM0_DIR/client-receipt.json"; then
+        fail "$MEM0_DIR/client-receipt.json records an ams_hub that could not be read back; repair the file or pass --ams-hub <user@host:repo.git> (or --ams-hub \"\" to leave the fleet store)"
+    fi
+fi
 [[ "$USER_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--user-id must be a plain tenant name (letters, digits, . _ -), got '$USER_ID'"
 command -v python3 >/dev/null || fail "python3 is required"
 PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
@@ -281,7 +298,7 @@ ams_setup_client_store() {
 }
 
 if [ -z "$AMS_HUB" ]; then
-    echo "    no --ams-hub: this client does not join the fleet store (skipped)"
+    echo "    WARN: no --ams-hub and none recorded: this client does not join the fleet store (skipped)"
 elif plan "install ams-store into $AMS_BIN_DIR, wire the hub transport for $AMS_HUB, register the gate + sync hooks"; then :; else
     command -v git >/dev/null 2>&1 || fail "git is required for the fleet store"
     ams_install_binary
