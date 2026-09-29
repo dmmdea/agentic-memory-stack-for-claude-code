@@ -65,7 +65,7 @@ It resolves the **WSL distro** by auto-detecting the default distro (`wsl -l -q`
 `1-wsl-services.sh` provisions the Linux half:
 
 - **Qdrant** binary + a config that pins a **loopback bind** (`127.0.0.1:6333`), rewritten on every run so an old install can't stay LAN-exposed.
-- **mem0 server** under `~/apps/mem0-server/` with its venv. The full **`MEM0_MODULES` import closure** — every module `app.py` imports — is copied so a fresh install never crash-loops on a missing module; security floors for transitive deps are enforced and post-condition-asserted.
+- **mem0 server** under `~/apps/mem0-server/` with its venv. The full **`MEM0_MODULES` import closure** — every module `app.py` imports — is copied so a fresh install never crash-loops on a missing module; dependency floors (never caps or exact pins: starlette>=1.3.1, cryptography>=50.0.1, mem0ai[nlp]>=2.0.4) are enforced on both the fresh and the refresh branch, together with `pip-audit`, and post-condition-asserted: the floors are met, `pip check` is clean and `pip-audit` is present, or the installer exits non-zero. `scripts/upgrade-check.sh` is the read-only inventory that uses the scanner: a missing scanner is reported as `security scan UNAVAILABLE` with a non-zero exit (with an OSV `querybatch` fallback listing advisories anyway), never as an empty review.
 - The **DPAPI key-fetch script**, the mem0 **API key**, and the **canonical-key** (generated only when neither a plaintext key nor a DPAPI blob already exists).
 - The **WSL-side receipt** `~/.mem0/stack.env` (`MEM0_WSL_USER`, `MEM0_WIN_USER`, `MEM0_DISTRO`, `MEM0_REPO_ROOT_WSL`, `MEM0_BIND`), which `deploy.sh` later sources.
 

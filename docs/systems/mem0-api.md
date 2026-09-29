@@ -232,7 +232,7 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 
 - **Qdrant** on `:6333` (collection `mem0_egemma_768`, loopback).
 - **llama-swap** on `:11436` — the EmbeddingGemma-300m embedder and the bge-reranker-v2-m3 cross-encoder.
-- **mem0 2.0.4** (`mem0ai`) library.
+- **mem0** (`mem0ai[nlp]`, floor 2.0.4; see `mem0-server/requirements.txt`) library.
 - **The Codex HTTP shim** on `:18792` — used by the optional NLI write-gate (`codex_shim_client.py`) to judge contradictions against canonical.
 
 ## Downstream effects

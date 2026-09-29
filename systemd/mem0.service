@@ -1,5 +1,5 @@
 [Unit]
-Description=mem0 v2.0.4 WSL-native server (v0.12 agentic-memory-stack)
+Description=mem0 WSL-native server (agentic-memory-stack)
 After=default.target
 
 [Service]
