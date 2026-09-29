@@ -214,7 +214,7 @@ def test_high_entropy_token_flags_but_ids_and_prose_do_not():
         "the path /mnt/x/dev/worktrees/AbCd1234EfGh5678IjKl9012MnOp3456QrSt/docs",  # token inside a path
         "class InvestigationWarehouseOrdersGap2026Q3 handles it",              # CamelCase, 37 chars
         "getUserAccountSettingsFromDatabase2026 is the helper",                 # camelCase, 38 chars
-        "ReadyPepPrefilledPensOrderFulfillmentQueue3 runs nightly",            # CamelCase, 43 chars
+        "WidgetPrefilledItemsOrderFulfillmentQueue3 runs nightly",            # CamelCase, 43 chars
         "MemoryAuditPostHocFlagsJsonlWriterV2Impl is the writer",              # CamelCase, 40 chars
         "ProductVariantInventoryLevelSyncJobRunner9 is the runner",            # CamelCase, 42 chars
     ]
@@ -255,7 +255,7 @@ def test_automemory_oversize_uses_the_migration_cap():
     go = (REPO_ROOT / "ams-store" / "internal" / "store" / "constants.go").read_text(encoding="utf-8")
     cap = int(_re.search(r"Mem0MaxChars\s*=\s*(\d+)", go).group(1))
     assert l10.AUTOMEMORY_OVERSIZE_CHARS == cap
-    am = {"source": "automemory:apollo-visitor-tracker-install", "tier": "evidence"}
+    am = {"source": "automemory:example-project-note", "tier": "evidence"}
     assert "oversize" not in l10.heuristic_flags({**am, "data": "x" * cap})
     assert "oversize" in l10.heuristic_flags({**am, "data": "x" * (cap + 1)})
     other = {"source": "l1a-extractor", "tier": "evidence"}
