@@ -134,6 +134,15 @@ TS_ISO="${TS_DATE:0:4}-${TS_DATE:4:2}-${TS_DATE:6:2}T${TS_TIME:0:2}:${TS_TIME:2:
 # restore chased a phantom. Every entry is now conditional on the artifact being
 # present in THIS snapshot; absent artifacts are an explicit JSON null.
 mf() { if [ -f "$BACKUP_DIR/$1" ]; then echo "\"$1\""; else echo "null"; fi; }
+# Further collections of a secondary kind (qcol-<kind>+<collection>-<TS>.snapshot, see stack-backup.sh):
+# every one that is in THIS set is listed, so it is checksummed and a restore can find it. Names hold
+# only [A-Za-z0-9._+-] (stack-backup.sh validates the collection name), so they are JSON-safe.
+EXTRA_COLLECTIONS_JSON="["; _sep=""
+for _f in "$BACKUP_DIR"/qcol-*+*-"$TS".snapshot; do
+    [ -f "$_f" ] || continue
+    EXTRA_COLLECTIONS_JSON="$EXTRA_COLLECTIONS_JSON$_sep\"${_f##*/}\""; _sep=", "
+done
+EXTRA_COLLECTIONS_JSON="$EXTRA_COLLECTIONS_JSON]"
 # required artifacts: a 0-byte file is NOT a backup (review R3) - null it so the restore
 # gate and the TMS FAIL row both see it the same night instead of at disaster time
 mfreq() { if [ -s "$BACKUP_DIR/$1" ]; then echo "\"$1\""; else echo "null"; fi; }
@@ -161,6 +170,7 @@ cat > "$MANIFEST.tmp" <<EOF
     "qdrant_entities": $(mf "qcol-entities-$TS.snapshot"),
     "qdrant_wiki": $(mf "qcol-wiki-$TS.snapshot")
   },
+  "qdrant_extra_collections": $EXTRA_COLLECTIONS_JSON,
   "deliberately_excluded": "pair-verdict-cache.db (TTL'd rebuildable cache), jobs.db (transient queue), canonical-replay.jsonl (anti-replay nonce ledger; signed tokens carry a 300s skew gate and the ledger GCs at 600s, so a lost ledger reopens at most a 10-minute window), telemetry ledgers (retrieval-log, admission-rejected, receipts). The three secondary Qdrant collections (episodes, entities, wiki) are snapshotted into the set when present; if one is missing, rebuild episodes with episode-embed-backfill.py (from episodic.db) and wiki with wiki-index-build.py - entities is written by the mem0 library and has no rebuild path, its snapshot is the only copy. See docs/data-backup.md",
   "counts": {
     "qdrant_points": $QDRANT_POINTS,
@@ -179,7 +189,9 @@ backup_dir, path = sys.argv[1], sys.argv[2]
 with open(path) as fh:
     m = json.load(fh)
 sums = {}
-for name in (v for v in m["files"].values() if isinstance(v, str)):
+names = [v for v in m["files"].values() if isinstance(v, str)]
+names += [n for n in m.get("qdrant_extra_collections", []) if isinstance(n, str)]
+for name in names:
     full = os.path.join(backup_dir, name)
     h = hashlib.sha256()
     with open(full, "rb") as fh:

@@ -43,7 +43,8 @@ class FakeQdrant:
     plus the sha256 `.checksum` file Qdrant writes beside it."""
 
     def __init__(self, snap_root: Path, collections, corrupt_checksum: bool = False,
-                 fail_delete: bool = False, fail_create=(), fail_collection_list: bool = False, fail_snapshot_list: bool = False):
+                 fail_delete: bool = False, fail_create=(), fail_collection_list: bool = False, fail_snapshot_list: bool = False,
+                 collection_list_body: str | None = None):
         self.snap_root = snap_root
         self.collections = list(collections)
         self.corrupt_checksum = corrupt_checksum
@@ -51,6 +52,7 @@ class FakeQdrant:
         self.fail_create = set(fail_create)  # collections whose snapshot POST answers 500
         self.fail_collection_list = fail_collection_list  # GET /collections answers 500
         self.fail_snapshot_list = fail_snapshot_list  # GET /collections/<c>/snapshots answers 500
+        self.collection_list_body = collection_list_body  # GET /collections answers 200 with this raw body
         self.deleted: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []
         self._n = 0
@@ -74,6 +76,12 @@ class FakeQdrant:
                 if parts == ["collections"]:
                     if fake.fail_collection_list:
                         return self._send({"status": "boom"}, 500)
+                    if fake.collection_list_body is not None:
+                        raw = fake.collection_list_body.encode()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        return self.wfile.write(raw)
                     return self._send({"result": {"collections": [{"name": c} for c in fake.collections]}})
                 if len(parts) == 2 and parts[1] in fake.collections:
                     return self._send({"result": {"points_count": 42}})
@@ -626,3 +634,94 @@ def test_pcloud_size_mismatch_leaves_no_manifest_and_prunes_nothing(home, tmp_pa
     assert "size" in r.stderr
     assert not (dst / f"manifest-{_ts(2)}.json").exists(), "the manifest is copied last, only after every file verified"
     assert (dst / f"manifest-{_ts(1)}.json").exists(), "retention does not run on a failed copy"
+
+
+# ------------------------------------------------- more than one collection of a secondary kind
+
+
+def _extras_of(b: Path, kind: str):
+    return sorted(p.name for p in b.glob(f"qcol-{kind}+*.snapshot"))
+
+
+def test_a_second_collection_of_a_kind_is_snapshotted_and_is_not_degraded(home, tmp_path):
+    """Snapshot EVERY collection that matches a secondary kind. Skipping the second one silently
+    left it out of the set (and the old code then counted the skip as degraded, so a healthy
+    night with two wiki collections read red while still not backing the second one up)."""
+    extra_wiki, extra_ep = "wiki_pages_other_768", "episodes_other_768"
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES, extra_wiki, extra_ep])
+    try:
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        assert "not snapshotted" not in r.stderr, r.stderr
+        line = _outcome_line(out)
+        assert line is None or line[0] == "ok", f"a second collection of a kind is not a degradation: {line}"
+        b = home / ".mem0" / "backups"
+        # every matching collection has its own snapshot in the set, none overwrites another
+        assert sorted(c for c, _ in fake.created) == sorted([PRIMARY, *SECONDARIES, extra_wiki, extra_ep])
+        assert len(list(b.glob("qcol-wiki-*.snapshot"))) == 1 and len(_extras_of(b, "wiki")) == 1
+        assert len(list(b.glob("qcol-episodes-*.snapshot"))) == 1 and len(_extras_of(b, "episodes")) == 1
+        assert len(list(b.glob("qcol-entities-*.snapshot"))) == 1
+        # the manifest names and checksums the extras too (a file the manifest does not list is not restorable)
+        m = json.loads(next(b.glob("manifest-*.json")).read_text())
+        listed = sorted(m["qdrant_extra_collections"])
+        assert listed == sorted(_extras_of(b, "wiki") + _extras_of(b, "episodes"))
+        for name in listed:
+            assert m["checksums"][name]["sha256"] == hashlib.sha256((b / name).read_bytes()).hexdigest()
+    finally:
+        fake.close()
+
+
+def test_extra_collection_snapshots_keep_eight_each_and_never_eat_the_first(home):
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES, "wiki_pages_other_768"])
+    try:
+        b = home / ".mem0" / "backups"
+        for d in range(1, 11):
+            _touch(b / f"qcol-wiki-{_ts(d)}.snapshot", b"first")
+            _touch(b / f"qcol-wiki+wiki_pages_other_768-{_ts(d)}.snapshot", b"extra")
+        r = _run(BACKUP, home, fake)
+        assert r.returncode == 0, r.stderr
+        assert len(list(b.glob("qcol-wiki-[0-9]*.snapshot"))) == 8
+        assert len(_extras_of(b, "wiki")) == 8, "each collection keeps its own newest 8"
+        assert not (b / f"qcol-wiki-{_ts(1)}.snapshot").exists()
+        assert not (b / f"qcol-wiki+wiki_pages_other_768-{_ts(1)}.snapshot").exists()
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("body", ["this is not json", '{"status": "ok"}', '{"result": {"collections": null}}'])
+def test_a_collection_list_jq_cannot_read_reads_degraded(home, tmp_path, body):
+    """curl succeeds (HTTP 200) but the body has no collection list: jq exits non-zero, and that
+    status must not be masked by the `| sort` after it (a pipe reports its LAST command)."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES], collection_list_body=body)
+    try:
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        assert "could not list Qdrant collections" in r.stderr, r.stderr
+        status, reason, counts = _outcome_line(out)
+        assert status == "degraded" and "secondary-snapshot-failed" in reason
+        assert counts["secondary_snapshot_failed"] >= 1
+    finally:
+        fake.close()
+
+
+def test_manifest_lists_no_extra_collections_when_there_are_none(home, qdrant):
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    b = home / ".mem0" / "backups"
+    m = json.loads(next(b.glob("manifest-*.json")).read_text())
+    assert m["qdrant_extra_collections"] == []
+
+
+def test_manifest_reads_the_unknown_stamp_as_unknown(home, qdrant):
+    """The installers' shared stamp contract writes the word `unknown` when it cannot name a commit."""
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    app = home / "apps" / "mem0-server"
+    app.mkdir(parents=True)
+    (app / "DEPLOYED_SHA").write_text("unknown\n")
+    r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "nowhere"))
+    assert r.returncode == 0, r.stderr
+    assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == "unknown"

@@ -36,8 +36,19 @@ contains** (absent artifacts are an explicit `null`, never a hoped-for name):
 | `qcol-entities-<TS>.snapshot` | the `*_entities` collection | written by the mem0 library; the snapshot is its only copy |
 | `qcol-wiki-<TS>.snapshot` | the `wiki_pages_*` collection | small; rebuildable with `wiki-index-build.py` |
 
+Every collection that matches a kind is snapshotted, so a second `wiki_pages_*` (or `episodes_*`,
+`*_entities`) collection is backed up, not skipped, and is not a degradation. Within a kind the first
+collection in name order keeps the plain `qcol-<kind>-<TS>.snapshot` name (the manifest's fixed
+`qdrant_*` keys name it); each further one is `qcol-<kind>+<collection>-<TS>.snapshot`, listed and
+checksummed under the manifest's top-level `qdrant_extra_collections` array, and trimmed to its own
+newest 8. A collection that stops existing leaves its last (up to 8) snapshots behind; they are
+plain files an operator can delete.
+
 A failed secondary snapshot warns and leaves its manifest entry `null`, but does not fail the
-night: those collections are small and rebuildable, and a red night stops the off-box copy.
+night: those collections are small and rebuildable, and a red night stops the off-box copy. The
+collection list itself is read strictly: a `GET /collections` that fails, or answers with a body that
+is not a collection list, reads `degraded` (`secondary-snapshot-failed`), never a clean night with no
+secondary snapshotted.
 
 ### Retention
 
@@ -70,8 +81,10 @@ but it does not read as a clean success either: the step writes a `degraded` out
 `app_version` and `git_sha` come from the `VERSION` and `DEPLOYED_SHA` stamps written beside the
 server modules (the deployed tree has no `.git`): by `deploy.sh` on a WSL host, and by the
 installers (`install/linux-authority.sh`, `install/1-wsl-services.sh`) on every install and
-refresh, because `deploy.sh` refuses a native host. An install from a tree with no `.git` removes
-the stamp rather than leave a stale one; `unknown` means the stamp is absent. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
+refresh, because `deploy.sh` refuses a native host. The installers write it only through the shared
+`install/deploy-stamp.sh` contract: one line, a 40-hex sha or the word `unknown` (an install from a
+tree with no `.git` and no stamp of its own), so a stale sha is never kept. The manifest says
+`unknown` when the stamp is absent or reads `unknown`. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
 key (`grep '^KEY='`), never sourced, so a malformed line cannot stop the writer.
 
 **Deliberately excluded** (so nobody re-litigates; the secondary Qdrant collections are no longer

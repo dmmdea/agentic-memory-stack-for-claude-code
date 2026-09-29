@@ -289,13 +289,21 @@ if ! command -v jq >/dev/null 2>&1; then
   rc=1
 else
   snapshot_collection "$QDRANT_COLLECTION" "$BACKUP_DIR/qdrant-$TS.snapshot" || rc=1
-  # The three small secondary collections ride in the same set (episodes_*, *_entities,
-  # wiki_pages_*), under a distinct qcol-<kind> prefix so the qdrant-* prune glob stays
-  # disjoint. A failure WARNs and reads `degraded` but does not fail the night: episodes and
+  # The small secondary collections ride in the same set (episodes_*, *_entities, wiki_pages_*),
+  # under a distinct qcol-<kind> prefix so the qdrant-* prune glob stays disjoint. EVERY collection
+  # matching a kind is snapshotted: the first (in name order) is qcol-<kind>-<TS>.snapshot, which the
+  # manifest's fixed keys name; each further one is qcol-<kind>+<collection>-<TS>.snapshot (the "+"
+  # keeps its prune glob disjoint from the first's and gives it its own newest-8 window).
+  # A failure WARNs and reads `degraded` but does not fail the night: episodes and
   # wiki are rebuildable, while the entities snapshot is the ONLY copy of that collection.
   seen=""
   colls=""
-  if body=$(curl -sf "$QDRANT_URL/collections") && colls=$(printf '%s' "$body" | jq -r '.result.collections[]?.name' | sort); then :; else
+  # Each stage is its own status: piped into `sort`, jq's failure (a 200 whose body is not a
+  # collection list) would be masked by sort's exit 0 and the night would read clean with no
+  # secondary snapshotted. A body with no .result.collections array makes jq fail (null | map).
+  if body=$(curl -sf "$QDRANT_URL/collections") && names=$(printf '%s' "$body" | jq -r '.result.collections | map(.name)[]'); then
+    colls=$(printf '%s\n' "$names" | sort)
+  else
     echo "WARN: could not list Qdrant collections - secondary collections NOT snapshotted" >&2
     DEG_SECONDARY=$((DEG_SECONDARY + 1)); colls=""
   fi
@@ -309,10 +317,10 @@ else
       *) continue ;;
     esac
     case " $seen " in
-      *" $kind "*) echo "WARN: a second $kind collection ($coll) is not snapshotted - one per kind" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); continue ;;
+      *" $kind "*) qname="qcol-$kind+$coll-$TS.snapshot" ;;
+      *) qname="qcol-$kind-$TS.snapshot"; seen="$seen $kind" ;;
     esac
-    seen="$seen $kind"
-    snapshot_collection "$coll" "$BACKUP_DIR/qcol-$kind-$TS.snapshot" \
+    snapshot_collection "$coll" "$BACKUP_DIR/$qname" \
       || { echo "WARN: $coll snapshot failed (the set is missing this collection)" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); }
   done
 fi
@@ -334,9 +342,16 @@ prune_kind() {  # <kind> <extension>
 }
 for spec in qdrant:snapshot history:db tier-ledger:jsonl MEMORY:md audit-flags:baseline episodic:db \
             claude-settings:json l10-flags:jsonl l10-state:json promote-review:jsonl \
-            stale-worksheet:jsonl qcol-episodes:snapshot qcol-entities:snapshot qcol-wiki:snapshot; do
+            stale-worksheet:jsonl; do
   prune_kind "${spec%%:*}" "${spec#*:}"
 done
+# Secondary-collection snapshots: one retention window per collection, found by what is on disk
+# (qcol-<kind> and qcol-<kind>+<collection>), so a collection added or renamed needs no list edit.
+qcol_kinds=$(for f in "$BACKUP_DIR"/qcol-*.snapshot; do
+  [ -f "$f" ] || continue
+  b="${f##*/}"; printf '%s\n' "${b%-[0-9]*-[0-9]*.snapshot}"
+done | sort -u)
+for qk in $qcol_kinds; do prune_kind "$qk" snapshot; done
 # Orphan sidecars beside backup DBs: an empty WAL holds no unflushed transaction, so it and its
 # -shm are debris; a -shm with no -wal at all is debris too. A non-empty WAL is left alone.
 for wal in "$BACKUP_DIR"/*.db-wal; do

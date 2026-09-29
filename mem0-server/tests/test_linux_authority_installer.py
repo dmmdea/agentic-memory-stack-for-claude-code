@@ -473,36 +473,54 @@ def test_the_judge_apply_wrapper_syncs_the_checkout_before_it_applies():
 
 
 # ------------------------------------------------------------- DEPLOYED_SHA stamp (backup manifest)
+# The release sha is written by ONE contract, install/deploy-stamp.sh (deploy_stamp_write), never by an
+# inline `git rev-parse` in an installer: a second writer drifts (an inline writer removed the stamp on a tarball
+# install, where the contract writes the word "unknown").
 WSL_INSTALLER = REPO_ROOT / "install" / "1-wsl-services.sh"
+STAMP_LIB = REPO_ROOT / "install" / "deploy-stamp.sh"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def _sha_stamp_lines(installer: Path, app_var: str) -> list[str]:
-    """The installer's own DEPLOYED_SHA stamp lines, with the runtime-dir variable pinned to APP."""
-    out = []
-    for line in installer.read_text(encoding="utf-8").splitlines():
-        if "rev-parse HEAD" in line and "DEPLOYED_SHA" in line:
-            out.append(line.strip().replace(f'"${app_var}', '"$APP'))
-    return out
+def _code_lines(path: Path) -> list[str]:
+    return [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
 
 
 @pytest.mark.parametrize("installer,app_var,sites", [(SCRIPT, "MEM0_APP", 1), (WSL_INSTALLER, "MEM0_DIR", 2)])
-def test_installers_stamp_the_deployed_sha_beside_every_version_stamp(installer, app_var, sites):
-    """The backup manifest reads git_sha from <app>/DEPLOYED_SHA. deploy.sh writes it but refuses a
-    native host, so on the native authority every manifest said "unknown" until the installer
-    stamped it. Every VERSION stamp site needs a sha stamp beside it (fresh install AND refresh)."""
-    text = installer.read_text(encoding="utf-8")
-    assert text.count('cp "$REPO_ROOT/VERSION"') == sites
-    assert len(_sha_stamp_lines(installer, app_var)) == sites
+def test_installers_stamp_the_sha_only_through_the_shared_deploy_stamp_contract(installer, app_var, sites):
+    code = _code_lines(installer)
+    joined = "\n".join(code)
+    assert '/install/deploy-stamp.sh"' in joined or '$SCRIPT_DIR/deploy-stamp.sh"' in joined, \
+        f"{installer.name} must source the deploy-stamp contract"
+    inline = [ln for ln in code if "DEPLOYED_SHA" in ln and ("rev-parse" in ln or ">" in ln)]
+    assert not inline, f"an inline DEPLOYED_SHA writer bypasses the contract: {inline}"
+    calls = [ln for ln in code if "deploy_stamp_write " in ln]
+    assert len(calls) == sites, calls
+    assert all(f'"${app_var}"' in ln for ln in calls), f"every stamp goes into the {app_var} runtime dir"
+    if installer == SCRIPT:
+        assert '"$SCRIPTS_DIR"' in calls[0], "the manifest writer runs from the deployed scripts dir"
+    # a stamp beside every VERSION stamp (fresh install AND refresh), one per site
+    assert joined.count('cp "$REPO_ROOT/VERSION"') == sites
+
+
+def _stamp_from_installer(tmp_path: Path, installer: Path, app_var: str, checkout: Path, app: Path):
+    """Run the installer's own deploy_stamp_write line with the real library, under the installers'
+    `set -euo pipefail`, against a checkout and an app dir."""
+    call = next(ln.strip() for ln in _code_lines(installer) if "deploy_stamp_write " in ln)
+    script = "\n".join([
+        "set -euo pipefail",
+        'REPO_ROOT="$1"; %s="$2"; SCRIPTS_DIR="$2"' % app_var,
+        '. "$3"',
+        call,
+    ])
+    return subprocess.run([BASH, "-c", script, "stamp", checkout.as_posix(), app.as_posix(), STAMP_LIB.as_posix()],
+                          capture_output=True, text=True, timeout=60)
 
 
 @pytest.mark.parametrize("installer,app_var", [(SCRIPT, "MEM0_APP"), (WSL_INSTALLER, "MEM0_DIR")])
-def test_the_sha_stamp_writes_head_and_never_leaves_a_stale_or_empty_stamp(tmp_path, installer, app_var):
+def test_the_installer_stamp_writes_head_and_says_unknown_without_a_checkout(tmp_path, installer, app_var):
     git = shutil.which("git")
     if git is None:
         pytest.skip("git not available")
-    lines = _sha_stamp_lines(installer, app_var)
-    assert lines, "no DEPLOYED_SHA stamp line found"
     app = tmp_path / "app"
     app.mkdir()
     checkout = tmp_path / "checkout"
@@ -514,23 +532,14 @@ def test_the_sha_stamp_writes_head_and_never_leaves_a_stale_or_empty_stamp(tmp_p
     head = subprocess.run([git, "-C", str(checkout), "rev-parse", "HEAD"], check=True, env=env,
                           capture_output=True, text=True).stdout.strip()
 
-    def stamp(repo_root: Path):
-        # the installers run under `set -euo pipefail`: the stamp must be safe there
-        script = "set -euo pipefail\nREPO_ROOT=%s\nAPP=%s\n%s\n" % (
-            _q(repo_root), _q(app), "\n".join(lines))
-        return subprocess.run([BASH, "-c", script], env=env, capture_output=True, text=True)
-
-    r = stamp(checkout)
+    r = _stamp_from_installer(tmp_path, installer, app_var, checkout, app)
     assert r.returncode == 0, r.stderr
-    assert (app / "DEPLOYED_SHA").read_text().strip() == head and SHA_RE.match(head)
+    assert SHA_RE.match(head) and (app / "DEPLOYED_SHA").read_text().strip() == head
 
-    # a source tree with no .git (a tarball install): no failure, and no stale sha left to lie
+    # a source tree with no .git (a tarball install): no failure, and the stamp says "unknown"
+    # rather than keeping the previous install's sha (which would name the wrong commit)
     bare = tmp_path / "bare"
     bare.mkdir()
-    r = stamp(bare)
+    r = _stamp_from_installer(tmp_path, installer, app_var, bare, app)
     assert r.returncode == 0, r.stderr
-    assert not (app / "DEPLOYED_SHA").exists()
-
-
-def _q(p: Path) -> str:
-    return "'" + str(p).replace("\\", "/").replace("'", "'\''") + "'"
+    assert (app / "DEPLOYED_SHA").read_text().strip() == "unknown"
