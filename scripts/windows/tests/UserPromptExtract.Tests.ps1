@@ -58,6 +58,41 @@ Describe 'Step 1 (2026-06-30) correction-capture' {
             $rec.correction | Should -Match 'bge-reranker'
         } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
+
+    It 'Add-LearnRuleCapture redacts a token-shaped string before it reaches the queue (WP-17)' {
+        $tmp = Join-Path $env:TEMP ("learn-rules-redact-" + [guid]::NewGuid().ToString('N') + ".jsonl")
+        # Built by concatenation so no credential-shaped literal sits in the source.
+        $key  = 's' + 'k-ABCD1234567890efghIJKL'
+        $bear = 'tok_' + 'secretvalue0123456789'
+        try {
+            (Add-LearnRuleCapture -Prompt "no that's wrong, the key is $key and Authorization: Bearer $bear so use the other one" -SessionId 'sid-r' -QueuePath $tmp) | Should -BeTrue
+            $raw = Get-Content -LiteralPath $tmp -Raw
+            $raw | Should -Not -Match ([regex]::Escape($key))
+            $raw | Should -Not -Match ([regex]::Escape($bear))
+            $rec = $raw.Trim() | ConvertFrom-Json
+            $rec.correction | Should -Match 'REDACTED_OPENAI_KEY'
+            $rec.correction | Should -Match 'use the other one'
+        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'user-prompt-lib Redact-Secrets copy follows the shared fixture (WP-17)' {
+    BeforeDiscovery {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+        $fixturePath = Join-Path $repoRoot (Join-Path 'tests' (Join-Path 'fixtures' 'redaction-cases.jsonl'))
+        $libCases = @(
+            foreach ($line in (Get-Content -LiteralPath $fixturePath)) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $o = ConvertFrom-Json $line
+                @{ name = $o.name; text = $o.text; must_redact = @($o.must_redact); must_keep = @($o.must_keep) }
+            }
+        )
+    }
+    It 'fixture case <name>' -ForEach $libCases {
+        $out = Redact-Secrets ($text.Replace('|+|', ''))
+        foreach ($n in $must_redact) { $out.Contains($n.Replace('|+|', '')) | Should -BeFalse -Because "case '$name' must redact '$n' but got: $out" }
+        foreach ($n in $must_keep)   { $out.Contains($n.Replace('|+|', '')) | Should -BeTrue  -Because "case '$name' must keep '$n' but got: $out" }
+    }
 }
 
 Describe 'Phase 0.B decision-capture predicate (Test-DecisionLikePrompt)' {

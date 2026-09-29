@@ -281,6 +281,35 @@ function Test-MachineTurnPrompt {
     return $trimmed.StartsWith('<task-notification>', [System.StringComparison]::Ordinal)
 }
 
+function Redact-Secrets {
+    # Byte-identical (comment-stripped) copy of Redact-Secrets in memory-common.ps1, pinned by
+    # AuthorityResolution.Tests.ps1 and run against tests/fixtures/redaction-cases.jsonl by
+    # UserPromptExtract.Tests.ps1. This lib is dot-sourced alone by the per-prompt hook and the
+    # resident daemon (memory-common.ps1 has load-time side effects and is not loaded there), so
+    # the corrections queue can only redact at write time with its own copy. The rationale for
+    # every pattern lives in memory-common.ps1 and mem0-server/redact.py. EDIT ALL COPIES TOGETHER.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $rules = @(
+        @('(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}', '[REDACTED_OPENAI_KEY]'),
+        @('(?i)(Authorization[ \t]*:[ \t]*Bearer[ \t]+)[^\s"'']+', '$1[REDACTED]'),
+        @('(?i)(Authorization[ \t]*:[ \t]*Basic[ \t]+)[^\s"'']+', '$1[REDACTED]'),
+        @('(?i)((?<![A-Za-z0-9])[A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)(?:(?:["''](?:\\.|[^\\\r\n]){4,200}["'']|["''](?:\\.|[^"''\\\r\n]){4,200})|(?=[^\s"''\r\n]{4})(?:[^\s"''\r\n]{16,200}|[^\s"''\r\n]{0,200}[0-9][^\s"''\r\n]{0,200}))', '$1[REDACTED]'),
+        @('(?i)(["''][A-Za-z0-9]*[_-]?(?:api[_-]?key|token|password|passwd|secret)["''][ \t]*:[ \t]*["''])([^"''\r\n]{0,200}[0-9][^"''\r\n]{0,200})(["''])', '$1[REDACTED]$3'),
+        @('(?im)^([ \t]*(?:[-*+][ \t]+)?(?:value|key|api[_-]?key|token|password|passwd|secret)[ \t]*[:=][ \t]*)["''\x60]?(?:[A-Za-z0-9]{32,}[A-Za-z0-9+/=_-]*|[0-9a-f][0-9a-f-]{31,})', '$1[REDACTED]'),
+        @('(?-i:(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,})', '[REDACTED_GITHUB_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{60,})', '[REDACTED_GITHUB_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,})', '[REDACTED_SLACK_TOKEN]'),
+        @('(?-i:(?<![A-Za-z0-9])nvapi-[A-Za-z0-9_-]{60,})', '[REDACTED_NVIDIA_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16})', '[REDACTED_AWS_KEY]'),
+        @('(?-i:(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?)', '[REDACTED_JWT]'),
+        @('(?i)(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://[^\s:@/]{1,64}):[^\s:@/]{1,256}@', '$1:[REDACTED]@'),
+        @('(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]')
+    )
+    foreach ($r in $rules) { $Text = $Text -replace $r[0], $r[1] }
+    return $Text
+}
+
 function Add-LearnRuleCapture {
     <#
     .SYNOPSIS
@@ -302,7 +331,12 @@ function Add-LearnRuleCapture {
         if ([string]::IsNullOrWhiteSpace($Prompt)) { return $false }
         $dir = Split-Path -Parent $QueuePath
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $text = $Prompt.Trim()
+        # Redact BEFORE the cap and never skip it: a credential pasted into a correction must not
+        # reach a queue that sits on disk until the drain posts it (and is then a queryable memory),
+        # and a cap applied first could cut a key in half so that neither half matches a pattern.
+        # A throw here lands in the catch below, so a broken redactor drops the capture instead of
+        # writing the raw text.
+        $text = Redact-Secrets ($Prompt.Trim())
         if ($text.Length -gt 2000) { $text = $text.Substring(0, 2000) }
         $rec = [ordered]@{
             ts         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
