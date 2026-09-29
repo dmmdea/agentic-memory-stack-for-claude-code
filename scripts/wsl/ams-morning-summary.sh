@@ -21,10 +21,19 @@ try:
         if ts.tzinfo is None: ts = ts.replace(tzinfo=dt.timezone.utc)
         if ts >= cut: rows.append(o)
 except OSError: pass
-lines = [f"- {o.get('step')} {'ok' if o.get('ok') else 'FAILED'} {o.get('duration_ms', 0)}ms{(' -- ' + o['note']) if o.get('note') else ''}" for o in rows] or ["- (no receipts in the last 24 h)"]
+def label(o):
+    # `status` (outcome contract C1) says what exit 0 cannot: a step can run and do nothing.
+    st = o.get("status") or ("ok" if o.get("ok") else "failed")
+    return {"ok": "ok", "degraded": "DEGRADED"}.get(st, "FAILED")
+def work(o):
+    w = o.get("work")
+    return (" [" + " ".join(f"{k}={v}" for k, v in w.items()) + "]") if isinstance(w, dict) and w else ""
+lines = [f"- {o.get('step')} {label(o)} {o.get('duration_ms', 0)}ms{(' -- ' + o['note']) if o.get('note') else ''}{work(o)}" for o in rows] or ["- (no receipts in the last 24 h)"]
+def names(h, key):
+    return ",".join(str(x.get("step")) for x in h.get(key) or []) or "-"
 try:
     h = json.loads((d / "health-maintenance.json").read_text(encoding="utf-8"))
-    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}%")
+    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} failed={names(h, 'failed_steps')} degraded={names(h, 'degraded_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}% pool-health {(h.get('pool') or {}).get('health', 'unknown')}")
 except (OSError, ValueError): lines.append("- health stamp unavailable")
 try:
     g = json.loads((d / "dream" / "gather.json").read_text(encoding="utf-8"))

@@ -126,6 +126,7 @@ jobs:
             mem0-server/tests/test_deploy_host_kind.py \
             mem0-server/tests/test_w7_server_smalls.py \
             claude-config/tests \
+            scripts/wsl/tests/test_ams_health_stamp.py \
             scripts/wsl/tests/test_ams_step_outcome.py \
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \
