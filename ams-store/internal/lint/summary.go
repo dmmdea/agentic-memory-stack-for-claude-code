@@ -30,6 +30,7 @@ type Counts struct {
 	Resurrected       int `json:"resurrected"`
 	ConflictInHistory int `json:"conflict_in_history"`
 	OverInjectLimit   int `json:"over_inject_limit"`
+	UnparsedPointer   int `json:"unparsed_pointer"`
 }
 
 // Summary is lint-summary.json.
@@ -179,6 +180,8 @@ func count(f []Finding) Counts {
 			c.Resurrected++
 		case KindConflictInHist:
 			c.ConflictInHistory++
+		case KindUnparsedPointer:
+			c.UnparsedPointer++
 		}
 		if x.Kind == KindOverSyncLimit || x.Kind == KindOverInjectCap {
 			c.OverBudget++

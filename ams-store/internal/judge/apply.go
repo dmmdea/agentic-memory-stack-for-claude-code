@@ -331,7 +331,7 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 			if hook == "" {
 				continue
 			}
-			candidate := index.EntryLine(rec.Title, rec.Slug, hook, rec.Indent)
+			candidate := index.RecordLine(rec, hook)
 			newBytes := index.ByteCount(candidate)
 			if newBytes >= rec.Bytes {
 				continue // strict decrease, or the edit is not a shortening
@@ -720,7 +720,7 @@ func recordLine(r *index.Record) string {
 	if r.Raw != "" {
 		return r.Raw
 	}
-	return index.EntryLine(r.Title, r.Slug, r.Summary, r.Indent)
+	return index.RecordLine(r, r.Summary)
 }
 
 // finish writes the receipt and returns the result. Every exit from Apply that reached a

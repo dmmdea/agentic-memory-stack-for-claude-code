@@ -31,6 +31,10 @@ const (
 	KindHistoryRemote  = "history-remote"
 	KindResurrected    = "resurrected"
 	KindConflictInHist = "conflict-in-history"
+	// KindUnparsedPointer is a bullet line that links a .md file and did not parse as an
+	// index entry: every per-entry rule (dup-slug, dangling, long-line) and the floor are
+	// blind to it, so it is a finding rather than something that reads as prose.
+	KindUnparsedPointer = "unparsed-pointer"
 )
 
 // actionableKinds is what reaches the session-start banner (LINT:146, plus the two v2
@@ -40,18 +44,19 @@ const (
 // of this set reaches no surface at all. That is how a store that could not be read once
 // became completely invisible - scan-error was missing from the list.
 var actionableKinds = map[string]bool{
-	KindOrphan:         true,
-	KindDangling:       true,
-	KindDupSlug:        true,
-	KindOverSyncLimit:  true,
-	KindOverInjectCap:  true,
-	KindSilent:         true,
-	KindUnproductive:   true,
-	KindStarved:        true,
-	KindHistoryRemote:  true,
-	KindScanError:      true,
-	KindResurrected:    true,
-	KindConflictInHist: true,
+	KindOrphan:          true,
+	KindDangling:        true,
+	KindDupSlug:         true,
+	KindOverSyncLimit:   true,
+	KindOverInjectCap:   true,
+	KindSilent:          true,
+	KindUnproductive:    true,
+	KindStarved:         true,
+	KindHistoryRemote:   true,
+	KindScanError:       true,
+	KindResurrected:     true,
+	KindConflictInHist:  true,
+	KindUnparsedPointer: true,
 }
 
 // Actionable reports whether a kind reaches the banner.
@@ -174,6 +179,11 @@ func StoreFindings(s store.Store) ([]Finding, error) {
 		}
 		if e.Bytes > store.LineByteCap {
 			add(KindLongLine, e.Slug, fmt.Sprintf("%d B (cap %d)", e.Bytes, store.LineByteCap))
+		}
+	}
+	for _, r := range ix.Records {
+		if r.UnparsedPointer() {
+			add(KindUnparsedPointer, store.IndexName, fmt.Sprintf("index line %d links a .md file but does not parse as a pointer (\"- [title](file.md)\", with at most one marker token before the bracket)", r.Index+1))
 		}
 	}
 	for _, f := range files {

@@ -765,7 +765,7 @@ func TestLint_SummaryCarriesTheKeysTheBannerReads(t *testing.T) {
 	for _, k := range []string{
 		"total", "orphan", "dangling", "dup_slug", "long_line", "oversized", "over_budget",
 		"scan_error", "starved", "actionable",
-		"resurrected", "conflict_in_history", "over_inject_limit",
+		"resurrected", "conflict_in_history", "over_inject_limit", "unparsed_pointer",
 	} {
 		if _, ok := counts[k]; !ok {
 			t.Errorf("counts has no %q", k)
@@ -1005,5 +1005,53 @@ func gitRun(t *testing.T, gitDir, workTree string, args ...string) {
 	out, err := exec.Command("git", full...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// --------------------------------------------------------------------------------
+// Decorated pointers: what still does not parse is a finding, never silent prose.
+// --------------------------------------------------------------------------------
+
+func TestLint_DecoratedPointersParseAndUnparsedOnesAreFindings(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{
+		"- 🛑 [Stop](stop.md) " + testutil.EmDash + " marked",
+		"- Shipped: [A](a.md) · [B](b.md)",
+		"- two marker words [C](c.md)",
+		"- [Plain](plain.md)",
+	}, map[string]string{
+		"stop.md":  testutil.FactFile("stop", "d", "project", "body"),
+		"a.md":     testutil.FactFile("a", "d", "project", "body"),
+		"b.md":     testutil.FactFile("b", "d", "project", "body"),
+		"c.md":     testutil.FactFile("c", "d", "project", "body"),
+		"plain.md": testutil.FactFile("plain", "d", "project", "body"),
+	})
+	s := firstStore(t, sb)
+	st, err := lint.MeasureStore(s)
+	if err != nil {
+		t.Fatalf("MeasureStore: %v", err)
+	}
+	if st.Entries != 3 {
+		t.Errorf("Entries = %d, want 3 (the marked pointer, the Shipped line and the plain one)", st.Entries)
+	}
+	found, err := lint.StoreFindings(s)
+	if err != nil {
+		t.Fatalf("StoreFindings: %v", err)
+	}
+	k := kinds(found)
+	if len(k[lint.KindUnparsedPointer]) != 1 {
+		t.Fatalf("unparsed-pointer findings = %v, want exactly the two-marker-word line", k[lint.KindUnparsedPointer])
+	}
+	for _, f := range found {
+		if f.Kind == lint.KindUnparsedPointer && !strings.Contains(f.Detail, "line 3") {
+			t.Errorf("detail = %q, want the index line number 3", f.Detail)
+		}
+	}
+	if !lint.Actionable(lint.KindUnparsedPointer) {
+		t.Error("unparsed-pointer must be actionable, or it reaches no surface")
+	}
+	sum := runLint(t, sb, "")
+	if sum.Counts.UnparsedPointer != 1 {
+		t.Errorf("counts.unparsed_pointer = %d, want 1", sum.Counts.UnparsedPointer)
 	}
 }

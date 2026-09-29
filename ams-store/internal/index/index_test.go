@@ -1,6 +1,8 @@
 package index_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -320,5 +322,123 @@ func TestRender_DirtyEntriesAreRebuiltOthersEmitRaw(t *testing.T) {
 	want := "# Memory Index\n\n- [A](a.md) " + em + " rebuilt\n"
 	if res.Text != want {
 		t.Errorf("RenderDerived\n got %q\nwant %q", res.Text, want)
+	}
+}
+
+// --------------------------------------------------------------- decorated pointers
+// Sessions and the write gate decorate pointers: "- <marker> [title](file.md)". A strict
+// "- [" left 133 of one live store's 135 pointer lines as opaque text.
+
+const (
+	stopSign = "\U0001F6D1"
+	newBadge = "\U0001F195"
+	keyEmoji = "\U0001F511"
+)
+
+func TestParse_DecoratedPointersAreEntries(t *testing.T) {
+	for _, tc := range []struct{ name, line, prefix string }{
+		{"stop", "- " + stopSign + " [T](t.md) " + em + " hook", stopSign + " "},
+		{"new", "- " + newBadge + " [T](t.md) " + em + " hook", newBadge + " "},
+		{"key", "- " + keyEmoji + " [T](t.md) " + em + " hook", keyEmoji + " "},
+		{"word", "- Shipped: [T](t.md) " + em + " hook", "Shipped: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix := index.Parse(tc.line)
+			es := ix.Entries()
+			if len(es) != 1 {
+				t.Fatalf("entries = %d, want 1 (line %q parsed as opaque text)", len(es), tc.line)
+			}
+			e := es[0]
+			if e.Slug != "t.md" || e.Title != "T" || e.Summary != "hook" || e.Prefix != tc.prefix {
+				t.Errorf("parsed slug=%q title=%q summary=%q prefix=%q; want t.md T hook %q", e.Slug, e.Title, e.Summary, e.Prefix, tc.prefix)
+			}
+			// A rebuilt line keeps the marker byte for byte.
+			e.Dirty = true
+			if got := index.RenderVerbatim(ix.Records, ix.Newline); got != tc.line {
+				t.Errorf("dirty render lost the marker\n got %q\nwant %q", got, tc.line)
+			}
+			if got := index.RecordLine(e, "hook"); got != tc.line {
+				t.Errorf("RecordLine = %q, want %q", got, tc.line)
+			}
+		})
+	}
+}
+
+// A multi-link "Shipped:" line is an entry that carries a second link, never dropped: the
+// extra slug keeps its target reachable and visible to the dangling rules.
+func TestParse_MultiLinkShippedLineKeepsBothLinks(t *testing.T) {
+	line := "- Shipped: [a](x.md) \u00b7 [b](y.md)"
+	ix := index.Parse(line)
+	es := ix.Entries()
+	if len(es) != 1 || es[0].Slug != "x.md" || len(es[0].ExtraSlugs) != 1 || es[0].ExtraSlugs[0] != "y.md" {
+		t.Fatalf("entries = %+v, want one entry x.md with the extra link y.md", es)
+	}
+	linked := index.LinkedSlugs(ix.Records)
+	if !linked["x.md"] || !linked["y.md"] {
+		t.Errorf("both links must count for reachability, got %v", linked)
+	}
+}
+
+func TestParse_CanonicalLinesCarryNoPrefix(t *testing.T) {
+	for _, line := range []string{"- [A](a.md)", "- [A](a.md) " + em + " hook", "  - [A](a.md)"} {
+		es := index.Parse(line).Entries()
+		if len(es) != 1 || es[0].Prefix != "" {
+			t.Errorf("%q: entries=%d prefix=%q, want one entry with no prefix", line, len(es), func() string {
+				if len(es) == 1 {
+					return es[0].Prefix
+				}
+				return "?"
+			}())
+		}
+	}
+	// A checkbox is not a marker: "[x]" opens the bracket itself.
+	if es := index.Parse("- [x] task, see [notes](n.md)").Entries(); len(es) != 1 || es[0].Prefix != "" {
+		t.Errorf("checkbox line changed shape: %+v", es)
+	}
+}
+
+func TestParse_UnparsedPointerBullets(t *testing.T) {
+	text := "- two words [a](x.md)\n* [b](y.md)\n- plain text with no link\n```\n- fenced [c](z.md)\n```\n- [ok](ok.md)\n"
+	var got []string
+	for _, r := range index.Parse(text).Records {
+		if r.UnparsedPointer() {
+			got = append(got, r.Raw)
+		}
+	}
+	want := []string{"- two words [a](x.md)", "* [b](y.md)"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("unparsed pointers = %q, want %q (a fenced line and a parsed entry are not findings)", got, want)
+	}
+}
+
+// Golden: a real-shaped index round-trips byte for byte, even with every entry rebuilt.
+func TestIndex_DecoratedGoldenRoundTrips(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "decorated-index.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	ix := index.Parse(text)
+	if got := len(ix.Entries()); got != 6 {
+		t.Fatalf("golden entries = %d, want 6", got)
+	}
+	if got := index.RenderVerbatim(ix.Records, ix.Newline); got != text {
+		t.Fatalf("untouched render is not byte-identical\n got %q\nwant %q", got, text)
+	}
+	for _, e := range ix.Entries() {
+		e.Dirty = true
+	}
+	// Every canonical-separator line is rebuilt exactly. The Shipped line's hook starts
+	// with a middle dot, which is not a separator, so it is the one place the rebuild adds
+	// the em-dash the author never typed: assert everything else is unchanged.
+	rebuilt := strings.Split(index.RenderVerbatim(ix.Records, ix.Newline), "\n")
+	orig := strings.Split(text, "\n")
+	for i := range orig {
+		if strings.HasPrefix(orig[i], "- Shipped:") {
+			continue
+		}
+		if rebuilt[i] != orig[i] {
+			t.Errorf("line %d rebuilt differently\n got %q\nwant %q", i+1, rebuilt[i], orig[i])
+		}
 	}
 }

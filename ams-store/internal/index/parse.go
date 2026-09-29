@@ -21,7 +21,17 @@ var (
 	// the leading indent group makes an indented pointer an entry rather than opaque
 	// text - both shapes previously fell through to Kind='other', which is how an
 	// indexed file came to read as an ORPHAN and gain a second pointer.
-	reEntry = regexp.MustCompile(`^(?P<indent>\s*)- \[(?P<title>.*?)\]\((?P<slug>[^)\s]+\.md)\)(?P<rest>.*)$`)
+	//
+	// One optional marker token may sit between "- " and "[": a run of non-space,
+	// non-"[" characters such as an emoji or "Shipped:". Sessions and the write gate
+	// decorate pointers that way, and a strict "- [" left 133 of one live store's 135
+	// pointer lines as opaque text: every per-entry rule and the floor were blind on the
+	// fleet's largest store. The marker is captured WITH its trailing whitespace so the
+	// renderer puts it back byte for byte.
+	reEntry = regexp.MustCompile(`^(?P<indent>\s*)- (?P<prefix>[^\s\[]+\s+)?\[(?P<title>.*?)\]\((?P<slug>[^)\s]+\.md)\)(?P<rest>.*)$`)
+	// rePointerBullet is a bullet line that carries a link to a .md file. A bullet like
+	// that which did not parse as an entry is an unparsed pointer (lint finds it).
+	rePointerBullet = regexp.MustCompile(`^\s*[-*+]\s.*\]\([^)\s]+\.md\)`)
 	// reLink is LIB:224: any markdown link to a .md file, wherever it sits.
 	reLink = regexp.MustCompile(`\(([^)\s]+\.md)\)`)
 	// reSep is LIB:246: the separator between a pointer and its hook is an em-dash, one
@@ -37,16 +47,29 @@ var (
 // Record is one line of the index. Every line - blank lines and headings included - is
 // preserved verbatim in Raw so an untouched line reproduces byte-for-byte.
 type Record struct {
-	Index      int
-	Kind       string
-	Raw        string
-	Indent     string
+	Index  int
+	Kind   string
+	Raw    string
+	Indent string
+	// Prefix is the marker token between "- " and "[", with its trailing whitespace
+	// ("" for a canonical line). It is rendered back verbatim, so a rebuilt line keeps
+	// the decoration its author gave it.
+	Prefix     string
 	Title      string
 	Slug       string
 	Summary    string
 	ExtraSlugs []string
 	Bytes      int
 	Dirty      bool
+	// Fenced marks a line inside a code fence: text, never a pointer.
+	Fenced bool
+}
+
+// UnparsedPointer reports whether a record is a bullet line that links to a .md file and
+// still did not parse as an entry. Such a line is invisible to every per-entry rule, so
+// it is surfaced instead of being left to look like prose.
+func (r *Record) UnparsedPointer() bool {
+	return r.Kind == KindOther && !r.Fenced && rePointerBullet.MatchString(r.Raw)
 }
 
 // Index is a parsed MEMORY.md.
@@ -98,7 +121,7 @@ func Parse(text string) *Index {
 			m = reEntry.FindStringSubmatch(ln)
 		}
 		if m != nil {
-			rest := m[4]
+			rest := m[5]
 			summary := strings.TrimRightFunc(reSep.ReplaceAllString(rest, ""), unicode.IsSpace)
 			extra := []string{}
 			for _, lm := range reLink.FindAllStringSubmatch(rest, -1) {
@@ -109,8 +132,9 @@ func Parse(text string) *Index {
 				Kind:       KindEntry,
 				Raw:        ln,
 				Indent:     m[1],
-				Title:      m[2],
-				Slug:       m[3],
+				Prefix:     m[2],
+				Title:      m[3],
+				Slug:       m[4],
 				Summary:    summary,
 				ExtraSlugs: extra,
 				Bytes:      ByteCount(ln),
@@ -123,6 +147,7 @@ func Parse(text string) *Index {
 			Raw:        ln,
 			ExtraSlugs: []string{},
 			Bytes:      ByteCount(ln),
+			Fenced:     inFence,
 		})
 	}
 	return &Index{Newline: Newline(text), Records: records, Lines: len(lines)}
