@@ -1,0 +1,480 @@
+"""Backup and DR hygiene: stack-backup retention, the manifest writer and the pCloud copy.
+
+Every script runs for real under a scratch HOME. The Qdrant REST API is a fake HTTP server in
+this process (the scripts take its base from MEM0_QDRANT_URL); nothing here reads or writes the
+operator's real ~/.mem0 or talks to a live Qdrant.
+
+Run: python3 -m pytest scripts/wsl/tests/test_backup_retention.py -q  (bash, curl, jq, python3)
+"""
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+WSL_DIR = Path(__file__).resolve().parents[1]
+BACKUP = WSL_DIR / "stack-backup.sh"
+MANIFEST = WSL_DIR / "stack-backup-manifest.sh"
+PCLOUD = WSL_DIR / "ams-pcloud-copy.sh"
+
+pytestmark = pytest.mark.skipif(
+    any(shutil.which(t) is None for t in ("bash", "curl", "jq", "python3", "sha256sum")),
+    reason="bash/curl/jq/python3/sha256sum not available",
+)
+
+PRIMARY = "mem0_egemma_768"
+SECONDARIES = ("episodes_egemma_768", "mem0_egemma_768_entities", "wiki_pages_egemma_768")
+DAY = 86400
+
+
+# --------------------------------------------------------------------------- fake Qdrant
+
+
+class FakeQdrant:
+    """The slice of the Qdrant REST API the backup uses: list collections, read a collection,
+    list/create/delete snapshots. A created snapshot is a real file under the snapshot root
+    plus the sha256 `.checksum` file Qdrant writes beside it."""
+
+    def __init__(self, snap_root: Path, collections, corrupt_checksum: bool = False):
+        self.snap_root = snap_root
+        self.collections = list(collections)
+        self.corrupt_checksum = corrupt_checksum
+        self.deleted: list[tuple[str, str]] = []
+        self.created: list[tuple[str, str]] = []
+        self._n = 0
+        self._lock = threading.Lock()
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # keep pytest output pristine
+                pass
+
+            def _send(self, obj, code=200):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parts = self.path.strip("/").split("/")
+                if parts == ["collections"]:
+                    return self._send({"result": {"collections": [{"name": c} for c in fake.collections]}})
+                if len(parts) == 2 and parts[1] in fake.collections:
+                    return self._send({"result": {"points_count": 42}})
+                if len(parts) == 3 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    return self._send({"result": fake.list_snapshots(parts[1])})
+                self._send({"status": "not found"}, 404)
+
+            def do_POST(self):
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 3 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    return self._send({"result": {"name": fake.create_snapshot(parts[1])}})
+                self._send({"status": "not found"}, 404)
+
+            def do_DELETE(self):
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 4 and parts[2] == "snapshots" and parts[1] in fake.collections:
+                    fake.delete_snapshot(parts[1], parts[3])
+                    return self._send({"result": True})
+                self._send({"status": "not found"}, 404)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _dir(self, coll):
+        d = self.snap_root / coll
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def seed(self, coll, name, age_days, payload=b"old-snapshot"):
+        """A snapshot that already exists server-side (listed by the API)."""
+        f = self._dir(coll) / name
+        f.write_bytes(payload)
+        (self._dir(coll) / (name + ".checksum")).write_text(hashlib.sha256(payload).hexdigest())
+        t = time.time() - age_days * DAY
+        os.utime(f, (t, t))
+
+    def list_snapshots(self, coll):
+        out = []
+        for f in sorted(self._dir(coll).glob("*.snapshot")):
+            if f.name.startswith("qdrant-"):
+                continue  # a hand-made one-off: on disk, not something the API created
+            out.append({"name": f.name, "creation_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(f.stat().st_mtime)),
+                        "size": f.stat().st_size})
+        return out
+
+    def create_snapshot(self, coll):
+        with self._lock:
+            self._n += 1
+            name = f"{coll}-node-{int(time.time())}-{self._n:03d}.snapshot"
+        payload = (f"snapshot-of-{coll}-{name}" * 40).encode()
+        f = self._dir(coll) / name
+        f.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        if self.corrupt_checksum:
+            digest = "0" * 64
+        (self._dir(coll) / (name + ".checksum")).write_text(digest)
+        self.created.append((coll, name))
+        return name
+
+    def delete_snapshot(self, coll, name):
+        for suffix in ("", ".checksum"):
+            (self._dir(coll) / (name + suffix)).unlink(missing_ok=True)
+        self.deleted.append((coll, name))
+
+    def remaining(self, coll):
+        return sorted(p.name for p in self._dir(coll).glob("*.snapshot"))
+
+
+@pytest.fixture
+def home(tmp_path):
+    h = tmp_path / "home"
+    (h / ".mem0" / "backups").mkdir(parents=True)
+    return h
+
+
+@pytest.fixture
+def qdrant(home):
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES])
+    yield fake
+    fake.close()
+
+
+def _env(home: Path, qdrant: FakeQdrant | None = None, **extra) -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEM0_", "AMS_"))}
+    env.update({"HOME": str(home), "MEM0_WIN_USER": "scratch", "LC_ALL": "C"})
+    if qdrant is not None:
+        env["MEM0_QDRANT_URL"] = qdrant.url
+    env.update(extra)
+    return env
+
+
+def _run(script: Path, home: Path, qdrant=None, args=(), **extra) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", str(script), *args], env=_env(home, qdrant, **extra),
+                          capture_output=True, text=True, timeout=120)
+
+
+def _touch(path: Path, content: bytes = b"x", age_s: float = 0) -> Path:
+    path.write_bytes(content)
+    if age_s:
+        t = time.time() - age_s
+        os.utime(path, (t, t))
+    return path
+
+
+def _ts(day: int, hms: str = "030000") -> str:
+    return f"202609{day:02d}-{hms}"
+
+
+# --------------------------------------------------------------------------- 3.1 prune
+
+
+def test_prune_ignores_sidecars(home, qdrant):
+    """9 real backups + 8 fresh sidecars (+ a fresh .tmp): only the oldest .db goes."""
+    b = home / ".mem0" / "backups"
+    dbs = [_touch(b / f"episodic-{_ts(d)}.db", b"sqlite", age_s=(20 - d) * DAY) for d in range(1, 10)]
+    for d in range(2, 10):  # sidecars beside the 8 newest; the WAL is non-empty so the orphan sweep leaves them
+        _touch(b / f"episodic-{_ts(d)}.db-wal", b"wal-frames")
+        _touch(b / f"episodic-{_ts(d)}.db-shm", b"\0" * 32768)
+    _touch(b / f"episodic-{_ts(9, '040000')}.db.tmp", b"partial")
+
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+
+    assert not dbs[0].exists(), "the oldest episodic .db must be pruned"
+    assert all(p.exists() for p in dbs[1:]), "the 8 newest .db must survive"
+    assert len(list(b.glob("episodic-*.db-wal"))) == 8
+    assert len(list(b.glob("episodic-*.db-shm"))) == 8
+    assert (b / f"episodic-{_ts(9, '040000')}.db.tmp").exists(), "a fresh .tmp is left alone (swept only when stale)"
+
+
+def test_orphan_sidecars_of_empty_wal_are_swept(home, qdrant):
+    b = home / ".mem0" / "backups"
+    _touch(b / f"episodic-{_ts(1)}.db", b"sqlite")
+    _touch(b / f"episodic-{_ts(1)}.db-wal", b"")  # empty WAL: a read-only opener's leftover
+    _touch(b / f"episodic-{_ts(1)}.db-shm", b"\0" * 32768)
+    _touch(b / f"episodic-{_ts(2)}.db", b"sqlite")
+    _touch(b / f"episodic-{_ts(2)}.db-wal", b"unflushed-frames")  # real content: never touched
+    _touch(b / f"episodic-{_ts(2)}.db-shm", b"\0" * 32768)
+
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+
+    assert not (b / f"episodic-{_ts(1)}.db-wal").exists()
+    assert not (b / f"episodic-{_ts(1)}.db-shm").exists()
+    assert (b / f"episodic-{_ts(1)}.db").exists()
+    assert (b / f"episodic-{_ts(2)}.db-wal").exists()
+    assert (b / f"episodic-{_ts(2)}.db-shm").exists()
+
+
+def test_manifests_are_pruned_with_their_sets(home, qdrant):
+    b = home / ".mem0" / "backups"
+    for d in range(1, 12):
+        _touch(b / f"manifest-{_ts(d)}.json", b"{}")
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    left = sorted(p.name for p in b.glob("manifest-*.json"))
+    # 11 seeded + tonight's, keep 8
+    assert len(left) == 8
+    assert f"manifest-{_ts(1)}.json" not in left
+
+
+# --------------------------------------------------------------------------- 3.2 qdrant
+
+
+def test_server_side_snapshots_pruned_after_verified_copy(home, qdrant):
+    for i in range(1, 6):
+        qdrant.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+    snapdir = qdrant.snap_root / PRIMARY
+    stray_old = snapdir / "qdrant-20260801.snapshot"
+    stray_new = snapdir / "qdrant-20260925.snapshot"
+    for f in (stray_old, stray_new):
+        f.write_bytes(b"one-off")
+    old = time.time() - 30 * DAY
+    os.utime(stray_old, (old, old))
+    recent = time.time() - 5 * DAY
+    os.utime(stray_new, (recent, recent))
+
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+
+    created = [n for c, n in qdrant.created if c == PRIMARY]
+    assert len(created) == 1
+    kept = [n for n in qdrant.remaining(PRIMARY) if not n.startswith("qdrant-")]
+    assert kept == sorted([created[0], f"{PRIMARY}-node-05.snapshot"]), "the newest 2 stay server-side"
+    assert {n for c, n in qdrant.deleted if c == PRIMARY} == {f"{PRIMARY}-node-0{i}.snapshot" for i in (1, 2, 3, 4)}
+    assert not stray_old.exists(), "a one-off qdrant-*.snapshot older than 14 days is pruned"
+    assert stray_new.exists(), "a recent one-off is kept"
+    local = list((home / ".mem0" / "backups").glob("qdrant-*.snapshot"))
+    assert len(local) == 1
+    assert local[0].read_bytes() == (snapdir / created[0]).read_bytes()
+
+
+def test_unverified_copy_keeps_server_snapshots(home):
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY], corrupt_checksum=True)
+    try:
+        for i in range(1, 5):
+            fake.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+        r = _run(BACKUP, home, fake)
+        assert r.returncode != 0
+        assert "checksum" in r.stderr
+        assert fake.deleted == [], "nothing is deleted server-side unless the copy verified"
+        assert list((home / ".mem0" / "backups").glob("qdrant-*.snapshot")) == [], "a copy that failed verification is not kept"
+    finally:
+        fake.close()
+
+
+def test_secondary_collections_are_snapshotted_into_the_set(home, qdrant):
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    b = home / ".mem0" / "backups"
+    for kind in ("episodes", "entities", "wiki"):
+        assert len(list(b.glob(f"qcol-{kind}-*.snapshot"))) == 1, kind
+    assert len(list(b.glob("qdrant-*.snapshot"))) == 1
+    m = json.loads(next(b.glob("manifest-*.json")).read_text())
+    for key in ("qdrant_episodes", "qdrant_entities", "qdrant_wiki"):
+        assert m["files"][key], key
+    assert "rebuild" in m["deliberately_excluded"]
+    # each secondary is trimmed server-side like the primary (only the fresh one is there: nothing to delete)
+    assert sorted(c for c, _ in qdrant.created) == sorted([PRIMARY, *SECONDARIES])
+
+
+# --------------------------------------------------------------------------- 3.3 manifest
+
+
+def _seed_set(b: Path, ts: str):
+    _touch(b / f"qdrant-{ts}.snapshot", b"vectors")
+    _touch(b / f"history-{ts}.db", b"history-bytes")
+    _touch(b / f"tier-ledger-{ts}.jsonl", b'{"a":1}\n')
+    _touch(b / f"episodic-{ts}.db", b"episodic-bytes")
+
+
+def test_manifest_stamps_version_sha_and_checksums_and_tolerates_bad_stack_env(home, qdrant):
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    app = home / "apps" / "mem0-server"
+    app.mkdir(parents=True)
+    (app / "VERSION").write_text("9.8.7\n")
+    (app / "DEPLOYED_SHA").write_text("0123456789abcdef0123456789abcdef01234567\n")
+    # the exact failure of the 09-21 night: an unquoted space value that bash would execute
+    (home / ".mem0" / "stack.env").write_text(
+        "MEM0_WIN_USER=scratch\nMEM0_WIKI_SOURCES=someone@hostone someone@hosttwo\nMEM0_REPO_ROOT_WSL=/nonexistent\n")
+
+    r = _run(MANIFEST, home, qdrant, args=[ts])
+    assert r.returncode == 0, r.stderr
+    m = json.loads((b / f"manifest-{ts}.json").read_text())
+    assert m["app_version"] == "v9.8.7"
+    assert m["git_sha"] == "0123456789abcdef0123456789abcdef01234567"
+    for name in (f"qdrant-{ts}.snapshot", f"history-{ts}.db", f"tier-ledger-{ts}.jsonl", f"episodic-{ts}.db"):
+        want = (b / name).read_bytes()
+        assert m["checksums"][name] == {"size": len(want), "sha256": hashlib.sha256(want).hexdigest()}
+    assert m["files"]["qdrant_snapshot"] == f"qdrant-{ts}.snapshot"
+
+
+def test_manifest_without_deploy_stamp_says_unknown(home, qdrant):
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "nowhere"))
+    assert r.returncode == 0, r.stderr
+    m = json.loads((b / f"manifest-{ts}.json").read_text())
+    assert m["git_sha"] == "unknown"
+    assert m["app_version"] == "unknown"
+
+
+def test_stack_backup_survives_a_bad_stack_env(home, qdrant):
+    (home / ".mem0" / "stack.env").write_text("MEM0_WIKI_SOURCES=someone@hostone someone@hosttwo\n")
+    r = _run(BACKUP, home, qdrant, MEM0_WIN_USER="")
+    assert r.returncode == 0, r.stderr
+    assert "command not found" not in r.stderr
+
+
+# --------------------------------------------------------------------------- 3.4 pcloud
+
+
+def _set(d: Path, stamp: str, age_s: float = 0, kinds=("history", "qdrant"), manifest: bool = True):
+    """One backup set in `d`: data files and (last) its manifest."""
+    for k in kinds:
+        ext = {"qdrant": "snapshot", "tier-ledger": "jsonl"}.get(k, "db")
+        _touch(d / f"{k}-{stamp}.{ext}", f"{k}-{stamp}".encode(), age_s)
+    if manifest:
+        _touch(d / f"manifest-{stamp}.json", b'{"files":{}}', age_s)
+
+
+def _pcloud_env(home: Path, tmp_path: Path):
+    parent = tmp_path / "cloud"
+    parent.mkdir(exist_ok=True)
+    dst = parent / "host"
+    return dst, {"MEM0_PCLOUD_DIR": str(dst)}
+
+
+def _receipt(home: Path, step: str, ok: bool):
+    d = home / ".mem0" / "maintenance"
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "receipts.jsonl").open("a") as f:
+        f.write(json.dumps({"ts": "2026-09-29T08:02:37Z", "step": step, "ok": ok, "exit": 0 if ok else 1,
+                            "duration_ms": 5, "receipt_id": "x", "note": ""}) + "\n")
+
+
+def test_pcloud_retention_keeps_newest_complete(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    for d in range(1, 11):  # ten complete sets already in the cloud
+        _set(dst, _ts(d))
+    _touch(dst / f"tier-ledger-{_ts(3, '030304')}.jsonl", b"partial")  # a dead partial: no manifest
+    _set(dst, _ts(30), manifest=False)  # an in-flight newer partial: not ours to delete
+    _set(src, _ts(11))  # tonight's set, freshly written
+    _receipt(home, "stack-backup", True)
+
+    r = _run(PCLOUD, home, **env)
+    assert r.returncode == 0, r.stderr
+
+    sets = sorted(p.name[len("manifest-"):-len(".json")] for p in dst.glob("manifest-*.json"))
+    assert sets == [_ts(d) for d in range(5, 12)], "the newest 7 complete sets remain"
+    for d in range(1, 5):
+        assert not list(dst.glob(f"*-{_ts(d)}.*")), f"set of day {d} must be fully deleted"
+    assert not list(dst.glob(f"*-{_ts(3, '030304')}.*")), "a dead partial older than the newest complete set goes"
+    assert (dst / f"history-{_ts(30)}.db").exists(), "a partial newer than the newest complete set is left"
+    assert (dst / f"history-{_ts(11)}.db").read_bytes() == (src / f"history-{_ts(11)}.db").read_bytes()
+
+
+def test_pcloud_retention_never_deletes_newest_complete(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    _set(dst, _ts(1))
+    _set(src, _ts(2))
+    r = _run(PCLOUD, home, AMS_PCLOUD_KEEP_SETS="0", **env)
+    assert r.returncode == 0, r.stderr
+    assert (dst / f"manifest-{_ts(2)}.json").exists()
+    assert (dst / f"history-{_ts(2)}.db").exists()
+
+
+def test_pcloud_refuses_a_stale_set(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    _set(dst, _ts(1))
+    _set(src, _ts(2), age_s=30 * 3600)
+    outcome = tmp_path / "outcome"
+    r = _run(PCLOUD, home, AMS_OUTCOME_FILE=str(outcome), **env)
+    assert r.returncode != 0
+    status, counts = outcome.read_text().strip().split(" ", 1)
+    assert status == "failed:stale-set"
+    assert json.loads(counts)["age_h"] == 30
+    assert not (dst / f"manifest-{_ts(2)}.json").exists(), "nothing is copied"
+    assert (dst / f"manifest-{_ts(1)}.json").exists(), "and nothing is pruned"
+
+
+def test_pcloud_refuses_when_stack_backup_failed(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    _set(src, _ts(2))
+    _receipt(home, "stack-backup", True)
+    _receipt(home, "stack-backup", False)  # the LATEST receipt is what counts
+    outcome = tmp_path / "outcome"
+    r = _run(PCLOUD, home, AMS_OUTCOME_FILE=str(outcome), **env)
+    assert r.returncode != 0
+    assert outcome.read_text().startswith("failed:")
+    assert not list(dst.glob("*"))
+
+
+def _fake_cp(tmp_path: Path, body: str) -> Path:
+    b = tmp_path / "fakebin"
+    b.mkdir(exist_ok=True)
+    real = shutil.which("cp")
+    cp = b / "cp"
+    cp.write_text(f'#!/usr/bin/env bash\n{body}\nexec {real} "$@"\n')
+    cp.chmod(cp.stat().st_mode | stat.S_IEXEC)
+    return b
+
+
+def test_pcloud_copies_data_first_manifest_last_and_skips_sidecars(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    _set(src, _ts(2), kinds=("history", "qdrant", "episodic", "tier-ledger"))
+    _touch(src / f"episodic-{_ts(2)}.db-wal", b"")
+    _touch(src / f"episodic-{_ts(2)}.db-shm", b"\0" * 32768)
+    log = tmp_path / "cp.log"
+    fake = _fake_cp(tmp_path, f'echo "${{@: -1}}" >> "{log}"')
+    r = _run(PCLOUD, home, PATH=f"{fake}:{os.environ['PATH']}", **env)
+    assert r.returncode == 0, r.stderr
+    order = [Path(p).name for p in log.read_text().split()]
+    assert order[-1].endswith(f"manifest-{_ts(2)}.json.tmp"), order
+    assert not any("manifest" in n for n in order[:-1]), order
+    assert not (dst / f"episodic-{_ts(2)}.db-wal").exists()
+    assert not (dst / f"episodic-{_ts(2)}.db-shm").exists()
+    assert (dst / f"episodic-{_ts(2)}.db").exists()
+
+
+def test_pcloud_size_mismatch_leaves_no_manifest_and_prunes_nothing(home, tmp_path):
+    src = home / ".mem0" / "backups"
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    _set(dst, _ts(1))
+    _set(src, _ts(2))
+    # a copy that silently truncates the history file
+    fake = _fake_cp(tmp_path, 'case "${@: -1}" in *history-*) head -c 3 "${@: -2:1}" > "${@: -1}"; exit 0;; esac')
+    r = _run(PCLOUD, home, PATH=f"{fake}:{os.environ['PATH']}", **env)
+    assert r.returncode != 0
+    assert "size" in r.stderr
+    assert not (dst / f"manifest-{_ts(2)}.json").exists(), "the manifest is copied last, only after every file verified"
+    assert (dst / f"manifest-{_ts(1)}.json").exists(), "retention does not run on a failed copy"
