@@ -6,7 +6,8 @@
 # SSH tunnel; the embedder is this box's own llama-swap (mirrored networking: localhost in WSL).
 #
 #   wiki-index.sh snapshot   < tar of the vault's wiki/   -> ~/wiki-index/wiki
-#   wiki-index.sh build                                    (snapshot -> brain Qdrant)
+#   wiki-index.sh build                                    (snapshot -> brain Qdrant, then stamps the brain's
+#                                                           ~/wiki-index/last-build: the freshness the nightly reads)
 #   wiki-index.sh search "query" [--k N]                   (JSON lines, top-K pages)
 #
 # The snapshot step exists because the vault sits on a cloud-synced folder that WSL does not
@@ -61,6 +62,17 @@ tunnel_open() {
     return 1
 }
 
+# Freshness stamp for the nightly's contract (docs/systems/wiki-index.md): the brain records the
+# time of the last successful build by ANY path in ~/wiki-index/last-build, through the control
+# socket the tunnel already holds. Fail-soft: a stamp that could not be written must not turn a
+# built index into a failed run; the nightly then simply measures from its own pull.
+stamp_last_build() {
+    if ! ssh -n -S "$SOCK" -o BatchMode=yes -o ConnectTimeout=10 "$BRAIN" \
+            'mkdir -p "$HOME/wiki-index" && date +%s > "$HOME/wiki-index/last-build"' >/dev/null 2>&1; then
+        echo "wiki-index: built, but could not stamp last-build on $BRAIN (the nightly will measure freshness from its own pull)" >&2
+    fi
+}
+
 case "${1:-}" in
     snapshot)
         tmp="$SNAP.new"
@@ -80,6 +92,7 @@ case "${1:-}" in
         tunnel_open
         WIKI_ROOT="$SNAP" WIKI_QDRANT_HOST=127.0.0.1 WIKI_QDRANT_PORT="$PORT" \
             "$PY" "$DIR/wiki-index-build.py"
+        stamp_last_build
         ;;
     search)
         shift
