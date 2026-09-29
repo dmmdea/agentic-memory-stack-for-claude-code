@@ -74,8 +74,10 @@ type ReceiptRow struct {
 // and the store that went over the sync limit had applied, skipped, skipped. The skip
 // streak is the per-store signal both of them lacked.
 type RunHistory struct {
-	SkipStreak        int
-	LastStatus        string
+	SkipStreak int
+	LastStatus string
+	// LastReceiptUTC is the timestamp of the receipt LastStatus came from.
+	LastReceiptUTC    *time.Time
 	LastProductiveUTC *time.Time
 	// LastJudgeUTC is when this store last had a judge CALL, whatever the outcome. A
 	// rejected result is a receipt, not a retry.
@@ -100,6 +102,8 @@ func ReadRunHistory(path, workspace string) RunHistory {
 		return out
 	}
 	out.LastStatus = mine[len(mine)-1].Status
+	lastTS := mine[len(mine)-1].TS.UTC()
+	out.LastReceiptUTC = &lastTS
 	for i := len(mine) - 1; i >= 0; i-- {
 		if mine[i].Status != SkipLiveSession {
 			break

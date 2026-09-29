@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -321,17 +322,33 @@ func RemoteFindings(ctx context.Context, repo amsync.Repo, p amsync.RemotePolicy
 // not the tool; a body conflict's loser is still in history and only a human can decide
 // whether to recover it - which is why the finding carries the commit id rather than just
 // saying a conflict happened.
-func MergeFindings(stateRoot string, since time.Time) []Finding {
+//
+// A finding AGES OUT: rows older than `since` are ignored, and a resurrected path whose
+// file is no longer in the store is dropped - the deletion that "came back" was healed by
+// a later pass, and a banner that keeps naming it teaches the operator to ignore the
+// banner. projectsRoot is where the path is checked; empty skips the check.
+func MergeFindings(stateRoot, projectsRoot string, since time.Time) []Finding {
 	rows, err := amsync.ReadReceipts(amsync.ReceiptPath(stateRoot), TailLines)
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
 	var out []Finding
+	seen := map[string]bool{}
 	for _, r := range rows {
 		if !since.IsZero() && r.TS.Before(since) {
 			continue
 		}
 		for _, p := range r.Resurrected {
+			key := KindResurrected + "\x00" + p
+			if seen[key] {
+				continue
+			}
+			if projectsRoot != "" {
+				if _, statErr := os.Stat(filepath.Join(projectsRoot, filepath.FromSlash(p))); os.IsNotExist(statErr) {
+					continue
+				}
+			}
+			seen[key] = true
 			out = append(out, Finding{
 				Store: workspaceOf(p), Kind: KindResurrected, File: p,
 				Detail: "kept by the modify/delete rule: one side edited it while the other deleted it",

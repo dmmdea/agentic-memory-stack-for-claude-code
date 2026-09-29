@@ -1055,3 +1055,72 @@ func TestLint_DecoratedPointersParseAndUnparsedOnesAreFindings(t *testing.T) {
 		t.Errorf("counts.unparsed_pointer = %d, want 1", sum.Counts.UnparsedPointer)
 	}
 }
+
+// --------------------------------------------------------------------------------
+// Findings age out: a healed ghost must not stay on the banner until 600 newer rows push
+// it off, and a store that has not run for a week has no "last status" worth showing.
+// --------------------------------------------------------------------------------
+
+func TestLint_ResurrectedFindingsAgeOutAndNeedTheFileToStillExist(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{"- [A](a.md)", "- [B](b.md)"}, map[string]string{
+		"a.md": testutil.FactFile("a", "d", "", ""),
+		"b.md": testutil.FactFile("b", "d", "", ""),
+	})
+	rec := func(age time.Duration, paths ...string) {
+		t.Helper()
+		if err := amsync.AppendReceipt(sb.StateRoot, amsync.Receipt{
+			TS: fixedNow.Add(-age), Kind: "once", Status: amsync.StatusPushed, Resurrected: paths,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec(8*24*time.Hour, "ws/memory/b.md") // too old
+	rec(2*time.Hour, "ws/memory/gone.md") // recent, but the file is gone (healed)
+	rec(2*time.Hour, "ws/memory/a.md")    // recent and still there: the one real finding
+	rec(3*time.Hour, "ws/memory/a.md")    // the same path again: one finding, not two
+
+	sum := runLint(t, sb, "")
+
+	var got []string
+	for _, f := range sum.Findings {
+		if f.Kind == lint.KindResurrected {
+			got = append(got, f.File)
+		}
+	}
+	if len(got) != 1 || got[0] != "ws/memory/a.md" {
+		t.Fatalf("resurrected findings = %v, want only ws/memory/a.md (older than 7 d, gone from the store, and duplicate rows are not findings)", got)
+	}
+	if sum.Counts.Resurrected != 1 {
+		t.Errorf("counts.resurrected = %d, want 1", sum.Counts.Resurrected)
+	}
+}
+
+func TestLint_LastStatusIsClearedWhenTheStoreHasNoRecentReceipt(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("stale", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	sb.AddStore("fresh", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	seedReceipts(t, receiptPath(sb), "stale", []string{"aborted-blast-cap"}, 8*24)
+	f, err := os.OpenFile(receiptPath(sb), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := json.Marshal(map[string]any{"ts": fixedNow.Add(-time.Hour).Format(time.RFC3339Nano), "workspace": "fresh", "status": "no-op"})
+	_, _ = f.Write(append(row, '\n'))
+	f.Close()
+
+	sum := runLint(t, sb, "")
+
+	for _, r := range sum.Stores {
+		switch r.Workspace {
+		case "stale":
+			if r.LastStatus != "" {
+				t.Errorf("stale store last_status = %q, want it cleared (no receipt in 7 days)", r.LastStatus)
+			}
+		case "fresh":
+			if r.LastStatus != "no-op" {
+				t.Errorf("fresh store last_status = %q, want no-op", r.LastStatus)
+			}
+		}
+	}
+}
