@@ -270,3 +270,85 @@ func TestCLI_JudgeApplyMigrationCarriesTheConfiguredCorpusUser(t *testing.T) {
 		t.Errorf("the write carried user_id %q, want the configured partition", gotUser)
 	}
 }
+
+// --brand-map reaches the wire: a migrated fact carries the brand its workspace resolves to,
+// and the JSON result names offered / updated / add_failed for the nightly wrapper's outcome.
+func TestCLI_JudgeApplyBrandMapTagsTheMigration(t *testing.T) {
+	sb, dir := judgeSandbox(t)
+	var mu sync.Mutex
+	var postedBrand string
+	var postedText string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost {
+			var body struct {
+				Messages string            `json:"messages"`
+				Metadata map[string]string `json:"metadata"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			postedBrand = body.Metadata["brand"]
+			postedText = body.Messages
+			_, _ = w.Write([]byte(`{"results":[{"id":"m1"}]}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"memory": postedText, "retrievable": true})
+	}))
+	defer srv.Close()
+	t.Setenv("AMS_MEM0_URL", "")
+	t.Setenv("MEM0_URL", srv.URL)
+	t.Setenv("AMS_MEM0_USER", "")
+	t.Setenv("MEM0_USER_ID", "probe-partition")
+	brandMap := filepath.Join(sb.Root, "brands.json")
+	if err := os.WriteFile(brandMap, []byte(`{"rules":[{"pattern":"^ws$","brand":"alpha"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := run(t, "judge-apply", "--hub", "--json", "--brand-map", brandMap,
+		"--state-root", sb.StateRoot, "--projects-root", sb.ProjectsRoot,
+		"--store", dir, "--plan", migratePlan(t, sb.Root))
+
+	if code != cli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr %s)", code, stderr)
+	}
+	mu.Lock()
+	got := postedBrand
+	mu.Unlock()
+	if got != "alpha" {
+		t.Errorf("the migration carried brand %q, want alpha from the map", got)
+	}
+	var out struct {
+		Migrated  int `json:"migrated"`
+		Offered   int `json:"offered"`
+		Updated   int `json:"updated"`
+		AddFailed int `json:"add_failed"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not one JSON document: %v\n%s", err, stdout)
+	}
+	if out.Migrated != 1 || out.Updated != 0 || out.AddFailed != 0 || out.Offered < 1 {
+		t.Errorf("counts = %+v, want migrated 1, updated 0, add_failed 0, offered >= 1", out)
+	}
+}
+
+// A brand map that is missing or malformed never stops the run.
+func TestCLI_JudgeApplyBrandMapMissingIsNeutral(t *testing.T) {
+	sb, dir := judgeSandbox(t)
+	plan := writePlan(t, sb.Root, `{"version":1,"stores":[{"workspace":"ws","decisions":[]}]}`)
+	bad := filepath.Join(sb.Root, "bad.json")
+	if err := os.WriteFile(bad, []byte("{nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"missing": filepath.Join(sb.Root, "absent.json"), "malformed": bad} {
+		t.Run(name, func(t *testing.T) {
+			code, _, stderr := run(t, "judge-apply", "--hub", "--json", "--brand-map", path,
+				"--state-root", sb.StateRoot, "--projects-root", sb.ProjectsRoot, "--store", dir, "--plan", plan)
+			if code != cli.ExitOK {
+				t.Fatalf("exit = %d, want 0 (stderr %s)", code, stderr)
+			}
+		})
+	}
+}

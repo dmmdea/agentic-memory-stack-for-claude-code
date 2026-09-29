@@ -47,6 +47,12 @@ type Mem0Post struct {
 	APIKey   string
 }
 
+// Mem0Put is one recorded update (PUT /v1/memories/{id}).
+type Mem0Put struct {
+	ID   string
+	Text string
+}
+
 // FakeMem0 is an in-process mem0 authority.
 //
 // It speaks the wire protocol rather than substituting the client, so the tests exercise
@@ -60,8 +66,13 @@ type FakeMem0 struct {
 	// index write, say - without a seam into the code under test.
 	OnAdd func(post Mem0Post)
 
+	// PutStatus, when non-zero, makes every update answer with that HTTP status and change
+	// nothing - a corpus that refuses a write (a protected tier, an unavailable embedder).
+	PutStatus int
+
 	mu      sync.Mutex
 	mode    Mem0Mode
+	puts    []Mem0Put
 	n       int
 	posts   []Mem0Post
 	deleted []string
@@ -88,6 +99,28 @@ func (f *FakeMem0) Posts() []Mem0Post {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]Mem0Post(nil), f.posts...)
+}
+
+// Puts returns every recorded update.
+func (f *FakeMem0) Puts() []Mem0Put {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Mem0Put(nil), f.puts...)
+}
+
+// Seed stores a record under a chosen id, the way an earlier night's migration left it.
+func (f *FakeMem0) Seed(id, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byID[id] = text
+}
+
+// Text returns a stored record's current text.
+func (f *FakeMem0) Text(id string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.byID[id]
+	return t, ok
 }
 
 // Deleted returns every id deleted through the API.
@@ -169,6 +202,30 @@ func (f *FakeMem0) handleItem(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"deleted":true}`))
+	case http.MethodPut:
+		if f.PutStatus != 0 {
+			w.WriteHeader(f.PutStatus)
+			_, _ = w.Write([]byte(`{"detail":"refused"}`))
+			return
+		}
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var payload struct {
+			Text string `json:"text"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		f.byID[id] = payload.Text
+		f.puts = append(f.puts, Mem0Put{ID: id, Text: payload.Text})
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message":"updated"}`))
 	case http.MethodGet:
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)

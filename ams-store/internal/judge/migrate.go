@@ -52,6 +52,12 @@ type Mem0Client interface {
 	Get(ctx context.Context, id string) (Record, error)
 	// Delete removes a record this run created and could not verify.
 	Delete(ctx context.Context, id string) error
+	// Update replaces the text of an EXISTING record by id (PUT /v1/memories/{id}). It is
+	// how a re-created slug carrying `migrated: <id>` reaches the record it already has,
+	// instead of adding a near-duplicate variant every night. The server carries the
+	// record's payload (tier, source, brand) over on its own and takes the text only, so
+	// metadata is accepted for the interface's symmetry with Add and is not transmitted.
+	Update(ctx context.Context, id, text string, metadata map[string]string) error
 }
 
 // Landed reports whether a record read back by id is byte-equal to what was sent.
@@ -247,6 +253,24 @@ func (m *HTTPMem0) Get(ctx context.Context, id string) (Record, error) {
 		}
 	}
 	return rec, nil
+}
+
+// Update replaces an existing record's text by id. A refusal (HTTP 4xx/5xx) is an error:
+// the caller keeps the line and does not fall back to Add, because a refused update
+// followed by an add is exactly the second record this method exists to prevent.
+func (m *HTTPMem0) Update(ctx context.Context, id, text string, _ map[string]string) error {
+	body, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
+	raw, code, err := m.do(ctx, http.MethodPut, m.endpoint(id), body, mem0AddTimeout)
+	if err != nil {
+		return fmt.Errorf("mem0 update %s: %w", id, err)
+	}
+	if code < 200 || code > 299 {
+		return fmt.Errorf("mem0 update %s: HTTP %d: %s", id, code, snippet(raw))
+	}
+	return nil
 }
 
 // Delete removes a record. It is only ever called on an id THIS run created and could

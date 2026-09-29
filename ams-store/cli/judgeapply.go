@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/brand"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/judge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
@@ -20,6 +21,7 @@ import (
 // this verb consumes the plan file that call produces.
 const judgeApplyUsage = `usage: ams-store judge-apply --plan <file> --store <dir> [--dry-run]
                             [--max-migrations 5] [--force] [--hub] [--candidates]
+                            [--brand-map <path>]
 
 Apply a judge plan to one store under every apply-guard: strict decrease, anchor
 retention, the seal, the line round-trip, migration write-then-verify, the blast cap
@@ -33,6 +35,9 @@ and protected-set overflow. Hub-only.
   --force                bypass the 20 h one-attempt-per-store window, and only that
   --hub                  assert the hub role before <state-root>/role is seeded
   --candidates           print the offer set for this store and apply nothing
+  --brand-map <path>     the operator's brand map (brands.json); a migrated fact is tagged
+                         with the brand it resolves to. A missing or unreadable map is
+                         brand-neutral, never an error
   --mem0-url <url>       the corpus authority (env AMS_MEM0_URL, MEM0_URL)
   --mem0-user <id>       the corpus user id (env MEM0_USER_ID)
   --json                 machine output on stdout
@@ -60,6 +65,7 @@ type judgeApplyFlags struct {
 	hub           bool
 	candidates    bool
 	maxMigrations int
+	brandMap      string
 	mem0URL       string
 	mem0User      string
 	stateRoot     string
@@ -82,6 +88,7 @@ func runJudgeApply(env Env, args []string) int {
 	fs.BoolVar(&f.hub, "hub", false, "assert the hub role")
 	fs.BoolVar(&f.candidates, "candidates", false, "print the offer set and apply nothing")
 	fs.IntVar(&f.maxMigrations, "max-migrations", judge.DefaultMaxMigrations, "cap the judge's migrations")
+	fs.StringVar(&f.brandMap, "brand-map", "", "the brand map (brands.json)")
 	fs.StringVar(&f.mem0URL, "mem0-url", "", "the corpus authority")
 	fs.StringVar(&f.mem0User, "mem0-user", "", "the corpus user id")
 	fs.StringVar(&f.stateRoot, "state-root", "", "override the maintainer state root")
@@ -179,9 +186,17 @@ func runJudgeApply(env Env, args []string) int {
 	}
 	defer func() { _ = l.Release() }()
 
+	// A brand map that cannot be read routes nothing: the run stays brand-neutral, which is
+	// what it was before the map existed. It is reported, never fatal.
+	brands, brandErr := brand.Load(f.brandMap)
+	if brandErr != nil {
+		fmt.Fprintf(env.Stderr, "ams-store judge-apply: brand map: %v; continuing brand-neutral\n", brandErr)
+	}
+
 	st := storeAt(storeDir)
 	st.Workspace = workspace
 	opt := judge.Options{
+		Brand:         brands,
 		Roots:         roots,
 		Dir:           storeDir,
 		Workspace:     workspace,
@@ -217,6 +232,9 @@ func runJudgeApply(env Env, args []string) int {
 			"shortened":    res.Shortened,
 			"migrated":     res.Migrated,
 			"line_floored": res.LineFloored,
+			"offered":      res.Offered,
+			"updated":      res.Updated,
+			"add_failed":   res.AddFailed,
 			"before_bytes": res.BeforeBytes,
 			"after_bytes":  res.AfterBytes,
 			"before_lines": res.BeforeLines,
@@ -236,8 +254,8 @@ func runJudgeApply(env Env, args []string) int {
 		return ExitOK
 	}
 
-	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (shortened=%d migrated=%d line_floored=%d, %d -> %d B)\n",
-		res.Workspace, res.Status, res.Shortened, res.Migrated, res.LineFloored, res.BeforeBytes, res.AfterBytes)
+	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (shortened=%d migrated=%d line_floored=%d updated=%d add_failed=%d, %d -> %d B)\n",
+		res.Workspace, res.Status, res.Shortened, res.Migrated, res.LineFloored, res.Updated, res.AddFailed, res.BeforeBytes, res.AfterBytes)
 	if res.Note != "" {
 		fmt.Fprintf(env.Stderr, "  %s\n", res.Note)
 	}

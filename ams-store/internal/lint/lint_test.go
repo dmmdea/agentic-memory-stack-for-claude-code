@@ -1015,8 +1015,8 @@ func gitRun(t *testing.T, gitDir, workTree string, args ...string) {
 func TestLint_DecoratedPointersParseAndUnparsedOnesAreFindings(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	sb.AddStore("ws", []string{
-		"- 🛑 [Stop](stop.md) " + testutil.EmDash + " marked",
-		"- Shipped: [A](a.md) · [B](b.md)",
+		"- \U0001F6D1 [Stop](stop.md) " + testutil.EmDash + " marked",
+		"- Shipped: [A](a.md) \u00b7 [B](b.md)",
 		"- two marker words [C](c.md)",
 		"- [Plain](plain.md)",
 	}, map[string]string{

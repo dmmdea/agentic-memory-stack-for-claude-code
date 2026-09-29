@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/atomic"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/brand"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/frontmatter"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
@@ -74,6 +75,9 @@ type Options struct {
 	// Mem0 is the corpus client. Nil makes migrations impossible - they are reported as
 	// unmigrated, never silently counted.
 	Mem0 Mem0Client
+	// Brand routes a migrated fact to a brand (contract C3). Nil, or a map that routes
+	// nothing, leaves the metadata exactly as it was before the map existed.
+	Brand *brand.Map
 	// History is the local out-of-tree repo the deletion commit and its Migrated:
 	// trailers go into. An invalid repo skips the commit and says so in the receipt.
 	History HistoryRepo
@@ -95,6 +99,14 @@ type Result struct {
 	Shortened   int
 	Migrated    int
 	LineFloored int
+	// Offered is how many migration candidates the store presented this run.
+	Offered int
+	// Updated is the subset of Migrated that reached an existing record by id (the fact
+	// carried `migrated: <id>`) instead of adding a new one.
+	Updated int
+	// AddFailed counts corpus writes (add or update) that failed, so a night whose every
+	// write failed can be told apart from a night with nothing to migrate.
+	AddFailed int
 	// Mem0 carries "<id> | <slug> | <the line as it stood in the index>" per migrated
 	// fact. The third field is never empty: it is the only record of what the index said
 	// before the pointer was removed.
@@ -119,6 +131,9 @@ type pendingDelete struct {
 	ID           string
 	Raw          string
 	Deduplicated bool
+	// Updated marks an id that belonged to a record this run did NOT create: an undo
+	// leaves it in place, and says so.
+	Updated bool
 }
 
 type pendingHook struct {
@@ -187,6 +202,7 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 		return res, err
 	}
 	res.Candidates = st.Candidates(seal)
+	res.Offered = len(res.Candidates.Migrate)
 
 	preText := st.Text
 	preFiles := st.FileNames()
@@ -387,6 +403,7 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 				continue
 			}
 			if opt.Mem0 == nil {
+				res.AddFailed++
 				res.Mem0Orphan = append(res.Mem0Orphan, "(no id) | "+d.Slug+" | no corpus client configured; line kept")
 				continue
 			}
@@ -397,8 +414,54 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 				}
 				meta[k] = v
 			}
+			if b := opt.Brand.Resolve(opt.Workspace, m.FM.Body); b != "" {
+				meta["brand"] = b
+			}
+
+			// A slug derive stamped `migrated: <id>` is a fact the corpus already holds:
+			// update that record instead of adding a second variant of it.
+			if id := strings.TrimSpace(m.FM.Migrated); id != "" {
+				cur, getErr := opt.Mem0.Get(ctx, id)
+				if getErr != nil {
+					// Cannot tell whether the record exists: an add now could fork it.
+					res.AddFailed++
+					res.Mem0Orphan = append(res.Mem0Orphan, id+" | "+d.Slug+" | line kept: cannot read the stamped record: "+getErr.Error())
+					opt.logf("%s: migration %s: stamped record %s unreadable; line kept (%s)", opt.Workspace, d.Slug, id, getErr)
+					continue
+				}
+				if cur.Found {
+					if upErr := opt.Mem0.Update(ctx, id, text, meta); upErr != nil {
+						res.AddFailed++
+						res.Mem0Orphan = append(res.Mem0Orphan, id+" | "+d.Slug+" | line kept: "+upErr.Error())
+						opt.logf("%s: migration %s: update of %s failed; line kept (%s)", opt.Workspace, d.Slug, id, upErr)
+						continue
+					}
+					back, backErr := opt.Mem0.Get(ctx, id)
+					if backErr != nil || !Landed(back, text) {
+						res.AddFailed++
+						res.Mem0Orphan = append(res.Mem0Orphan, id+" | "+d.Slug+" | updated record failed its read-back; line kept, record left as updated")
+						opt.logf("%s: migration %s: update of %s did not verify; line kept", opt.Workspace, d.Slug, id)
+						continue
+					}
+					keep = removeRecord(keep, rec)
+					pendingDeletes = append(pendingDeletes, pendingDelete{
+						Slug: d.Slug, ID: id, Raw: recordLine(rec), Updated: true,
+					})
+					migrationsDone++
+					removals++
+					res.Migrated++
+					res.Updated++
+					if isFloor {
+						res.LineFloored++
+					}
+					continue
+				}
+				// The stamped record is gone: fall through to a plain add.
+			}
+
 			w, err := opt.Mem0.Add(ctx, text, SourceTag(opt.Workspace, d.Slug), meta)
 			if err != nil || w.ID == "" {
+				res.AddFailed++
 				// A record MAY still have landed, so nothing is undone: the retry is
 				// hash-idempotent and will deduplicate.
 				msg := "write returned no id"
@@ -445,6 +508,10 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 
 	undo := func(why string) {
 		for _, pd := range pendingDeletes {
+			if pd.Updated {
+				res.Mem0Orphan = append(res.Mem0Orphan, pd.ID+" | "+pd.Slug+" | existing record left as updated after "+why)
+				continue
+			}
 			if pd.Deduplicated {
 				res.Mem0Orphan = append(res.Mem0Orphan, pd.ID+" | "+pd.Slug+" | pre-existing (dedup) record left in place after "+why)
 				continue
@@ -459,6 +526,7 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 			opt.logf("%s: undid migration write %s for %s after %s", opt.Workspace, pd.ID, pd.Slug, why)
 		}
 		res.Migrated = 0
+		res.Updated = 0
 		res.LineFloored = 0
 	}
 
