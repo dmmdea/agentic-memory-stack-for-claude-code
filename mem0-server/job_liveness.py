@@ -11,7 +11,8 @@ mouths have gone quiet — detection latency of one session/night is by design
 Shape (fixed cross-track contract — do not rename keys; W4 ADDS keys, and
 additions are safe because every consumer reads by name):
     {role, last_dream_age_h, prune_age_h, gather_age_h, backup_manifest_age_h,
-     dedup_report_age_h, morning_summary_age_h, morning_summary_sections_48h,
+     dedup_report_age_h, dedup_summary_age_h, dedup_last_outcome, dedup_last_scanned,
+     dedup_last_compared_pairs, dedup_last_skipped_no_vector, morning_summary_age_h, morning_summary_sections_48h,
      l1a_attempt_age_h, l1a_success_age_h, sessionstart_banner_age_h,
      mcp_shim_receipt_age_h, mcp_shim_host_match, mcp_shim_stack_version,
      brand_scope_age_h, brand_scope_misscoped,
@@ -41,7 +42,9 @@ Sources:
   fields the Windows profile did not fill; MEM0_HOST_KIND=native skips the profile lookup,
 - WSL-native: ~/.mem0/backups/manifest-*.json (newest mtime),
   ~/.mem0/dedup-report.jsonl (mtime — the dedup job unlinks+rewrites the report
-  every run, so mtime is a real liveness signal even on zero-delete days),
+  every run, so mtime proves it RAN, never that it compared anything),
+  ~/.mem0/dedup-summary.jsonl (the job's own last row: outcome + scanned/compared_pairs —
+  what the dedup-job capability judges),
   ~/.mem0/last-sessionstart-banner (epoch CONTENT — one unconditional line at
   the top of claude-config/storage-cap-check.sh, before its cold-server gate),
   ~/.mem0/mcp-shim-receipt.json (the shim's own start receipt),
@@ -216,6 +219,22 @@ def tail_text(path, max_bytes=_TAIL_BYTES):
     return text
 
 
+def last_json_line(path):
+    """The last parseable JSON-object line of a JSONL file (tail-read, never the whole file), or
+    None. Raises OSError to the caller. A torn final line (a writer mid-append) is skipped."""
+    for line in reversed(tail_text(path).splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
 def _mtime_age(path, now_s):
     return age_hours(Path(path).stat().st_mtime, now_s)
 
@@ -271,6 +290,14 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
         "gather_age_h": None,
         "backup_manifest_age_h": None,
         "dedup_report_age_h": None,
+        # WP-4: the dedup job's OWN work summary (last row of ~/.mem0/dedup-summary.jsonl).
+        # The report above is unlinked and rewritten every run, so its mtime proves "ran",
+        # never "compared anything" - the dedup was blind for weeks behind a fresh mtime.
+        "dedup_summary_age_h": None,
+        "dedup_last_outcome": None,
+        "dedup_last_scanned": None,
+        "dedup_last_compared_pairs": None,
+        "dedup_last_skipped_no_vector": None,
         "morning_summary_age_h": None,
         "morning_summary_sections_48h": None,
         # --- W4 session-scoped receipts ---
@@ -340,6 +367,20 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
             notes.append("dedup_report: missing")
     except OSError as e:
         notes.append(f"dedup_report: {e.__class__.__name__}")
+
+    try:
+        summ = mem0_dir / "dedup-summary.jsonl"
+        last = last_json_line(summ) if summ.exists() else None
+        if last is None:
+            notes.append("dedup_summary: missing/unparseable")
+        else:
+            out["dedup_summary_age_h"] = age_hours(parse_ts_epoch(last.get("ts")), now_s)
+            out["dedup_last_outcome"] = last.get("outcome")
+            out["dedup_last_scanned"] = last.get("scanned")
+            out["dedup_last_compared_pairs"] = last.get("compared_pairs")
+            out["dedup_last_skipped_no_vector"] = last.get("skipped_no_vector")
+    except OSError as e:
+        notes.append(f"dedup_summary: {e.__class__.__name__}")
 
     # W4: SessionStart banner stamp — one unconditional `date +%s >` line at the
     # TOP of storage-cap-check.sh, ahead of its cold-server gate, so the stamp

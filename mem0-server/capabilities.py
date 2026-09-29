@@ -142,7 +142,9 @@ CAPABILITIES = [
      "required": "brain", "escalation_documented": True},
     {"id": "dedup-job",
      "what": "daily semantic dedup sweep",
-     "probe": "job_liveness.dedup_report_age_h (report rewritten every run)",
+     "probe": ("job_liveness.dedup_summary_age_h + dedup_last_* (the job's own summary: "
+               "degraded on compared_pairs==0 with scanned>1000, a degraded/no-op outcome, "
+               "or no summary within 36h)"),
      "required": "brain", "escalation_documented": True},
     {"id": "memory-index",
      "what": "dream gather step (memory index refresh)",
@@ -281,6 +283,37 @@ def _age_state(age_h):
     if age_h <= DEAD_H:
         return "degraded"
     return "dead"
+
+
+# WP-4: the dedup job read 'alive' for weeks while comparing nothing, because its probe was the
+# mtime of a report it rewrites on every run. The verdict now reads what the job says it did.
+DEDUP_SUMMARY_FRESH_H = 36.0     # daily job: a summary older than this means a night was missed
+DEDUP_BLIND_MIN_SCANNED = 1000   # scanned above this with zero compared pairs is the blind-job bug
+
+
+def _dedup_job_state(jl):
+    """alive | degraded | dead | unknown for the daily semantic dedup.
+
+    degraded: no summary at all, a summary older than 36h, the job's own outcome is degraded or a
+    no-op (it could not run), or it scanned more than 1000 points and compared no pair.
+    dead: the summary is older than the nightly DEAD_H window. A job_liveness dict from before the
+    summary fields existed (no dedup_summary_* key) keeps the old report-age ladder."""
+    if "dedup_summary_age_h" not in jl:
+        return _age_state(jl.get("dedup_report_age_h"))
+    age = jl.get("dedup_summary_age_h")
+    if age is None:
+        return "degraded"
+    if age > DEAD_H:
+        return "dead"
+    if age > DEDUP_SUMMARY_FRESH_H:
+        return "degraded"
+    outcome = str(jl.get("dedup_last_outcome") or "")
+    if outcome.startswith("degraded") or outcome.startswith("no-op"):
+        return "degraded"
+    scanned, compared = jl.get("dedup_last_scanned"), jl.get("dedup_last_compared_pairs")
+    if isinstance(scanned, (int, float)) and scanned > DEDUP_BLIND_MIN_SCANNED and compared == 0:
+        return "degraded"
+    return "alive"
 
 
 def _ok_state(check):
@@ -589,7 +622,7 @@ def _state_for(row, checks, stack_version=None, now_s=None):
     if cid == "backup-pipeline":
         return _age_state(jl.get("backup_manifest_age_h"))
     if cid == "dedup-job":
-        return _age_state(jl.get("dedup_report_age_h"))
+        return _dedup_job_state(jl)
     if cid == "memory-index":
         return _age_state(jl.get("gather_age_h"))
     if cid == "sweep-job":

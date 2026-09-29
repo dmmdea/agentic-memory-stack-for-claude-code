@@ -58,6 +58,10 @@ GREEN_CHECKS = {
         "role": "brain",
         "last_dream_age_h": 10.0, "prune_age_h": 10.0, "gather_age_h": 10.0,
         "backup_manifest_age_h": 12.0, "dedup_report_age_h": 12.0,
+        # WP-4: the dedup-job verdict reads the job's own summary (work counts), not the mtime
+        "dedup_summary_age_h": 12.0, "dedup_last_outcome": "ok",
+        "dedup_last_scanned": 16000, "dedup_last_compared_pairs": 90_000_000,
+        "dedup_last_skipped_no_vector": 0,
         "morning_summary_age_h": 10.0, "morning_summary_sections_48h": 2,
         "l1a_attempt_age_h": 0.5, "l1a_success_age_h": 2.0,
         "sessionstart_banner_age_h": 1.0,
@@ -220,12 +224,48 @@ def test_drift_snapshot_failures_dead():
 
 
 def test_nightly_receipt_ladder():
-    # alive <= 48h, degraded <= 96h, dead beyond, unknown on no signal.
+    # The dream-cycle row keeps the plain age ladder: alive <= 48h, degraded <= 96h, dead beyond,
+    # unknown on no signal.
     for age, want in ((10.0, "alive"), (60.0, "degraded"),
                       (200.0, "dead"), (None, "unknown")):
-        jl = dict(GREEN_CHECKS["job_liveness"], dedup_report_age_h=age)
+        jl = dict(GREEN_CHECKS["job_liveness"], last_dream_age_h=age)
         out = _ev(_checks(job_liveness=jl))
-        assert out["states"]["dedup-job"] == want, (age, want)
+        assert out["states"]["dream-cycle"] == want, (age, want)
+
+
+def test_dedup_job_reads_work_not_mtime():
+    """The finding: the dedup capability read the mtime of a report the job unlinks and rewrites on
+    every run, so it said 'alive' while the job compared nothing for ~54 nights. It now reads the
+    job's own summary: what it scanned and compared, and how old that summary is."""
+    def state(**kw):
+        jl = dict(GREEN_CHECKS["job_liveness"], **kw)
+        return _ev(_checks(job_liveness=jl))["states"]["dedup-job"]
+
+    assert state() == "alive"
+    # scanned a real corpus, compared zero pairs: the exact bug, however fresh the file is
+    assert state(dedup_last_scanned=16000, dedup_last_compared_pairs=0, dedup_report_age_h=0.1) == "degraded"
+    # a tiny corpus that legitimately has nothing to compare is not the bug
+    assert state(dedup_last_scanned=800, dedup_last_compared_pairs=0) == "alive"
+    # exactly at the 1000 line still counts as small (the rule is scanned > 1000)
+    assert state(dedup_last_scanned=1000, dedup_last_compared_pairs=0) == "alive"
+    # the job's own degraded / no-op outcome is surfaced
+    assert state(dedup_last_outcome="degraded:skipped-no-vector") == "degraded"
+    assert state(dedup_last_outcome="no-op:backend-unreachable:ConnectError") == "degraded"
+    # a missing summary is degraded (the old probe said 'unknown' or, off a stale report, 'alive')
+    assert state(dedup_summary_age_h=None, dedup_last_outcome=None, dedup_last_scanned=None,
+                 dedup_last_compared_pairs=None) == "degraded"
+    # older than 36 h: a night was missed; beyond four nights it is dead, not late
+    assert state(dedup_summary_age_h=30.0) == "alive"
+    assert state(dedup_summary_age_h=40.0) == "degraded"
+    assert state(dedup_summary_age_h=200.0) == "dead"
+
+
+def test_dedup_job_falls_back_to_report_age_on_an_old_liveness_shape():
+    """A job_liveness dict from before the summary fields existed has no dedup_summary_* keys at
+    all: keep the age ladder rather than convicting on absent keys."""
+    jl = {k: v for k, v in GREEN_CHECKS["job_liveness"].items() if not k.startswith("dedup_summary")
+          and not k.startswith("dedup_last")}
+    assert _ev(_checks(job_liveness=jl))["states"]["dedup-job"] == "alive"
 
 
 def test_codex_auth_derived_never_dead():

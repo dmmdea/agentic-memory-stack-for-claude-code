@@ -54,7 +54,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `dream-cycle` | nightly dream consolidation runs | job_liveness.last_dream_age_h (throttle marker content) | brain | F17 |
 | `drift-guard` | retrieval-drift guard compares around each consolidation | retrieval_drift (~/.mem0/retrieval-drift-state.json) | brain | F17 |
 | `backup-pipeline` | daily stack snapshot + manifest writer | job_liveness.backup_manifest_age_h (newest manifest age) | brain | F17 |
-| `dedup-job` | daily semantic dedup sweep | job_liveness.dedup_report_age_h (report rewritten every run) | brain | F17 |
+| `dedup-job` | daily semantic dedup sweep | job_liveness.dedup_summary_age_h + dedup_last_* (the job's own summary: degraded on compared_pairs==0 with scanned>1000, a degraded/no-op outcome, or no summary within 36h) | brain | F17 |
 | `memory-index` | dream gather step (memory index refresh) | job_liveness.gather_age_h (gather.json receipt age) | brain | F17 |
 | `sweep-job` | dream prune step (consolidation-completed receipt) | job_liveness.prune_age_h (prune.json receipt age) | brain | F17 |
 | `codex-auth` | Codex CLI auth serving dream judgment | derived: a fresh dream ran, therefore its judge authenticated | brain | F17 |
@@ -70,7 +70,12 @@ The **escalation** column marks the F17 rows: their source check is *information
 
 Verdict rules per probe family (all thresholds live in `capabilities.py`):
 
-- **Nightly receipts** (`dream-cycle`, `backup-pipeline`, `dedup-job`, `memory-index`,
+- **`dedup-job`** reads the job's own work summary (`~/.mem0/dedup-summary.jsonl`, last row), not
+  the mtime of a report it rewrites on every run (that proved "ran", and the job compared nothing
+  for weeks behind it). `degraded` when: no summary exists, the summary is older than 36 h, the
+  job's own outcome is `degraded:*` or `no-op:*`, or it scanned more than 1000 points and
+  compared zero pairs; `dead` past 96 h.
+- **Nightly receipts** (`dream-cycle`, `backup-pipeline`, `memory-index`,
   `sweep-job`): age ≤ 48h → `alive` (one missed night tolerated); ≤ 96h → `degraded`; older →
   `dead`; no signal → `unknown`.
 - **`bm25-sparse-leg`**: `sparse_leg.ok: false` → `dead`; alive but coverage < 0.95 → `degraded`
