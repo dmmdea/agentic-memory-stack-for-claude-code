@@ -150,3 +150,56 @@ def test_native_parses_the_inline_token_line_of_codex_0154():
     assert out["ok"] and out["tokens_used"] == 4037
     out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="codex\nok\ntokens used\n12\n"))
     assert out["tokens_used"] == 12, "the 0.153 two-line form still parses"
+
+
+# --- usage telemetry: the codex CLI prints its session header and usage footer on STDERR --------
+# (the final message is what goes to stdout). Reading stdout only left tokens_used 0 and the resolved
+# model empty on every row of the usage ledger. Fixtures below are the two shapes of `codex exec` output.
+_STDERR_SHAPE = (
+    "OpenAI Codex v0.154.0 (research preview)\n"
+    "--------\n"
+    "workdir: /tmp/codex-judge-x\n"
+    "model: gpt-6-astra\n"
+    "provider: openai\n"
+    "approval: never\n"
+    "sandbox: read-only\n"
+    "reasoning effort: high\n"
+    "reasoning summaries: auto\n"
+    "session id: 0199-abc\n"
+    "--------\n"
+    "tokens used\n"
+    "12,345\n")
+_STDOUT_SHAPE = ("codex\n"
+                 '{"plan":[]}\n'
+                 "tokens used 4,037\n")
+
+
+def test_native_reads_tokens_model_and_effort_from_stderr():
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out='{"plan":[]}\n', err=_STDERR_SHAPE))
+    assert out["ok"] is True
+    assert out["tokens_used"] == 12345
+    assert out["model_resolved"] == "gpt-6-astra" and out["effort_resolved"] == "high"
+
+
+def test_native_reads_tokens_from_stdout_too():
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out=_STDOUT_SHAPE, err=""))
+    assert out["tokens_used"] == 4037
+    assert out["model_resolved"] is None and out["effort_resolved"] is None, "no header on this shape: unknown, not ''"
+
+
+def test_native_header_on_stdout_and_footer_on_stderr_combine():
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="model: gpt-5.6-terra\nreasoning effort: medium\nanswer\n", err="tokens used\n7\n"))
+    assert out["tokens_used"] == 7 and out["model_resolved"] == "gpt-5.6-terra" and out["effort_resolved"] == "medium"
+
+
+def test_native_takes_the_last_token_tally_when_several_are_printed():
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="ok\n", err="tokens used\n10\nmore work\ntokens used\n99\n"))
+    assert out["tokens_used"] == 99
+
+
+def test_native_a_missed_footer_is_null_never_zero():
+    """0 reads as 'this call was free'; None reads as 'not measured'. The ledger sums both the same way,
+    but an audit (and the morning summary) can tell them apart."""
+    out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="just the answer\n", err="some warning\n"))
+    assert out["ok"] is True
+    assert out["tokens_used"] is None and out["model_resolved"] is None and out["effort_resolved"] is None

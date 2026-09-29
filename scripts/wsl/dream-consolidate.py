@@ -675,7 +675,9 @@ class Dream:
         ms = int(out.get("duration_ms") or (time.monotonic() - t0) * 1000)
         if out.get("ok"):
             ams_env.write_usage(component, tokens_used=out.get("tokens_used", 0), duration_ms=ms, status="ok",
-                                model_requested=model, effort_requested=effort, outcome="ok", **(extra or {}))
+                                model_requested=model, effort_requested=effort, outcome="ok",
+                                model_resolved=out.get("model_resolved"), effort_resolved=out.get("effort_resolved"),
+                                **(extra or {}))
         else:
             et = out.get("error_type", "")
             outcome = "timeout" if et == "client_timeout" else "exit_nonzero"

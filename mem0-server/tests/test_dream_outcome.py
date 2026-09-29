@@ -286,3 +286,27 @@ def test_embedder_probe_is_the_health_embedder_route(home):
     client = mod.Mem0Client("http://authority.invalid", "k", "u", http=httpx.Client(transport=httpx.MockTransport(
         lambda r: httpx.Response(503, json={"reason": "cold-embedder"}))))
     assert client.health_embedder() is False, "a cold embedder answers 503: not ready, not an error"
+
+
+# ---- 1.8: the usage ledger says "not measured", never "0 tokens" ---------------------------------
+def _ledger(home):
+    p = home / ".mem0" / "maintenance" / "codex-usage.jsonl"
+    return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_ledger_row_keeps_measured_usage_and_null_for_a_miss(home, m):
+    def judge(prompt, effort="low", timeout_s=60, model="", **kw):
+        if "signals" in prompt and judge.n == 0:
+            judge.n += 1
+            return {"ok": True, "response": SIG, "tokens_used": 4037, "duration_ms": 3,
+                    "model_resolved": "gpt-6-astra", "effort_resolved": "high"}
+        judge.n += 1
+        # a CLI whose footer could not be read: tokens_used is None, not 0
+        return {"ok": True, "response": NONE if judge.n == 2 else PROMO, "tokens_used": None, "duration_ms": 3}
+    judge.n = 0
+    _run(m, [], mem0=Mem0(EV), judge=judge)
+    rows = {r["component"]: r for r in _ledger(home)}
+    assert rows["dream-gather"]["tokens_used"] == 4037
+    assert rows["dream-gather"]["model_resolved"] == "gpt-6-astra" and rows["dream-gather"]["effort_resolved"] == "high"
+    assert rows["dream-consolidate"]["tokens_used"] is None, "unmeasured is null in the ledger"
+    assert rows["dream-consolidate"]["model_resolved"] is None
