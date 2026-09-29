@@ -34,7 +34,19 @@ type Repo struct {
 	// so a Repo built without it would re-commit every change a live session is being
 	// protected from.
 	StateRoot string
+	// Version is the ams-store build that makes commits through this Repo. It becomes the
+	// Ams-Store-Version trailer of every commit, so the hub's history says which client
+	// version each fleet member runs. Empty writes no trailer.
+	Version string
 }
+
+// ClientVersion is this process's ams-store version, set once by the binary's entry point.
+// NewRepo starts every Repo with it, so the sync, derive and gate commits all carry the
+// trailer without every caller having to thread the version through.
+var ClientVersion string
+
+// TrailerVersion is the commit trailer that names the client version.
+const TrailerVersion = "Ams-Store-Version"
 
 // NewRepo builds a Repo from the resolved roots.
 func NewRepo(roots store.Roots) Repo {
@@ -42,6 +54,7 @@ func NewRepo(roots store.Roots) Repo {
 		GitDir:    roots.HistoryGitDir(),
 		WorkTree:  roots.ProjectsRoot,
 		StateRoot: roots.StateRoot,
+		Version:   ClientVersion,
 	}
 }
 
@@ -228,6 +241,9 @@ func (r Repo) Commit(ctx context.Context, message, machineID, kind string) (stri
 		return "", nil
 	}
 	full := message + "\n\nAms-Machine: " + machineID + "\nAms-Kind: " + kind + "\n"
+	if v := strings.TrimSpace(r.Version); v != "" {
+		full += TrailerVersion + ": " + oneLine(v) + "\n"
+	}
 	if _, err := gitx.Run(ctx, r.opts(), "commit", "-q", "-m", full); err != nil {
 		return "", fmt.Errorf("sync: commit: %w", err)
 	}

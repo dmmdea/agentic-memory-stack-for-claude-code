@@ -938,3 +938,32 @@ func TestMerge_FirstJoinCannotResurrectWhatTheHubDeleted(t *testing.T) {
 		t.Errorf("the hub received the resurrected fact:\n%s", hubTree)
 	}
 }
+
+// The merge engine's own commits (the local commit and the merge commit) carry the client
+// version trailer too, so a hub log shows the version behind every kind of commit.
+func TestMerge_CommitsCarryTheClientVersionTrailer(t *testing.T) {
+	f := newFleet(t, "a", "b")
+	a, b := f.pcs["a"], f.pcs["b"]
+	a.eng.Version = "3.2.1-test"
+	b.eng.Version = "3.2.1-test"
+
+	a.write(ws, "a.md", fact("A", "on A", "hook", "a body\n"))
+	a.commit("A writes")
+	if r := a.push(); !r.OK {
+		t.Fatalf("seed: %s", r.Stderr)
+	}
+	if msg := a.git("log", "-1", "--format=%B"); !strings.Contains(msg, "\nAms-Store-Version: 3.2.1-test\n") {
+		t.Errorf("the local commit carries no version trailer:\n%s", msg)
+	}
+
+	b.write(ws, "b.md", fact("B", "on B", "hook", "b body\n"))
+	b.commit("B writes")
+	rep := b.mergeOnly(b.mo())
+	if rep.Commit == "" {
+		t.Fatalf("no merge commit: %+v", rep)
+	}
+	if msg := b.git("log", "-1", "--format=%B", rep.Commit); !strings.Contains(msg, "\nAms-Store-Version: 3.2.1-test\n") ||
+		!strings.Contains(msg, "Ams-Kind: merge") {
+		t.Errorf("the merge commit carries no version trailer:\n%s", msg)
+	}
+}

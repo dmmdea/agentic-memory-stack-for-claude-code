@@ -257,6 +257,7 @@ func (m mergerAdapter) Merge(ctx context.Context, opts amsync.MergeOptions) (ams
 		GitDir:    opts.GitDir,
 		WorkTree:  opts.WorkTree,
 		MachineID: opts.MachineID,
+		Version:   amsync.ClientVersion,
 		Now:       func() time.Time { return now },
 	}
 	deriver := deriverAdapter{roots: m.roots, machineID: m.machineID, log: m.log}
@@ -309,6 +310,7 @@ func (d drainerAdapter) ApplyDeferred(ctx context.Context, opts amsync.DrainOpti
 		GitDir:    d.roots.HistoryGitDir(),
 		WorkTree:  d.roots.ProjectsRoot,
 		MachineID: d.machineID,
+		Version:   amsync.ClientVersion,
 		Now:       func() time.Time { return now },
 	}
 	deriver := deriverAdapter{roots: d.roots, machineID: d.machineID, log: d.log}

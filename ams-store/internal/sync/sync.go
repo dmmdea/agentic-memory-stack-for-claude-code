@@ -53,6 +53,9 @@ type Options struct {
 	// Version is stamped into the receipt so a fleet-wide behaviour change is
 	// attributable to a binary.
 	Version string
+	// Kind is what the receipt calls this pass: "once" (a hook-driven `sync --once`, the
+	// default) or "watch" (a pass the watcher ran), so a watcher push is attributable.
+	Kind string
 	// Log receives the human progress log. Nil discards it.
 	Log io.Writer
 }
@@ -100,10 +103,14 @@ func Once(ctx context.Context, opt Options) Result {
 	}
 	host, _ := os.Hostname()
 
+	kind := opt.Kind
+	if kind == "" {
+		kind = "once"
+	}
 	res := Result{Receipt: Receipt{
 		TS:      now.UTC(),
 		Host:    host,
-		Kind:    "once",
+		Kind:    kind,
 		Version: opt.Version,
 		Status:  StatusUpToDate,
 	}}
@@ -121,6 +128,9 @@ func Once(ctx context.Context, opt Options) Result {
 	res.Receipt.Machine = machineID
 
 	repo := NewRepo(opt.Roots)
+	if opt.Version != "" {
+		repo.Version = opt.Version
+	}
 	if err := repo.Initialize(ctx); err != nil {
 		res.Err = err
 		res.ExitCode = exitRefused
