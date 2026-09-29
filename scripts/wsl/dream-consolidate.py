@@ -662,6 +662,7 @@ class Dream:
         self.consolidated = 0
         self.spooled = 0
         self.replayed = 0
+        self.replay_failed = 0
         self.drift_snapshot_failed = False
         self.canonical_fetch_failed = False
 
@@ -830,6 +831,7 @@ class Dream:
                 ok = False
             if not ok:
                 keep.append(e)
+                self.replay_failed += 1
                 continue
             landed.add(e.get("hash") or _insight_hash(e["text"]))
             self.replayed += 1
@@ -846,14 +848,23 @@ class Dream:
     def outcome(self, out: dict) -> tuple[str, dict]:
         """`<status>[:<reason>]` and the counts for ams-step.sh's receipt. exit 0 says the dream finished;
         this says whether it did its job: an insight it could not post, a drift guard that could not
-        snapshot, a canonical set it could not fetch. Several reasons join with a comma."""
+        snapshot, a canonical set it could not fetch, a queued insight it could not replay, a backlog it
+        never got to. Several reasons join with a comma. `spool_depth` is the post-run line count, read
+        from the file, so a standing backlog is visible on every night, replayed or not."""
+        spool_depth = len(self._spool_read())
         work = {"signals": self.n_signals, "consolidated": self.consolidated, "posted": self.posted,
-                "spooled": self.spooled, "replayed": self.replayed}
+                "spooled": self.spooled, "replayed": self.replayed,
+                "replay_failed": self.replay_failed, "spool_depth": spool_depth}
         if out.get("failed") or out.get("unreachable"):
             return f"failed:{'mem0-unreachable' if out.get('unreachable') else out.get('phase')}", work
         reasons = []
         if self.posted < self.consolidated:
             reasons.append(f"posted-{self.posted}-of-{self.consolidated}")
+        if self.replay_failed:
+            reasons.append(f"replay-failed-{self.replay_failed}")
+        elif spool_depth > self.spooled:
+            # queued insights from earlier nights that this night never tried (no signals, phase 3 not reached)
+            reasons.append(f"spool-backlog-{spool_depth - self.spooled}")
         if self.drift_snapshot_failed:
             reasons.append("drift-snapshot-failed")
         if self.canonical_fetch_failed:

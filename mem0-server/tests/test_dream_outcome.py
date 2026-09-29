@@ -87,7 +87,8 @@ def test_failed_insight_post_is_spooled_and_reads_degraded(home, m):
     assert spooled[0]["metadata"]["tier"] == "insight" and spooled[0]["metadata"]["source"] == "dream-consolidator"
     head, work = _outcome(home)
     assert head == "degraded:posted-0-of-3"
-    assert work == {"signals": 1, "consolidated": 3, "posted": 0, "spooled": 3, "replayed": 0}
+    assert work == {"signals": 1, "consolidated": 3, "posted": 0, "spooled": 3, "replayed": 0,
+                    "replay_failed": 0, "spool_depth": 3}
     assert out["outcome"] == "degraded:posted-0-of-3" and out["work"] == work
 
 
@@ -110,7 +111,8 @@ def test_spooled_insight_is_replayed_first_on_the_next_run(home, m):
     assert posted[3] == "A brand new insight" and len(posted) == 4
     assert _spool(home) == [], "a replayed line leaves the spool"
     head, work = _outcome(home)
-    assert head == "ok" and work == {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 3}
+    assert head == "ok" and work == {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 3,
+                                                   "replay_failed": 0, "spool_depth": 0}
     assert out["posted"] == 1
 
 
@@ -129,13 +131,51 @@ def test_replayed_insight_is_not_posted_twice_when_the_dream_regenerates_it(home
     assert head == "ok" and work["replayed"] == 1 and work["posted"] == 1 and work["consolidated"] == 1
 
 
-def test_failed_replay_keeps_the_line(home, m):
+def test_failed_replay_keeps_the_line_and_reads_degraded(home, m):
+    """A dead embedder tonight with nothing new to say still means last night's insight is NOT stored:
+    that is unfinished work, so the receipt must not read ok (WP-1 fix round 1)."""
     _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS, PROMO))
     _run(m, ["--force"], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, NONE, PROMO))
     assert len(_spool(home)) == 1
     head, work = _outcome(home)
-    assert head == "ok", "nothing new was lost tonight; the backlog is still queued, not dropped"
+    assert head == "degraded:replay-failed-1", "the queued insight was not stored; that is not ok"
     assert work["replayed"] == 0 and work["spooled"] == 0
+    assert work["replay_failed"] == 1 and work["spool_depth"] == 1
+
+
+def test_partial_replay_counts_only_the_lines_that_failed(home, m):
+    _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS3, PROMO))
+    fm = Mem0(EV, fail_adds=2)   # the replay's first two POSTs 500, the third lands
+    _run(m, ["--force"], mem0=fm, judge=_judge(SIG, NONE, PROMO))
+    head, work = _outcome(home)
+    assert head == "degraded:replay-failed-2"
+    assert work["replayed"] == 1 and work["replay_failed"] == 2 and work["spool_depth"] == 2
+    assert len(_spool(home)) == 2
+
+
+def test_failed_replay_and_a_failed_new_post_name_both(home, m):
+    _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS, PROMO))
+    other = '{"insights":[{"text":"A brand new insight","source_memory_ids":["e1"]}]}'
+    _run(m, ["--force"], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, other, PROMO))
+    head, work = _outcome(home)
+    assert head == "degraded:posted-0-of-1,replay-failed-1"
+    assert work["spool_depth"] == 2 and work["spooled"] == 1 and work["replay_failed"] == 1
+
+
+def test_a_standing_backlog_on_a_night_that_never_replayed_reads_degraded(home, m):
+    """A no-signal night returns before phase 3: the spool is untouched, and it must not read as a clean night."""
+    _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS3, PROMO))
+    _run(m, ["--force"], mem0=Mem0(EV), judge=_judge('{"signals":[]}'))
+    head, work = _outcome(home)
+    assert head == "degraded:spool-backlog-3"
+    assert work["spool_depth"] == 3 and work["replay_failed"] == 0 and work["replayed"] == 0
+
+
+def test_a_drained_backlog_reads_ok_again(home, m):
+    _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS, PROMO))
+    _run(m, ["--force"], mem0=Mem0(EV), judge=_judge(SIG, NONE, PROMO))
+    assert _outcome(home) == ("ok", {"signals": 1, "consolidated": 0, "posted": 0, "spooled": 0, "replayed": 1,
+                                     "replay_failed": 0, "spool_depth": 0})
 
 
 def test_dry_run_never_touches_the_spool(home, m):
@@ -226,18 +266,20 @@ def test_the_whole_09_24_night_names_every_loss(home, m, monkeypatch):
     _run(m, [], mem0=fm, judge=_judge(SIG, INS3, PROMO), eval_runner=ev)
     head, work = _outcome(home)
     assert head == "degraded:posted-0-of-3,drift-snapshot-failed,canonical-fetch-failed"
-    assert work["spooled"] == 3
+    assert work["spooled"] == 3 and work["spool_depth"] == 3
 
 
 # ---- outcomes that are not degraded ----------------------------------------------------------
 def test_a_clean_night_writes_ok_with_counts(home, m):
     _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, PROMO))
-    assert _outcome(home) == ("ok", {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 0})
+    assert _outcome(home) == ("ok", {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 0,
+                                     "replay_failed": 0, "spool_depth": 0})
 
 
 def test_a_no_signal_night_is_ok_and_carries_its_counts(home, m):
     _run(m, [], mem0=Mem0(EV), judge=_judge('{"signals":[]}'))
-    assert _outcome(home) == ("ok", {"signals": 0, "consolidated": 0, "posted": 0, "spooled": 0, "replayed": 0})
+    assert _outcome(home) == ("ok", {"signals": 0, "consolidated": 0, "posted": 0, "spooled": 0, "replayed": 0,
+                                     "replay_failed": 0, "spool_depth": 0})
 
 
 def test_a_failed_phase_writes_failed_and_a_skipped_night_writes_nothing(home, m):

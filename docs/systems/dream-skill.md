@@ -172,9 +172,12 @@ promotions, the drift canary before/after, the morning summary and the usage led
   and replayed before anything else on the next run; a replayed line leaves the spool. The run then
   writes its step outcome (`AMS_OUTCOME_FILE`, see the chain description in
   [installer-and-deploy.md](./installer-and-deploy.md)): `ok`, or `degraded:` with `posted-<p>-of-<c>`,
-  `drift-snapshot-failed` and/or `canonical-fetch-failed` (comma-joined) and the counts
-  `{signals, consolidated, posted, spooled, replayed}`, so a night that posted 0 of 3 no longer
-  reads as a green receipt. The dream's canonical search carries `hook_contract_version` 17.0.
+  `replay-failed-<n>` (queued insights the replay could not post), `spool-backlog-<n>` (queued insights
+  a night that never reached phase 3 left untouched), `drift-snapshot-failed` and/or
+  `canonical-fetch-failed` (comma-joined) and the counts
+  `{signals, consolidated, posted, spooled, replayed, replay_failed, spool_depth}` (`spool_depth` is the
+  post-run line count), so a night that posted 0 of 3, or that could not empty last night's queue,
+  no longer reads as a green receipt. The dream's canonical search carries `hook_contract_version` 17.0.
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
   throttle stamp is `~/.mem0/maintenance/last-dream`, written by Python only.
