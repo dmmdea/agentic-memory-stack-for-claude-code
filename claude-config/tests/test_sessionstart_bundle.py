@@ -201,3 +201,50 @@ def test_load_and_consume_marker_stale_is_dropped(tmp_path):
 
 def test_load_and_consume_marker_missing(tmp_path):
     assert ssb.load_and_consume_marker(str(tmp_path / "nope.json"), now=10, max_age=300) is None
+
+
+# --- WP-2: the enrichment bundle stamps the hook contract -------------------------------------------
+# hook_contract.missing counts every /v1/context/bundle body without hook_contract_version; this helper
+# was the one repo caller that sent none (session-12 audit, brain-hook-contract-missing-two-sources).
+
+def test_bundle_payload_stamps_the_hook_contract():
+    p = ssb.build_bundle_payload("resume the invite flow", "brand-a", "brand-a-platform", "frontier")
+    assert p["hook_contract_version"] == "20.0"
+    assert p["hook_contract_version"] == ssb.HOOK_CONTRACT_VERSION
+    assert p["checkpoint"] is False and p["tier"] == "frontier" and p["prompt"] == "resume the invite flow"
+    assert p["brand"] == "brand-a" and p["initiative"] == "brand-a-platform"
+
+
+def test_bundle_payload_stamps_even_without_scope():
+    p = ssb.build_bundle_payload("q", None, None)
+    assert p["hook_contract_version"] == "20.0"
+    assert "brand" not in p and "initiative" not in p
+
+
+def test_fetch_bundle_sends_the_stamped_payload(monkeypatch):
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *a):
+            return b'{"memories": []}'
+
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = __import__("json").loads(req.data.decode("utf-8"))
+        return _Resp()
+
+    monkeypatch.setattr(ssb.urllib.request, "urlopen", fake_urlopen)
+    assert ssb.fetch_bundle("http://authority.invalid", "k", "q", "brand-a", None) == []
+    assert seen["body"]["hook_contract_version"] == "20.0"
+
+
+def test_stamped_version_is_one_the_server_knows():
+    import re
+    src = (_HERE.parent.parent / "mem0-server" / "hook_contract.py").read_text(encoding="utf-8")
+    known = re.search(r"KNOWN_HOOK_CONTRACT_VERSIONS\s*=\s*\{([^}]*)\}", src).group(1)
+    assert f'"{ssb.HOOK_CONTRACT_VERSION}"' in known

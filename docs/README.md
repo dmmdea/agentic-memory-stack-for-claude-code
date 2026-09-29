@@ -27,6 +27,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/goals.md`](./systems/goals.md) | Persistent multi-session objectives tracked alongside episodic memory |
 | [`systems/open-questions.md`](./systems/open-questions.md) | The cross-session open-questions registry and why it is global, not per-session |
 | [`systems/continuity.md`](./systems/continuity.md) | Session-continuity behavior (resume, checkpoints) and the problem it solves |
+| [`systems/sessionstart-banner.md`](./systems/sessionstart-banner.md) | What the SessionStart banner reads on each role: replicas read the authority (recent sessions, one health line), never their own frozen brain artifacts |
 | [`systems/codex-hooks.md`](./systems/codex-hooks.md) | The L1a extractor + C1 consolidator hooks, and why unattended cron runs on Codex |
 | [`systems/dream-skill.md`](./systems/dream-skill.md) | The nightly 4-phase consolidation ("dream") pattern — *design doc; marked DESIGN in-file* |
 | [`systems/l10-audit.md`](./systems/l10-audit.md) | The post-hoc audit job: what it flags and how to triage the flags |

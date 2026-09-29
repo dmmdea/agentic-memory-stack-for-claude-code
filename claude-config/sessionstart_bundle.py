@@ -37,6 +37,8 @@ import time
 import urllib.request
 
 HEADER = "Recently-relevant memory (verify before acting):"
+# Same value the hook daemon stamps; must stay in KNOWN_HOOK_CONTRACT_VERSIONS (mem0-server/hook_contract.py).
+HOOK_CONTRACT_VERSION = "20.0"
 DEFAULT_LIMIT = 120  # per-fact char cap (matches the canonical/episode banner lines)
 DEFAULT_K = 1        # boot precision: at most the single highest-ranked durable/evidence fact
 MARKER_NAME = "precompact-query.json"  # written by precompact_capture.py (B1 Phase 2)
@@ -159,14 +161,25 @@ def load_and_consume_marker(path: str, now, max_age: int = MARKER_MAX_AGE) -> "s
     return q
 
 
-def fetch_bundle(url: str, key: str, query: str, brand, initiative, tier: str = "small", timeout: float = 6.0) -> list:
-    """POST /v1/context/bundle (checkpoint:false). tier scales K at the calibrated 0.30 gate
-    (small=>K<=1, frontier=>K<=2). Returns memories[] or [] on any error."""
-    payload = {"session_id": "sessionstart-enrich", "prompt": query, "checkpoint": False, "tier": tier}
+def build_bundle_payload(query: str, brand, initiative, tier: str = "small") -> dict:
+    """The /v1/context/bundle body. It carries hook_contract_version: the server counts every bundle
+    body without it as hook_contract.missing, and this helper was the larger unstamped share of that
+    counter (session-12 audit)."""
+    payload = {
+        "session_id": "sessionstart-enrich", "prompt": query, "checkpoint": False, "tier": tier,
+        "hook_contract_version": HOOK_CONTRACT_VERSION,
+    }
     if brand:
         payload["brand"] = brand
     if initiative:
         payload["initiative"] = initiative
+    return payload
+
+
+def fetch_bundle(url: str, key: str, query: str, brand, initiative, tier: str = "small", timeout: float = 6.0) -> list:
+    """POST /v1/context/bundle (checkpoint:false). tier scales K at the calibrated 0.30 gate
+    (small=>K<=1, frontier=>K<=2). Returns memories[] or [] on any error."""
+    payload = build_bundle_payload(query, brand, initiative, tier)
     try:
         req = urllib.request.Request(
             url.rstrip("/") + "/v1/context/bundle",

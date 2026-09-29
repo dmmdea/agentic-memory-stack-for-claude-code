@@ -11,6 +11,14 @@ set +e
 mkdir -p "$HOME/.mem0" 2>/dev/null && date +%s > "$HOME/.mem0/last-sessionstart-banner" 2>/dev/null || true
 warnings=""
 
+# WP-2 (session-12 audit): the role decides which inputs this banner may trust. Read it ONCE, here,
+# before any block. ~/.mem0/role is written by the installer beside authority-url; an absent file is
+# the brain. Every brain-only artifact below (MEMORY.md, the job-queue mirror, brand-scope status, the
+# l10 flags, the contradiction queue/sweep log, the local episodic.db, the morning-summary counter) is
+# written by the BRAIN's chain and freezes on a replica at the authority cutover, so a replica prints
+# none of them and reads the authority instead (recent sessions + one health line, below).
+_ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
+
 # v0.17 Phase 0.E brand inference; v1.0 Phase 7B: operator-agnostic — rules from
 # the deployed brands.json beside this script (no private brand names hardcoded;
 # operators add their own). Neutral fallback if absent/unparseable.
@@ -109,7 +117,7 @@ fi
 # reads, no server call.
 FLAGS="$HOME/.mem0/audit-flags.jsonl"
 L10STATE="$HOME/.mem0/l10-state.json"
-if [ -f "$FLAGS" ]; then
+if [ "$_ROLE" = brain ] && [ -f "$FLAGS" ]; then
   l10counts=$(python3 - "$FLAGS" "$L10STATE" <<'PY' 2>/dev/null
 import json, sys
 flags_p, state_p = sys.argv[1], sys.argv[2]
@@ -232,8 +240,11 @@ fi
 # froze on 2026-06-16 and this banner showed stale 06-16 decisions forever. Episodes ARE captured by
 # the SessionStart/PreCompact LIFECYCLE hooks (which DO fire), so they stay fresh. Show the last 5
 # episodes that have a real goal (skip empty placeholder rows).
+# WP-2: this read is the BRAIN's. A replica's episodic.db stopped receiving writes at the authority
+# cutover, so it presented weeks-old sessions as current; a replica reads the authority instead (the
+# block after the MEM0_UP probe below).
 EPDB="$HOME/.mem0/episodic.db"
-if [ -f "$EPDB" ]; then
+if [ "$_ROLE" = brain ] && [ -f "$EPDB" ]; then
   ep=$(python3 - "$EPDB" <<'PY' 2>/dev/null
 import sys, sqlite3
 try:
@@ -323,7 +334,85 @@ AMS_URL="$(ams_authority_url)"
 MEM0_UP=1
 curl -sf --max-time 1 $AMS_URL/health >/dev/null 2>&1 || MEM0_UP=0
 if [ "$MEM0_UP" = 0 ]; then
-  echo "[agentic-memory-stack] memory server still starting — brand facts/goals skipped this session (they return next session)"
+  if [ "$_ROLE" = brain ]; then
+    echo "[agentic-memory-stack] memory server still starting — brand facts/goals skipped this session (they return next session)"
+  else
+    # WP-2: a replica whose authority is down has NOTHING current to show, and its own files are
+    # frozen at the cutover. One plain, loud line; never a grey "still starting" and never stale data.
+    echo "[AMS] authority unreachable"
+  fi
+fi
+# WP-2 (register: alert-no-session-start-reader): the client half of /health/maintenance. ONE bounded
+# read (1.5 s) behind the MEM0_UP probe, any role; silent when the brain is OK, loud when it is not.
+# The endpoint is public (no key). A malformed or missing body prints nothing: this line must never
+# be the reason a session start fails.
+if [ "$MEM0_UP" = 1 ]; then
+  curl -sf --max-time 1.5 "$AMS_URL/health/maintenance" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if not isinstance(d, dict):
+        raise ValueError
+    drift = d.get('drift'); drift = drift if isinstance(drift, dict) else {}
+    pool = d.get('pool'); pool = pool if isinstance(pool, dict) else {}
+    if d.get('ok') is not False and not drift.get('alarm'):
+        raise SystemExit(0)
+    def names(v):
+        out = []
+        for x in (v if isinstance(v, list) else []):
+            n = x.get('step') if isinstance(x, dict) else x
+            if isinstance(n, str) and n:
+                out.append(n)
+        return out
+    parts = []
+    f, g, st = names(d.get('failed_steps')), names(d.get('degraded_steps')), names(d.get('stale_steps'))
+    if f: parts.append('failed: ' + ', '.join(f))
+    if g: parts.append('degraded: ' + ', '.join(g))
+    if (pool.get('alarm') or pool.get('health_alarm')) and pool.get('used_pct') is not None:
+        parts.append('pool %s%% %s' % (pool.get('used_pct'), pool.get('health') or 'ONLINE'))
+    if st: parts.append('stale: ' + ', '.join(st))
+    if drift.get('alarm'): parts.append('drift alarm')
+    line = '[AMS] brain NOT OK' + ((' \u2014 ' + '; '.join(parts)) if parts else '')
+    sys.stdout.buffer.write((line + '\n').encode('utf-8'))
+except BaseException:
+    pass
+" 2>/dev/null
+fi
+# WP-2: a replica's recent sessions come from the authority (its own episodic.db froze at the
+# cutover). GET /v1/episodes?recent=20 (1.5 s), keep the 5 newest that have a goal, label the source.
+# Authority reachable but the read fails -> one "unavailable" line, so the gap is never silent.
+if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
+  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20" 2>/dev/null)
+  _epout=$(printf '%s' "$_eps" | python3 -c "
+import sys, json
+try:
+    rows = json.load(sys.stdin)
+    if not isinstance(rows, list):
+        raise ValueError
+except Exception:
+    print('UNAVAILABLE'); raise SystemExit(0)
+out = []
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    goal = (r.get('goal_text') or '').strip()
+    if not goal:
+        continue
+    ended = (r.get('ended_at') or '')[:16].replace('T', ' ')
+    brand = r.get('brand') or ''
+    tag = ('[' + brand + '] ') if brand else ''
+    out.append('  - ' + ended + ': ' + tag + goal[:90])
+    if len(out) == 5:
+        break
+if out:
+    print('[agentic-memory-stack] recent sessions (last 5) (authority):')
+    print(chr(10).join(out))
+" 2>/dev/null)
+  if [ "$_epout" = UNAVAILABLE ]; then
+    echo "[agentic-memory-stack] recent sessions unavailable: authority unreachable"
+  elif [ -n "$_epout" ]; then
+    echo "$_epout"
+  fi
 fi
 if [ "$MEM0_UP" = 1 ] && [ -n "$BRAND" ] && [ -n "$KEY" ]; then
   echo "[agentic-memory-stack] brand context ($BRAND):"
@@ -426,7 +515,7 @@ fi
 # on its own 6h SessionStart throttle, DECOUPLED from the dream — the old
 # "dream-consolidator may be failing" hint misdiagnosed this for months.
 MEMORYMD="$HOME/.mem0/MEMORY.md"
-if [ -f "$MEMORYMD" ]; then
+if [ "$_ROLE" = brain ] && [ -f "$MEMORYMD" ]; then
   age_days=$(( ( $(date +%s) - $(stat -c %Y "$MEMORYMD") ) / 86400 ))
   [ "$age_days" -gt 8 ] && warnings+="MEMORY.md stale (${age_days}d old; memory-index-refresh.ps1 is not firing at SessionStart). "
 fi
@@ -435,7 +524,7 @@ fi
 # Warn if any canonical fact ABOUT a brand is brand-untagged (invisible to that brand's
 # sessions — the bug that hid the Brand-A pre-filled-pens fact). Self-clears next clean run.
 BSSTATUS="$HOME/.mem0/brand-scope-status.json"
-if [ -f "$BSSTATUS" ]; then
+if [ "$_ROLE" = brain ] && [ -f "$BSSTATUS" ]; then
   nmis=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('n_misscoped',0))" "$BSSTATUS" 2>/dev/null || echo 0)
   [ "${nmis:-0}" -gt 0 ] && warnings+="brand-scope: ${nmis} canonical fact(s) brand-untagged (invisible to brand sessions; see brand-scope-audit.py). "
 fi
@@ -446,7 +535,10 @@ fi
 # run hid 3/4 CONSISTENT facts). Weekly-throttled; detached so it never blocks SessionStart. The
 # weekly local sweep keeps minting advisory flags; this is what authoritatively resolves them.
 RESOLVE_MARKER="$HOME/.mem0/last-contradiction-rejudge"
-if [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
+# WP-2: brain only. A replica targets its dormant local store (the run degraded to qdrant-unreachable
+# and burned the weekly throttle) and, were a failover store ever raised, --apply would mutate a
+# replica: the brain runs its own authoritative Sunday sweep.
+if [ "$_ROLE" = brain ] && [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
   _do=1
   if [ -f "$RESOLVE_MARKER" ]; then
     _age=$(( ( $(date +%s) - $(stat -c %Y "$RESOLVE_MARKER" 2>/dev/null || echo 0) ) / 86400 ))
@@ -487,13 +579,14 @@ fi
 # MEM-13 (2026-07-03): own line, not the [storage-cap] warnings blob — the queue must be visible
 # even when nothing is over cap. /health/deep mirrors it as checks.pending_contradiction_reviews.
 RQ="$HOME/.mem0/contradiction-promote-review.jsonl"
-if [ -s "$RQ" ]; then
+if [ "$_ROLE" = brain ] && [ -s "$RQ" ]; then
   nrev=$(grep -c . "$RQ" 2>/dev/null)
   [ "${nrev:-0}" -gt 0 ] && echo "${nrev} contradiction verdict(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl)"
 fi
 
 # W3 AMS-05 heartbeat digest — one own-line (MEM-13 convention), silent when all
-# clear. CHEAP FILE READS ONLY (the 1s cold-morning guard exists because serial
+# clear. BRAIN ONLY since WP-2 (a replica's copies of these files are frozen; its health signal is the
+# authority's one "[AMS]" line above). CHEAP FILE READS ONLY (the 1s cold-morning guard exists because serial
 # curls once blocked sessions 15-30s; /health/deep is never called inline here).
 # Windows-side files are reached via this script's own /mnt/c deployment path
 # (review F10 — never $HOME for Windows artifacts: the two-homes bug class).
@@ -505,7 +598,7 @@ _WINPROFILE=""
 case "${BASH_SOURCE[0]:-}" in
   /mnt/c/Users/*) _WINPROFILE="$(echo "${BASH_SOURCE[0]}" | sed -E 's#^(/mnt/c/Users/[^/]+)/.*#\1#')" ;;
 esac
-if [ -n "$_WINPROFILE" ]; then
+if [ "$_ROLE" = brain ] && [ -n "$_WINPROFILE" ]; then
   _MS="$_WINPROFILE/.claude/state/dream/morning-summary.md"
   if [ -f "$_MS" ]; then
     # Tail-read (bounded — the file rotates at ~128KB but be defensive) and count
@@ -521,9 +614,7 @@ if [ -n "$_WINPROFILE" ]; then
 fi
 # 1.28.4 (register P5-11): the drift guard runs inside the brain's dream. A replica's copy of this
 # state file is frozen at the last night the dream ran locally (before the authority cutover) and
-# printed a permanent "DRIFT GUARD DEAD" here. Read it on the brain only: ~/.mem0/role is written by
-# the installer beside authority-url; an absent file is the brain.
-_ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
+# printed a permanent "DRIFT GUARD DEAD" here. Read it on the brain only ($_ROLE is read at the top).
 _RDS="$HOME/.mem0/retrieval-drift-state.json"
 if [ "$_ROLE" = brain ] && [ -f "$_RDS" ]; then
   _rd=$(python3 -c "
@@ -538,7 +629,7 @@ print('; '.join(bits))" "$_RDS" 2>/dev/null)
   [ -n "$_rd" ] && _hb+="$_rd. "
 fi
 _CSW="$HOME/.mem0/contradiction-sweep.jsonl"
-if [ -s "$_CSW" ]; then
+if [ "$_ROLE" = brain ] && [ -s "$_CSW" ]; then
   # grep -c prints the count even on zero matches (exit 1) — no ||-fallback, it
   # would append a second line and break the -ge integer test (diff-review fix 4).
   # W5 T3.5: the streak reads NORMAL sweep lines only — mode-tagged lines
@@ -551,7 +642,7 @@ fi
 # the sqlite db; the banner's no-/health/deep pin applies to db opens in
 # spirit). Age-gated (F7d): a stale mirror is itself the alarm.
 _JHB="$HOME/.mem0/jobs-heartbeat.json"
-if [ -s "$_JHB" ]; then
+if [ "$_ROLE" = brain ] && [ -s "$_JHB" ]; then
   _jq=$(python3 -c "
 import json, datetime as dt
 try:
