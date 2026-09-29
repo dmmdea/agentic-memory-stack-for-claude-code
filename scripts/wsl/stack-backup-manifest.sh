@@ -46,20 +46,23 @@ EPISODIC_OQ=0
 SCHEMA_VERSION="unknown"
 
 EPISODIC_BACKUP="$BACKUP_DIR/episodic-$TS.db"
+# Read the backup immutably: a plain read-only open of a WAL-mode database leaves -wal/-shm
+# sidecars beside it, and those are what once made the prune delete real backups.
+EPISODIC_URI="file:$EPISODIC_BACKUP?mode=ro&immutable=1"
 if [ -f "$EPISODIC_BACKUP" ]; then
     # Prefer sqlite3 CLI; fall back to python3's built-in sqlite3 module
     if command -v sqlite3 >/dev/null 2>&1; then
-        EPISODIC_SESSIONS=$(sqlite3 "$EPISODIC_BACKUP" "SELECT COUNT(*) FROM sessions" 2>/dev/null || echo 0)
-        EPISODIC_EPISODES=$(sqlite3 "$EPISODIC_BACKUP" "SELECT COUNT(*) FROM episodes" 2>/dev/null || echo 0)
-        EPISODIC_GOALS=$(sqlite3    "$EPISODIC_BACKUP" "SELECT COUNT(*) FROM goals"    2>/dev/null || echo 0)
-        EPISODIC_OQ=$(sqlite3       "$EPISODIC_BACKUP" "SELECT COUNT(*) FROM open_questions" 2>/dev/null || echo 0)
-        SCHEMA_VERSION=$(sqlite3    "$EPISODIC_BACKUP" "SELECT value FROM schema_meta WHERE key='schema_version'" 2>/dev/null || echo "unknown")
+        EPISODIC_SESSIONS=$(sqlite3 "$EPISODIC_URI" "SELECT COUNT(*) FROM sessions" 2>/dev/null || echo 0)
+        EPISODIC_EPISODES=$(sqlite3 "$EPISODIC_URI" "SELECT COUNT(*) FROM episodes" 2>/dev/null || echo 0)
+        EPISODIC_GOALS=$(sqlite3    "$EPISODIC_URI" "SELECT COUNT(*) FROM goals"    2>/dev/null || echo 0)
+        EPISODIC_OQ=$(sqlite3       "$EPISODIC_URI" "SELECT COUNT(*) FROM open_questions" 2>/dev/null || echo 0)
+        SCHEMA_VERSION=$(sqlite3    "$EPISODIC_URI" "SELECT value FROM schema_meta WHERE key='schema_version'" 2>/dev/null || echo "unknown")
     else
         # python3's sqlite3 module is always available in the venv environment
-        read -r EPISODIC_SESSIONS EPISODIC_EPISODES EPISODIC_GOALS EPISODIC_OQ SCHEMA_VERSION <<< "$(python3 - "$EPISODIC_BACKUP" <<'PYEOF'
+        read -r EPISODIC_SESSIONS EPISODIC_EPISODES EPISODIC_GOALS EPISODIC_OQ SCHEMA_VERSION <<< "$(python3 - "$EPISODIC_URI" <<'PYEOF'
 import sys, sqlite3 as sq
 db = sys.argv[1]
-conn = sq.connect(db)
+conn = sq.connect(db, uri=True)
 def qone(sql, default=0):
     try: return conn.execute(sql).fetchone()[0]
     except: return default

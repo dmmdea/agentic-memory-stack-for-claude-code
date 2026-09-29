@@ -338,6 +338,34 @@ def test_manifest_without_deploy_stamp_says_unknown(home, qdrant):
     assert m["app_version"] == "unknown"
 
 
+def test_manifest_reads_the_backup_db_without_leaving_sidecars(home, qdrant):
+    """A plain open of a read-only WAL-mode backup leaves -wal/-shm beside it (the debris that
+    once made the prune delete real backups); the manifest reads it immutably instead."""
+    import sqlite3
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    db = b / f"episodic-{ts}.db"
+    db.unlink()
+    con = sqlite3.connect(db)
+    con.execute("pragma journal_mode=wal")
+    con.execute("create table sessions(x)")
+    con.execute("create table episodes(x)")
+    con.execute("create table goals(x)")
+    con.execute("create table open_questions(x)")
+    con.executemany("insert into sessions values(?)", [(1,), (2,), (3,)])
+    con.commit()
+    con.close()
+    for stray in b.glob("episodic-*.db-*"):
+        stray.unlink()
+    db.chmod(0o444)
+    r = _run(MANIFEST, home, qdrant, args=[ts])
+    assert r.returncode == 0, r.stderr
+    m = json.loads((b / f"manifest-{ts}.json").read_text())
+    assert m["counts"]["episodic_sessions"] == 3
+    assert sorted(p.name for p in b.glob("episodic-*")) == [db.name], "no -wal/-shm left behind"
+
+
 def test_stack_backup_survives_a_bad_stack_env(home, qdrant):
     (home / ".mem0" / "stack.env").write_text("MEM0_WIKI_SOURCES=someone@hostone someone@hosttwo\n")
     r = _run(BACKUP, home, qdrant, MEM0_WIN_USER="")

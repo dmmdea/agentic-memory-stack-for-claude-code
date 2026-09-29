@@ -45,7 +45,7 @@ if [ -f "$HIST_SRC" ]; then
       && echo "history.db backed up" \
       || { rm -f "$HIST_DST.tmp"; echo "WARN: history.db backup failed" >&2; rc=1; }
     if [ -f "$HIST_DST" ]; then
-      result=$(sqlite3 "$HIST_DST" 'pragma integrity_check' 2>&1)
+      result=$(sqlite3 "file:$HIST_DST?mode=ro&immutable=1" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
         echo "WARN: history.db integrity_check: $result" >&2; rc=1
       else
@@ -109,7 +109,7 @@ if [ -f "$EPISODIC_SRC" ]; then
       && echo "episodic.db backed up" \
       || { rm -f "$EPISODIC_DST.tmp"; echo "WARN: episodic.db backup failed" >&2; rc=1; }
     if [ -f "$EPISODIC_DST" ]; then
-      result=$(sqlite3 "$EPISODIC_DST" 'pragma integrity_check' 2>&1)
+      result=$(sqlite3 "file:$EPISODIC_DST?mode=ro&immutable=1" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
         echo "WARN: episodic.db integrity_check: $result" >&2; rc=1
       else
