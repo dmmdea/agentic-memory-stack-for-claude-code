@@ -86,8 +86,8 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
 
 ### W4 rows (the eight that were `probe: none` until 2026-08-07)
 
-- **`reranker`** — **passive only, and that is a hard rule (review F11).** The reranker is a CPU
-  cross-encoder that the verifier budgets 90s, and `scripts/wsl/deploy.sh` gates on `/health/deep`
+- **`reranker`** — **passive only, and that is a hard rule (review F11).** The reranker is a GPU-served
+  cross-encoder that unloads after five idle minutes (a cold load takes seconds; the verifier budgets 90s), and `scripts/wsl/deploy.sh` gates on `/health/deep`
   seconds after a restart. An *active* rerank probe on that endpoint would hang deploys on a cold
   model, so `reranker.py` instead exposes counters bumped by **real** search traffic
   (`last_rerank_ok_ts`, `consecutive_rerank_failures`, in-process, zero I/O). Verdict: ≥ 3
