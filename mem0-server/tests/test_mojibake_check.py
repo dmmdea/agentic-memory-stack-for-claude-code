@@ -60,7 +60,7 @@ def test_scan_payloads_counts_and_samples():
         ("id4", None),
     ]
     out = scan_payloads(iter(pts))
-    assert out == {"scanned": 4, "hits": 2, "sample_ids": ["id2", "id3"]}
+    assert out == {"scanned": 4, "hits": 2, "sample_ids": ["id2", "id3"], "allowlisted": 0}
 
 
 class _Pt:
@@ -102,3 +102,42 @@ def test_mojibake_health_fail_soft():
     out = mojibake_health(boom)
     assert out["ok"] is True  # informational check never flips ok
     assert "error" in out
+
+
+# ---- WP-4 task 4.9: a per-point allowlist, so a legitimate note that QUOTES mojibake as an example
+# does not hold the tripwire at 'degraded' forever (a permanent yellow trains everyone to ignore it,
+# and hides the day a real recurrence arrives) ----
+
+def test_flagged_point_is_not_a_hit_but_an_unflagged_twin_still_is():
+    bad = _corrupt(f"quoted example {ARROW} here")
+    pts = [
+        ("legit-note", {"data": bad, "mojibake_ok": True}),
+        ("real-hit", {"data": bad}),
+    ]
+    out = scan_payloads(iter(pts))
+    assert out == {"scanned": 2, "hits": 1, "sample_ids": ["real-hit"], "allowlisted": 1}
+
+
+def test_only_a_literal_true_flag_allowlists():
+    """The flag is deliberate: a string, 1 or a falsy value must not exempt a point."""
+    bad = _corrupt(f"x {ARROW} y")
+    pts = [(f"p{i}", {"data": bad, "mojibake_ok": v}) for i, v in enumerate(["true", 1, False, None, "yes"])]
+    out = scan_payloads(iter(pts))
+    assert out["hits"] == 5 and out["allowlisted"] == 0
+
+
+def test_flag_also_covers_the_lemmatized_field():
+    bad = _corrupt(f"x {ARROW} y")
+    out = scan_payloads(iter([("a", {"data": "clean", "text_lemmatized": bad, "mojibake_ok": True})]))
+    assert out["hits"] == 0 and out["allowlisted"] == 1
+
+
+def test_health_scan_requests_the_flag_field_and_honours_it():
+    """The server's scroll must actually FETCH mojibake_ok, or the allowlist is a dead letter."""
+    from mojibake_check import PAYLOAD_KEYS
+    assert "mojibake_ok" in PAYLOAD_KEYS and "data" in PAYLOAD_KEYS
+    src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    assert "with_payload=list(PAYLOAD_KEYS)" in src, "app.py must scroll the allowlist key too"
+    bad = _corrupt(f"q {GEQ} r")
+    out = mojibake_health(lambda off, lim: ([_Pt("a", {"data": bad, "mojibake_ok": True})], None))
+    assert out["hits"] == 0 and out["allowlisted"] == 1 and out["scanned"] == 1

@@ -46,6 +46,7 @@ from sparse_health import encode_with_selfheal   # AMS-09b: bounded sentinel un-
 # text_lemmatized — exact store-side parity for the keyword union leg.
 from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize_bm25
 from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
+from mojibake_check import PAYLOAD_KEYS          # WP-4: fields the scan reads (text + the mojibake_ok allowlist)
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
 from capabilities import evaluate as evaluate_capabilities  # W3: capability manifest (informational)
@@ -1082,7 +1083,7 @@ def health_deep() -> dict:
     def _mj_scroll(offset, limit):
         return mem.vector_store.client.scroll(
             mem.vector_store.collection_name,
-            with_payload=["data", "text_lemmatized"], with_vectors=False,
+            with_payload=list(PAYLOAD_KEYS), with_vectors=False,
             limit=limit, offset=offset,
         )
     out["checks"]["mojibake"] = mojibake_health(_mj_scroll)

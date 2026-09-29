@@ -34,25 +34,42 @@ def contains_mojibake(text):
     return bool(text) and MOJIBAKE_RE.search(text) is not None
 
 
-def scan_payloads(payload_iter, text_keys=("data", "text_lemmatized"), max_samples=5):
+# The payload fields the scan reads: the two text fields plus the allowlist flag. The server's
+# scroll requests exactly these (a flag the scroll does not fetch would be a dead letter).
+TEXT_KEYS = ("data", "text_lemmatized")
+ALLOWLIST_KEY = "mojibake_ok"
+PAYLOAD_KEYS = TEXT_KEYS + (ALLOWLIST_KEY,)
+
+
+def scan_payloads(payload_iter, text_keys=TEXT_KEYS, max_samples=5):
     """Pure scan over an iterable of ``(point_id, payload_dict)``.
 
-    Returns ``{"scanned": int, "hits": int, "sample_ids": [...]}`` — the
+    Returns ``{"scanned": int, "hits": int, "sample_ids": [...], "allowlisted": int}`` — the
     /health/deep shape minus timing, so it unit-tests headless.
+
+    A point whose payload carries ``mojibake_ok: true`` (the literal boolean) is skipped and counted
+    in ``allowlisted``: a legitimate note that QUOTES mojibake as a worked example is a true regex
+    positive and a semantic false positive, and one such note held the tripwire at 'degraded'
+    permanently, which hides a real recurrence. The flag is per point and deliberate; anything but
+    the boolean True (a string, 1) does not exempt.
     """
     scanned = 0
     hits = 0
+    allowlisted = 0
     samples = []
     for pid, payload in payload_iter:
         scanned += 1
         p = payload or {}
+        if p.get(ALLOWLIST_KEY) is True:
+            allowlisted += 1
+            continue
         for key in text_keys:
             if contains_mojibake(p.get(key) or ""):
                 hits += 1
                 if len(samples) < max_samples:
                     samples.append(str(pid))
                 break
-    return {"scanned": scanned, "hits": hits, "sample_ids": samples}
+    return {"scanned": scanned, "hits": hits, "sample_ids": samples, "allowlisted": allowlisted}
 
 
 def mojibake_health(scroll_fn, page_size=1000, page_cap=50):
@@ -65,7 +82,7 @@ def mojibake_health(scroll_fn, page_size=1000, page_cap=50):
     """
     import time as _time
     started = _time.monotonic()
-    out = {"ok": True, "scanned": 0, "hits": 0, "sample_ids": [], "elapsed_ms": 0}
+    out = {"ok": True, "scanned": 0, "hits": 0, "sample_ids": [], "allowlisted": 0, "elapsed_ms": 0}
     try:
         offset = None
         pages = 0
