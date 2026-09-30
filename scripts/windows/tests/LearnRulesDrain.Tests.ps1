@@ -517,3 +517,45 @@ Describe 'learn-rules-drain under Windows PowerShell 5.1 (the hook host)' {
         } finally { $env:USERPROFILE = $saved }
     }
 }
+
+Describe 'learn-rules-drain: a machine turn is never a correction' {
+    BeforeEach { $script:sb = script:New-DrainSandbox; $script:mock = $null }
+    AfterEach  { script:Stop-MockAuthority $script:mock }
+
+    It 'drops a queued task notification instead of posting it, and still posts the real correction' {
+        # 1.32: capture queued task notifications whose tool output read like a correction, and the
+        # first drain posted 66 of them. A line already in a queue must be dropped, never posted.
+        $note = "<task-notification>`n<task-id>w1</task-id>`n<status>completed</status>`n<result>you forgot the test; revert that change</result>`n</task-notification>"
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value @(
+            (script:New-QueueLine -Text $note -Session 'sid-n')
+            (script:New-QueueLine -Text 'no, that is the wrong file' -Session 'sid-h')
+        )
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        $r = script:Invoke-Drain $sb $mock.Url -Force
+
+        $r.drained | Should -Be 1
+        $r.dropped | Should -Be 1
+        $reqs = script:Get-MockRequests $mock
+        $reqs.Count | Should -Be 1
+        $reqs[0].json.messages | Should -Be 'no, that is the wrong file'
+        $q = script:Read-Queue $sb
+        ($q | Where-Object { $_.session_id -eq 'sid-n' }).status | Should -Be 'dropped'
+        ($q | Where-Object { $_.session_id -eq 'sid-h' }).status | Should -Be 'drained'
+    }
+
+    It 'agrees with Test-MachineTurnPrompt on every prompt of the shared machine-turn corpus' {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:winDir 'learn-rules-drain.ps1'), [ref]$tokens, [ref]$errs)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-DrainMachineTurn' }, $true)
+        $fn | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($fn.Extent.Text))
+        . (Join-Path $script:winDir 'user-prompt-lib.ps1')
+        $corpus = @((Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts)
+        $corpus.Count | Should -BeGreaterThan 3
+        foreach ($c in $corpus) {
+            (Test-DrainMachineTurn ([string]$c.prompt)) | Should -Be ([bool]$c.machine_turn) -Because $c.name
+            (Test-DrainMachineTurn ([string]$c.prompt)) | Should -Be (Test-MachineTurnPrompt -Prompt ([string]$c.prompt)) -Because $c.name
+        }
+    }
+}
