@@ -2,12 +2,10 @@ package judge
 
 import (
 	"encoding/json"
-	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -68,56 +66,25 @@ func ReceiptPath(stateRoot string) string { return filepath.Join(stateRoot, Rece
 func UsagePath(stateRoot string) string { return filepath.Join(stateRoot, UsageFileName) }
 
 // AppendJSONL appends one JSON document as a line. The write is O_APPEND so two
-// processes cannot interleave a partial line, and it is UTF-8 without a BOM.
-func AppendJSONL(path string, v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Errorf("encode row for %s: %w", path, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	if _, err := f.Write(append(b, '\n')); err != nil {
-		return fmt.Errorf("append to %s: %w", path, err)
-	}
-	return nil
-}
+// processes cannot interleave a partial line, it is UTF-8 without a BOM, and the file is
+// size-rotated (receiptlog).
+func AppendJSONL(path string, v any) error { return receiptlog.Append(path, v) }
 
-// WriteReceipt appends a receipt row.
-func WriteReceipt(stateRoot string, r Receipt) error { return AppendJSONL(ReceiptPath(stateRoot), r) }
+// WriteReceipt appends a receipt row. Consecutive identical aborted-* rows for one store
+// collapse into one row with a repeat count.
+func WriteReceipt(stateRoot string, r Receipt) error {
+	return receiptlog.AppendCollapsing(ReceiptPath(stateRoot), r, receiptlog.SameAbortedRow)
+}
 
 // WriteUsage appends a usage row. A judge call that succeeded and returned nothing is an
 // OUTCOME, not a non-event: the row is what makes it countable.
 func WriteUsage(stateRoot string, row UsageRow) error { return AppendJSONL(UsagePath(stateRoot), row) }
 
-// readTail returns the last n lines of a file. A missing file is no lines and no error;
-// an unreadable one is an error, because "I could not read the ledger" must never be
-// spelled the same way as "the judge has never run".
-func readTail(path string, n int) ([]string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
-	out := make([]string, 0, len(lines))
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			out = append(out, l)
-		}
-	}
-	if len(out) > n {
-		out = out[len(out)-n:]
-	}
-	return out, nil
-}
+// readTail returns the last n lines of the receipts ledger, across the newest rotated
+// generation. A missing file is no lines and no error; an unreadable one is an error,
+// because "I could not read the ledger" must never be spelled the same way as "the judge
+// has never run".
+func readTail(path string, n int) ([]string, error) { return receiptlog.ReadTailLines(path, n) }
 
 // LastJudgeAttempt is the newest receipt for a workspace whose judge_called is true.
 //

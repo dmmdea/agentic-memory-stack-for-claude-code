@@ -16,7 +16,7 @@ func RenderVerbatim(records []*Record, newline string) string {
 	out := make([]string, 0, len(records))
 	for _, r := range records {
 		if r.Kind == KindEntry && r.Dirty {
-			out = append(out, EntryLine(r.Title, r.Slug, r.Summary, r.Indent))
+			out = append(out, RecordLine(r, r.Summary))
 			continue
 		}
 		out = append(out, r.Raw)
@@ -132,7 +132,7 @@ func RenderDerived(records []*Record, opt RenderOptions) RenderResult {
 	for _, r := range entries {
 		text := r.Raw
 		if r.Dirty {
-			text = EntryLine(r.Title, r.Slug, r.Summary, r.Indent)
+			text = RecordLine(r, r.Summary)
 		}
 		if isDoctrine(r) {
 			// Doctrine is never dropped. If doctrine alone exceeds the cap, say so and

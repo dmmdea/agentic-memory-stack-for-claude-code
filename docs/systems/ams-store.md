@@ -84,6 +84,8 @@ ams-store/
   internal/
     store/           enumerate, constants, paths, reparse dedup
     index/           parse, render (derived order), line, round-trip, reach, ghosts
+    brand/           the brand-map resolver (contract C3) for migrated facts
+    receiptlog/      the receipt writer: rotation, collapsing, generation-aware tail reads
     frontmatter/     parse, harvest, doctrine rule
     atomic/          temp + rename + hash read-back writer
     gitx/            every git exec (argv, env, timeout, exit classifier, version check)
@@ -128,7 +130,8 @@ ams-store lock     status | acquire --for <dur> --reason <s> | release | break
 ams-store harvest  --store <dir> | --all [--workspace <slug>] [--json]
 ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-run]
                       [--max-migrations 5] [--force] [--hub] [--candidates]
-                      [--mem0-url <url>] [--mem0-user <id>] [--json]   # hub-only
+                      [--brand-map <path>] [--mem0-url <url>] [--mem0-user <id>]
+                      [--json]   # hub-only
 ```
 
 ## What `derive` does
@@ -140,7 +143,12 @@ ams-store judge-apply --plan <file> --store <dir> [--workspace <slug>] [--dry-ru
    not read the directory" must never be spellable as "nothing is there", or a
    caller concludes every line is dangling and the whole index is wiped with a
    receipt reporting success;
-2. abort when the index has entries and the store enumerates no fact files;
+2. abort when the index has entries and the store enumerates no fact files - unless the
+   directory enumerated cleanly, is empty, and the history explains **every** slug the
+   index still links by a `Migrated:` trailer: that is a store whose last fact the judge
+   moved to the corpus, and the dangling lines are dropped (the receipt counts them as
+   `dedangled_migrated`) instead of aborting on every sync forever. One slug the history
+   cannot explain keeps the abort;
 3. sweep leftover `*.am-tmp` from a previously failed write;
 4. **harvest**: copy each entry's hook text into its fact file as `hook:`, and
    stamp `migrated: <id>` on a re-created slug the judge had migrated. Idempotent,
@@ -171,6 +179,27 @@ receipt row, flagged `dry_run` with status `dry-run`: the ledger is the record o
 every run, rehearsals included (the compactor's own contract, carried 1:1), and
 lint skips `dry_run` rows when it judges whether the maintainer is silent or
 starved, so a rehearsal can never pass for a run.
+
+### Index line shapes: decorated pointers
+
+An entry is a bullet, a markdown link to the fact file, and a hook after a separator -
+optionally with **one marker token** between the dash and the link: a run of non-space,
+non-`[` characters such as an emoji or `Shipped:`.
+Sessions and the write gate decorate pointers that way, and a strict "dash, space, link"
+once left 133 of one live store's 135 pointer lines as opaque text, so every per-entry rule
+(dup-slug, dangling, long-line), the floor and the judge's candidates were blind on the
+fleet's largest store. The marker is kept in `Record.Prefix` with its trailing whitespace
+and every renderer (`index.RecordLine`, used by the floor, hygiene, the judge's shorten and
+both index renders) puts it back byte for byte, so shortening a line never strips its
+decoration and the marker's bytes count against the line cap. A **decorated line that
+carries more than one `.md` link** (a `Shipped:` line listing two pointers) is deliberately
+not read as an entry: the second link would become part of the hook, harvested into the
+fact file as `hook:`, and a rebuild would reshape the line. It stays opaque text, kept
+byte for byte, both links still count for reachability (neither target reads as an
+orphan), and it is reported like any other unparsed pointer. A canonical line (no marker)
+with an inline second link is unchanged: still one entry. A bullet line that links a
+`.md` file and does not parse (a multi-link decorated line, two marker words, a `*`
+bullet) is the actionable lint finding `unparsed-pointer` rather than prose nobody sees.
 
 ### The floor and the injection cap
 
@@ -278,8 +307,14 @@ PC, three already back on the hub from another store).
 
 The receipt carries both ends. `deferred` names each withheld change with its OP
 (`[{"path":...,"op":"delete"}]`, where every entry used to be reported as
-`replace`), and `deferred_applied` names what a drain landed, so the audit trail
-does not show changes going into a queue and never coming out.
+`replace`), and the pass that drains the queue names what became of **every** entry
+that was pending in exactly one outcome field: `deferred_applied` (the drain landed
+it), `deferred_still_queued` (a live session still blocks it), `resurrected` (edited
+after the merge, so the file stays) or `deferred_gone` (a queued deletion whose file
+another pass had already removed - it used to be folded into applied). The engine's
+own report is not trusted for completeness: the queue before and after the drain is
+compared, so an entry the report leaves out is still classified (still queued, or
+gone), and 37 queued deletions can no longer leave no outcome at all.
 
 `MEMORY.md` is never tracked and never merged. Two guards hold that: the
 `info/exclude` entry and the `:(exclude)` pathspec that both staging passes share,
@@ -307,6 +342,59 @@ workspace kept succeeding and skipping it - its fact files stayed tracked with
 stale bytes forever. Only `IsNotExist` counts as a removal; any other stat error
 leaves the store tracked, which keeps the original caution against propagating a
 fleet-wide removal off one bad read and makes it exact.
+
+### Scratch and temp workspaces are never stores
+
+A throwaway session whose working directory is under the OS temp dir (or a session
+scratchpad) leaves a `projects/<slug>/memory` directory behind. Enrolled as a store it is
+synced fleet-wide and judged, its test facts reach the production corpus, and once the
+judge has migrated its only fact it wedges derive for good. `store.Enumerate` therefore
+skips a workspace whose slug lies under the encoded OS temp dir or contains one of the
+exclude fragments - by default `-AppData-Local-Temp-` and `-scratchpad-`. The list is
+configurable in `<projects root>/.ams/policy.json` (`{"store_exclude": ["-fragment-"]}`,
+case-insensitive; it replaces the defaults, and a missing or malformed file fails open to
+them). The rules (`store.LoadExcludeRules`) are shared by two places. Enumeration applies
+them, so sync, derive and lint agree. The hub's judge does **not** enumerate - the wrapper
+and the dream step hand `judge-apply` an explicit store directory - so `judge-apply`
+applies the same rules to its `--workspace` itself: an excluded workspace gets an empty
+offer set from `--candidates` (no judge call is spent) and, on apply, status
+`excluded-scratch` with exit 0, nothing written to the corpus, the index or the receipts.
+That is what keeps a scratch store already in the hub checkout, or pushed by a PC still on
+an older binary, out of the production corpus.
+
+### A first join cannot resurrect what the hub deleted
+
+A replica whose history repo is new (a reinstall, a lost state root) while its projects
+still hold older fact files merges against the empty tree, where every local-only file is
+an addition. That empty-base rule is the intended fleet bootstrap - but it also pushed
+back every fact the judge had migrated away. With no merge base the engine now reads the
+hub's history once (`git log --diff-filter=D`) and **quarantines** every local-only path
+that history ever deleted: it is reported in the receipt as `resurrected` (with a note
+that it was a first-join quarantine), left out of the merged tree and so out of the push,
+and its bytes are copied to `<state root>/quarantine/<path>` first, so nothing is lost. A
+file the hub never had is unaffected. Lint keeps the `resurrected` finding visible while
+the quarantine copy exists, so a human restores or drops it.
+
+### Receipts are bounded
+
+`sync-receipts.jsonl` and `compact-receipts.jsonl` are written through
+`internal/receiptlog`. At 2 MB the live file becomes `<name>.1` and older generations shift
+up, keeping three rotated generations; readers that tail by row count (lint, the judge's
+window, `ReadReceipts`) read across the newest rotated generation, so a rotation never
+blinds them. Consecutive **identical** `aborted-*` rows for one store (same status, note
+and measurements, not a dry run) collapse into one row carrying `repeat` and `first_ts`
+instead of growing the file by a row per sync - a wedged store wrote 231 of them in a
+week. Lint expands a collapsed row back to its repeat count, so the "last three runs all
+failed" window still sees the run it was.
+
+### Every commit names its client
+
+Commits made by the sync repo and the merge engine (the local, gate, derive and merge
+commits) end with an `Ams-Store-Version: <version>` trailer beside `Ams-Machine` and
+`Ams-Kind`, so the hub's history says which client version each fleet member runs and a
+box on an old binary is visible from the brain. The trailer is metadata for that view; no
+merge decision reads it. A watcher pass writes its receipt with `kind: "watch"` (a
+hook-driven `sync --once` stays `"once"`), so a push is attributable to the watcher.
 
 **`sync --watch`** is one singleton watcher per PC, not one per session. It holds
 `watch.lock`, wakes on the dirty marker through a filesystem watch, and holds no
@@ -347,12 +435,20 @@ option through `sh -c` and asserts ssh receives the exact path.
 shipped rules (orphan, dangling, dup-slug, long-line, oversized-file, budget
 findings, `compactor-starved`, `compactor-unproductive`) and adds `resurrected` and
 `conflict-in-history`, which it reads from the sync receipts and reports with the
-losing commit id so the loser is recoverable. `compactor-silent` is parameterised:
+losing commit id so the loser is recoverable, and `unparsed-pointer` (counted as
+`counts.unparsed_pointer`). **Findings age out**: receipt-derived findings older than
+7 days are dropped, a `resurrected` path whose file is no longer in the store (healed by
+a later pass) is dropped unless a first-join quarantine copy still waits for a decision,
+repeat rows for one path count once, and a store with no receipt in 7 days reports no
+`last_status`. The hub's own checkout is linted every night by the judge wrapper (see
+*judge-apply*), so it no longer freezes while the PCs are the only callers. `compactor-silent` is parameterised:
 on a PC the finding does not exist, because there is no local nightly to be silent;
 on the hub `--nightly-unit` names the systemd timer. The G7 clock - hours over
 trigger without an applied decision - comes from `.ams/over-trigger.json`, which
 rides in the synced tree outside every store. `derive` and `sync` write it; lint
-only reads it.
+only reads it. A store is over trigger on bytes **or** lines (`store.OverTrigger`:
+20,000 B or 160 lines); the clock once tested bytes only, so a store at 176 lines and
+19 KB had no clock at all.
 
 **A cleared clock stays cleared.** The reducer takes the earliest crossing any PC
 saw, but a clear is an ABSENCE, and a union-of-keys minimum could never represent
@@ -465,7 +561,7 @@ uses, so what may be judged and what may be applied are one implementation.
 | round-trip | the rewritten line must re-parse to the same slug set; a markdown link in a hook injects a phantom slug hygiene can never remove |
 | the seal | `sealed-lines.json` — one judge rewrite per line, ever |
 | write-then-verify | a fact file is deleted only after a byte-equal read-back **by id**; an unverifiable write is undone, and a record the server reports as deduplicated is never deleted |
-| blast cap | at most 20 % of the entries may be removed in one run, not counting dangling pointers to facts the history says were migrated or deleted on purpose; `--max-migrations` (default 5) additionally bounds the judge's own migrations |
+| blast cap | at most 20 % of the entries may be removed in one run, not counting dangling pointers to facts the history says were migrated or deleted on purpose; `--max-migrations` (default 5) additionally bounds the judge's own migrations; the nightly wrapper passes 15 for a store over the compaction trigger (below) |
 | protected-set overflow | when doctrine alone exceeds the budget the run reports `protected-set-overflow` and stops rather than loosen the hard rule |
 | the 20 h window | one judge attempt per store, computed from `judge_called` in the receipts ledger, never from a timer or a stamp file; `--force` bypasses that and nothing else |
 
@@ -480,6 +576,63 @@ is already synced to every PC. When a slug re-appears later, derive's harvest st
 looks it up (`git log --grep`, fails closed) and writes `migrated: <id>` into the
 new file, so the judge updates the existing record by id instead of adding a
 near-duplicate every night.
+
+**Update by id.** That consumer is implemented: `Mem0Client.Update` is
+`PUT /v1/memories/{id}` (the server takes the text and carries the record's payload
+over), and the MIGRATE branch reads the stamp. When the stamped id exists the record is
+updated, read back by id and verified byte-equal (`Landed`) like an add; the receipt
+maps the slug to that id and `judge-apply --json` counts it in `updated`. A stamp whose
+record is gone falls back to a plain add. An update the corpus refuses, or a stamped
+record that cannot be read, **keeps the line and does not fall back to an add** - a
+refused update followed by an add is the second record this exists to prevent - and
+counts as a write failure. An updated record is never deleted by an undo: it is not this
+run's to remove. The stamp names an id, not an owner: a server-deduplicated add keeps a
+PRE-EXISTING record's id and derive stamps it like any other, so before a PUT the judge
+reads the record's `source` and updates it only when it is exactly this slug's
+`automemory:<workspace>/<slug>` tag. A record of any other source (an operator fact with
+none, another slug's identical text) is left untouched and the fact is added as its own
+record.
+
+**Brand.** `--brand-map <path>` loads the operator's `brands.json` (contract C3, resolver
+in `internal/brand`, shared corpus `tests/fixtures/brand-routing-cases.jsonl` run by every
+resolver) and a migrated fact carries `brand` in its metadata when it resolves: the first
+`rules` pattern matching the workspace slug decides; otherwise, for a
+`content_rule_workspaces` match, exactly one distinct brand across the `content_rules`
+over the fact body decides and zero or several decide nothing. Path separators are one
+character to the matcher: the slug (or path) has each backslash, slash and space read as
+`-`, and the same literals in a `rules` or `content_rule_workspaces` pattern are read
+that way too, so a rule written `projects/client-a` finds a Windows path, a Unix path and
+the hyphenated slug alike (the Python and PowerShell resolvers do the same, and the shared
+corpus pins it); `content_rules` match the fact body as written. A brand listed in
+`shared_brands` is written as-is - making it visible to every scope is the admission
+gate's job. A missing, empty or malformed map is brand-neutral and never an error.
+
+**Counts and the nightly wrapper.** `judge-apply --json` reports `offered` (migration
+candidates the store presented), `migrated`, `updated` and `add_failed` (corpus writes -
+add or update - that failed, including "no corpus client configured" and a write the
+corpus accepted with an id but that failed its read-back, whether the record was then
+removed or could not be). The chain step's
+wrapper `scripts/wsl/ams-store-judge-apply.sh` sums them and writes the step outcome
+(contract C1) when the chain exports `AMS_OUTCOME_FILE`: one line
+`<status>[:<reason>] {"stores","offered","migrated","add_failed","updated","actionable","unparsed_pointer"}`.
+A night that offered migrations, migrated none and had write failures reads
+`degraded:add-failed-<n>`. The run still exits 0 - failing closed on a transient embedder
+outage is intended, and turning the chain red would delay every step after it - so the
+outcome is where the outage becomes visible instead of a green receipt (the 2026-09-24
+night: 69 offered, 0 migrated, receipt ok). After the apply and the closing sync the
+wrapper runs `ams-store lint --summary-out` on the hub checkout and adds the
+`actionable` and `unparsed_pointer` counts, so the brain's index health is checked every
+night. The wrapper takes the brand map from `MEM0_BRAND_MAP` (or `stack.env`) and echoes
+each store's `--json` result to the journal.
+
+**The migration cap is per trigger (P5-6, decided 2026-09-29).** The default cap of 5
+migrations per store per night was measured against the largest store, whose inflow
+exceeded 5 a night: it reported "40 over-cap, 40 pullable offered" every night and never
+converged, while a smaller store did. The wrapper therefore passes `--max-migrations 15`
+for a store over the compaction trigger (20,000 B or 160 lines) and keeps 5 for every
+other store. The blast cap still bounds every run and the line floor still bypasses the
+migration cap; the decision is pinned by the wrapper harness
+(`mem0-server/tests/test_ams_store_judge_wrapper.py`).
 
 ## Build and test
 
