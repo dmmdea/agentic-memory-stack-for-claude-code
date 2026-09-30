@@ -97,7 +97,7 @@ mem0 :18791
 
 ### The fail-open PreCompact contract
 
-`stop-extract.ps1` is fire-and-forget: it reads the hook JSON from stdin, and **exits 0 immediately** after spawning the detached worker, so Claude Code's session-close and compaction paths are never blocked. For `PreCompact` specifically, it first copies the transcript to a `precompact-snap-<PID>.jsonl` snapshot **before** compaction can mutate it, and dispatches the extractor against that snapshot (so the pre-compaction turns are still available to extract). The worker `l1a-extract.ps1` "runs detached, exits 0 always (best-effort, never blocks Claude Code)." Nothing on this path can fail loudly enough to affect the user.
+`stop-extract.ps1` is fire-and-forget: it reads the hook JSON from stdin, and **exits 0 immediately** after spawning the detached worker, so Claude Code's session-close and compaction paths are never blocked. For `PreCompact` specifically, it first copies the transcript to a `precompact-snap-<PID>.jsonl` snapshot **before** compaction can mutate it, and dispatches the extractor against that snapshot (so the pre-compaction turns are still available to extract). The snapshot's file name is not a session, so the spawner also passes the hook's own `session_id` (`-SessionId`, accepted only as a plain token) and the original transcript path (`-OriginTranscriptPath`): the worker keys the episode on the real session and reads workspace and brand from the real path, where it used to post every compaction under a phantom `precompact-snap-<PID>` session with neither. The worker `l1a-extract.ps1` "runs detached, exits 0 always (best-effort, never blocks Claude Code)." Nothing on this path can fail loudly enough to affect the user.
 
 ### UserPromptSubmit injection (daemon + compiled client)
 
@@ -107,7 +107,7 @@ The **hard constraint** is that the daemon is an **accelerator, never a dependen
 
 The daemon (`mem0-hook-daemon.ps1`) stays resident (single instance via a named mutex; self-shutdown after 2h idle), pays the .NET HTTP init once, keeps the loopback connection warm, and serves `POST /v1/context/bundle` + block rendering. A `lib_hash` (SHA256 over the deployed lib **and** the daemon script) rides every response; a mismatch after a redeploy makes the client shut the stale daemon down so the next prompt starts a fresh one.
 
-**`cold-embedder` (v1.22).** The embedder behind the authority unloads after five idle minutes and needs a few seconds to come back; the server answers such a bundle with `503` + `Retry-After` and `reason: cold-embedder` (see `embedder_503.py`). The daemon names that condition instead of a generic `bundle_failed`, waits the smaller of `Retry-After` and 3 s, retries the bundle once and reports `cold-embedder retried=1 ok=<bool>` in its diag; every other failure keeps the fail-open path unchanged. The SessionStart hook additionally fires a detached, non-blocking `GET /health/embedder` on the authority (resolved from `~/.mem0/authority-url`, else `MEM0_URL`) so the first prompt of a session finds the embedder warm.
+**`cold-embedder` (v1.22).** The embedder behind the authority unloads after five idle minutes and needs a few seconds to come back; the server answers such a bundle with `503` + `Retry-After` and `reason: cold-embedder` (see `embedder_503.py`). The daemon names that condition instead of a generic `bundle_failed`, waits the smaller of `Retry-After` and 3 s, retries the bundle once and reports `cold-embedder retried=1 ok=<bool>` in its diag; every other failure keeps the fail-open path unchanged. The SessionStart hook additionally fires a detached, non-blocking `GET /health/embedder?warm=rerank` on the authority (the embedder embed, then a one-document rerank, since both support models unload after five idle minutes) (resolved from `~/.mem0/authority-url`, else `MEM0_URL`) so the first prompt of a session finds the embedder warm and the first deliberate search finds the reranker warm.
 
 ### The nightly consolidator (dream)
 
@@ -223,7 +223,7 @@ The daemon's named pipe is ACL'd to the current user only (inherited ACEs droppe
 ## Observability and debugging
 
 - **Logs:** `l1a.log` (extraction), `hook-daemon.log` (daemon ops), `codex-usage.jsonl` (Codex spend).
-- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew).
+- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew). The counters are per server process (since the last restart). The SessionStart enrichment call (`20.0`) and the dream's canonical search (`17.0`) stamp the version too, but `missing` is still polluted: the retrieval-drift guard's snapshot searches (about 28 a night, run from a private evaluation repo) do not stamp yet, so a nonzero `missing` is not by itself a hook regression. Open follow-up: once that repo sends the same `hook_contract_version` field, a nonzero `missing` becomes a real regression signal; until then read it as a floor, not an alarm.
 - **Staleness:** the `lib_hash` handshake makes a stale-daemon-after-deploy self-correct on the next prompt.
 - **`Test-MemoryStack.ps1`** (R9) hashes `mem0-hook-client.cs` and checks the exe is fresh against it.
 

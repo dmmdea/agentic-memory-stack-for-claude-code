@@ -11,6 +11,9 @@ EXEC = REPO_ROOT / "scripts" / "wsl" / "ams-canonize.sh"
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _home(tmp_path, role, brain_ssh="fakebrain"):
     (tmp_path / ".mem0").mkdir(exist_ok=True)
     (tmp_path / ".mem0" / "role").write_text(role + "\n", encoding="utf-8")
@@ -33,7 +36,7 @@ def _run(script, home, path_prefix, *argv):
     # the first run of this test signed a real PATCH against production (401 only because the API
     # key was fake). Never again.
     rt = Path(home) / "runtime"; rt.mkdir(exist_ok=True)
-    env = {"HOME": str(home), "PATH": f"{path_prefix}:{os.environ['PATH']}",
+    env = {**home_env(home, base={}), "PATH": f"{path_prefix}:{os.environ['PATH']}",
            "XDG_RUNTIME_DIR": str(rt), "MEM0_URL": "http://authority.invalid:1"}
     return subprocess.run(["bash", str(script), *argv], env=env, capture_output=True, text=True)
 

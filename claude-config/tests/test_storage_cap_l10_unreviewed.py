@@ -15,6 +15,7 @@ suite runs in the WSL gate env.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -25,7 +26,10 @@ SCRIPT = Path(__file__).parent.parent / "storage-cap-check.sh"
 def _run_with_fake_home(home: Path) -> str:
     res = subprocess.run(
         ["bash", str(SCRIPT)],
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "CLAUDE_CWD": "/tmp"},
+        # HOME plus the Windows variables, so no platform resolves ~ to the real profile.
+        env={"HOME": str(home), "USERPROFILE": str(home),
+             "HOMEDRIVE": os.path.splitdrive(str(home))[0], "HOMEPATH": os.path.splitdrive(str(home))[1],
+             "PATH": "/usr/bin:/bin", "CLAUDE_CWD": "/tmp"},
         capture_output=True, text=True, timeout=60,
     )
     assert res.returncode == 0, f"script must always exit 0: {res.stderr}"

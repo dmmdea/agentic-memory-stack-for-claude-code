@@ -130,7 +130,8 @@ v0.17 Phase A closes all three side doors by wiring the same HMAC credential req
 | canonical | PUT (update text) | HMAC user-direct token (format 2) |
 | canonical | DELETE | HMAC user-direct token (format 2) |
 | canonical | PATCH /metadata | HMAC user-direct token (format 2) |
-| canonical | PATCH /tier (promote/demote/re-promote) | HMAC user-direct token (format 2, action `promote`, since v0.19 G); nonce-less format-1 **rejected since v0.20 G** (403) |
+| canonical | PATCH /tier (re-promote) | HMAC user-direct token (format 2, action `promote`, since v0.19 G); nonce-less format-1 **rejected since v0.20 G** (403) |
+| canonical | PATCH /tier (demote to any lower tier) | HMAC user-direct token (format 2, action `demote`); `mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence\|stable\|temporal]`. Before this gate an API-key holder could demote a canonical record and then PUT or DELETE it with no token (the side doors above only guard a record while it is canonical) |
 | insight | PUT | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
 | insight | DELETE | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
 | insight | PATCH /metadata | actor ∈ INSIGHT_ALLOWED_ACTORS OR HMAC user-direct (format 2) |
@@ -149,8 +150,8 @@ Status: **rejected.** A tier promotion without `X-User-Direct-Nonce` → 403 `"X
 ```
 <ts>|<nonce>|<action>|<memory_id>|<reason>
 ```
-where action ∈ {promote, put, delete, patch_metadata, merge_goals}
-Used by: `bash mem0-canonize.sh [<no flag → promote> | --action put|delete|patch_metadata] <mid> "<reason>"` (the CLI generates the uuid4 nonce and sends it as `X-User-Direct-Nonce`)
+where action ∈ {promote, demote, put, delete, patch_metadata, merge_goals}
+Used by: `bash mem0-canonize.sh [<no flag → promote> | --action put|delete|patch_metadata|demote] <mid> "<reason>"` (the CLI generates the uuid4 nonce and sends it as `X-User-Direct-Nonce`)
 Validated by: `security_invariants.validate_hmac_user_direct()` called from the respective endpoint. The v0.17 no-nonce variant (`<ts>|<action>|<memory_id>|<reason>`) is no longer accepted (v0.18 MED-7).
 
 **Format-2 promote (v0.19 Phase G)** — PATCH /tier canonical promotion:
@@ -175,6 +176,9 @@ bash mem0-canonize.sh --action delete <mid> "<reason>"
 
 # Patch metadata on a canonical record (v0.17 new):
 bash mem0-canonize.sh --action patch_metadata <mid> "<reason>" --metadata-json '{"key": "value"}'
+
+# Move a record out of canonical (session 12; default target evidence, canonical refused):
+bash mem0-canonize.sh --action demote [--tier evidence|stable|temporal] <mid> "<reason>"
 ```
 
 The CLI is the **single signing surface**. Never manually construct the HMAC + curl — the CLI ensures the signed payload format matches what the server expects.
@@ -188,11 +192,13 @@ All new gate logic lives in `mem0-server/security_invariants.py`. Key exports:
 - `validate_insight_actor(actor, token, ts, memory_id, action, reason)` — insight allowlist OR HMAC
 - `assert_writable(client, collection_name, memory_id, action, token, ts, actor, reason)` — policy matrix orchestrator
 
-The PATCH /tier gate routes through `security_invariants.validate_hmac_user_direct()` (format 2, action `promote`) for every canonical promotion (v0.19 G). v0.20 Phase G removed the nonce-less format-1 inline gate from app.py — a promotion without `X-User-Direct-Nonce` is rejected 403 before any validation, and the `warn_deprecated_format1_tier_promotion` helper was retired with it.
+The PATCH /tier gate routes through `security_invariants.validate_hmac_user_direct()` (format 2, action `promote`) for every canonical promotion (v0.19 G), and (session 12) with action `demote` for every move out of canonical; `tier_change_hmac_action(current, target)` decides which, from a fail-closed tier read. v0.20 Phase G removed the nonce-less format-1 inline gate from app.py — a promotion without `X-User-Direct-Nonce` is rejected 403 before any validation, and the `warn_deprecated_format1_tier_promotion` helper was retired with it.
 
 ### TOCTOU note (accepted risk, v0.18+)
 
 `fetch_current_tier` and the actual mutation are not a single atomic Qdrant operation. A theoretical race exists where tier changes between the fetch and the mutation. This is accepted risk for v0.17: exploiting it requires both the regular API key AND the canonical-key simultaneously — an attacker with both could edit the record directly. v0.18+ may address this with optimistic locking.
+
+The asymmetry since session 12: PATCH `/tier` re-reads the tier under the record's write lock (`_mid_write_lock`) and answers `409` when a record it saw as non-canonical became canonical in between, so an unsigned tier change cannot land on a record promoted mid-flight. PUT and PATCH `/metadata` still check the tier before taking that lock, and DELETE does not take it; that window stays the accepted risk above.
 
 ---
 
@@ -329,7 +335,7 @@ Fetch the record and read `metadata.source_memory_ids`. These are the evidence r
 
 ### Step 3 — Decide: demote or delete
 
-**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token — only canonical promotions need it. The MCP shim's `memory_demote` works for this:
+**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token. Moving a record into or out of `canonical` does: promotion signs `promote`, demotion signs `demote` (`mem0-canonize.sh --action demote`); `memory_demote` from the MCP shim is refused on a canonical record (400 without a reason, 403 with one). The MCP shim's `memory_demote` works for this:
 
 ```python
 memory_demote(memory_id="<id>", tier="evidence", reason="bad insight: <reason>")

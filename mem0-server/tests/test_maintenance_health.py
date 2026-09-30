@@ -38,7 +38,8 @@ def test_steps_report_last_success_and_stale(tmp_path):
 def test_pool_alarm_at_85_pct(tmp_path):
     p = _receipts(tmp_path, [])
     out = mh.build(p, NOW, pool_reader=lambda: (85, 15), boots_reader=lambda: [], judge_transport=lambda: "none")
-    assert out["pool"] == {"used_pct": 85.0, "alarm": True, "threshold_pct": 85}
+    assert out["pool"] == {"used_pct": 85.0, "alarm": True, "threshold_pct": 85,
+                           "health": "unknown", "health_alarm": False}   # no health reader wired: unknown, not an alarm
     assert out["ok"] is False
     out = mh.build(p, NOW, pool_reader=lambda: (84, 16), boots_reader=lambda: [], judge_transport=lambda: "none")
     assert out["pool"]["alarm"] is False and out["ok"] is True

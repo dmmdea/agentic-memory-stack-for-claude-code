@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 # ams-step.sh [--guard] <step> <cmd...> — run one chain step and receipt it (spec §4/§9).
 # Receipt: ~/.mem0/maintenance/receipts.jsonl, one line per run:
-#   {ts, step, ok, exit, duration_ms, receipt_id, note}
+#   {ts, step, ok, status, exit, duration_ms, receipt_id, note, work}
+# OUTCOME CONTRACT (C1): the job gets $AMS_OUTCOME_FILE and MAY write ONE line to it,
+#   <status>[:<reason>] <json-object-of-counts>      status = ok | degraded | failed
+# e.g. `degraded:posted-0-of-3 {"consolidated":3,"posted":0}`. Exit 0 says the process finished, not
+# that it did its job; the outcome line says the second thing:
+#   exit != 0                  -> ok:false status:failed, note = stderr tail
+#   exit 0 + failed:<reason>   -> ok:false status:failed exit:0, note = reason (never stamps the chain)
+#   exit 0 + degraded:<reason> -> ok:true  status:degraded, note = reason
+#   exit 0 + no line, or ok    -> ok:true  status:ok
+# `work` is the counts object ({} when absent). Text that is not `<status>[:reason] [{json}]` reads
+# degraded with note `outcome-unparsable: <first 120 chars>`. When the note would otherwise be empty
+# and the status is not ok, the job's LAST stdout line is the note: the journal drops stdout lines
+# that carry no unit attribution, so the receipt has to hold that evidence itself.
 # --guard: the chain's boot guard — when last-chain-success is newer than the most recent scheduled
 #          boundary (AMS_CHAIN_SCHEDULE, default 03:00 local) the step is a no-op with a receipt that
 #          says so (OnBootSec=15min would otherwise re-run a night that completed). Calendar-aware
@@ -32,9 +44,54 @@ dir="$HOME/.mem0/maintenance"; mkdir -p "$dir"
 rp="$dir/receipts.jsonl"; stamp="$dir/last-chain-success"
 rid="$step-$(date -u +%Y%m%dT%H%M%SZ)-$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
-receipt() {  # ok exit duration_ms note
-    printf '{"ts":"%s","step":"%s","ok":%s,"exit":%s,"duration_ms":%s,"receipt_id":"%s","note":%s}\n' \
+receipt() {  # ok exit duration_ms note   (the guard / weekly no-ops: status ok, no work)
+    printf '{"ts":"%s","step":"%s","ok":%s,"status":"ok","exit":%s,"duration_ms":%s,"receipt_id":"%s","note":%s,"work":{}}\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$step" "$1" "$2" "$3" "$rid" "$(printf '%s' "$4" | json_escape)" >> "$rp"
+}
+# finalize_receipt rc duration_ms outcome_file stderr_file stdout_file: resolve the outcome contract,
+# append the receipt line, print "true" when the step counts as a success (ok:true).
+finalize_receipt() {
+    python3 - "$rp" "$step" "$rid" "$@" <<'PY'
+import datetime as dt, json, re, sys
+rp, step, rid, rc, ms, outcome_f, err_f, out_f = sys.argv[1:9]
+rc = int(rc)
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+def last_line(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1][:200] if lines else ""
+status, reason, work, unparsable = "ok", "", {}, ""
+lines = [ln.strip() for ln in read(outcome_f).splitlines() if ln.strip()]
+if lines:
+    m = re.match(r"^(ok|degraded|failed)(?::(\S*))?(?:\s+(\{.*\}))?$", lines[-1])
+    parsed = None
+    if m:
+        try:
+            parsed = json.loads(m.group(3)) if m.group(3) else {}
+        except ValueError:
+            parsed = None
+    if m and isinstance(parsed, dict):
+        status, reason, work = m.group(1), (m.group(2) or "").strip(), parsed
+    else:
+        status, unparsable = "degraded", "outcome-unparsable: " + lines[-1][:120]
+if rc != 0:
+    status = "failed"
+    note = read(err_f)[-400:].rstrip(chr(10)) or last_line(read(out_f))
+else:
+    note = unparsable or reason
+    if status != "ok" and not note:
+        note = last_line(read(out_f))
+ok = rc == 0 and status != "failed"
+rec = {"ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "step": step, "ok": ok,
+       "status": status, "exit": rc, "duration_ms": int(ms), "receipt_id": rid, "note": note, "work": work}
+with open(rp, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+print("true" if ok else "false")
+PY
 }
 if [ -n "$WEEKLY" ]; then
     today="${AMS_STEP_TODAY:-$(date +%a)}"
@@ -79,17 +136,17 @@ fi
 # shipped on Ubuntu 26.04 ignores the width and prints nanoseconds (first live chain run
 # receipted 1,834,879,975 ms for a 2 s step).
 t0=${EPOCHREALTIME//[!0-9]/}
-err="$(mktemp)"
+err="$(mktemp)"; outlog="$(mktemp)"; AMS_OUTCOME_FILE="$(mktemp)"; export AMS_OUTCOME_FILE
 # stderr is captured synchronously, then echoed: a `2> >(tee …)` substitution is not waited
 # for and the receipt read raced it (review 2026-09-10: 2 of 5000 lines landed in the note).
-"$@" 2>"$err"; rc=$?
+# stdout goes through a plain pipe into tee, which IS waited for: it streams to the journal as
+# before and leaves a copy for the receipt (last line -> note when the outcome is not ok).
+"$@" 2>"$err" | tee "$outlog"; rc=${PIPESTATUS[0]}
 cat "$err" >&2
 ms=$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))
-if [ "$rc" -eq 0 ]; then
-    receipt true 0 "$ms" ""
+okflag="$(finalize_receipt "$rc" "$ms" "$AMS_OUTCOME_FILE" "$err" "$outlog")"
+if [ "$rc" -eq 0 ] && [ "$okflag" = true ]; then
     [ "$STAMP" = 1 ] && date +%s > "$stamp"
-else
-    receipt false "$rc" "$ms" "$(tail -c 400 "$err")"
 fi
-rm -f "$err"
+rm -f "$err" "$outlog" "$AMS_OUTCOME_FILE"
 exit "$rc"

@@ -38,6 +38,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _make_handler(bound_collection: str, egemma_points: int, egemma_status: str,
                   embedder_dim: int):
     """Stub server that mimics mem0 /health/deep and Qdrant /collections/<name>.
@@ -93,7 +96,7 @@ def _run_gate(tmp_path, bound_collection, egemma_points=2279, egemma_status="gre
             "EGEMMA_PRUNE_QDRANT_URL": f"http://127.0.0.1:{port}",
             "EGEMMA_PRUNE_LOG": str(tmp_path / "prune.log"),
             "EGEMMA_PRUNE_AUDIT_FLAGS": str(tmp_path / "audit-flags.jsonl"),
-            "HOME": str(tmp_path),  # isolate snapshot dir / self-disable from the real box
+            **home_env(tmp_path, base={}),  # isolate snapshot dir / self-disable from the real box
         }
         r = subprocess.run(
             ["bash", str(SCRIPT)],

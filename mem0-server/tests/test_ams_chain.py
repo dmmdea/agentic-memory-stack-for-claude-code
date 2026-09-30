@@ -2,7 +2,6 @@
 """One nightly chain on the authority (spec §4): timer → target, steps hang off it with
 WantedBy=/After= (never Requires=), each step runs through ams-step.sh which writes a receipt."""
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -28,6 +27,9 @@ CODEX = {"dream", "contradiction-sweep", "retrieval-pairs"}
 # Every step AFTER the stamping stack-backup step runs unguarded: the first v1.22.1 chain no-op'd
 # syncoid, pcloud-copy and morning-summary because their predecessor had just stamped the night.
 UNGUARDED = {"syncoid", "pcloud-copy", "morning-summary", "health-stamp", "rtcwake"}
+
+
+from _home_isolation import home_env  # noqa: E402
 
 
 def test_every_step_is_a_unit_in_chain_order():
@@ -92,7 +94,7 @@ def test_pcloud_copy_copies_the_newest_set_only(tmp_path):
             (b / f).write_text("x")
     dst = tmp_path / "pcloud"
     dst.mkdir()
-    env = dict(os.environ, HOME=str(home), MEM0_PCLOUD_DIR=str(dst))
+    env = dict(home_env(home), MEM0_PCLOUD_DIR=str(dst))
     r = subprocess.run([BASH, str(SCRIPTS / "ams-pcloud-copy.sh")], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr
     assert sorted(p.name for p in dst.iterdir()) == ["history-20260911-031903.db", "manifest-20260911-031903.json", "qdrant-20260911-031903.snapshot"]
@@ -117,7 +119,7 @@ def test_morning_summary_section_from_receipts(tmp_path):
         '{"ts":"2099-01-01T08:01:00Z","step":"pcloud-copy","ok":false,"exit":3,"duration_ms":12,"receipt_id":"z","note":"not a directory"}\n')
     (d / "health-maintenance.json").write_text('{"ok":true,"stale_steps":[],"pool":{"used_pct":78.0},"usage":{"used_percent":2}}')
     (d / "dream" / "gather.json").write_text('{"signals":[{"kind":"decision"}],"tokens":123,"dry_run":false}')
-    env = dict(os.environ, HOME=str(home), AMS_SUMMARY_NOW="2099-01-01T09:00:00Z")
+    env = dict(home_env(home), AMS_SUMMARY_NOW="2099-01-01T09:00:00Z")
     r = subprocess.run([BASH, str(SCRIPTS / "ams-morning-summary.sh")], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr
     t = (d / "morning-summary.md").read_text(encoding="utf-8")
@@ -145,7 +147,7 @@ def test_chain_units_exist_and_never_require():
 def _step(tmp_path, args, env_extra=None):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    env = dict(os.environ, HOME=str(home))
+    env = home_env(home)
     env.pop("MEM0_URL", None)
     env.update(env_extra or {})
     r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), *args], capture_output=True, text=True, env=env, timeout=60)

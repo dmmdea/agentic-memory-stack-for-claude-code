@@ -16,12 +16,22 @@
 #                       is sourced by bash), space-separated in older receipts; both work (required)
 #   MEM0_WIKI_PULL_KEY  the identity file                (default ~/.ssh/id_ed25519_wiki_pull)
 # Env overrides for tests and hand runs: WIKI_SOURCES, WIKI_PULL_KEY, WIKI_SNAPSHOT,
-# WIKI_MAX_STALE_H, WIKI_PY.
+# WIKI_MAX_STALE_H, WIKI_FRESH_H, WIKI_PY.
 #
-# Exit policy (receipted by ams-step.sh): pulled + built -> 0. No source reachable -> 0 while the
-# last successful pull is younger than WIKI_MAX_STALE_H (default 72 h; PCs are often off at
-# 03:00 and the chain catches up in the morning), 1 once it is older, so a real outage surfaces
-# in the morning summary instead of hiding behind a green night.
+# Freshness, not pull age: the index is as fresh as the NEWER of two brain stamps,
+# ~/wiki-index/last-pull (this script's pull, stamped only after its build succeeds) and ~/wiki-index/last-build (the last successful
+# build by EITHER path: this script, or a session's `wiki-index.sh build`). Nothing here retries
+# a missed night: a PC that was off at 03:00 is covered by its own session-side refresh (the
+# replica's SessionStart catch-up), and this step makes the aging visible instead of green.
+#
+# Exit policy (receipted by ams-step.sh; outcome contract C1 through AMS_OUTCOME_FILE):
+#   pulled + built                            -> exit 0, `ok`, last-pull and last-build stamped.
+#   pulled, build failed                      -> exit 1, no stamp moves (the index did not get the pages).
+#   no source reachable, freshness <= 24 h    -> exit 0, `ok`; each source's ssh exit and stderr
+#                                                ride in the outcome JSON.
+#   no source reachable, freshness > 24 h     -> exit 0, `degraded:no-source-fresh-<h>h`.
+#   no source reachable, freshness > WIKI_MAX_STALE_H (default 72 h), or no stamp ever recorded
+#                                             -> exit 1, so a real outage is red in the morning.
 set -u
 export LC_ALL=C
 
@@ -30,10 +40,12 @@ stack_val() { [ -s "$STACK_ENV" ] && sed -n "s/^$1=//p" "$STACK_ENV" | head -n1;
 
 SNAP="${WIKI_SNAPSHOT:-$HOME/wiki-index/wiki}"
 STAMP="$(dirname "$SNAP")/last-pull"
+BUILD_STAMP="$(dirname "$SNAP")/last-build"
 KEY="${WIKI_PULL_KEY:-$(stack_val MEM0_WIKI_PULL_KEY)}"
 KEY="${KEY:-$HOME/.ssh/id_ed25519_wiki_pull}"
 SOURCES="${WIKI_SOURCES:-$(stack_val MEM0_WIKI_SOURCES)}"
 MAX_STALE_H="${WIKI_MAX_STALE_H:-72}"
+FRESH_H="${WIKI_FRESH_H:-24}"
 PY="${WIKI_PY:-$HOME/apps/mem0-server/.venv/bin/python}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -50,36 +62,94 @@ if [ -z "${MEM0_EMBED_MODEL:-}" ]; then
 fi
 
 mkdir -p "$(dirname "$SNAP")"
-pulled=""
+
+# A JSON string body: control characters dropped, length capped at 200 bytes, then escaped. The cap
+# comes BEFORE the escaping so it can never split a backslash or quote pair (a lone trailing backslash
+# breaks the JSON), and `iconv -c` drops an incomplete or invalid UTF-8 sequence (a byte cap can cut a
+# multibyte character) so the outcome line stays valid UTF-8. LC_ALL=C keeps tr and head byte-wise.
+json_esc() {
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037' | LC_ALL=C head -c 200 \
+        | { iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true; } \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# One outcome line (contract C1) when the chain step asked for one; a hand run has no file.
+outcome() {
+    if [ -n "${AMS_OUTCOME_FILE:-}" ]; then printf '%s\n' "$1" > "$AMS_OUTCOME_FILE"; fi
+    return 0
+}
+
+# An epoch stamp, or 0 when the file is missing, empty or not a number.
+stamp_val() {
+    local v
+    v="$(cat "$1" 2>/dev/null || true)"
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    printf '%s' "$v"
+}
+
+pulled=""; pulled_n=0
+src_json=""
+errf="$SNAP.err"
 # Split on commas AND whitespace: the installer writes commas (1.31.1); a receipt written
 # before that, or a hand-typed WIKI_SOURCES, may still use spaces.
 read -r -a SOURCE_LIST <<< "${SOURCES//,/ }"
 for src in "${SOURCE_LIST[@]}"; do
     tmp="$SNAP.new"; rm -rf "$tmp"; mkdir -p "$tmp"
     # The remote word is ignored by the forced command; it documents intent in the ssh log.
-    if timeout 180 ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
-            -o StrictHostKeyChecking=accept-new "$src" wiki-tar 2>/dev/null \
-        | tar -C "$tmp" --strip-components=1 -xf - 2>/dev/null; then
+    # ssh's stderr is kept (host down, tailnet offline, sshd refusing and a forced-command
+    # failure all read differently) and so is ssh's own exit status, not tar's.
+    timeout 180 ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=accept-new "$src" wiki-tar 2>"$errf" \
+        | tar -C "$tmp" --strip-components=1 -xf - 2>/dev/null
+    rcs=("${PIPESTATUS[@]}")
+    ssh_rc="${rcs[0]}"; tar_rc="${rcs[1]}"
+    if [ "$tar_rc" -eq 0 ]; then
         n="$(find "$tmp" -name '*.md' | wc -l)"
         if [ "$n" -gt 0 ]; then
-            rm -rf "$SNAP"; mv "$tmp" "$SNAP"; date +%s > "$STAMP"
-            pulled="$src"; echo "wiki-index: pulled $n pages from $src"
+            rm -rf "$SNAP"; mv "$tmp" "$SNAP"
+            pulled="$src"; pulled_n="$n"; echo "wiki-index: pulled $n pages from $src"
             break
         fi
     fi
     rm -rf "$tmp"
-    echo "wiki-index: $src unreachable or empty" >&2
+    err_tail="$(tail -c 300 "$errf" 2>/dev/null | tr '\n\t' '  ' | sed -e 's/[[:space:]]*$//')"
+    echo "wiki-index: $src unreachable or empty (ssh exit $ssh_rc): $err_tail" >&2
+    src_json="$src_json${src_json:+,}{\"source\":\"$(json_esc "$src")\",\"exit\":$ssh_rc,\"stderr\":\"$(json_esc "$err_tail")\"}"
 done
+rm -f "$errf"
+
+now="$(date +%s)"
+last_pull="$(stamp_val "$STAMP")"
+last_build="$(stamp_val "$BUILD_STAMP")"
+fresh_last="$last_pull"; [ "$last_build" -gt "$fresh_last" ] && fresh_last="$last_build"
+fresh_age_s=$(( now - fresh_last ))
+fresh_age_h=$(( fresh_age_s / 3600 ))
 
 if [ -z "$pulled" ]; then
-    last="$(cat "$STAMP" 2>/dev/null || echo 0)"
-    age_h=$(( ( $(date +%s) - last ) / 3600 ))
-    if [ "$last" -gt 0 ] && [ "$age_h" -lt "$MAX_STALE_H" ]; then
-        echo "wiki-index: no wiki source reachable; index kept as-is (last pull ${age_h} h ago, limit ${MAX_STALE_H} h)"
-        exit 0
+    if [ "$fresh_last" -eq 0 ]; then
+        echo "wiki-index: no wiki source reachable and no pull or build has ever been recorded" >&2
+        exit 1
     fi
-    echo "wiki-index: no wiki source reachable and the last pull is ${age_h} h old (limit ${MAX_STALE_H} h)" >&2
-    exit 1
+    if [ "$fresh_age_s" -gt $(( MAX_STALE_H * 3600 )) ]; then
+        echo "wiki-index: no wiki source reachable and the index is ${fresh_age_h} h old (limit ${MAX_STALE_H} h)" >&2
+        exit 1
+    fi
+    echo "wiki-index: no wiki source reachable; index kept as-is (index is ${fresh_age_h} h old, limit ${MAX_STALE_H} h)"
+    work="{\"pulled\":0,\"fresh_age_h\":$fresh_age_h,\"sources\":[$src_json]}"
+    if [ "$fresh_age_s" -gt $(( FRESH_H * 3600 )) ]; then
+        outcome "degraded:no-source-fresh-${fresh_age_h}h $work"
+    else
+        outcome "ok $work"
+    fi
+    exit 0
 fi
 
 WIKI_ROOT="$SNAP" "$PY" "$DIR/wiki-index-build.py"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    # Both stamps move only once Qdrant has the pages: a pull whose build failed must not make the
+    # next skip night report a fresh index.
+    now_ok="$(date +%s)"; echo "$now_ok" > "$STAMP"; echo "$now_ok" > "$BUILD_STAMP"
+    outcome "ok {\"pulled\":$pulled_n,\"source\":\"$(json_esc "$pulled")\",\"fresh_age_h\":0}"
+fi
+exit "$rc"

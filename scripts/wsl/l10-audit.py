@@ -18,7 +18,9 @@ explicitly heuristic-only.
 """
 from __future__ import annotations
 import json
+import math
 import os
+import re
 import time
 import sys
 import datetime as dt
@@ -28,6 +30,16 @@ from typing import Any
 import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
+
+# S12: the possible-credential flag runs the server's redaction rules. redact.py lives in
+# mem0-server/ (repo layout: scripts/wsl/ -> <repo>/mem0-server; deployed: ~/apps/mem0-scripts/ ->
+# ~/apps/mem0-server). A missing module fails LOUD at import: silently falling back to the old
+# keyword tripwire would re-hide exactly the credentials this audit exists to surface.
+for _cand in (Path(__file__).resolve().parents[2] / "mem0-server", Path.home() / "apps" / "mem0-server"):
+    if (_cand / "redact.py").is_file():
+        sys.path.append(str(_cand))
+        break
+import redact  # noqa: E402
 
 MEM0_URL = ams_env.mem0_url()
 QDRANT_URL = "http://127.0.0.1:6333"
@@ -45,6 +57,11 @@ DURABILITY_DAYS_REPORT = 30  # memories older than this with no flags are report
 # dump from a path that bypassed the extractor — worth a flag. Still well under
 # the 4000 server cap.
 OVERSIZE_CHARS = 1200
+# S12: judge-migrated facts (source "automemory:*") are stored VERBATIM up to the migration cap
+# (ams-store internal/store/constants.go Mem0MaxChars = mem0-server MAX_MEMORY_CHARS), so the
+# 1200 line flagged them permanently (326 of 1264 oversize flags at audit time) and fed the
+# slow-drip thresholds. The cap is pinned to the Go constant by test_l10_audit.py.
+AUTOMEMORY_OVERSIZE_CHARS = 4000
 ONE_PAGE = 256
 
 # v0.17 F.2.7: slow-drip detection thresholds
@@ -142,18 +159,100 @@ def scroll_all_qdrant_points(client: httpx.Client) -> list[dict]:
     return points
 
 
+# --- possible-credential detector (S12) -------------------------------------------------------
+# Three independent signals, any one flags: (1) the shared redaction rule set (redact.py), minus
+# benign matches; (2) a provider-prefix tripwire looser than the rules' length quantifiers;
+# (3) a high-entropy token check. It replaced a six-keyword substring tripwire that flagged
+# env-var names and missed 10 of 11 real credential-bearing points.
+_PROVIDER_PREFIX_RE = re.compile(
+    r"(?-i:(?<![A-Za-z0-9])(?:sk-|sk_live_|sk_test_|pk_live_|rk_live_|whsec_|gh[pousr]_|github_pat_|"
+    r"glpat-|xox[baprs]-|nvapi-|hf_|npm_|vcp_|sbp_|cfut_|tskey-|AIza)[A-Za-z0-9_-]{12,})")
+_RANDOM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9/.\\])[A-Za-z0-9]{32,}(?![A-Za-z0-9])")
+# Entropy alone cannot separate secrets from identifiers at the 32-char floor: a random 32-char
+# base62 token measures only ~4.54 bits at the median (p10 4.37, capped at log2(32) = 5.0), while
+# English CamelCase ids reach 4.4-4.5 at 40-46 chars. A fixed 4.6 floor therefore caught ~39% of
+# exactly-32-char secrets (~90% at 40, ~99% at 48). So the entropy floor is low (4.2) and a second
+# statistic carries the separation: the class-transition ratio (share of adjacent character pairs
+# that change class among digit / UPPER / lower). Random base62 is ~0.62 (p10 ~0.5 at 32 chars);
+# CamelCase ids are ~0.27-0.46, because their words are lowercase runs. Measured (seeded, upper+
+# lower+digit tokens): flagged 94-98% at 32-64 chars; benign ids stay unflagged.
+ENTROPY_MIN_BITS = 4.2
+TRANSITION_MIN_RATIO = 0.48
+_BENIGN_VALUE_START = ("$", "<", "{", "%", "/", "~", "./", "../", "[REDACTED")
+_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+
+
+def _entropy_bits(s: str) -> float:
+    n = len(s)
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+def _class_transition_ratio(s: str) -> float:
+    def cls(ch: str) -> int:
+        return 0 if ch.isdigit() else (1 if ch.isupper() else 2)
+    if len(s) < 2:
+        return 0.0
+    return sum(cls(a) != cls(b) for a, b in zip(s, s[1:])) / (len(s) - 1)
+
+
+def _benign_generic_value(value: str) -> bool:
+    """A generic (`<label>: <value>`) rule match that is not a literal credential: an env-var or
+    shell reference (`$VT`), a path, a placeholder, an already-redacted marker, or an UPPER_SNAKE
+    env-var name. Family rules (sk-, ghp_, AKIA...) are never vetoed - their shapes are
+    unambiguous."""
+    v = value.strip().strip("\"'`")
+    return v.startswith(_BENIGN_VALUE_START) or bool(_ENV_NAME_RE.fullmatch(v))
+
+
+def has_credential(text: str) -> bool:
+    """True when `text` carries a literal credential shape. Advisory heuristic feeding a review
+    flag, so it favours the operator's time: benign env-var/path/nonce shapes do not flag."""
+    for key, value in redact.find_credentials(text):
+        if not key.startswith("pattern_") or not _benign_generic_value(value):
+            return True
+    if _PROVIDER_PREFIX_RE.search(text):
+        return True
+    for m in _RANDOM_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if (any(c.isdigit() for c in tok) and any(c.isupper() for c in tok)
+                and any(c.islower() for c in tok) and _entropy_bits(tok) >= ENTROPY_MIN_BITS
+                and _class_transition_ratio(tok) >= TRANSITION_MIN_RATIO):
+            return True
+    return False
+
+
+def flag_preview(payload: dict, limit: int = 120) -> str:
+    """The audit-flags.jsonl preview: REDACTED before truncated, so neither a credential nor the
+    head of one cut by the window is written into the flags file."""
+    return (redact.redact_secrets(payload.get("data") or "") or "")[:limit]
+
+
+def oversize_limit(payload: dict) -> int:
+    source = payload.get("source")
+    if isinstance(source, str) and source.startswith("automemory:"):
+        return AUTOMEMORY_OVERSIZE_CHARS
+    return OVERSIZE_CHARS
+
+
 def heuristic_flags(payload: dict) -> list[str]:
     """Cheap deterministic signals. No LLM, no priors, no Bayesian theater."""
     flags = []
     text = payload.get("data", "") or payload.get("memory", "") or ""
     if not isinstance(text, str):
         text = str(text)
+    if payload.get("retrievable") is False:
+        # v0.13 skips retired points to keep noise down; S12 scans them for the credential flag
+        # ONLY, because a retired point is still a readable row in every store and backup.
+        return ["possible-credential"] if has_credential(text) else []
     tlow = text.lower()
-    if len(text) > OVERSIZE_CHARS:
+    if len(text) > oversize_limit(payload):
         flags.append("oversize")
     if "ignore previous" in tlow or "ignore all previous" in tlow or "ignore the above" in tlow:
         flags.append("possible-injection")
-    if any(k in tlow for k in ("password:", "api_key:", "api-key:", "secret:", "bearer ", "private_key")):
+    if has_credential(text):
         flags.append("possible-credential")
     if not payload.get("source"):
         flags.append("missing-provenance")
@@ -201,9 +300,9 @@ def main():
             if not mid:
                 continue
 
-            # v0.13: skip records that were retired (retrievable=false) so they don't pollute the audit
-            if payload.get("retrievable") is False:
-                continue
+            # v0.13: retired records (retrievable=false) don't pollute the audit - heuristic_flags
+            # returns ONLY the credential flag for them (S12), and they are never durable candidates.
+            retired = payload.get("retrievable") is False
 
             # Incremental: skip if created before last audit AND we already saw it
             # (records that have aged in place still get re-considered for new flag types)
@@ -221,7 +320,7 @@ def main():
                     "audited_at": now,
                     "memory_id": str(mid),
                     "flag_type": flag_type,
-                    "preview": (payload.get("data") or "")[:120],
+                    "preview": flag_preview(payload),
                     "source": payload.get("source"),
                     "tier": payload.get("tier"),
                 }
@@ -230,7 +329,8 @@ def main():
 
             # Durable-candidate report (NOT auto-promoted)
             if (
-                payload.get("tier") == "evidence"
+                not retired
+                and payload.get("tier") == "evidence"
                 and payload.get("source") not in ("backfill-v012", None, "")
                 and created_dt is not None
                 and (now_dt - created_dt).days >= DURABILITY_DAYS_REPORT
