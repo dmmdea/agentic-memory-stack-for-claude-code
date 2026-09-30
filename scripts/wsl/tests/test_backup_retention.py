@@ -178,7 +178,11 @@ def qdrant(home):
 
 def _env(home: Path, qdrant: FakeQdrant | None = None, **extra) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("MEM0_", "AMS_"))}
-    env.update({"HOME": str(home), "MEM0_WIN_USER": "scratch", "LC_ALL": "C"})
+    # Every variable a platform resolves `~` from: HOME alone leaves a child that reads USERPROFILE
+    # (or HOMEDRIVE + HOMEPATH) writing into the real profile.
+    env.update({"HOME": str(home), "USERPROFILE": str(home),
+                "HOMEDRIVE": os.path.splitdrive(str(home))[0], "HOMEPATH": os.path.splitdrive(str(home))[1],
+                "MEM0_WIN_USER": "scratch", "LC_ALL": "C"})
     if qdrant is not None:
         env["MEM0_QDRANT_URL"] = qdrant.url
     env.update(extra)
