@@ -101,6 +101,8 @@ Output: `{"insights":["...", "..."]}`. Each insight posted to mem0 as:
 }
 ```
 
+The native (Python) dream also stamps `brand` when more than half of the cited memories carry the same non-shared brand, and none otherwise ([`brands.md`](./brands.md)). The brand is part of the metadata that is posted and, when the POST fails, spooled, so a spooled insight replays with it.
+
 ### Phase 3.5 — Autonomous canonical promotion
 
 After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second Codex call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task/imperative text) → sort by confidence → **cap at 3** → dedup against the existing canonical set.

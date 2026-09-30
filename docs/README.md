@@ -21,6 +21,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/memory-model.md`](./systems/memory-model.md) | The model the machinery serves: layers, tiers, query classes, the life of a memory |
 | [`systems/tier-policy.md`](./systems/tier-policy.md) | The trust-tier protocol and its server-side enforcement (the `403` boundary) |
 | [`systems/admission-gate.md`](./systems/admission-gate.md) | Retrieval admission policy — why a record isn't surfacing (hide reasons, query classes, forensics) |
+| [`systems/brands.md`](./systems/brands.md) | Brand routing: the brand map, shared brands, how facts and insights get a brand, and the audit + reviewed backfill |
 | [`systems/reconciliation.md`](./systems/reconciliation.md) | How the store stays honest: the sweeps, the two judges, verdict semantics, never-auto-hide + the review queue |
 | [`systems/model-aware-injection.md`](./systems/model-aware-injection.md) | Why the injected `[MEMORY CONTEXT]` block is scaled to the consuming model's tier |
 | [`systems/episodic.md`](./systems/episodic.md) | The SQLite + FTS5 episodic sidecar: session-level temporal records and schema |

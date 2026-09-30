@@ -51,6 +51,19 @@ channel.
      canonical+stable records, so the boundary enforced nothing unless the
      caller voluntarily passed a brand filter.
 
+   **Shared brands (C3).** A label listed in the brand map's `shared_brands`
+   (the file `MEM0_BRAND_MAP` names, else `~/.claude/scripts/brands.json`;
+   re-read when its mtime or size changes) or in `MEM0_SHARED_BRANDS` (process
+   environment first, then `~/.mem0/stack.env`; comma-separated,
+   case-insensitive; the two sources are unioned, and an explicitly empty
+   environment value clears only the `MEM0_SHARED_BRANDS` list) is written on the record as-is but treated as
+   brand-neutral here: the record is admitted for a brandless search and for
+   any other brand's search, exactly like a null-brand record, and the
+   brand-coherence floor skips it. An unlisted brand stays fail-closed, and a
+   search scoped to the shared label itself still rejects other brands'
+   records. Empty or unset = the behavior described above. See
+   [brands.md](./brands.md).
+
    Null/empty-string-brand records (legacy) are always admitted. With the
    v0.19 fail-closed default, the cross-brand leak is closed at the server
    boundary for brandless queries too; `allow_cross_brand` is the explicit,
@@ -223,6 +236,7 @@ previously omitted `schema_version`):
 | `created_at` missing | **fail-open** — admitted (recency check skipped) | nothing to compare |
 | unknown / missing / case-variant `query_class` | normalized then falls back to **durable** policy | single normalization at `apply_admission` (v0.19 L4/L8) |
 | brandless scope + brand-tagged record | **fail-closed** — `brand_scope_required` (v0.19 M4) | `allow_cross_brand` is the explicit opt-in |
+| record brand is listed in the brand map's `shared_brands` or `MEM0_SHARED_BRANDS` | **fail-open** — treated as brand-neutral | the operator declared the label visible to every scope (C3) |
 | audit log unwritable | **fail-open for availability** — WARN, search proceeds (v0.19 M6/M11) | audit must never break retrieval |
 | `superseded_by` truthy (durable/operational) | **fail-closed** — `superseded_by:<mid>` (v0.19 I.1) | the newer record should surface instead; `history` class admits |
 | `superseded_by` null/absent | **fail-open** — admitted | legacy data carries no supersession pointer |

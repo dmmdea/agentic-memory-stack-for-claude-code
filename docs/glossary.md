@@ -72,7 +72,7 @@ A **legacy**, switch-based offline approach (`travel-mode.ps1 on`/`off`) that re
 
 ## Brand
 
-The primary isolation scope stamped on a memory. The Admission Gate enforces it fail-closed: a brandless search returns only brand-neutral records and a branded search never leaks another brand's records (opt out only with an explicit `allow_cross_brand`). See [admission-gate.md](systems/admission-gate.md).
+The primary isolation scope stamped on a memory. The Admission Gate enforces it fail-closed: a brandless search returns only brand-neutral records and a branded search never leaks another brand's records (opt out only with an explicit `allow_cross_brand`). The Brand Map decides which brand a session, fact or insight gets; a Shared Brand label is treated as brand-neutral by the gate. See [admission-gate.md](systems/admission-gate.md) and [brands.md](systems/brands.md).
 
 ## Campaign
 
