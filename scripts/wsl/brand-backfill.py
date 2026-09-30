@@ -116,13 +116,20 @@ def _live(p: dict) -> bool:
 
 
 def propose(p: dict, brand_map) -> tuple[str | None, str | None]:
-    """(brand, rule) for one record, or (None, None): a path rule on its workspace/project first,
-    else exactly one brand's content rules over its text."""
+    """(brand, rule) for one record, or (None, None), by the C3 contract (brand_routing):
+    1. a path rule on its workspace, else on its project -> "path";
+    2. else, when its workspace or project is a content-rule workspace, or it carries no path at all
+       (nothing to route by), exactly one brand's content rules over its text -> "content";
+    3. else nothing: a record whose path routes nowhere outside the content-rule workspaces stays
+       brand-neutral, exactly as the live resolver leaves a new fact from that path."""
     pl = _payload(p)
-    path = str(pl.get("workspace") or pl.get("project") or "")
-    b = brand_routing.resolve(brand_map, path, "") if path else None
-    if b:
-        return b, "path"
+    paths = [str(v) for v in (pl.get("workspace"), pl.get("project")) if v]
+    for path in paths:
+        b = brand_routing.resolve(brand_map, path, "")
+        if b:
+            return b, "path"
+    if paths and not any(brand_routing.in_content_rule_workspace(brand_map, path) for path in paths):
+        return None, None
     b = brand_routing.resolve_by_content(brand_map, _text(p))
     return (b, "content") if b else (None, None)
 
@@ -188,9 +195,12 @@ def run_apply(store, brand_map, from_path: str) -> int:
         except Exception as e:  # noqa: BLE001 - one bad write must not stop the rest
             print(f"  FAILED {pid}: {e}", flush=True)
             failed += 1
+    # A native authority holds the key only inside a unit that loads its credential, and
+    # ams-canonize.sh is what starts that unit; mem0-canonize.sh run from a shell there finds no key.
+    signer = "ams-canonize.sh" if ams_env.stack_env().get("MEM0_HOST_KIND") == "native" else "mem0-canonize.sh"
     for h in hmac_rows:
         meta = json.dumps({"brand": h["proposed"]})
-        print(f"  HMAC ({h['tier']}): bash ~/apps/mem0-scripts/mem0-canonize.sh --action patch_metadata {h['id']} "
+        print(f"  HMAC ({h['tier']}): bash ~/apps/mem0-scripts/{signer} --action patch_metadata {h['id']} "
               f"\"brand backfill\" --metadata-json '{meta}'", flush=True)
     print(f"brand-backfill: {applied} applied, {refused} refused, {failed} failed, "
           f"{len(hmac_rows)} left for the HMAC path", flush=True)

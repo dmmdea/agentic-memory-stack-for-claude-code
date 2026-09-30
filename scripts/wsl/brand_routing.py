@@ -89,9 +89,15 @@ def resolve(brand_map, path: Optional[str], text: Optional[str] = "") -> Optiona
     for r in _entries(brand_map, "rules"):
         if isinstance(r, dict) and r.get("brand") and _matches(r.get("pattern"), hay, is_path=True):
             return str(r["brand"])
-    if any(_matches(p, hay, is_path=True) for p in _entries(brand_map, "content_rule_workspaces")):
+    if in_content_rule_workspace(brand_map, path):
         return resolve_by_content(brand_map, text)
     return None
+
+
+def in_content_rule_workspace(brand_map, path: Optional[str]) -> bool:
+    """True when the path matches a `content_rule_workspaces` pattern (resolution step 2)."""
+    hay = norm_path(path)
+    return bool(hay) and any(_matches(p, hay, is_path=True) for p in _entries(brand_map, "content_rule_workspaces"))
 
 
 def content_brands(brand_map, text: Optional[str]) -> set[str]:

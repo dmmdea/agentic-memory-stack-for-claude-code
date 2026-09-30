@@ -180,6 +180,42 @@ def test_dry_run_prefers_a_path_rule_over_content(tmp_path):
     assert row["proposed"] == "brand-a" and row["rule"] == "path"
 
 
+CONTRACT_MAP = {
+    "rules": [{"pattern": "projects/clienta", "brand": "brand-a"}, {"pattern": "shopclick", "brand": "brand-a"}],
+    "content_rule_workspaces": ["projects/mixed"],
+    "content_rules": [{"pattern": "alpha-store", "brand": "brand-a"}, {"pattern": "beta-shop", "brand": "brand-b"}],
+}
+
+
+def test_dry_run_gives_no_content_brand_to_a_path_outside_the_content_workspaces(tmp_path):
+    """C3 step 3: a record whose path routes nowhere, outside the content-rule workspaces, stays
+    brand-neutral. Content rules run only in a content-rule workspace or for a record with no path
+    (s12: the first live run content-tagged records from unrelated workspaces)."""
+    bf = _load("brand_backfill", "brand-backfill.py")
+    store = FakeStore([
+        _pt("o1", "beta-shop checkout uses a flat rate", workspace="g--My-Drive-Projects-Other"),
+        _pt("m1", "beta-shop checkout uses a flat rate", workspace="g--My-Drive-Projects-Mixed"),
+        _pt("n1", "beta-shop checkout uses a flat rate"),
+    ])
+    out = tmp_path / "report.jsonl"
+    assert _dry(bf, store, out, CONTRACT_MAP) == 0
+    by = {r["id"]: r for r in _rows(out)}
+    assert "o1" not in by, "a non-routing path outside the content workspaces gets no content brand"
+    assert by["m1"]["proposed"] == "brand-b" and by["m1"]["rule"] == "content"
+    assert by["n1"]["proposed"] == "brand-b" and by["n1"]["rule"] == "content"
+
+
+def test_dry_run_tries_the_project_when_the_workspace_does_not_route(tmp_path):
+    """The workspace used to shadow the project: a record from a non-routing workspace whose
+    project matches a rule fell through to the content rules and could get the wrong brand."""
+    bf = _load("brand_backfill", "brand-backfill.py")
+    store = FakeStore([_pt("q1", "beta-shop checkout", workspace="umbrella", project="shopclick-platform")])
+    out = tmp_path / "report.jsonl"
+    assert _dry(bf, store, out, CONTRACT_MAP) == 0
+    (row,) = _rows(out)
+    assert row["proposed"] == "brand-a" and row["rule"] == "path"
+
+
 def test_text_head_is_one_short_line(tmp_path):
     bf = _load("brand_backfill", "brand-backfill.py")
     store = FakeStore([_pt("l1", "alpha-store\n" + "x" * 400)])
@@ -243,6 +279,20 @@ def test_apply_never_patches_canonical_or_insight_and_prints_the_hmac_command(tm
     text = capsys.readouterr().out
     assert "mem0-canonize.sh --action patch_metadata k1" in text and "i1" in text
     assert "--metadata-json '{\"brand\": \"brand-a\"}'" in text
+
+
+def test_apply_on_a_native_authority_prints_the_signer_that_loads_the_key(tmp_path, home, capsys):
+    """A native authority holds the canonical key only inside a unit that loads its credential;
+    mem0-canonize.sh run from a shell there finds no key, ams-canonize.sh starts that unit."""
+    (home / ".mem0" / "stack.env").write_text("MEM0_HOST_KIND=native\n", encoding="utf-8")
+    bf = _load("brand_backfill", "brand-backfill.py")
+    store = FakeStore([_pt("k1", "alpha-store rule", tier="canonical")])
+    out = tmp_path / "report.jsonl"
+    _dry(bf, store, out)
+    assert bf.run_apply(store, BRAND_MAP, str(out)) == 0
+    text = capsys.readouterr().out
+    assert "bash ~/apps/mem0-scripts/ams-canonize.sh --action patch_metadata k1" in text
+    assert "mem0-canonize.sh" not in text
 
 
 def test_apply_refuses_a_brand_the_map_cannot_route(tmp_path, capsys):
