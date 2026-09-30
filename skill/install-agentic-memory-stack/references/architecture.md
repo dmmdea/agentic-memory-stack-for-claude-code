@@ -8,7 +8,7 @@ Read on demand from `SKILL.md`. The canonical, in-repo deep dive is `ARCHITECTUR
 |---|---|---|
 | `mem0-server` (`:18791`) | WSL systemd-user | FastAPI wrapper over mem0 2.0.4; also hosts the episodic/goals/open-questions SQLite sidecar + the admission gate + the canonical-key HMAC enforcement. |
 | Qdrant (`:6333`) | WSL systemd-user | Vector store. Collections: `mem0_egemma_768` (memories) + `episodes_egemma_768` (R4 episode embeddings). Loopback-bound. |
-| llama-swap (`:11436`) | WSL | Single local inference stack: **EmbeddingGemma-300m** (mem0's CPU embedder, 768-dim, multilingual) + **bge-reranker-v2-m3**. Loopback-bound. (Ollama decommissioned v0.22.) |
+| llama-swap (`:11436`) | WSL | Single local inference stack: **EmbeddingGemma-300m** (mem0's embedder, 768-dim, multilingual) + **bge-reranker-v2-m3**. Loopback-bound. (Ollama decommissioned v0.22.) |
 | Codex CLI | Windows | The subagent LLM for ALL LLM judgment — L1a extraction, nightly consolidation, the contradiction-sweep judge, the NLI write-gate. ChatGPT-subscription auth. Reached from WSL python via the loopback `codex-shim.ps1` HTTP shim (`:18792`). |
 | Claude Code hooks | Windows | Stop/PreCompact (extract), SessionStart (warm + caps), UserPromptSubmit (`[MEMORY CONTEXT]` injection via the resident named-pipe daemon), PreToolUse (audit gate). |
 

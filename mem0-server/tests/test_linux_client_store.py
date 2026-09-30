@@ -28,6 +28,9 @@ BIN = "/home/u/.local/bin/ams-store"
 HUB = "hub-host"
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def run_hooks(settings: Path, *extra, binary=BIN, hub=HUB):
     return subprocess.run(
         [sys.executable, str(HOOKS), "--settings", str(settings),
@@ -191,7 +194,7 @@ def test_the_replica_installer_forwards_the_hub_to_the_client(tmp_path):
     stub = binp / "claude"
     stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     stub.chmod(0o755)
-    env = dict(os.environ, HOME=str(home), PATH=f"{binp}:{os.environ.get('PATH', '')}")
+    env = dict(home_env(home), PATH=f"{binp}:{os.environ.get('PATH', '')}")
 
     r = subprocess.run(
         [BASH, str(replica), "--authority", "http://192.0.2.9:18791", "--brain-ssh", "nobrain",

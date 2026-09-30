@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import codex_shim_client as shim  # noqa: E402
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 def _client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
@@ -88,7 +91,7 @@ def test_judge_connection_error_is_unreachable():
 def test_judge_no_key_returns_no_key(monkeypatch, tmp_path):
     monkeypatch.delenv("MEM0_KEY", raising=False)
     # Point HOME at an empty dir so ~/.mem0/api-key does not exist.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     out = shim.judge("p")
     assert out["ok"] is False
     assert out["error_type"] == "no_key"

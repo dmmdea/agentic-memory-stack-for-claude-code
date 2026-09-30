@@ -23,6 +23,19 @@ sweep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweep)
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _tmp_locks(monkeypatch, tmp_path):
+    """The single-runner locks are real directories under ~/.mem0. A test that drives a run
+    without redirecting them takes (and releases) the host's lock, and returns 0 instead of the
+    result under test on any box where a live sweep holds it. Every test here gets its own."""
+    for name in ("REJUDGE_LOCK", "EVIDENCE_LOCK", "PAIRS_LOCK"):
+        monkeypatch.setattr(sweep, name, tmp_path / "locks" / name.lower())
+    (tmp_path / "locks").mkdir()
+
+
 @pytest.fixture(autouse=True)
 def _no_pair_cache(monkeypatch):
     """W5 ADOPT-4 isolation: the dispatch layer now consults the pair-verdict
@@ -923,8 +936,7 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
     fake_home = Path(tempfile.mkdtemp(prefix="sweep-fake-home-"))
     (fake_home / ".mem0").mkdir()
     (fake_home / ".mem0" / "api-key").write_text("test-key\n")
-    monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    apply_home(monkeypatch, fake_home)
     monkeypatch.setattr(sweep, "REJUDGE_LOCK", fake_home / ".mem0" / ".rejudge-stamped.lock")
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
     monkeypatch.setattr(sweep, "scroll_stamped", lambda http: records)
@@ -1411,3 +1423,29 @@ def test_zero_canonicals_run_is_degraded_in_the_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--judge", "codex"])
     assert sweep.main() == 0
     assert p.read_text(encoding="utf-8").startswith("degraded:no-op-zero-canonicals {")
+
+
+@pytest.mark.parametrize("var,attr", [
+    ("MEM0_REJUDGE_LOCK", "REJUDGE_LOCK"),
+    ("MEM0_EVIDENCE_LOCK", "EVIDENCE_LOCK"),
+    ("MEM0_PAIRS_LOCK", "PAIRS_LOCK"),
+])
+def test_lock_paths_are_overridable_from_the_environment(monkeypatch, tmp_path, var, attr):
+    """A run (or a test driving the script as a child) can point the mutex away from ~/.mem0."""
+    target = tmp_path / "elsewhere" / "lock"
+    monkeypatch.setenv(var, str(target))
+    spec = importlib.util.spec_from_file_location("contradiction_sweep_env", SCRIPT)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert getattr(fresh, attr) == target
+
+
+def test_lock_paths_default_to_the_home_mem0_dir(monkeypatch):
+    for var in ("MEM0_REJUDGE_LOCK", "MEM0_EVIDENCE_LOCK", "MEM0_PAIRS_LOCK"):
+        monkeypatch.delenv(var, raising=False)
+    spec = importlib.util.spec_from_file_location("contradiction_sweep_dflt", SCRIPT)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert fresh.REJUDGE_LOCK == Path.home() / ".mem0" / ".rejudge-stamped.lock"
+    assert fresh.EVIDENCE_LOCK == Path.home() / ".mem0" / ".evidence-sweep.lock"
+    assert fresh.PAIRS_LOCK == Path.home() / ".mem0" / ".retrieval-pairs.lock"

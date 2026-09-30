@@ -21,6 +21,9 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 WSL_ONLY = re.compile(r"/mnt/c|cmd\.exe|powershell\.exe|dpapi-fetch-key\.sh|/run/WSL")
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _run(args, tmp_path, secrets=True):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -29,8 +32,7 @@ def _run(args, tmp_path, secrets=True):
     if secrets:
         (sec / "ams-api-key.cred").write_bytes(b"x" * 64)
         (sec / "ams-canonical-key.cred").write_bytes(b"y" * 64)
-    env = dict(os.environ)
-    env["HOME"] = str(home)
+    env = home_env(home)
     r = subprocess.run([BASH, str(SCRIPT), *args, "--secrets-dir", str(sec)],
                        capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     return r, home
