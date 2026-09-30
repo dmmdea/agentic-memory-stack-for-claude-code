@@ -227,6 +227,24 @@ wsl -e bash -lc "~/apps/mem0-server/.venv/bin/python $shim < /dev/null"
 
 ---
 
+## "The banner says the write path is failing"
+
+The banner line `[AMS] brain NOT OK — write path failing (503 upstream since <time>)`, or `write_path.ok: false` on `/health/maintenance`, means the last memory write the server saw (`POST /v1/memories` or `PUT /v1/memories/{id}`) ended in a `5xx` and no write has succeeded since. The signal is **passive**: the server learns it from real write traffic and never probes, so it clears only when a write succeeds (a server restart also clears it, back to "no evidence yet"), and an hour of silence does not clear it. The fields and rules are in [systems/mem0-api.md](systems/mem0-api.md#get-healthmaintenance).
+
+```bash
+curl -s http://<authority>:18791/health/maintenance | jq '.write_path'          # ok, last_error, last_error_at, errors_1h, writes_1h
+journalctl --user -u mem0.service --since "1 hour ago" | grep -E "add failed|update failed" | tail -5   # what the failing writes raised
+curl -s http://127.0.0.1:11436/v1/models | jq '.data[] | select(.id | test("embedding"))'                # is the embedder listed, and loaded?
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv                                 # what else holds the card?
+```
+
+- **`503 upstream` (or `503 cold-embedder`):** the embedder cannot serve right now. The write routes report a dead embedder as `503 upstream`; `503 cold-embedder` is the same condition reaching the dedicated handler, so read the two alike. It is not resident and could not start, or llama-swap is down or rate-limiting. The usual cause is a co-resident process holding the GPU so the embedder has no room to load; check the embedder's residency first (the `/v1/models` listing above, and what `nvidia-smi` shows on the card). Free the card, or restart llama-swap as described under "mem0 returns 500" below.
+- **`500 upstream`:** an error the server does not recognise as an outage (a coding error, a context overflow). Read the `add failed` / `update failed` traceback in the journal.
+- **Hand check of the embedder:** `curl -s http://<authority>:18791/health/embedder` once. It embeds one token and therefore loads the model. Use it by hand, **never as a poll**: an uptime checker calling it (or `/health/deep`) every few minutes would keep the embedder resident and defeat the five-minute idle unload. Poll `/health/maintenance` instead, which reads only the tracker and costs nothing.
+- **After the fix,** the next successful write from any session clears the flag and the banner goes quiet. `errors_1h`, `last_error` and `last_error_at` keep the record of the outage.
+
+---
+
 ## "mem0 returns 500"
 
 ```bash
@@ -235,6 +253,8 @@ journalctl --user -u mem0.service -n 50
 curl http://127.0.0.1:6333/collections/mem0_egemma_768     # Qdrant collection healthy?
 curl -s http://127.0.0.1:11436/v1/models | grep -o embeddinggemma   # embedder being served?
 ```
+
+A write that failed with a `5xx` also shows on `/health/maintenance` as `write_path`: see "The banner says the write path is failing" above.
 
 - **Qdrant refused** → `systemctl --user restart qdrant.service`.
 - **Embedder refused / wrong dim** → llama-swap issue. **llama-swap is per-host: it may run as a WSL systemd-user unit OR as a Windows-native process** (mirrored networking makes `:11436` reachable either way, which masks the difference until restart time — find the owner before restarting):
