@@ -175,6 +175,15 @@ Describe 'Regression guards for the authority contract' {
         $gate | Should -BeGreaterThan 0 -Because 'the enabled-timer checks must sit inside a brain-role gate'
         $code | Should -Match 'NOT enabled \(replica, one-brain rule\)'
     }
+    It '3-verify tells only a brain that the nightly dream fires on this box (1.32.1)' {
+        $code = script:Get-CodeLines (Join-Path $script:repoRoot 'install\3-verify.ps1')
+        $i = $code.IndexOf('First dream-consolidate nightly run fires at 3:00 AM')
+        $i | Should -BeGreaterThan 0
+        $success = $code.LastIndexOf('ALL VERIFY CHECKS PASSED', $i)
+        $gate = $code.LastIndexOf("if (`$stackRole -eq 'brain')", $i)
+        $gate | Should -BeGreaterThan $success -Because 'the dream next-step must sit inside a brain-role gate within the success block'
+        $code | Should -Match 'the nightly dream and dedup run on the memory authority'
+    }
     It 'restore-replica refuses artifacts WSL cannot read and asserts the manifest count (v1.23.1)' {
         $code = script:Get-CodeLines (Join-Path $script:repoRoot 'scripts\travel\restore-replica.ps1')
         $code | Should -Match "test -r '\`$\(\`$pair\[1\]\)'"

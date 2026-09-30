@@ -183,6 +183,22 @@ def test_nft_persistence_unit_is_a_root_oneshot():
     assert "enable --now nftables.service" not in sh, "nftables.service would flush the iptables-nft tables"
 
 
+def test_the_nft_system_unit_is_never_rendered_as_a_user_unit(tmp_path):
+    """ams-nft.service is the root oneshot installed into /etc/systemd/system; the systemd/ams-*
+    glob used to render it into the user unit dir as well, where it sat disabled and useless. A
+    real install also removes the copy earlier installs left behind."""
+    assert (REPO_ROOT / "systemd" / "ams-nft.service").is_file()
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not (out / "ams-nft.service").exists()
+    units_line = next(line for line in r.stdout.splitlines() if "units:" in line)
+    assert "ams-nft.service" not in units_line
+    sh = SCRIPT.read_text(encoding="utf-8")
+    i = sh.index('render_units "$SYSTEMD_USER_DIR"')
+    assert 'rm -f "$SYSTEMD_USER_DIR/$NFT_UNIT"' in sh[i:i + 400]
+
+
 def test_l10_audit_gets_its_own_credential_dropin(tmp_path):
     """l10-audit runs on its own timer outside the chain; on v1.22.0 it exited 1 with
     'no mem0 API key' because only mem0.service and the chain steps loaded the credential."""
