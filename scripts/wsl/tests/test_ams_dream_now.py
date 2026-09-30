@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(BASH is None or os.name == "nt", reason="needs a
 FAKE_SYSTEMD_RUN = """#!/bin/bash
 printf '%s\\0' "$@" > "$FAKE_ARGV"
 printf '%s' "${XDG_RUNTIME_DIR:-}" > "$FAKE_ARGV.xdg"
+echo "FAKE-SYSTEMD-RUN-RAN" >&2
 exit "${FAKE_RC:-0}"
 """
 
@@ -67,14 +68,16 @@ class Box:
         fake.write_text(FAKE_SYSTEMD_RUN, encoding="utf-8")
         fake.chmod(0o755)
 
-    def run(self, *args, rc=0, xdg=None):
+    def run(self, *args, rc=0, xdg=None, merge=False):
         env = _home_env(self.home, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_ARGV=str(self.argv_file),
                         FAKE_RC=str(rc))
         for k in [k for k in env if k.startswith("MEM0_")] + ["XDG_RUNTIME_DIR"]:
             env.pop(k, None)
         if xdg is not None:
             env["XDG_RUNTIME_DIR"] = xdg
-        return subprocess.run([BASH, str(HELPER), *args], capture_output=True, text=True, env=env, timeout=60)
+        # merge=True: stderr into stdout, one stream, so the ORDER of the helper's lines and the fake's is visible
+        return subprocess.run([BASH, str(HELPER), *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT if merge else subprocess.PIPE, text=True, env=env, timeout=60)
 
     def argv(self):
         return self.argv_file.read_bytes().decode("utf-8").split("\0")[:-1] if self.argv_file.exists() else None
@@ -98,10 +101,10 @@ def test_the_exact_systemd_run_call(box):
     py = f"{home}/apps/mem0-server/.venv/bin/python"
     scripts = f"{home}/apps/mem0-scripts"
 
-    unit = argv[4]
+    unit = argv[3]
     assert re.fullmatch(r"--unit=ams-dream-now-\d{8}T\d{6}Z", unit), unit
-    assert argv[:4] == ["--user", "--pipe", "--wait", "--collect"]
-    assert argv[5:] == [
+    assert argv[:3] == ["--user", "--wait", "--collect"]
+    assert argv[4:] == [
         "-p", f"LoadCredentialEncrypted=ams-api-key:{sec}/ams-api-key.cred",
         "-p", f"LoadCredentialEncrypted=ams-canonical-key:{sec}/ams-canonical-key.cred",
         "-p", "Environment=MEM0_HOST_KIND=native",
@@ -152,6 +155,55 @@ def test_the_call_is_the_units_own_credentials_environment_and_command(box):
     assert " --guarded " in start
     tail = " ".join(argv[argv.index("_") + 1:])
     assert tail == start.replace(" --guarded ", " ") + " --force", (tail, start)
+
+
+# systemd-run flags that attach the unit's stdio to the caller's terminal or pipe
+STDIO_TYING_FLAGS = {"--pipe", "-P", "--pty", "-t", "--shell", "-S"}
+
+
+def test_the_dream_is_not_tied_to_the_operators_session(box):
+    """`--pipe` makes the unit's stdout the caller's pipe. The dream prints as it goes, so a dropped ssh
+    session, a closed laptop or a Ctrl-C closes that pipe and the dream's next print kills it mid-cycle
+    (measured on systemd 255 with a Python unit: `Main process exited, code=exited, status=120`, no
+    completion marker). On the real chain that is a partial cycle (insights posted, throttle unmarked)
+    and a `failed` `dream` receipt that turns /health/maintenance red. Without the stdio flags the
+    output goes to the journal exactly as the unit's does, `--wait` still returns the unit's exit
+    status, and the unit runs to completion after its client is gone (both measured on systemd 255;
+    the fake systemd-run here cannot prove either, only that nothing ties the stdio back)."""
+    box.run()
+    argv = box.argv()
+    assert not STDIO_TYING_FLAGS & set(argv), sorted(STDIO_TYING_FLAGS & set(argv))
+    assert "--wait" in argv, "the helper still waits, so the exit status is the unit's"
+    props = _properties(argv)
+    assert not [p for p in props if p.startswith(("StandardInput=", "StandardOutput=", "StandardError=", "TTYPath="))], props
+
+
+def test_the_follow_command_is_printed_before_the_wait_starts(box):
+    """Nothing streams to the terminal any more, so the operator needs the way to watch it BEFORE the
+    wait begins (the wait can last the dream's whole cycle)."""
+    r = box.run(merge=True)
+    assert r.returncode == 0, r.stdout
+    unit = box.argv()[3].split("=", 1)[1]
+    follow = f"journalctl --user -u {unit} -f"
+    assert follow in r.stdout, r.stdout
+    assert r.stdout.index(follow) < r.stdout.index("FAKE-SYSTEMD-RUN-RAN"), r.stdout
+    assert "keeps running" in r.stdout[:r.stdout.index("FAKE-SYSTEMD-RUN-RAN")], "say that a dropped session does not stop it"
+
+
+@pytest.mark.parametrize("rc", [0, 5])
+def test_on_completion_it_prints_the_units_result_and_where_the_dreams_verdict_is(box, rc):
+    """The unit's exit status says the run ended, not what the dream decided: a skip for the judge lock
+    or the quota gate exits 0 too. The verdict is the dream's own `dream:` lines."""
+    r = box.run(rc=rc, merge=True)
+    assert r.returncode == rc
+    unit = box.argv()[3].split("=", 1)[1]
+    tail = r.stdout[r.stdout.index("FAKE-SYSTEMD-RUN-RAN"):]      # only what is printed once the wait returned
+    assert f"{unit}.service" in tail and f"exit {rc}" in tail, tail
+    assert ("success" in tail) == (rc == 0), tail
+    assert ("failure" in tail) == (rc != 0), tail
+    assert f"journalctl --user -u {unit}" in tail and "dream:" in tail, tail
+    assert "~/.mem0/maintenance/logs/dream.log" in tail, tail
+    assert "receipts.jsonl" in tail, tail
 
 
 def test_a_dream_throttled_by_its_own_23_hour_rule_is_not_a_hand_run(box):
@@ -241,6 +293,31 @@ def test_the_user_bus_is_found_over_a_plain_ssh_command(box):
     assert (box.argv_file.parent / "argv.xdg").read_text(encoding="utf-8") == f"/run/user/{os.getuid()}"
     box.run(xdg="/run/user/4242")
     assert (box.argv_file.parent / "argv.xdg").read_text(encoding="utf-8") == "/run/user/4242"
+
+
+def _manual_dream_paragraph():
+    doc = (REPO_ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+    return next(p for p in doc.split("\n\n") if p.startswith("**Forcing a dream by hand.**"))
+
+
+def test_the_operations_doc_says_where_the_output_goes_and_what_a_hand_run_costs_the_next_night():
+    """The paragraph said the dream's output streams to the terminal (true only under --pipe), and said
+    nothing of the throttle a completed forced dream marks: `mark_throttle("dream")` is written at the
+    end of the cycle, so a hand run that ends after 04:00 leaves the next 03:00 dream less than 23 h
+    behind it, and that dream skips (`skipping: nightly throttle (23h) not yet elapsed`)."""
+    para = _manual_dream_paragraph()
+    assert "streams to your terminal" not in para
+    assert "journalctl --user -u ams-dream-now-<timestamp> -f" in para
+    assert "dream.log" in para and "`dream:`" in para
+    assert "after 04:00" in para and "23 h throttle" in para and "next 03:00" in para
+    assert "--pipe" not in para
+
+
+def test_the_helpers_header_says_what_a_hand_run_costs_the_next_night():
+    # the comment prose with the `# ` markers dropped and the line wrapping undone
+    header = " ".join(ln.lstrip("#").strip() for ln in HELPER.read_text(encoding="utf-8").splitlines()[:40] if ln.startswith("#"))
+    assert "after 04:00" in header and "next 03:00" in header
+    assert "keeps running" in header, "the header must say the unit outlives the session"
 
 
 def test_the_helper_is_deployed_with_the_chain_scripts():

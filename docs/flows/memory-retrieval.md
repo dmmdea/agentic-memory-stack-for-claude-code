@@ -27,7 +27,7 @@ Retrieval fires through four channels, each with its own trigger:
 
 ### Embedding: the prefix shim
 
-EmbeddingGemma-300m (llama-swap, CPU, 768-d) is **asymmetric**: queries and documents must be embedded with different task prefixes (`task: search result | query: …` vs `title: none | text: …`). Neither llama.cpp nor stock mem0 applies them — `egemma_embedder.py` is the shim, installed onto the mem0 embedding model at server start. This detail is load-bearing: an earlier EmbeddingGemma trial was *wrongly rejected* as worse-on-domain because the test predated the shim; with correct prefixes it beats the English-only predecessor decisively on the EN+ES corpus (ES recall@1 0.33 → 0.93; English at parity).
+EmbeddingGemma-300m (llama-swap, GPU, 768-d) is **asymmetric**: queries and documents must be embedded with different task prefixes (`task: search result | query: …` vs `title: none | text: …`). Neither llama.cpp nor stock mem0 applies them — `egemma_embedder.py` is the shim, installed onto the mem0 embedding model at server start. This detail is load-bearing: an earlier EmbeddingGemma trial was *wrongly rejected* as worse-on-domain because the test predated the shim; with correct prefixes it beats the English-only predecessor decisively on the EN+ES corpus (ES recall@1 0.33 → 0.93; English at parity).
 
 ### Hybrid scoring — and the trap every maintainer must know
 

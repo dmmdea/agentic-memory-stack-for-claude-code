@@ -6,7 +6,7 @@ WSL-native, no Docker. Backends:
   history of why this is NOT 'claude --print' (Anthropic Max OAuth concurrency
   block; verified failure documented in CHANGELOG.md).
 - Embedder: EmbeddingGemma-300m (multilingual EN/ES) via llama.cpp/llama-swap :11436
-  (CPU). Migrated from English-only nomic-embed-text in v0.22 (2026-06-13); full
+  (a GPU model, unloaded after 300 s idle). Migrated from English-only nomic-embed-text in v0.22 (2026-06-13); full
   corpus re-embedded into Qdrant collection mem0_egemma_768. Ollama fully
   decommissioned by this change. The model needs asymmetric task prefixes that
   mem0's stock embedder won't apply, so a custom prefix-shim embedder
