@@ -116,6 +116,8 @@ posts queue to the Outbox, replica reads fail over with a `source=` stamp, and c
 authority (forwarded or queued from a replica). The first workstation is cut over in the same session; the
 remaining workstations follow when they are online.
 
+**Phase status, closed out (2026-09-29).** The block above stops at the start of Phase 2, and the 2026-09-16 amendment below lists P4-1b and P4-1c as still open. `CHANGELOG.md` records both as shipped. The hub-side checkout, the judge step in the nightly chain and the generated plan contract shipped in 1.26.0 (P4-1b), with two follow-ups in 1.26.1 and 1.26.2 (the reasons the judge would never have written a plan, and the corpus partition that never reached the applier); the session-start G7 line and the store lint at session start shipped in 1.25.1 (P4-1c). The Linux installers' binary blocks landed with the authority installer in 1.26.0, with the client installer in 1.27.0 and with the replica installer's forwarding of the store flags in 1.27.1 (P4-3); 1.28.0 then added the capture path to the client. Around them: the store client's engines in 1.24.0 (Phase 3), its Windows install in 1.25.0 (P4-1a), and, since 1.28.4, a replica never dreams. The chain that decision 2 sketches runs on the authority as 17 steps, `store-judge` among them; the ordered list is in [installer-and-deploy.md](../../systems/installer-and-deploy.md), and `CHANGELOG.md` is the release-by-release record.
+
 **Gather input on the authority.** The consolidator's gather phase reads the store — the last
 36 hours of evidence and the recent episodes — rather than workstation transcripts, which never
 reach the authority (transcript extraction stays per workstation, see Alternatives). Transcripts

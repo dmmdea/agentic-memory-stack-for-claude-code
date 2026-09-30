@@ -2,25 +2,25 @@
 
 [![CI](https://github.com/dmmdea/agentic-memory-stack-for-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/dmmdea/agentic-memory-stack-for-claude-code/actions/workflows/ci.yml)
 
-A persistent, multi-tier, **measurably faithful** memory backend for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows + WSL2. It captures durable facts from your sessions, consolidates them into higher-order insights, surfaces the right one before each prompt, and governs against drift — with a causal-intervention eval proving the memory actually changes behavior.
+A persistent, multi-tier, **measurably faithful** memory backend for [Claude Code](https://docs.claude.com/en/docs/claude-code): one always-on Linux **authority** holds the memory, and any number of Windows + WSL2 or Linux PCs use it. It captures durable facts from your sessions, consolidates them into higher-order insights, surfaces the right one before each prompt, and governs against drift — with a causal-intervention eval proving the memory actually changes behavior.
 
-> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), nightly consolidation (Task Scheduler), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a DPAPI-isolated canonical-key credential.
+> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), one 17-step nightly chain on the authority (consolidation, dedup, backups, health), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a canonical-key credential kept out of the store (a systemd credential on the authority, a DPAPI blob on a Windows-hosted brain).
 >
-> **What it is NOT:** a Claude Code feature. It's external infrastructure you install once — WSL systemd services + Windows Claude Code hooks.
+> **What it is NOT:** a Claude Code feature. It's external infrastructure: one authority install on a Linux box, plus a PC install on each machine you code on (Windows hooks and WSL, or a Linux client).
 
 ## What you get
 
 - **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, per-prompt correction capture, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
-- **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deliberate pulls; a resume précis at session start.
+- **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deeper, deliberate pulls on top of that injection; a resume précis at session start.
 - **Trust, not just recall** — five tiers from auto-captured `evidence` up to HMAC-locked `canonical` ground truth; an admission gate hides superseded, contradicted, or wrong-workspace records at read time; time-sensitive tiers age out on a Weibull curve.
 - **A memory that polices itself** — weekly Codex-judged contradiction sweeps, an on-demand supersession sweep, an optional write-time NLI gate, and a queue-gated resolution policy: false flags auto-clear, evidence-vs-evidence hides are human-confirmed, and every hide is one-command reversible and forensically visible.
-- **Boring-by-design operations** — nightly/weekly hygiene (dedup, decay, audit, backups ×8 with integrity checks), an append-only audit ledger, loopback-only + API-key security, ~28 MCP tools.
+- **Boring-by-design operations** — nightly/weekly hygiene run as one receipted chain (dedup, decay, audit, backups ×8 with integrity checks), an append-only audit ledger, a tailnet-only bind + API-key security, and a full MCP tool family (memory, episodic, goals, open questions).
 
 ```mermaid
 flowchart LR
     A["Claude Code sessions"] -->|"hooks: extract + capture"| B["mem0 server :18791<br/>tiers + admission gate"]
     B --> C["Qdrant :6333<br/>768-d vectors"]
-    B -->|"embed / rerank"| D["llama-swap :11436<br/>EmbeddingGemma + bge"]
+    B -->|"embed / rerank"| D["llama-swap :11436<br/>EmbeddingGemma + bge (GPU)"]
     E["Codex CLI (per-job model)"] -->|"extraction / consolidation / judgment"| B
     B -->|"top K=1-2 at the 0.30 gate, or abstain"| A
 ```
@@ -39,14 +39,15 @@ flowchart LR
 
 ## Install
 
-The installer is **self-contained, idempotent, and operator-agnostic** (it detects your WSL distro and derives every path from your own home/username). In Windows PowerShell, from the repo root:
+There are two installs. **The authority** — the one box that holds the memory — is a native-Linux install: `bash install/linux-authority.sh --bind-ip <tailscale0 ipv4> --secrets-dir <dir holding ams-api-key.cred and ams-canonical-key.cred>` puts mem0 on the tailnet address, Qdrant on loopback and the `ams-nightly.timer` chain under systemd `--user` (llama-swap must already serve the embedder, and should serve the reranker, on `:11436`; see [the llama-swap setup](./install/llama-swap-setup.md)). A re-run inherits every flag recorded in `~/.mem0/stack.env`, and a re-run from the updated checkout is also how the authority is deployed. **Every other machine is a replica PC or a client** and talks to the authority. The Windows PC installer below is **self-contained, idempotent, and operator-agnostic** (it detects your WSL distro and derives every path from your own home/username). In Windows PowerShell, from the repo root:
 
 ```powershell
 .\install.ps1                          # auto-detects your default WSL distro
 .\install.ps1 -Distro <your-distro>    # multi-distro / non-default; see: wsl -l -q
+.\install.ps1 -Role replica -AuthorityUrl http://<authority-host>:18791 -AuthoritySsh <ssh-alias>   # a replica PC: first install only, re-runs keep the recorded role and flags
 ```
 
-**Linux thin client** — a native-Linux box that should use another machine's Brain (no WSL, no local store): from a checkout, `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <the Brain's ~/.mem0/api-key>`. It deploys only the MCP shim and the Outbox replay driver, registers the `mem0` MCP server, and proves itself with a real `memory_health` call through the shim. Details: [docs/systems/installer-and-deploy.md](./docs/systems/installer-and-deploy.md). To also carry a dormant read-only copy of the Brain for offline use, `bash install/linux-replica.sh --authority ... --brain-ssh <alias>` on top (Linux replica: local Qdrant + mem0 started only while the Brain is unreachable, refreshed daily while online).
+**Linux thin client** — a native-Linux box that should use another machine's Brain (no WSL, no local store): from a checkout, `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <a file holding the authority's API key>`. It deploys only the MCP shim and the Outbox replay driver, registers the `mem0` MCP server, and proves itself with a real `memory_health` call through the shim. Details: [docs/systems/installer-and-deploy.md](./docs/systems/installer-and-deploy.md). To also carry a dormant read-only copy of the Brain for offline use, `bash install/linux-replica.sh --authority ... --brain-ssh <alias>` on top (Linux replica: local Qdrant + mem0 started only while the Brain is unreachable, refreshed daily while online).
 
 Fresh machine: `git clone <this repo> $HOME\agentic-memory-stack`, then `cd` in and run the same. The 4-phase installer (`prereqs → WSL services → Windows config → verify`) halts with an exact fix if any prerequisite is missing. Safe to re-run for upgrades/repair. See **[skill/install-agentic-memory-stack/SKILL.md](./skill/install-agentic-memory-stack/SKILL.md)** for the full walkthrough and **[skill/install-agentic-memory-stack/references/troubleshooting.md](./skill/install-agentic-memory-stack/references/troubleshooting.md)** for the matrix.
 
@@ -59,7 +60,7 @@ Fresh machine: `git clone <this repo> $HOME\agentic-memory-stack`, then `cd` in 
 | Python 3.12+ in WSL | mem0 server |
 | `curl` + `jq` in WSL | Health probes and the nightly backup's Qdrant snapshot-name parse |
 | Node.js 22+ (WSL + Windows) | Codex / Claude CLIs |
-| [llama-swap](https://github.com/mostlygeek/llama-swap) on `:11436` in WSL (llama.cpp ≥ b6384) | Serves the EmbeddingGemma embedder + bge-reranker (CPU). No Ollama. |
+| [llama-swap](https://github.com/mostlygeek/llama-swap) on `:11436` in WSL (llama.cpp ≥ b6384) | Serves the EmbeddingGemma embedder + bge-reranker on the GPU, every layer, unloading after 300 s idle. No Ollama. |
 | [Claude Code](https://docs.claude.com/en/docs/claude-code) (Windows, npm) | The host you're augmenting |
 | [Codex CLI](https://github.com/openai/codex) (npm) authenticated against an active ChatGPT subscription | Subagent LLM for background extraction + nightly consolidation |
 | `git` for Windows | — |
@@ -70,7 +71,7 @@ Claude Max OAuth enforces a single concurrent session — headless `claude --pri
 
 ## Architecture
 
-See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full data-flow diagram and **[skill/.../references/architecture.md](./skill/install-agentic-memory-stack/references/architecture.md)** for the v1.0 summary. Live runtime processes: `mem0-server` (:18791) + Qdrant (:6333) + llama-swap (:11436, EmbeddingGemma + bge-reranker) + Codex CLI, plus the Claude Code hooks. Trust tiers: evidence → insight → canonical (HMAC-gated, CLI-only promotion).
+See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full data-flow diagram and **[skill/.../references/architecture.md](./skill/install-agentic-memory-stack/references/architecture.md)** for the v1.0 summary. Live runtime processes on the authority: `mem0-server` (:18791, tailnet address) + Qdrant (:6333, loopback) + llama-swap (:11436, EmbeddingGemma + bge-reranker on the GPU) + the Codex CLI on demand; on every PC, the Claude Code hooks and the MCP shim. Trust tiers: evidence → insight → canonical (HMAC-gated, CLI-only promotion).
 
 ### v1.0 faithfulness (R1–R6)
 
@@ -80,7 +81,7 @@ The stack went from "store + inject and hope" to "measurably faithful memory": a
 
 | Path | What |
 |---|---|
-| `install/` + `install.ps1` | The 4-phase idempotent, operator-agnostic installer |
+| `install/` + `install.ps1` | The 4-phase idempotent, operator-agnostic PC installer, plus `linux-authority.sh`, `linux-replica.sh` and `linux-client.sh` |
 | `scripts/windows/` | PowerShell runtime: hooks, the compiled UserPromptSubmit client, extractor, consolidator, `Test-MemoryStack` |
 | `scripts/wsl/` | mem0 MCP shim, audit/decay/dedup/backup/restore/reconcile, canonize CLI, index builder |
 | `mem0-server/` | FastAPI wrapper around mem0 2.0.4 (+ episodic/goals/open-questions, admission gate, freshness, NLI write-gate, Codex shim client) |

@@ -17,8 +17,10 @@ brain, with no cross-machine lock to coordinate a second writer.
 Exactly one machine — the **brain box** — holds write authority. Every other machine is a **replica
 box**: read-only, and it can *never* absorb a write. Two independent mechanisms enforce this:
 
-- **Install-time role gate.** `install.ps1 -Role brain|replica` (default `brain`) records the role
-  in the install receipt. A `brain` install registers the two nightly canonical-mutation scheduled
+- **Install-time role gate.** `install.ps1 -Role brain|replica` (default `brain` on a first install;
+  an omitted `-Role` on a re-run keeps the role the box recorded, so a plain re-run on a replica
+  leaves it a replica; a record that exists but cannot be used stops the run and asks for an explicit
+  `-Role`, rather than guessing `brain`) records the role in the install receipt. A `brain` install registers the two nightly canonical-mutation scheduled
   tasks (the dream consolidator and the semantic dedup); a `replica` install registers *neither* and
   removes any it finds. Verify asserts the tasks are present on a brain and absent on a replica.
 

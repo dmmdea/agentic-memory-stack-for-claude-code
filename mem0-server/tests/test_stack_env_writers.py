@@ -389,3 +389,48 @@ def test_the_shared_operator_key_list_holds_the_gate_and_brand_switches():
     m = re.search(r'^STACK_ENV_OPERATOR_KEYS="([^"]*)"', lib, re.M)
     assert m, "STACK_ENV_OPERATOR_KEYS must be one quoted list"
     assert set(GATE_KEYS) <= set(m.group(1).split())
+
+
+# Carried is not the same as read. The writers keep every operator-owned key across a re-run, but a key
+# only takes effect where something reads it, and the mem0 server unit never loads stack.env into its
+# environment (no EnvironmentFile=): a reader that wants a key from the file opens it itself. The
+# comment beside the key list and the installer doc say who reads each key; these pin the claims.
+KEY_READERS = {   # key -> [(file, the text of its stack.env read)]
+    "MEM0_PROMOTION_GATE_MODE": [("scripts/wsl/dream-consolidate.py", 'stack_env().get("MEM0_PROMOTION_GATE_MODE")'),
+                                 ("mem0-server/capabilities.py", 'read_stack_env(stack_env_path).get("MEM0_PROMOTION_GATE_MODE")')],
+    "MEM0_SHARED_BRANDS": [("mem0-server/admission_gate.py", '_stack_env_value("MEM0_SHARED_BRANDS")'),
+                           ("scripts/wsl/brand_routing.py", '_stack_env_value("MEM0_SHARED_BRANDS")')],
+    "MEM0_BRAND_MAP": [("mem0-server/admission_gate.py", '_stack_env_value("MEM0_BRAND_MAP")'),
+                       ("scripts/wsl/brand_routing.py", '_stack_env_value("MEM0_BRAND_MAP")'),
+                       ("scripts/wsl/ams-store-judge-apply.sh", "s/^MEM0_BRAND_MAP=//p")],
+    "MEM0_POOL_HEALTH_ACK": [("mem0-server/maintenance_health.py", "read_stack_env().get(POOL_ACK_KEY)")],
+    "MEM0_BRAIN_SSH": [("scripts/wsl/wiki-index.sh", "s/^MEM0_BRAIN_SSH=//p")],
+}
+
+
+@pytest.mark.parametrize("key", sorted(KEY_READERS))
+def test_every_operator_key_the_docs_call_read_from_stack_env_has_that_reader(key):
+    for rel, needle in KEY_READERS[key]:
+        assert needle in (REPO_ROOT / rel).read_text(encoding="utf-8"), \
+            f"{rel} no longer reads {key} from stack.env: update the comment in install/stack-env.sh and installer-and-deploy.md"
+
+
+def test_the_carried_nli_flag_is_documented_as_not_read_from_stack_env():
+    """MEM0_NLI_GATE_ENABLED is carried, but app.py reads it once, at import, from the process environment
+    only, and no unit loads stack.env, so the file's value never reaches it. The comment beside the key list
+    and the installer doc must say so; when a unit gains EnvironmentFile= for stack.env, or app.py starts
+    reading the file for this key, this fails, and the disclosure is what to update."""
+    for unit in (REPO_ROOT / "systemd").iterdir():
+        for ln in unit.read_text(encoding="utf-8", errors="replace").splitlines():
+            assert not ln.strip().startswith("EnvironmentFile="), (
+                f"{unit.name} now loads an environment file; if it is stack.env, update the NLI disclosure in "
+                "install/stack-env.sh and docs/systems/installer-and-deploy.md")
+    app = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    assert 'return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")' in app, "_env_flag reads os.environ only"
+    assert 'NLI_GATE_ENABLED = _env_flag("MEM0_NLI_GATE_ENABLED")' in app
+    assert "MEM0_NLI_GATE_ENABLED" not in "\n".join(ln for ln in app.splitlines() if "stack" in ln.lower())
+    lib = LIB.read_text(encoding="utf-8")
+    doc = (REPO_ROOT / "docs" / "systems" / "installer-and-deploy.md").read_text(encoding="utf-8")
+    assert re.search(r"MEM0_NLI_GATE_ENABLED \(the NLI write gate\): NOT read from here", lib)
+    assert "systemctl --user edit mem0" in lib and "systemctl --user edit mem0" in doc
+    assert "does not turn the NLI write gate on" in doc

@@ -52,9 +52,10 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 
 - **Purpose:** facts with a shelf life ("the staging deploy is frozen this week"). Keeping them out of `evidence` prevents time-bound state from masquerading as durable knowledge.
 - **Written by:** direct MCP/API `memory_add` with `tier=temporal`. The L1a extractor never emits it — every auto-extracted fact posts as `evidence`.
-- **`expires_at` CANNOT be set at write time.** It sits in `_ADD_FORBIDDEN_META` (app.py:449), so `add()`
+- **`expires_at` CANNOT be set at write time.** It sits in `_ADD_FORBIDDEN_META` (`app.py`), so `add()`
   **silently strips** it and still returns `200` — the caller believes it set an expiry and did not. The only
-  writer is `PATCH /v1/memories/{id}/metadata` by a trusted actor (app.py:2202), i.e. after the fact.
+  writer is `PATCH /v1/memories/{id}/metadata` by a trusted actor (`decay-scan` or `system`), i.e. after the fact.
+  There is no `valid_until` field at all ([tier policy](./tier-policy.md)).
   Verified live 2026-08-11: an add carrying `expires_at` returned `200` with the key absent from the stored
   payload.
 - **Consequence — decay-scan's expiry arm has never fired.** `decay-scan.py` hard-deletes `tier=temporal`

@@ -235,10 +235,11 @@ PY
 fi
 
 # Recent-sessions surface (cross-restart). 2026-06-24: REPOINTED from recent-decisions.jsonl to
-# episodic.db. recent-decisions.jsonl was written by UserPromptSubmit 0.B (decision capture), a
-# PER-TURN hook that does NOT fire in the Claude Code VSCode-extension / Agent-SDK runtime — so it
-# froze on 2026-06-16 and this banner showed stale 06-16 decisions forever. Episodes ARE captured by
-# the SessionStart/PreCompact LIFECYCLE hooks (which DO fire), so they stay fresh. Show the last 5
+# episodic.db. recent-decisions.jsonl was written by UserPromptSubmit 0.B (decision capture); in June
+# the per-turn hooks were silent in the Claude Code VSCode-extension / Agent-SDK runtime (a hook
+# command-form defect, fixed in 1.18.0), so it froze on 2026-06-16 and this banner showed stale 06-16
+# decisions forever. Episodes are captured by the Stop, SessionStart and PreCompact hooks alike and
+# are the store the rest of the stack reads, so the surface stays on them. Show the last 5
 # episodes that have a real goal (skip empty placeholder rows).
 # WP-2: this read is the BRAIN's. A replica's episodic.db stopped receiving writes at the authority
 # cutover, so it presented weeks-old sessions as current; a replica reads the authority instead (the
@@ -489,9 +490,9 @@ except Exception:
   [ -n "$goals" ] && echo "$goals"
 fi
 
-# B1 (2026-06-28, Phase 1+2): durable/evidence ranked-bundle enrichment — the thin precis the
-# (now-dead) per-prompt UserPromptSubmit hook used to inject, which the canonical+goals lines do
-# NOT cover. Runs REGARDLESS of brand (gated only on the api key): a brandless session still has
+# B1 (2026-06-28, Phase 1+2): durable/evidence ranked-bundle enrichment — the thin precis of what the
+# per-prompt UserPromptSubmit hook injects once a prompt exists (none does at session start), which
+# the canonical+goals lines do NOT cover. Runs REGARDLESS of brand (gated only on the api key): a brandless session still has
 # brand-neutral facts AND must consume any fresh PreCompact marker so it can't linger. Reuses the
 # live /v1/context/bundle: Phase 2 — a FRESH PreCompact marker supplies a real CONVERSATION query
 # (tier=frontier, K<=2); otherwise a RECENCY pseudo-query (most-recent episode goal; precision-first
