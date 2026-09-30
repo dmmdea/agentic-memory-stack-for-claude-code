@@ -80,11 +80,15 @@ but it does not read as a clean success either: the step writes a `degraded` out
 
 `app_version` and `git_sha` come from the `VERSION` and `DEPLOYED_SHA` stamps written beside the
 server modules (the deployed tree has no `.git`): by `deploy.sh` on a WSL host, and by the
-installers (`install/linux-authority.sh`, `install/1-wsl-services.sh`) on every install and
-refresh, because `deploy.sh` refuses a native host. The installers write it only through the shared
-`install/deploy-stamp.sh` contract: one line, a 40-hex sha or the word `unknown` (an install from a
-tree with no `.git` and no stamp of its own), so a stale sha is never kept. The manifest says
-`unknown` when the stamp is absent or reads `unknown`. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
+installers (`install/linux-authority.sh`, `install/linux-replica.sh`, `install/1-wsl-services.sh`)
+on every install and refresh, because `deploy.sh` refuses a native host. The installers write it
+only through the shared `install/deploy-stamp.sh` contract: one line, a 40-hex sha or the word
+`unknown` (an install from a tree with no `.git` and no stamp of its own), so a stale sha is never
+kept. The stamp is authoritative for the manifest: `git_sha` is its 40-hex sha, and `unknown` when
+the stamp reads `unknown` or is empty or malformed, because a checkout that happens to be reachable
+names its own commit, not the deployed one. Only a tree with no stamp file at all (the writer
+running straight from a checkout no installer deployed) asks that checkout; with none, it says
+`unknown`. `checksums` maps every file in the set to its `size` and `sha256`. `stack.env` is read by
 key (`grep '^KEY='`), never sourced, so a malformed line cannot stop the writer.
 
 **Deliberately excluded** (so nobody re-litigates; the secondary Qdrant collections are no longer

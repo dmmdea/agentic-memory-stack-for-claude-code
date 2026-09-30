@@ -87,9 +87,13 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Release stamp of the DEPLOYED tree: VERSION and DEPLOYED_SHA beside the server modules
 # ---------------------------------------------------------------------------
-# The brain has no .git: deploy.sh stamps VERSION and DEPLOYED_SHA into the app dir, so those
-# two files ARE the deployed release. (A hard-coded "v0.17" and an "unknown" sha sat in every
-# manifest for months.) A checkout with a .git is only the fallback for the sha.
+# The deployed tree has no .git, so the release is what was stamped beside the server modules:
+# VERSION, and DEPLOYED_SHA (one line, a 40-hex sha or the word `unknown`) written by the installers
+# through install/deploy-stamp.sh and by deploy.sh. (A hard-coded "v0.17" and an "unknown" sha sat
+# in every manifest for months.) The stamp is AUTHORITATIVE: `unknown`, an empty line or anything
+# that is not a 40-hex sha reads unknown, because a checkout that happens to be reachable names the
+# commit it is on, not the one that was deployed. Only a tree with no stamp at all (this script
+# running straight from a checkout no installer deployed) asks that checkout.
 
 APP_DIR="${MEM0_APP_DIR:-$HOME/apps/mem0-server}"
 APP_VERSION="unknown"
@@ -101,14 +105,10 @@ if [ -s "$APP_DIR/VERSION" ]; then
     esac
 fi
 GIT_SHA="unknown"
-if [ -s "$APP_DIR/DEPLOYED_SHA" ]; then
+if [ -e "$APP_DIR/DEPLOYED_SHA" ]; then
     sha=$(head -n1 "$APP_DIR/DEPLOYED_SHA" | tr -d '[:space:]')
-    case "$sha" in
-        ""|*[!0-9a-f]*) ;;
-        *) GIT_SHA="$sha" ;;
-    esac
-fi
-if [ "$GIT_SHA" = "unknown" ]; then
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then GIT_SHA="$sha"; fi
+else
     REPO="${MEM0_REPO_ROOT_WSL:-$(stack_env_get MEM0_REPO_ROOT_WSL)}"
     [ -n "$REPO" ] || REPO="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)"
     if [ -n "$REPO" ] && [ -d "$REPO/.git" ]; then

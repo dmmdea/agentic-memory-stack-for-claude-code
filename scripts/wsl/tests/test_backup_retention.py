@@ -729,3 +729,47 @@ def test_manifest_reads_the_unknown_stamp_as_unknown(home, qdrant):
     r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "nowhere"))
     assert r.returncode == 0, r.stderr
     assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == "unknown"
+
+
+def _git_checkout(path: Path) -> str:
+    """A real git checkout with one commit under `path`; returns its HEAD sha."""
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git not available")
+    path.mkdir(parents=True)
+    cfg = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run([git, "init", "-q", str(path)], check=True, capture_output=True, timeout=60)
+    subprocess.run([git, *cfg, "-C", str(path), "commit", "-q", "--allow-empty", "-m", "x"],
+                   check=True, capture_output=True, timeout=60)
+    return subprocess.run([git, "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True, timeout=60).stdout.strip()
+
+
+@pytest.mark.parametrize("stamp", ["unknown\n", "", "not a sha\n", "0123abc\n"])
+def test_a_present_stamp_is_authoritative_and_never_asks_a_checkout(home, qdrant, stamp):
+    """The installers' stamp contract (install/deploy-stamp.sh): one line, a 40-hex sha or the word
+    `unknown`. A stamp that names no commit reads unknown even when a checkout is reachable: that
+    checkout is on whatever commit it is on, which is not evidence of what was deployed."""
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    head = _git_checkout(home / "checkout")
+    app = home / "apps" / "mem0-server"
+    app.mkdir(parents=True)
+    (app / "DEPLOYED_SHA").write_text(stamp)
+    r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "checkout"))
+    assert r.returncode == 0, r.stderr
+    got = json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"]
+    assert got == "unknown", f"stamp {stamp!r} read as {got} (the reachable checkout is at {head})"
+
+
+def test_without_any_stamp_the_checkout_the_script_runs_from_is_asked(home, qdrant):
+    """No stamp file at all: nothing deployed this tree, the script is running from a checkout, and
+    that checkout's HEAD is the release."""
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    head = _git_checkout(home / "checkout")
+    r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "checkout"))
+    assert r.returncode == 0, r.stderr
+    assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == head
