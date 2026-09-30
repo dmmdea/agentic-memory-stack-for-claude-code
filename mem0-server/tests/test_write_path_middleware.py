@@ -335,6 +335,23 @@ def test_the_neutral_mark_belongs_to_one_request_and_does_not_leak_to_the_next()
     assert _counts() == (0, 1), "the second request is a real success and is recorded"
 
 
+def test_the_mark_reaches_the_middleware_on_a_server_that_gives_the_scope_no_state():
+    """uvicorn (and TestClient) put a `state` dict in the ASGI scope; a bare ASGI driver does not. The route's
+    request and the middleware's must share the mark either way, because both build `request.state` on the one
+    scope dict (`setdefault`), so the flag cannot depend on the server having supplied one."""
+    app = build_app()
+
+    async def drive():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+            failed = await ac.post("/v1/memories", params={"case": "embedder"}, json={"text": "x"})
+            neutral = await ac.post("/v1/memories", params={"case": "neutral-dup"}, json={"text": "x"})
+            return failed, neutral
+
+    failed, neutral = asyncio.run(drive())
+    assert failed.status_code == 503 and neutral.status_code == 200
+    assert wp.snapshot()["ok"] is False and _counts() == (1, 1), "the duplicate was neutral: nothing recorded, nothing cleared"
+
+
 @pytest.mark.parametrize("case,status,label", [
     ("neutral-then-503", 503, "503 upstream"),
     ("neutral-then-500", 500, "500 upstream"),
