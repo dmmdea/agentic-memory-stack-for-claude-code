@@ -4,6 +4,56 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.1 — a failing write path turns health red, and a junction no longer captures a session twice (2026-09-30)
+
+### Fixed
+- **`/health/maintenance` answered `ok: true` while every memory write failed.** When the embedder could
+  not start (a co-resident GPU process held the card), `POST /v1/memories` answered 500 or 503 for
+  hours, and the banner and uptime checks stayed green. The endpoints that touch the embedder load the
+  model, and polling them would keep it resident against the five-minute idle unload, so the new signal
+  is passive. `mem0-server/write_path.py` records the final status of every `POST /v1/memories` and
+  `PUT /v1/memories/{id}` through an HTTP middleware that sees the response after the exception handlers
+  ran: a 2xx is a success, a 5xx or an unhandled exception is a failure, a 4xx is not recorded.
+  `/health/maintenance` gains `write_path` = `{ok, last_ok_at, last_error_at, last_error, errors_1h,
+  writes_1h}` and folds `write_path.ok` into `ok`. `ok` turns false on a failure and clears only on the
+  next successful write that reached the embedder. A content-hash duplicate answer and an `infer: false`
+  add that stored nothing are neutral (they neither count nor clear), because writers re-post whole
+  transcripts and those answers would flip the signal back to green inside the outage. There is no I/O,
+  no model load and nothing on disk, so a restart forgets the state. The response is never changed; the
+  middleware adds about 0.4 ms per request.
+- **The SessionStart NOT OK line, the nightly health stamp and the morning summary now name a failing
+  write path.** `claude-config/storage-cap-check.sh` prints `write path failing (<last_error> since
+  <last_error_at>)`, for example `(503 upstream since ...)`. `scripts/wsl/ams-health-stamp.sh` and `ams-morning-summary.sh` end the health line
+  with ` write-path <last_error>`, and the stamp exits 2 on it, like a failed step. A healthy, missing or
+  unreadable write path changes no byte of either line.
+- **A transcript reachable through a directory junction under `~/.claude/projects` could be captured
+  twice.** `scripts/windows/sessionstart-capture.ps1` globs `projects\*\*.jsonl`, which lists every
+  transcript behind a junction a second time at the same mtime. The tie was unordered and the watermark
+  was `<full path>|<ticks>`, so each flip of the winning path spawned the extractor again, and when the
+  alias won, the alias path reached the session row's workspace label and brand. The pick now orders by
+  mtime, then a file under a real directory before one behind a reparse-point parent (read once per
+  directory), then path. The watermark is `<file name>|<ticks>` (the file name is the session id), and a
+  watermark written by an earlier release is still honoured by its tail after a separator, so the upgrade
+  costs no extra capture. A transcript that exists only behind a junction is still captured.
+- **`install/3-verify.ps1` told a replica that its first nightly dream fires at 3:00 AM.** A replica
+  never dreams; on any role but `brain` the next steps now say the nightly dream and dedup run on the
+  memory authority.
+
+### Upgrade notes
+- **Deploy the authority, then re-run the installer on every replica PC.** The write-path signal exists
+  only after the authority's server restarts on the new `app.py`, `maintenance_health.py` and
+  `write_path.py` (`install/linux-authority.sh`, or `deploy.sh` on a WSL authority, which also ships the
+  two nightly scripts). The capture fix, the banner text and the verify text reach a PC when its own
+  installer re-runs (on Windows, `install/2-windows-config.ps1`).
+- **Uptime checks that read `/health/maintenance`** go red on a failing write path, which is the point.
+  The field is absent before the upgrade, so add a condition on `write_path.ok` only after the authority
+  reports it. After an outage, `ok` stays false until the next write that stores something; a hand check
+  of `/health/embedder` shows the embedder itself (never poll it: it loads the model). A 5xx from any
+  cause on a write route counts, a server-side bug included.
+- **The capture watermark format changes.** An older release reading a new-format watermark spawns the
+  extractor once more, and the extractor's throttle or its transcript cursor drops the repeat. Sessions
+  already stored under an alias path keep their label; no data is migrated.
+
 ## 1.32.0 — a hollow night reads red, a canonical demotion needs the operator's token, and jobs that only looked healthy now do their work (2026-09-30)
 
 ### Fixed
