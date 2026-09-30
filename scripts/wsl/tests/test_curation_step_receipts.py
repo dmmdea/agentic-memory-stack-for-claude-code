@@ -31,8 +31,8 @@ def _home_env(home, **extra):
     return dict(os.environ, HOME=h, USERPROFILE=h, HOMEDRIVE=drive, HOMEPATH=tail, **extra)
 
 
-def _receipt(tmp_path, step, scenario):
-    """Run the job the way its shipped unit does and return (process, receipt).
+def _run(tmp_path, step, scenario):
+    """Run the job the way its shipped unit does and return (process, sandbox home).
 
     semantic-dedup and episodic-reconcile run straight under `ams-step.sh <step> python <job>`; the
     contradiction sweep runs `ams-step.sh --weekly Sun <step> python jobs.py run <step> --receipt <its log>
@@ -55,8 +55,18 @@ def _receipt(tmp_path, step, scenario):
                "--", *job]
     r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), *wrapper, step, *job],
                        capture_output=True, text=True, env=env, timeout=180)
+    return r, home
+
+
+def _rows(home):
     rp = home / ".mem0" / "maintenance" / "receipts.jsonl"
-    rows = [json.loads(ln) for ln in rp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return [json.loads(ln) for ln in rp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _receipt(tmp_path, step, scenario):
+    """One run in a fresh sandbox: (process, the single receipt it wrote)."""
+    r, home = _run(tmp_path, step, scenario)
+    rows = _rows(home)
     assert len(rows) == 1, (rows, r.stdout[-600:], r.stderr[-600:])
     return r, rows[0]
 
@@ -145,3 +155,33 @@ def test_episodic_reconcile_with_a_coverage_gap_is_a_degraded_receipt_that_still
     assert row["ok"] is True and row["status"] == "degraded" and row["note"] == "embedding-coverage-40"
     w = row["work"]
     assert w["coverage_pct"] == 40 and w["abandoned"] == 1 and w["embedded"] == 7
+
+
+# ------------------------------------------------------------------ the consumer of the receipts
+
+def test_curation_receipts_turn_the_maintenance_verdict_red_until_a_later_ok_run(tmp_path):
+    """The receipts exist so /health/maintenance can tell a run that did nothing from one that worked: it
+    reads each step's LATEST receipt, a degraded or failed one turns `ok` false, a later ok run clears it."""
+    import datetime as dt
+
+    sys.path.insert(0, str(SCRIPTS.parents[1] / "mem0-server"))
+    import maintenance_health as mh
+
+    home = _run(tmp_path, "semantic-dedup", "dedup-refused")[1]
+    _run(tmp_path, "episodic-reconcile", "episodic-coverage")
+    _run(tmp_path, "contradiction-sweep", "sweep-marker-failed")
+    receipts = home / ".mem0" / "maintenance" / "receipts.jsonl"
+
+    def verdict():
+        return mh.build(receipts, dt.datetime.now(dt.timezone.utc), pool_reader=lambda: (10, 90),
+                        boots_reader=lambda: [], judge_transport=lambda: "native")
+
+    out = verdict()
+    assert out["ok"] is False
+    assert {d["step"]: d["note"] for d in out["degraded_steps"]} == {
+        "semantic-dedup": "deletes-refused", "episodic-reconcile": "embedding-coverage-40"}
+    assert [f["step"] for f in out["failed_steps"]] == ["contradiction-sweep"]
+    assert "degraded:marker-failed:1" in out["failed_steps"][0]["note"]
+
+    _run(tmp_path, "semantic-dedup", "dedup-ok")                   # a later ok run of a step clears that step
+    assert [d["step"] for d in verdict()["degraded_steps"]] == ["episodic-reconcile"]
