@@ -70,6 +70,8 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # An omitted -Role keeps the role this box recorded (install/role-lib.ps1), the rule install.ps1 applies
 # before it calls us. Run directly, the bare default 'brain' would overwrite a replica's receipt and
 # ~/.mem0/role and register the nightly dream/dedup tasks on it. 'brain' is the FIRST-install default.
+# A record that exists but yields no role throws here, before this script writes or registers anything
+# (the first write is the receipt, far below): the box is left untouched.
 . (Join-Path $PSScriptRoot 'role-lib.ps1')
 if (-not $PSBoundParameters.ContainsKey('Role')) {
     $RoleChoice = Resolve-InstallRole -Explicit $false -ProfileDir $env:USERPROFILE
