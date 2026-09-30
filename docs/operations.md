@@ -41,7 +41,9 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 | daily 4:30 (Task Scheduler) | semantic dedup | `~/.mem0/tier-ledger-YYYY-MM.jsonl` (deletes are logged; monthly segments) |
 | Sun 02:00 / 04:00 / 05:00 / 05:30 | decay-scan / goals-stale-sweep / contradiction-sweep / episodic-reconcile | `systemctl --user list-timers` in WSL |
 | every 6 h | L10 heuristic audit | `~/.mem0/audit-flags.jsonl` |
-| **native Linux authority:** daily 03:00 (`ams-nightly.timer`, `Persistent=`, RTC wake armed 02:45) | the one chain: dream → dedup → index refresh → wiki index (when configured) → goal recurrence → Sunday jobs → stack backup → syncoid → pCloud copy → morning summary → health stamp → rtcwake | `systemctl --user list-timers ams-nightly.timer`; `tail ~/.mem0/maintenance/receipts.jsonl`; `curl -s http://<authority>:18791/health/maintenance` |
+| **native Linux authority:** daily 03:00 (`ams-nightly.timer`, `Persistent=`, RTC wake armed 02:45) | the one chain, 17 steps: `dream` → `semantic-dedup` and `store-judge` (with a hub configured) → `index-refresh` → `wiki-index` (when configured) beside `goal-recurrence-promote` → the Sunday jobs `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` → `stack-backup` → `syncoid` → `pcloud-copy` → `morning-summary` → `health-stamp` → `rtcwake` (order and conditions: [installer-and-deploy](systems/installer-and-deploy.md#linux-authority-native-installlinux-authoritysh)) | `systemctl --user list-timers ams-nightly.timer`; `tail ~/.mem0/maintenance/receipts.jsonl`; `curl -s http://<authority>:18791/health/maintenance` |
+
+The Task Scheduler and per-job timer rows above describe a Windows/WSL-hosted brain. On the native authority, the shipped shape, those jobs are steps of the one chain in the last row, and a replica PC registers none of them: its hooks and shim talk to the authority, and its own local mem0 and Qdrant stay dormant.
 
 ```bash
 # WSL: are the timers armed?

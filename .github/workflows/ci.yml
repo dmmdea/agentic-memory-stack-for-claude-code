@@ -126,6 +126,7 @@ jobs:
             mem0-server/tests/test_loopback_probe_pins.py \
             mem0-server/tests/test_maintenance_health_steps.py \
             mem0-server/tests/test_machine_turn_gate.py \
+            mem0-server/tests/test_docs_match_code.py \
             mem0-server/tests/test_dream_consolidate.py \
             mem0-server/tests/test_brand_routing.py \
             mem0-server/tests/test_brand_backfill.py \
