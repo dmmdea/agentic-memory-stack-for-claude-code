@@ -100,7 +100,7 @@ curl -s http://127.0.0.1:18791/health/deep
 ls ~/.mem0/history.db ~/.mem0/MEMORY.md ~/.mem0/audit-flags.baseline ~/.mem0/tier-ledger-pre-migration.jsonl
 ```
 
-> **Vector compatibility:** the restored memory vectors were embedded with EmbeddingGemma-300m and stay valid as long as the new machine serves the same embedder (which `llama-swap-setup.md` installs) — no re-embedding needed. **Exception — episode embeddings:** the backup covers only the memory collection; the `episodes_egemma_768` collection (semantic episode search / the raw-trace fallback) starts empty on the new box and old episodes fall back to keyword (FTS) search until you rebuild it: `~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/episode-embed-backfill.py` (one-time, local, free).
+> **Vector compatibility:** the restored memory vectors were embedded with EmbeddingGemma-300m and stay valid as long as the new machine serves the same embedder (which `llama-swap-setup.md` installs) — no re-embedding needed. **Exception — episode embeddings:** `stack-restore` restores only the memory collection. The nightly set also carries a snapshot of the episodes collection (`qcol-episodes-<TS>.snapshot`), but it is not restored automatically, so the `episodes_egemma_768` collection (semantic episode search / the raw-trace fallback) starts empty on the new box and old episodes fall back to keyword (FTS) search until you rebuild it: `~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/episode-embed-backfill.py` (one-time, local, free).
 
 ## Phase 4 — full-stack verification
 
