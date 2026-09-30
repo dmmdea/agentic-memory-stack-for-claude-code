@@ -88,7 +88,11 @@ BeforeAll {
         }
         Copy-Item (Join-Path $script:winDir 'memory-common.ps1') $scripts
         Copy-Item (Join-Path $script:winDir 'learn-rules-drain.ps1') $scripts
-        Set-Content -Path (Join-Path $scripts 'brands.json') -Encoding UTF8 -Value '{"rules":[{"pattern":"alpha-proj","brand":"brand-a"}]}'
+        # One path rule, plus one content-rule workspace ("mixed-root": its sessions are classified by
+        # what they say) with two content rules; the C3 map shape, see docs/systems/brands.md.
+        Set-Content -Path (Join-Path $scripts 'brands.json') -Encoding UTF8 -Value ('{"rules":[{"pattern":"alpha-proj","brand":"brand-a"}],' +
+            '"content_rule_workspaces":["mixed-root"],' +
+            '"content_rules":[{"pattern":"widget","brand":"brand-c"},{"pattern":"gadget","brand":"brand-d"}]}')
         return [pscustomobject]@{
             Root = $root; Drain = (Join-Path $scripts 'learn-rules-drain.ps1')
             Queue = (Join-Path $root '.mem0\learn-rules.jsonl'); State = (Join-Path $root '.claude\state')
@@ -175,6 +179,33 @@ Describe 'learn-rules-drain: corrections reach the authority' {
         $reqs = script:Get-MockRequests $mock
         $reqs[0].json.metadata.brand | Should -Be 'brand-a'
         $reqs[1].json.metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
+    }
+
+    It 'classifies a transcript under a content-rule workspace by the correction text, as L1a does for facts' {
+        # Nothing in the path routes this workspace (no path rule matches "mixed-root"), so the words
+        # are all there is: the drain must hand the correction's own text to the resolver.
+        $mixed = 'C:\u\.claude\projects\D--dev-mixed-root\s.jsonl'
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value @(
+            (script:New-QueueLine -Text 'no, the widget total is wrong' -Brand 'stale-brand' -Transcript $mixed)
+            (script:New-QueueLine -Text 'the widget and the gadget disagree' -Transcript $mixed)
+            (script:New-QueueLine -Text 'undo that last edit' -Transcript $mixed)
+            (script:New-QueueLine -Text 'undo that last edit too' -Brand 'kept-brand' -Transcript $mixed)
+            (script:New-QueueLine -Text 'no, the widget name is wrong' -Brand 'kept-brand' -Transcript 'C:\u\.claude\projects\D--dev-alpha-proj\s.jsonl')
+        )
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        [void](script:Invoke-Drain $sb $mock.Url -Force)
+        $reqs = script:Get-MockRequests $mock
+        $reqs.Count | Should -Be 5
+        # exactly one content rule matches: its brand, over the brand captured with the line
+        $reqs[0].json.metadata.brand | Should -Be 'brand-c'
+        # two brands match: ambiguous, so none (never a guess between two businesses)
+        $reqs[1].json.metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
+        # no rule matches: none, or the brand the line was captured with when it has one
+        $reqs[2].json.metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
+        $reqs[3].json.metadata.brand | Should -Be 'kept-brand'
+        # a path rule still wins over the words
+        $reqs[4].json.metadata.brand | Should -Be 'brand-a'
     }
 
     It 'redacts a credential that an older, unredacted capture left in the queue before posting it' {

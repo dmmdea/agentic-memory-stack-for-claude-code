@@ -33,9 +33,10 @@
 #   * Fail-open for the session: spawned hidden by memory-maintenance-spawn.ps1 on every role, it
 #     never throws to its caller and returns a summary object for tests and logs.
 #
-# Brand: the record's transcript path is resolved with Get-BrandFromTranscriptPath (the brand
-# map in brands.json); a record whose path resolves to nothing keeps the brand it was captured
-# with, and a record with neither carries no brand key.
+# Brand: the record's transcript path AND the correction's own text go to Get-BrandFromTranscriptPath
+# (the C3 brand map in brands.json: path rules first, then, for a content-rule workspace, the
+# words, exactly as L1a classifies a fact); a record that resolves to nothing keeps the brand it
+# was captured with, and a record with neither carries no brand key.
 #
 # Test seams: -QueuePath, -AuthorityUrl, -ApiKey, -CommitRetries/-CommitRetryMs and -Force (skip the 1 h throttle). Production
 # passes none of them; the API key is then read from the authority host on first use.
@@ -112,12 +113,15 @@ function Set-DrainStatus {
 }
 
 function Get-DrainBrand {
-    param($Rec)
+    # -Text is the correction as it will be posted. A transcript under a content-rule workspace is
+    # classified by its words, not its path, so without the text such a line could never be routed
+    # (it would keep whatever brand capture recorded, which is none for a path that routes nowhere).
+    param($Rec, [string]$Text = '')
     $brand = ''
     $tp = Get-DrainString $Rec 'transcript'
     if ($tp) {
         try {
-            $b = Get-BrandFromTranscriptPath -Path $tp
+            $b = Get-BrandFromTranscriptPath -Path $tp -Text $Text
             if ($b -and $b.brand) { $brand = [string]$b.brand }
         } catch {}
     }
@@ -299,7 +303,7 @@ function Invoke-LearnRulesDrain {
                         captured_at = (Get-DrainRawTimestamp $raw 'ts')
                         session_id  = (Get-DrainString $rec 'session_id')
                     }
-                    $brand = Get-DrainBrand $rec
+                    $brand = Get-DrainBrand $rec -Text $text
                     if ($brand) { $meta['brand'] = $brand }
                     # The key lives in WSL (a UNC read that can wake the distro), so it is fetched
                     # only now: after the lock and the throttle, and only when a line is going out.
