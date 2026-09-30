@@ -8,7 +8,7 @@ after five minutes. The signal therefore has to be PASSIVE: this tracker only co
 of writes that really happen, with no I/O and no model load, so an uptime checker can poll the
 endpoint that publishes it as often as it likes.
 
-Rules (the docstrings below repeat the ones the code enforces):
+Rules:
 
 * An outcome counts only when it says something about the path: a 2xx is a success and a 5xx a
   failure. A 4xx (admission reject, validation, auth) is the caller's problem, and a 1xx/3xx says
@@ -21,18 +21,28 @@ Rules (the docstrings below repeat the ones the code enforces):
 
 The tracker is a plain object (`WritePathTracker`) so a test can own one; the module-level
 `record`, `snapshot` and `reset` work on the process-wide `TRACKER`, which is what the server uses.
+
+`install(app)` registers the one HTTP middleware that feeds it: the final status of every
+`POST /v1/memories` and `PUT /v1/memories/{id}`. It lives here, not in app.py, so the wiring can be
+tested without building the live memory client that `import app` builds.
 """
 from __future__ import annotations
 
 import collections
 import datetime as dt
+import json
+import logging
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
+
+log = logging.getLogger("mem0-server")
 
 WINDOW_S = 3600.0          # errors_1h / writes_1h look back this far; nothing older is kept
 MAX_REASON_CHARS = 64      # a reason is a short label, never a message
 DEFAULT_REASON = "upstream"
+WRITE_PATH_PREFIX = "/v1/memories"
+PEEK_MAX_BYTES = 4096      # a failure body bigger than this is not read for a reason (it is still sent whole)
 
 
 def _iso(epoch: float) -> str:
@@ -148,3 +158,100 @@ def snapshot(now: Optional[float] = None) -> dict:
 
 def reset() -> None:
     TRACKER.reset()
+
+
+# --------------------------------------------------------------------------- the HTTP middleware
+def is_write_request(method: str, path: str) -> bool:
+    """`POST /v1/memories` and `PUT /v1/memories/{id}`, exactly. `/v1/memories/search` and `/diagnose`,
+    the tier and metadata PATCHes, DELETE and every read share the prefix but are not the write path,
+    and a trailing-slash form is a 307 redirect (a 3xx is never recorded anyway)."""
+    verb = (method or "").upper()
+    if verb == "POST":
+        return path == WRITE_PATH_PREFIX
+    if verb == "PUT":
+        head, _, memory_id = path.rpartition("/")
+        return head == WRITE_PATH_PREFIX and bool(memory_id)
+    return False
+
+
+def _reason_from(chunk: Any) -> Optional[str]:
+    """The `reason` string of a small JSON-object body (embedder_503 answers with one), else None."""
+    if not isinstance(chunk, (bytes, bytearray)) or not chunk or len(chunk) > PEEK_MAX_BYTES:
+        return None
+    try:
+        doc = json.loads(chunk)
+    except Exception:  # not JSON, not UTF-8, absurdly nested: no reason, and never an error
+        return None
+    reason = doc.get("reason") if isinstance(doc, dict) else None
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+async def _reason_of(response: Any) -> Optional[str]:
+    """The reason a failure response gives for itself, read WITHOUT changing what the client receives.
+
+    Starlette hands the middleware a response whose body is still a stream. Take its first chunk,
+    read the reason from that, and put the same chunk back at the front of the stream: the bytes,
+    the headers and the status that go out are exactly what the handler produced. Only the first
+    chunk is looked at (an error body is one chunk), so a slow or endless body is never waited on.
+    A failure raised by the stream itself is held and raised again at the same point of the replay."""
+    body = getattr(response, "body", None)
+    if isinstance(body, (bytes, bytearray)):          # a fully rendered response, not a stream
+        return _reason_from(body)
+    stream = getattr(response, "body_iterator", None)
+    if stream is None:
+        return None
+    first: Any = None
+    failure: Optional[Exception] = None
+    try:
+        first = await stream.__anext__()
+    except StopAsyncIteration:
+        pass
+    except Exception as exc:  # not ours to swallow: raised again by the replay below
+        failure = exc
+
+    async def replay():
+        if first is not None:
+            yield first
+        if failure is not None:
+            raise failure
+        async for chunk in stream:
+            yield chunk
+
+    response.body_iterator = replay()
+    return _reason_from(first)
+
+
+def _note(status: int, reason: Optional[str]) -> None:
+    try:
+        TRACKER.record(status, reason)
+    except Exception:  # the tracker must never be the reason a write fails
+        log.exception("write_path: could not record a %s outcome", status)
+
+
+async def middleware(request: Any, call_next: Any) -> Any:
+    """Record the final status of a write, and hand the response back exactly as it came.
+
+    Only POST /v1/memories and PUT /v1/memories/{id} are looked at; every other request goes straight
+    through. The status is the one the client gets, after the exception handlers ran. An exception
+    that no handler takes arrives here as an exception: it is recorded as a 500 and raised again, so
+    the server answers it as it always did."""
+    if not is_write_request(request.method, request.scope.get("path", "")):
+        return await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        _note(500, None)
+        raise
+    status = response.status_code
+    _note(status, await _reason_of(response) if status >= 500 else None)
+    return response
+
+
+def install(app: Any) -> None:
+    """Register `middleware` on a FastAPI/Starlette app (what `@app.middleware("http")` does).
+
+    Ordering: Starlette stacks ServerErrorMiddleware > user middleware > ExceptionMiddleware > routes
+    whatever order things were added in, so the exception handlers (embedder_503's 503, FastAPI's
+    HTTPException and validation handlers) run INSIDE this middleware and it records the response
+    they produced, not the exception they took."""
+    app.middleware("http")(middleware)

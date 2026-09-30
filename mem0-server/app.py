@@ -225,6 +225,12 @@ STACK_VERSION = _resolve_stack_version()
 app = FastAPI(title="mem0 WSL", version="2.0.4-v012")
 import embedder_503 as _embedder_503  # spec §4 P1-6: embedder outages -> 503 + Retry-After (reason cold-embedder)
 _embedder_503.install(app)
+# Passive write-path health: the FINAL status of every POST /v1/memories and PUT /v1/memories/{id}
+# (the 503 embedder_503 builds, an HTTPException 500, an unhandled exception recorded as 500 and
+# re-raised) is counted in-process; /health/maintenance publishes it as `write_path`. Zero I/O, and
+# no model load: an endpoint that probed the embedder would keep it resident.
+import write_path as _write_path
+_write_path.install(app)
 
 def auth(x_api_key: Optional[str] = Header(None)):
     if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
