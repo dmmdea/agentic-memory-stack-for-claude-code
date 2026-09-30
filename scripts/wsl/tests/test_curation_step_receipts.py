@@ -32,14 +32,28 @@ def _home_env(home, **extra):
 
 
 def _receipt(tmp_path, step, scenario):
-    """Run `ams-step.sh <step> python curation_step_driver.py <scenario>` and return (process, receipt)."""
+    """Run the job the way its shipped unit does and return (process, receipt).
+
+    semantic-dedup and episodic-reconcile run straight under `ams-step.sh <step> python <job>`; the
+    contradiction sweep runs `ams-step.sh --weekly Sun <step> python jobs.py run <step> --receipt <its log>
+    --stale-after N -- python <job>`, i.e. one process deeper, under the durable job queue. The queue passes
+    the environment (AMS_OUTCOME_FILE) and both output streams through, and it is the piece that could have
+    swallowed the outcome line or the reason on stderr, so the sweep is driven through it here too."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     env = _home_env(home)
     for k in ("MEM0_URL", "AMS_OUTCOME_FILE", "MEM0_KEY", "MEM0_API_KEY", "MEM0_API_KEY_FILE",
               "MEM0_DEFAULT_USER_ID", "JOBS_IDEMPOTENCY_KEY"):
         env.pop(k, None)
-    r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), step, sys.executable, str(DRIVER), scenario],
+    job = [sys.executable, str(DRIVER), scenario]
+    wrapper = []
+    if step == "contradiction-sweep":
+        env["AMS_STEP_TODAY"] = "Sun"
+        wrapper = ["--weekly", "Sun"]
+        job = [sys.executable, str(SCRIPTS / "jobs.py"), "run", step,
+               "--receipt", str(home / ".mem0" / "contradiction-sweep.jsonl"), "--stale-after", "10800",
+               "--", *job]
+    r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), *wrapper, step, *job],
                        capture_output=True, text=True, env=env, timeout=180)
     rp = home / ".mem0" / "maintenance" / "receipts.jsonl"
     rows = [json.loads(ln) for ln in rp.read_text(encoding="utf-8").splitlines() if ln.strip()]
