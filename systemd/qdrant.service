@@ -1,5 +1,5 @@
 [Unit]
-Description=Qdrant v1.18.2 vector store (v0.12 agentic-memory-stack)
+Description=Qdrant vector store (agentic-memory-stack)
 After=default.target
 
 [Service]

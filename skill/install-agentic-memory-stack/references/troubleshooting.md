@@ -4,30 +4,32 @@ Read on demand from `SKILL.md`. All paths use `$HOME` / `<distro>` / `<wsl-user>
 
 ## llama-swap model entries (the one manual step)
 
-The installer fetches `~/models/embeddinggemma-300M-Q8_0.gguf` and verifies the embed endpoint, but does not rewrite your llama-swap config. Add both models to the `always_loaded` group, bound to loopback:
+The installer fetches `~/models/embeddinggemma-300M-Q8_0.gguf` and verifies the embed endpoint, but does not rewrite your llama-swap config. Add both models to a non-exclusive, non-swapping `support` group, each with `ttl: 300`, bound to loopback:
 
 ```yaml
 models:
   embeddinggemma:
     cmd: <llama.cpp>/build/bin/llama-server --model $HOME/models/embeddinggemma-300M-Q8_0.gguf
-         --embeddings --pooling mean --n-gpu-layers 0
+         --embeddings --pooling mean --n-gpu-layers 999
          --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
          --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
-    ttl: 0    # never auto-unload
+    ttl: 300    # unload after 5 idle minutes
     aliases: ["embeddinggemma", "egemma", "embeddinggemma-300m"]
   bge-reranker-v2-m3:
     cmd: <llama.cpp>/build/bin/llama-server --model /path/to/bge-reranker-v2-m3.Q4_K_M.gguf
-         --reranking --host 127.0.0.1 --port ${PORT}
+         --reranking --pooling rank --n-gpu-layers 999 --host 127.0.0.1 --port ${PORT}
     env: ["RERANK_DOC_MAX_CHARS=6000"]
+    ttl: 300
 groups:
-  always_loaded:
-    persistent: true
+  support:
     swap: false
     exclusive: false
     members: ["embeddinggemma", "bge-reranker-v2-m3"]
 ```
 
+> `--n-gpu-layers 999` puts every layer on the GPU (both models are a few hundred MB); host RAM is overflow only, so if a model does not fit the card let llama.cpp spill just the remainder instead of forcing zero GPU layers.
+>
 > Do NOT raise `--ctx-size` above 2048 (the model's trained limit; the shim `mem0-server/egemma_embedder.py` truncates input to stay within it). llama-swap must bind `127.0.0.1:11436` (Test-MemoryStack WARNs if LAN-exposed). Verify:
 
 ```powershell

@@ -135,3 +135,52 @@ def test_health_embedder_asks_for_the_configured_model(health_client, monkeypatc
     monkeypatch.setattr(httpx, "post", post)
     r = health_client.get("/health/embedder")
     assert r.status_code == 200 and seen["model"] == "embeddinggemma-ams" and r.json()["loaded"] is True
+
+
+# ---- llama-swap >= v256: `status` is an object, not a string; ?warm=rerank warms the reranker ----
+
+def _models_v256(status):
+    return {"object": "list", "data": [{"id": "embeddinggemma-ams", "object": "model", "status": status}]}
+
+
+def test_health_embedder_reads_the_v256_status_object(health_client, monkeypatch):
+    import app as appmod
+    monkeypatch.setitem(appmod.EMBEDDER_CONFIG, "model", "embeddinggemma-ams")
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _llama_swap(200, _models_v256({"value": "loaded"})))
+    monkeypatch.setattr(httpx, "post", _embedding_ok)
+    assert health_client.get("/health/embedder").json()["loaded"] is True
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _llama_swap(200, _models_v256({"value": "unloaded"})))
+    assert health_client.get("/health/embedder").json()["loaded"] is False
+
+
+def test_health_embedder_warm_rerank_issues_a_one_document_rerank(health_client, monkeypatch):
+    import app as appmod
+    monkeypatch.setitem(appmod.EMBEDDER_CONFIG, "model", "embeddinggemma-ams")
+    seen = []
+
+    def post(url, json=None, timeout=None, **kw):
+        seen.append((url, json))
+        if url.endswith("/v1/rerank"):
+            return _llama_swap(200, {"results": [{"index": 0, "relevance_score": 0.5}]}, "POST", "/v1/rerank")
+        return _embedding_ok(url)
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _llama_swap(200, _models_v256({"value": "loaded"})))
+    monkeypatch.setattr(httpx, "post", post)
+    body = health_client.get("/health/embedder?warm=rerank").json()
+    assert body["ok"] is True and body["rerank"]["ok"] is True
+    rerank_calls = [j for u, j in seen if u.endswith("/v1/rerank")]
+    assert len(rerank_calls) == 1 and len(rerank_calls[0]["documents"]) == 1
+    seen.clear()
+    assert "rerank" not in health_client.get("/health/embedder").json()
+    assert not [1 for u, _ in seen if u.endswith("/v1/rerank")], "no ?warm, no rerank"
+
+
+def test_health_embedder_warm_rerank_failure_never_fails_the_endpoint(health_client, monkeypatch):
+    def post(url, json=None, timeout=None, **kw):
+        if url.endswith("/v1/rerank"):
+            return _llama_swap(500, {"error": {"message": "upstream command exited prematurely"}}, "POST", "/v1/rerank")
+        return _embedding_ok(url)
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _llama_swap(200, _models("loaded")))
+    monkeypatch.setattr(httpx, "post", post)
+    r = health_client.get("/health/embedder?warm=rerank")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True and r.json()["rerank"]["ok"] is False

@@ -28,11 +28,12 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/goals.md`](./systems/goals.md) | Persistent multi-session objectives tracked alongside episodic memory |
 | [`systems/open-questions.md`](./systems/open-questions.md) | The cross-session open-questions registry and why it is global, not per-session |
 | [`systems/continuity.md`](./systems/continuity.md) | Session-continuity behavior (resume, checkpoints) and the problem it solves |
+| [`systems/sessionstart-banner.md`](./systems/sessionstart-banner.md) | What the SessionStart banner reads on each role: replicas read the authority (recent sessions, one health line), never their own frozen brain artifacts |
 | [`systems/codex-hooks.md`](./systems/codex-hooks.md) | The L1a extractor + C1 consolidator hooks, and why unattended cron runs on Codex |
 | [`systems/dream-skill.md`](./systems/dream-skill.md) | The nightly 4-phase consolidation ("dream") pattern — *design doc; marked DESIGN in-file* |
 | [`systems/l10-audit.md`](./systems/l10-audit.md) | The post-hoc audit job: what it flags and how to triage the flags |
 | [`systems/auto-memory-maintenance.md`](./systems/auto-memory-maintenance.md) | Lint + nightly compaction of the harness's own per-workspace memory stores: the budgets, the safety guards, and what the job may never touch |
-| [`systems/wiki-index.md`](./systems/wiki-index.md) | The operator's LLM Wiki as a searchable index on the brain box: the two refresh paths (session + nightly backstop), the forced-command pull key, why it is outside the backup set |
+| [`systems/wiki-index.md`](./systems/wiki-index.md) | The operator's LLM Wiki as a searchable index on the brain box: the two refresh paths (session + nightly backstop) and the PC catch-up, freshness as the newer of pull and build, the forced-command pull key, why it is outside the backup set |
 | [`systems/stale-paths-audit.md`](./systems/stale-paths-audit.md) | Read-only staleness audit: memories asserting dead filesystem paths, and the hand-label worksheet that decides whether a validity schema is worth building |
 | [`systems/mem0-api.md`](./systems/mem0-api.md) | The mem0 server's REST endpoints and the MCP shim in detail |
 | [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker stage — *design doc; marked DESIGN in-file* |

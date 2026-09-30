@@ -25,7 +25,9 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # P1-6: pre-warm the memory authority's embedder. It unloads after 5 idle minutes and takes
 # ~3.4 s to come back, so the first prompt's bundle used to pay the cold start (or get a
-# cold-embedder 503). A hidden child calls GET /health/embedder (one active embed) and exits.
+# cold-embedder 503). A hidden child calls GET /health/embedder?warm=rerank (one active embed, then a
+# one-document rerank: the reranker unloads after 5 idle minutes too, and its cold load otherwise
+# lands inside the first deliberate search) and exits. -TimeoutSec 45 = embed 10 s + rerank 20 s + margin.
 # Fire-and-forget: nothing here blocks, and nothing is logged unless the spawn itself throws.
 # This runs BEFORE the capture early-exits below on purpose: a repeated start on the same prior
 # transcript (the watermark case) still needs a warm embedder.
@@ -49,7 +51,7 @@ if (-not $prewarmUrl) { $prewarmUrl = 'http://127.0.0.1:18791' }
 # Only a plain http(s) URL is ever interpolated into the child command line.
 if ($prewarmUrl -notmatch '^https?://[A-Za-z0-9._:\[\]/-]+$') { $prewarmUrl = '' }
 if ($prewarmUrl) {
-    $prewarmCmd = "try { Invoke-RestMethod '" + $prewarmUrl.TrimEnd('/') + "/health/embedder' -TimeoutSec 20 | Out-Null } catch {}"
+    $prewarmCmd = "try { Invoke-RestMethod '" + $prewarmUrl.TrimEnd('/') + "/health/embedder?warm=rerank' -TimeoutSec 45 | Out-Null } catch {}"
     try {
         if ($IsUnixHost) {
             Start-Process -FilePath 'pwsh' `

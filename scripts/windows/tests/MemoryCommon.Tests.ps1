@@ -659,3 +659,29 @@ Describe 'Invoke-CodexSubagent: auth mode and failure tail (capture-l1a-codex-lo
         Get-OutputTail -Text 'only' -Lines 3 | Should -Be 'only'
     }
 }
+
+Describe 'Resolve-L1aSessionId (the episode is keyed on the real session, not the snapshot file)' {
+    # PreCompact hands the worker a temp copy named precompact-snap-<PID>.jsonl. Deriving the session
+    # from that file name posted every compaction under a phantom session.
+
+    It 'prefers the session id the hook reported over any file name' {
+        Resolve-L1aSessionId -SessionId 'b5d1c0de-1111-2222-3333-444455556666' -TranscriptPath 'C:\tmp\precompact-snap-1234.jsonl' |
+            Should -Be 'b5d1c0de-1111-2222-3333-444455556666'
+    }
+
+    It 'falls back to the transcript file name (Claude Code names transcripts <session>.jsonl)' {
+        Resolve-L1aSessionId -SessionId '' -TranscriptPath 'C:\Users\x\.claude\projects\p\abcdef12-0000-0000-0000-000000000000.jsonl' |
+            Should -Be 'abcdef12-0000-0000-0000-000000000000'
+    }
+
+    It 'ignores a session id that is not a plain token' {
+        Resolve-L1aSessionId -SessionId 'a b"; calc' -TranscriptPath 'C:\t\real-session.jsonl' | Should -Be 'real-session'
+    }
+
+    It 'mints a fresh id only when there is neither a session id nor a transcript' {
+        $a = Resolve-L1aSessionId -SessionId '' -TranscriptPath ''
+        $b = Resolve-L1aSessionId -SessionId '' -TranscriptPath ''
+        [guid]::Parse($a) | Should -Not -BeNullOrEmpty
+        $a | Should -Not -Be $b
+    }
+}
