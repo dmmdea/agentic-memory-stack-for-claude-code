@@ -38,6 +38,11 @@ in the first entries below — full pre-inversion history lives in the maintaine
 - **`install/3-verify.ps1` told a replica that its first nightly dream fires at 3:00 AM.** A replica
   never dreams; on any role but `brain` the next steps now say the nightly dream and dedup run on the
   memory authority.
+- **`install/linux-authority.sh` rendered the nft belt's system unit into the user unit dir.** Its
+  `systemd/ams-*` glob picked up `ams-nft.service`, the root oneshot it also installs into
+  `/etc/systemd/system`, so every install left a disabled copy under `~/.config/systemd/user` that could
+  never load a firewall table. The unit set now leaves it out, and a real install removes the copy an
+  earlier install left there.
 
 ### Upgrade notes
 - **Deploy the authority, then re-run the installer on every replica PC.** The write-path signal exists

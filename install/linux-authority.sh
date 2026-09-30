@@ -230,6 +230,11 @@ if [ -z "$WIKI_SOURCES" ]; then
     UNITS="$(printf '%s\n' $UNITS | grep -vx "$WIKI_INDEX_UNIT" | tr '\n' ' ')"
     echo "    --wiki-sources not configured: no wiki-index step"
 fi
+# ams-nft.service is a SYSTEM unit (the root oneshot that loads the nft belt at boot), installed into
+# /etc/systemd/system in step [5]. The systemd/ams-* glob above also rendered it into the USER unit
+# dir, where it sat disabled and could never load a firewall table.
+NFT_UNIT="ams-nft.service"
+UNITS="$(printf '%s\n' $UNITS | grep -vx "$NFT_UNIT" | tr '\n' ' ')"
 echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID"
 echo "    units: $UNITS"
 
@@ -449,6 +454,10 @@ say "[5] units (native drop-in; no per-job timers) + maintenance scripts"
 if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; deploy scripts/wsl/*.{py,sh} to $SCRIPTS_DIR"; then :; else
     mkdir -p "$SYSTEMD_USER_DIR" "$SCRIPTS_DIR"
     render_units "$SYSTEMD_USER_DIR"
+    if [ -f "$SYSTEMD_USER_DIR/$NFT_UNIT" ]; then   # the copy earlier installs left behind
+        rm -f "$SYSTEMD_USER_DIR/$NFT_UNIT"
+        echo "    removed the stale user-unit copy of $NFT_UNIT (it is a system unit)"
+    fi
     for f in "$REPO_ROOT"/scripts/wsl/*.py "$REPO_ROOT"/scripts/wsl/*.sh; do
         [ -f "$f" ] || continue
         tr -d "\r" < "$f" > "$SCRIPTS_DIR/$(basename "$f")"
