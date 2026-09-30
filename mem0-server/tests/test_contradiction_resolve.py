@@ -160,8 +160,14 @@ def test_dismiss_removes_every_queue_line_for_the_memory(tmp_path, monkeypatch):
 
 
 def test_main_dismiss_needs_no_backend(tmp_path, monkeypatch):
+    """--dismiss is queue-file only. It must run on a box where the Codex judge is unavailable
+    (no bridge import, no install receipt), where the judge preflight would otherwise answer a
+    no-op with exit 0 and leave the line in the queue: success reported for work not done."""
     q = tmp_path / "q.jsonl"
     monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    monkeypatch.setattr(sweep, "_codex", None)
+    monkeypatch.setattr(sweep, "_install_is_provisioned", lambda: False)
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
     sweep.append_review_queue(str(q), _stale("m1", "c2"))
     assert sweep.main(["--dismiss", "m1"]) == 0
     assert _lines(q) == []

@@ -2222,7 +2222,9 @@ def _main(argv=None) -> int:
     # v0.27.3: when judging with Codex, the Windows shim must be reachable. Preflight it; if it is
     # NOT, record a NO-OP (exit 0 — NOT a hard failure, so the weekly timer is not noisy) and never
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
-    if args.judge == "codex" and not args.unstamp and not args.promote:
+    # The operator's remediation modes judge nothing, so the preflight never gates them: a judge
+    # outage must not turn --unstamp / --promote / --dismiss into an exit-0 no-op.
+    if args.judge == "codex" and not args.unstamp and not args.promote and not args.dismiss:
         if _codex is None:
             # Receipt-gated: the two cases look identical here but mean opposite things.
             #   - No install receipt -> a fresh box or a half-finished deploy legitimately has no
