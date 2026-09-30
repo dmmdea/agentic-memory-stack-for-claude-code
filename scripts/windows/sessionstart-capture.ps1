@@ -93,13 +93,32 @@ try {
 } catch {}
 
 # Find the most-recently-modified transcript that is NOT the current session (2-level glob, no -Recurse).
+# A junction (or directory symlink) under projects is an ALIAS of another project directory: the glob
+# lists every transcript behind it a second time, at the same mtime, under another FullName, and
+# Sort-Object does not order ties. So the tie is broken on purpose: newest mtime first, then a file
+# under a REAL directory before one reached through an alias, then the path. Aliases stay in the
+# listing: a transcript that exists only behind a junction must still be captured. The alias flag is
+# read once per directory (cached by DirectoryName), not once per file: a stat per transcript would be
+# paid on every session start, over a listing of a thousand files and more.
 $projects = Join-Path $HomeDirPath (Join-Path '.claude' 'projects')
 if (-not (Test-Path $projects)) { exit 0 }
 $prior = $null
+$aliasByDir = @{}
 try {
     $prior = Get-ChildItem -Path (Join-Path $projects (Join-Path '*' '*.jsonl')) -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $curTrans -and $_.BaseName -ne $curSid -and $_.Length -gt 0 } |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Sort-Object @{ Expression = { $_.LastWriteTimeUtc.Ticks }; Descending = $true },
+                    @{ Expression = {
+                            $dir = $_.DirectoryName
+                            if (-not $aliasByDir.ContainsKey($dir)) {
+                                $isAlias = 0
+                                try { if (($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $isAlias = 1 } } catch {}
+                                $aliasByDir[$dir] = $isAlias
+                            }
+                            $aliasByDir[$dir]
+                        } },
+                    @{ Expression = { $_.FullName } } |
+        Select-Object -First 1
 } catch {}
 if (-not $prior) { exit 0 }
 
