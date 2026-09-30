@@ -7,10 +7,12 @@ Tiers are the trust layer of semantic memory. Every memory has a tier that contr
 | Tier | Who can write (POST) | Who can promote (PATCH /tier) | Typical lifetime | Trust level |
 |---|---|---|---|---|
 | `evidence` | Any caller | Any actor (incl. `claude-autonomous`) | Days–weeks | Advisory — verify before acting |
-| `temporal` | Any caller | Any actor | Set by `valid_until` metadata | Time-scoped — check window |
+| `temporal` | Any caller | Any actor | No automatic expiry today (see below) | Time-scoped — read the window from the memory text |
 | `stable` | Not directly | Any actor after manual review | Months | Background context |
 | `insight` | `c1-consolidator` or `dream-consolidator` only (source enforcement) | Actor containing `c1` or `consolidator` only | Weeks–months | Synthesized — trust unless contradicted |
 | `canonical` | Never via POST | Actor must be `user-direct` + non-empty `reason` | Indefinite | Ground truth — the operator explicitly locked this in |
+
+**`temporal` has no validity window and no automatic expiry.** There is no `valid_until` (or `valid_from`/`valid_to`) field anywhere in the server or the sweeps: a time-scoped fact keeps its dates in the memory text, and readers check them there. The one expiry field is `expires_at`, and it is read by `decay-scan.py`, which deletes a `temporal` record whose `expires_at` has passed (the full payload is preserved in `decay-report.jsonl`). It cannot be set on add: `POST /v1/memories` strips it silently (still `200`, with a server-side warning), and only the trusted actors `decay-scan` and `system` may PATCH it in through `/metadata`. Nothing shipped writes it, so today no `temporal` record expires by itself ([memory-model](./memory-model.md) has the full account).
 
 ## Server-Enforced Constants (from `mem0-server/app.py`)
 
