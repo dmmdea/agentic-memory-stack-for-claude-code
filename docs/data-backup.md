@@ -16,7 +16,7 @@ The largest store is Qdrant storage (vectors). The rest is small.
 
 ## What the daily `stack-backup.sh` snapshot covers
 
-The installed timer (03:30 daily) writes dated artifacts into `~/.mem0/backups/` (last 8
+The nightly chain's `stack-backup` step (03:00 chain; on a Windows/WSL-hosted brain a `stack-backup.timer` at 03:30) writes dated artifacts into `~/.mem0/backups/` (last 8
 kept per kind) plus a `manifest-<TS>.json` that lists **exactly what that snapshot
 contains** (absent artifacts are an explicit `null`, never a hoped-for name):
 
