@@ -68,10 +68,12 @@ BeforeAll {
     function script:Get-Tree {
         # Every directory and file under $Root with its size, write time and hash: two snapshots are
         # equal only when nothing was created, changed or rewritten in between.
-        # -IgnorePowerShellHostCache: a child pwsh whose USERPROFILE is redirected writes its OWN startup
-        # cache, AppData\Local\Microsoft\PowerShell\StartupProfileData-<mode>, under that profile when it
-        # exits. That file is the PowerShell runtime's, not the installer's, so exactly it (and the empty
-        # directories that only hold it) is left out; any other file under AppData still counts.
+        # -IgnorePowerShellHostCache: a child pwsh whose USERPROFILE is redirected writes its OWN state
+        # under that profile when it exits (measured: AppData\Local\Microsoft\PowerShell\StartupProfileData-
+        # NonInteractive; Windows PowerShell keeps its module cache under AppData\Local\Microsoft\Windows\
+        # PowerShell). That is the PowerShell runtime's, not the installer's, so those two directory trees
+        # (and the bare AppData\Local\Microsoft parents that would hold only them) are left out; anything
+        # else under AppData, or anywhere in the profile, still counts.
         param([string]$Root, [switch]$IgnorePowerShellHostCache)
         $full = (Resolve-Path -LiteralPath $Root).ProviderPath.TrimEnd('\')
         $lines = @(Get-ChildItem -LiteralPath $full -Recurse -Force | Sort-Object FullName | ForEach-Object {
@@ -80,7 +82,10 @@ BeforeAll {
             else { 'F {0} {1} {2} {3}' -f $rel, $_.Length, $_.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
         })
         if ($IgnorePowerShellHostCache) {
-            $lines = @($lines | Where-Object { $_ -notmatch '^[DF] \\AppData(\\Local(\\Microsoft(\\PowerShell(\\StartupProfileData-[^ ]*)?)?)?)?( |$)' })
+            $lines = @($lines | Where-Object {
+                ($_ -notmatch '^[DF] \\AppData\\Local\\Microsoft\\(Windows\\)?PowerShell( |\\|$)') -and
+                ($_ -notmatch '^D \\AppData(\\Local(\\Microsoft(\\Windows)?)?)?$')
+            })
         }
         $lines -join "`n"
     }
@@ -286,6 +291,11 @@ Describe 'an unusable role record stops both installers before anything is writt
             $psi.EnvironmentVariables['HOMEDRIVE'] = $root.TrimEnd('\')
             $psi.EnvironmentVariables['HOMEPATH'] = '\' + $ProfileDir.Substring($root.Length)
             $psi.EnvironmentVariables['PATH'] = (Split-Path -Parent $script:pwshExe)
+            # keep the host from writing update-check and telemetry files into the sandbox profile
+            $psi.EnvironmentVariables['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+            $psi.EnvironmentVariables['POWERSHELL_UPDATECHECK'] = 'Off'
+            $psi.EnvironmentVariables['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
+            $psi.EnvironmentVariables['DOTNET_NOLOGO'] = '1'
             if ($psi.EnvironmentVariables.ContainsKey('PSModulePath')) { $psi.EnvironmentVariables.Remove('PSModulePath') }
             $proc = [System.Diagnostics.Process]::Start($psi)
             $so = $proc.StandardOutput.ReadToEndAsync()
@@ -312,6 +322,18 @@ Describe 'an unusable role record stops both installers before anything is writt
         $r.Text | Should -Match '(?i)Pass -Role brain or -Role replica explicitly'
         $r.Text | Should -Not -Match 'Memory role:|role \(no -Role given\)|\[0/4\]|not recognized' -Because 'the run must end at the resolver, not at a later step'
         script:Get-Tree $p -IgnorePowerShellHostCache | Should -BeExactly $before -Because 'nothing under the profile may be created, changed or rewritten'
+    }
+
+    It 'the snapshot ignores the PowerShell hosts'' own state directories and nothing else under AppData' {
+        $p = script:New-Profile -RoleFile "replica`n"
+        $before = script:Get-Tree $p -IgnorePowerShellHostCache
+        New-Item -ItemType Directory -Force -Path (Join-Path $p 'AppData\Local\Microsoft\PowerShell'), (Join-Path $p 'AppData\Local\Microsoft\Windows\PowerShell') | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $p 'AppData\Local\Microsoft\PowerShell\StartupProfileData-NonInteractive'), 'x')
+        [System.IO.File]::WriteAllText((Join-Path $p 'AppData\Local\Microsoft\Windows\PowerShell\ModuleAnalysisCache'), 'x')
+        script:Get-Tree $p -IgnorePowerShellHostCache | Should -BeExactly $before -Because 'the hosts'' own state is not the installer''s'
+        New-Item -ItemType Directory -Force -Path (Join-Path $p 'AppData\Roaming\Claude') | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $p 'AppData\Roaming\Claude\config.json'), '{}')
+        script:Get-Tree $p -IgnorePowerShellHostCache | Should -Not -BeExactly $before -Because 'a file elsewhere under AppData must still show'
     }
 
     It 'control: the snapshot sees a write a child makes under the profile, and only the PowerShell host cache is ignored' -Skip:(-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
