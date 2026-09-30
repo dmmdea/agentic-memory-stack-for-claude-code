@@ -906,7 +906,9 @@ class Dream:
     # ---- store judge (register P4-1b) ----------------------------------------------------
     def _store_workspaces(self, checkout: str) -> list[str]:
         """Every workspace with a store in the hub checkout, sorted so a night's plan is
-        deterministic. A workspace whose memory/ is missing is not a store."""
+        deterministic. A workspace whose memory/ is missing is not a store. Scratch and temp
+        workspaces are listed here but offer nothing: `judge-apply --candidates` applies the
+        store exclude rules and returns an empty offer set for them."""
         proj = Path(checkout) / "projects"
         try:
             names = [p.name for p in proj.iterdir() if (p / "memory").is_dir()]

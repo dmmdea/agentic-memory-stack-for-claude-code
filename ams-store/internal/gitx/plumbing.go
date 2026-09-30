@@ -367,6 +367,25 @@ const (
 	logHeadEnd   = "\x02"
 )
 
+// DeletedPaths is every path some commit reachable from rev deleted, as a set. It answers
+// "did this history ever remove that file", which is what a first sync needs to know about
+// the hub before it lets a local-only file back in. One log pass, never one exec per path.
+// A path deleted and re-added later is still in the set: the caller compares it against the
+// tree it is asking about.
+func DeletedPaths(ctx context.Context, opt Options, rev string) (map[string]bool, error) {
+	res, err := Run(ctx, opt, "log", "--no-renames", "--diff-filter=D", "--name-only", "--format=", rev)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out[line] = true
+		}
+	}
+	return out, nil
+}
+
 // CommitTimesByPath walks rev's history ONCE and returns, per path, the commit that last
 // touched it.
 //

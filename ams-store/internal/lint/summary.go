@@ -30,6 +30,7 @@ type Counts struct {
 	Resurrected       int `json:"resurrected"`
 	ConflictInHistory int `json:"conflict_in_history"`
 	OverInjectLimit   int `json:"over_inject_limit"`
+	UnparsedPointer   int `json:"unparsed_pointer"`
 }
 
 // Summary is lint-summary.json.
@@ -46,6 +47,10 @@ type Summary struct {
 	Counts              Counts     `json:"counts"`
 	LastReceiptAgeHours *float64   `json:"last_receipt_age_hours"`
 }
+
+// FindingWindow is how long a receipt-derived finding or a store's last status stays on the
+// summary: a week. Older than that it describes a fleet that no longer exists.
+const FindingWindow = 7 * 24 * time.Hour
 
 // SummaryTimeFormat is the whole-second Zulu layout.
 const SummaryTimeFormat = "2006-01-02T15:04:05Z"
@@ -115,7 +120,7 @@ func Run(ctx context.Context, opt Options) (Summary, error) {
 			Files:            stats.Files,
 			OverTrigger:      stats.OverTrigger,
 			SkipStreak:       h.SkipStreak,
-			LastStatus:       h.LastStatus,
+			LastStatus:       agedStatus(h, now),
 			OverTriggerHours: stamps.HoursOverTrigger(s.Workspace, now),
 		}
 		rows = append(rows, row)
@@ -140,7 +145,7 @@ func Run(ctx context.Context, opt Options) (Summary, error) {
 
 	findings = append(findings, SilentFinding(opt.NightlyUnit, overTriggerCount, receiptAge)...)
 	findings = append(findings, RemoteFindings(ctx, amsync.NewRepo(opt.Roots), opt.Policy)...)
-	findings = append(findings, MergeFindings(opt.Roots.StateRoot, time.Time{})...)
+	findings = append(findings, MergeFindings(opt.Roots.StateRoot, opt.Roots.ProjectsRoot, now.Add(-FindingWindow))...)
 
 	sortFindings(findings)
 	return Summary{
@@ -150,6 +155,15 @@ func Run(ctx context.Context, opt Options) (Summary, error) {
 		Counts:              count(findings),
 		LastReceiptAgeHours: receiptAge,
 	}, nil
+}
+
+// agedStatus is a store's last receipt status, or "" when its newest receipt is older than
+// FindingWindow: a status from last week is history, not the store's state.
+func agedStatus(h RunHistory, now time.Time) string {
+	if h.LastReceiptUTC != nil && now.UTC().Sub(*h.LastReceiptUTC) > FindingWindow {
+		return ""
+	}
+	return h.LastStatus
 }
 
 // Write persists the summary through the atomic writer.
@@ -179,6 +193,8 @@ func count(f []Finding) Counts {
 			c.Resurrected++
 		case KindConflictInHist:
 			c.ConflictInHistory++
+		case KindUnparsedPointer:
+			c.UnparsedPointer++
 		}
 		if x.Kind == KindOverSyncLimit || x.Kind == KindOverInjectCap {
 			c.OverBudget++

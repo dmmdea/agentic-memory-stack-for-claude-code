@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/frontmatter"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/merge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 	amsync "github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/sync"
 )
@@ -31,6 +33,10 @@ const (
 	KindHistoryRemote  = "history-remote"
 	KindResurrected    = "resurrected"
 	KindConflictInHist = "conflict-in-history"
+	// KindUnparsedPointer is a bullet line that links a .md file and did not parse as an
+	// index entry: every per-entry rule (dup-slug, dangling, long-line) and the floor are
+	// blind to it, so it is a finding rather than something that reads as prose.
+	KindUnparsedPointer = "unparsed-pointer"
 )
 
 // actionableKinds is what reaches the session-start banner (LINT:146, plus the two v2
@@ -40,18 +46,19 @@ const (
 // of this set reaches no surface at all. That is how a store that could not be read once
 // became completely invisible - scan-error was missing from the list.
 var actionableKinds = map[string]bool{
-	KindOrphan:         true,
-	KindDangling:       true,
-	KindDupSlug:        true,
-	KindOverSyncLimit:  true,
-	KindOverInjectCap:  true,
-	KindSilent:         true,
-	KindUnproductive:   true,
-	KindStarved:        true,
-	KindHistoryRemote:  true,
-	KindScanError:      true,
-	KindResurrected:    true,
-	KindConflictInHist: true,
+	KindOrphan:          true,
+	KindDangling:        true,
+	KindDupSlug:         true,
+	KindOverSyncLimit:   true,
+	KindOverInjectCap:   true,
+	KindSilent:          true,
+	KindUnproductive:    true,
+	KindStarved:         true,
+	KindHistoryRemote:   true,
+	KindScanError:       true,
+	KindResurrected:     true,
+	KindConflictInHist:  true,
+	KindUnparsedPointer: true,
 }
 
 // Actionable reports whether a kind reaches the banner.
@@ -130,7 +137,7 @@ func MeasureStore(s store.Store) (Stats, error) {
 		Lines:       lines,
 		Entries:     len(ix.Entries()),
 		Files:       len(files),
-		OverTrigger: len(data) >= store.TriggerBytes || lines >= store.TriggerLines,
+		OverTrigger: store.OverTrigger(len(data), lines),
 	}, nil
 }
 
@@ -174,6 +181,11 @@ func StoreFindings(s store.Store) ([]Finding, error) {
 		}
 		if e.Bytes > store.LineByteCap {
 			add(KindLongLine, e.Slug, fmt.Sprintf("%d B (cap %d)", e.Bytes, store.LineByteCap))
+		}
+	}
+	for _, r := range ix.Records {
+		if r.UnparsedPointer() {
+			add(KindUnparsedPointer, store.IndexName, fmt.Sprintf("index line %d links a .md file but does not parse as a pointer (\"- [title](file.md)\", with at most one marker token before the bracket)", r.Index+1))
 		}
 	}
 	for _, f := range files {
@@ -311,21 +323,42 @@ func RemoteFindings(ctx context.Context, repo amsync.Repo, p amsync.RemotePolicy
 // not the tool; a body conflict's loser is still in history and only a human can decide
 // whether to recover it - which is why the finding carries the commit id rather than just
 // saying a conflict happened.
-func MergeFindings(stateRoot string, since time.Time) []Finding {
+//
+// A finding AGES OUT: rows older than `since` are ignored, and a resurrected path whose
+// file is no longer in the store is dropped - the deletion that "came back" was healed by
+// a later pass, and a banner that keeps naming it teaches the operator to ignore the
+// banner. projectsRoot is where the path is checked; empty skips the check.
+func MergeFindings(stateRoot, projectsRoot string, since time.Time) []Finding {
 	rows, err := amsync.ReadReceipts(amsync.ReceiptPath(stateRoot), TailLines)
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
 	var out []Finding
+	seen := map[string]bool{}
 	for _, r := range rows {
 		if !since.IsZero() && r.TS.Before(since) {
 			continue
 		}
 		for _, p := range r.Resurrected {
-			out = append(out, Finding{
-				Store: workspaceOf(p), Kind: KindResurrected, File: p,
-				Detail: "kept by the modify/delete rule: one side edited it while the other deleted it",
-			})
+			key := KindResurrected + "\x00" + p
+			if seen[key] {
+				continue
+			}
+			detail := "kept by the modify/delete rule: one side edited it while the other deleted it"
+			if projectsRoot != "" {
+				if _, statErr := os.Stat(filepath.Join(projectsRoot, filepath.FromSlash(p))); os.IsNotExist(statErr) {
+					// Gone from the store. Healed - unless a first sync set the file aside
+					// because the hub had already deleted it: that copy still waits for a
+					// human to restore or drop it.
+					if _, qErr := os.Stat(filepath.Join(stateRoot, merge.QuarantineDir, filepath.FromSlash(p))); qErr != nil {
+						continue
+					}
+					detail = "quarantined by a first sync: the hub's history had already deleted it; the copy is under " +
+						merge.QuarantineDir + "/ in the state root"
+				}
+			}
+			seen[key] = true
+			out = append(out, Finding{Store: workspaceOf(p), Kind: KindResurrected, File: p, Detail: detail})
 		}
 		for _, c := range r.ConflictsInHistory {
 			out = append(out, Finding{

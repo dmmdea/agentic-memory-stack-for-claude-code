@@ -765,7 +765,7 @@ func TestLint_SummaryCarriesTheKeysTheBannerReads(t *testing.T) {
 	for _, k := range []string{
 		"total", "orphan", "dangling", "dup_slug", "long_line", "oversized", "over_budget",
 		"scan_error", "starved", "actionable",
-		"resurrected", "conflict_in_history", "over_inject_limit",
+		"resurrected", "conflict_in_history", "over_inject_limit", "unparsed_pointer",
 	} {
 		if _, ok := counts[k]; !ok {
 			t.Errorf("counts has no %q", k)
@@ -1005,5 +1005,187 @@ func gitRun(t *testing.T, gitDir, workTree string, args ...string) {
 	out, err := exec.Command("git", full...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// --------------------------------------------------------------------------------
+// Decorated pointers: what still does not parse is a finding, never silent prose.
+// --------------------------------------------------------------------------------
+
+func TestLint_DecoratedPointersParseAndUnparsedOnesAreFindings(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{
+		"- \U0001F6D1 [Stop](stop.md) " + testutil.EmDash + " marked",
+		"- Shipped: [A](a.md) \u00b7 [B](b.md)",
+		"- two marker words [C](c.md)",
+		"- [Plain](plain.md)",
+	}, map[string]string{
+		"stop.md":  testutil.FactFile("stop", "d", "project", "body"),
+		"a.md":     testutil.FactFile("a", "d", "project", "body"),
+		"b.md":     testutil.FactFile("b", "d", "project", "body"),
+		"c.md":     testutil.FactFile("c", "d", "project", "body"),
+		"plain.md": testutil.FactFile("plain", "d", "project", "body"),
+	})
+	s := firstStore(t, sb)
+	st, err := lint.MeasureStore(s)
+	if err != nil {
+		t.Fatalf("MeasureStore: %v", err)
+	}
+	if st.Entries != 2 {
+		t.Errorf("Entries = %d, want 2 (the marked pointer and the plain one; the multi-link Shipped line is a finding)", st.Entries)
+	}
+	found, err := lint.StoreFindings(s)
+	if err != nil {
+		t.Fatalf("StoreFindings: %v", err)
+	}
+	k := kinds(found)
+	if len(k[lint.KindUnparsedPointer]) != 2 {
+		t.Fatalf("unparsed-pointer findings = %v, want the multi-link Shipped line and the two-marker-word line", k[lint.KindUnparsedPointer])
+	}
+	for _, want := range []string{"line 2", "line 3"} {
+		hit := false
+		for _, f := range found {
+			if f.Kind == lint.KindUnparsedPointer && strings.Contains(f.Detail, want) {
+				hit = true
+			}
+		}
+		if !hit {
+			t.Errorf("no unparsed-pointer finding names %q", want)
+		}
+	}
+	if !lint.Actionable(lint.KindUnparsedPointer) {
+		t.Error("unparsed-pointer must be actionable, or it reaches no surface")
+	}
+	sum := runLint(t, sb, "")
+	if sum.Counts.UnparsedPointer != 2 {
+		t.Errorf("counts.unparsed_pointer = %d, want 2", sum.Counts.UnparsedPointer)
+	}
+}
+
+// --------------------------------------------------------------------------------
+// Findings age out: a healed ghost must not stay on the banner until 600 newer rows push
+// it off, and a store that has not run for a week has no "last status" worth showing.
+// --------------------------------------------------------------------------------
+
+func TestLint_ResurrectedFindingsAgeOutAndNeedTheFileToStillExist(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{"- [A](a.md)", "- [B](b.md)"}, map[string]string{
+		"a.md": testutil.FactFile("a", "d", "", ""),
+		"b.md": testutil.FactFile("b", "d", "", ""),
+	})
+	rec := func(age time.Duration, paths ...string) {
+		t.Helper()
+		if err := amsync.AppendReceipt(sb.StateRoot, amsync.Receipt{
+			TS: fixedNow.Add(-age), Kind: "once", Status: amsync.StatusPushed, Resurrected: paths,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec(8*24*time.Hour, "ws/memory/b.md") // too old
+	rec(2*time.Hour, "ws/memory/gone.md") // recent, but the file is gone (healed)
+	rec(2*time.Hour, "ws/memory/a.md")    // recent and still there: the one real finding
+	rec(3*time.Hour, "ws/memory/a.md")    // the same path again: one finding, not two
+
+	sum := runLint(t, sb, "")
+
+	var got []string
+	for _, f := range sum.Findings {
+		if f.Kind == lint.KindResurrected {
+			got = append(got, f.File)
+		}
+	}
+	if len(got) != 1 || got[0] != "ws/memory/a.md" {
+		t.Fatalf("resurrected findings = %v, want only ws/memory/a.md (older than 7 d, gone from the store, and duplicate rows are not findings)", got)
+	}
+	if sum.Counts.Resurrected != 1 {
+		t.Errorf("counts.resurrected = %d, want 1", sum.Counts.Resurrected)
+	}
+}
+
+func TestLint_LastStatusIsClearedWhenTheStoreHasNoRecentReceipt(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("stale", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	sb.AddStore("fresh", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	seedReceipts(t, receiptPath(sb), "stale", []string{"aborted-blast-cap"}, 8*24)
+	f, err := os.OpenFile(receiptPath(sb), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := json.Marshal(map[string]any{"ts": fixedNow.Add(-time.Hour).Format(time.RFC3339Nano), "workspace": "fresh", "status": "no-op"})
+	_, _ = f.Write(append(row, '\n'))
+	f.Close()
+
+	sum := runLint(t, sb, "")
+
+	for _, r := range sum.Stores {
+		switch r.Workspace {
+		case "stale":
+			if r.LastStatus != "" {
+				t.Errorf("stale store last_status = %q, want it cleared (no receipt in 7 days)", r.LastStatus)
+			}
+		case "fresh":
+			if r.LastStatus != "no-op" {
+				t.Errorf("fresh store last_status = %q, want no-op", r.LastStatus)
+			}
+		}
+	}
+}
+
+// A collapsed run of identical aborted rows (one row with a repeat count) still counts as
+// the run it was: three aborts in a row are unproductive whether they are three rows or one.
+func TestLint_UnproductiveCountsACollapsedRunAsItsRepeatCount(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	overTriggerStore(t, sb, "lt")
+	ts := fixedNow.Add(-time.Hour).Format(time.RFC3339Nano)
+	row := `{"ts":"` + ts + `","workspace":"lt","status":"aborted-no-fact-files","dry_run":false,"repeat":3}` + "\n"
+	if err := os.WriteFile(receiptPath(sb), []byte(row), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := countKind(runLint(t, sb, ""), lint.KindUnproductive); n != 1 {
+		t.Errorf("compactor-unproductive = %d, want 1 for a row standing for three aborts", n)
+	}
+}
+
+// The tail readers reach across a rotation: when the live receipts file was just rotated
+// and holds one row, the history of the store still comes from the newest generation.
+func TestLint_RunHistoryReadsAcrossARotation(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	overTriggerStore(t, sb, "lt")
+	rp := receiptPath(sb)
+	seedReceipts(t, rp+".1", "lt", []string{"rejected-no-shrink", "rejected-no-shrink"}, 3)
+	seedReceipts(t, rp, "lt", []string{"rejected-no-shrink"}, 1)
+	if n := countKind(runLint(t, sb, ""), lint.KindUnproductive); n != 1 {
+		t.Errorf("compactor-unproductive = %d, want 1: two rows in generation 1 plus one live make three", n)
+	}
+}
+
+// A path a first sync quarantined is gone from the store but still waits for a human: its
+// finding stays while the copy under the state root exists, and says why.
+func TestLint_AQuarantinedResurrectionStaysVisible(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	sb.AddStore("ws", []string{"- [A](a.md)"}, map[string]string{"a.md": testutil.FactFile("a", "d", "", "")})
+	if err := amsync.AppendReceipt(sb.StateRoot, amsync.Receipt{
+		TS: fixedNow.Add(-time.Hour), Kind: "once", Status: amsync.StatusPushed,
+		Resurrected: []string{"ws/memory/quarantined.md", "ws/memory/healed.md"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	qdir := filepath.Join(sb.StateRoot, "quarantine", "ws", "memory")
+	if err := os.MkdirAll(qdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qdir, "quarantined.md"), []byte("kept aside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sum := runLint(t, sb, "")
+	var got []lint.Finding
+	for _, f := range sum.Findings {
+		if f.Kind == lint.KindResurrected {
+			got = append(got, f)
+		}
+	}
+	if len(got) != 1 || got[0].File != "ws/memory/quarantined.md" || !strings.Contains(got[0].Detail, "quarantined") {
+		t.Fatalf("resurrected findings = %+v, want only the quarantined path (the other is healed)", got)
 	}
 }

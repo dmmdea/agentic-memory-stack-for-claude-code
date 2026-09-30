@@ -156,6 +156,10 @@ type DrainReport struct {
 	Resurrected []string
 	// StillQueued is what a live session still blocks.
 	StillQueued []string
+	// Gone is a queued DELETION whose file was already absent when the drain looked: some
+	// other pass removed it. It is not "applied" by this drain, and folding it into
+	// Applied is what left audit trails that could not tell a drain's work from luck.
+	Gone []string
 }
 
 // ApplyDeferred drains a workspace's queue, re-checking BOTH guards for every entry: the
@@ -202,7 +206,7 @@ func (e *Engine) ApplyDeferred(ctx context.Context, workspace string, mo Materia
 		if ent.Op == OpDelete {
 			switch {
 			case diskErr != nil:
-				rep.Applied = append(rep.Applied, ent.Path) // already gone
+				rep.Gone = append(rep.Gone, ent.Path) // already gone
 			case untouched:
 				deletions = append(deletions, ent)
 			default:
@@ -239,7 +243,7 @@ func (e *Engine) ApplyDeferred(ctx context.Context, workspace string, mo Materia
 	if err := SaveDeferred(mo.StateRoot, workspace, Deferred{Tree: d.Tree, Entries: keep}); err != nil {
 		return rep, err
 	}
-	if (len(rep.Applied) > 0 || len(rep.Resurrected) > 0) && mo.Derive != nil {
+	if (len(rep.Applied) > 0 || len(rep.Resurrected) > 0 || len(rep.Gone) > 0) && mo.Derive != nil {
 		if err := mo.Derive(workspace); err != nil {
 			return rep, err
 		}

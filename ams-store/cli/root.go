@@ -8,6 +8,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	amsync "github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/sync"
 )
 
 // Exit codes, blueprint section 1.2. They are a contract: a caller can tell "skipped"
@@ -164,6 +166,9 @@ func RunWith(env Env, args []string) int {
 	if env.Stdin == nil {
 		env.Stdin = strings.NewReader("")
 	}
+
+	// Every commit this process makes names the client that made it (Ams-Store-Version).
+	amsync.ClientVersion = BuildInfo.Version
 
 	if len(args) == 0 {
 		fmt.Fprint(env.Stderr, Usage())

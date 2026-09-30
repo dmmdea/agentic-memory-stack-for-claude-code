@@ -144,7 +144,7 @@ func runDerive(env Env, args []string) int {
 			}
 			// The G7 clock: this is the maintenance path, and the maintenance path is the
 			// only writer of the over-trigger stamp.
-			recordOverTrigger(roots, res.Workspace, resultBytes(res.BeforeBytes, res.AfterBytes), dryRun, now, env.Stderr)
+			recordOverTrigger(roots, res.Workspace, resultBytes(res.BeforeBytes, res.AfterBytes), resultLines(res.BeforeLines, res.AfterLines), dryRun, now, env.Stderr)
 		}
 		if err != nil {
 			// One unreadable store must not kill the run: every other store still gets

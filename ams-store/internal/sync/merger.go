@@ -78,8 +78,11 @@ type MergeResult struct {
 	// ConflictedPaths is what merge-tree reported, before resolution. A path here is not
 	// a failure - it is the set the deletion table and the field-aware merge resolved.
 	ConflictedPaths []string
-	// Resurrected reports the modify/delete decisions.
+	// Resurrected reports the modify/delete decisions, and the first-join quarantines.
 	Resurrected []Resurrection
+	// Quarantined is the subset of Resurrected a first sync set aside instead of pushing:
+	// local-only paths the hub's history had already deleted.
+	Quarantined []string
 	// ConflictsInHistory reports real body conflicts whose loser stayed in history.
 	ConflictsInHistory []ConflictRef
 	// Materialized and Deferred are what reached the work tree and what did not.
@@ -124,6 +127,8 @@ type DrainResult struct {
 	Resurrected []string
 	// StillQueued is what a live session still blocks.
 	StillQueued []string
+	// Gone is a queued deletion whose file another pass had already removed.
+	Gone []string
 }
 
 // Deriver is the derive engine, declared here for the same reason as Merger: derive is
@@ -162,6 +167,8 @@ type DeriveResult struct {
 	Changed     bool
 	BeforeBytes int
 	AfterBytes  int
+	// AfterLines is the index's line count after the pass, for the over-trigger clock.
+	AfterLines int
 	// Floored is how many hooks the convergence floor truncated.
 	Floored int
 	// Converged is AfterBytes < the sync limit.

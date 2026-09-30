@@ -19,6 +19,7 @@ ams-store gate     [--stdin-payload]
 ams-store sync     [--once] [--watch] [--timeout <dur>] [--remote <name>] [--json]
 ams-store lock     status | acquire --for <dur> --reason <s> | release | break
 ams-store judge-apply --plan <file> --store <dir> [--dry-run] [--max-migrations 5]
+                      [--brand-map <path>]
 ams-store harvest  --store <dir>
 ```
 

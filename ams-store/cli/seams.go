@@ -213,6 +213,7 @@ func (d deriverAdapter) Derive(_ context.Context, opts amsync.DeriveOptions) (am
 		if res.AfterBytes != nil {
 			out.AfterBytes = *res.AfterBytes
 		}
+		out.AfterLines = resultLines(res.BeforeLines, res.AfterLines)
 		out.Floored = res.Floored
 		out.Converged = !res.Unconverged
 		out.OverInjectLimit = res.OverInjectLimit
@@ -256,6 +257,7 @@ func (m mergerAdapter) Merge(ctx context.Context, opts amsync.MergeOptions) (ams
 		GitDir:    opts.GitDir,
 		WorkTree:  opts.WorkTree,
 		MachineID: opts.MachineID,
+		Version:   amsync.ClientVersion,
 		Now:       func() time.Time { return now },
 	}
 	deriver := deriverAdapter{roots: m.roots, machineID: m.machineID, log: m.log}
@@ -308,6 +310,7 @@ func (d drainerAdapter) ApplyDeferred(ctx context.Context, opts amsync.DrainOpti
 		GitDir:    d.roots.HistoryGitDir(),
 		WorkTree:  d.roots.ProjectsRoot,
 		MachineID: d.machineID,
+		Version:   amsync.ClientVersion,
 		Now:       func() time.Time { return now },
 	}
 	deriver := deriverAdapter{roots: d.roots, machineID: d.machineID, log: d.log}
@@ -331,6 +334,7 @@ func (d drainerAdapter) ApplyDeferred(ctx context.Context, opts amsync.DrainOpti
 		Merged:      rep.Merged,
 		Resurrected: rep.Resurrected,
 		StillQueued: rep.StillQueued,
+		Gone:        rep.Gone,
 	}, nil
 }
 
@@ -345,10 +349,17 @@ func reportToResult(rep *merge.Report) amsync.MergeResult {
 		UpToDate:     rep.Commit == "" && !rep.FastForward,
 		Materialized: append(append([]string(nil), rep.Materialized...), rep.Deleted...),
 	}
+	quarantined := map[string]bool{}
+	for _, p := range rep.Quarantined {
+		quarantined[p] = true
+	}
+	out.Quarantined = rep.Quarantined
 	for _, p := range rep.Resurrected {
-		out.Resurrected = append(out.Resurrected, amsync.Resurrection{
-			Path: p, Side: "ours", Reason: "modified here, deleted there",
-		})
+		reason := "modified here, deleted there"
+		if quarantined[p] {
+			reason = "first join: deleted in the hub's history, quarantined and not pushed"
+		}
+		out.Resurrected = append(out.Resurrected, amsync.Resurrection{Path: p, Side: "ours", Reason: reason})
 	}
 	for _, c := range rep.Conflicts {
 		out.ConflictsInHistory = append(out.ConflictsInHistory, amsync.ConflictRef{
@@ -499,13 +510,24 @@ func judgeRenderIndex(roots store.Roots, storeDir string, now time.Time) func([]
 //
 // A dry run never stamps: a rehearsal that started the clock would report a debt the
 // operator never incurred.
-func recordOverTrigger(roots store.Roots, workspace string, bytes int, dryRun bool, now time.Time, log io.Writer) {
+//
+// The store is over trigger on bytes OR lines (store.OverTrigger). Testing bytes alone left a
+// store past the 160-line trigger with no clock at all.
+func recordOverTrigger(roots store.Roots, workspace string, bytes, lines int, dryRun bool, now time.Time, log io.Writer) {
 	if dryRun || workspace == "" {
 		return
 	}
-	if _, err := lint.RecordOverTrigger(roots.ProjectsRoot, workspace, bytes >= store.TriggerBytes, now); err != nil && log != nil {
+	if _, err := lint.RecordOverTrigger(roots.ProjectsRoot, workspace, store.OverTrigger(bytes, lines), now); err != nil && log != nil {
 		fmt.Fprintf(log, "ams-store: over-trigger stamp for %s: %v\n", workspace, err)
 	}
+}
+
+// resultLines is resultBytes for the line count.
+func resultLines(before int, after *int) int {
+	if after != nil {
+		return *after
+	}
+	return before
 }
 
 // resultBytes is the size the clock is judged on: what the index IS after the run, or what
