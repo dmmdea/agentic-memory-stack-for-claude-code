@@ -17,7 +17,9 @@ param(
     # v1.16 one-brain role gate: 'brain' (default) = this box is the memory write
     # authority and runs the nightly dream/dedup scheduled tasks; 'replica' = a
     # read-replica box where those canonical-mutation tasks must never run (and
-    # any previously-registered ones are removed).
+    # any previously-registered ones are removed). 'brain' is the default of a FIRST
+    # install only: an omitted -Role keeps the role the box recorded (install/role-lib.ps1),
+    # so re-running install.ps1 on a replica leaves it a replica.
     [ValidateSet('brain','replica')][string]$Role = 'brain',
     # v1.23 P2-5: forwarded to 2-windows-config.ps1. Empty = inherit what is on the box
     # (a plain re-run never re-points a replica); a replica needs its brain's URL once.
@@ -35,6 +37,13 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
+
+# The role this run applies: an explicit -Role wins; otherwise the role this box recorded on an
+# earlier install; 'brain' only when nothing is recorded. The bare default used to reach
+# 2-windows-config.ps1 unconditionally and turned a replica into a brain on a plain re-run.
+. (Join-Path $RepoRoot 'install\role-lib.ps1')
+$RoleChoice = Resolve-InstallRole -Explicit ($PSBoundParameters.ContainsKey('Role')) -Requested $Role -ProfileDir $env:USERPROFILE
+$Role = $RoleChoice.Role
 
 # v1.0 Phase 7A: resolve the WSL distro (never hardcode 'Ubuntu'). `wsl -l -q`
 # emits UTF-16 — read it with the right console encoding or names arrive
@@ -65,7 +74,7 @@ try {
     Write-Host "WSL distro: $Distro"
     $wslUser = (wsl.exe -d $Distro -e whoami).Trim()
     Write-Host "WSL user: $wslUser"
-    Write-Host "Memory role: $Role (brain = runs nightly dream/dedup; replica = never)"
+    Write-Host "Memory role: $Role ($($RoleChoice.Source); brain = runs nightly dream/dedup; replica = never)"
     Write-Host ""
 
     Write-Phase "[0/4] Prerequisites check"

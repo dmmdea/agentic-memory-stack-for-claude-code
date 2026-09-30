@@ -119,7 +119,7 @@ R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-conso
 
 **The `brands.json` fallback.** The operator's private brand map (`claude-config/brands.json`) is gitignored, so a fresh clone has only the tracked `brands.example.json` template. The installer deploys the local `brands.json` if present, else the example template — and only when no deployed `brands.json` already exists, so a customized map survives re-installs. The map's keys and how they route are in [brands.md](./brands.md).
 
-**The One-Brain Rule role gate.** With `-Role brain` (default) the installer registers the two nightly **canonical-mutation** scheduled tasks. With `-Role replica` it registers *neither* and additionally **removes any previously-registered ones** — because consolidation and dedup mutate the one shared brain and there is no cross-machine lock. (See *Important flows* for the task names.)
+**The One-Brain Rule role gate.** With `-Role brain` (default) the installer registers the two nightly **canonical-mutation** scheduled tasks. With `-Role replica` it registers *neither* and additionally **removes any previously-registered ones** — because consolidation and dedup mutate the one shared brain and there is no cross-machine lock. (See *Important flows* for the task names.) **An omitted `-Role` keeps the recorded role.** `brain` is the default of a first install only: `install.ps1` and `2-windows-config.ps1` resolve an omitted `-Role` from `%USERPROFILE%\.mem0\role` (the file phase 2 writes), then the Receipt's `Role`, then `brain` (`install/role-lib.ps1`), so a plain re-run on a replica leaves it a replica; an explicit `-Role` always wins, and a recorded value that is neither role is ignored with a warning. Before this, the bare default reached phase 2 and rewrote the Receipt, both `~/.mem0/role` files and the task registrations as `brain`. (The WSL phase already kept a recorded role on its own: `stack.env`, then `~/.mem0/role`.)
 
 **The store binary and its hooks (1.25.0, register P4-1a).** Before the receipt is written, phase 2 installs `ams-store.exe` beside the hooks from the GitHub release asset of the tag `VERSION` names, verified against the release's `SHA256SUMS` (a `.sha256` sidecar records the digest; `-BinaryPath` + `-BinarySums` is the offline drop). A binary that cannot be installed aborts the run before the receipt and before any hook is registered. With `-HubHost <hub>` (inherited from the receipt on a re-run) it then writes the hub transport — the `Match host <hub> user ams-hub` block in `~/.ssh/config`, the hub's host key into the binary's own `known_hosts`, a history repo on `main` with `hub` as its one remote — and, only when that path is proven (identity key present, host key seeded), registers `ams-store sync --once` at SessionStart (async) and SessionEnd, lets the maintenance spawner launch the resident watcher, and **removes the 5am `ClaudeCode-MemoryCompactor-5am` task**. A box that cannot prove its hub path keeps the legacy nightly and the installer says so in red. "Proven" is one predicate, `Get-AmHubPathGaps` in `memory-store-lib.ps1`, which the installer and `Test-MemoryStack.ps1` both call: since 1.31.3 the self-test reports an absent task as OK when the hub path is proven (retired) and FAIL only when it is not. `ams-store gate` replaces the PowerShell write gate on PostToolUse on every box, registered over the two legacy markers so the previous entries are replaced, never duplicated. The full sequence and the reasons for its order are in `ams-store.md` (*Release assets and install*).
 
@@ -241,7 +241,7 @@ On a `brain` nothing changes: the authority is loopback and every row runs as be
 
 ## Interfaces and entry points
 
-- `install.ps1 [-NonInteractive] [-LogFile <path>] [-Distro <name>] [-Role brain|replica]` — the operator entry point (pwsh 7+).
+- `install.ps1 [-NonInteractive] [-LogFile <path>] [-Distro <name>] [-Role brain|replica]` — the operator entry point (pwsh 7+). `-Role` omitted = the role this box recorded, `brain` on a first install.
 - The four phase scripts are individually runnable (each auto-detects the distro if run standalone); `2-windows-config.ps1` additionally accepts `-EvalRootWsl`.
 - `deploy.sh [--dry-run]` — the ongoing deploy entry point (run inside WSL, brain or replica). On a native Linux authority the entry point is a re-run of `install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR>`; `deploy.sh` refuses there with exit 5.
 - `Test-MemoryStack.ps1` — the manual, non-mutating health verifier that hosts R9 (pwsh 7+; not invoked by any hook or task).
@@ -309,13 +309,14 @@ On a `brain` nothing changes: the authority is loopback and every row runs as be
 - **Adding a sentinel/module/hook in only one place.** All of source, installer, `deploy.sh`, and R9 (or phase-1's `MEM0_MODULES`) must agree.
 - **Expecting `deploy.sh` to restart on a failing import** — it deliberately does not.
 - **Running `deploy.sh` on the native authority.** It is the WSL path and refuses a `MEM0_HOST_KIND=native` box; re-run `install/linux-authority.sh` with the `MEM0_BIND` / `MEM0_SECRETS_DIR` from `stack.env` instead.
-- **Registering nightly tasks on a replica.** Use `-Role replica`; the gate keeps the One-Brain Rule intact.
+- **Registering nightly tasks on a replica.** Install it with `-Role replica` once; the gate keeps the One-Brain Rule intact, and re-runs without `-Role` keep the recorded role.
 - **Task principals on a workgroup box.** Every scheduled task is registered under the current identity's resolvable name (`WindowsIdentity.GetCurrent().Name`), never `$env:USERDOMAIN\$env:USERNAME` — on a workgroup machine USERDOMAIN is the literal `WORKGROUP`, which has no SID, and registration fails with "No mapping between account names and security IDs".
 - **Committing `claude-config/brands.json`.** It is gitignored on purpose; the tracked template is `brands.example.json`.
 
 ## Source map
 
 - [`../../install.ps1`](../../install.ps1) — the orchestrator (phase sequence, pwsh gate, distro/role resolution).
+- [`../../install/role-lib.ps1`](../../install/role-lib.ps1) — `Resolve-InstallRole`: explicit `-Role`, else the recorded role, else `brain` (dot-sourced by `install.ps1` and `2-windows-config.ps1`).
 - [`../../install/0-prereqs.ps1`](../../install/0-prereqs.ps1) — phase 0 prerequisite checks.
 - [`../../install/1-wsl-services.sh`](../../install/1-wsl-services.sh) — phase 1 WSL services (Qdrant, mem0, `MEM0_MODULES`, keys, units, WSL receipt).
 - [`../../install/2-windows-config.ps1`](../../install/2-windows-config.ps1) — phase 2 receipt, sentinel resolution, distro-agnostic hooks, `brands.json` fallback, role gate.

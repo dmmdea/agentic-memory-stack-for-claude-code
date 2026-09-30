@@ -38,7 +38,7 @@ The through-line is that **the code is reinstalled, never transported.** The ins
 
 ### Role selection — `brain` vs `replica`
 
-`install.ps1 -Role brain|replica` (default **`brain`**) sets the machine's place under the **One-Brain Rule**. Since v1.23 an explicit `-Role` also reaches the WSL phase (as `MEM0_ROLE`), and `-AuthorityUrl http://<brain-host>:18791` / `-AuthoritySsh <alias>` are forwarded to phase 2 — a replica needs both once; omitting them on a re-run inherits what is on the box.
+`install.ps1 -Role brain|replica` (default **`brain`** on a first install) sets the machine's place under the **One-Brain Rule**. An omitted `-Role` on a re-run keeps the role the box recorded (`%USERPROFILE%\.mem0\role`, else the Receipt's `Role`; `install/role-lib.ps1`), so re-running `install.ps1` — or `2-windows-config.ps1` directly — on a replica leaves it a replica; pass `-Role` explicitly to change a box's role. Since v1.23 an explicit `-Role` also reaches the WSL phase (as `MEM0_ROLE`), and `-AuthorityUrl http://<brain-host>:18791` / `-AuthoritySsh <alias>` are forwarded to phase 2 — a replica needs both once; omitting them on a re-run inherits what is on the box.
 
 - **`brain`** — this box is the sole memory write authority; phase 2 registers the two nightly canonical-mutation scheduled tasks (`ClaudeCode-DreamConsolidator-3am`, `ClaudeCode-SemanticDedup-430am`).
 - **`replica`** — a read-only consumer; phase 2 registers *neither* task **and removes any previously-registered ones**, because consolidation and dedup mutate the one shared brain and there is no cross-machine lock. The role is recorded in the Receipt and re-asserted by verify: a `brain` must have both tasks, a `replica` must have neither.
@@ -104,7 +104,7 @@ A fresh install *creates* the machine-local set from the tracked source; a re-in
 ## Invariants and assumptions
 
 1. **Phase order is strict: 0 → 1 → 2 → 3.** Prereqs gate everything; WSL services must exist before Windows config wires hooks to them; verify runs last. A hard failure in 0–2 aborts; verify is advisory.
-2. **The role flag is `-Role brain|replica`, default `brain`, and enforces the One-Brain Rule.** Exactly one box runs the nightly canonical-mutation tasks; a `replica` install registers none and removes any it finds.
+2. **The role flag is `-Role brain|replica`, default `brain` on a first install (a re-run keeps the recorded role), and enforces the One-Brain Rule.** Exactly one box runs the nightly canonical-mutation tasks; a `replica` install registers none and removes any it finds.
 3. **Every phase is idempotent.** Re-running is safe and resumes a partial install — the property that makes re-install, upgrade, and rollback the same operation as a fresh install.
 4. **The code is reinstalled, never transported.** The installer derives all operator-specific values locally from Sentinels; no repo artifact encodes a specific machine, so a fresh install on any box is operator-agnostic.
 5. **Machine-local vs tracked never blur.** Receipts, `~/.mem0/*` runtime state, and sentinel-resolved deployed copies are per-machine; the repo source is tracked and operator-neutral. Data and credentials are machine-local and are *restored / re-provisioned* on cutover, not copied.
