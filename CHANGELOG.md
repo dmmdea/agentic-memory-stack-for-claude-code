@@ -322,8 +322,11 @@ in the first entries below — full pre-inversion history lives in the maintaine
   checked.
 - **A plain `install.ps1` re-run turned a replica PC into a brain.** `install.ps1` and
   `install/2-windows-config.ps1` now keep the recorded role when `-Role` is omitted
-  (`install/role-lib.ps1`); an explicit `-Role` still wins, and first installs are unchanged. Test:
-  `scripts/windows/tests/InstallRole.Tests.ps1`.
+  (`install/role-lib.ps1`); an explicit `-Role` still wins, and first installs are unchanged. A role
+  record that exists but cannot be read (a garbage or empty role file, a receipt with a bad or empty
+  `Role`, an unparseable receipt) stops the installer before it writes anything and asks for an
+  explicit `-Role`, instead of silently resolving to `brain`. Test:
+  `scripts/windows/tests/InstallRole.Tests.ps1` (Windows PowerShell 5.1 and PowerShell 7).
 - **A WSL deploy could leave `DEPLOYED_SHA` empty.** `scripts/wsl/deploy.sh` now stamps it through the
   shared contract in `install/deploy-stamp.sh` (a 40-hex sha or `unknown`), where
   `git rev-parse HEAD > DEPLOYED_SHA || true` left an empty file when git failed, and it reads the stamp
@@ -638,7 +641,8 @@ in the first entries below — full pre-inversion history lives in the maintaine
   `corrections drain` WARNs when a pending correction is older than 48 h.
 - **Replica PCs keep their role.** A plain `install.ps1` re-run used to turn a replica into a brain.
   With `-Role` omitted, `install.ps1` and `install/2-windows-config.ps1` now keep the recorded role, an
-  explicit `-Role` still wins, and first installs are unchanged. Re-run the installer on each replica
+  explicit `-Role` still wins, and first installs are unchanged; an unreadable role record stops the
+  installer and asks for `-Role` (pass it explicitly then). Re-run the installer on each replica
   PC: the PC-side changes in this release (brand resolution in the hooks and the L1a worker, the L1a
   lock wait, capture-time redaction of corrections and the corrections drain) reach a PC only then.
 - **Manual dream.** `scripts/wsl/ams-dream-now.sh` has run only against a fake `systemd-run`, and its
