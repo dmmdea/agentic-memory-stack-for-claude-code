@@ -93,13 +93,14 @@ try {
 } catch {}
 
 # Find the most-recently-modified transcript that is NOT the current session (2-level glob, no -Recurse).
-# A junction (or directory symlink) under projects is an ALIAS of another project directory: the glob
-# lists every transcript behind it a second time, at the same mtime, under another FullName, and
-# Sort-Object does not order ties. So the tie is broken on purpose: newest mtime first, then a file
-# under a REAL directory before one reached through an alias, then the path. Aliases stay in the
-# listing: a transcript that exists only behind a junction must still be captured. The alias flag is
-# read once per directory (cached by DirectoryName), not once per file: a stat per transcript would be
-# paid on every session start, over a listing of a thousand files and more.
+# A junction under projects is an ALIAS of another project directory (a directory symlink carries the
+# same ReparsePoint attribute that is read below, but only junctions were exercised): the glob lists
+# every transcript behind it a second time, at the same mtime, under another FullName, and Sort-Object
+# does not order ties. So the tie is broken on purpose: newest mtime first, then a file under a REAL
+# directory before one reached through an alias, then the path. Aliases stay in the listing: a
+# transcript that exists only behind a junction must still be captured. The alias flag is read once per
+# directory (cached by DirectoryName), not once per file: a stat per transcript would be paid on every
+# session start, over a listing of a thousand files and more.
 $projects = Join-Path $HomeDirPath (Join-Path '.claude' 'projects')
 if (-not (Test-Path $projects)) { exit 0 }
 $prior = $null
@@ -156,7 +157,11 @@ try {
 # The key is the file name + the mtime ticks, never the path. The file name is the session uuid, so it
 # is unique across workspaces; the directory is only the way this start happened to reach the file.
 # An alias directory lists one transcript under two paths, and a path-keyed watermark took the
-# other path for a new transcript and captured it again (a second extraction and a second episode).
+# other path for a new transcript and spawned the extractor on it again. That cost one extra spawn per
+# flip, not a second extraction: l1a-extract.ps1 keeps a transcript cursor keyed by file name (both
+# paths share it) and, once an extraction of those bytes has completed, exits before any codex call.
+# The visible damage was the alias path reaching the session row's workspace label when the alias won
+# the first capture; the tie-break above fixes that half.
 $wm = Join-Path $stateDir 'last-sessionstart-capture'
 $sig = $prior.Name + '|' + $prior.LastWriteTimeUtc.Ticks
 # A watermark written by an earlier release is <full path>|<ticks>, through whichever of the real or an

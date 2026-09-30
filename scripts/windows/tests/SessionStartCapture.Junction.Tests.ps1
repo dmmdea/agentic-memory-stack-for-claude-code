@@ -1,13 +1,18 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
 # SessionStartCapture.Junction.Tests.ps1 - the SessionStart capture must not capture one transcript twice
-# because a directory junction (or symlink) under ~/.claude/projects lists it under a second path.
+# because a directory junction under ~/.claude/projects lists it under a second path. (A directory
+# symlink carries the same ReparsePoint attribute the hook reads, but no test builds one: only
+# junctions are exercised, and creating a symlink needs elevation.)
 #
 # The hook globs projects\*\*.jsonl, and a glob descends into an alias directory: every transcript
 # behind it is listed a second time, at the same mtime, under a different FullName (Windows PowerShell
 # 5.1 and pwsh 7 both do this). Sort-Object does not order the tie, and the watermark used to be
 # <FullName>|<mtime ticks>, so whenever the winning path flipped, the same transcript at the same mtime
-# looked new and was captured again: a codex extraction plus a POST /v1/episodes, which the server
-# does not dedupe.
+# looked new and the extractor was spawned on it again. That cost one extra spawn per flip, not a second
+# extraction: the extractor's transcript cursor is keyed by file name (both paths share it) and drops a
+# repeat before any codex call once an extraction of those bytes has completed. The visible damage was
+# the alias path reaching the session row's workspace label when the alias won the first capture. The
+# tests below assert the spawn count and the path the extractor is handed.
 #
 # Every test builds its own temp tree with real directory junctions (New-Item -ItemType Junction needs
 # no elevation), runs the real sessionstart-capture.ps1 under Windows PowerShell 5.1 against a sandboxed
@@ -18,11 +23,16 @@
 
 BeforeAll {
     $script:winDir = Split-Path -Parent $PSScriptRoot
-    $script:ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    # $env:SystemRoot is unset off Windows, and Join-Path throws on a null path before any test can skip
+    $script:ps51 = ''
+    if ($env:SystemRoot) { $script:ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
 
-    # Why every test would be skipped (empty when the suite can run): the hook host, then a junction probe.
+    # Why every test would be skipped (empty when the suite can run): the host (Windows, with
+    # powershell.exe 5.1), then a junction probe.
     $script:skipReason = ''
-    if (-not (Test-Path -LiteralPath $script:ps51)) {
+    if (-not $script:ps51) {
+        $script:skipReason = 'this is not a Windows host (SystemRoot is unset): the suite runs the hook under Windows PowerShell 5.1'
+    } elseif (-not (Test-Path -LiteralPath $script:ps51)) {
         $script:skipReason = 'Windows PowerShell 5.1 (powershell.exe) is not present'
     } else {
         $probe = Join-Path $TestDrive ('jp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
