@@ -199,7 +199,9 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 - **The daemon is an accelerator, never a dependency** — every failure falls back to a behavior byte-identical to the no-daemon path.
 - **Hooks never block:** stop-extract and the extractor exit 0 always; the client maps a blocking child exit `2` to `0`.
 - **PreCompact snapshots before compaction** — the pre-compaction transcript is preserved for extraction.
-- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator.
+- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator. A run that finds it held waits (polling every 2 s, 20 s by default; `AMS_L1A_LOCK_WAIT_SECONDS` overrides) before it skips. A run that waited re-checks the 10-minute throttle and the transcript cursor once it holds the lock, and releases it without calling Codex when another run on the same transcript finished meanwhile (its window is stale).
+- **The ChatGPT login is what Codex authenticates with** — `Invoke-CodexSubagent` clears `OPENAI_API_KEY` and `CODEX_API_KEY` from the child's environment (an API-key credential would preempt the login) and logs the auth mode to `codex.log`, never a credential.
+- **One SessionStart start per session per second** — an atomic per-session marker in `~/.claude/state/` lets exactly one of several same-second SessionStart hooks spawn the extractor.
 - **The throttle is marked only after success** — a transient failure never silences the next 10 minutes.
 
 ## Error handling
@@ -207,8 +209,8 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 | Condition | Behavior |
 |---|---|
 | mem0 unreachable on L1a start | Skip extraction; drain the legacy DLQ on next run |
-| Codex unauthenticated / exits non-zero | Log error; release lock; exit 0 (best-effort) |
-| Lock held by other component | Log "skipping: lock held"; exit 0 |
+| Codex unauthenticated / exits non-zero | Log error with the last three lines of Codex's output (where the error is); release lock; exit 0 (best-effort) |
+| Lock held by other component | Wait up to 20 s (polling every 2 s); if still held, log "codex lock held by another worker; skipping this extraction (waited Ns)"; exit 0 |
 | JSON parse fails on Codex output | Log preview of raw output; exit 0 (no partial write) |
 | mem0 POST fails per-fact | Queue an `add` op to the WSL Outbox (deterministic 4xx → poison file); continue to next fact |
 | Daemon pipe absent / timeout / stale `lib_hash` | Fall back to the inline PS path; respawn the daemon detached |
@@ -243,6 +245,7 @@ The compiled client's fail-open matrix (missing lib, absent pipe, timeouts, garb
 
 - [`../../scripts/windows/stop-extract.ps1`](../../scripts/windows/stop-extract.ps1) — the Stop/PreCompact dispatcher + the PreCompact snapshot.
 - [`../../scripts/windows/l1a-extract.ps1`](../../scripts/windows/l1a-extract.ps1) — the detached Codex-backed extractor.
+- [`../../scripts/windows/sessionstart-capture.ps1`](../../scripts/windows/sessionstart-capture.ps1) — the SessionStart capture of the prior session, with the per-session same-second guard.
 - [`../../scripts/windows/mem0-hook-daemon.ps1`](../../scripts/windows/mem0-hook-daemon.ps1) — the resident UserPromptSubmit bundle accelerator.
 - [`../../scripts/windows/mem0-hook-client.cs`](../../scripts/windows/mem0-hook-client.cs) — the compiled thin client (fail-open exit-code contract).
 - [`../../scripts/windows/build-hook-client.ps1`](../../scripts/windows/build-hook-client.ps1) — compiles + smoke-gates the client exe.
@@ -255,6 +258,7 @@ The compiled client's fail-open matrix (missing lib, absent pipe, timeouts, garb
 - [`dream-skill.md`](./dream-skill.md) — the nightly consolidator that shares the Codex mutex + DLQ.
 - [`mem0-api.md`](./mem0-api.md) — the REST surface the hooks read and write.
 - [`model-aware-injection.md`](./model-aware-injection.md) — what the bundle injects per model tier.
+- [`brands.md`](./brands.md) — how the extractor brands facts and episodes.
 - [`continuity.md`](./continuity.md) — session continuity / the SessionStart précis.
 - [`../flows/memory-capture.md`](../flows/memory-capture.md) — the capture flow these hooks implement.
 - [`../glossary.md`](../glossary.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)

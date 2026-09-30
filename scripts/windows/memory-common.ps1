@@ -567,6 +567,31 @@ function Drain-Mem0DeadLetter {
     return @{ drained = $drained; remaining = $still.Count; quarantined = $poisoned; dropped = $dropped }
 }
 
+function Get-OutputTail {
+    # The last $Lines non-empty lines of $Text, trimmed and joined with ' | ' - one log line.
+    param([string]$Text, [int]$Lines = 3)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $kept = @($Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($kept.Count -eq 0) { return '' }
+    if ($kept.Count -gt $Lines) { $kept = @($kept[($kept.Count - $Lines)..($kept.Count - 1)]) }
+    return ($kept -join ' | ')
+}
+
+function Get-CodexAuthMode {
+    # auth_mode from the codex auth.json ($env:CODEX_HOME, else ~/.codex): 'chatgpt' or 'apikey'.
+    # 'unknown' when the file is absent or unreadable. Reads ONE field; no token is ever returned.
+    $dir = $env:CODEX_HOME
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Join-Path (Get-AmsHomeDir) '.codex' }
+    try {
+        $f = Join-Path $dir 'auth.json'
+        if (Test-Path -LiteralPath $f) {
+            $m = ((Get-Content -LiteralPath $f -Raw -ErrorAction Stop) | ConvertFrom-Json).auth_mode
+            if ($m -and ([string]$m -match '^[A-Za-z0-9_-]{1,32}$')) { return [string]$m }
+        }
+    } catch { }
+    return 'unknown'
+}
+
 function Invoke-CodexSubagent {
     param(
         [Parameter(Mandatory)][string]$Prompt,
@@ -654,6 +679,21 @@ exit $LASTEXITCODE
     $psi.EnvironmentVariables['MEM0_CODEX_MODEL'] = $Model
     $psi.EnvironmentVariables['MEM0_CODEX_LASTMSG'] = $LastMessagePath
 
+    # An API-key credential in the launching environment PREEMPTS the ChatGPT login this stack
+    # authenticates with: 83 "POST /judge -> 401 Incorrect API key provided: <service-account key>"
+    # since July, and 9 dropped L1a extractions on 2026-09-25. The CHILD must never see one, so the
+    # login in auth.json is what is used. Only the child is scrubbed; the caller's environment is
+    # untouched. The log names the auth mode and which keys were cleared, never a credential.
+    $clearedKeys = @()
+    foreach ($k in @('OPENAI_API_KEY', 'CODEX_API_KEY')) {
+        if ($psi.EnvironmentVariables.ContainsKey($k)) { $psi.EnvironmentVariables.Remove($k); $clearedKeys += $k }
+    }
+    try {
+        $authLine = 'codex auth: mode=' + (Get-CodexAuthMode)
+        if ($clearedKeys.Count -gt 0) { $authLine += '; cleared ' + ($clearedKeys -join ', ') + ' from the child environment' }
+        Write-MemoryLog -Component 'codex' -Message $authLine
+    } catch { }   # a log failure never costs the call
+
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
         $promptBytes = [System.Text.Encoding]::UTF8.GetBytes($Prompt)
@@ -681,7 +721,9 @@ exit $LASTEXITCODE
         $errText = $errTask.Result
         if ($p.ExitCode -ne 0) {
             $detail = if ($output) { $output } else { $errText }
-            throw "codex exited $($p.ExitCode) : $detail"
+            # The error is at the END of codex's output, after a metadata header: the first line is
+            # only the version banner (nine 09-25 failures were logged as just "OpenAI Codex v0.155.1").
+            throw "codex exited $($p.ExitCode); last output lines: $(Get-OutputTail -Text $detail -Lines 3)"
         }
         return $output
     } finally {
@@ -1065,6 +1107,29 @@ function Acquire-CodexLock {
     }
 }
 
+function Acquire-CodexLockWithWait {
+    # Acquire-CodexLock, but a held lock is WAITED on (polling every $PollSeconds, up to
+    # $WaitSeconds) before giving up. The shared mutex serializes L1a, C1 and the dream; a loser
+    # used to skip at once, so a session whose last Stop lost the race was never extracted (24% of
+    # L1a runs in one week). Returns @{ acquired = <bool>; waited = <seconds slept> }. -Sleep is
+    # injectable so a test does not really wait.
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [int]$WaitSeconds = 20,
+        [int]$PollSeconds = 2,
+        [scriptblock]$Sleep = { param($s) Start-Sleep -Seconds $s }
+    )
+    if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = 0 } }
+    $waited = 0
+    while ($waited -lt $WaitSeconds) {
+        $step = [Math]::Min($PollSeconds, $WaitSeconds - $waited)
+        & $Sleep $step
+        $waited += $step
+        if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = $waited } }
+    }
+    return @{ acquired = $false; waited = $waited }
+}
+
 function Release-CodexLock {
     $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' 'codex.lock'))
     if (-not (Test-Path -LiteralPath $lockFile)) { return }
@@ -1080,30 +1145,109 @@ function Release-CodexLock {
     } catch { return }
 }
 
-function Get-BrandFromTranscriptPath {
-    # Infer brand/workspace/project from a Claude Code transcript path.
-    # Claude Code stores transcripts under a directory whose name encodes the project path,
-    # e.g. "d--My-Drive-AI-Ecosystem" or "D--repos-myapp-platform".
-    # Returns a hashtable with keys: brand, workspace, project.
+# ---------------------------------------------------------------- C3 brand map resolver
+# ONE resolver, two pinned copies: this block lives byte-identical (comment-stripped) in
+# memory-common.ps1 and user-prompt-lib.ps1, which do not dot-source each other
+# (BrandRouting.Tests.ps1 pins them). The Python resolver (scripts/wsl/brand_routing.py) and the Go
+# judge run the same corpus, tests/fixtures/brand-routing-cases.jsonl. The contract and the map
+# shape are in docs/systems/brands.md. PS 5.1-safe: no ?? / ?. / ternary.
+function ConvertTo-BrandPath {
     param([string]$Path)
-    $segs = $Path -split '[\\/]'
-    # Find the segment that looks like a project-dir encoding (contains '--')
-    $proj = $segs | Where-Object { $_ -match '^[a-zA-Z]--' } | Select-Object -First 1
-    if (-not $proj) { return @{ brand = $null; workspace = $null; project = $null } }
-    $lower = $proj.ToLower()
-    # v1.0 Phase 7B: operator-agnostic brand routing — rules from the deployed
-    # brands.json (beside this lib), neutral default fallback. No private brand
-    # names hardcoded in source; operators add their own in brands.json.
-    $brand = $null
-    $brandCfg = Join-Path $PSScriptRoot 'brands.json'
-    $brandRules = $null
-    try { if (Test-Path -LiteralPath $brandCfg) { $brandRules = (Get-Content -LiteralPath $brandCfg -Raw | ConvertFrom-Json).rules } } catch {}
-    if (-not $brandRules) { $brandRules = @([pscustomobject]@{ pattern = 'ai-ecosystem|agentic-memory|mem0'; brand = 'ai-ecosystem' }) }
-    foreach ($r in $brandRules) { if ($r.pattern -and ($lower -match $r.pattern)) { $brand = $r.brand; break } }
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    return [regex]::Replace($Path, '[\\/ ]', '-')
+}
+
+function ConvertTo-BrandPattern {
+    param([string]$Pattern)
+    return [regex]::Replace($Pattern, '\\\\|\\/|\\ |[/ ]', '-')
+}
+
+function Test-BrandPattern {
+    param($Pattern, [string]$Text, [switch]$IsPath)
+    if (($Pattern -isnot [string]) -or [string]::IsNullOrEmpty($Pattern)) { return $false }
+    try {
+        $p = $Pattern
+        if ($IsPath) { $p = ConvertTo-BrandPattern $Pattern }
+        return [regex]::IsMatch($Text, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    } catch { return $false }
+}
+
+function Get-BrandMapList {
+    param($Map, [string]$Key)
+    if ($null -eq $Map) { return @() }
+    $v = $null
+    if ($Map -is [System.Collections.IDictionary]) {
+        if ($Map.Contains($Key)) { $v = $Map[$Key] }
+    } elseif ($Map.PSObject.Properties[$Key]) {
+        $v = $Map.PSObject.Properties[$Key].Value
+    }
+    if ($null -eq $v) { return @() }
+    return @($v)
+}
+
+function Resolve-BrandFromMap {
+    param($Map, [string]$Path, [string]$Text = '')
+    $hay = ConvertTo-BrandPath $Path
+    if (-not $hay) { return $null }
+    foreach ($r in @(Get-BrandMapList $Map 'rules')) {
+        if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $hay -IsPath)) { return [string]$r.brand }
+    }
+    $contentWorkspace = $false
+    foreach ($p in @(Get-BrandMapList $Map 'content_rule_workspaces')) {
+        if (Test-BrandPattern $p $hay -IsPath) { $contentWorkspace = $true; break }
+    }
+    if (-not $contentWorkspace) { return $null }
+    $found = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in @(Get-BrandMapList $Map 'content_rules')) {
+        if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $Text)) { [void]$found.Add([string]$r.brand) }
+    }
+    if ($found.Count -eq 1) { return [string]@($found)[0] }
+    return $null
+}
+
+function Get-BrandMap {
+    param([string]$Path)
+    if (-not $Path) { $Path = Join-Path $PSScriptRoot 'brands.json' }
+    $map = $null
+    try { if (Test-Path -LiteralPath $Path) { $map = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } } catch { $map = $null }
+    if ($map -isnot [System.Management.Automation.PSCustomObject]) { $map = $null }
+    $rules = @(Get-BrandMapList $map 'rules' | Where-Object { $_ })
+    if ($rules.Count -gt 0) { return $map }
+    return [pscustomobject]@{
+        rules                   = @([pscustomobject]@{ pattern = 'ai-ecosystem|agentic-memory|mem0'; brand = 'ai-ecosystem' })
+        shared_brands           = @(Get-BrandMapList $map 'shared_brands')
+        content_rule_workspaces = @(Get-BrandMapList $map 'content_rule_workspaces')
+        content_rules           = @(Get-BrandMapList $map 'content_rules')
+    }
+}
+
+function Get-SharedBrands {
+    param($Map)
+    $out = New-Object 'System.Collections.Generic.HashSet[string]'
+    $names = @(Get-BrandMapList $Map 'shared_brands') + @(([string]$env:MEM0_SHARED_BRANDS) -split ',')
+    foreach ($b in $names) {
+        $t = ([string]$b).Trim().ToLowerInvariant()
+        if ($t) { [void]$out.Add($t) }
+    }
+    return @($out)
+}
+
+function Get-BrandFromTranscriptPath {
+    param([string]$Path, [string]$Text = '', $Map = $null)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @{ brand = $null; workspace = $null; project = $null } }
+    if ($null -eq $Map) { $Map = Get-BrandMap }
+    $slug = $null
+    foreach ($seg in ($Path -split '[\\/]')) {
+        if ($seg -match '^[a-zA-Z]--') { $slug = $seg; break }
+    }
+    $workspace = $slug
+    if (-not $workspace) {
+        try { $workspace = [string](Split-Path -Leaf (Split-Path -Parent $Path)) } catch { $workspace = $null }
+    }
     return @{
-        brand     = $brand
-        workspace = $proj
-        project   = $proj
+        brand     = (Resolve-BrandFromMap -Map $Map -Path $Path -Text $Text)
+        workspace = $workspace
+        project   = $slug
     }
 }
 

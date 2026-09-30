@@ -138,8 +138,8 @@ Rules for goal extraction:
 - Be CONSERVATIVE: prefer 0 goals over fabricated ones. The Information Gain principle prefers absence of noise over precision-fudged signal.
 - If session was trivial or no goal-relevant content: {"advanced_goals":[],"blocked_goals":[],"open_questions":[]}.
 
-If facts is empty (truly trivial chat with no durable signal), output {"facts":[],"episode":null}.
-Otherwise, episode MUST be populated — every session with at least one extracted fact must produce a goal+summary+advanced_goals+blocked_goals+open_questions (arrays may be empty), even if brief.
+Facts and the episode are independent. facts may be [] while the episode is still required: the episode records that this session HAPPENED and what it was about, and a session with nothing durable to keep is still a session.
+The episode MUST be populated (goal + summary + advanced_goals + blocked_goals + open_questions, arrays may be empty, even if brief) whenever the conversation has substantive turns - real work done, a decision made, a question worked through, a file or system changed - even when no fact passes the gates above. Only a truly trivial exchange (a greeting, a one-word acknowledgement, no work) may output {"facts":[],"episode":null}.
 
 Conversation excerpt:
 $turns
@@ -148,9 +148,31 @@ $turns
     # Shared Codex mutex: don't fire if C1 (or another L1a) is mid-Codex-call
     # (audit finding 2026-06-08: prior design had separate locks, allowing concurrent
     # Codex calls that contended for ChatGPT subscription quota).
-    if (-not (Acquire-CodexLock -Owner 'l1a')) {
-        Write-MemoryLog -Component 'l1a' -Message '  codex lock held by another worker; skipping this extraction'
+    # 2026-09: a run that finds the lock held now WAITS (polling every 2 s, 20 s by default) before it
+    # gives up. Skipping at once cost 24% of extractions (114 of 481 runs in one week), and a session
+    # whose last Stop skipped was never extracted. AMS_L1A_LOCK_WAIT_SECONDS overrides the bound.
+    $lockWaitSeconds = 20
+    if ($env:AMS_L1A_LOCK_WAIT_SECONDS -match '^\d{1,3}$') { $lockWaitSeconds = [int]$env:AMS_L1A_LOCK_WAIT_SECONDS }
+    $lockResult = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds $lockWaitSeconds
+    if (-not $lockResult.acquired) {
+        Write-MemoryLog -Component 'l1a' -Message "  codex lock held by another worker; skipping this extraction (waited $($lockResult.waited)s)"
         exit 0
+    }
+    if ($lockResult.waited -gt 0) {
+        Write-MemoryLog -Component 'l1a' -Message "  codex lock acquired after $($lockResult.waited)s wait"
+        # The throttle and the turn window above were evaluated BEFORE the wait. A run on the same
+        # transcript (Stop + PreCompact, parallel Stops) may have finished meanwhile: it marked the
+        # throttle and advanced the cursor, so this window is stale, and running codex on it would
+        # spend quota and post paraphrased near-duplicates that the server's byte-identical hash
+        # cannot catch. Re-check both, and give the lock back if the work is already done.
+        $cursorNow = Get-L1aCursor -TranscriptPath $TranscriptPath
+        $throttleBlocks = -not (Test-Throttle -Name 'l1a' -MinIntervalSeconds 600)
+        $cursorReached = ($cursorNow -ne $cursor) -and ($advanceTo -gt 0) -and ($cursorNow -ge $advanceTo)
+        if ($throttleBlocks -or $cursorReached) {
+            Write-MemoryLog -Component 'l1a' -Message '  another run finished while this one waited for the lock; skipping this extraction'
+            Release-CodexLock
+            exit 0
+        }
     }
 
     Write-MemoryLog -Component 'l1a' -Message '  calling codex subagent for extraction'
@@ -224,6 +246,28 @@ $turns
     # facts (Test-IsShipLog=true) fold into the episode summary, not mem0 records.
     $split = Split-FactsByShipLog -Facts $facts
 
+    # The transcript the session actually lives in: it differs from -TranscriptPath only for a
+    # PreCompact snapshot (a temp copy named precompact-snap-<PID>.jsonl, whose directory routes
+    # to no brand). Workspace and brand are read from THIS path, for the facts and the episode alike.
+    $sourceTranscript = if ($OriginTranscriptPath) { $OriginTranscriptPath } else { $TranscriptPath }
+
+    # C3: resolve the brand BEFORE the facts loop. The episode below used to be the only record
+    # that carried a brand (the call sat after the loop), so every fact was brand-neutral and
+    # surfaced in every brand's recall. The map is read once; each fact is routed with its own
+    # text, which only matters in a content-rule workspace (a path rule wins first). NOTE: plain
+    # $sourceTranscript, NOT ($TranscriptPath ?? '') - the ?? null-coalescing operator is PS7-only
+    # and the Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
+    # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
+    # $sourceTranscript is never $null (a [string] param, default ''), so ?? would be redundant.
+    $brandMap = $null
+    $brandInfo = @{ brand = $null; workspace = $null; project = $null }
+    try {
+        $brandMap = Get-BrandMap
+        $brandInfo = Get-BrandFromTranscriptPath -Path $sourceTranscript -Map $brandMap
+    } catch {
+        Write-MemoryLog -Component 'l1a' -Message "  brand routing failed (facts post brand-neutral): $_"
+    }
+
     $posted = 0
     $postedMemoryIds = [System.Collections.Generic.List[string]]::new()
     # Only evergreen facts POST to mem0 and populate linked_memory_ids (durable-only).
@@ -236,11 +280,15 @@ $turns
         # OVERSIZE line (1200) and embeds many topics into one vector.
         foreach ($fact in (Split-OversizeFact -Fact $rawFact)) {
             if ([string]::IsNullOrWhiteSpace($fact)) { continue }
-            $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata @{
+            $factMeta = @{
                 event = $EventName
                 tier = 'evidence'
                 extracted_at = (Get-Date).ToString('o')
             }
+            $factBrand = $null
+            try { $factBrand = Resolve-BrandFromMap -Map $brandMap -Path $sourceTranscript -Text $fact } catch { $factBrand = $null }
+            if ($factBrand) { $factMeta['brand'] = $factBrand }   # unrouted stays brand-neutral: no key at all
+            $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata $factMeta
             if ($memId) {
                 $posted++
                 if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
@@ -278,15 +326,9 @@ $turns
             # named precompact-snap-<PID>, which is not a session.
             # (PowerShell variables are case-insensitive: the local must not shadow the -SessionId parameter.)
             $episodeSessionId = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $TranscriptPath
-            # The transcript the session actually lives in (differs from -TranscriptPath only for a PreCompact snapshot).
-            $sourceTranscript = if ($OriginTranscriptPath) { $OriginTranscriptPath } else { $TranscriptPath }
 
-            # Infer brand/workspace/project from transcript path. NOTE: plain $sourceTranscript,
-            # NOT ($TranscriptPath ?? '') — the ?? null-coalescing operator is PS7-only and the
-            # Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
-            # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
-            # $TranscriptPath is a [string] param (defaults '', never $null), so ?? was redundant.
-            $brandInfo = Get-BrandFromTranscriptPath -Path $sourceTranscript
+            # brand/workspace/project: $brandInfo was resolved above from $sourceTranscript (the real
+            # transcript, not a PreCompact snapshot), before the facts loop.
 
             # Best-effort started_at: use transcript file mtime as a proxy for session start
             $sessionStartedAt = (Get-Date).ToString('o')

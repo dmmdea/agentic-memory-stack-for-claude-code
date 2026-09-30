@@ -72,6 +72,8 @@ The other shape rules (all enforced in-prompt, all consequential downstream):
 
 **The ship-log split.** Facts are then partitioned (`Split-FactsByShipLog`): evergreen atomics POST to mem0 as `tier=evidence`; ship-log narratives ("shipped X, fixed Y, merged Z") fold into the **episode summary** instead. This single rule keeps release-note noise — the largest class of junk a coding agent generates — out of semantic memory while preserving it as history.
 
+**Facts and the episode are independent.** The extraction prompt asks for the episode whenever the conversation has substantive turns, even when no fact passes the gates; only a truly trivial exchange may return `episode: null`. Each posted fact carries the brand its transcript path (or, in a content-rule workspace, its own text) routes to; an unrouted path posts none ([`brands.md`](../systems/brands.md)).
+
 **Beyond facts**, the same Codex call extracts the episode (goal: 1–2 sentences; summary: 2–4), **0–3 advanced goals** (with a one-sentence delta), **0–2 blocked goals** (with the blocker), and **0–5 open questions** — declarative uncertainties raised but unanswered, "NOT idle wondering". These feed the prospective-memory surfaces (session banners, the bundle).
 
 ### Per-prompt capture
