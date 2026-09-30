@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "wsl"))
 import brand_routing  # noqa: E402
+from _home_isolation import apply_home  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "brand-routing-cases.jsonl"
 CASES = [json.loads(ln) for ln in FIXTURE.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -18,8 +19,7 @@ CASES = [json.loads(ln) for ln in FIXTURE.read_text(encoding="utf-8").splitlines
 @pytest.fixture(autouse=True)
 def _fresh_warnings(monkeypatch, tmp_path):
     brand_routing._WARNED.clear()
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    apply_home(monkeypatch, tmp_path)
     for v in ("MEM0_BRAND_MAP", "MEM0_SHARED_BRANDS"):
         monkeypatch.delenv(v, raising=False)
 

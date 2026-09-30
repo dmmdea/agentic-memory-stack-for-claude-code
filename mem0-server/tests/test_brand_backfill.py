@@ -12,6 +12,7 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "wsl"
 sys.path.insert(0, str(SCRIPTS))
 import brand_routing  # noqa: E402
+from _home_isolation import apply_home  # noqa: E402
 
 
 def _load(name, filename):
@@ -30,8 +31,7 @@ BRAND_MAP = {
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     for v in ("MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE", "MEM0_BRAND_MAP", "MEM0_SHARED_BRANDS"):
         monkeypatch.delenv(v, raising=False)
