@@ -13,12 +13,13 @@ call and prints scripted results, so what is asserted is the wrapper's own behav
 No live stack: the fake binary is a shell script in tmp_path.
 """
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from _home_isolation import home_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "wsl" / "ams-store-judge-apply.sh"
@@ -85,13 +86,14 @@ class Hub:
             (self.dir / f"apply-{ws}.json").write_text(result)
 
     def run(self, env_extra=None, outcome=True):
-        env = dict(os.environ)
+        # The wrapper reads $HOME/.mem0 (stack.env, the default plan path): the child's home is the
+        # sandbox on every platform, so it goes through the shared helper, never HOME alone.
+        env = home_env(self.dir)
         env.update({
             "AMS_STORE_BIN": str(self.bin),
             "AMS_STORE_CHECKOUT": str(self.checkout),
             "AMS_STORE_PLAN": str(self.plan),
             "FAKE_DIR": str(self.dir),
-            "HOME": str(self.dir),
         })
         env.pop("MEM0_BRAND_MAP", None)
         env.pop("AMS_OUTCOME_FILE", None)
