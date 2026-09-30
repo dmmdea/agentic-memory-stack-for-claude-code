@@ -44,6 +44,16 @@ Describe 'Step 1 (2026-06-30) correction-capture' {
         Test-CorrectionLikePrompt -Prompt $_ | Should -BeFalse
     }
 
+    It 'Test-CorrectionLikePrompt never matches a background task notification, whatever its output says' {
+        # 1.32: the first drain posted 66 task notifications as operator corrections; their tool
+        # output said "revert that" / "you forgot". The same body typed by a person still matches.
+        $body = "Agent finished. Findings: you forgot the test; revert that change; wrong file edited."
+        $note = "<task-notification>`n<task-id>w1</task-id>`n<status>completed</status>`n<result>$body</result>`n</task-notification>"
+        Test-CorrectionLikePrompt -Prompt $note | Should -BeFalse
+        Test-CorrectionLikePrompt -Prompt ("  `r`n" + $note) | Should -BeFalse
+        Test-CorrectionLikePrompt -Prompt $body | Should -BeTrue
+    }
+
     It 'Add-LearnRuleCapture appends a well-formed record and skips blank prompts (fail-open)' {
         $tmp = Join-Path $env:TEMP ("learn-rules-test-" + [guid]::NewGuid().ToString('N') + ".jsonl")
         try {

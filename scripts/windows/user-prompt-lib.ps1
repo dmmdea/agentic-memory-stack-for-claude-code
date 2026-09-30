@@ -242,6 +242,10 @@ function Test-CorrectionLikePrompt {
     param([string]$Prompt)
 
     if ([string]::IsNullOrWhiteSpace($Prompt)) { return $false }
+    # A background task notification is a machine turn, never the operator correcting the agent,
+    # however often its tool output says "revert" or "you forgot" (the first 1.32 drain posted 66
+    # of them among 100 "corrections").
+    if (Test-MachineTurnPrompt -Prompt $Prompt) { return $false }
     $p = $Prompt.Trim()
 
     $patterns = @(

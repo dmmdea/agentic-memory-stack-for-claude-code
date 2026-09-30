@@ -9,6 +9,8 @@
 #                             source learn-rules, kind correction) -> status "drained" + mem0_id
 #   test-failure (any age) -> status "dropped": a failing test is not an operator correction and
 #                             must never become a memory (the hook that wrote them is retired)
+#   correction that is a machine turn (a task notification capture queued before 1.32.2)
+#                          -> status "dropped", whatever its output says
 #   4xx that can never succeed (400/413/422) -> status "rejected" (else it would block the head
 #                             of the queue for ever)
 #   connect failure, 401/403/429, 5xx -> the run stops and every unposted line stays "pending"
@@ -79,6 +81,17 @@ function Get-DrainRecordKind {
         if ($p -and $p.Value) { return ([string]$p.Value).ToLowerInvariant() }
     }
     return ''
+}
+
+function Test-DrainMachineTurn {
+    # The C10 machine-turn rule (user-prompt-lib.ps1 Test-MachineTurnPrompt; one shared corpus,
+    # tests\fixtures\machine-turn-prompts.json): a background task notification is never an
+    # operator correction. Capture queued them whenever their tool output read like one, and the
+    # first 1.32 drain posted 66 of them; lines already queued are dropped here.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    $t = $Text.TrimStart([char[]]@([char]32, [char]9, [char]13, [char]10, [char]12, [char]11))
+    return $t.StartsWith('<task-notification>', [System.StringComparison]::Ordinal)
 }
 
 function Get-DrainString {
@@ -290,12 +303,13 @@ function Invoke-LearnRulesDrain {
                 $newStatus = 'dropped'
                 $summary.dropped++
             } elseif ($kind -eq 'correction') {
-                if ($abort -or $posted -ge $MaxPerRun) { continue }
                 $text = Redact-Secrets (Get-DrainString $rec 'correction').Trim()
-                if ([string]::IsNullOrWhiteSpace($text)) {
+                if ([string]::IsNullOrWhiteSpace($text) -or (Test-DrainMachineTurn $text)) {
+                    # dropping needs no network, so it does not wait for the per-run budget
                     $newStatus = 'dropped'
                     $summary.dropped++
                 } else {
+                    if ($abort -or $posted -ge $MaxPerRun) { continue }
                     $meta = @{
                         tier        = 'evidence'
                         source      = 'learn-rules'
