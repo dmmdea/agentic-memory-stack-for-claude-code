@@ -1,7 +1,7 @@
 """B1 tests: SessionStart durable/evidence bundle enrichment (sessionstart_bundle.py).
 
 The SessionStart banner already surfaces canonical + open goals + recent episodes, but NOT the
-ranked durable/evidence facts the (now-dead) per-prompt UserPromptSubmit hook used to inject. B1
+ranked durable/evidence facts the per-prompt UserPromptSubmit hook injects once a prompt exists. B1
 enriches the banner with a thin, brand+initiative-scoped, recency-pseudo-query-ranked, K<=1,
 DISTILLED precis of those facts, reusing the live /v1/context/bundle pipeline (checkpoint:false,
 tier:small). Frontier-grounded (scope-first/rank-second; precision-over-recall; distill-not-dump).

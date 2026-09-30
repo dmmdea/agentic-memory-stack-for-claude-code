@@ -1153,8 +1153,8 @@ def _ensure_session(conn: sqlite3.Connection, session_id: str | None) -> None:
     """Insert a minimal sessions row so an open_questions FK reference
     (first_seen_session_id / resolved_in_session_id -> sessions.session_id) never
     raises IntegrityError when the referencing session was never checkpointed - e.g.
-    per-turn hooks are disabled in the VS Code / Agent-SDK runtime, so the live
-    session is never written to `sessions`. No-op for None/empty or an already-present
+    a session the per-prompt checkpoint never reached (a subagent's or an SDK session, a
+    hook that failed), so it is not in `sessions`. No-op for None/empty or an already-present
     session; a later real checkpoint (create_session, ON CONFLICT) enriches the row.
     """
     if not session_id:

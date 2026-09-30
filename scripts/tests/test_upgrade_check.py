@@ -76,9 +76,16 @@ esac
         _stub(self.bin / "llama-swap", f"echo '{version_line}'\n")
 
     def run(self):
+        home = str(self.tmp)
+        drive, tail = os.path.splitdrive(home)
         env = {
             "PATH": f"{self.bin}:/usr/bin:/bin",
-            "HOME": str(self.tmp),
+            # every variable a platform resolves `~` from: HOME alone leaves a child whose home is
+            # read from USERPROFILE (or HOMEDRIVE + HOMEPATH) reaching into the real profile
+            "HOME": home,
+            "USERPROFILE": home,
+            "HOMEDRIVE": drive,
+            "HOMEPATH": tail,
             "MEM0_VENV": str(self.venv),
             "LLAMA_SWAP_BIN": str(self.bin / "llama-swap"),
             "LC_ALL": "C",

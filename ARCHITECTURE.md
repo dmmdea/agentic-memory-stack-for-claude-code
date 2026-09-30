@@ -1,10 +1,26 @@
 # Architecture
 
-A persistent, multi-tier, **measurably faithful** memory backend for Claude Code on Windows + WSL2. This document explains how the whole system works: the six functional layers, the trust-tier memory model, the life of a memory from conversation to retrieval, and the safety invariants that keep a *self-writing* store honest.
+A persistent, multi-tier, **measurably faithful** memory backend for Claude Code: one always-on Linux authority holds the memory, and Windows + WSL2 or Linux PCs use it. This document explains how the whole system works: the six functional layers, the trust-tier memory model, the life of a memory from conversation to retrieval, and the safety invariants that keep a *self-writing* store honest.
 
 > **How to read this doc.** Skim the [bird's-eye view](#birds-eye-view) and the [six layers](#the-six-functional-layers) for the mental model; use the [component code map](#component-code-map) and [ports table](#processes--ports) as reference while reading code. Per-component deep-dives live in `docs/systems/`; end-to-end pipeline walkthroughs in `docs/flows/`; day-2 operations in [`docs/operations.md`](./docs/operations.md); the API surface in [`docs/api-contracts.md`](./docs/api-contracts.md); the full doc map in [`docs/README.md`](./docs/README.md).
 
-**Current shape** (see the `VERSION` file for the release): 4 long-running processes (mem0 FastAPI server, Qdrant, llama-swap, plus on-demand Codex CLI), ~10 Claude Code hooks, 2 Windows scheduled tasks, 6+ WSL systemd-user timers.
+**Current shape** (see the `VERSION` file for the release): one **authority**, a native-Linux box, runs the memory server, Qdrant, llama-swap (the embedder and the reranker, on the GPU) and the one nightly chain of 17 steps, with the Codex CLI on demand as the judge; every other machine is a **replica PC** or **client** whose Claude Code hooks, MCP shim and SessionStart banner talk to the authority. See [Topology](#topology-one-authority-many-pcs).
+
+---
+
+## Topology: one authority, many PCs
+
+Exactly one box holds write authority (the [One-Brain Rule](./docs/architecture/decisions/one-brain-rule.md)). Every other machine reads and writes through it.
+
+| Role | Host | What runs there |
+|---|---|---|
+| **Authority** ("brain": `role=brain`, `MEM0_HOST_KIND=native`) | an always-on Linux box, no WSL and no Windows user | The mem0 server as a systemd `--user` service, bound to the box's **tailnet address** on `:18791` (never a wildcard); Qdrant on loopback `:6333`; llama-swap on loopback `:11436` serving the embedder and the reranker as **GPU models that unload after 300 s idle**; the `ams-nightly.timer` chain; the Codex CLI as the native judge (`MEM0_CODEX_TRANSPORT=native`); and, when a hub is configured, the System A store binary (`ams-store`) with the hub checkout it judges. The two keys are systemd credentials (`LoadCredentialEncrypted=`), not files in a home directory. Installed by `install/linux-authority.sh`. |
+| **Replica PC** (`role=replica`) | a Windows + WSL2 workstation (`install.ps1 -Role replica`) or a Linux box (`install/linux-replica.sh`) | The Claude Code hooks, the MCP shim and the SessionStart banner, all pointed at the authority through `~/.mem0/authority-url`. A local mem0 and Qdrant are installed but **dormant**: an offline watcher starts them only while the authority is unreachable, reads then fail over to that read-only copy and writes queue in the Outbox and replay on reconnect ([offline and travel](./docs/systems/offline-travel.md)). No nightly job runs on a replica. |
+| **Client** (`role=client`) | a Linux box (`install/linux-client.sh`) | The same hooks and shim with no local store at all; offline, reads return the shim's offline result and writes queue. |
+
+**Host kinds.** `MEM0_HOST_KIND=native` (recorded in `~/.mem0/stack.env` by the installers) is a plain Linux box; the other kind is a WSL2 distro on a Windows PC. A Windows + WSL2 box can still be installed as the authority (`install.ps1 -Role brain`, with Task Scheduler and per-job timers doing what the chain does below), but the shipped deployment is the native one and this document describes it. `deploy.sh` is the WSL deploy path and refuses a native host; the authority is deployed by re-running `install/linux-authority.sh` from the updated checkout.
+
+**The one nightly chain.** `ams-nightly.timer` fires at 03:00 local (`Persistent=true`, and the last step arms an RTC wake for 02:45) and starts `ams-nightly.target`. Its steps are `systemd/ams-step-*.service` units ordered by `After=`, never `Requires=`, so a failed step never stops the backup, and each runs through `scripts/wsl/ams-step.sh`, which appends a receipt (`~/.mem0/maintenance/receipts.jsonl`) that `GET /health/maintenance` folds. **The chain is 17 steps:** `dream` → `semantic-dedup` and `store-judge` → `index-refresh` → `wiki-index` beside `goal-recurrence-promote` → the Sunday jobs `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` → `stack-backup` → `syncoid` → `pcloud-copy` → `morning-summary` → `health-stamp` → `rtcwake`. The System A hub and judge (`ams-store`, [System A store client](./docs/systems/ams-store.md)) are part of it: `store-judge` applies the plan the dream wrote for the harness's own per-workspace memory stores to the authority's hub checkout and syncs it. `store-judge` and `wiki-index` are rendered only where a hub or a wiki source is configured, so an install without them runs 15 (details: [installer and deploy](./docs/systems/installer-and-deploy.md), [operations](./docs/operations.md)).
 
 ---
 
@@ -12,32 +28,33 @@ A persistent, multi-tier, **measurably faithful** memory backend for Claude Code
 
 ```mermaid
 flowchart LR
-    subgraph WIN["Windows"]
+    subgraph PC["Replica PC or client"]
         CC["Claude Code<br/>(the host being augmented)"]
-        HOOKS["Hooks<br/>Stop / PreCompact / UserPromptSubmit / SessionStart"]
-        DREAM["Nightly dream consolidator<br/>(Task Scheduler 3am)"]
-        CODEX["Codex CLI (per-job model)<br/>extraction + consolidation + judgment"]
-        SHIM["Codex HTTP shim :18792<br/>(loopback, API-key)"]
+        HOOKS["Hooks + MCP shim + SessionStart banner<br/>extract / capture / inject"]
+        PCCODEX["Codex CLI (per-job model)<br/>session-end extraction"]
+        DORMANT["Dormant local mem0 + Qdrant<br/>(only while the authority is unreachable)"]
     end
-    subgraph WSL["WSL2 (mirrored networking)"]
-        MEM0["mem0 FastAPI server :18791<br/>tiers, admission gate, context bundle,<br/>episodic / goals / open-questions"]
-        QD["Qdrant :6333<br/>mem0_egemma_768 (768-d cosine)<br/>+ episodes collection"]
-        LS["llama-swap :11436<br/>EmbeddingGemma-300m (embed)<br/>bge-reranker (rerank)"]
-        TIMERS["systemd-user timers<br/>decay / dedup / audit / backup /<br/>contradiction-sweep / reconcile"]
+    subgraph AUTH["Authority (native Linux, systemd --user)"]
+        MEM0["mem0 FastAPI server :18791<br/>tailnet address only<br/>tiers, admission gate, context bundle,<br/>episodic / goals / open-questions"]
+        QD["Qdrant 127.0.0.1:6333<br/>mem0_egemma_768 (768-d cosine)<br/>+ episodes and wiki collections"]
+        LS["llama-swap 127.0.0.1:11436<br/>EmbeddingGemma-300m (embed) + bge-reranker-v2-m3 (rerank)<br/>GPU, unload after 300 s idle"]
+        CHAIN["ams-nightly.timer 03:00<br/>17-step chain"]
+        JUDGE["Codex CLI (native judge)"]
+        STORE["System A hub checkout<br/>ams-store judge-apply"]
     end
     CC --> HOOKS
-    HOOKS -->|"extract, capture, inject"| MEM0
-    HOOKS --> CODEX
-    DREAM --> CODEX
-    CODEX -.->|"judgment via"| SHIM
-    TIMERS -.->|"judgment via"| SHIM
+    HOOKS -->|"authority URL"| MEM0
+    HOOKS -.->|"outage only: reads / Outbox"| DORMANT
+    HOOKS --> PCCODEX
     MEM0 --> QD
     MEM0 -->|"embed / rerank"| LS
-    TIMERS --> QD
-    TIMERS --> MEM0
+    CHAIN --> MEM0
+    CHAIN --> JUDGE
+    CHAIN --> STORE
+    JUDGE -.->|"judgment"| MEM0
 ```
 
-Everything is **loopback-only** and **API-key-gated** (`X-API-Key`, key file `~/.mem0/api-key`, mode 600). The only cloud dependency is the Codex CLI (ChatGPT OAuth), used strictly as the *LLM for extraction, consolidation, and judgment* — never as a data store.
+Qdrant and llama-swap listen on loopback only; mem0 on the authority listens on its tailnet address only, and every `/v1` call is **API-key-gated** (`X-API-Key`; the five health probes answer without one, see [`docs/api-contracts.md`](./docs/api-contracts.md)). The only cloud dependency is the Codex CLI (ChatGPT OAuth), used strictly as the *LLM for extraction, consolidation, and judgment* — never as a data store.
 
 ---
 
@@ -47,7 +64,7 @@ Think of a fact's life: **born → stored → trusted → recalled → kept hone
 
 | # | Layer | Job | Key code |
 |---|---|---|---|
-| 1 | [Capture (write path)](#1-capture--the-write-path) | Turn conversations into durable facts + episodes, automatically | `scripts/windows/l1a-extract.ps1`, `scripts/windows/dream-consolidate.ps1`, `mem0-server/episodic.py` — deep-dive: [`docs/flows/memory-capture.md`](./docs/flows/memory-capture.md) |
+| 1 | [Capture (write path)](#1-capture--the-write-path) | Turn conversations into durable facts + episodes, automatically | `scripts/windows/l1a-extract.ps1`, `scripts/wsl/dream-consolidate.py`, `mem0-server/episodic.py` — deep-dive: [`docs/flows/memory-capture.md`](./docs/flows/memory-capture.md) |
 | 2 | [Storage + hybrid search](#2-storage--hybrid-search) | Persist facts as vectors; find them by meaning + keywords + entities | `mem0-server/app.py`, `mem0-server/config.py`, `mem0-server/egemma_embedder.py` |
 | 3 | [Tiers + admission gate](#3-trust-tiers--the-admission-gate) | Rank by trust; hide superseded/contradicted/wrong-brand records at read time | `mem0-server/admission_gate.py`, `mem0-server/freshness.py` |
 | 4 | [Recall (read path)](#4-recall--the-read-path) | Put the right 1–2 memories into the agent's context — or abstain | `scripts/windows/user-prompt-extract.ps1`, `scripts/wsl/mem0-mcp-shim.py`, `claude-config/sessionstart_bundle.py` — deep-dive: [`docs/flows/memory-retrieval.md`](./docs/flows/memory-retrieval.md) |
@@ -60,7 +77,7 @@ Facts are extracted **automatically, with zero user action**, at four moments:
 
 - **Session end / compaction** (`Stop` / `PreCompact` hooks → `stop-extract.ps1` → detached `l1a-extract.ps1`): a Codex subagent reads the last ~24 turns (12 KB cap) under a strict-JSON prompt whose top rule is an **inferability gate** — keep only genuinely project-specific facts a competent outsider could *not* guess (max 5/run, one successful extraction per 10 min). Credential shapes are redacted (`redact.py` server-side + `Redact-Secrets` in the readers) *before* text reaches the LLM or the store.
 - **Per prompt** (`UserPromptSubmit` → compiled `mem0-hook-client.exe` → daemon): checkpoints an in-progress **episode** and captures **operator corrections** in real time (`~/.mem0/learn-rules.jsonl`, redacted at write) the moment they happen, and `learn-rules-drain.ps1` posts them to the authority as evidence-tier memories at the next session start (hourly throttle) — no dependence on the nightly run.
-- **Nightly at 3am, on the brain only** (Task Scheduler → `dream-consolidate.ps1`; a replica's copy exits on its role since 1.28.4): the 4-phase "dream" (orient → gather → consolidate → prune) surprise-weights the last 36 h, synthesizes 1–3 lineage-tracked **insights**, and may autonomously promote at most **3 facts/night** to canonical through the enforced 4C contradiction/corroboration gate. A SessionStart **catch-up** spawner (`dream-catchup.ps1`) re-runs a missed dream (>48 h gap or a queued promotion; the correction queue is the drain's, not dream debt); the MEMORY.md index refresh is decoupled so a down dream can't freeze it.
+- **Nightly at 03:00, on the authority only** (the chain's first step, `dream-consolidate.py`; the Windows `dream-consolidate.ps1` of a Windows-hosted brain exits on any other role, `-Force` included, since 1.28.4): the 4-phase "dream" (orient → gather → consolidate → prune) surprise-weights the last 36 h of the store, synthesizes 1–3 lineage-tracked **insights**, and may autonomously promote at most **3 facts/night** to canonical through the enforced 4C contradiction/corroboration gate. A missed night is made up by the authority itself: the timer is `Persistent=` with an `OnBootSec` re-run, and the chain's boot guard turns a re-run of a completed night into receipted no-ops (the SessionStart catch-up, `dream-catchup.ps1`, belongs to a Windows-hosted brain). The MEMORY.md index refresh is its own step (`index-refresh`), so a down dream can't freeze it. To force a dream by hand: `scripts/wsl/ams-dream-now.sh` on the authority ([operations](./docs/operations.md)).
 - **Write-time classification**: evergreen atomic facts become durable records (`tier=evidence`); volatile ship-log narratives fold into the **episode summary** (SQLite + FTS5 ledger `~/.mem0/episodic.db`) instead of polluting durable memory. Oversize writes are rejected at the API — atomicity is enforced at write time.
 
 Failed writes dead-letter to a retry queue (poison-code quarantine, max 5 attempts). Every tier change and deletion appends to the **append-only tier ledger** (monthly segments `~/.mem0/tier-ledger-YYYY-MM.jsonl`).
@@ -85,10 +102,10 @@ sequenceDiagram
 ### 2. Storage + hybrid search
 
 - **Store**: Qdrant (systemd-user, loopback :6333), collection `mem0_egemma_768` — 768-d cosine, on-disk. A second collection holds **episode-summary embeddings** for the raw-trace fallback.
-- **Embedder**: **EmbeddingGemma-300m** on llama-swap (:11436, CPU). Multilingual — EN/ES recall@1 ≈ 0.90 both (see [design decisions](#design-decisions-worth-knowing)). It requires *asymmetric task prefixes* (query vs document), applied by the prefix-shim `egemma_embedder.py` installed onto the mem0 embedding model at server start.
-- **Server**: a FastAPI wrapper around mem0 2.x (loopback :18791) that owns the tier protocol, admission gate, context bundle, and the episodic/goals/open-questions sidecar. `/health` and `/health/deep` report the stack version and end-to-end store/embedder health — including the GATING `sparse_leg` BM25-liveness canary.
+- **Embedder**: **EmbeddingGemma-300m** on llama-swap (:11436, on the GPU; it unloads after 300 s idle, so the first call after an idle spell pays a cold load, which the SessionStart pre-warm `GET /health/embedder` absorbs). Multilingual — EN/ES recall@1 ≈ 0.90 both (see [design decisions](#design-decisions-worth-knowing)). It requires *asymmetric task prefixes* (query vs document), applied by the prefix-shim `egemma_embedder.py` installed onto the mem0 embedding model at server start.
+- **Server**: a FastAPI wrapper around mem0 2.x (the authority's tailnet address, :18791) that owns the tier protocol, admission gate, context bundle, and the episodic/goals/open-questions sidecar. `/health` and `/health/deep` report the stack version and end-to-end store/embedder health — including the GATING `sparse_leg` BM25-liveness canary.
 - **Search is hybrid**: dense cosine is the **gate** (a candidate must clear the semantic threshold), then BM25 keyword + entity boosts shape the returned ranking. The BM25 leg depends on the **fastembed** sparse encoder (explicit in the installer, with a loadability post-condition) — when it is missing, mem0 silently falls back to dense-only, so the GATING `sparse_leg` check on `/health/deep` (a deterministic oldest-point canary) turns that silent fallback into a failed health/deploy gate ([`docs/systems/mem0-api.md`](./docs/systems/mem0-api.md)). The gate is calibrated on the *raw semantic* scale — off-domain tops out ≈0.12, relevant runs 0.25–0.57, so the **0.30 gate** rejects noise with margin. (Raising it was measured to crater recall; calibration record in `eval/injection-gating/`, private repo.)
-- **Reranker**: a bge cross-encoder applied only where its ~2 s CPU cost is acceptable — deliberate `memory_search` calls (auto-on at `limit ≥ 5`) — never on the hot per-prompt path.
+- **Reranker**: `bge-reranker-v2-m3`, a cross-encoder on the GPU behind the same llama-swap (same 300 s idle unload), applied only where its cost is acceptable — deliberate `memory_search` calls (auto-on at `limit ≥ 5`) — never on the hot per-prompt path. After an idle unload the first search pays a cold load: one budget-bounded retry, then the fail-open dense order, and `rerank_status` says which ([reranker](./docs/systems/reranker.md)).
 
 ### 3. Trust tiers + the admission gate
 
@@ -118,7 +135,7 @@ At **read time** every hit passes the **admission gate** (`admission_gate.py`) f
 Four delivery channels, all precision-first:
 
 1. **Per-prompt injection** (`UserPromptSubmit` → one `POST /v1/context/bundle` round-trip): the top **K = 2** (frontier models) / **K = 1** (small) memories that clear the **0.30** gate, plus open goals/questions, rendered as a `[MEMORY CONTEXT]` block above the prompt. **Abstention-first**: if nothing clears the gate, no block renders at all. Unchanged goals/OQ are not re-injected every prompt; the `insight` tier is filtered server-side from this hot path; client-side defense-in-depth caps and truncates before anything reaches context.
-2. **Deliberate pull** (`memory_recall` MCP tool): the same gated bundle **plus** a separate `canonical`-class search — the curated "what do we know" call an agent makes before consequential work.
+2. **Explicit deeper recall** (`memory_recall` MCP tool), in addition to the per-prompt injection: the same gated bundle **plus** a separate `canonical`-class search — the curated "what do we know" call for when the injected block is empty, for canonical facts (the hook never injects them) or for another brand's scope.
 3. **Deliberate search** (`memory_search` MCP tool): free-text semantic search with the cross-encoder reranker auto-on at `limit ≥ 5`.
 4. **Session start** (`sessionstart_bundle.py`): a resume précis — after a compaction it reuses the **PreCompact-captured conversation query** (K=2); on a cold boot it builds a recency pseudo-query (K=1, precision-first).
 
@@ -140,35 +157,42 @@ flowchart TD
 
 A self-writing store drifts unless something hunts stale and contradicting facts. Two detectors + one write-time guard, under a **safe-by-default resolution policy**:
 
-- **Canonical contradiction sweep** (weekly systemd timer): for each canonical fact, judge near-duplicate non-canonical candidates — *"does B contradict A?"*. All sweep judgment routes to **Codex** through the Windows HTTP shim (:18792); local models are never the judge (a measured 78% false-positive rate killed that design).
+- **Canonical contradiction sweep** (weekly, a Sunday chain step): for each canonical fact, judge near-duplicate non-canonical candidates — *"does B contradict A?"*. All sweep judgment routes to **Codex** through the judge transport (the native Codex CLI on the authority; the Windows HTTP shim, :18792, on a host without native transport); local models are never the judge (a measured 78% false-positive rate killed that design).
 - **Evidence-vs-evidence supersession sweep** (`--evidence-sweep`): anchors on recent facts, finds *older near-duplicate* neighbors, and asks the **supersession judge** a different question — *"would re-reading the older fact mislead about the CURRENT state?"* → `STALE` / `KEEP`, default KEEP. The distinction matters: a valid historical ship-log logically *supersedes* but must be **kept**; reusing the contradiction prompt over-flagged ~2/3 of pairs, and the dedicated judge measured precision 35% → 67% at 100% genuine recall.
 - **NLI write-gate** (async, opt-in): flags a *new* record that contradicts canonical truth at write time — fast cosine pre-filter, Codex judge only on high-similarity neighbors, fail-open on any uncertainty.
 - **Resolution policy — queue-gated hides**: re-judging **auto-clears** false flags (always safe, always automated); evidence-vs-evidence hides and pending-flag promotions route to the **human review queue** (`~/.mem0/contradiction-promote-review.jsonl`; depth surfaced in the SessionStart banner) — `--promote <id>` is the human-confirmed enforce, `--unstamp <id>` the one-command recovery. The **weekly canonical sweep is the exception**: its authoritative Codex YES verdicts stamp directly (recoverable via `--unstamp`; forensic `history` always sees hidden records). The queue exists because a live auto-enforce incident hid 3 consistent facts out of 4 — see `docs/systems/reconciliation.md` for the per-path matrix.
 
 ### 6. Ops, security + the tool surface
 
-**Scheduled hygiene** (all unattended):
+**Scheduled hygiene** (all unattended). On the authority everything scheduled is the one chain above: 17 steps, one receipt each.
 
-| When | Job | What |
+| Step | Runs | What |
 |---|---|---|
-| daily 3:00 | dream consolidator (Task Scheduler, WakeToRun) | consolidate → insight, gated canonical autopromote, prune/index, drift canaries |
-| daily 3:30 | `stack-backup.timer` | SQLite online backups + Qdrant snapshot + ledger/config; integrity-checked. **Retention: last 8 daily snapshots kept ≈ an 8-day restore window** (daily since 2026-07-14, for read-replica freshness — was weekly) |
-| daily 4:30 | semantic dedup (Task Scheduler) | tier-scoped near-duplicate removal (thresholds 0.94–0.97); deleted payloads preserved in `dedup-report.jsonl` |
-| Sun 02:00 | `decay-scan.timer` | expire `temporal`, flag stale `evidence` (>90 d) for review |
-| Sun 04:00 | `goals-stale-sweep.timer` | stale goal hygiene |
-| Sun 05:00 | `contradiction-sweep.timer` | weekly Codex-judged contradiction pass |
-| Sun 05:30 | `episodic-reconcile.timer` | read-only drift detector (mem0 ↔ episodic links) |
-| every 6 h | `l10-audit.timer` | heuristic flags: oversize / injection-shaped / credential-shaped / missing provenance; slow-drip detection |
+| `dream` | nightly | consolidate → insight, gated canonical autopromote, prune/index, drift canaries; skips below the Codex quota reserve |
+| `semantic-dedup` | nightly | tier-scoped near-duplicate removal; deleted payloads preserved in `dedup-report.jsonl` |
+| `store-judge` | nightly, with a hub | applies the dream's System A plan to the hub checkout and syncs it |
+| `index-refresh` | nightly | MEMORY.md index refresh, decoupled from the dream |
+| `wiki-index` | nightly, with a wiki source | the LLM Wiki's semantic index (backstop for the session-side refresh) |
+| `goal-recurrence-promote` | nightly | promotes goals that recur across sessions |
+| `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` | Sundays (`--weekly Sun`) | expire/flag decayed records; stale goal hygiene; weekly Codex-judged contradiction pass; mem0 ↔ episodic link reconciliation (orphan detection, stale in-progress episodes, embedding back-fill); retrieval-pair judging |
+| `stack-backup` | nightly | SQLite online backups + Qdrant snapshots + ledgers/config, integrity-checked, with a manifest. **Retention: last 8 daily snapshots kept ≈ an 8-day restore window**; the only step that stamps `last-chain-success` |
+| `syncoid` | nightly, when its script exists | off-box ZFS replication of the dataset |
+| `pcloud-copy` | nightly | mirrors the newest complete set to the cloud folder (refuses a stale or failed set) |
+| `morning-summary` | nightly | the night's receipts as a summary section |
+| `health-stamp` | nightly | pulls `/health/maintenance`; red on a failed step or an unhealthy pool |
+| `rtcwake` | nightly | arms the RTC wake for the next 02:45 |
+
+Outside the chain, `l10-audit.timer` runs every 6 h: heuristic flags for oversize / injection-shaped / credential-shaped / missing-provenance writes, and slow-drip detection. On a replica PC the stack schedules only its offline watcher (plus the legacy compactor task, on a box whose store-hub path is not yet proven); the rest is hook-driven (session start spawns the correction drain, the index refresh and the wiki catch-up). A Windows-hosted brain runs the same jobs from Task Scheduler and per-job timers instead of the chain ([installer and deploy](./docs/systems/installer-and-deploy.md)).
 
 **Security posture**:
 
-- Loopback-only services; `X-API-Key` on every mem0 call (constant-time compare).
-- **Canonical is cryptographically locked**: promotion/edit/delete requires an HMAC-SHA256 format-2 token (timestamp + burned nonce + reason) signed with a key designed to rest as a Windows-DPAPI blob injected into RAM-backed tmpfs at service start. That cutover is a **per-box operator act**; until it is performed the key rests as a mode-600 plaintext file, which `/health/deep` reports as `canonical_key.source` (see [`docs/systems/dpapi-canonical-key.md`](./docs/systems/dpapi-canonical-key.md)). Either way no plain `add` can ever create canonical — the HMAC gate is unaffected by where the key rests.
+- Qdrant and llama-swap are loopback-only, and mem0 binds the authority's tailnet address, never a wildcard (a persisted nft table, `ams-nft.service`, drops :18791 and :6333 arriving on any interface but `tailscale0` and loopback); `X-API-Key` on every `/v1` call (constant-time compare), the five health probes excepted.
+- **Canonical is cryptographically locked**: promotion/edit/delete requires an HMAC-SHA256 format-2 token (timestamp + burned nonce + reason) signed with a key that never rests as a plain file on the authority: it is a systemd credential (`LoadCredentialEncrypted=ams-canonical-key`, delivered under `$CREDENTIALS_DIRECTORY`), which `/health/deep` reports as `canonical_key.source: credential`. On a Windows-hosted brain the key rests as a Windows-DPAPI blob injected into RAM-backed tmpfs at service start, a **per-box operator act**; until it is performed it rests as a mode-600 plaintext file, reported the same way (see [`docs/systems/dpapi-canonical-key.md`](./docs/systems/dpapi-canonical-key.md)). Either way no plain `add` can ever create canonical — the HMAC gate is unaffected by where the key rests.
 - Server-side `add()` strips caller-forged gating metadata (`contradicts_canonical`, `superseded_by`, `retrievable`, …).
 - Judge prompts treat memory text as **untrusted data** inside delimiter blocks with closing-tag neutralization (prompt-injection defense, pinned by tests).
 - Secrets are redacted at every chokepoint: session readers, extraction prompts, and the server checkpoint path.
 
-**Tool surface**: the MCP shim (`scripts/wsl/mem0-mcp-shim.py`) exposes ~28 tools to Claude Code — `memory_*` (recall / search / add / promote / demote / update / health…), `episodic_*`, `goals_*` / `goal_*`, `open_question(s)_*` — contract in [`docs/api-contracts.md`](./docs/api-contracts.md).
+**Tool surface**: the MCP shim (`scripts/wsl/mem0-mcp-shim.py`) exposes its tool family to Claude Code — `memory_*` (recall / search / add / promote / demote / update / health…), `episodic_*`, `goals_*` / `goal_*`, `open_question(s)_*` — contract in [`docs/api-contracts.md`](./docs/api-contracts.md).
 
 ---
 
@@ -212,8 +236,8 @@ The short codes used across `docs/systems/`, `docs/flows/`, and code comments:
 |---|---|---|
 | L1a | Session fact extractor | `scripts/windows/l1a-extract.ps1` |
 | L10 | Heuristic audit (6 h) | `scripts/wsl/l10-audit.py` |
-| C1 / "dream" | Nightly consolidator | `scripts/windows/dream-consolidate.ps1` |
-| 4C | Promotion gate (contradiction/corroboration, enforced) | `scripts/windows/autopromote-lib.ps1` |
+| C1 / "dream" | Nightly consolidator | `scripts/wsl/dream-consolidate.py` (the authority's chain step; `scripts/windows/dream-consolidate.ps1` on a Windows-hosted brain) |
+| 4C | Promotion gate (contradiction/corroboration, enforced) | `scripts/wsl/autopromote_lib.py` (`scripts/windows/autopromote-lib.ps1` on a Windows-hosted brain) |
 | M1 | mem0 API server | `mem0-server/app.py` |
 | M3 | Vector index | Qdrant `mem0_egemma_768` |
 | R1 | Embedder | EmbeddingGemma-300m via `mem0-server/egemma_embedder.py` |
@@ -230,13 +254,13 @@ Historical codes you may meet in old notes: M2 (an episodic MCP surface removed 
 
 | Port | Process | Runs as |
 |---|---|---|
-| :18791 | mem0 FastAPI server | WSL systemd-user `mem0.service` |
-| :6333 | Qdrant | WSL systemd-user |
-| :11436 | llama-swap (EmbeddingGemma + bge-reranker) | per-host: WSL systemd-user *or* Windows-native (e.g. a scheduled task) — mirrored networking serves `:11436` either way; see the operations runbook before restarting |
-| :18792 | Codex HTTP shim (judgment bridge) | Windows PowerShell daemon (flag-gated, idle-shutdown) |
+| :18791 | mem0 FastAPI server | systemd-user `mem0.service`; on the authority it binds the tailnet address (a dormant replica's copy binds loopback) |
+| :6333 | Qdrant | systemd-user, loopback |
+| :11436 | llama-swap (EmbeddingGemma + bge-reranker-v2-m3, on the GPU, 300 s idle unload) | on the authority a host process on loopback; on a Windows PC per-host: WSL systemd-user *or* Windows-native (e.g. a scheduled task) — mirrored networking serves `:11436` either way; see the operations runbook before restarting |
+| :18792 | Codex HTTP shim (judgment bridge) | Windows PowerShell daemon (flag-gated, idle-shutdown); not installed on the native authority, which runs `codex exec` itself |
 | — | Codex CLI | on-demand, ChatGPT OAuth, shared lock (extractor / dream / shim never run it concurrently) |
 
-Why the shim exists: Codex runs Windows-side (its stdout is only clean there), while the sweeps run WSL-side — the shim moves *only clean JSON over loopback TCP* across that boundary, authenticated with the same API key.
+Why the shim exists: on a Windows-hosted brain Codex runs Windows-side (its stdout is only clean there) while the sweeps run WSL-side, so the shim moves *only clean JSON over loopback TCP* across that boundary, authenticated with the same API key. The native authority has no such boundary and calls the Codex CLI directly.
 
 ---
 
@@ -272,7 +296,7 @@ Measured over-promotion on both judge designs (78% FP local; 3/4 wrong on early 
 
 ### Why a 3am consolidation
 
-The operator is asleep, no Codex quota competition, and `-WakeToRun` wakes the PC for it. Once-daily prevents semantic drift (re-running on unchanged evidence yields near-duplicate insights). Robustness is layered on top: a SessionStart catch-up covers missed nights, and the index refresh is decoupled.
+The operator is asleep and there is no Codex quota competition; the authority is always on, and its last step arms an RTC wake for 02:45 anyway. Once-daily prevents semantic drift (re-running on unchanged evidence yields near-duplicate insights). Robustness is layered on top: the timer is `Persistent=` and re-runs at boot, and the index refresh is its own step.
 
 ### Why the L10 audit is heuristic-only at 6 h
 

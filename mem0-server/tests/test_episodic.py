@@ -1980,10 +1980,11 @@ def test_search_query_class_operational_recency_boost():
 def test_resolve_open_question_from_untracked_session_no_500():
     """v1.0 regression: resolving (and creating) an open question from a session that
     was never checkpointed must NOT 500. open_questions.{first_seen,resolved_in}_
-    session_id are FK-constrained to sessions(session_id); per-turn hooks are disabled
-    in the VS Code / Agent-SDK runtime, so the live session is never written to
-    `sessions` and the FK raised IntegrityError -> 500 (the live mem0
-    open_question_resolve failure). create/resolve now ensure a minimal session row."""
+    session_id are FK-constrained to sessions(session_id); a session the per-prompt
+    checkpoint never reached (per-turn hooks were silent in the VS Code / Agent-SDK
+    runtime when this was found) is not in `sessions`, and the FK raised IntegrityError
+    -> 500 (the live mem0 open_question_resolve failure). create/resolve now ensure a
+    minimal session row."""
     import uuid as _uuid
     s1 = f"test-oq-untracked-{_uuid.uuid4()}"
     cr = httpx.post(f"{URL}/v1/open_questions", json={

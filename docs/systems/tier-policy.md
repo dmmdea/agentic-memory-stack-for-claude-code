@@ -7,18 +7,22 @@ Tiers are the trust layer of semantic memory. Every memory has a tier that contr
 | Tier | Who can write (POST) | Who can promote (PATCH /tier) | Typical lifetime | Trust level |
 |---|---|---|---|---|
 | `evidence` | Any caller | Any actor (incl. `claude-autonomous`) | Days–weeks | Advisory — verify before acting |
-| `temporal` | Any caller | Any actor | Set by `valid_until` metadata | Time-scoped — check window |
+| `temporal` | Any caller | Any actor | No automatic expiry today (see below) | Time-scoped — read the window from the memory text |
 | `stable` | Not directly | Any actor after manual review | Months | Background context |
-| `insight` | `c1-consolidator` or `dream-consolidator` only (source enforcement) | Actor containing `c1` or `consolidator` only | Weeks–months | Synthesized — trust unless contradicted |
-| `canonical` | Never via POST | Actor must be `user-direct` + non-empty `reason` | Indefinite | Ground truth — the operator explicitly locked this in |
+| `insight` | The nightly dream only: `source` in `INSIGHT_ALLOWED_ACTORS` (`dream-consolidator`; the older `c1-consolidator` and `c1-dream-consolidator` are still allowlisted) | An actor in the same allowlist only | Weeks–months | Synthesized — trust unless contradicted |
+| `canonical` | Never via POST | Actor must be `user-direct` + non-empty `reason` (and the HMAC token); the dream's gated autopromotion signs as `dream-autopromote` | Indefinite | Ground truth — the operator explicitly locked this in |
+
+**`temporal` has no validity window and no automatic expiry.** There is no `valid_until` (or `valid_from`/`valid_to`) field anywhere in the server or the sweeps: a time-scoped fact keeps its dates in the memory text, and readers check them there. The one expiry field is `expires_at`, and it is read by `decay-scan.py`, which deletes a `temporal` record whose `expires_at` has passed (the full payload is preserved in `decay-report.jsonl`). It cannot be set on add: `POST /v1/memories` strips it silently (still `200`, with a server-side warning), and only the trusted actors `decay-scan` and `system` may PATCH it in through `/metadata`. Nothing shipped writes it, so today no `temporal` record expires by itself ([memory-model](./memory-model.md) has the full account).
 
 ## Server-Enforced Constants (from `mem0-server/app.py`)
 
 ```python
-ADD_ALLOWED_TIERS = {"evidence", "temporal"}        # POST /v1/memories
-CANONICAL_REQUIRES_USER_DIRECT = True               # actor must be "user-direct" for canonical
-INSIGHT_REQUIRES_C1 = True                          # actor must contain "c1" or "consolidator"
-MAX_MEMORY_CHARS = 1500                             # 413 if exceeded; break into atomic facts
+ADD_ALLOWED_TIERS = {"evidence", "temporal"}        # POST /v1/memories (insight too, when `source` is in INSIGHT_ALLOWED_ACTORS)
+CANONICAL_REQUIRES_USER_DIRECT = True               # actor must be "user-direct" (or in CANONICAL_AUTOPROMOTE_ALLOWED) for canonical
+INSIGHT_REQUIRES_C1 = True                          # actor / source must be in INSIGHT_ALLOWED_ACTORS (exact match, not a substring)
+INSIGHT_ALLOWED_ACTORS = {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"}
+CANONICAL_AUTOPROMOTE_ALLOWED = {"dream-autopromote"}
+MAX_MEMORY_CHARS = 4000                             # 413 if exceeded (env MEM0_MAX_MEMORY_CHARS); break into atomic facts
 ```
 
 These constants are quoted from the live source. Do not assume they changed without reading `app.py`.
@@ -26,10 +30,10 @@ These constants are quoted from the live source. Do not assume they changed with
 **Enforcement details:**
 
 - `POST /v1/memories` with `metadata.tier=canonical` → `403 "add: tier='canonical' not allowed on POST"`.
-- `POST /v1/memories` with `metadata.tier=insight` and `source` not containing `c1` or `consolidator` → `403`.
-- `PATCH /v1/memories/{id}/tier` with `tier=canonical` and `actor != "user-direct"` → `403`.
+- `POST /v1/memories` with `metadata.tier=insight` and `source` not in `INSIGHT_ALLOWED_ACTORS` → `403`.
+- `PATCH /v1/memories/{id}/tier` with `tier=canonical` and `actor` neither `"user-direct"` nor in `CANONICAL_AUTOPROMOTE_ALLOWED` → `403`.
 - `PATCH /v1/memories/{id}/tier` with `tier=canonical` and empty `reason` → `400`.
-- `PATCH /v1/memories/{id}/tier` with `tier=insight` and actor not containing `c1` or `consolidator` → `403`.
+- `PATCH /v1/memories/{id}/tier` with `tier=insight` and actor not in `INSIGHT_ALLOWED_ACTORS` → `403`.
 - `PATCH /v1/memories/{id}/tier` with missing `actor` → `400 "actor is required"`.
 
 ## Actor Values
@@ -37,8 +41,9 @@ These constants are quoted from the live source. Do not assume they changed with
 | Actor string | Meaning | Allowed for |
 |---|---|---|
 | `user-direct` | the operator explicitly said to lock this in | canonical + any tier |
-| `c1-consolidator` | Nightly C1 consolidator | insight + any tier |
-| `dream-consolidator` | Dream-skill consolidator (D.1) | insight + any tier |
+| `c1-consolidator` | The pre-dream name of the nightly consolidator (still allowlisted) | insight + any tier |
+| `dream-consolidator` | The authority's nightly dream (`scripts/wsl/dream-consolidate.py`; `dream-consolidate.ps1` on a Windows brain): the insight add and the `touched_by_dream` stamp | insight + any tier |
+| `dream-autopromote` | The dream's gated canonical autopromotion (at most 3 a night, through the 4C gate); it still signs the HMAC token, through `mem0-canonize.sh --actor dream-autopromote` | canonical only |
 | `claude-autonomous` | Claude acting without explicit the operator direction | evidence, stable, temporal only |
 
 ## Ledger Format
@@ -47,12 +52,14 @@ Every tier change (promotion or demotion) and every insight add appends one JSON
 
 ```jsonl
 {"ts": "2026-06-09T03:12:44+00:00", "event": "tier-change", "memory_id": "7f3a...", "tier": "canonical", "actor": "user-direct", "reason": "the operator said to lock this in"}
-{"ts": "2026-06-09T03:12:50+00:00", "event": "add", "memory_id": "9c2b...", "tier": "insight", "actor": "c1-consolidator", "reason": "C1 add (window_evidence_count=18)"}
+{"ts": "2026-06-09T03:12:50+00:00", "event": "add", "memory_id": "9c2b...", "tier": "insight", "actor": "dream-consolidator", "reason": "C1 add (window_evidence_count=18)"}
 ```
+
+(The `actor` of an insight `add` is the record's `source`; the `reason` string still reads `C1 add`, the name the server wrote before the dream replaced the C1 consolidator.)
 
 **Event types (v0.13):**
 - `tier-change` — any PATCH /tier call that succeeds (promotion or demotion)
-- `add` — insight add via POST (C1 path only)
+- `add` — insight add via POST (the dream's path only)
 - `metadata-merge` — PATCH /metadata (added in C.1, lands Phase C)
 - `decay-delete` — DELETE called by decay scanner (added in D.2, lands Phase D)
 

@@ -228,18 +228,18 @@ try {
     $embBody = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json
     $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($embBody)) -ContentType 'application/json' -TimeoutSec $probeTimeoutSec
     $dim = @($e.data[0].embedding).Count
-    if ($dim -eq 768) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "embeddinggemma live, dim=$dim (CPU)" }
+    if ($dim -eq 768) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "embeddinggemma live, dim=$dim" }
     else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "responded but dim=$dim (expected 768)" }
 } catch {
     $f = Get-ProbeFailure $_
-    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "no response in ${probeTimeoutSec}s (CPU model cold or contended, not necessarily down)" }
+    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "no response in ${probeTimeoutSec}s (model cold or contended, not necessarily down)" }
     else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $f.Message }
 }
 
 # L5: bge-reranker-v2-m3 on llama-swap :11436.
 # W4 (review F11): THIS is the reranker capability's active exerciser, and it stays
 # here on purpose. /health/deep must NOT run an active rerank probe — deploy.sh gates
-# on that endpoint immediately after a restart, and this is a CPU cross-encoder that
+# on that endpoint immediately after a restart, and this is a cross-encoder that
 # routinely needs the full 90s budget below on a cold or contended box; an active
 # probe there would hang deploys. The server therefore exposes only PASSIVE counters
 # (checks.reranker, bumped by real search traffic) and the `reranker` manifest row
@@ -257,7 +257,7 @@ try {
     else                                         { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "responded but unexpected shape$rrStats" }
 } catch {
     $f = Get-ProbeFailure $_
-    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "no response in ${probeTimeoutSec}s (CPU model cold or contended, not necessarily down)" }
+    if ($f.IsTimeout) { Add-Check 'LIVENESS' 'bge-reranker :11436' 'WARN' "no response in ${probeTimeoutSec}s (model cold or contended, not necessarily down)" }
     else              { Add-Check 'LIVENESS' 'bge-reranker :11436' 'FAIL' $f.Message }
 }
 

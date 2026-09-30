@@ -8,9 +8,9 @@ The mem0 stack exposes two surfaces: a **REST API** (HTTP, used internally by L1
 
 ## REST API — `mem0-server/app.py`
 
-Base URL: `http://127.0.0.1:18791` (loopback only, accessible from Windows via WSL mirrored networking).
+Base URL: the authority's, `http://<authority-host>:18791`. On the native authority the server binds its tailnet address only, never a wildcard, and every client (hooks, MCP shim, SessionStart banner) reads the URL from `~/.mem0/authority-url`. A replica's own copy is dormant and answers on loopback, `http://127.0.0.1:18791`, only during an outage or a restore.
 
-Auth: every endpoint except `GET /health` and `GET /health/deep` requires the `X-API-Key` header. Key is at `~/.mem0/api-key` (WSL, mode 0600). Comparison uses `hmac.compare_digest` (constant-time).
+Auth: every endpoint the server defines requires the `X-API-Key` header except the five health probes, which answer without a key: `GET /health`, `GET /health/deep`, `GET /health/maintenance`, `GET /health/morning-summary` and `GET /health/embedder`. Every `/v1/...` route authenticates. FastAPI's own generated routes are keyless too, because the app leaves the framework defaults on: `/openapi.json` (the schema), Swagger UI at `/docs` with its `/docs/oauth2-redirect` page, and `/redoc`. The server reads the key from the file `MEM0_API_KEY_FILE` names (a systemd credential on the native authority), else `~/.mem0/api-key` (mode 0600). Comparison uses `hmac.compare_digest` (constant-time).
 
 All endpoints return JSON. On error, HTTP 401 (auth), 400 (validation), 503 (upstream rate-limited — **retryable**, carries `Retry-After`), or 500 (server). Error body is `{"detail": "..."}`.
 
@@ -30,6 +30,10 @@ Liveness + version probe. No auth.
 ### `GET /health/deep`
 
 Deep diagnostic probe. No auth. Exercises Qdrant + the embedder + the live collection binding (reported as `collection`), plus job liveness, canonical-key source, and drift canaries. Slow — use `/health` for liveness, `/health/deep` for diagnostics.
+
+### `GET /health/maintenance`, `GET /health/morning-summary`, `GET /health/embedder`
+
+Three more keyless probes, all answered by the authority. `/health/maintenance` folds the nightly chain's receipts into per-step last success and duration, the steps whose latest run failed or degraded, the judge transport, pool usage and health, and the newest Codex plan-window probe; its `ok` is the chain's verdict (fields and the pool-health acknowledgment: [`systems/mem0-api.md`](./systems/mem0-api.md)). `/health/morning-summary` returns the last three sections of the chain's morning summary, and 404 before the first night. `/health/embedder` is the SessionStart pre-warm target: it embeds one token as active work and reports whether llama-swap lists the embedder as loaded; `?warm=rerank` also sends the reranker one document so the first deliberate search does not pay its cold load. An embedder that cannot serve answers 503 with `Retry-After`, like every other route that needs it.
 
 ### `POST /v1/memories` — add memory
 
@@ -198,7 +202,7 @@ Wraps `GET /v1/memories`. Client-clamps `limit` at 500 (the server clamps too). 
 Wraps `GET /v1/memories/{id}` — exact read (text, metadata, tier, timestamps). Call it before update/delete/promote to confirm the right record.
 
 ### `memory_recall(query, brand=None, initiative=None, project=None, user_id="youruser")` → dict
-The proactive start-of-task pull: wraps `POST /v1/context/bundle` (checkpoint suppressed) plus a `query_class="canonical"` search. Returns `{ok, canonical, memories, goals, open_questions}` — a branded recall returns that brand's facts plus the brand-neutral set; brandless returns neutral only.
+The explicit, deeper recall, in addition to the `[MEMORY CONTEXT]` block the per-prompt hook already injects: use it when that block is empty, when you need canonical facts (the hook never injects them) or when you need another brand's scope. Wraps `POST /v1/context/bundle` (checkpoint suppressed) plus a `query_class="canonical"` search. Returns `{ok, canonical, memories, goals, open_questions}` — a branded recall returns that brand's facts plus the brand-neutral set; brandless returns neutral only.
 
 ### `memory_update(memory_id, text)` → dict
 Wraps `PUT /v1/memories/{id}`. Text only. Queues to the offline outbox when the authority is unreachable.
