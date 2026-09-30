@@ -54,6 +54,19 @@ Describe 'Step 1 (2026-06-30) correction-capture' {
         Test-CorrectionLikePrompt -Prompt $body | Should -BeTrue
     }
 
+    It 'Test-CorrectionLikePrompt never matches a message relayed from another agent session' {
+        # 1.32.2's drain still posted 14 peer messages as operator corrections. Both delivery forms:
+        # the wrapper first (queued behind a running turn) and the harness announcement + wrapper.
+        $body = "No, that is wrong - revert that change, you forgot the lock."
+        $wrapped = "<cross-session-message from=`"uds:x`" from-name=`"peer`">`n$body`n</cross-session-message>"
+        Test-CorrectionLikePrompt -Prompt $wrapped | Should -BeFalse
+        Test-CorrectionLikePrompt -Prompt ("Another Claude session sent a message:`n" + $wrapped) | Should -BeFalse
+        Test-CorrectionLikePrompt -Prompt ("`r`n  " + $wrapped) | Should -BeFalse
+        Test-CorrectionLikePrompt -Prompt $body | Should -BeTrue
+        # a person quoting the wrapper mid-sentence is still a person
+        Test-CorrectionLikePrompt -Prompt ("no, that's wrong: the <cross-session-message wrapper is not a task notification") | Should -BeTrue
+    }
+
     It 'Add-LearnRuleCapture appends a well-formed record and skips blank prompts (fail-open)' {
         $tmp = Join-Path $env:TEMP ("learn-rules-test-" + [guid]::NewGuid().ToString('N') + ".jsonl")
         try {

@@ -559,3 +559,54 @@ Describe 'learn-rules-drain: a machine turn is never a correction' {
         }
     }
 }
+
+Describe 'learn-rules-drain: a message relayed from another agent session is never a correction' {
+    BeforeEach { $script:sb = script:New-DrainSandbox; $script:mock = $null }
+    AfterEach  { script:Stop-MockAuthority $script:mock }
+
+    It 'drops a queued peer message in both delivery forms and still posts the real correction' {
+        # 1.32.2's drain posted 14 of these as operator corrections.
+        $wrapped = "<cross-session-message from=`"uds:x`" from-name=`"peer`">`nno, that is wrong - revert that`n</cross-session-message>"
+        Set-Content -LiteralPath $sb.Queue -Encoding UTF8 -Value @(
+            (script:New-QueueLine -Text $wrapped -Session 'sid-w')
+            (script:New-QueueLine -Text ("Another Claude session sent a message:`n" + $wrapped) -Session 'sid-a')
+            (script:New-QueueLine -Text 'no, that is the wrong branch' -Session 'sid-h')
+        )
+        $mock = script:Start-MockAuthority -Statuses @(200) -LogPath (Join-Path $sb.Root 'mock.log')
+        $script:mock = $mock
+        $r = script:Invoke-Drain $sb $mock.Url -Force
+
+        $r.drained | Should -Be 1
+        $r.dropped | Should -Be 2
+        $reqs = script:Get-MockRequests $mock
+        $reqs.Count | Should -Be 1
+        $reqs[0].json.messages | Should -Be 'no, that is the wrong branch'
+        $q = script:Read-Queue $sb
+        ($q | Where-Object { $_.session_id -eq 'sid-w' }).status | Should -Be 'dropped'
+        ($q | Where-Object { $_.session_id -eq 'sid-a' }).status | Should -Be 'dropped'
+    }
+
+    It 'the drain copy of the rule agrees with Test-RelayedAgentMessage in user-prompt-lib' {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:winDir 'learn-rules-drain.ps1'), [ref]$tokens, [ref]$errs)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-DrainRelayedMessage' }, $true)
+        $fn | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($fn.Extent.Text))
+        . (Join-Path $script:winDir 'user-prompt-lib.ps1')
+        $w = "<cross-session-message from=`"uds:x`">`nhi`n</cross-session-message>"
+        $cases = @(
+            @{ t = $w; want = $true },
+            @{ t = (" `r`n`t" + $w); want = $true },
+            @{ t = ("Another Claude session sent a message:`n" + $w); want = $true },
+            @{ t = 'Another Claude session sent a message: but no wrapper here'; want = $false },
+            @{ t = ('please look at this: ' + $w); want = $false },
+            @{ t = '<cross-session-messages> are noisy'; want = $false },
+            @{ t = 'no, that is wrong'; want = $false },
+            @{ t = ''; want = $false }
+        )
+        foreach ($c in $cases) {
+            (Test-DrainRelayedMessage $c.t) | Should -Be $c.want -Because $c.t
+            (Test-DrainRelayedMessage $c.t) | Should -Be (Test-RelayedAgentMessage -Prompt $c.t) -Because $c.t
+        }
+    }
+}
