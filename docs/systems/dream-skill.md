@@ -101,7 +101,7 @@ Output: `{"insights":["...", "..."]}`. Each insight posted to mem0 as:
 }
 ```
 
-The native (Python) dream also stamps `brand` when more than half of the cited memories carry the same non-shared brand, and none otherwise ([`brands.md`](./brands.md)).
+The native (Python) dream also stamps `brand` when more than half of the cited memories carry the same non-shared brand, and none otherwise ([`brands.md`](./brands.md)). The brand is part of the metadata that is posted and, when the POST fails, spooled, so a spooled insight replays with it.
 
 ### Phase 3.5 — Autonomous canonical promotion
 

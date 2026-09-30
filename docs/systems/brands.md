@@ -60,9 +60,9 @@ Patterns are case-insensitive. Path separators (backslash, slash, space) are one
 
 **Sessions.** The UserPromptSubmit hook, the resident daemon and the L1a extractor all call `Get-BrandFromTranscriptPath`, one pinned copy in `memory-common.ps1` and one in `user-prompt-lib.ps1` (they do not dot-source each other, so a Pester test pins the two byte-identical). The workspace recorded with a session is the transcript's directory name, no longer a constant, and an unrouted session is no longer stamped with a hard-coded brand on the user-decision write.
 
-**L1a facts.** The extractor resolves the brand before the facts loop and routes each fact with its own text, so a fact posted from a routed workspace carries that brand, a fact from a content-rule workspace carries the brand its text names, and an unrouted path posts no `brand` key at all. The episode keeps its path-only brand.
+**L1a facts.** The extractor resolves the brand before the facts loop and routes each fact with its own text, so a fact posted from a routed workspace carries that brand, a fact from a content-rule workspace carries the brand its text names, and an unrouted path posts no `brand` key at all. The episode keeps its path-only brand. When the worker analyses a PreCompact snapshot (a temp copy whose directory routes to nothing) it routes by the real transcript's path, passed as `-OriginTranscriptPath`, for the facts and the episode alike; the extraction cursor stays keyed on the file it actually reads.
 
-**Dream insights.** An insight takes the brand held by more than half of the memories it cites (neutral sources count in the denominator). A tie, no brand, or a shared label leaves it brand-neutral.
+**Dream insights.** An insight takes the brand held by more than half of the memories it cites (neutral sources count in the denominator). A tie, no brand, or a shared label leaves it brand-neutral. The brand is decided when the insight is consolidated and travels in its metadata: an insight whose POST fails is spooled with that brand and replays the next night with it, whatever tonight's evidence holds ([`dream-skill.md`](./dream-skill.md)).
 
 **Admission gate.** The shared set is the UNION of the brand map's `shared_brands` and `MEM0_SHARED_BRANDS`, on the server as everywhere else. The gate reads the map file itself (path from `MEM0_BRAND_MAP`, environment first, then `stack.env`, else `~/.claude/scripts/brands.json`; cached on the file's mtime and size, no import from `scripts/wsl`) and `MEM0_SHARED_BRANDS` (environment first, then `stack.env`) when a policy is built; a record carrying a listed label is admitted like a null-brand record. An unlisted brand stays fail-closed. The hook's client-side backstop (`Select-AdmittedMemoryResults`) reads the PC's map and the `MEM0_SHARED_BRANDS` environment variable, so it does not drop what the server just admitted. Because the PC has no `stack.env`, the map's `shared_brands` is the one place that works on both sides: a label set only in the brain's `stack.env` is admitted by the server but dropped by a PC whose environment lacks it.
 
@@ -125,8 +125,8 @@ The brand names and folder paths are operator data and live only in the operator
 
 - `mem0-server/tests/test_brand_routing.py` (Python resolver over the corpus, map loading, shared brands).
 - `scripts/windows/tests/BrandRouting.Tests.ps1` (the same corpus, the pinned copies, the client backstop).
-- `mem0-server/tests/test_admission_gate.py` (shared brands), `test_dream_consolidate.py` (insight brand), `test_brand_backfill.py` (audit and backfill against a fake store).
-- `scripts/windows/tests/L1aExtract.Tests.ps1` runs the real `l1a-extract.ps1` under Windows PowerShell 5.1 and checks the brand on every posted fact.
+- `mem0-server/tests/test_admission_gate.py` (shared brands), `test_dream_consolidate.py` (insight brand, including a spooled insight replaying with its brand), `test_brand_backfill.py` (audit and backfill against a fake store).
+- `scripts/windows/tests/L1aExtract.Tests.ps1` runs the real `l1a-extract.ps1` under Windows PowerShell 5.1 and checks the brand on every posted fact, also when the worker analyses a PreCompact snapshot.
 
 ## Common pitfalls
 
