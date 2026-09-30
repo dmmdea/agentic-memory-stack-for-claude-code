@@ -14,6 +14,9 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS.parents[1] / "mem0-server"))
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 def _mod():
     spec = importlib.util.spec_from_file_location("dream_consolidate", SCRIPTS / "dream-consolidate.py")
     m = importlib.util.module_from_spec(spec)
@@ -81,8 +84,7 @@ def _judge(*replies):
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     for v in ("MEM0_PROMOTION_GATE_MODE", "MEM0_EVAL_ROOT", "MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE",
               # P4-1b: the store-judge phase reads these. Unset by default so every existing

@@ -42,6 +42,9 @@ WSL_ENV = (
 )
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _stubs(tmp_path):
     """Commands a deploy that got past the gate would reach for; each one is a recorder that fails,
     so a regressed gate can never touch a real user manager, network or Windows side."""
@@ -74,7 +77,7 @@ def _run(tmp_path, stack_env, *args):
     before = _files(home)
     stubs, log = _stubs(tmp_path)
     env = {k: v for k, v in os.environ.items() if not k.startswith("MEM0_")}
-    env["HOME"] = str(home)
+    env.update(home_env(home, base={}))
     env["USER"] = env.get("USER") or "tenant"  # deploy.sh reads $USER under set -u; Git Bash has none
     env["PATH"] = str(stubs) + os.pathsep + env.get("PATH", "")
     r = subprocess.run([BASH, str(DEPLOY), *args], capture_output=True, text=True, env=env,

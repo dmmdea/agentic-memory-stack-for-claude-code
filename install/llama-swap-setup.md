@@ -1,14 +1,14 @@
 # llama-swap setup — the one prerequisite the installer can't do for you
 
 The memory stack needs a local inference endpoint on `127.0.0.1:11436` serving two
-small CPU models: **EmbeddingGemma-300m** (the embedder, 768-dim, multilingual) and
+small models: **EmbeddingGemma-300m** (the embedder, 768-dim, multilingual) and
 **bge-reranker-v2-m3** (the reranker). Both are served by
 [llama-swap](https://github.com/mostlygeek/llama-swap), a tiny proxy that starts and
 swaps [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` processes on
 demand. `install/0-prereqs.ps1` checks this endpoint and fails until it's up.
 
 Everything below happens **inside WSL** (Ubuntu assumed; adjust paths for your distro).
-Total footprint: ~600 MB of models, CPU-only — no GPU required for the memory stack.
+Total footprint: ~600 MB of models. Run them on a GPU (every layer, `--n-gpu-layers 999`); see the note after the config.
 
 ## 1. Build llama.cpp (needs release b6384 or newer for the gemma-embedding arch)
 
@@ -59,7 +59,7 @@ models:
   embeddinggemma:
     cmd: ~/llama.cpp/build/bin/llama-server
       --model ~/models/embeddinggemma-300M-Q8_0.gguf
-      --embeddings --pooling mean --n-gpu-layers 0
+      --embeddings --pooling mean --n-gpu-layers 999
       --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
       --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
@@ -69,7 +69,7 @@ models:
   bge-reranker-v2-m3:
     cmd: ~/llama.cpp/build/bin/llama-server
       --model ~/models/bge-reranker-v2-m3-Q4_K_M.gguf
-      --reranking --pooling rank --n-gpu-layers 0
+      --reranking --pooling rank --n-gpu-layers 999
       --ctx-size 8192 --batch-size 4096 --ubatch-size 4096 --parallel 4
       --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
@@ -79,12 +79,24 @@ models:
 (If you expand `~` manually, use your real home path — llama-swap does not expand `~`
 inside `cmd` on every platform.)
 
-`ttl: 300` on both, not `ttl: 0`. An idle model that never unloads holds its weights for the
-rest of the day on a box you may also want for something else; 300 s is long enough that a
-working session never pays a reload and short enough that an idle box gives the memory back.
-The `support` group above is what keeps the 300 s from costing you anything — the models
-co-reside rather than fighting a chat seat for the slot, so a reload is a cold start, not a
-queue behind someone else's model.
+`ttl: 300` on both. A model with no idle timeout holds its weights for the rest of the day on
+a box you may also want for something else; 300 s is long enough that a working session
+rarely pays a reload and short enough that an idle box gives the memory back.
+The `support` group above keeps the models from fighting a chat seat for the slot — they
+co-reside, so a reload is a cold start, not a queue behind someone else's model.
+
+The 300 s is not free, though: the first embed or rerank after an idle spell pays that cold
+start. The memory server absorbs it (an embedder that cannot answer yet gets a `503` +
+`Retry-After` so writes queue and retry; a reranker that times out is retried once with a
+longer allowance, then search falls back to dense order), and the SessionStart hook pre-warms
+both through `GET /health/embedder?warm=rerank`. See
+[`docs/systems/reranker.md`](../docs/systems/reranker.md).
+
+`--n-gpu-layers 999` puts every layer on the GPU: both models are a few hundred MB, so one
+card holds them next to a chat seat, and a GPU cold start after the 300 s idle unload is
+much faster than a CPU one. Host RAM is overflow, not the plan. If a model ever does not fit
+the card, let llama.cpp keep the layers that fit on the GPU and spill only the rest, rather
+than forcing zero GPU layers.
 
 ## 5. Run it as a service (systemd user unit)
 

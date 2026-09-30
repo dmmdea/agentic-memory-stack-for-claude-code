@@ -80,3 +80,29 @@ def test_http_500_response_is_not_treated_as_a_rate_limit():
     err = httpx.HTTPStatusError(
         "500", request=req, response=httpx.Response(500, request=req))
     assert app._upstream_error(err).status_code == 500
+
+
+def _openai_start_failure(code=500, message="unspecific error: upstream command exited prematurely"):
+    """What the write path meets when llama-swap cannot start the embedder (no VRAM headroom)."""
+    import openai
+    req = httpx.Request("POST", "http://127.0.0.1:11436/v1/embeddings")
+    resp = httpx.Response(code, request=req, json={"error": {"message": message}})
+    return openai.APIStatusError(f"Error code: {code} - {resp.text}", response=resp,
+                                 body={"error": {"message": message}})
+
+
+def test_embedder_start_failure_maps_to_503_with_retry_after():
+    """The 2026-09-24 outage: 39 writes answered 500 because the embedder could not start, so
+    the shim/outbox dropped them. A start failure is 'retry later', never a failed write."""
+    exc = app._upstream_error(_openai_start_failure())
+    assert exc.status_code == 503
+    assert (exc.headers or {}).get("Retry-After") == "10"
+
+
+@pytest.mark.parametrize("code", [502, 503, 504])
+def test_gateway_statuses_from_the_embedder_map_to_503(code):
+    assert app._upstream_error(_openai_start_failure(code, "bad gateway")).status_code == 503
+
+
+def test_a_plain_embedder_500_still_maps_to_500():
+    assert app._upstream_error(_openai_start_failure(500, "input is too large")).status_code == 500

@@ -24,6 +24,7 @@ from reranker import rerank as bge_rerank
 # it 90s). Holds regardless of device: the reranker moved CPU->GPU 2026-08-13,
 # but cold-load + llama-swap spawn can still exceed the deploy gate's window.
 from reranker import rerank_health as _rerank_health
+from reranker import warm as _rerank_warm, RAN_STATUSES as _RERANK_RAN_STATUSES
 from admission_gate import apply_admission
 # W5 T1.3: the PURE evaluate path for the diagnose endpoint — never
 # apply_admission there (it mutates the MEM-8 counters + audit log).
@@ -225,9 +226,12 @@ def auth(x_api_key: Optional[str] = Header(None)):
 # this way. 503 + Retry-After says the opposite — "not an answer, ask again" —
 # which the shim can act on without weakening the never-mask-a-real-answer rule.
 #
-# Deliberately narrow: ONLY an upstream rate-limit maps to 503. Every other
-# exception keeps its 500, because a ctx-overflow or a coding error must stay
-# loud and must never be replayed.
+# Deliberately narrow: ONLY "the upstream cannot serve right now" maps to 503 - a
+# rate-limit (above), or an embedder that cannot start (embedder_503.retry_later: llama-swap
+# 500 'upstream command exited prematurely', 502/503/504, a refused or timed-out connection;
+# measured 2026-09-24 when the seat beside it left no VRAM headroom and 39 writes were
+# answered 500). Every other exception keeps its 500, because a ctx-overflow or a coding
+# error must stay loud and must never be replayed.
 _RETRY_AFTER_SECONDS = "1"
 
 
@@ -249,6 +253,13 @@ def _upstream_error(e: Exception) -> HTTPException:
             503,
             f"upstream embedder rate-limited (llama-swap 429), retry shortly: {e}",
             headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+    wait = _embedder_503.retry_later(e)
+    if wait is not None:
+        return HTTPException(
+            503,
+            f"upstream unavailable (embedder cold start failed or down), retry later: {e}",
+            headers={"Retry-After": str(wait)},
         )
     return HTTPException(500, str(e))
 
@@ -925,7 +936,7 @@ def _embed_model() -> str:
 
 
 @app.get("/health/embedder")
-def health_embedder() -> dict:
+def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     """Spec §4 (P1-6 PC half): the SessionStart pre-warm target. The embedder unloads after
     5 idle minutes (ttl 300, every engine) and takes ~3.4 s to come back, so the first prompt's
     bundle used to pay the cold start. This embeds ONE token as active work (a pre-warm, not
@@ -933,7 +944,13 @@ def health_embedder() -> dict:
     (informational: an unreadable listing reads as `loaded: None`, never as an error).
     The embed exceptions deliberately PROPAGATE — embedder_503.install maps a cold/down seat
     to 503 + Retry-After with reason cold-embedder, the same answer the bundle path gives,
-    which the hook client names and retries once."""
+    which the hook client names and retries once.
+
+    `?warm=rerank` additionally issues a one-document rerank so the first deliberate search of
+    the session does not pay the reranker's cold load (it unloads after 5 idle minutes too).
+    The reranker result rides along as `rerank: {ok, warm_ms|error}` and never fails this
+    endpoint: search degrades gracefully without it, so a reranker that cannot load is
+    reported, not raised."""
     import httpx as _httpx
     import time as _time
     loaded = None
@@ -943,9 +960,7 @@ def health_embedder() -> dict:
         for entry in (r.json().get("data") or []):
             if str(entry.get("id", "")) != _embed_model():
                 continue
-            state = entry.get("state", entry.get("status"))
-            if state is not None:
-                loaded = str(state).lower() in ("loaded", "ready", "running")
+            loaded = _embedder_503.listing_loaded(entry)  # flat state OR v256 status.value
             break
     except Exception:
         loaded = None
@@ -954,7 +969,11 @@ def health_embedder() -> dict:
                     json={"model": _embed_model(), "input": "warm"},
                     timeout=10.0)
     r.raise_for_status()
-    return {"ok": True, "loaded": loaded, "warm_ms": int((_time.perf_counter() - t0) * 1000)}
+    out: dict[str, Any] = {"ok": True, "loaded": loaded,
+                           "warm_ms": int((_time.perf_counter() - t0) * 1000)}
+    if warm == "rerank":
+        out["rerank"] = _rerank_warm()
+    return out
 
 
 @app.get("/health/deep")
@@ -1816,7 +1835,7 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
             _st: dict = {}
             ranked = bge_rerank(b.query, pool, text_key="memory",
                                 force=True, status_out=_st)
-            rerank_probe["ran"] = _st.get("status") == "ran"
+            rerank_probe["ran"] = _st.get("status") in _RERANK_RAN_STATUSES
             rerank_probe["pre_rank"] = dense_rank
             for _i, _r in enumerate(ranked):
                 if str(_r.get("id")) == b.target_id:
