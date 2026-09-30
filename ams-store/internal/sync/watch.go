@@ -256,6 +256,7 @@ func watchPass(base Options, acquire func(time.Time) (func(), bool, error), cloc
 	}
 	return func(ctx context.Context) Result {
 		o := base
+		o.Kind = "watch"
 		o.Now = clock()
 		release, ok, err := acquire(o.Now)
 		if err != nil {

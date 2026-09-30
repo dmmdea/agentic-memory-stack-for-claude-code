@@ -51,6 +51,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402
 import autopromote_lib as ap  # noqa: E402
+import brand_routing  # noqa: E402
 import codex_usage  # noqa: E402
 
 # The server package (codex_shim_client, redact) lives beside the scripts in the repo and under
@@ -375,6 +376,26 @@ def _mem_text(e: dict) -> str:
 
 def _tier(e: dict):
     return (e.get("metadata") or {}).get("tier")
+
+
+def insight_brand(source_ids: list, by_id: dict, shared: set) -> str | None:
+    """The brand an insight is written under: the brand held by MORE THAN HALF of the memories it
+    cites (neutral sources count in the denominator), unless that brand is a shared label. No
+    majority -> None, and the insight stays brand-neutral. Insights used to carry no brand at all,
+    so a client brand's facts leaked into every other brand's recall through them."""
+    if not source_ids:
+        return None
+    counts: dict[str, int] = {}
+    for sid in source_ids:
+        b = str(((by_id.get(str(sid)) or {}).get("metadata") or {}).get("brand") or "").strip()
+        if b:
+            counts[b] = counts.get(b, 0) + 1
+    if not counts:
+        return None
+    brand, n = max(counts.items(), key=lambda kv: kv[1])
+    if n * 2 <= len(source_ids) or brand.lower() in shared:
+        return None
+    return brand
 
 
 def _lines(items) -> str:
@@ -906,7 +927,9 @@ class Dream:
     # ---- store judge (register P4-1b) ----------------------------------------------------
     def _store_workspaces(self, checkout: str) -> list[str]:
         """Every workspace with a store in the hub checkout, sorted so a night's plan is
-        deterministic. A workspace whose memory/ is missing is not a store."""
+        deterministic. A workspace whose memory/ is missing is not a store. Scratch and temp
+        workspaces are listed here but offer nothing: `judge-apply --candidates` applies the
+        store exclude rules and returns an empty offer set for them."""
         proj = Path(checkout) / "projects"
         try:
             names = [p.name for p in proj.iterdir() if (p / "memory").is_dir()]
@@ -1196,6 +1219,12 @@ class Dream:
         self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
 
         if ins_list and not self.dry:
+            evidence_by_id = {str(e.get("id")): e for e in evidence}
+            try:
+                shared_brands = brand_routing.shared_brands(brand_routing.load_brand_map())
+            except Exception as e:  # noqa: BLE001 - brand routing must never cost an insight
+                log(f"  brand map unreadable ({e}); insights post brand-neutral")
+                shared_brands = set()
             for ins in ins_list:
                 text = str(ins.get("text") or "").strip()
                 if not text:
@@ -1228,6 +1257,11 @@ class Dream:
                             "source_memory_ids": lineage, "window_evidence_count": len(evidence),
                             "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
                             "dream_phase": "consolidate", "source": "dream-consolidator"}
+                # C3: the brand goes into `metadata` BEFORE the post, so the same dict reaches the spool
+                # (_spool_add below) and a spooled insight replays the next night with its brand.
+                ib = insight_brand(lineage, evidence_by_id, shared_brands)
+                if ib:
+                    metadata["brand"] = ib
                 try:
                     ok = self.mem0.add(text, metadata)
                 except Exception as e:  # noqa: BLE001

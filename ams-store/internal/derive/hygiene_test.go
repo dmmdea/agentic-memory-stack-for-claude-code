@@ -528,3 +528,72 @@ func TestHygiene_DuplicateSlugCountsAgainstTheBlastCap(t *testing.T) {
 		t.Error("the index was modified although the run aborted on the blast cap")
 	}
 }
+
+// A store whose LAST fact was legitimately migrated enumerates cleanly, empty, with the
+// index still listing it. The history explains every indexed slug, so the dangling lines
+// are dropped - refusing forever ("aborted-no-fact-files" on every sync) helps nobody.
+func TestDerive_EmptiedStoreExplainedByMigrationsDropsTheDanglingLines(t *testing.T) {
+	e := newEnv(t, "ws", []string{"# Memory Index", "", "- [Gone](gone.md) " + emDash + " migrated away", "- [Also](also.md)"}, map[string]string{})
+
+	res, err := e.run(func(o *Options) {
+		o.Migrated = &fakeMigrated{ids: map[string]string{"gone.md": "id-1", "also.md": "id-2"}}
+	})
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+
+	if res.Status != StatusApplied {
+		t.Fatalf("status = %q, want %q (note: %s)", res.Status, StatusApplied, res.Note)
+	}
+	if res.Dedangled != 2 || res.DedangledMigrated != 2 {
+		t.Errorf("dedangled=%d dedangled_migrated=%d, want 2 and 2", res.Dedangled, res.DedangledMigrated)
+	}
+	if text := e.indexText(); strings.Contains(text, "gone.md") || strings.Contains(text, "also.md") {
+		t.Errorf("the dangling lines are still in the index: %q", text)
+	}
+}
+
+// ...but only when the history explains EVERY indexed slug. One line nothing explains keeps
+// the fail-closed abort: an unreadable or wiped store must never be spellable as "empty".
+func TestDerive_EmptiedStoreWithAnUnexplainedSlugStillAborts(t *testing.T) {
+	e := newEnv(t, "ws", []string{"- [Gone](gone.md)", "- [Unknown](unknown.md)"}, map[string]string{})
+	before := e.indexBytes()
+
+	res, err := e.run(func(o *Options) {
+		o.Migrated = &fakeMigrated{ids: map[string]string{"gone.md": "id-1"}}
+	})
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if res.Status != StatusAbortedNoFactFiles {
+		t.Fatalf("status = %q, want %q", res.Status, StatusAbortedNoFactFiles)
+	}
+	if string(e.indexBytes()) != string(before) {
+		t.Error("the index was rewritten during an abort")
+	}
+}
+
+// A wedged store repeats one abort on every sync; the receipts file records it once with a
+// repeat count instead of growing by a row per sync.
+func TestDerive_ConsecutiveIdenticalAbortsCollapseIntoOneRow(t *testing.T) {
+	e := newEnv(t, "ws", bigIndexLines(60), map[string]string{})
+	for i := 0; i < 3; i++ {
+		res, err := e.run()
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		if res.Status != StatusAbortedNoFactFiles {
+			t.Fatalf("status = %q, want the abort the scenario is about", res.Status)
+		}
+	}
+	rows := e.receipts()
+	if len(rows) != 1 {
+		t.Fatalf("receipts = %d rows, want 1 collapsed row: %v", len(rows), rows)
+	}
+	if rows[0]["repeat"] != float64(3) {
+		t.Errorf("repeat = %v, want 3", rows[0]["repeat"])
+	}
+	if _, ok := rows[0]["first_ts"]; !ok {
+		t.Error("the collapsed row must keep when the run started")
+	}
+}

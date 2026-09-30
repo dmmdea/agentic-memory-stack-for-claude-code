@@ -141,7 +141,7 @@ func applyHook(r *index.Record, hook string) {
 	if hook == r.Summary {
 		return
 	}
-	line := index.EntryLine(r.Title, r.Slug, hook, r.Indent)
+	line := index.RecordLine(r, hook)
 	parsed := index.Parse(line).Entries()
 	if len(parsed) != 1 || parsed[0].Slug != r.Slug {
 		return
@@ -172,7 +172,7 @@ func repairDeadExtras(in HygieneInput, res *HygieneResult, r *index.Record) {
 	summary = reTrailingComma.ReplaceAllString(reTrailingAnd.ReplaceAllString(summary, ""), "")
 	summary = strings.TrimSpace(summary)
 
-	candidate := index.EntryLine(r.Title, r.Slug, summary, r.Indent)
+	candidate := index.RecordLine(r, summary)
 	// Set EQUALITY on the extras, never subset: a repair that drops a DEAD extra link must
 	// keep a LIVE one, or the repair is rejected and the dead link stays forever.
 	if !index.LineRoundTrips(candidate, r.Slug, live) {

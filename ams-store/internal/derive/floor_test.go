@@ -287,3 +287,25 @@ func TestFloor_SkipsALineWhoseTitleEatsTheCap(t *testing.T) {
 		t.Error("the skipped record was marked Dirty, so the regenerator will rewrite a line nothing changed")
 	}
 }
+
+// A decorated pointer (marker token before the bracket) is floored like any other entry,
+// and the rebuilt line keeps its marker: shortening must never strip the decoration.
+func TestFloor_KeepsTheMarkerOfADecoratedPointer(t *testing.T) {
+	marker := "\U0001F6D1 "
+	recs := index.Parse("- " + marker + "[A](a.md) " + emDash + " " + strings.Repeat("x", 300)).Records
+	res := Floor(recs, FloorOptions{
+		Project:        func(r []*index.Record) string { return index.RenderVerbatim(r, "\n") },
+		EngageAtBytes:  10,
+		StopBelowBytes: 5,
+	})
+	if res.Floored != 1 {
+		t.Fatalf("floored = %d, want 1 (a decorated pointer is an entry the floor can shorten)", res.Floored)
+	}
+	out := index.RenderVerbatim(recs, "\n")
+	if !strings.HasPrefix(out, "- "+marker+"[A](a.md)") {
+		t.Errorf("the floored line lost its marker: %q", out)
+	}
+	if len(out) > store.LineByteCap {
+		t.Errorf("the floored line is %d B, over the %d B cap (the marker's bytes count against the budget)", len(out), store.LineByteCap)
+	}
+}

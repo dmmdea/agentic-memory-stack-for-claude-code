@@ -386,6 +386,21 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         Should -Invoke Invoke-Mem0Post -Times 1 -Exactly -ParameterFilter { $Uri -like '*context/bundle' }
     }
 
+    It 'C3: the bundle request names the transcript-dir workspace, never a constant' {
+        Mock Get-Mem0ApiKeyCached { 'k' }
+        $script:bundleBodies = @()
+        Mock Invoke-Mem0Post {
+            $script:bundleBodies += $Body
+            '{"ok":true,"checkpoint":{"ok":true,"episode_id":9,"action":"created"},"memories":[],"goals":[],"open_questions":[]}'
+        }
+        $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"what is the state of the admission gate","transcript_path":"C:\\h\\.claude\\projects\\g--My-Drive-Elsewhere\\' + $script:sid + '.jsonl"}'
+        $null = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
+        $script:bundleBodies.Count | Should -Be 1
+        $body = $script:bundleBodies[0] | ConvertFrom-Json
+        $body.workspace | Should -Be 'g--My-Drive-Elsewhere'
+        $body.brand | Should -BeNullOrEmpty -Because 'an unrouted transcript dir carries no brand'
+    }
+
     It 'decision-like prompt -> needs_0b TRUE (M4: 0.B verdict computed daemon-side)' {
         Mock Get-Mem0ApiKeyCached { 'k' }
         Mock Invoke-Mem0Post { '{"ok":true,"episode_id":3,"action":"updated"}' }

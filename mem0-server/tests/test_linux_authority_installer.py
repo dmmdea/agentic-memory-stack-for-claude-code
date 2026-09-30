@@ -472,3 +472,110 @@ def test_the_judge_apply_wrapper_syncs_the_checkout_before_it_applies():
     assert "pre_sync_exit=$pre_rc" in w, "the receipt line names the pre-apply sync's exit"
     assert 'case "$pre_rc" in 0|6) ;; *) exit "$pre_rc" ;; esac' in w, \
         "a stale checkout must leave the script non-zero, after the deterministic sync"
+
+
+# ------------------------------------------------------------- DEPLOYED_SHA stamp (backup manifest)
+# The release sha is written by ONE contract, install/deploy-stamp.sh (deploy_stamp_write), never by an
+# inline `git rev-parse` in an installer: a second writer drifts (an inline writer removed the stamp on a tarball
+# install, where the contract writes the word "unknown").
+WSL_INSTALLER = REPO_ROOT / "install" / "1-wsl-services.sh"
+STAMP_LIB = REPO_ROOT / "install" / "deploy-stamp.sh"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _code_lines(path: Path) -> list[str]:
+    return [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
+
+
+@pytest.mark.parametrize("installer,app_var,sites", [(SCRIPT, "MEM0_APP", 1), (WSL_INSTALLER, "MEM0_DIR", 2)])
+def test_installers_stamp_the_sha_only_through_the_shared_deploy_stamp_contract(installer, app_var, sites):
+    code = _code_lines(installer)
+    joined = "\n".join(code)
+    assert '/install/deploy-stamp.sh"' in joined or '$SCRIPT_DIR/deploy-stamp.sh"' in joined, \
+        f"{installer.name} must source the deploy-stamp contract"
+    inline = [ln for ln in code if "DEPLOYED_SHA" in ln and ("rev-parse" in ln or ">" in ln)]
+    assert not inline, f"an inline DEPLOYED_SHA writer bypasses the contract: {inline}"
+    calls = [ln for ln in code if "deploy_stamp_write " in ln]
+    assert len(calls) == sites, calls
+    assert all(f'"${app_var}"' in ln for ln in calls), f"every stamp goes into the {app_var} runtime dir"
+    if installer == SCRIPT:
+        assert '"$SCRIPTS_DIR"' in calls[0], "the manifest writer runs from the deployed scripts dir"
+    # a stamp beside every VERSION stamp (fresh install AND refresh), one per site
+    assert joined.count('cp "$REPO_ROOT/VERSION"') == sites
+
+
+def _stamp_from_installer(tmp_path: Path, installer: Path, app_var: str, checkout: Path, app: Path):
+    """Run the installer's own deploy_stamp_write line with the real library, under the installers'
+    `set -euo pipefail`, against a checkout and an app dir."""
+    call = next(ln.strip() for ln in _code_lines(installer) if "deploy_stamp_write " in ln)
+    script = "\n".join([
+        "set -euo pipefail",
+        'REPO_ROOT="$1"; %s="$2"; SCRIPTS_DIR="$2"' % app_var,
+        '. "$3"',
+        call,
+    ])
+    return subprocess.run([BASH, "-c", script, "stamp", checkout.as_posix(), app.as_posix(), STAMP_LIB.as_posix()],
+                          capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize("installer,app_var", [(SCRIPT, "MEM0_APP"), (WSL_INSTALLER, "MEM0_DIR")])
+def test_the_installer_stamp_writes_head_and_says_unknown_without_a_checkout(tmp_path, installer, app_var):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git not available")
+    app = tmp_path / "app"
+    app.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "c"]):
+        subprocess.run([git, "-C", str(checkout), *args], check=True, env=env, capture_output=True)
+    head = subprocess.run([git, "-C", str(checkout), "rev-parse", "HEAD"], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+    r = _stamp_from_installer(tmp_path, installer, app_var, checkout, app)
+    assert r.returncode == 0, r.stderr
+    assert SHA_RE.match(head) and (app / "DEPLOYED_SHA").read_text().strip() == head
+
+    # a source tree with no .git (a tarball install): no failure, and the stamp says "unknown"
+    # rather than keeping the previous install's sha (which would name the wrong commit)
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    r = _stamp_from_installer(tmp_path, installer, app_var, bare, app)
+    assert r.returncode == 0, r.stderr
+    assert (app / "DEPLOYED_SHA").read_text().strip() == "unknown"
+
+
+def test_one_stamp_mechanism_everywhere_a_version_is_stamped():
+    """Every installer that copies VERSION into a runtime dir calls deploy_stamp_write once per copy, and
+    only install/deploy-stamp.sh writes DEPLOYED_SHA: a second writer is how a stale or empty stamp gets
+    into a restore point. Runs over every install/*.sh, so an installer added later is held to it."""
+    stamping = []
+    for sh in sorted((REPO_ROOT / "install").glob("*.sh")):
+        code = _code_lines(sh)
+        writers = [ln.strip() for ln in code if "DEPLOYED_SHA" in ln and ">" in ln]
+        if sh.name == "deploy-stamp.sh":
+            assert writers, "the contract itself writes the stamp"
+            continue
+        assert not writers, f"{sh.name} writes DEPLOYED_SHA itself instead of through deploy_stamp_write: {writers}"
+        copies = "\n".join(code).count('cp "$REPO_ROOT/VERSION"')
+        calls = [ln for ln in code if "deploy_stamp_write " in ln]
+        assert len(calls) == copies, f"{sh.name}: {copies} VERSION copies but {len(calls)} deploy_stamp_write calls"
+        if copies:
+            stamping.append(sh.name)
+    # the three runtimes that stamp; a glob or a marker that drifted must not make the loop vacuous
+    assert {"1-wsl-services.sh", "linux-authority.sh", "linux-replica.sh"} <= set(stamping), stamping
+
+
+def test_the_manifest_reads_the_directory_the_installers_stamp():
+    """The stamp is only worth writing where the reader looks: every installer's app dir is
+    <home>/apps/mem0-server, which is the manifest writer's default."""
+    reader = (REPO_ROOT / "scripts" / "wsl" / "stack-backup-manifest.sh").read_text(encoding="utf-8")
+    m = re.search(r'^APP_DIR="\$\{MEM0_APP_DIR:-([^}]+)\}"', reader, re.M)
+    assert m and m.group(1) == "$HOME/apps/mem0-server", m and m.group(1)
+    for installer, var in ((SCRIPT, "MEM0_APP"), (REPO_ROOT / "install" / "linux-replica.sh", "MEM0_APP"),
+                           (WSL_INSTALLER, "MEM0_DIR")):
+        text = installer.read_text(encoding="utf-8")
+        assert re.search(rf'\b{var}="\$(HOME|USER_HOME)/apps/mem0-server"', text), \
+            f"{installer.name}: {var} is not <home>/apps/mem0-server, where the manifest writer looks"

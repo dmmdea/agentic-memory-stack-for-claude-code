@@ -213,7 +213,7 @@ def test_no_other_file_writes_stack_env():
 # --- the sourcing consumers, and the legacy line as a negative control -----------------------
 
 SOURCERS = ["scripts/wsl/deploy.sh", "claude-config/storage-cap-check.sh",
-            "scripts/wsl/stack-backup-manifest.sh", "scripts/wsl/ensure-codex-shim.sh"]
+            "scripts/wsl/ensure-codex-shim.sh"]
 
 
 def test_the_sourcing_consumers_are_the_ones_listed():
@@ -303,6 +303,15 @@ def test_every_writer_carries_the_operator_keys_into_its_write(writer):
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert re.search(r'stack_env_carry "\$[A-Z_]*(HOME|MEM0_DIR)[A-Z_]*/(\.mem0/)?stack\.env"', code), writer
     assert '"${STACK_ENV_CARRY[@]}"' in code, f"{writer} must pass the carried keys to its stack.env write"
+
+
+def test_brand_routing_keys_survive_a_render_only_rerun(tmp_path):
+    """C3: MEM0_SHARED_BRANDS (labels visible to every scope) and MEM0_BRAND_MAP (the brain's brand
+    map path) are operator-set, no installer flag sets them: a re-run must not delete them."""
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\nMEM0_SHARED_BRANDS=shared-a,shared-b\nMEM0_BRAND_MAP=/srv/ams/brands.json\n")
+    assert r.returncode == 0, r.stderr
+    assert "MEM0_SHARED_BRANDS=shared-a,shared-b" in _lines(se)
+    assert "MEM0_BRAND_MAP=/srv/ams/brands.json" in _lines(se)
 
 
 # --- (6) the promotion-gate switches survive a re-run (session-12 WP-12) ---------------------

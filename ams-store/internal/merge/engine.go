@@ -23,6 +23,9 @@ const MainRef = "refs/heads/main"
 const (
 	TrailerMachine = "Ams-Machine"
 	TrailerKind    = "Ams-Kind"
+	// TrailerVersion names the client version; it is metadata for the fleet view and is
+	// never read back by a merge decision.
+	TrailerVersion = "Ams-Store-Version"
 )
 
 // Engine binds one local out-of-tree history repo.
@@ -35,6 +38,10 @@ type Engine struct {
 	// MachineID is this PC's id, recorded in every commit and used as the deterministic
 	// tiebreak when two commits land in the same second.
 	MachineID string
+	// Version is the ams-store build driving this engine. It is written as the
+	// Ams-Store-Version trailer of every commit the engine makes, so the hub's history
+	// says which client version made each merge. Empty writes no trailer.
+	Version string
 	// StateRoot is STATE_ROOT, and it is required by Fetch and Push ONLY: it is where the
 	// pre-seeded known_hosts lives, so it is what the hardened network environment is
 	// built from. An engine that never touches the hub can leave it empty; one that does
@@ -270,7 +277,11 @@ func (e *Engine) message(subject, kind string) string {
 	if kind == "" {
 		kind = "local"
 	}
-	return subject + "\n\n" + TrailerMachine + ": " + e.MachineID + "\n" + TrailerKind + ": " + kind + "\n"
+	msg := subject + "\n\n" + TrailerMachine + ": " + e.MachineID + "\n" + TrailerKind + ": " + kind + "\n"
+	if v := strings.Join(strings.Fields(e.Version), " "); v != "" {
+		msg += TrailerVersion + ": " + v + "\n"
+	}
+	return msg
 }
 
 func (e *Engine) indexDiffersFromHead(ctx context.Context) (bool, error) {
