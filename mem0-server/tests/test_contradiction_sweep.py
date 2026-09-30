@@ -1776,6 +1776,17 @@ def test_a_later_ok_never_replaces_an_earlier_no_op_line(tmp_path, monkeypatch):
     assert p.read_text(encoding="utf-8") == 'degraded:no-op-codex-shim-unreachable {"canonicals_checked":0}\n'
 
 
+def test_a_non_zero_exit_says_why_on_stderr_and_a_quiet_no_op_does_not(monkeypatch, capsys):
+    """ams-step.sh takes the stderr tail as the note of a failed run; the chained re-judge prints after a
+    failed sweep pass, so the reason has to be on stderr or the note names the wrong pass."""
+    monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    assert sweep._finish("degraded:marker-failed:2", {"marker_failed": 2}) == 1
+    err = capsys.readouterr().err
+    assert "exit 1" in err and "degraded:marker-failed:2" in err
+    assert sweep._finish("ok") == 0 and sweep._finish("no-op:lock-held") == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_unwritable_or_unserialisable_outcome_never_fails_the_sweep(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AMS_OUTCOME_FILE", str(tmp_path / "no-such-dir" / "outcome"))
     sweep._write_outcome("ok", {"a": 1})                       # OSError: reported, not raised

@@ -630,9 +630,17 @@ def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
 def _finish(outcome: str, counts: Optional[dict] = None) -> int:
     """The last line of a leg: record the outcome with the leg's counts for the step receipt, return
     the unit's exit code. (_append_summary already wrote the status line for every path that logs a
-    summary; this adds the counts at the end of a leg.)"""
+    summary; this adds the counts at the end of a leg.)
+
+    A non-zero exit also says WHY on stderr: ams-step.sh records such a run as `failed` and takes the
+    stderr tail as the receipt's note (the last stdout line only when stderr is empty), and the chained
+    re-judge prints after a failed sweep pass, so without this line the note would be the second
+    pass's last line, not the reason the run failed."""
     _write_outcome(outcome, counts)
-    return exit_code_for(outcome)
+    rc = exit_code_for(outcome)
+    if rc:
+        print(f"contradiction-sweep: exit {rc}: {outcome}", file=sys.stderr, flush=True)
+    return rc
 
 
 def judge_pair(http: httpx.Client, model: str, canonical_text: str,

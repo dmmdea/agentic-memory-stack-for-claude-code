@@ -143,6 +143,7 @@ jobs:
             claude-config/tests \
             scripts/wsl/tests/test_ams_health_stamp.py \
             scripts/wsl/tests/test_ams_step_outcome.py \
+            scripts/wsl/tests/test_curation_step_receipts.py \
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \
             scripts/wsl/test_wiki_index.py \
