@@ -15,8 +15,8 @@
 # <24h timer.
 #
 # Fire-and-forget: spawns the worker DETACHED and exits 0 immediately so session start never blocks.
-# A per-transcript watermark prevents re-capturing the same prior session on repeated starts; the
-# extractor's own 10-min throttle + mem0 dedup bound cost further.
+# A per-transcript watermark (file name + mtime, not path) prevents re-capturing the same prior session
+# on repeated starts; the extractor's own 10-min throttle + mem0 dedup bound cost further.
 #
 # Claude Code SessionStart payload (stdin JSON): { session_id, transcript_path, cwd, source,
 # hook_event_name }; source in {startup, resume, clear, compact}.
@@ -95,13 +95,33 @@ try {
 } catch {}
 
 # Find the most-recently-modified transcript that is NOT the current session (2-level glob, no -Recurse).
+# A junction under projects is an ALIAS of another project directory (a directory symlink carries the
+# same ReparsePoint attribute that is read below, but only junctions were exercised): the glob lists
+# every transcript behind it a second time, at the same mtime, under another FullName, and Sort-Object
+# does not order ties. So the tie is broken on purpose: newest mtime first, then a file under a REAL
+# directory before one reached through an alias, then the path. Aliases stay in the listing: a
+# transcript that exists only behind a junction must still be captured. The alias flag is read once per
+# directory (cached by DirectoryName), not once per file: a stat per transcript would be paid on every
+# session start, over a listing of a thousand files and more.
 $projects = Join-Path $HomeDirPath (Join-Path '.claude' 'projects')
 if (-not (Test-Path $projects)) { exit 0 }
 $prior = $null
+$aliasByDir = @{}
 try {
     $prior = Get-ChildItem -Path (Join-Path $projects (Join-Path '*' '*.jsonl')) -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $curTrans -and $_.BaseName -ne $curSid -and $_.Length -gt 0 } |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Sort-Object @{ Expression = { $_.LastWriteTimeUtc.Ticks }; Descending = $true },
+                    @{ Expression = {
+                            $dir = $_.DirectoryName
+                            if (-not $aliasByDir.ContainsKey($dir)) {
+                                $isAlias = 0
+                                try { if (($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $isAlias = 1 } } catch {}
+                                $aliasByDir[$dir] = $isAlias
+                            }
+                            $aliasByDir[$dir]
+                        } },
+                    @{ Expression = { $_.FullName } } |
+        Select-Object -First 1
 } catch {}
 if (-not $prior) { exit 0 }
 
@@ -136,13 +156,25 @@ try {
 } catch {}
 
 # Watermark: skip if this exact transcript@mtime was already captured by a previous SessionStart.
+# The key is the file name + the mtime ticks, never the path. The file name is the session uuid, so it
+# is unique across workspaces; the directory is only the way this start happened to reach the file.
+# An alias directory lists one transcript under two paths, and a path-keyed watermark took the
+# other path for a new transcript and spawned the extractor on it again. That cost one extra spawn per
+# flip, not a second extraction: l1a-extract.ps1 keeps a transcript cursor keyed by file name (both
+# paths share it) and, once an extraction of those bytes has completed, exits before any codex call.
+# The visible damage was the alias path reaching the session row's workspace label when the alias won
+# the first capture; the tie-break above fixes that half.
 $wm = Join-Path $stateDir 'last-sessionstart-capture'
-$sig = $prior.FullName + '|' + $prior.LastWriteTimeUtc.Ticks
+$sig = $prior.Name + '|' + $prior.LastWriteTimeUtc.Ticks
+# A watermark written by an earlier release is <full path>|<ticks>, through whichever of the real or an
+# alias path won the sort. Its tail is this same signature, so it still counts as captured and the
+# upgrade does not cost one extra capture.
+$legacyTail = [string][System.IO.Path]::DirectorySeparatorChar + $sig
 try {
     if (Test-Path $wm) {
         $prev = (Get-Content -Path $wm -Raw -ErrorAction SilentlyContinue)
         if ($prev) { $prev = $prev.Trim() }
-        if ($prev -eq $sig) { exit 0 }
+        if ($prev -and ($prev -eq $sig -or $prev.EndsWith($legacyTail, [System.StringComparison]::OrdinalIgnoreCase))) { exit 0 }
     }
 } catch {}
 
