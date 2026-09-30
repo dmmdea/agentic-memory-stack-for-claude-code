@@ -17,7 +17,8 @@ def test_no_loopback_literal_in_server_calls():
     hits = [ln for ln in src.splitlines() if "127.0.0.1:18791" in ln and not ln.lstrip().startswith("#")]
     # the ONLY literal allowed is the resolver's last-resort fallback (MEM0_URL unset, no file)
     assert hits == ['  printf \'%s\\n\' "${MEM0_URL:-http://127.0.0.1:18791}"'], hits
-    assert src.count("$AMS_URL/") == 3, "every server call must go through the resolved authority"
+    # probe, canonical search, goals, then WP-2's two reads (/health/maintenance, /v1/episodes)
+    assert src.count("$AMS_URL/") == 5, "every server call must go through the resolved authority"
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")

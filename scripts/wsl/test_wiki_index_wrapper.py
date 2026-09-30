@@ -150,3 +150,41 @@ def test_build_without_a_snapshot_or_alias_fails_loudly(tmp_path):
     r = _run(env2, "build")
     assert r.returncode == 1 and "no brain alias" in r.stderr
     assert not log2.exists()
+
+
+# ---- WP-8: a session build stamps last-build on the brain (freshness for either refresh path) ----
+def test_build_stamps_last_build_on_the_brain_through_the_open_tunnel(tmp_path):
+    env, home, log = _env(tmp_path, {"WIKI_BRAIN_SSH": "brainhost"})
+    _snapshot(home)
+    r = _run(env, "build")
+    assert r.returncode == 0, r.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    opens = [c for c in calls if c.startswith("ssh -f -N -M")]
+    builds = [c for c in calls if c.startswith("py ")]
+    stamps = [c for c in calls if "last-build" in c]
+    closes = [c for c in calls if "-O exit brainhost" in c]
+    assert len(stamps) == 1, calls
+    assert "brainhost" in stamps[0] and "-S " in stamps[0], "reuses the control socket to the brain"
+    assert "wiki-index/last-build" in stamps[0]
+    assert calls.index(opens[0]) < calls.index(builds[0]) < calls.index(stamps[0]) < calls.index(closes[0])
+
+
+def test_a_failed_build_is_not_stamped(tmp_path):
+    env, home, log = _env(tmp_path, {"WIKI_BRAIN_SSH": "brainhost"})
+    _snapshot(home)
+    failing = tmp_path / "bin" / "fakepy"
+    failing.write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    r = _run(env, "build")
+    assert r.returncode == 3
+    assert not any("last-build" in c for c in log.read_text(encoding="utf-8").splitlines())
+
+
+def test_a_stamp_failure_warns_but_does_not_fail_the_build(tmp_path):
+    env, home, log = _env(tmp_path, {"WIKI_BRAIN_SSH": "brainhost"})
+    _snapshot(home)
+    (tmp_path / "bin" / "ssh").write_text(
+        '#!/usr/bin/env bash\necho "ssh $*" >> "$FAKE_LOG"\ncase "$*" in *last-build*) exit 255;; esac\nexit 0\n',
+        encoding="utf-8")
+    r = _run(env, "build")
+    assert r.returncode == 0, r.stderr
+    assert "could not stamp last-build" in r.stderr

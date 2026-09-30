@@ -1,6 +1,7 @@
 # memory-maintenance-spawn.ps1 - SessionStart hook entry point for the maintenance jobs.
 # Detach-spawns dream-catchup.ps1 (debt-based dream catch-up), memory-index-refresh.ps1 (the
-# mem0-side MEMORY.md index, decoupled from the dream), memory-lint.ps1 (read-only health scan
+# mem0-side MEMORY.md index, decoupled from the dream), wiki-index-catchup.ps1 (a replica
+# refreshes the LLM Wiki's index itself when it is due; docs/systems/wiki-index.md), memory-lint.ps1 (read-only health scan
 # of the harness-native per-workspace auto-memory stores) and - P4-1a, 2026-09-16 - the store
 # binary's resident watcher, `ams-store sync --watch`: one per PC (it holds the
 # Local\ams-store-watch singleton; a second instance exits 0 at once), wakes on the dirty marker
@@ -23,7 +24,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PowerShell51 = $env:SystemRoot + '\System32\WindowsPowerShell\v1.0\powershell.exe'
 
 $children = @()
-foreach ($f in @('dream-catchup.ps1', 'memory-index-refresh.ps1')) {
+foreach ($f in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'wiki-index-catchup.ps1')) {
     $target = Join-Path $ScriptDir $f
     if (Test-Path $target) {
         $children += @{ Exe = $PowerShell51; Args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $target + '"' }
