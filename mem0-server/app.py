@@ -8,6 +8,7 @@ import json
 import hashlib
 import logging
 import threading
+import uuid as _uuid
 import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
@@ -488,11 +489,20 @@ _ADD_FORBIDDEN_META = {"retrievable", "expires_at", "created_at", "tier_actor",
 # One lock per memory id serializes PUT, PATCH /tier, PATCH /metadata and the
 # NLI stamp for that id only. Registry grows one small Lock per distinct id
 # written this process lifetime — bounded in practice by the corpus.
+# The key is the canonical UUID spelling: Qdrant resolves the hyphenated, simple, braced and
+# urn:uuid spellings (any case) of one id to the same point, so keying on the raw path string
+# gave one record several locks and let a differently spelled request escape the serialization.
 _MID_LOCKS: dict = {}
 _MID_LOCKS_GUARD = threading.Lock()
 
+def _mid_lock_key(mid) -> str:
+    try:
+        return str(_uuid.UUID(str(mid).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return str(mid)
+
 def _mid_write_lock(mid):
-    key = str(mid)
+    key = _mid_lock_key(mid)
     with _MID_LOCKS_GUARD:
         lk = _MID_LOCKS.get(key)
         if lk is None:
@@ -2242,7 +2252,11 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             # between would let this unsigned change move a record that is canonical NOW, so a
             # move that saw a non-canonical record re-reads the tier under the lock and refuses.
             if b.tier != "canonical" and current_tier != "canonical":
-                if fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid) == "canonical":
+                _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+                if _tier_now == _NOT_FOUND:
+                    # Deleted while this change was in flight: nothing to change, and no ledger line.
+                    raise HTTPException(404, f"memory {mid} not found")
+                if _tier_now == "canonical":
                     raise _TierRaced()
             # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
             # change can never complete without an audit trace. If this append fails the

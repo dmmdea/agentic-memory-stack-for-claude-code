@@ -207,7 +207,7 @@ Wraps `PUT /v1/memories/{id}`. Text only. Queues to the offline outbox when the 
 Wraps `PATCH /v1/memories/{id}/tier` with `actor="claude-autonomous"` (always — the shim never sends another actor). Tiers reachable via MCP: `evidence` | `stable` | `temporal` (`insight` 403s — consolidator-only). **`tier="canonical"` is rejected inside the shim itself**: canonical promotion cannot execute over MCP because the server demands the user-direct HMAC token + nonce headers the shim never sends. The "lock that in" flow is therefore: `memory_add` (evidence) → optionally `memory_promote(tier="stable")` → the operator runs `bash mem0-canonize.sh <id> "<reason>"` (deployed to `~/apps/mem0-scripts/`).
 
 ### `memory_demote(memory_id, tier="evidence", reason=None)` → dict
-Same wire as promote, opposite direction (also `actor="claude-autonomous"`). Use to walk back wrong tier assignments. It cannot move a record out of `canonical`: that needs the operator's signed `demote` token (`bash mem0-canonize.sh --action demote <id> "<reason>"`), so over MCP it returns `403`.
+Same wire as promote, opposite direction (also `actor="claude-autonomous"`). Use to walk back wrong tier assignments. It cannot move a record out of `canonical`: that needs the operator's signed `demote` token (`bash mem0-canonize.sh --action demote <id> "<reason>"`), so over MCP it is refused: `400` when no `reason` is passed (a demotion needs one), otherwise `403`.
 
 ### `memory_delete(memory_id)` → dict
 Wraps `DELETE /v1/memories/{id}`. Queues to the offline outbox when the authority is unreachable.

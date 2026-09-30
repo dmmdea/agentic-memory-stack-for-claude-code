@@ -129,7 +129,9 @@ def _sandbox(tmp_path: Path) -> dict:
     curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > " + str(rec) + "\necho '{\"ok\": true}'\n",
                     encoding="utf-8")
     curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
-    env = {"HOME": str(home), "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+    env = {"HOME": str(home), "USERPROFILE": str(home),
+           "HOMEDRIVE": os.path.splitdrive(str(home))[0], "HOMEPATH": os.path.splitdrive(str(home))[1],
+           "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
            "XDG_RUNTIME_DIR": str(rt), "MEM0_URL": "http://authority.invalid:1"}
     return {"env": env, "rec": rec}
 
@@ -247,7 +249,7 @@ class _FakeStore:
         self.writes.append((payload, points))
 
 
-def _handler(store: _FakeStore):
+def _handler(store: _FakeStore, ledger_fail: bool = False):
     import ast
     import logging
     import threading
@@ -265,6 +267,12 @@ def _handler(store: _FakeStore):
     for n in nodes:
         n.decorator_list = []
     ledger: list = []
+
+    def append_ledger(record: dict) -> None:
+        if ledger_fail:
+            raise OSError("ledger disk full")
+        ledger.append(record)
+
     ns = {
         "HTTPException": HTTPException, "Header": Header, "BaseModel": BaseModel,
         "Optional": Optional, "_dt": dt, "log": logging.getLogger("test-update-tier"),
@@ -276,7 +284,7 @@ def _handler(store: _FakeStore):
         "INSIGHT_ALLOWED_ACTORS": {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"},
         "is_imperative_canonical": lambda text: False,
         "mem": types.SimpleNamespace(vector_store=types.SimpleNamespace(client=store, collection_name="memories")),
-        "_append_ledger": ledger.append,
+        "_append_ledger": append_ledger,
         "_mid_write_lock": lambda mid: threading.Lock(),
         "_upstream_error": lambda e: HTTPException(502, f"upstream: {e}"),
     }
@@ -363,6 +371,59 @@ def test_handler_accepts_a_signed_demotion(signing):
     assert out["ok"] is True
     assert store.writes and store.writes[0][0]["tier"] == "evidence"
     assert _intents(ledger) and _intents(ledger)[0]["transport"] == "cli-user-direct"
+
+
+def test_handler_answers_404_for_a_record_deleted_mid_flight(signing):
+    store = _FakeStore(["evidence", _ABSENT])
+    call, ledger = _handler(store)
+    assert _status(call, "stable") == 404
+    assert store.writes == [] and ledger == []
+
+
+def test_handler_refuses_the_change_when_the_intent_line_cannot_be_written(signing):
+    store = _FakeStore(["stable", "stable"])
+    call, ledger = _handler(store, ledger_fail=True)
+    assert _status(call, "evidence") == 503
+    assert store.writes == [], "no audit intent, no mutation"
+
+
+def test_handler_demotion_needs_a_reason(signing):
+    store = _FakeStore(["canonical"])
+    call, ledger = _handler(store)
+    ts, nonce = _now(), str(uuid.uuid4())
+    tok = _sign(signing, ts, nonce, "demote", "mid-1", "")
+    assert _status(call, "evidence", actor="user-direct", reason="", token=tok, ts=ts, nonce=nonce) == 400
+    assert store.writes == []
+
+
+@pytest.mark.parametrize("target", ["stable", "temporal", "insight"])
+def test_handler_every_target_out_of_canonical_needs_the_token(signing, target):
+    store = _FakeStore(["canonical"])
+    call, ledger = _handler(store)
+    assert _status(call, target, actor="c1-consolidator") == 403
+    assert store.writes == [] and ledger == []
+
+
+def test_lock_key_is_the_canonical_uuid_spelling():
+    """Qdrant resolves every spelling of one UUID to the same point, so the per-record write lock
+    must too, or a differently spelled request escapes the serialization."""
+    import ast
+    import uuid as _uuid_mod
+    tree = ast.parse((SERVER_DIR / "app.py").read_text(encoding="utf-8"))
+    fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_mid_lock_key"]
+    assert len(fn) == 1
+    ns = {"_uuid": _uuid_mod}
+    exec(compile(ast.Module(body=fn, type_ignores=[]), "app.py:_mid_lock_key", "exec", dont_inherit=True), ns)
+    key = ns["_mid_lock_key"]
+    u = _uuid_mod.uuid4()
+    spellings = [str(u), str(u).upper(), u.hex, "{" + str(u) + "}", "urn:uuid:" + str(u), " " + str(u) + " "]
+    assert {key(s) for s in spellings} == {str(u)}
+    assert key("not-a-uuid") == "not-a-uuid" and key(42) == "42"
+    body = _update_tier_src()
+    assert "_mid_write_lock(" in body
+    src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
+    lk = src[src.find("def _mid_write_lock("):]
+    assert "_mid_lock_key(mid)" in lk[:200], "the write lock must key on the normalized id"
 
 
 def test_handler_refuses_a_promote_token_for_a_demotion(signing):

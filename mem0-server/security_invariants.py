@@ -19,7 +19,8 @@ Two signed-payload formats (INTENTIONALLY DISTINCT for backward compat):
 
   2. Mutation actions (v0.17 Phase A + F.1; nonce REQUIRED since v0.18 MED-7):
        <ts>|<nonce>|<action>|<memory_id>|<reason>
-     Produced by: bash mem0-canonize.sh --action put|delete|patch_metadata <mid> "<reason>"
+     Produced by: bash mem0-canonize.sh --action put|delete|patch_metadata|demote <mid> "<reason>"
+     (demote: session 12, PATCH /tier moving a record out of canonical)
      (script generates a uuid4 nonce, sends X-User-Direct-Nonce header, and includes
      the nonce in the signed payload)
      v0.18 MED-9 adds action "merge_goals" (POST /v1/goals/{id}/merge bulk-relink

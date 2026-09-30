@@ -150,8 +150,8 @@ Status: **rejected.** A tier promotion without `X-User-Direct-Nonce` → 403 `"X
 ```
 <ts>|<nonce>|<action>|<memory_id>|<reason>
 ```
-where action ∈ {promote, put, delete, patch_metadata, merge_goals}
-Used by: `bash mem0-canonize.sh [<no flag → promote> | --action put|delete|patch_metadata] <mid> "<reason>"` (the CLI generates the uuid4 nonce and sends it as `X-User-Direct-Nonce`)
+where action ∈ {promote, demote, put, delete, patch_metadata, merge_goals}
+Used by: `bash mem0-canonize.sh [<no flag → promote> | --action put|delete|patch_metadata|demote] <mid> "<reason>"` (the CLI generates the uuid4 nonce and sends it as `X-User-Direct-Nonce`)
 Validated by: `security_invariants.validate_hmac_user_direct()` called from the respective endpoint. The v0.17 no-nonce variant (`<ts>|<action>|<memory_id>|<reason>`) is no longer accepted (v0.18 MED-7).
 
 **Format-2 promote (v0.19 Phase G)** — PATCH /tier canonical promotion:
@@ -176,6 +176,9 @@ bash mem0-canonize.sh --action delete <mid> "<reason>"
 
 # Patch metadata on a canonical record (v0.17 new):
 bash mem0-canonize.sh --action patch_metadata <mid> "<reason>" --metadata-json '{"key": "value"}'
+
+# Move a record out of canonical (session 12; default target evidence, canonical refused):
+bash mem0-canonize.sh --action demote [--tier evidence|stable|temporal] <mid> "<reason>"
 ```
 
 The CLI is the **single signing surface**. Never manually construct the HMAC + curl — the CLI ensures the signed payload format matches what the server expects.
@@ -332,7 +335,7 @@ Fetch the record and read `metadata.source_memory_ids`. These are the evidence r
 
 ### Step 3 — Decide: demote or delete
 
-**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token. Moving a record into or out of `canonical` does: promotion signs `promote`, demotion signs `demote` (`mem0-canonize.sh --action demote`); `memory_demote` from the MCP shim gets a 403 on a canonical record. The MCP shim's `memory_demote` works for this:
+**Demote (preferred — preserves history):** PATCH `/tier` with `tier='evidence'` or `tier='stable'`, `actor='user-direct'`, and a reason. Demoting from `insight` → `evidence` does **not** require the HMAC token. Moving a record into or out of `canonical` does: promotion signs `promote`, demotion signs `demote` (`mem0-canonize.sh --action demote`); `memory_demote` from the MCP shim is refused on a canonical record (400 without a reason, 403 with one). The MCP shim's `memory_demote` works for this:
 
 ```python
 memory_demote(memory_id="<id>", tier="evidence", reason="bad insight: <reason>")

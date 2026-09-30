@@ -436,7 +436,7 @@ def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = N
     actor is always 'claude-autonomous' when called via MCP.
     reason is recommended for audit clarity.
     A CANONICAL record cannot be demoted from here: the server requires the operator's
-    signed token for any move out of canonical (403). The operator path is
+    signed token for any move out of canonical (400 without a reason, else 403). The operator path is
     `mem0-canonize.sh --action demote <id> "<reason>"` on the authority."""
     payload = {"tier": tier, "actor": "claude-autonomous", "reason": reason}
     try:
