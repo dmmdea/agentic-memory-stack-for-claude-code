@@ -4,6 +4,30 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.2 — the brand backfill proposes only what the resolver would route (2026-09-30)
+
+### Fixed
+- **`brand-backfill.py` proposed business labels the C3 resolver would never give.** `propose()` ran the
+  content rules on every record whose path did not route, and read the workspace OR the project, so a
+  project rule never ran when a workspace was set. The contract (`brand_routing`) runs the content rules
+  only in a content-rule workspace; a non-routing path elsewhere gets no brand. The first live dry run
+  proposed content labels for records from unrelated workspaces and missed path rules carried by the
+  project. `propose()` now tries a path rule on the workspace, then on the project; runs the content
+  rules only for a content-rule workspace or a record with no path at all; and otherwise proposes
+  nothing. `brand_routing` gains `in_content_rule_workspace()`, which `resolve()` now uses (same
+  semantics; the shared corpus passes unchanged).
+- **The printed signing command did not work on a native authority.** For canonical and insight rows,
+  `--apply` printed `mem0-canonize.sh --action patch_metadata ...`, which finds no key from a shell on a
+  native authority. It now prints `ams-canonize.sh` there (`MEM0_HOST_KIND=native`).
+
+### Upgrade notes
+- **Authority only.** Deploy the authority (`install/linux-authority.sh`); the backfill and the resolver
+  helper run there. A replica or client changes nothing in behaviour and can take this release at its
+  next installer run.
+- **Review content rows closely.** A content rule names one business, so a fact about several
+  businesses' accounts or about shared infrastructure can match exactly one of them, and a wrong label
+  hides that fact from every other workspace. Leaving such a row out keeps the record visible everywhere.
+
 ## 1.32.1 — a failing write path turns health red, and a junction no longer captures a session twice (2026-09-30)
 
 ### Fixed
