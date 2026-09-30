@@ -41,16 +41,29 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 
 # Operator-owned keys: no installer flag sets them, the operator adds them by hand, and every
 # writer rewrites the whole file, so each writer carries them over from the existing file
-# (stack_env_carry) or a re-run deletes them silently. MEM0_BRAIN_SSH = the brain's SSH alias
-# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). The rest are the promotion-gate and
-# brand switches the nightly dream and the server read from here: MEM0_PROMOTION_GATE_MODE
-# (shadow|enforce; the code default is shadow, and a brain that loses the line silently stops
-# enforcing), MEM0_SHARED_BRANDS and MEM0_BRAND_MAP (which brand labels every scope may see, and
-# the operator's brand map path), MEM0_NLI_GATE_ENABLED (the NLI write gate). Only the gate mode
-# has an installer flag (linux-authority.sh --promotion-gate-mode); a flag that sets a key here
-# passes its name as a skip argument to stack_env_carry so the line is written exactly once.
-# MEM0_POOL_HEALTH_ACK = the operator's dated pool-health acknowledgment, `<STATE>:<YYYY-MM-DD>`
-# (docs/systems/mem0-api.md, /health/maintenance).
+# (stack_env_carry) or a re-run deletes them silently. CARRIED IS NOT THE SAME AS READ, and who
+# reads each key differs: the mem0 server unit has no EnvironmentFile= and never loads this file into
+# its environment, so a reader that wants a key from here opens the file itself (after the process
+# environment). mem0-server/tests/test_stack_env_writers.py pins every claim below.
+#   MEM0_BRAIN_SSH: the brain's SSH alias for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md).
+#   MEM0_PROMOTION_GATE_MODE (shadow|enforce; the code default is shadow, and a brain that loses the
+#     line silently stops enforcing): read by the nightly dream (scripts/wsl/dream-consolidate.py) and
+#     by the server's promotion_gate health check, both environment first, then this file, then shadow.
+#   MEM0_SHARED_BRANDS and MEM0_BRAND_MAP (which brand labels every scope may see, and the operator's
+#     brand map path): read, after the process environment, by the server's admission gate
+#     (mem0-server/admission_gate.py) and by scripts/wsl/brand_routing.py; ams-store-judge-apply.sh
+#     reads the map path the same way. The Windows hooks read the shared labels from their own
+#     environment and brands.json, not from here.
+#   MEM0_POOL_HEALTH_ACK: the operator's dated pool-health acknowledgment, `<STATE>:<YYYY-MM-DD>`
+#     (docs/systems/mem0-api.md, /health/maintenance), read by that endpoint on every call.
+#   MEM0_NLI_GATE_ENABLED (the NLI write gate): NOT read from here. mem0-server/app.py reads it once,
+#     at import, from the process environment only, so a value here is recorded and carried but does
+#     not turn the gate on. To turn it on, set Environment=MEM0_NLI_GATE_ENABLED=1 in a mem0.service
+#     drop-in of your own (systemctl --user edit mem0 writes override.conf; the installer rewrites
+#     only native.conf) and restart the service.
+# Only the gate mode has an installer flag (linux-authority.sh --promotion-gate-mode); a flag that
+# sets a key here passes its name as a skip argument to stack_env_carry so the line is written
+# exactly once.
 # A new hand-set key goes here.
 STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK"
 
