@@ -775,6 +775,36 @@ def test_without_any_stamp_the_checkout_the_script_runs_from_is_asked(home, qdra
     assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == head
 
 
+def test_the_sha_an_installer_stamps_is_the_sha_the_manifest_names(home, qdrant, tmp_path):
+    """Writer and reader end to end: the installers' real stamp library into the installers' app dir,
+    then the manifest writer with no app-dir override. A checkout -> its HEAD; a tree that cannot name
+    a commit -> `unknown`, and a checkout that is reachable does not override that."""
+    lib = WSL_DIR.parents[1] / "install" / "deploy-stamp.sh"
+    b = home / ".mem0" / "backups"
+    ts = "20260929-030237"
+    _seed_set(b, ts)
+    app = home / "apps" / "mem0-server"
+    app.mkdir(parents=True)
+    checkout = tmp_path / "checkout"
+    head = _git_checkout(checkout)
+
+    def stamp(source: Path):
+        subprocess.run(["bash", "-c", f'. "{lib.as_posix()}"; deploy_stamp_write "{source.as_posix()}" "{app.as_posix()}"'],
+                       check=True, capture_output=True, timeout=60)
+
+    stamp(checkout)
+    r = _run(MANIFEST, home, qdrant, args=[ts])
+    assert r.returncode == 0, r.stderr
+    assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == head
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    stamp(bare)  # a tarball install: no .git, no stamp of its own
+    r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(checkout))
+    assert r.returncode == 0, r.stderr
+    assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == "unknown"
+
+
 # ------------------------------------- the outcome contract, read by the real ams-step.sh
 #
 # The tests above pin the outcome line these scripts write with a parser of this suite's own. Only the
