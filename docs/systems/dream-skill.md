@@ -37,7 +37,7 @@ The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insi
 
 The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the nightly throttle and exits immediately if the last successful run was < 23h ago. It then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every Codex call goes through the ChatGPT-subscription Codex CLI, never Claude — see [`codex-hooks.md`](./codex-hooks.md) for why.
 
-If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a pending learn-rule, a queued promotion, or a last run > 48h ago) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own nightly throttle + Codex lock prevent a double-run.
+If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a queued promotion, or a last run > 48h ago; pending learn-rules are drained by `learn-rules-drain.ps1`, not by the dream) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own nightly throttle + Codex lock prevent a double-run.
 
 ## Important flows
 

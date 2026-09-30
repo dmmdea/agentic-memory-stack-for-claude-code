@@ -65,7 +65,7 @@ Describe 'Get-Mem0AuthorityUrl / Get-Mem0Role (per-host file first)' {
         Get-Mem0BundleFailoverUrl -AuthorityUrl 'http://127.0.0.1:18791' | Should -BeNullOrEmpty       # already local
     }
     It 'keeps the two library copies byte-identical (comment-stripped)' {
-        foreach ($fn in 'Get-Mem0AuthorityUrl', 'Get-Mem0Role') {
+        foreach ($fn in 'Get-Mem0AuthorityUrl', 'Get-Mem0Role', 'Redact-Secrets') {
             $a = script:Get-FunctionBody (Join-Path $script:winDir 'user-prompt-lib.ps1') $fn
             $b = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') $fn
             $a | Should -Not -BeNullOrEmpty -Because "$fn must exist in user-prompt-lib.ps1"

@@ -363,7 +363,7 @@ try {
                 Add-Check 'LIVENESS' 'dream cycle' 'WARN' "last cycle $([int]$ldAgeH)h ago (box likely slept) - dream-catchup should self-heal at the next session; re-check in 30m"
             } else {
                 $debt = $false
-                foreach ($f in 'learn-rules.jsonl', 'promote-queue.jsonl') {
+                foreach ($f in 'promote-queue.jsonl') {
                     $fp = Join-Path $env:USERPROFILE ".claude\state\$f"
                     if ((Test-Path $fp) -and ((Get-Item $fp).Length -gt 0)) { $debt = $true }
                 }
@@ -384,7 +384,7 @@ try {
                     } catch {}
                 }
                 if ($debt -or $failedRecovery) {
-                    Add-Check 'LIVENESS' 'dream cycle' 'FAIL' "last cycle $([int]($ldAgeH/24))d ago WITH $(if ($debt) { 'standing debt (learn/promote queues non-empty)' } else { 'a catchup that ran >30m ago and did not recover' }) - consolidation is genuinely stuck"
+                    Add-Check 'LIVENESS' 'dream cycle' 'FAIL' "last cycle $([int]($ldAgeH/24))d ago WITH $(if ($debt) { 'standing debt (promote queue non-empty)' } else { 'a catchup that ran >30m ago and did not recover' }) - consolidation is genuinely stuck"
                 } else {
                     Add-Check 'LIVENESS' 'dream cycle' 'WARN' "last cycle $([int]($ldAgeH/24))d ago, no debt evidence - long sleep/travel is normal for this box; catchup will fire on the next session"
                 }
@@ -1127,6 +1127,23 @@ try {
         Add-Check 'RECOVERY' 'store history git locks' $glv.Status $glv.Detail
     }
 } catch { Add-Check 'RECOVERY' 'auto-memory compactor task' 'WARN' "probe error: $($_.Exception.Message)" }
+
+# R2e (WP-17): the correction queue. Capture appends every correction-shaped prompt to
+# ~/.mem0/learn-rules.jsonl and learn-rules-drain.ps1 (spawned by memory-maintenance-spawn.ps1 on
+# every role, hourly) posts them to the authority. A pending correction older than 48 h means the
+# drain is not running or cannot reach the authority; the row is read-only and never drains.
+try {
+    if (-not (Get-Command Get-LearnRulesQueueStats -ErrorAction SilentlyContinue)) {
+        Add-Check 'RECOVERY' 'corrections drain' 'WARN' 'user-prompt-lib.ps1 predates the queue-stats helper - cannot judge; re-run 2-windows-config.ps1'
+    } else {
+        $lrs = Get-LearnRulesQueueStats
+        if ($lrs.stale -gt 0) {
+            Add-Check 'RECOVERY' 'corrections drain' 'WARN' "$($lrs.stale) pending correction(s) older than 48h (oldest $([int]$lrs.oldest_hours)h, $($lrs.pending) pending) - learn-rules-drain.ps1 is not draining; see ~/.claude/logs/learn-rules-drain.log and the authority reachability rows"
+        } else {
+            Add-Check 'RECOVERY' 'corrections drain' 'OK' "$($lrs.pending) pending correction(s), none older than 48h"
+        }
+    }
+} catch { Add-Check 'RECOVERY' 'corrections drain' 'WARN' "probe error: $($_.Exception.Message)" }
 
 # R2d: WATCH THE WATCHER. A registered task proves nothing: it can be pinned to a vanished
 # launcher, fail with LastTaskResult=1, or never fire because the box sleeps. If any store is

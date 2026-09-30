@@ -16,7 +16,7 @@ Brand isolation keeps one business's memories out of another's sessions. This sy
 
 - The brand map (`brands.json`) and its resolvers: PowerShell (`memory-common.ps1`, `user-prompt-lib.ps1`), Python (`scripts/wsl/brand_routing.py`) and the Go judge, all run over one shared corpus.
 - Shared brands (`MEM0_SHARED_BRANDS`, `shared_brands`) in the admission gate and the hook's client-side backstop.
-- Where a brand is stamped: L1a episodes and facts, the user-decision write, dream insights.
+- Where a brand is stamped: L1a episodes and facts, the user-decision write, dream insights, drained operator corrections.
 - The audit (`brand-scope-audit.py`) and the reviewed backfill (`brand-backfill.py`).
 
 ## Non-scope
@@ -61,6 +61,8 @@ Patterns are case-insensitive. Path separators (backslash, slash, space) are one
 **Sessions.** The UserPromptSubmit hook, the resident daemon and the L1a extractor all call `Get-BrandFromTranscriptPath`, one pinned copy in `memory-common.ps1` and one in `user-prompt-lib.ps1` (they do not dot-source each other, so a Pester test pins the two byte-identical). The workspace recorded with a session is the transcript's directory name, no longer a constant, and an unrouted session is no longer stamped with a hard-coded brand on the user-decision write.
 
 **L1a facts.** The extractor resolves the brand before the facts loop and routes each fact with its own text, so a fact posted from a routed workspace carries that brand, a fact from a content-rule workspace carries the brand its text names, and an unrouted path posts no `brand` key at all. The episode keeps its path-only brand. When the worker analyses a PreCompact snapshot (a temp copy whose directory routes to nothing) it routes by the real transcript's path, passed as `-OriginTranscriptPath`, for the facts and the episode alike; the extraction cursor stays keyed on the file it actually reads.
+
+**Corrections.** The correction-queue drain (`learn-rules-drain.ps1`) posts each queued operator correction with the brand its transcript path routes to and, in a content-rule workspace, the brand its own text names: the same `Get-BrandFromTranscriptPath -Path <transcript> -Text <correction>` call an L1a fact gets. A correction that routes nowhere keeps the brand recorded when it was captured, and one with neither carries no `brand` key ([`memory-capture.md`](../flows/memory-capture.md)).
 
 **Dream insights.** An insight takes the brand held by more than half of the memories it cites (neutral sources count in the denominator). A tie, no brand, or a shared label leaves it brand-neutral. The brand is decided when the insight is consolidated and travels in its metadata: an insight whose POST fails is spooled with that brand and replays the next night with it, whatever tonight's evidence holds ([`dream-skill.md`](./dream-skill.md)).
 
@@ -127,6 +129,7 @@ The brand names and folder paths are operator data and live only in the operator
 - `scripts/windows/tests/BrandRouting.Tests.ps1` (the same corpus, the pinned copies, the client backstop).
 - `mem0-server/tests/test_admission_gate.py` (shared brands), `test_dream_consolidate.py` (insight brand, including a spooled insight replaying with its brand), `test_brand_backfill.py` (audit and backfill against a fake store).
 - `scripts/windows/tests/L1aExtract.Tests.ps1` runs the real `l1a-extract.ps1` under Windows PowerShell 5.1 and checks the brand on every posted fact, also when the worker analyses a PreCompact snapshot.
+- `scripts/windows/tests/LearnRulesDrain.Tests.ps1` checks the brand a drained correction is posted with: a path rule, a content-rule workspace routed by the correction text (one matching rule, two, none), and the captured brand as the fallback.
 
 ## Common pitfalls
 
@@ -139,6 +142,7 @@ The brand names and folder paths are operator data and live only in the operator
 - [`../../scripts/wsl/brand_routing.py`](../../scripts/wsl/brand_routing.py) — the Python resolver.
 - [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1), [`../../scripts/windows/user-prompt-lib.ps1`](../../scripts/windows/user-prompt-lib.ps1) — the pinned PowerShell resolver copies.
 - [`../../scripts/windows/l1a-extract.ps1`](../../scripts/windows/l1a-extract.ps1) — brands episodes and facts.
+- [`../../scripts/windows/learn-rules-drain.ps1`](../../scripts/windows/learn-rules-drain.ps1) — brands drained operator corrections.
 - [`../../mem0-server/admission_gate.py`](../../mem0-server/admission_gate.py) — shared brands in the gate.
 - [`../../scripts/wsl/dream-consolidate.py`](../../scripts/wsl/dream-consolidate.py) — the insight brand.
 - [`../../scripts/wsl/brand-scope-audit.py`](../../scripts/wsl/brand-scope-audit.py), [`../../scripts/wsl/brand-backfill.py`](../../scripts/wsl/brand-backfill.py) — audit and backfill.

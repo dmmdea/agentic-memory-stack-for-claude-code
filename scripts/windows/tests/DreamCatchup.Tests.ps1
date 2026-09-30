@@ -11,7 +11,8 @@
 #
 # Test matrix:
 #   (a) fresh throttle (<30h)            -> no consolidator invoke
-#   (b) stale + debt (learn-rule line)   -> consolidator invoked (stub marker written)
+#   (b) stale + debt (promote-queue line) -> consolidator invoked (stub marker written);
+#       a learn-rules line alone is NOT debt (WP-17: learn-rules-drain.ps1 owns that queue)
 #   (c) stale + no debt                  -> no consolidator invoke
 #   (d) catch-up's own 6h throttle       -> a second run within 6h is a no-op
 #   (e) -Force bypasses the dream 24h throttle (condition-level test, no real run)
@@ -30,7 +31,7 @@ BeforeAll {
     function New-CatchupSandbox {
         param(
             [double]$DreamAgeHours,      # age of the last-dream marker; $null => no marker
-            [switch]$WithLearnLine,      # write a learn-rules.jsonl line (debt)
+            [switch]$WithLearnLine,      # write a learn-rules.jsonl line (NOT debt since WP-17)
             [switch]$WithPromoteLine,    # write a promote-queue.jsonl line (debt)
             [switch]$NoDreamMarker,
             [string]$Role                # 1.28.4: write ~\.mem0\role (absent = brain)
@@ -99,11 +100,11 @@ Describe 'catch-up: fresh dream throttle (<30h) -> no invoke' {
 # (b) stale + debt -> invokes consolidator
 # ---------------------------------------------------------------------------
 Describe 'catch-up: stale + debt -> invokes consolidator' {
-    It 'invokes the consolidator when >30h stale AND a learn-rule line exists' {
+    It 'does NOT treat a learn-rules line as debt: learn-rules-drain.ps1 owns that queue (WP-17)' {
         $sb = New-CatchupSandbox -DreamAgeHours 40 -WithLearnLine
         Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'dream-catchup.ps1') -SandboxRoot $sb.Root
-        Test-DreamInvoked -State $sb.State | Should -BeTrue -Because 'stale + pending learn-rule is debt -> catch up'
-        (Get-Content (Join-Path $sb.Logs 'dream-catchup.log') -Raw) | Should -Match 'debt detected'
+        Test-DreamInvoked -State $sb.State | Should -BeFalse -Because 'a pending correction is drained to the authority, not consolidated by a dream'
+        (Get-Content (Join-Path $sb.Logs 'dream-catchup.log') -Raw) | Should -Match 'stale but no debt'
     }
 
     It 'invokes the consolidator when >30h stale AND a promote-queue line exists' {
@@ -142,7 +143,7 @@ Describe 'catch-up: stale (30-48h) but no debt -> no invoke' {
 # ---------------------------------------------------------------------------
 Describe "catch-up: own 6h throttle stops back-to-back runs" {
     It 'a second run within 6h is a no-op (does not re-invoke)' {
-        $sb = New-CatchupSandbox -DreamAgeHours 40 -WithLearnLine
+        $sb = New-CatchupSandbox -DreamAgeHours 40 -WithPromoteLine
         # First run: stale + debt -> invokes, and marks the dream-catchup throttle.
         Invoke-InSandbox -ScriptPath (Join-Path $sb.Scripts 'dream-catchup.ps1') -SandboxRoot $sb.Root
         Test-DreamInvoked -State $sb.State | Should -BeTrue
