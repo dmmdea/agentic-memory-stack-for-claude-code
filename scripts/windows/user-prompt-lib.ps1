@@ -246,6 +246,8 @@ function Test-CorrectionLikePrompt {
     # however often its tool output says "revert" or "you forgot" (the first 1.32 drain posted 66
     # of them among 100 "corrections").
     if (Test-MachineTurnPrompt -Prompt $Prompt) { return $false }
+    # Nor is a message relayed from another agent session (1.32.2's drain still posted 14).
+    if (Test-RelayedAgentMessage -Prompt $Prompt) { return $false }
     $p = $Prompt.Trim()
 
     $patterns = @(
@@ -260,6 +262,25 @@ function Test-CorrectionLikePrompt {
     )
     foreach ($rx in $patterns) { if ($p -match $rx) { return $true } }
     return $false
+}
+
+function Test-RelayedAgentMessage {
+    <#
+    .SYNOPSIS
+    Is this prompt a message another agent session sent to this one? The harness delivers it as the
+    user turn, either opening with the <cross-session-message wrapper or with its one-line
+    announcement ("Another Claude session sent a message:") followed by the wrapper. It is that
+    agent speaking, never the operator, so correction capture skips it. C10 (Test-MachineTurnPrompt)
+    deliberately keeps such a turn human-shaped for the memory block; this predicate is for the
+    correction capture only. A prompt that merely quotes the wrapper mid-text does not match.
+    PS 5.1-safe, never throws.
+    #>
+    param([string]$Prompt)
+    if ([string]::IsNullOrEmpty($Prompt)) { return $false }
+    $t = $Prompt.TrimStart([char[]]@([char]32, [char]9, [char]13, [char]10, [char]12, [char]11))
+    if ($t -cmatch '^<cross-session-message[\s>]') { return $true }
+    return ($t.StartsWith('Another Claude session sent a message:', [System.StringComparison]::Ordinal) -and
+            ($t -cmatch '<cross-session-message[\s>]'))
 }
 
 function Test-MachineTurnPrompt {
