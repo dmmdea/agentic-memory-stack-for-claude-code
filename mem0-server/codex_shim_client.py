@@ -66,6 +66,23 @@ _USAGE_LIMIT_RE = re.compile(r"rate.?limit|usage.?limit", re.I)
 # codex 0.153 printed "tokens used" and the count on the next line; 0.154 prints them on ONE line
 # ("tokens used 4,037") — the first live native dream recorded tokens_used 0 for three real calls.
 _TOKENS_RE = re.compile(r"tokens used[:\s]*([\d,]+)", re.I)
+# `codex exec` prints its session header ("model: ...", "reasoning effort: ...") and the usage footer on
+# STDERR and the final message on stdout, so the telemetry is read from both streams. A field it cannot
+# find is None (not measured), never 0 / '': the usage ledger showed tokens_used 0 and an empty resolved
+# model on every row while the token regex looked at stdout only.
+_MODEL_RE = re.compile(r"^\s*model:\s*(\S+)", re.I | re.M)
+_EFFORT_RE = re.compile(r"^\s*reasoning effort:\s*(\S+)", re.I | re.M)
+
+
+def _native_telemetry(stdout: str, stderr: str) -> dict:
+    """{tokens_used, model_resolved, effort_resolved} from the CLI's stdout + stderr; each None on a miss.
+    The LAST token tally wins (a multi-turn session prints one per turn)."""
+    text = f"{stdout or ''}\n{stderr or ''}"
+    tallies = _TOKENS_RE.findall(text)
+    model, effort = _MODEL_RE.search(text), _EFFORT_RE.search(text)
+    return {"tokens_used": int(tallies[-1].replace(",", "")) if tallies else None,
+            "model_resolved": model.group(1) if model else None,
+            "effort_resolved": effort.group(1) if effort else None}
 
 
 def judge_transport() -> str:
@@ -121,9 +138,8 @@ def _judge_once_native(prompt: str, effort: str, timeout_s: int, model: str, _ru
                 response = ""
             if not response:
                 response = (cp.stdout or "").strip()
-            m = _TOKENS_RE.search(cp.stdout or "")
-            tokens = int(m.group(1).replace(",", "")) if m else 0
-            return {"ok": True, "response": response, "tokens_used": tokens, "duration_ms": duration_ms, "transport": "native"}
+            return {"ok": True, "response": response, **_native_telemetry(cp.stdout, cp.stderr),
+                    "duration_ms": duration_ms, "transport": "native"}
     finally:
         lock.close()
 

@@ -43,7 +43,7 @@ Calibrate thresholds against the *semantic* scale (binary-search the highest thr
 
 **The calibration record** (eval harness, private repo): on EmbeddingGemma's compressed cosine scale, off-domain prompts top out ≈ 0.12; genuinely relevant ones run 0.25–0.57 (median ≈ 0.33). The production gate is **0.30**: it rejects everything clearly-irrelevant with margin, while 0.35 was measured to crater recall to ≈ 0.47 and 0.50 to zero. That is why the gate must not be "tightened" as a precision lever — precision comes from admission, tiers, and abstention downstream.
 
-**Reranking** (bge cross-encoder, `reranker.py`) re-orders candidates at a measured 2–7 s of CPU — worth it only where latency doesn't matter: auto-on for deliberate `memory_search` at `limit ≥ 5`, overridable per call, **never** on the per-prompt bundle. Measured: it changes the top-2 on ~92 % of rerankable probes and improves blind-judged relevance — the win is real, just not affordable on the hot path.
+**Reranking** (bge cross-encoder, `reranker.py`) re-orders candidates at a measured 2–7 s (a cold load after the five-minute unload adds to that; one budget-bounded retry (12 s at the shipped values) absorbs it before search falls back to dense order, see [`reranker.md`](../systems/reranker.md)) — worth it only where latency doesn't matter: auto-on for deliberate `memory_search` at `limit ≥ 5`, overridable per call, **never** on the per-prompt bundle. Measured: it changes the top-2 on ~92 % of rerankable probes and improves blind-judged relevance — the win is real, just not affordable on the hot path.
 
 ### Channel 1 — the per-prompt bundle (working memory)
 

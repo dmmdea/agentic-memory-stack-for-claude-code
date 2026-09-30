@@ -39,6 +39,9 @@ GENERATE_SCRIPT = REPO_ROOT / "scripts" / "wsl" / "generate-canonical-key.sh"
 KEY_PLAINTEXT = "phase-d-test-canonical-key-0123456789"
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _install_script(src: Path, tmp_path: Path) -> Path:
     """Copy the script CRLF-stripped + executable (mirrors the installer's
     `tr -d '\\r' ... && chmod +x` deploy step)."""
@@ -140,7 +143,7 @@ def test_generate_key_refuses_when_dpapi_blob_exists(tmp_path):
     home = tmp_path / "home"
     (home / ".mem0").mkdir(parents=True)
     (home / ".mem0" / "canonical-key.dpapi").write_bytes(b"\x01fake-blob")
-    env = {**os.environ, "HOME": str(home)}
+    env = home_env(home)
     proc = subprocess.run(["bash", str(script)], env=env,
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 1
@@ -153,7 +156,7 @@ def test_generate_key_still_works_on_fresh_box(tmp_path):
     script = _install_script(GENERATE_SCRIPT, tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    env = {**os.environ, "HOME": str(home)}
+    env = home_env(home)
     proc = subprocess.run(["bash", str(script)], env=env,
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr

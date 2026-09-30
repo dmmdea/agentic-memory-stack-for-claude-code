@@ -448,6 +448,21 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         $script:bannerCode.Contains('retrieval-drift-state.json') | Should -BeTrue -Because 'drift alarm/guard-dead must reach the banner'
         $script:bannerCode | Should -Not -Match 'health/deep' -Because 'the banner must never call the expensive endpoint inline (the 1s cold-morning guard exists for a reason)'
     }
+
+    It 'WP-2: the banner makes exactly ONE bounded authority health read, after the MEM0_UP probe' {
+        # The heartbeat digest above stays file-read-only. The one sanctioned network read is the
+        # authority's /health/maintenance line (register: alert-no-session-start-reader): a single
+        # curl capped at 1.5 s, gated on the same MEM0_UP probe as every other server-dependent block,
+        # so a cold morning still costs the 1 s probe and nothing more.
+        $reads = [regex]::Matches($script:bannerCode, 'health/maintenance')
+        $reads.Count | Should -Be 1 -Because 'one bounded authority read; a second call site is the serial-curl cold-morning stall the 1s guard exists to prevent'
+        $script:bannerCode | Should -Match 'curl -sf --max-time 1\.5 "\$AMS_URL/health/maintenance"' -Because 'the read must carry a hard timeout of 1.5 s'
+        $probe = $script:bannerCode.IndexOf('$AMS_URL/health >/dev/null')
+        $read  = $script:bannerCode.IndexOf('health/maintenance')
+        $probe | Should -BeGreaterThan -1
+        $read  | Should -BeGreaterThan $probe -Because 'the read sits behind the MEM0_UP probe'
+        $script:bannerCode | Should -Match '(?s)if \[ "\$MEM0_UP" = 1 \]; then\s*\r?\n\s*curl -sf --max-time 1\.5 "\$AMS_URL/health/maintenance"' -Because 'and is gated on MEM0_UP=1'
+    }
 }
 
 Describe 'v1.20.5 replica-aware health: every mem0 probe targets the authority' {

@@ -138,14 +138,16 @@ def usage_log_path() -> Path:
     return state_dir() / "codex-usage.jsonl"
 
 
-def write_usage(component: str, tokens_used: int = 0, duration_ms=0, status: str = "ok",
+def write_usage(component: str, tokens_used: int | None = 0, duration_ms=0, status: str = "ok",
                 items_posted: int = 0, model_requested: str = "", effort_requested: str = "",
-                model_resolved: str = "", effort_resolved: str = "", outcome: str = "") -> None:
-    """One ledger row per Codex call (the Write-CodexUsageLog record shape)."""
+                model_resolved: str | None = "", effort_resolved: str | None = "", outcome: str = "") -> None:
+    """One ledger row per Codex call (the Write-CodexUsageLog record shape). `tokens_used=None` (and a
+    None resolved model/effort) is written as null: the call ran but its usage was not measured, which a
+    reader must be able to tell from a call that used 0 tokens."""
     if outcome not in USAGE_OUTCOMES:
         raise ValueError(f"unknown usage outcome {outcome!r}")
     rec = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(), "component": component,
-           "tokens_used": int(tokens_used or 0), "duration_ms": duration_ms, "status": status,
+           "tokens_used": None if tokens_used is None else int(tokens_used or 0), "duration_ms": duration_ms, "status": status,
            "items_posted": int(items_posted or 0), "model_requested": model_requested,
            "effort_requested": effort_requested, "model_resolved": model_resolved,
            "effort_resolved": effort_resolved, "outcome": outcome}

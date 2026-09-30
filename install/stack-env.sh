@@ -42,15 +42,28 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 # Operator-owned keys: no installer flag sets them, the operator adds them by hand, and every
 # writer rewrites the whole file, so each writer carries them over from the existing file
 # (stack_env_carry) or a re-run deletes them silently. MEM0_BRAIN_SSH = the brain's SSH alias
-# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH"
+# for scripts/wsl/wiki-index.sh (docs/systems/wiki-index.md). The rest are the promotion-gate and
+# brand switches the nightly dream and the server read from here: MEM0_PROMOTION_GATE_MODE
+# (shadow|enforce; the code default is shadow, and a brain that loses the line silently stops
+# enforcing), MEM0_SHARED_BRANDS and MEM0_BRAND_MAP (which brand labels every scope may see, and
+# the operator's brand map path), MEM0_NLI_GATE_ENABLED (the NLI write gate). Only the gate mode
+# has an installer flag (linux-authority.sh --promotion-gate-mode); a flag that sets a key here
+# passes its name as a skip argument to stack_env_carry so the line is written exactly once.
+# MEM0_POOL_HEALTH_ACK = the operator's dated pool-health acknowledgment, `<STATE>:<YYYY-MM-DD>`
+# (docs/systems/mem0-api.md, /health/maintenance).
+# A new hand-set key goes here.
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK"
 
-stack_env_carry() {  # $1 = the existing stack.env -> "KEY=VALUE" lines for the operator-owned keys it records
-    local k v
-    [ -f "$1" ] || return 0
+stack_env_carry() {  # $1 = the existing stack.env, $2.. = keys to skip (set by a flag) -> "KEY=VALUE" lines for the operator-owned keys it records
+    local k v file="$1" s skip
+    shift
+    [ -f "$file" ] || return 0
     for k in $STACK_ENV_OPERATOR_KEYS; do
+        skip=0
+        for s in "$@"; do [ "$s" != "$k" ] || skip=1; done
+        [ "$skip" = 0 ] || continue
         # first occurrence, as every sed reader takes it; a CR from a hand edit is dropped
-        v="$(sed -n "s/^$k=//p" "$1" | head -n1 | tr -d '\r')"
+        v="$(sed -n "s/^$k=//p" "$file" | head -n1 | tr -d '\r')"
         [ -z "$v" ] || printf '%s=%s\n' "$k" "$v"
     done
     return 0

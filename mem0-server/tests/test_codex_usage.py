@@ -7,6 +7,9 @@ sys.path.insert(0, str(SCRIPTS))
 import codex_usage as cu  # noqa: E402
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def test_plan_window_shape_check():
     assert cu.plan_window({"rate_limit": {"primary_window": {"used_percent": 41.6, "reset_after_seconds": 172800}}}) == {"used_percent": 42, "resets_in_days": 2.0, "note": ""}
     w = cu.plan_window({"rate_limit": {}})
@@ -79,10 +82,10 @@ def test_last_window_returns_fresh_row_and_ignores_stale(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("used,code,verb", [(70, 0, "allow"), (90, 3, "deny")])
 def test_cli_gate_exit_codes(tmp_path, used, code, verb):
-    import os, subprocess
+    import subprocess
     home = tmp_path / "home"; (home / ".mem0" / "maintenance").mkdir(parents=True)
     (home / ".mem0" / "maintenance" / "codex-usage.jsonl").write_text(json.dumps(_window_row(used, 1)) + "\n", encoding="utf-8")
-    env = dict(os.environ, HOME=str(home), CODEX_HOME=str(tmp_path / "no-codex"))
+    env = dict(home_env(home), CODEX_HOME=str(tmp_path / "no-codex"))
     for v in ("MEM0_URL", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY"):
         env.pop(v, None)
     r = subprocess.run([sys.executable, str(SCRIPTS / "codex-usage-report.py"), "--gate"], env=env,

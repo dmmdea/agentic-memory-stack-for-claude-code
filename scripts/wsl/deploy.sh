@@ -332,8 +332,11 @@ else
     echo "==> retrieval families gate (post-restart; repo suite + app venv; 300s bound)"
     _gate_out="$(mktemp)"
     _gate_red=0
+    # The suites refuse a non-loopback MEM0_URL (mem0-server/tests/_live_guard.py). This gate's
+    # target is the box's OWN authority, which binds MEM0_BIND (a tailnet address on some hosts),
+    # and the families suite writes test-* tenants only - so the opt-in is stated here, not implied.
     (cd "$REPO_ROOT/mem0-server" && MEM0_KEY="$(cat "$HOME/.mem0/api-key")" \
-          MEM0_URL="$MEM0_HEALTH_URL" \
+          MEM0_URL="$MEM0_HEALTH_URL" AMS_ALLOW_LIVE_PROD_TESTS=1 \
           timeout 300 "$APP_DIR/.venv/bin/python" -m pytest -q tests/test_retrieval_families.py) \
           > "$_gate_out" 2>&1 || _gate_red=1
     tail -20 "$_gate_out"
@@ -356,4 +359,6 @@ else
 fi
 git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
 
-echo "==> deploy complete. Full gate: cd $REPO_ROOT/mem0-server && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=$MEM0_HEALTH_URL $APP_DIR/.venv/bin/python -m pytest -q"
+_full_gate_opt=""
+case "$MEM0_HEALTH_URL" in http://127.0.0.1:*) ;; *) _full_gate_opt="AMS_ALLOW_LIVE_PROD_TESTS=1 " ;; esac   # the suites refuse a non-loopback target otherwise
+echo "==> deploy complete. Full gate: cd $REPO_ROOT/mem0-server && MEM0_KEY=\$(cat ~/.mem0/api-key) MEM0_URL=$MEM0_HEALTH_URL ${_full_gate_opt}$APP_DIR/.venv/bin/python -m pytest -q"

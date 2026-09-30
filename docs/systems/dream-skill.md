@@ -166,6 +166,18 @@ promotions, the drift canary before/after, the morning summary and the usage led
   transcript-ingest endpoint was cut in review): the corpus is the last 36 h of evidence, each line
   tagged with its `source`, plus the recent episodes; transcripts that exist locally under
   `~/.claude/projects` are appended exactly as the PowerShell does.
+- **An honest night.** Phase 3 embeds (the drift snapshot, the insight POSTs), so it first polls
+  `GET /health/embedder` (21 probes, 30 s apart) and then proceeds either way. An insight whose POST
+  fails is appended to `~/.mem0/maintenance/dream/insight-spool.jsonl` (deduplicated by content hash)
+  and replayed before anything else on the next run; a replayed line leaves the spool. The run then
+  writes its step outcome (`AMS_OUTCOME_FILE`, see the chain description in
+  [installer-and-deploy.md](./installer-and-deploy.md)): `ok`, or `degraded:` with `posted-<p>-of-<c>`,
+  `replay-failed-<n>` (queued insights the replay could not post), `spool-backlog-<n>` (queued insights
+  a night that never reached phase 3 left untouched), `drift-snapshot-failed` and/or
+  `canonical-fetch-failed` (comma-joined) and the counts
+  `{signals, consolidated, posted, spooled, replayed, replay_failed, spool_depth}` (`spool_depth` is the
+  post-run line count), so a night that posted 0 of 3, or that could not empty last night's queue,
+  no longer reads as a green receipt. The dream's canonical search carries `hook_contract_version` 17.0.
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
   throttle stamp is `~/.mem0/maintenance/last-dream`, written by Python only.
@@ -224,7 +236,7 @@ Autonomous canonical promotion does **not** bypass the canonical write gate: it 
 
 ## Observability and debugging
 
-Per-run logging goes to the dream component log; the GATE log records each nominee's verdict, gate class, source class, corroboration count, and contradiction flag; the morning summary lists what was promoted, gate-blocked, deduped, or over-cap; `codex-usage.jsonl` tracks token spend. The Phase 5 drift compare is the alarm for a consolidation that degraded retrieval.
+Per-run logging goes to the dream component log; the GATE log records each nominee's verdict, gate class, source class, corroboration count, and contradiction flag; the morning summary lists what was promoted, gate-blocked, deduped, or over-cap; `codex-usage.jsonl` tracks token spend (`tokens_used`, `model_resolved` and `effort_resolved` are read from the Codex CLI's stdout and stderr, and are `null`, never `0` or `""`, when the CLI's footer could not be read). The Phase 5 drift compare is the alarm for a consolidation that degraded retrieval.
 
 ## Testing notes
 

@@ -1,15 +1,17 @@
 # memory-maintenance-spawn.ps1 - SessionStart hook entry point for the maintenance jobs.
 # Detach-spawns dream-catchup.ps1 (debt-based dream catch-up), memory-index-refresh.ps1 (the
-# mem0-side MEMORY.md index, decoupled from the dream), learn-rules-drain.ps1 (posts the pending
-# operator corrections to the authority; every role, since the queue is written on every PC; its own
-# 1 h throttle and lock make a burst of session starts cost one drain), memory-lint.ps1 (read-only health scan
+# mem0-side MEMORY.md index, decoupled from the dream), wiki-index-catchup.ps1 (a replica
+# refreshes the LLM Wiki's index itself when it is due; docs/systems/wiki-index.md),
+# learn-rules-drain.ps1 (posts the pending operator corrections to the authority; every role, since
+# the queue is written on every PC; its own 1 h throttle and lock make a burst of session starts
+# cost one drain), memory-lint.ps1 (read-only health scan
 # of the harness-native per-workspace auto-memory stores) and - P4-1a, 2026-09-16 - the store
 # binary's resident watcher, `ams-store sync --watch`: one per PC (it holds the
 # Local\ams-store-watch singleton; a second instance exits 0 at once), wakes on the dirty marker
 # the gate leaves, checks the hub only while a session is live, and exits by itself when none
 # is. Every child is hidden, then this script exits immediately so the hook never holds the
 # session. Same ProcessStartInfo pattern as mem0-hook-daemon-spawn.ps1. Each child carries its
-# own throttle, debt gate or singleton, so a burst of session starts costs five no-op spawns at
+# own throttle, debt gate or singleton, so a burst of session starts costs six no-op spawns at
 # worst. Fail-open: any error here is swallowed.
 #
 # The compactor catch-up child (2026-09-06) is gone: the nightly PowerShell compactor is retired
@@ -25,7 +27,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PowerShell51 = $env:SystemRoot + '\System32\WindowsPowerShell\v1.0\powershell.exe'
 
 $children = @()
-foreach ($f in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'learn-rules-drain.ps1')) {
+foreach ($f in @('dream-catchup.ps1', 'memory-index-refresh.ps1', 'wiki-index-catchup.ps1', 'learn-rules-drain.ps1')) {
     $target = Join-Path $ScriptDir $f
     if (Test-Path $target) {
         $children += @{ Exe = $PowerShell51; Args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $target + '"' }
