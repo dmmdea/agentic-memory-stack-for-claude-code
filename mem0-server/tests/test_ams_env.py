@@ -11,6 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "scripts" / "wsl"
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 def _load():
     spec = importlib.util.spec_from_file_location("ams_env", SCRIPTS / "ams_env.py")
     m = importlib.util.module_from_spec(spec)
@@ -20,8 +23,7 @@ def _load():
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    apply_home(monkeypatch, tmp_path)
     for v in ("MEM0_URL", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY", "CODEX_HOME",
               "MEM0_EVAL_ROOT", "MEM0_DEFAULT_USER_ID"):
         monkeypatch.delenv(v, raising=False)

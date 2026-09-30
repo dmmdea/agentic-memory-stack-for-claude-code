@@ -153,8 +153,8 @@ LLAMA_SWAP = "http://127.0.0.1:11436"
 # model `offload-e4b` (gemma-4-E4B QAT). WHY: the v0.19 bake-off picked the 14B
 # purely on a tiny 8-9-pair verdict-quality sample and ignored the binding
 # hardware constraint. The 14B GGUF is 8.24 GB on an 8.19 GB (RTX 3070) card;
-# with --n-gpu-layers 999 it overflows the ~6 GB free after the PERSISTENT
-# always_loaded group (nomic-embed + bge-reranker-v2-m3 + gemma-3-270m, ~950 MB)
+# with --n-gpu-layers 999 it overflows the ~6 GB free after the
+# support group (nomic-embed + bge-reranker-v2-m3 + gemma-3-270m, ~950 MB)
 # and triage_tier, so loading it spills to RAM and thrashes the VRAM ceiling —
 # the weekly sweep was knocking the live retrieval reranker off the GPU.
 # `offload-e4b` (~4-4.5 GB, swappable_offload group) fits inside that free
@@ -185,8 +185,15 @@ SWEEP_LOG = Path.home() / ".mem0" / "contradiction-sweep.jsonl"
 REVIEW_QUEUE = Path.home() / ".mem0" / "contradiction-promote-review.jsonl"
 # Single-runner mutex for the rejudge: two concurrent SessionStart triggers (two terminals/IDE
 # windows opened together) must not launch two --apply runs against the same store (2026-06-30).
-REJUDGE_LOCK = Path.home() / ".mem0" / ".rejudge-stamped.lock"
-EVIDENCE_LOCK = Path.home() / ".mem0" / ".evidence-sweep.lock"  # evidence-vs-evidence sweep mutex
+def _lock_path(env_var: str, default_name: str) -> Path:
+    """A single-runner lock lives under ~/.mem0 unless the environment moves it: a test (or a
+    second instance on the same host) must be able to take the lock without touching the real one."""
+    override = (os.environ.get(env_var) or "").strip()
+    return Path(override) if override else Path.home() / ".mem0" / default_name
+
+
+REJUDGE_LOCK = _lock_path("MEM0_REJUDGE_LOCK", ".rejudge-stamped.lock")
+EVIDENCE_LOCK = _lock_path("MEM0_EVIDENCE_LOCK", ".evidence-sweep.lock")  # evidence-vs-evidence sweep mutex
 PAIR_TIMEOUT_S = 30.0
 COLD_LOAD_TIMEOUT_S = 120.0
 PROMPT_TEXT_MAX_CHARS = 1500  # MAX_MEMORY_CHARS — payloads never legally exceed it
@@ -541,6 +548,91 @@ def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
 def exit_code_for(outcome: str) -> int:
     """degraded:* -> 1 (systemd oneshot visibly fails); ok / no-op:* -> 0."""
     return 1 if str(outcome).startswith("degraded") else 0
+
+
+_OUTCOME_RANK = {"ok": 0, "degraded": 1, "failed": 2}
+_OUTCOME_SCOPE = ""   # "rejudge" while main() runs the chained second pass: its counts sit beside the sweep's
+
+
+def _c1_status(outcome: str) -> str:
+    """The sweep's outcome vocabulary in the C1 grammar of scripts/wsl/ams-step.sh:
+    `<status>[:<reason>]`, status = ok | degraded | failed, the reason without whitespace.
+      ok           -> ok
+      no-op:<r>    -> degraded:no-op-<r>   exit 0 by design (the weekly unit is not noisy), but the run
+                                           did nothing, so it must not read ok in the receipt
+      degraded:<r> -> degraded:<r>         (exits non-zero; ams-step then reads the receipt as failed)
+      fatal:<r>    -> failed:<r>
+      degraded / failed (already C1) pass through
+      anything else (refused:*, a future outcome) -> degraded:<outcome>: a line the receipt cannot
+      read as ok must never be able to read as ok.
+    Whitespace folds to '-' (the abort grammar carries spaces, and the reason ends at the first one)."""
+    o = "-".join(str(outcome).split())[:160] or "ok"
+    if o == "ok":
+        return "ok"
+    if o.startswith("no-op:"):
+        return "degraded:no-op-" + o[len("no-op:"):]
+    if o.startswith("fatal:"):
+        return "failed:" + o[len("fatal:"):]
+    if o.split(":", 1)[0] in ("degraded", "failed"):
+        return o
+    return "degraded:" + o
+
+
+def _read_outcome_line(path: Path) -> tuple:
+    """(status token, counts) of the line already in the outcome file; ("", {}) when there is none."""
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return "", {}
+    if not lines:
+        return "", {}
+    status, _, body = lines[-1].strip().partition(" ")
+    try:
+        counts = json.loads(body) if body.strip() else {}
+    except ValueError:
+        counts = {}
+    return status, counts if isinstance(counts, dict) else {}
+
+
+def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
+    """Step outcome contract (C1, scripts/wsl/ams-step.sh): under the chain ams-step.sh exports
+    $AMS_OUTCOME_FILE and reads ONE line from it, `<status>[:<reason>] <json counts>`, which lets the
+    receipt say what exit 0 cannot. A no-op run (the shim was down, no canonicals, every pair skipped)
+    exits 0 by design, but it did nothing: it reads `degraded:no-op-<reason>`; a real run reads
+    `ok {counts}`; a degraded run (exit 1) and a fatal one write their line too, because the receipt
+    takes `work` from it even when the exit code has already made the step `failed`.
+
+    One line per run, never a downgrade. main() runs the sweep and then the stamped re-judge
+    (--then-rejudge-stamped) against the same file: the second pass finishing ok must not overwrite the
+    first pass's degraded line, and its counts are added beside the sweep's (prefixed with the scope
+    so `yes` from the sweep is not lost to `yes` from the re-judge) rather than over them."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    status = _c1_status(outcome)
+    counts = {(f"{_OUTCOME_SCOPE}_{k}" if _OUTCOME_SCOPE else k): v for k, v in (counts or {}).items()}
+    try:
+        p = Path(path)
+        prior_status, prior_counts = _read_outcome_line(p)
+        prior_rank = _OUTCOME_RANK.get(prior_status.split(":", 1)[0], -1)
+        new_rank = _OUTCOME_RANK[status.split(":", 1)[0]]
+        if _OUTCOME_SCOPE:
+            if prior_rank >= new_rank:
+                status = prior_status      # the sweep pass keeps its reason; this pass only adds counts
+            counts = {**prior_counts, **counts}
+        elif prior_rank > new_rank:
+            return                         # never downgrade
+        p.write_text(f"{status} {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except (OSError, TypeError, ValueError) as e:  # the receipt hint must never fail the sweep
+        print(f"contradiction-sweep: outcome file write failed (non-fatal): {e}", flush=True)
+
+
+def _finish(outcome: str, counts: Optional[dict] = None) -> int:
+    """The last line of a leg: record the outcome with the leg's counts for the step receipt, return
+    the unit's exit code. (_append_summary already wrote the status line for every path that logs a
+    summary; this adds the counts at the end of a leg.)"""
+    _write_outcome(outcome, counts)
+    return exit_code_for(outcome)
 
 
 def judge_pair(http: httpx.Client, model: str, canonical_text: str,
@@ -1205,44 +1297,6 @@ def query_similar(http: httpx.Client, vector: list, user_id: str,
 # Main sweep
 # ---------------------------------------------------------------------------
 
-_OUTCOME_RANK = {"ok": 0, "degraded": 1, "failed": 2}
-
-
-def _c1_status(outcome: str) -> str:
-    """The sweep's outcome vocabulary in the C1 grammar (status is ok | degraded | failed, and the
-    status token ends at the first space): no-op:<r> -> ok:no-op:<r> (a quiet no-op stays ok),
-    fatal:<r> -> failed:<r>, whitespace inside a reason folded to '_'."""
-    o = "_".join(str(outcome).split())[:160] or "ok"
-    if o.startswith("no-op:"):
-        return "ok:" + o
-    if o.startswith("fatal:"):
-        return "failed:" + o[len("fatal:"):]
-    return o
-
-
-def _write_outcome(outcome: str, record: dict) -> None:
-    """The step-outcome line ams-step.sh reads: '<status>[:<reason>] <compact json counts>' written to
-    AMS_OUTCOME_FILE. One line per run, and never a downgrade: main() chains the sweep and the stamped
-    re-judge against ONE file, and the second pass finishing ok must not overwrite a degraded first pass.
-    The counts are the summary's scalar fields."""
-    path = os.environ.get("AMS_OUTCOME_FILE")
-    if not path:
-        return
-    status = _c1_status(outcome)
-    try:
-        p = Path(path)
-        try:
-            prior = p.read_text(encoding="utf-8").split(" ", 1)[0].split(":", 1)[0]
-        except OSError:
-            prior = ""
-        if _OUTCOME_RANK.get(prior, -1) > _OUTCOME_RANK.get(status.split(":", 1)[0], 0):
-            return
-        counts = {k: v for k, v in record.items() if isinstance(v, (int, float))}
-        p.write_text(f"{status} {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
-    except OSError as e:
-        print(f"contradiction-sweep: outcome file write failed (non-fatal): {e}", flush=True)
-
-
 def _append_summary(record: dict) -> None:
     record.setdefault("ts", _iso_now())
     record.setdefault("schema_version", "v20")  # v0.20 Phase C: outcome + canonical_total
@@ -1257,10 +1311,12 @@ def _append_summary(record: dict) -> None:
             f.write(json.dumps(record) + "\n")
     except OSError as e:  # advisory log must never crash the sweep
         print(f"contradiction-sweep: summary append failed (non-fatal): {e}", flush=True)
-    # every terminal path (preflight failures, no-ops, all four legs) goes through here, so this is
-    # the one place the C1 outcome line is written
+    # Every terminal path (preflight failures, no-ops, all four legs) logs its summary here, so this
+    # is the net that gives each of them its C1 status line, including a path added later that
+    # forgets _finish: an exit-0 run that did nothing must never be able to read ok. The leg's counts
+    # arrive with _finish, which overwrites this line at the end of the leg.
     if record.get("outcome"):
-        _write_outcome(str(record["outcome"]), record)
+        _write_outcome(str(record["outcome"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1414,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
         print("contradiction-sweep: rejudge-stamped: another run holds the lock — skipping", flush=True)
         _append_summary({"mode": "rejudge-stamped", "dry_run": dry_run, "judge": args.judge,
                          "outcome": "no-op:lock-held", "skipped": "single-runner lock held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
@@ -1493,7 +1549,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                      "cleared_ids": cleared_ids, "kept_ids": kept_ids, "outcome": outcome})
     print(f"contradiction-sweep: rejudge-stamped done. checked={checked} yes={yes} no={no} "
           f"cleared={cleared} queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    return _finish(outcome, {"stamped_found": len(stamped), "checked": checked, "yes": yes, "no": no, "cleared": cleared})
 
 
 def scroll_noncanonical(http: httpx.Client, user_id: Optional[str] = None) -> list[dict]:
@@ -1549,7 +1605,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     if not _acquire_lock(EVIDENCE_LOCK):
         print("contradiction-sweep: evidence-sweep: another run holds the lock — skipping", flush=True)
         _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "outcome": "no-op:lock-held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
@@ -1645,10 +1701,10 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                      "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
           f"queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    return _finish(outcome, {"anchors": anchors, "pairs": pairs, "queued": queued})
 
 
-PAIRS_LOCK = Path.home() / ".mem0" / ".retrieval-pairs.lock"
+PAIRS_LOCK = _lock_path("MEM0_PAIRS_LOCK", ".retrieval-pairs.lock")
 PAIRS_RECEIPT = Path.home() / ".mem0" / "retrieval-pairs-yield.json"
 RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
 
@@ -1709,7 +1765,8 @@ def resolve_supersede_precheck(loser_id: str, winner_id: str,
         return "loser and winner are the same record"
     if loser_payload.get("tier") == "canonical":
         return ("loser is CANONICAL — canonicals are never superseded by this "
-                "path (demote first via the tier API if that is really intended)")
+                "path (if that is really intended, the operator demotes it first: "
+                "mem0-canonize.sh --action demote <id> \"<reason>\")")
     if loser_payload.get("superseded_by"):
         return (f"loser already superseded by {loser_payload.get('superseded_by')} "
                 "— refusing to overwrite an existing resolution")
@@ -1817,7 +1874,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         print("contradiction-sweep: --retrieval-pairs already running (lock held) — exiting", flush=True)
         _append_summary({"mode": "retrieval-pairs", "dry_run": True,
                          "outcome": "no-op:lock-held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     outcome = "ok"
     judged_stats = None  # assigned in the judged block; must exist for the
@@ -2025,7 +2082,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
     _append_summary({"mode": "retrieval-pairs", "dry_run": not judged,
                      "judged_stats": judged_stats if judged else None,
                      "outcome": outcome})
-    return exit_code_for(outcome)
+    return _finish(outcome, judged_stats if judged else None)
 
 
 def main(argv=None) -> int:
@@ -2033,12 +2090,18 @@ def main(argv=None) -> int:
     --judge/--apply) AFTER the sweep in the same process, so the weekly unit runs both under ONE chain
     step and one receipt (a second step would need its own name in the chain). The worse exit wins.
     A dry run does not chain: it would only print the same decisions twice."""
+    global _OUTCOME_SCOPE
     argv = list(sys.argv[1:] if argv is None else argv)
     chain = "--then-rejudge-stamped" in argv
     argv = [a for a in argv if a != "--then-rejudge-stamped"]
     rc = _main(argv)
     if chain and "--apply" in argv and "--rejudge-stamped" not in argv:
-        rc = max(rc, _main(argv + ["--rejudge-stamped"]))
+        # both passes report into ONE outcome line: the second never overwrites the first's reason or counts
+        _OUTCOME_SCOPE = "rejudge"
+        try:
+            rc = max(rc, _main(argv + ["--rejudge-stamped"]))
+        finally:
+            _OUTCOME_SCOPE = ""
     return rc
 
 
@@ -2175,7 +2238,7 @@ def _main(argv=None) -> int:
                              "outcome": "no-op:codex-bridge-unavailable",
                              "skipped": "codex_shim_client import failed",
                              "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
-            return 0
+            return _finish("no-op:codex-bridge-unavailable")
         _ok, _ensured, _h = _preflight_codex_health()
         if not _ok:
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "
@@ -2186,7 +2249,7 @@ def _main(argv=None) -> int:
                              "outcome": "no-op:codex-shim-unreachable",
                              "skipped": f"codex shim health: {_h.get('error_type')}",
                              "ensure_attempted": _ensured})
-            return 0
+            return _finish("no-op:codex-shim-unreachable")
 
     if args.rejudge_stamped:
         return run_rejudge_stamped(args, dry_run)
@@ -2484,6 +2547,7 @@ def _main(argv=None) -> int:
     outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted,
                           all_no_vector=bool(canonicals) and skipped_no_vector == len(canonicals),
                           marker_failed=marker_failed, user_id_defaulted=user_id_defaulted)
+    coverage = sweep_coverage(canonical_total, canonicals_checked)
     summary = {
         "ts": run_ts,
         "dry_run": dry_run,
@@ -2494,7 +2558,7 @@ def _main(argv=None) -> int:
         "model": args.model,
         "canonical_total": canonical_total,   # v0.20 L6: pre-slice total
         "canonical_count": len(canonicals),   # processed (post --limit slice)
-        **sweep_coverage(canonical_total, canonicals_checked),   # WP-4: checked/total + weeks for a full pass
+        **coverage,                           # WP-4: checked/total + weeks for a full pass
         "user_id": args.user_id,
         "skipped_no_vector": skipped_no_vector,
         "marker_written": marker_written,
@@ -2522,12 +2586,22 @@ def _main(argv=None) -> int:
     _append_summary(summary)
     print(f"contradiction-sweep: done. outcome={outcome} "
           f"canonicals={canonicals_checked}/{canonical_total} "
-          f"(full pass in {sweep_coverage(canonical_total, canonicals_checked)['weeks_for_full_pass']} weekly runs) "
+          f"(full pass in {coverage['weeks_for_full_pass']} weekly runs) "
           f"pairs={pairs_checked} "
           f"yes={yes_count} no={no_count} skipped={skipped_pairs} "
           f"stamped={stamped_count} cleared={cleared_count} (dry_run={dry_run}) "
           f"summary -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    # The receipt's counts. canonicals_checked/total: only `--limit` canonicals are judged per week
+    # (50 of 122 = three weeks to cover the set even when healthy), so the receipt has to say how much
+    # was covered - and `checked` means swept end to end with the rotation marker landed, not merely
+    # selected. The rest is what a broken rotation or a stale-canonical route looks like from outside.
+    return _finish(outcome, {
+        "canonicals_checked": canonicals_checked, "canonicals_total": canonical_total,
+        "pairs": pairs_checked, "yes": yes_count,
+        "weeks_for_full_pass": coverage["weeks_for_full_pass"],
+        "marker_written": marker_written, "marker_failed": marker_failed,
+        "skipped_no_vector": skipped_no_vector,
+        "stale_canonical_routed": stale_routed, "stale_review_pruned": stale_review_pruned})
 
 
 if __name__ == "__main__":

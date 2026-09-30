@@ -23,6 +23,19 @@ sweep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweep)
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _tmp_locks(monkeypatch, tmp_path):
+    """The single-runner locks are real directories under ~/.mem0. A test that drives a run
+    without redirecting them takes (and releases) the host's lock, and returns 0 instead of the
+    result under test on any box where a live sweep holds it. Every test here gets its own."""
+    for name in ("REJUDGE_LOCK", "EVIDENCE_LOCK", "PAIRS_LOCK"):
+        monkeypatch.setattr(sweep, name, tmp_path / "locks" / name.lower())
+    (tmp_path / "locks").mkdir()
+
+
 @pytest.fixture(autouse=True)
 def _no_pair_cache(monkeypatch):
     """W5 ADOPT-4 isolation: the dispatch layer now consults the pair-verdict
@@ -923,8 +936,7 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
     fake_home = Path(tempfile.mkdtemp(prefix="sweep-fake-home-"))
     (fake_home / ".mem0").mkdir()
     (fake_home / ".mem0" / "api-key").write_text("test-key\n")
-    monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    apply_home(monkeypatch, fake_home)
     monkeypatch.setattr(sweep, "REJUDGE_LOCK", fake_home / ".mem0" / ".rejudge-stamped.lock")
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
     monkeypatch.setattr(sweep, "scroll_stamped", lambda http: records)
@@ -1643,7 +1655,10 @@ def test_the_sweep_writes_the_c1_outcome_line(monkeypatch, tmp_path):
     status, _, body = text.partition(" ")
     assert status == "degraded:marker-failed:1"
     counts = json.loads(body)
-    assert counts["marker_failed"] == 1 and counts["canonicals_checked"] == 1 and counts["canonical_total"] == 2
+    assert counts["marker_failed"] == 1 and counts["canonicals_checked"] == 1 and counts["canonicals_total"] == 2
+    # ONE line carries both packages' counts: the receipt's coverage keys and the rotation/direction ones
+    assert {"pairs", "yes", "weeks_for_full_pass", "marker_written", "skipped_no_vector",
+            "stale_canonical_routed", "stale_review_pruned"} <= set(counts)
     assert len(text.splitlines()) == 1, "exactly one line"
     # a healthy run writes a bare ok
     _sweep_rig(monkeypatch, cans)
@@ -1654,8 +1669,13 @@ def test_the_sweep_writes_the_c1_outcome_line(monkeypatch, tmp_path):
 
 def test_c1_status_mapping_and_the_defaulted_tenant_line(monkeypatch, tmp_path):
     assert sweep._c1_status("ok") == "ok"
-    assert sweep._c1_status("no-op:zero-canonicals") == "ok:no-op:zero-canonicals"
+    # exit 0 by design, but the run did nothing: it must not read ok in the receipt
+    assert sweep._c1_status("no-op:zero-canonicals") == "degraded:no-op-zero-canonicals"
     assert sweep._c1_status("fatal:codex-bridge-missing") == "failed:codex-bridge-missing"
+    assert sweep._c1_status("degraded:marker-failed:2") == "degraded:marker-failed:2"
+    assert sweep._c1_status("failed:boom") == "failed:boom"
+    # an outcome outside the sweep's vocabulary reads degraded, never ok
+    assert sweep._c1_status("refused:non-codex-judge") == "degraded:refused:non-codex-judge"
     # the abort grammar carries a space; the C1 status token ends at the first space
     assert " " not in sweep._c1_status("degraded:judge-lock-contended: lock held 40 min")
     _sweep_rig(monkeypatch, [])
@@ -1719,3 +1739,185 @@ def test_the_sweep_prunes_stale_queue_entries_in_apply_mode_only(monkeypatch, tm
     monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
     sweep.main(["--apply", "--judge", "codex"])
     assert calls == [str(q)] and summaries[-1]["stale_review_pruned"] == 3
+
+
+# --- step outcome contract (C1): the chain receipt must not read a no-op sweep as success ---
+
+def _outcome_line(tmp_path, monkeypatch):
+    p = tmp_path / "outcome"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(p))
+    return p
+
+
+def test_write_outcome_maps_no_op_to_degraded_and_ok_to_counts(tmp_path, monkeypatch):
+    p = _outcome_line(tmp_path, monkeypatch)
+    sweep._write_outcome("no-op:codex shim unreachable")
+    assert p.read_text(encoding="utf-8") == "degraded:no-op-codex-shim-unreachable {}\n", "no whitespace inside a reason"
+    p.unlink()
+    sweep._write_outcome("ok", {"canonicals_checked": 50, "canonicals_total": 122, "pairs": 176, "yes": 2})
+    assert p.read_text(encoding="utf-8") == 'ok {"canonicals_checked":50,"canonicals_total":122,"pairs":176,"yes":2}\n', "one line"
+    # degraded:* / fatal:* exit non-zero, which the receipt already reads as failed, but it still takes
+    # `work` from the line, so they write theirs too (a fatal one reads failed, and replaces a lesser line)
+    p.unlink()
+    sweep._write_outcome("degraded:qdrant-unreachable")
+    assert p.read_text(encoding="utf-8") == "degraded:qdrant-unreachable {}\n"
+    sweep._write_outcome("fatal:codex-bridge-missing-on-provisioned-box")
+    assert p.read_text(encoding="utf-8") == "failed:codex-bridge-missing-on-provisioned-box {}\n"
+    monkeypatch.delenv("AMS_OUTCOME_FILE")
+    sweep._write_outcome("no-op:lock-held")   # not under ams-step: nothing to write, nothing to raise
+
+
+def test_a_later_ok_never_replaces_an_earlier_no_op_line(tmp_path, monkeypatch):
+    """The weekly unit runs two passes against one outcome file: a shim-down no-op followed by a
+    second pass that finishes ok must still read degraded."""
+    p = _outcome_line(tmp_path, monkeypatch)
+    sweep._write_outcome("no-op:codex-shim-unreachable", {"canonicals_checked": 0})
+    sweep._write_outcome("ok", {"canonicals_checked": 9})
+    assert p.read_text(encoding="utf-8") == 'degraded:no-op-codex-shim-unreachable {"canonicals_checked":0}\n'
+
+
+def test_unwritable_or_unserialisable_outcome_never_fails_the_sweep(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(tmp_path / "no-such-dir" / "outcome"))
+    sweep._write_outcome("ok", {"a": 1})                       # OSError: reported, not raised
+    _outcome_line(tmp_path, monkeypatch)
+    sweep._write_outcome("ok", {"a": object()})                # TypeError from json: the same
+    assert capsys.readouterr().out.count("outcome file write failed") == 2
+
+
+def test_chained_passes_write_one_line_that_carries_both_passes(tmp_path, monkeypatch):
+    """--then-rejudge-stamped runs the sweep and then the stamped re-judge under ONE receipt. The
+    second pass adds its counts beside the sweep's (prefixed: both have a `yes`) and can neither
+    replace the first pass's reason nor launder it with its own ok."""
+    p = _outcome_line(tmp_path, monkeypatch)
+
+    def healthy(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("ok", {"stamped_found": 4, "checked": 4, "yes": 1, "no": 3, "cleared": 3})
+        return sweep._finish("ok", {"canonicals_checked": 25, "canonicals_total": 43, "pairs": 12, "yes": 2})
+    monkeypatch.setattr(sweep, "_main", healthy)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 0
+    text = p.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    counts = json.loads(body)
+    assert status == "ok" and len(text.splitlines()) == 1
+    assert counts["canonicals_checked"] == 25 and counts["yes"] == 2, "the sweep's own counts survive"
+    assert counts["rejudge_stamped_found"] == 4 and counts["rejudge_yes"] == 1 and counts["rejudge_cleared"] == 3
+    assert sweep._OUTCOME_SCOPE == "", "the scope never outlives the run"
+
+    p.unlink()
+
+    def shim_down_then_ok(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("ok", {"checked": 4})
+        return sweep._finish("no-op:codex-shim-unreachable")
+    monkeypatch.setattr(sweep, "_main", shim_down_then_ok)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 0
+    status, _, body = p.read_text(encoding="utf-8").partition(" ")
+    assert status == "degraded:no-op-codex-shim-unreachable", "the ok second pass cannot launder the first"
+    assert json.loads(body) == {"rejudge_checked": 4}
+
+    p.unlink()
+
+    def marker_failed_then_lock_held(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("no-op:lock-held")
+        return sweep._finish("degraded:marker-failed:2", {"marker_failed": 2})
+    monkeypatch.setattr(sweep, "_main", marker_failed_then_lock_held)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 1
+    assert p.read_text(encoding="utf-8").startswith("degraded:marker-failed:2 "), "the first pass keeps its reason at equal rank"
+
+
+def test_the_outcome_scope_is_reset_when_the_chained_pass_raises(tmp_path, monkeypatch):
+    _outcome_line(tmp_path, monkeypatch)
+
+    def boom(argv):
+        if "--rejudge-stamped" in argv:
+            raise RuntimeError("second pass blew up")
+        return 0
+    monkeypatch.setattr(sweep, "_main", boom)
+    with pytest.raises(RuntimeError):
+        sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"])
+    assert sweep._OUTCOME_SCOPE == ""
+
+
+def test_shim_down_no_op_reaches_the_step_outcome_file(tmp_path, monkeypatch):
+    p = _outcome_line(tmp_path, monkeypatch)
+    monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace(
+        health=lambda: {"ok": False, "error_type": "unreachable"}))
+    monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--judge", "codex"])
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
+    assert sweep.main() == 0, "exit 0 is unchanged: the receipt, not the unit, carries the degraded verdict"
+    assert p.read_text(encoding="utf-8") == "degraded:no-op-codex-shim-unreachable {}\n"
+
+
+def test_bridge_unavailable_no_op_reaches_the_step_outcome_file(tmp_path, monkeypatch):
+    p = _outcome_line(tmp_path, monkeypatch)
+    monkeypatch.setattr(sweep, "_codex", None)
+    monkeypatch.setattr(sweep, "_install_is_provisioned", lambda: False)
+    monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--apply", "--judge", "codex"])
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
+    assert sweep.main() == 0
+    assert p.read_text(encoding="utf-8") == "degraded:no-op-codex-bridge-unavailable {}\n"
+
+
+def test_normal_run_writes_ok_with_canonical_coverage(tmp_path, monkeypatch):
+    """A working sweep says how much of the canonical set it actually covered (50 of 122 per week)."""
+    p = _outcome_line(tmp_path, monkeypatch)
+    canon = [{"id": f"c{i}", "payload": {"data": f"fact {i}", "user_id": "u"}, "vector": {"": [0.1]}} for i in range(3)]
+    monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace(health=lambda: {"ok": True}))
+    monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(sweep, "scroll_canonicals", lambda http, user_id=None: list(canon))
+    monkeypatch.setattr(sweep, "dense_vector", lambda pt: [0.1])
+    monkeypatch.setattr(sweep, "query_similar", lambda *a, **k: [])
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
+    monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--judge", "codex", "--limit", "2"])
+    assert sweep.main() == 0
+    text = p.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    counts = json.loads(body)
+    assert status == "ok" and len(text.splitlines()) == 1
+    assert {k: counts[k] for k in ("canonicals_checked", "canonicals_total", "pairs", "yes")} == {
+        "canonicals_checked": 2, "canonicals_total": 3, "pairs": 0, "yes": 0}
+    assert counts["weeks_for_full_pass"] == 2 and counts["marker_failed"] == 0, "and the rotation counts beside them"
+
+
+def test_zero_canonicals_run_is_degraded_in_the_receipt(tmp_path, monkeypatch):
+    p = _outcome_line(tmp_path, monkeypatch)
+    # no tenant configured: the scope is the operator's, so this is the quiet no-op (a defaulted
+    # tenant that scopes to nothing is degraded:zero-canonicals-defaulted-tenant, tested above)
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")
+    monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace(health=lambda: {"ok": True}))
+    monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(sweep, "scroll_canonicals", lambda http, user_id=None: [])
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
+    monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--judge", "codex"])
+    assert sweep.main() == 0
+    assert p.read_text(encoding="utf-8").startswith("degraded:no-op-zero-canonicals {")
+
+
+@pytest.mark.parametrize("var,attr", [
+    ("MEM0_REJUDGE_LOCK", "REJUDGE_LOCK"),
+    ("MEM0_EVIDENCE_LOCK", "EVIDENCE_LOCK"),
+    ("MEM0_PAIRS_LOCK", "PAIRS_LOCK"),
+])
+def test_lock_paths_are_overridable_from_the_environment(monkeypatch, tmp_path, var, attr):
+    """A run (or a test driving the script as a child) can point the mutex away from ~/.mem0."""
+    target = tmp_path / "elsewhere" / "lock"
+    monkeypatch.setenv(var, str(target))
+    spec = importlib.util.spec_from_file_location("contradiction_sweep_env", SCRIPT)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert getattr(fresh, attr) == target
+
+
+def test_lock_paths_default_to_the_home_mem0_dir(monkeypatch):
+    for var in ("MEM0_REJUDGE_LOCK", "MEM0_EVIDENCE_LOCK", "MEM0_PAIRS_LOCK"):
+        monkeypatch.delenv(var, raising=False)
+    spec = importlib.util.spec_from_file_location("contradiction_sweep_dflt", SCRIPT)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert fresh.REJUDGE_LOCK == Path.home() / ".mem0" / ".rejudge-stamped.lock"
+    assert fresh.EVIDENCE_LOCK == Path.home() / ".mem0" / ".evidence-sweep.lock"
+    assert fresh.PAIRS_LOCK == Path.home() / ".mem0" / ".retrieval-pairs.lock"

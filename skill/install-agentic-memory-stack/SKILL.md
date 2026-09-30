@@ -19,7 +19,7 @@ User says any of: "install agentic memory stack", "set up the memory stack on th
 The runtime is **mem0-server + Qdrant + llama-swap (EmbeddingGemma embedder + bge-reranker) + Codex CLI**, plus the episodic/goals/open-questions sidecar (same mem0-server process) and a DPAPI-isolated canonical-key credential. On disk:
 
 - **WSL systemd-user services** (`1-wsl-services.sh`): `qdrant.service`, `mem0.service` (with the DPAPI key chain + the `MEM0_DEFAULT_USER_ID`/`MEM0_RAW_FALLBACK_ENABLED`/`MEM0_DURABLE_FRESHNESS_ENABLED` env), and timers `l10-audit`, `decay-scan` (Sun 02:00), `stack-backup` (Sun 03:30), `goals-stale-sweep` + `contradiction-sweep` (Sun 04:00/05:00, report-safe), `episodic-reconcile`. The `egemma-rollback-prune` units ship disabled.
-- **Embedder model**: `embeddinggemma-300M-Q8_0.gguf` fetched to `~/models/` (multilingual EN/ES, CPU on llama-swap `:11436`). **No Ollama** (decommissioned v0.22).
+- **Embedder model**: `embeddinggemma-300M-Q8_0.gguf` fetched to `~/models/` (multilingual EN/ES, on llama-swap `:11436`). **No Ollama** (decommissioned v0.22).
 - **Credential files** at `~/.mem0/`: `api-key`, `canonical-key.dpapi` (the plaintext key is removed on boxes where the per-box DPAPI cutover has been run; plaintext mode-600 otherwise), plus the operator receipt `stack.env`.
 - **Windows runtime scripts** at `~/.claude/scripts/`: the hook chain (`mem0-hook-client.exe` + `mem0-hook-daemon.ps1` + `-spawn` + `.cs` + `build-hook-client.ps1`), `user-prompt-extract.ps1` + `user-prompt-lib.ps1`, `stop-extract.ps1`, `l1a-extract.ps1`, `dream-consolidate.ps1`, `memory-common.ps1`, `Test-MemoryStack.ps1`, `codex-shim.ps1` + `-spawn`, `mem0-mcp-shim.py`, `storage-cap-check.sh`, `model-tiers.json`, and the **operator receipt** `mem0-stack.config.psd1`.
 - **Claude Code hooks** (in `~/.claude/settings.json`): `Stop`/`PreCompact` → `stop-extract.ps1` (Codex L1a extraction); `SessionStart` → storage-caps banner + daemon pre-warm + codex-shim pre-warm (opt-OUT via ~/.claude/state/codex-shim.disabled; it was opt-in behind a flag nothing created, which is why the judgment leg never ran); `UserPromptSubmit` → `mem0-hook-client.exe` (injects `[MEMORY CONTEXT]` via the resident daemon, fails open to the inline extractor). (The former `PreToolUse` → `pre-tool-check.ps1` entry was retired 2026-08-09 by operator decision, AMS-16.)
@@ -74,9 +74,9 @@ For a native-Linux machine that should use an existing Brain over the network, r
 
 ## One manual step: the llama-swap model entries
 
-The installer fetches the EmbeddingGemma GGUF and verifies the `:11436` embed endpoint, but it does **not** rewrite your llama-swap config (external user config). Ensure two models are in your `always_loaded` group, bound to `127.0.0.1`:
+The installer fetches the EmbeddingGemma GGUF and verifies the `:11436` embed endpoint, but it does **not** rewrite your llama-swap config (external user config). Ensure two models are in a non-exclusive, non-swapping `support` group (`swap: false`, `exclusive: false`), each with `ttl: 300` (every model unloads when idle; none is kept resident), bound to `127.0.0.1`:
 
-1. **`embeddinggemma`** — mem0's embedder. `--embeddings --pooling mean --n-gpu-layers 0 --ctx-size 2048` (2048 is the trained limit — do not raise it). Without it, every add/search embed fails.
+1. **`embeddinggemma`** — mem0's embedder. `--embeddings --pooling mean --n-gpu-layers 999 --ctx-size 2048` (every layer on the GPU, host RAM is overflow only; 2048 is the trained limit — do not raise it). Without it, every add/search embed fails.
 2. **`bge-reranker-v2-m3`** — search reranker, `RERANK_DOC_MAX_CHARS=6000`.
 
 The exact YAML stanzas + verification curls are in `references/troubleshooting.md` → llama-swap.
@@ -85,7 +85,7 @@ The exact YAML stanzas + verification curls are in `references/troubleshooting.m
 
 1. **Restart VS Code / Claude Code** so the new hooks + MCP server load (the installer prints this reminder).
 2. In a new session, confirm the MCP tools appear: `mcp__mem0__memory_search`, `memory_add`, `memory_promote`/`demote`, plus the episodic / goals / open-question tools.
-3. Confirm `bge-reranker-v2-m3` is in `always_loaded` (the one manual step above).
+3. Confirm `bge-reranker-v2-m3` is in the `support` group with `ttl: 300` (the one manual step above).
 4. Work normally. L1a extraction fires on Stop/PreCompact (10-min throttle); `[MEMORY CONTEXT]` is injected before each prompt; the dream consolidator runs nightly at 3 AM.
 
 ## Verify

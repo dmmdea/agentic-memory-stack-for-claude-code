@@ -8,6 +8,7 @@ import json
 import hashlib
 import logging
 import threading
+import uuid as _uuid
 import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
@@ -24,6 +25,7 @@ from reranker import rerank as bge_rerank
 # it 90s). Holds regardless of device: the reranker moved CPU->GPU 2026-08-13,
 # but cold-load + llama-swap spawn can still exceed the deploy gate's window.
 from reranker import rerank_health as _rerank_health
+from reranker import warm as _rerank_warm, RAN_STATUSES as _RERANK_RAN_STATUSES
 from admission_gate import apply_admission
 # WP-4: contradicts_canonical stamps are enforced only while their target is still canonical; the
 # gate resolves targets through this fetcher (registered below, once `mem` exists).
@@ -242,9 +244,12 @@ def auth(x_api_key: Optional[str] = Header(None)):
 # this way. 503 + Retry-After says the opposite — "not an answer, ask again" —
 # which the shim can act on without weakening the never-mask-a-real-answer rule.
 #
-# Deliberately narrow: ONLY an upstream rate-limit maps to 503. Every other
-# exception keeps its 500, because a ctx-overflow or a coding error must stay
-# loud and must never be replayed.
+# Deliberately narrow: ONLY "the upstream cannot serve right now" maps to 503 - a
+# rate-limit (above), or an embedder that cannot start (embedder_503.retry_later: llama-swap
+# 500 'upstream command exited prematurely', 502/503/504, a refused or timed-out connection;
+# measured 2026-09-24 when the seat beside it left no VRAM headroom and 39 writes were
+# answered 500). Every other exception keeps its 500, because a ctx-overflow or a coding
+# error must stay loud and must never be replayed.
 _RETRY_AFTER_SECONDS = "1"
 
 
@@ -266,6 +271,13 @@ def _upstream_error(e: Exception) -> HTTPException:
             503,
             f"upstream embedder rate-limited (llama-swap 429), retry shortly: {e}",
             headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+    wait = _embedder_503.retry_later(e)
+    if wait is not None:
+        return HTTPException(
+            503,
+            f"upstream unavailable (embedder cold start failed or down), retry later: {e}",
+            headers={"Retry-After": str(wait)},
         )
     return HTTPException(500, str(e))
 
@@ -494,11 +506,20 @@ _ADD_FORBIDDEN_META = {"retrievable", "expires_at", "created_at", "tier_actor",
 # One lock per memory id serializes PUT, PATCH /tier, PATCH /metadata and the
 # NLI stamp for that id only. Registry grows one small Lock per distinct id
 # written this process lifetime — bounded in practice by the corpus.
+# The key is the canonical UUID spelling: Qdrant resolves the hyphenated, simple, braced and
+# urn:uuid spellings (any case) of one id to the same point, so keying on the raw path string
+# gave one record several locks and let a differently spelled request escape the serialization.
 _MID_LOCKS: dict = {}
 _MID_LOCKS_GUARD = threading.Lock()
 
+def _mid_lock_key(mid) -> str:
+    try:
+        return str(_uuid.UUID(str(mid).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return str(mid)
+
 def _mid_write_lock(mid):
-    key = str(mid)
+    key = _mid_lock_key(mid)
     with _MID_LOCKS_GUARD:
         lk = _MID_LOCKS.get(key)
         if lk is None:
@@ -908,8 +929,9 @@ def health() -> dict:
 
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
-    """Spec §9 (P1-5): the nightly chain's last successes, the judge transport, pool usage
-    (alarm at 85 %) and the box's boot ids for 7 days. Gatus probes it; the session-start
+    """Spec §9 (P1-5): the nightly chain's last successes, the steps whose latest run failed or
+    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, and the box's boot
+    ids for 7 days. `ok` folds the failed/degraded steps and the pool in. Gatus probes it; the session-start
     line reads it with a 1.5 s budget and falls back to local numbers. Never raises on a
     reader: an unreadable pool/journal reads as unknown, not as an error."""
     import os as _os
@@ -919,7 +941,13 @@ def health_maintenance() -> dict:
     maint = Path.home() / ".mem0" / "maintenance"
     return _mh.build(maint / "receipts.jsonl", _dt.datetime.now(_dt.timezone.utc), pool,
                      _mh.journal_boots_reader(), codex_shim_client.judge_transport,
-                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"))
+                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
+                     # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
+                     pool_health_reader=_mh.zpool_health_reader(ds) if ds else None,
+                     # The operator's dated pool-health ack (env, else stack.env), read on every call.
+                     pool_ack_reader=_mh.read_pool_ack,
+                     wiki_stamp_dir=Path.home() / "wiki-index",
+                     drift_reader=drift_state_health)
 
 
 @app.get("/health/morning-summary")
@@ -942,7 +970,7 @@ def _embed_model() -> str:
 
 
 @app.get("/health/embedder")
-def health_embedder() -> dict:
+def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     """Spec §4 (P1-6 PC half): the SessionStart pre-warm target. The embedder unloads after
     5 idle minutes (ttl 300, every engine) and takes ~3.4 s to come back, so the first prompt's
     bundle used to pay the cold start. This embeds ONE token as active work (a pre-warm, not
@@ -950,7 +978,13 @@ def health_embedder() -> dict:
     (informational: an unreadable listing reads as `loaded: None`, never as an error).
     The embed exceptions deliberately PROPAGATE — embedder_503.install maps a cold/down seat
     to 503 + Retry-After with reason cold-embedder, the same answer the bundle path gives,
-    which the hook client names and retries once."""
+    which the hook client names and retries once.
+
+    `?warm=rerank` additionally issues a one-document rerank so the first deliberate search of
+    the session does not pay the reranker's cold load (it unloads after 5 idle minutes too).
+    The reranker result rides along as `rerank: {ok, warm_ms|error}` and never fails this
+    endpoint: search degrades gracefully without it, so a reranker that cannot load is
+    reported, not raised."""
     import httpx as _httpx
     import time as _time
     loaded = None
@@ -960,9 +994,7 @@ def health_embedder() -> dict:
         for entry in (r.json().get("data") or []):
             if str(entry.get("id", "")) != _embed_model():
                 continue
-            state = entry.get("state", entry.get("status"))
-            if state is not None:
-                loaded = str(state).lower() in ("loaded", "ready", "running")
+            loaded = _embedder_503.listing_loaded(entry)  # flat state OR v256 status.value
             break
     except Exception:
         loaded = None
@@ -971,7 +1003,11 @@ def health_embedder() -> dict:
                     json={"model": _embed_model(), "input": "warm"},
                     timeout=10.0)
     r.raise_for_status()
-    return {"ok": True, "loaded": loaded, "warm_ms": int((_time.perf_counter() - t0) * 1000)}
+    out: dict[str, Any] = {"ok": True, "loaded": loaded,
+                           "warm_ms": int((_time.perf_counter() - t0) * 1000)}
+    if warm == "rerank":
+        out["rerank"] = _rerank_warm()
+    return out
 
 
 @app.get("/health/deep")
@@ -1841,7 +1877,7 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
             _st: dict = {}
             ranked = bge_rerank(b.query, pool, text_key="memory",
                                 force=True, status_out=_st)
-            rerank_probe["ran"] = _st.get("status") == "ran"
+            rerank_probe["ran"] = _st.get("status") in _RERANK_RAN_STATUSES
             rerank_probe["pre_rank"] = dense_rank
             for _i, _r in enumerate(ranked):
                 if str(_r.get("id")) == b.target_id:
@@ -2126,7 +2162,8 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
                 x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce")):
     """Update a memory's tier. Server-enforced actor requirements per tier.
-    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B).
+    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B),
+    and so does a move OUT of canonical (session 12: signed action "demote"; see the gate below).
     v0.19 Phase G: the token is validated as format-2
     (<ts>|<nonce>|promote|<mid>|<reason>) via security_invariants —
     nonce + replay protection, HMAC verified before the nonce is burned (MED-8).
@@ -2143,6 +2180,27 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     reason = (b.reason or "").strip()
     if not actor:
         raise HTTPException(400, "actor is required (e.g., 'user-direct', 'c1-consolidator', 'claude-autonomous')")
+    # Canonical DEMOTION gate: a move OUT of canonical signs its own "demote" action. Without
+    # it an API-key holder could demote a canonical record and then PUT or DELETE it with no
+    # token, because assert_writable gates those only while the record is still canonical.
+    # fetch_current_tier fails closed: a store error is a 503, and a point with no tier field
+    # reads as canonical. A point that does not exist is a 404 (nothing to change).
+    current_tier = None
+    if b.tier != "canonical":
+        from security_invariants import fetch_current_tier, tier_change_hmac_action, _NOT_FOUND
+        _ct = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+        if _ct == _NOT_FOUND:
+            raise HTTPException(404, f"memory {mid} not found")
+        current_tier = _ct
+        if tier_change_hmac_action(current_tier, b.tier) == "demote":
+            if not reason:
+                raise HTTPException(400, "demoting a canonical record requires non-empty 'reason' (audit-trail policy)")
+            from security_invariants import validate_hmac_user_direct
+            validate_hmac_user_direct(
+                mid, "demote", reason,
+                x_user_direct_token, x_user_direct_ts,
+                x_user_direct_nonce=x_user_direct_nonce,
+            )
     if b.tier == "canonical":
         if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct" and actor not in CANONICAL_AUTOPROMOTE_ALLOWED:
             raise HTTPException(403,
@@ -2210,36 +2268,61 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         transport = "autonomous"
     elif b.tier == "canonical" and x_user_direct_token:
         transport = "cli-user-direct"
+    elif current_tier == "canonical" and x_user_direct_token:
+        transport = "cli-user-direct"
     else:
         transport = "rest-api"
-    # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
-    # change can never complete without an audit trace. If this append fails the
-    # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
-    # would be worse than useless (the tier would already have changed).
-    try:
-        _append_ledger({
-            "ts": now, "event": "tier-change-intent", "memory_id": mid,
-            "tier": b.tier, "actor": actor, "reason": reason or None,
-            "transport": transport, "status": "intent",
-            "judge_model": (b.judge_model or None), "schema_version": "v18",
-        })
-    except Exception as e:
-        log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
-        raise HTTPException(
-            503,
-            "audit ledger unavailable (intent append failed); tier change refused "
-            f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
-        )
+    class _TierRaced(Exception):
+        """The record became canonical between the gate's read and this write."""
+
     try:
         # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
         # without this, a promotion landing inside the PUT window was silently
         # demoted by the PUT's stale-tier upsert (store and ledger disagreed).
         with _mid_write_lock(mid):
+            # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
+            # between would let this unsigned change move a record that is canonical NOW, so a
+            # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            if b.tier != "canonical" and current_tier != "canonical":
+                _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+                if _tier_now == _NOT_FOUND:
+                    # Deleted while this change was in flight: nothing to change, and no ledger line.
+                    raise HTTPException(404, f"memory {mid} not found")
+                if _tier_now == "canonical":
+                    raise _TierRaced()
+            # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
+            # change can never complete without an audit trace. If this append fails the
+            # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
+            # would be worse than useless (the tier would already have changed). It sits
+            # after the re-check so a refused (409) change leaves no unpaired intent line;
+            # PUT appends its ledger line under the same lock, so the lock order matches.
+            try:
+                _append_ledger({
+                    "ts": now, "event": "tier-change-intent", "memory_id": mid,
+                    "tier": b.tier, "actor": actor, "reason": reason or None,
+                    "transport": transport, "status": "intent",
+                    "judge_model": (b.judge_model or None), "schema_version": "v18",
+                })
+            except Exception as e:
+                log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
+                raise HTTPException(
+                    503,
+                    "audit ledger unavailable (intent append failed); tier change refused "
+                    f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
+                )
             mem.vector_store.client.set_payload(
                 collection_name=mem.vector_store.collection_name,
                 payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
                 points=[mid],
             )
+    except _TierRaced:
+        raise HTTPException(409, (
+            "the record became canonical while this tier change was in flight; retry. "
+            "Moving it out of canonical needs the signed 'demote' token "
+            "(mem0-canonize.sh --action demote)."
+        ))
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("tier-update failed")
         raise _upstream_error(e)

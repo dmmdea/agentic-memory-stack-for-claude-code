@@ -106,3 +106,17 @@ def test_redaction_fixture_case(case):
         assert _unsplit(needle) not in out, "%s: leaked %r -> %r" % (case["name"], needle, out)
     for needle in case["must_keep"]:
         assert _unsplit(needle) in out, "%s: lost %r -> %r" % (case["name"], needle, out)
+
+
+def test_find_credentials_reports_rule_key_and_value_without_the_label():
+    """S12: the L10 detector needs WHAT matched (to veto env refs and paths), not just a count.
+    Keys match count_redactions; `<label><sep><value>` rules report only the value part."""
+    tok = "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH1234"
+    text = "Vercel token v" + "cp_" + tok + " and Authorization: Bearer Ab" + "Cd1234 and plain prose"
+    found = redact.find_credentials(text)
+    assert ("REDACTED_VERCEL_TOKEN", "v" + "cp_" + tok) in found
+    generic = [v for k, v in found if k.startswith("pattern_")]
+    assert generic == ["Ab" + "Cd1234"]
+    assert redact.find_credentials("nothing secret here") == []
+    assert redact.find_credentials(None) == [] and redact.find_credentials("") == []
+    assert set(redact.count_redactions(text)) == {k for k, _ in found}

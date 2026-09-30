@@ -1,5 +1,6 @@
 # L1a extractor - Windows-native PowerShell
 # Spawned by stop-extract dispatcher with: -TranscriptPath <path> -EventName <Stop|PreCompact|SessionEnd>
+#   [-SessionId <the hook's session id>] [-OriginTranscriptPath <the real transcript, when -TranscriptPath is a PreCompact snapshot>]
 # Runs detached, exits 0 always (best-effort, never blocks Claude Code).
 #
 # Architecture: Stop hook (Claude Code) -> stop-extract.ps1 (Start-Process -Hidden) ->
@@ -9,7 +10,12 @@
 
 param(
     [string]$TranscriptPath = '',
-    [string]$EventName = 'Stop'
+    [string]$EventName = 'Stop',
+    # The hook's own session id. PreCompact points -TranscriptPath at a temp snapshot whose file
+    # name is not a session, so the episode's session comes from here (Resolve-L1aSessionId).
+    [string]$SessionId = '',
+    # The real transcript behind a PreCompact snapshot: workspace/brand/start time are read from it.
+    [string]$OriginTranscriptPath = ''
 )
 
 $ErrorActionPreference = 'Continue'
@@ -267,28 +273,26 @@ $turns
         try {
             $apiKey = Get-Mem0Key
 
-            # Extract session UUID from transcript filename (format: <project-dir>/<uuid>.jsonl)
-            $sessionId = $null
-            if ($TranscriptPath) {
-                $fname = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
-                # Claude Code transcript filenames are UUIDs
-                if ($fname -match '^[0-9a-f\-]{32,}$') { $sessionId = $fname }
-                if (-not $sessionId) { $sessionId = $fname }
-            }
-            if (-not $sessionId) { $sessionId = [System.Guid]::NewGuid().ToString() }
+            # The episode's session: the hook's session id when the spawner passed one, else the
+            # transcript file name (format: <project-dir>/<uuid>.jsonl). A PreCompact snapshot is
+            # named precompact-snap-<PID>, which is not a session.
+            # (PowerShell variables are case-insensitive: the local must not shadow the -SessionId parameter.)
+            $episodeSessionId = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $TranscriptPath
+            # The transcript the session actually lives in (differs from -TranscriptPath only for a PreCompact snapshot).
+            $sourceTranscript = if ($OriginTranscriptPath) { $OriginTranscriptPath } else { $TranscriptPath }
 
-            # Infer brand/workspace/project from transcript path. NOTE: plain $TranscriptPath,
+            # Infer brand/workspace/project from transcript path. NOTE: plain $sourceTranscript,
             # NOT ($TranscriptPath ?? '') — the ?? null-coalescing operator is PS7-only and the
             # Stop hook runs this under Windows PowerShell 5.1, where ?? is a PARSE ERROR that
             # silently kills the ENTIRE worker (root cause of the 2026-06-16 capture outage).
             # $TranscriptPath is a [string] param (defaults '', never $null), so ?? was redundant.
-            $brandInfo = Get-BrandFromTranscriptPath -Path $TranscriptPath
+            $brandInfo = Get-BrandFromTranscriptPath -Path $sourceTranscript
 
             # Best-effort started_at: use transcript file mtime as a proxy for session start
             $sessionStartedAt = (Get-Date).ToString('o')
-            if ($TranscriptPath -and (Test-Path $TranscriptPath)) {
+            if ($sourceTranscript -and (Test-Path $sourceTranscript)) {
                 try {
-                    $sessionStartedAt = (Get-Item $TranscriptPath).CreationTimeUtc.ToString('o')
+                    $sessionStartedAt = (Get-Item $sourceTranscript).CreationTimeUtc.ToString('o')
                 } catch {}
             }
 
@@ -300,10 +304,10 @@ $turns
             $openQuestions  = @($parsed.episode.open_questions  | Where-Object { $_ })
 
             $episodePayload = @{
-                session_id     = $sessionId
+                session_id     = $episodeSessionId
                 started_at     = $sessionStartedAt
                 ended_at       = (Get-Date).ToUniversalTime().ToString('o')
-                transcript_path = $TranscriptPath
+                transcript_path = $sourceTranscript
                 goal           = $parsed.episode.goal
                 summary        = $episodeSummary
                 message_count  = 0
@@ -330,7 +334,7 @@ $turns
                 -ContentType 'application/json' `
                 -Headers @{'X-API-Key' = $apiKey} `
                 -TimeoutSec 5 | Out-Null
-            Write-MemoryLog -Component 'l1a' -Message "  posted episode for session $sessionId (goal: $($parsed.episode.goal.Substring(0, [Math]::Min(80, $parsed.episode.goal.Length))))"
+            Write-MemoryLog -Component 'l1a' -Message "  posted episode for session $episodeSessionId (goal: $($parsed.episode.goal.Substring(0, [Math]::Min(80, $parsed.episode.goal.Length))))"
         } catch {
             # Best-effort: POST /v1/episodes is live (v0.20 Phase B). A failure here is
             # non-fatal — the session's durable facts already landed in mem0; the episode

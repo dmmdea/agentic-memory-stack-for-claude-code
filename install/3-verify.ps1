@@ -321,6 +321,7 @@ Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
     try {
         $key = wsl.exe -d $Distro -e bash -c "cat /home/$WslUser/.mem0/api-key"
         $key = ($key -as [string]).Trim()
+        $hdr = @{'X-API-Key' = $key; 'Content-Type' = 'application/json'}
         $body = @{ messages = 'smoke-test memory: agentic memory stack verify timestamp ' + (Get-Date -Format o); user_id = 'verify-test'; infer = $false; metadata = @{ source = 'install-verify'; tier = 'evidence' } } | ConvertTo-Json -Compress
         # 2026-07-25: generous timeout + bounded retry on the SEARCH side. Both legs go through
         # the CPU-only embedder on :11436, which can take many seconds during a model swap or
@@ -328,19 +329,36 @@ Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
         # same instant. With a single 15s attempt this check failed on a completely healthy box
         # and made 3-verify exit 1 — and a verifier that cries wolf stops being read.
         # A genuine HTTP error on the ADD still throws and FAILs loudly; only slowness is absorbed.
-        Invoke-RestMethod -Uri "$authorityUrl/v1/memories" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $body -TimeoutSec 60 | Out-Null
-        $searchBody = @{ query = 'smoke-test memory'; filters = @{ user_id = 'verify-test' }; top_k = 1; threshold = 0.1 } | ConvertTo-Json -Compress
+        $added = Invoke-RestMethod -Uri "$authorityUrl/v1/memories" -Method Post -Headers $hdr -Body $body -TimeoutSec 60
+        # The point this check just wrote is removed again by id (2026-09-29): every verify used to
+        # leave one permanent 'smoke-test memory' in the authority's retrieval namespace (42 of
+        # them piled up), and nothing failed. The cleanup is part of the check - a smoke test
+        # that cannot remove its own point reports MISSING, not OK. Evidence tier, so a plain
+        # DELETE by id is allowed.
+        $smokeId = $null
+        try { $smokeId = "$(@($added.results)[0].id)".Trim() } catch { }
         $found = $false
-        foreach ($attempt in 1..3) {
-            try {
-                $r = Invoke-RestMethod -Uri "$authorityUrl/v1/memories/search" -Method Post -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} -Body $searchBody -TimeoutSec 60
-                if ($r.results.Count -ge 1) { $found = $true; break }
-            } catch { }
-            if ($attempt -lt 3) { Start-Sleep -Seconds 3 }
+        try {
+            $searchBody = @{ query = 'smoke-test memory'; filters = @{ user_id = 'verify-test' }; top_k = 1; threshold = 0.1 } | ConvertTo-Json -Compress
+            foreach ($attempt in 1..3) {
+                try {
+                    $r = Invoke-RestMethod -Uri "$authorityUrl/v1/memories/search" -Method Post -Headers $hdr -Body $searchBody -TimeoutSec 60
+                    if ($r.results.Count -ge 1) { $found = $true; break }
+                } catch { }
+                if ($attempt -lt 3) { Start-Sleep -Seconds 3 }
+            }
+        } finally {
+            $deleted = $false
+            if ($smokeId) {
+                try {
+                    Invoke-RestMethod -Uri "$authorityUrl/v1/memories/${smokeId}?actor=install-verify&reason=smoke-test+cleanup" -Method Delete -Headers $hdr -TimeoutSec 60 | Out-Null
+                    $deleted = $true
+                } catch { }
+            }
         }
-        $found
+        $found -and $deleted
     } catch { $false }
-} "Round-trip against $authorityUrl failed. On the brain: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'. On a replica: is the brain reachable (tailscale status), and does ~/.mem0/authority-url point at it?"
+} "Round-trip against $authorityUrl failed, or the smoke point it wrote could not be deleted again (a point with user_id verify-test / source install-verify is left in the authority - remove it by id). On the brain: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'. On a replica: is the brain reachable (tailscale status), and does ~/.mem0/authority-url point at it?"
 
 Write-Host ""
 if ($fails.Count -eq 0) {

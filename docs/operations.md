@@ -179,12 +179,23 @@ Get-Content "$env:USERPROFILE\.claude\logs\dream.log" -Tail 40
 journalctl --user -u ams-step-dream --no-pager -n 60          # the phase log (also ~/.mem0/maintenance/logs/dream.log)
 tail -20 ~/.mem0/maintenance/receipts.jsonl                    # one line per step: ok / exit / duration / note
 cat ~/.mem0/maintenance/dream/gather.json | jq '.signals|length'
-curl -s http://<authority>:18791/health/maintenance | jq '{stale_steps, usage, judge_transport}'
+curl -s http://<authority>:18791/health/maintenance | jq '{ok, failed_steps, degraded_steps, stale_steps, pool, usage, judge_transport}'
 ~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/codex-usage-report.py --gate   # the 25 % reserve verdict the dream read
 systemctl --user start ams-step-dream.service                 # a hand run (its own 23 h throttle still applies; --force only by hand)
 ```
 
 A receipt with `note: "skipping: codex quota gate ..."` is the reserve rule, not a failure; `"guard: chain succeeded since the last 03:00 boundary"` is the boot re-run of a completed night; `"weekly: not Sun; no-op"` is a weekday. A step with `ok:false` names its exit code and the tail of its stderr in `note`.
+
+**Reading `status`.** Every receipt carries `status` (`ok`, `degraded` or `failed`) and `work` (counts the step reported). `degraded` means the step exited 0 but did not do its job: the dream posted 0 of 3 insights (`posted-0-of-3`; the unposted ones wait in `~/.mem0/maintenance/dream/insight-spool.jsonl` and go first next run), a queued insight could not be replayed (`replay-failed-<n>`) or was left waiting (`spool-backlog-<n>`), its drift snapshot failed, or a weekly sweep found nothing to judge (`no-op-<reason>`). The receipt is `ok:true`, so the chain still stamps its success, but `/health/maintenance` lists the step under `degraded_steps` and its `ok` is false until a later run of that step comes back `ok`. `failed_steps` lists steps whose latest run exited non-zero (or reported `failed:*`); the health stamp ends the chain red on any of those, or on a pool that is not `ONLINE`. The morning summary's Chain block prints each degraded step with its note and counts, e.g. `- dream DEGRADED 41000ms -- posted-0-of-3 [consolidated=3 posted=0]`. A `weekly:` off-day receipt does not clear a Sunday failure; only a later real run does. A `--dry-run` of the dream skips the spool replay by design, so it does not report a standing spool as `spool-backlog-<n>`.
+
+**Pool-health acknowledgment.** A pool that is DEGRADED on purpose (a planned boot-disk swap) would keep `/health/maintenance` `ok:false`, the health stamp red and a replica's banner up for the whole window. Acknowledge it with a dated key in `~/.mem0/stack.env` on the authority:
+
+```bash
+echo 'MEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06' >> ~/.mem0/stack.env   # STATE:last day (UTC); read on every request, no restart
+curl -s http://<authority>:18791/health/maintenance | jq '.pool'        # health DEGRADED, health_alarm false, health_ack.active true
+```
+
+The ack lapses by itself the day after its date (`health_ack.reason` becomes `expired` and the alarm returns), and it applies only while the pool is in exactly the named state: a pool that worsens to `FAULTED` alarms at once (`mismatch`). Clear it early by deleting the line (`sed -i '/^MEM0_POOL_HEALTH_ACK=/d' ~/.mem0/stack.env`) once the pool is `ONLINE`. A process environment value of the same name wins over the file. Installer re-runs carry the line over (`STACK_ENV_OPERATOR_KEYS`). The health stamp and the morning summary print `DEGRADED (acked until <date>)` while it is active, so an acknowledged pool is never mistaken for a healthy one.
 
 ---
 

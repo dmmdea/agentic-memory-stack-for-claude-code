@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # upgrade-check.sh - READ-ONLY inventory + outdated scan for the agentic-memory-stack
 # components (mem0-server Python venv, Qdrant, llama-swap, Codex CLI). Classifies the
-# Python updates as SECURITY (pip-audit CVE) / SAFE / MAJOR / PINNED so the
+# Python updates as SECURITY (pip-audit CVE) / SAFE / MAJOR so the
 # /upgrade-memory-stack skill can present a plan. Makes NO changes.
 #
-# Pin policy (intentional holds - bump only via UPGRADE.md, then re-test + VERSIONS.md):
-#   cryptography  capped <49   (GHSA-537c-gmf6-5ccf; as-tested 48.x - see VERSIONS.md)
-#   mem0ai        ==2.0.4      (stack is built/tested on this exact version)
+# Dependency policy: floors, not caps. The installer sets minimums (cryptography, starlette,
+# mem0ai) and nothing pins a version below "latest"; the /health/deep sparse_leg canary and
+# the hook contract are the tripwires for a breaking release. Only the transitive majors below
+# are held back.
 #   protobuf/thinc  majors held (breaking-change risk; transitive via mem0ai[nlp]/spaCy)
+#
+# Exit status: 0 = every leg ran; 2 = the security scan could not run (no venv, no pip-audit,
+# or pip-audit died without a verdict). When pip-audit is missing the OSV querybatch fallback
+# still lists advisories, but the status stays 2: a missing scanner is a defect to fix, not a
+# clean bill of health. Findings do not change the exit status; read the output.
+#
+# Test hooks (env): MEM0_VENV (venv path), LLAMA_SWAP_BIN (llama-swap binary to interrogate).
 set -uo pipefail
 VENV="${MEM0_VENV:-$HOME/apps/mem0-server/.venv}"
 PIP="$VENV/bin/pip"
-POLICY_PINNED="cryptography mem0ai"   # held by policy (not merely a major bump)
+POLICY_PINNED=""                      # no package is held below latest by policy (floors only)
 MAJOR_HELD="protobuf thinc"           # majors we deliberately keep
+RC=0                                  # 2 once the security scan could not run
 
 # latest release tag from the public GitHub API (no gh CLI / no auth needed in WSL)
 gh_latest() {
@@ -26,13 +35,62 @@ echo ""
 echo "## Python deps  (venv: $VENV)"
 if [ ! -x "$PIP" ]; then
   echo "  ! venv pip not found at $PIP (set MEM0_VENV)"
+  echo "  security scan UNAVAILABLE: no venv to scan"
+  RC=2
 else
-  echo -n "  security (pip-audit): "
-  AUDIT=$("$VENV/bin/pip-audit" 2>&1 || true)   # 2>&1: pip-audit prints its verdict to stderr
-  if echo "$AUDIT" | grep -qi "No known vulnerabilities"; then
-    echo "clean (no known CVEs)"
+  AUDIT_BIN="$VENV/bin/pip-audit"
+  if [ -x "$AUDIT_BIN" ]; then
+    AUDIT=$("$AUDIT_BIN" 2>&1); AUDIT_RC=$?   # 2>&1: pip-audit prints its verdict to stderr
+    ROWS=$(echo "$AUDIT" | grep -iE "GHSA|CVE|PYSEC|Fix Versions" | head -20)
+    if echo "$AUDIT" | grep -qi "No known vulnerabilities"; then
+      echo "  security (pip-audit): clean (no known CVEs)"
+    elif [ -n "$ROWS" ]; then
+      echo "  security (pip-audit): REVIEW:"; echo "$ROWS" | sed 's/^/    /'
+    else
+      echo "  security scan UNAVAILABLE: pip-audit exited $AUDIT_RC without a verdict:"
+      echo "$AUDIT" | head -3 | sed 's/^/    /'
+      RC=2
+    fi
   else
-    echo "REVIEW:"; echo "$AUDIT" | grep -iE "GHSA|CVE|PYSEC|Fix Versions" | head -20 | sed 's/^/    /'
+    echo "  security scan UNAVAILABLE: pip-audit is not installed in this venv"
+    echo "    fix: $PIP install pip-audit   (the installer does this on a re-run)"
+    RC=2
+    # No scanner, but the advisory database is public: ask OSV about the installed set.
+    echo "  fallback (OSV querybatch over the installed set):"
+    FREEZE=$(mktemp)
+    "$PIP" list --format=json 2>/dev/null > "$FREEZE"
+    OSV_OUT=$(python3 - "$FREEZE" <<'PY'
+import json, subprocess, sys
+try:
+    pkgs = json.load(open(sys.argv[1]))
+    queries = [{"package": {"name": p["name"], "ecosystem": "PyPI"}, "version": p["version"]} for p in pkgs]
+    if not queries:
+        raise ValueError("empty package list")
+    body = subprocess.run(
+        ["curl", "-s", "-f", "-m", "60", "-X", "POST", "-H", "Content-Type: application/json",
+         "--data-binary", "@-", "https://api.osv.dev/v1/querybatch"],
+        input=json.dumps({"queries": queries}), capture_output=True, text=True, timeout=90, check=True,
+    ).stdout
+    results = json.loads(body)["results"]
+    if len(results) != len(queries):
+        raise ValueError("OSV returned %d results for %d packages" % (len(results), len(queries)))
+except Exception as exc:
+    print("ERROR %s" % exc)
+    sys.exit(0)
+rows = []
+for q, res in zip(queries, results):
+    ids = sorted({v["id"] for v in (res.get("vulns") or [])})
+    if ids:
+        rows.append("%s==%s: %s" % (q["package"]["name"], q["version"], ", ".join(ids)))
+print("\n".join(rows) if rows else "CLEAN %d" % len(queries))
+PY
+)
+    rm -f "$FREEZE"
+    case "$OSV_OUT" in
+      ERROR*) echo "    OSV fallback failed (${OSV_OUT#ERROR }); the security scan did not run at all" ;;
+      CLEAN*) echo "    no known advisories for ${OSV_OUT#CLEAN } installed packages (OSV)" ;;
+      *)      echo "    REVIEW (OSV advisories):"; echo "$OSV_OUT" | sed 's/^/      /' ;;
+    esac
   fi
   OUT=$(mktemp)
   "$PIP" list --outdated --format=json 2>/dev/null > "$OUT"   # to a file: the heredoc below owns stdin
@@ -59,7 +117,7 @@ def show(title, items):
     print("\n".join(f"    - {i}" for i in items) if items else "    (none)")
 show("SAFE (no CVE, minor/patch - eligible for the safe-upgrade pass)", safe)
 show("MAJOR (breaking-change risk - hold unless needed, then test in isolation)", majors)
-show("PINNED (policy - bump ONLY via UPGRADE.md)", pins)
+show("PINNED (held below latest by policy)", pins)
 PY
   rm -f "$OUT"
 fi
@@ -72,12 +130,23 @@ echo "  installed $QV | latest $QL | $([ "$QV" = "$QL" ] && echo CURRENT || echo
 
 echo ""
 echo "## llama-swap  (inference proxy - ECOSYSTEM-SHARED: serves embeddings+reranker+all local models)"
-LB=$(ps -eo args 2>/dev/null | grep -i "[l]lama-swap" | head -1 | awk '{print $1}')
+LB="${LLAMA_SWAP_BIN:-}"
+[ -z "$LB" ] && LB=$(ps -eo args 2>/dev/null | grep -i "[l]lama-swap" | head -1 | awk '{print $1}')
 [ -z "$LB" ] && LB=$(command -v llama-swap 2>/dev/null)
-LV=$([ -n "$LB" ] && [ -x "$LB" ] && "$LB" --version 2>/dev/null | grep -oiE 'version:? *[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "?")
+LV=""
+# `version: v256 (6701d0d), built at ...` today, `version: 230` before the v prefix appeared.
+[ -n "$LB" ] && [ -x "$LB" ] && LV=$("$LB" --version 2>/dev/null | grep -oiE 'version:? *v?[0-9]+' | grep -oE '[0-9]+' | head -1)
+[ -z "$LV" ] && LV="?"
 LL=$(gh_latest mostlygeek/llama-swap)
 echo "  binary: ${LB:-?}"
-echo "  installed $LV | latest $LL | $([ "$LV" = "$LL" ] && echo CURRENT || echo 'UPDATE - binary swap + config compat; affects the WHOLE ecosystem, extra caution')"
+if [ "$LV" = "?" ]; then
+  LSTATE="UNKNOWN - could not read the installed version from '${LB:-?} --version'"
+elif [ "$LV" = "$LL" ]; then
+  LSTATE=CURRENT
+else
+  LSTATE='UPDATE - binary swap + config compat; affects the WHOLE ecosystem, extra caution'
+fi
+echo "  installed $LV | latest $LL | $LSTATE"
 
 echo ""
 echo "## Codex CLI  (LLM judge)"
@@ -95,3 +164,5 @@ echo "## Models  (EmbeddingGemma-300m, bge-reranker-v2-m3)"
 echo "  fixed GGUF artifacts - a model change is a DELIBERATE swap (re-embed + re-eval), NOT an auto-upgrade."
 echo ""
 echo "Next: /upgrade-memory-stack applies the SAFE set with snapshot -> full-suite gate -> rollback."
+[ "$RC" -ne 0 ] && echo "NOTE: exiting $RC - the security scan did not complete (see 'security scan UNAVAILABLE' above)."
+exit "$RC"
