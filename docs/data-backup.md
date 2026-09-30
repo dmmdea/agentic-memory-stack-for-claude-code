@@ -71,9 +71,13 @@ nightly snapshot, roughly a second full copy of the vectors per day.
 
 A failed server-side list, DELETE or sweep, or a secondary collection whose snapshot could not be
 taken, does not turn the night red (a red night makes the off-box copy refuse the primary set)
-but it does not read as a clean success either: the step writes a `degraded` outcome
-(`secondary-snapshot-failed` and/or `server-prune-failed`, with counts), so the receipt and
-`/health/maintenance` show it. The entities collection has no rebuild path, so a missing
+but it does not read as a clean success either: the step writes one `degraded` outcome line to
+`AMS_OUTCOME_FILE` (the chain's step outcome contract, described in
+[`systems/installer-and-deploy.md`](./systems/installer-and-deploy.md)):
+`degraded:secondary-snapshot-failed,server-prune-failed {"secondary_snapshot_failed":N,"server_prune_failed":M}`,
+with only the reason that applies. The receipt then reads `status: degraded` (still `ok: true`, so
+the off-box copy still runs) with the counts in `work`, and `/health/maintenance` lists the step
+under `degraded_steps`. The entities collection has no rebuild path, so a missing
 `qcol-entities-*` snapshot is a real gap, not noise.
 
 ### Manifest fields
@@ -107,13 +111,17 @@ files, and scripts that live in this repo. Keys (`api-key`, `canonical-key.dpapi
 **Cloud mirror (`ams-pcloud-copy.sh`).** Mirrors the newest set to the synced cloud folder. It
 copies files as they are: the mirror is **not client-side encrypted**, so treat the cloud account as
 holding the raw corpus (encrypting it is an operator decision, not something the script does). The
-copy refuses, with exit 5 and the outcome `failed:stale-set`, when the newest local manifest is
-older than 26 h or the latest `stack-backup` receipt is not ok, so a failed night can no longer
-read green by re-copying yesterday's set. It copies only real artifacts (never sidecars or `.tmp`),
-data files first and the manifest last, and compares sizes before the manifest travels (exit 6 on a
-mismatch). After a verified copy it keeps the newest 7 **complete** sets (a set is complete when
-its manifest exists), deletes older sets and dead partials, and never deletes the newest complete
-set. `AMS_PCLOUD_MAX_AGE_H` and `AMS_PCLOUD_KEEP_SETS` override the two limits.
+copy refuses, with exit 5 and the outcome `failed:stale-set` (or `failed:stack-backup-not-ok`), when
+the newest local manifest is older than 26 h or the latest `stack-backup` receipt is not ok, so a
+failed night can no longer read green by re-copying yesterday's set. A `degraded` night is ok, so
+its whole primary set still travels. It copies only real artifacts (never sidecars or `.tmp`),
+data files first and the manifest last, and compares sizes before the manifest travels (exit 6 and
+`failed:copy-size-mismatch` on a mismatch). A refusal leaves a `failed` receipt: the exit code, the
+message as the note, and the outcome line's counts in `work` (`{"age_h": N}`, or the file name), and
+`/health/maintenance` lists the step under `failed_steps`. After a verified copy it keeps the
+newest 7 **complete** sets (a set is complete when its manifest exists), deletes older sets and
+dead partials, and never deletes the newest complete set. `AMS_PCLOUD_MAX_AGE_H` and
+`AMS_PCLOUD_KEEP_SETS` override the two limits.
 
 **ZFS replica (recovery point).** The replication step is an operator-side script on the brain
 (it is not in this repo). It sends with `--no-sync-snap`, so it ships only snapshots that already

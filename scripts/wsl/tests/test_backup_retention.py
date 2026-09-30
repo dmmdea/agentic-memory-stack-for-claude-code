@@ -773,3 +773,99 @@ def test_without_any_stamp_the_checkout_the_script_runs_from_is_asked(home, qdra
     r = _run(MANIFEST, home, qdrant, args=[ts], MEM0_REPO_ROOT_WSL=str(home / "checkout"))
     assert r.returncode == 0, r.stderr
     assert json.loads((b / f"manifest-{ts}.json").read_text())["git_sha"] == head
+
+
+# ------------------------------------- the outcome contract, read by the real ams-step.sh
+#
+# The tests above pin the outcome line these scripts write with a parser of this suite's own. Only the
+# reader that ships can notice the two drifting apart, so these run each script the way the chain does
+# (`ams-step.sh <step> bash <script>`) and assert on the receipt line ams-step.sh appends.
+
+STEP = WSL_DIR / "ams-step.sh"
+
+
+def _under_step(step: str, script: Path, home: Path, qdrant=None, **extra):
+    """Run `script` as chain step `step`; return the process and the LAST receipt line written for it."""
+    r = subprocess.run(["bash", str(STEP), step, "bash", str(script)], env=_env(home, qdrant, **extra),
+                       capture_output=True, text=True, timeout=180)
+    rp = home / ".mem0" / "maintenance" / "receipts.jsonl"
+    rows = [json.loads(ln) for ln in rp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return r, [x for x in rows if x["step"] == step][-1]
+
+
+def _degraded_night(home: Path):
+    """A night whose primary set is whole but whose server-side DELETE and one secondary snapshot failed."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [PRIMARY, *SECONDARIES],
+                      fail_delete=True, fail_create={"wiki_pages_egemma_768"})
+    try:
+        for i in range(1, 5):
+            fake.seed(PRIMARY, f"{PRIMARY}-node-{i:02d}.snapshot", age_days=10 - i)
+        return _under_step("stack-backup", BACKUP, home, fake)
+    finally:
+        fake.close()
+
+
+def test_the_real_step_reads_a_degraded_backup_as_degraded_with_its_counts(home):
+    r, rec = _degraded_night(home)
+    assert r.returncode == 0, r.stderr
+    assert (rec["ok"], rec["status"], rec["exit"]) == (True, "degraded", 0), rec
+    assert rec["note"] == "secondary-snapshot-failed,server-prune-failed", rec
+    assert rec["work"]["secondary_snapshot_failed"] == 1 and rec["work"]["server_prune_failed"] >= 1, rec
+
+
+def test_the_real_step_reads_a_clean_backup_as_ok(home, qdrant):
+    r, rec = _under_step("stack-backup", BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    assert (rec["ok"], rec["status"], rec["exit"], rec["note"], rec["work"]) == (True, "ok", 0, "", {}), rec
+
+
+def test_a_degraded_night_still_travels_off_box(home, tmp_path):
+    """`degraded` keeps ok:true, so the off-box copy's receipt gate lets the (whole) primary set through;
+    it must never read a degraded night as a failed one."""
+    _, night = _degraded_night(home)
+    assert night["status"] == "degraded"
+    dst, env = _pcloud_env(home, tmp_path)
+    r, rec = _under_step("pcloud-copy", PCLOUD, home, **env)
+    assert r.returncode == 0, r.stderr
+    assert (rec["ok"], rec["status"]) == (True, "ok"), rec
+    assert list(dst.glob("manifest-*.json")), "the set was copied"
+
+
+def test_the_real_step_receipts_a_refused_pcloud_copy_as_failed_with_its_counts(home, tmp_path):
+    """A refusal exits non-zero AND writes the outcome line: the receipt is failed either way, and the
+    reader still carries the line's counts into `work`."""
+    _set(home / ".mem0" / "backups", _ts(2), age_s=30 * 3600)
+    dst, env = _pcloud_env(home, tmp_path)
+    r, rec = _under_step("pcloud-copy", PCLOUD, home, **env)
+    assert r.returncode == 5, r.stderr
+    assert (rec["ok"], rec["status"], rec["exit"]) == (False, "failed", 5), rec
+    assert rec["work"] == {"age_h": 30}, rec
+    assert "REFUSING" in rec["note"] and "30 h old" in rec["note"], rec
+    assert not dst.exists() or not list(dst.glob("*"))
+
+
+def test_a_real_failed_stack_backup_receipt_stops_the_pcloud_copy(home, tmp_path):
+    """The receipt gate reads the receipt ams-step.sh really writes, not a hand-made one."""
+    _set(home / ".mem0" / "backups", _ts(2))
+    failing = tmp_path / "failing-backup.sh"
+    failing.write_text("echo 'stack.env: line 16: boom' >&2\nexit 1\n")
+    _, bad = _under_step("stack-backup", failing, home)
+    assert (bad["ok"], bad["status"]) == (False, "failed"), bad
+    dst, env = _pcloud_env(home, tmp_path)
+    r, rec = _under_step("pcloud-copy", PCLOUD, home, **env)
+    assert r.returncode == 5, r.stderr
+    assert (rec["ok"], rec["status"], rec["exit"]) == (False, "failed", 5), rec
+    assert "stack-backup" in rec["note"], rec
+    assert not dst.exists() or not list(dst.glob("*"))
+
+
+def test_the_real_step_receipts_a_copy_size_mismatch_as_failed_with_the_file(home, tmp_path):
+    dst, env = _pcloud_env(home, tmp_path)
+    dst.mkdir()
+    _set(dst, _ts(1))
+    _set(home / ".mem0" / "backups", _ts(2))
+    fake = _fake_cp(tmp_path, 'case "${@: -1}" in *history-*) head -c 3 "${@: -2:1}" > "${@: -1}"; exit 0;; esac')
+    r, rec = _under_step("pcloud-copy", PCLOUD, home, PATH=f"{fake}:{os.environ['PATH']}", **env)
+    assert r.returncode == 6, r.stderr
+    assert (rec["ok"], rec["status"], rec["exit"]) == (False, "failed", 6), rec
+    assert rec["work"] == {"file": f"history-{_ts(2)}.db"}, rec
