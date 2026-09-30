@@ -945,8 +945,10 @@ def _rejudge_env(monkeypatch, records, fetch_map, verdict_map, tmp_path=None):
         v = fetch_map[pid]
         if isinstance(v, Exception):
             raise v
-        return v
-    monkeypatch.setattr(sweep, "fetch_point_text", fake_fetch)
+        # the rejudge reads text AND current tier through fetch_point_info; a plain text fixture
+        # means "a live canonical with this text"
+        return None if v is None else {"text": v, "tier": "canonical", "retired": False}
+    monkeypatch.setattr(sweep, "fetch_point_info", fake_fetch)
     monkeypatch.setattr(sweep, "judge_dispatch",
                         # **kw absorbs the W5 cache kwargs (use_cache/cache_stats)
                         lambda mode, http, model, can, cand, t, **kw: verdict_map[cand])
@@ -1354,6 +1356,391 @@ def test_rejudge_early_scroll_failure_still_writes_the_receipt(monkeypatch):
     assert summaries[-1]["stamped_found"] == 0
 
 
+# ---------------------------------------------------------------------------
+# WP-4 (session-12 audit): sweep coverage, direction, and the stamped re-judge on the brain
+# ---------------------------------------------------------------------------
+
+def _can(cid, checked=None, created="2026-07-01T00:00:00+00:00", vec=None, user="u1"):
+    pl = {"data": "canonical " + cid, "user_id": user, "tier": "canonical", "created_at": created}
+    if checked:
+        pl["contradiction_checked_at"] = checked
+    return {"id": cid, "payload": pl, "vector": {"": vec if vec is not None else [0.1, 0.2],
+                                                 "bm25": {"indices": [1], "values": [1.0]}}}
+
+
+def _cand(cid, created="2026-06-01T00:00:00+00:00"):
+    return {"id": cid, "payload": {"data": "candidate " + cid, "user_id": "u1", "tier": "evidence",
+                                   "created_at": created}}
+
+
+def test_order_canonicals_never_checked_first_then_oldest_check():
+    """Rotation: --limit is a budget, not a permanent cut. Never-checked canonicals come first, then
+    the ones checked longest ago; ties break on id so a run is reproducible."""
+    cans = [_can("c-recent", checked="2026-09-20T00:00:00+00:00"),
+            _can("c-old", checked="2026-08-01T00:00:00+00:00"),
+            _can("c-never-b"), _can("c-never-a"),
+            _can("c-garbage", checked="not-a-date")]
+    ordered = [c["id"] for c in sweep.order_canonicals(cans)]
+    assert ordered == ["c-garbage", "c-never-a", "c-never-b", "c-old", "c-recent"]
+
+
+def test_sweep_coverage_reports_weeks_for_a_full_pass():
+    assert sweep.sweep_coverage(total=43, processed=25) == {"canonicals_checked": 25, "canonical_total": 43,
+                                                            "weeks_for_full_pass": 2}
+    assert sweep.sweep_coverage(total=43, processed=43)["weeks_for_full_pass"] == 1
+    assert sweep.sweep_coverage(total=0, processed=0)["weeks_for_full_pass"] == 0
+    assert sweep.sweep_coverage(total=10, processed=0)["weeks_for_full_pass"] is None   # no progress
+
+
+def test_default_user_id_is_the_corpus_tenant(monkeypatch):
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "tenant-1")
+    assert sweep.resolve_user_id(None) == "tenant-1"
+    assert sweep.resolve_user_id("other") == "other"
+    assert sweep.resolve_user_id("") is None           # explicit empty = every user
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")
+    assert sweep.resolve_user_id(None) is None         # no tenant configured: unchanged behaviour
+
+
+def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fail=(), marker_fail=()):
+    """Drive the real canonical sweep leg with fakes for Qdrant, the judge and mem0."""
+    monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace())
+    monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
+    monkeypatch.setattr(sweep.httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(sweep, "_api_key_or_raise", lambda: "k")
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "u1")
+    seen_user = []
+    monkeypatch.setattr(sweep, "scroll_canonicals",
+                        lambda http, user_id=None: (seen_user.append(user_id) or list(canonicals)))
+
+    def fake_query(http, vec, user, exclude_id, fetch_n):
+        if exclude_id in query_fail:
+            raise httpx.ConnectError("blip")
+        return list((candidates or {}).get(exclude_id, []))
+    monkeypatch.setattr(sweep, "query_similar", fake_query)
+    monkeypatch.setattr(sweep, "judge_dispatch",
+                        lambda mode, http, model, can, cand, t, **kw: (verdicts or {}).get(cand, (False, "NO")))
+    stamps, queued, summaries = [], [], []
+    monkeypatch.setattr(sweep, "stamp_candidate",
+                        lambda http, cid, ts, contradicts=None, clear=False, justification="", pending=False: (
+                            stamps.append({"id": cid, "contradicts": contradicts, "clear": clear}) or True))
+    # marker_fail: ids whose rotation-marker PATCH fails; "all" fails every one
+    monkeypatch.setattr(sweep, "mark_canonical_checked",
+                        lambda http, cid, ts: (stamps.append({"id": cid, "marker": True})
+                                               or not (marker_fail == "all" or cid in marker_fail)))
+    monkeypatch.setattr(sweep, "append_review_queue", lambda path, rec: (queued.append(rec) or True))
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    # the queue prune reads the real review file and asks Qdrant: never from a unit test
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: 0)
+    return stamps, queued, summaries, seen_user
+
+
+def test_limited_sweep_rotates_and_marks_every_canonical_it_processed(monkeypatch):
+    """The finding: the weekly --limit 50 swept the same first 50 ids forever. With rotation the run
+    takes the never-checked and longest-unchecked canonicals, and WRITES the marker back onto each,
+    otherwise the ordering would never change."""
+    cans = [_can("c1", checked="2026-09-20T00:00:00+00:00"), _can("c2"), _can("c3", checked="2026-08-01T00:00:00+00:00")]
+    stamps, queued, summaries, seen_user = _sweep_rig(monkeypatch, cans, candidates={"c2": [_cand("x1")]})
+    rc = sweep.main(["--apply", "--limit", "2", "--judge", "codex"])
+    assert rc == 0
+    assert seen_user == ["u1"], "the corpus tenant is the default scope"
+    markers = [s["id"] for s in stamps if s.get("marker")]
+    assert markers == ["c2", "c3"], "never-checked first, then the longest-unchecked; c1 waits for next week"
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 2 and s["canonical_total"] == 3 and s["weeks_for_full_pass"] == 2
+    assert s["user_id"] == "u1"
+
+
+def test_canonical_with_no_candidates_is_still_marked_but_a_failed_query_is_not(monkeypatch):
+    cans = [_can("c-empty"), _can("c-failed")]
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, cans, query_fail=("c-failed",))
+    sweep.main(["--apply", "--judge", "codex"])
+    markers = [s["id"] for s in stamps if s.get("marker")]
+    assert markers == ["c-empty"], "a canonical whose candidate query failed keeps its place at the front"
+    assert summaries[-1]["canonicals_checked"] == 1
+    assert summaries[-1]["canonicals_query_failed"] == 1
+
+
+def test_dry_run_marks_nothing(monkeypatch):
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1")], candidates={"c1": [_cand("x1")]},
+                                         verdicts={"candidate x1": (True, "YES")})
+    sweep.main(["--judge", "codex"])          # no --apply
+    assert stamps == []
+
+
+def test_yes_pair_whose_candidate_is_newer_than_the_canonical_is_routed_not_stamped(monkeypatch):
+    """The sweep assumed the canonical is the truth. When the candidate is NEWER than the canonical it
+    may be the correction and the canonical the stale one, so it goes to the review queue as
+    canonical-possibly-stale instead of hiding the newer fact. Only the checked-at marker is written
+    (so the pair is not re-judged every week)."""
+    cans = [_can("c1", created="2026-07-01T00:00:00+00:00")]
+    cands = {"c1": [_cand("newer", created="2026-09-01T00:00:00+00:00"),
+                    _cand("older", created="2026-06-01T00:00:00+00:00")]}
+    verdicts = {"candidate newer": (True, "YES conflict"), "candidate older": (True, "YES conflict")}
+    stamps, queued, summaries, _ = _sweep_rig(monkeypatch, cans, cands, verdicts)
+    sweep.main(["--apply", "--judge", "codex"])
+    by = {s["id"]: s for s in stamps if not s.get("marker")}
+    assert by["older"]["contradicts"] == "c1", "an older contradicting candidate is stamped as before"
+    assert by["newer"]["contradicts"] is None and by["newer"]["clear"] is False, \
+        "a newer candidate gets ONLY the checked-at marker, never the enforced stamp"
+    assert [q["memory_id"] for q in queued] == ["newer"]
+    assert queued[0]["kind"] == "canonical-possibly-stale"
+    assert queued[0]["stale_canonical_id"] == "c1"
+    assert "canonical_id" not in queued[0], "must not be promotable via --promote (which would HIDE the newer fact)"
+    s = summaries[-1]
+    assert s["stale_canonical_routed"] == 1 and s["stamped_count"] >= 1
+
+
+def test_no_vector_canonicals_are_counted_and_all_skipped_degrades(monkeypatch):
+    """A future vector-shape change must not read as 'canonicals=50 pairs=0 ok'."""
+    blind = [dict(_can("c1"), vector={"bm25": {"indices": [1], "values": [1.0]}}),
+             dict(_can("c2"), vector=None)]
+    stamps, _, summaries, _ = _sweep_rig(monkeypatch, blind)
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["skipped_no_vector"] == 2
+    assert s["outcome"] == "degraded:no-vectors" and rc == 1
+
+
+def test_weekly_unit_runs_the_stamped_rejudge_pass_after_the_sweep():
+    text = (REPO_ROOT / "systemd" / "ams-step-contradiction-sweep.service").read_text(encoding="utf-8")
+    exec_line = next(ln for ln in text.splitlines() if ln.startswith("ExecStart="))
+    assert "--judge codex" in exec_line and "--judge local" not in exec_line
+    assert "--then-rejudge-stamped" in exec_line
+
+
+def test_then_rejudge_runs_both_passes_and_reports_the_worse_exit(monkeypatch):
+    calls = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 0 if "--rejudge-stamped" not in argv else 1
+    monkeypatch.setattr(sweep, "_main", fake_main)
+    rc = sweep.main(["--apply", "--limit", "50", "--judge", "codex", "--then-rejudge-stamped"])
+    assert calls == [["--apply", "--limit", "50", "--judge", "codex"],
+                     ["--apply", "--limit", "50", "--judge", "codex", "--rejudge-stamped"]]
+    assert rc == 1
+    calls.clear()
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0 and len(calls) == 1
+    # a dry run does not chain the rejudge: it would only print the same decisions twice
+    calls.clear()
+    sweep.main(["--judge", "codex", "--then-rejudge-stamped"])
+    assert len(calls) == 1
+
+
+def _rejudge_with_tiers(monkeypatch, records, info_map, verdict_map):
+    calls, summaries = _rejudge_env(monkeypatch, records, {}, verdict_map)
+
+    def fake_info(http, pid):
+        v = info_map[pid]
+        if isinstance(v, Exception):
+            raise v
+        return v
+    monkeypatch.setattr(sweep, "fetch_point_info", fake_info)
+    return calls, summaries
+
+
+def test_rejudge_clears_a_stamp_whose_target_is_no_longer_canonical(monkeypatch):
+    """98 % of the audited rejections named a target that had since been demoted. The gate now
+    ignores such stamps; the weekly rejudge also clears them from the record, without a judge call
+    (there is no canonical left to contradict)."""
+    records = [
+        {"id": "r-demoted", "payload": {"data": "cand d", "contradicts_canonical": "t-stable"}},
+        {"id": "r-retired", "payload": {"data": "cand r", "contradicts_canonical": "t-retired"}},
+        {"id": "r-live",    "payload": {"data": "cand l", "contradicts_canonical": "t-canon"}},
+        {"id": "r-gone",    "payload": {"data": "cand g", "contradicts_canonical": "t-gone"}},
+    ]
+    info = {"t-stable": {"text": "T1", "tier": "stable", "retired": False},
+            "t-retired": {"text": "T2", "tier": "canonical", "retired": True},
+            "t-canon": {"text": "T3", "tier": "canonical", "retired": False},
+            "t-gone": None}
+    # only the live pair reaches the judge: a KeyError on any other candidate proves no judge call
+    calls, summaries = _rejudge_with_tiers(monkeypatch, records, info, {"cand l": (True, "YES")})
+    rc = sweep.run_rejudge_stamped(_types.SimpleNamespace(judge="codex", model="m"), dry_run=False)
+    assert rc == 0
+    by = {c["id"]: c for c in calls}
+    assert by["r-demoted"]["clear"] is True and by["r-retired"]["clear"] is True and by["r-gone"]["clear"] is True
+    assert by["r-live"]["contradicts"] == "t-canon" and by["r-live"]["clear"] is False
+    s = summaries[-1]
+    assert s["cleared"] == 3
+    reasons = {c["memory_id"]: c["reason"] for c in s["cleared_ids"]}
+    assert reasons["r-demoted"] == "target-demoted:stable"
+    assert reasons["r-retired"] == "target-retired"
+    assert reasons["r-gone"] == "dangling-canonical"
+
+
+# ---------------------------------------------------------------------------
+# WP-4 fix round F1: marker failures, the zero-canonical tenant trap, the C1 outcome line
+# ---------------------------------------------------------------------------
+
+def test_failed_rotation_marker_is_not_counted_as_checked_and_degrades(monkeypatch):
+    """A failing marker PATCH leaves every canonical never-checked, so next week the sweep takes the
+    same id-ordered head again (the original bug). The summary used to say N/N and outcome ok."""
+    cans = [_can("c1"), _can("c2"), _can("c3")]
+    _, _, summaries, _ = _sweep_rig(monkeypatch, cans, marker_fail="all")
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 0 and s["marker_failed"] == 3
+    assert s["weeks_for_full_pass"] is None, "no rotation progress must not read as a finite pass"
+    assert s["outcome"].startswith("degraded:marker-failed") and rc == 1
+
+
+def test_a_single_failed_marker_is_counted_and_degrades(monkeypatch):
+    """Fail loud: a canonical whose marker keeps failing would sit at the front of the rotation and
+    eat a slot every week, visible nowhere but here."""
+    cans = [_can("c1"), _can("c2"), _can("c3")]
+    _, _, summaries, _ = _sweep_rig(monkeypatch, cans, marker_fail=("c2",))
+    rc = sweep.main(["--apply", "--judge", "codex"])
+    s = summaries[-1]
+    assert s["canonicals_checked"] == 2 and s["marker_failed"] == 1
+    assert s["outcome"].startswith("degraded:marker-failed") and rc == 1
+
+
+def test_a_no_vector_canonical_whose_marker_fails_is_counted_too(monkeypatch):
+    blind = dict(_can("c1"), vector=None)
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [blind, _can("c2")], marker_fail=("c1",))
+    sweep.main(["--apply", "--judge", "codex"])
+    assert summaries[-1]["marker_failed"] == 1 and summaries[-1]["canonicals_checked"] == 1
+
+
+def test_dry_run_reports_no_marker_failures_and_counts_the_pass(monkeypatch):
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1"), _can("c2")], marker_fail="all")
+    rc = sweep.main(["--judge", "codex"])      # dry run: no marker is attempted
+    s = summaries[-1]
+    assert s["marker_failed"] == 0 and s["canonicals_checked"] == 2 and s["outcome"] == "ok" and rc == 0
+
+
+def test_zero_canonicals_under_a_defaulted_tenant_degrades_but_an_explicit_scope_does_not(monkeypatch):
+    """--user-id defaults to the corpus tenant; a wrong tenant scopes to zero canonicals, which used
+    to exit 0 as no-op:zero-canonicals and read ok."""
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [])
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    assert summaries[-1]["outcome"] == "degraded:zero-canonicals-defaulted-tenant"
+    assert summaries[-1]["user_id"] == "u1"
+    for extra in (["--user-id", "someone"], ["--user-id", ""]):     # operator chose the scope
+        assert sweep.main(["--apply", "--judge", "codex", *extra]) == 0
+        assert summaries[-1]["outcome"] == "no-op:zero-canonicals"
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")       # no tenant configured: unscoped
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0
+    assert summaries[-1]["outcome"] == "no-op:zero-canonicals"
+
+
+def test_run_outcome_new_guards_and_precedence():
+    assert sweep.run_outcome(5, 1, 0, None, marker_failed=1) == "degraded:marker-failed:1"
+    assert sweep.run_outcome(0, 0, 0, None, user_id_defaulted=True) == "degraded:zero-canonicals-defaulted-tenant"
+    assert sweep.run_outcome(0, 0, 0, None, user_id_defaulted=False) == "no-op:zero-canonicals"
+    # a marker failure outranks the benign no-op, an abort outranks the marker failure
+    assert sweep.run_outcome(5, 4, 4, None, marker_failed=2).startswith("degraded:marker-failed")
+    assert sweep.run_outcome(5, 4, 4, "ReadTimeout", marker_failed=2).startswith("degraded:aborted:")
+
+
+_REAL_APPEND_SUMMARY = sweep._append_summary
+
+
+def _real_summary(monkeypatch, tmp_path):
+    """Undo the rig's summary stub: the C1 line is written from the real _append_summary."""
+    tmp_path.mkdir(exist_ok=True)
+    monkeypatch.setattr(sweep, "SWEEP_LOG", tmp_path / "sweep.jsonl")
+    monkeypatch.setattr(sweep, "_append_summary", _REAL_APPEND_SUMMARY)
+    out = tmp_path / "outcome.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    return out
+
+
+def test_the_sweep_writes_the_c1_outcome_line(monkeypatch, tmp_path):
+    cans = [_can("c1"), _can("c2")]
+    _sweep_rig(monkeypatch, cans, marker_fail=("c1",))
+    out = _real_summary(monkeypatch, tmp_path / "a")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    text = out.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    assert status == "degraded:marker-failed:1"
+    counts = json.loads(body)
+    assert counts["marker_failed"] == 1 and counts["canonicals_checked"] == 1 and counts["canonicals_total"] == 2
+    # ONE line carries both packages' counts: the receipt's coverage keys and the rotation/direction ones
+    assert {"pairs", "yes", "weeks_for_full_pass", "marker_written", "skipped_no_vector",
+            "stale_canonical_routed", "stale_review_pruned"} <= set(counts)
+    assert len(text.splitlines()) == 1, "exactly one line"
+    # a healthy run writes a bare ok
+    _sweep_rig(monkeypatch, cans)
+    out2 = _real_summary(monkeypatch, tmp_path / "b")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 0
+    assert out2.read_text(encoding="utf-8").startswith("ok {")
+
+
+def test_c1_status_mapping_and_the_defaulted_tenant_line(monkeypatch, tmp_path):
+    assert sweep._c1_status("ok") == "ok"
+    # exit 0 by design, but the run did nothing: it must not read ok in the receipt
+    assert sweep._c1_status("no-op:zero-canonicals") == "degraded:no-op-zero-canonicals"
+    assert sweep._c1_status("fatal:codex-bridge-missing") == "failed:codex-bridge-missing"
+    assert sweep._c1_status("degraded:marker-failed:2") == "degraded:marker-failed:2"
+    assert sweep._c1_status("failed:boom") == "failed:boom"
+    # an outcome outside the sweep's vocabulary reads degraded, never ok
+    assert sweep._c1_status("refused:non-codex-judge") == "degraded:refused:non-codex-judge"
+    # the abort grammar carries a space; the C1 status token ends at the first space
+    assert " " not in sweep._c1_status("degraded:judge-lock-contended: lock held 40 min")
+    _sweep_rig(monkeypatch, [])
+    out = _real_summary(monkeypatch, tmp_path / "c")
+    assert sweep.main(["--apply", "--judge", "codex"]) == 1
+    assert out.read_text(encoding="utf-8").startswith("degraded:zero-canonicals-defaulted-tenant {")
+
+
+def test_outcome_line_never_downgrades_within_a_chained_run(monkeypatch, tmp_path):
+    """main() runs the sweep and then the stamped re-judge against ONE outcome file; the second
+    pass finishing ok must not overwrite the first pass's degraded line."""
+    out = tmp_path / "o.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    sweep._write_outcome("degraded:marker-failed:2", {"a": 1})
+    sweep._write_outcome("ok", {"b": 2})
+    assert out.read_text(encoding="utf-8").startswith("degraded:marker-failed:2 ")
+    sweep._write_outcome("failed:boom", {})
+    assert out.read_text(encoding="utf-8").startswith("failed:boom ")     # worse still wins
+    monkeypatch.delenv("AMS_OUTCOME_FILE")
+    sweep._write_outcome("ok", {})                                         # by hand: nothing to write, nothing raised
+
+
+def test_summary_paths_that_never_reach_the_sweep_loop_write_the_line_too(monkeypatch, tmp_path):
+    """Every terminal path goes through _append_summary, so a failed preflight is a degraded line too."""
+    monkeypatch.setattr(sweep, "SWEEP_LOG", tmp_path / "s.jsonl")
+    out = tmp_path / "o.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(out))
+    _REAL_APPEND_SUMMARY({"outcome": "degraded:qdrant-unreachable", "skipped": "x"})
+    assert out.read_text(encoding="utf-8").startswith("degraded:qdrant-unreachable ")
+
+
+def test_canonical_stale_route_queues_even_when_the_candidate_is_already_queued(monkeypatch, tmp_path):
+    """End to end through the sweep leg with the REAL queue: a candidate already queued for promote
+    used to swallow its canonical-possibly-stale record."""
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    cans = [_can("c1", created="2026-07-01T00:00:00+00:00")]
+    cands = {"c1": [_cand("newer", created="2026-09-01T00:00:00+00:00")]}
+    _sweep_rig(monkeypatch, cans, cands, {"candidate newer": (True, "YES conflict")})
+    monkeypatch.setattr(sweep, "append_review_queue", _REAL_APPEND_REVIEW_QUEUE)
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "newer", "canonical_id": "c9"})
+    sweep.main(["--apply", "--judge", "codex"])
+    recs = [json.loads(ln) for ln in q.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert [(r.get("kind"), r["memory_id"]) for r in recs] == [(None, "newer"), ("canonical-possibly-stale", "newer")]
+
+
+_REAL_APPEND_REVIEW_QUEUE = sweep.append_review_queue
+
+
+def test_the_sweep_prunes_stale_queue_entries_in_apply_mode_only(monkeypatch, tmp_path):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "m1", "stale_canonical_id": "gone",
+                                       "kind": "canonical-possibly-stale"})
+    _sweep_rig(monkeypatch, [_can("c1")])
+    calls = []
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
+    sweep.main(["--judge", "codex"])                      # dry run: the queue is not touched
+    assert calls == []
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1")])
+    monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
+    sweep.main(["--apply", "--judge", "codex"])
+    assert calls == [str(q)] and summaries[-1]["stale_review_pruned"] == 3
+
+
 # --- step outcome contract (C1): the chain receipt must not read a no-op sweep as success ---
 
 def _outcome_line(tmp_path, monkeypatch):
@@ -1366,15 +1753,102 @@ def test_write_outcome_maps_no_op_to_degraded_and_ok_to_counts(tmp_path, monkeyp
     p = _outcome_line(tmp_path, monkeypatch)
     sweep._write_outcome("no-op:codex shim unreachable")
     assert p.read_text(encoding="utf-8") == "degraded:no-op-codex-shim-unreachable {}\n", "no whitespace inside a reason"
+    p.unlink()
     sweep._write_outcome("ok", {"canonicals_checked": 50, "canonicals_total": 122, "pairs": 176, "yes": 2})
-    assert p.read_text(encoding="utf-8") == 'ok {"canonicals_checked":50,"canonicals_total":122,"pairs":176,"yes":2}\n', "one line, last write wins"
-    # degraded:* / fatal:* already exit non-zero: the exit code is their signal, no outcome line
+    assert p.read_text(encoding="utf-8") == 'ok {"canonicals_checked":50,"canonicals_total":122,"pairs":176,"yes":2}\n', "one line"
+    # degraded:* / fatal:* exit non-zero, which the receipt already reads as failed, but it still takes
+    # `work` from the line, so they write theirs too (a fatal one reads failed, and replaces a lesser line)
     p.unlink()
     sweep._write_outcome("degraded:qdrant-unreachable")
+    assert p.read_text(encoding="utf-8") == "degraded:qdrant-unreachable {}\n"
     sweep._write_outcome("fatal:codex-bridge-missing-on-provisioned-box")
-    assert not p.exists()
+    assert p.read_text(encoding="utf-8") == "failed:codex-bridge-missing-on-provisioned-box {}\n"
     monkeypatch.delenv("AMS_OUTCOME_FILE")
     sweep._write_outcome("no-op:lock-held")   # not under ams-step: nothing to write, nothing to raise
+
+
+def test_a_later_ok_never_replaces_an_earlier_no_op_line(tmp_path, monkeypatch):
+    """The weekly unit runs two passes against one outcome file: a shim-down no-op followed by a
+    second pass that finishes ok must still read degraded."""
+    p = _outcome_line(tmp_path, monkeypatch)
+    sweep._write_outcome("no-op:codex-shim-unreachable", {"canonicals_checked": 0})
+    sweep._write_outcome("ok", {"canonicals_checked": 9})
+    assert p.read_text(encoding="utf-8") == 'degraded:no-op-codex-shim-unreachable {"canonicals_checked":0}\n'
+
+
+def test_a_non_zero_exit_says_why_on_stderr_and_a_quiet_no_op_does_not(monkeypatch, capsys):
+    """ams-step.sh takes the stderr tail as the note of a failed run; the chained re-judge prints after a
+    failed sweep pass, so the reason has to be on stderr or the note names the wrong pass."""
+    monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    assert sweep._finish("degraded:marker-failed:2", {"marker_failed": 2}) == 1
+    err = capsys.readouterr().err
+    assert "exit 1" in err and "degraded:marker-failed:2" in err
+    assert sweep._finish("ok") == 0 and sweep._finish("no-op:lock-held") == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_unwritable_or_unserialisable_outcome_never_fails_the_sweep(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(tmp_path / "no-such-dir" / "outcome"))
+    sweep._write_outcome("ok", {"a": 1})                       # OSError: reported, not raised
+    _outcome_line(tmp_path, monkeypatch)
+    sweep._write_outcome("ok", {"a": object()})                # TypeError from json: the same
+    assert capsys.readouterr().out.count("outcome file write failed") == 2
+
+
+def test_chained_passes_write_one_line_that_carries_both_passes(tmp_path, monkeypatch):
+    """--then-rejudge-stamped runs the sweep and then the stamped re-judge under ONE receipt. The
+    second pass adds its counts beside the sweep's (prefixed: both have a `yes`) and can neither
+    replace the first pass's reason nor launder it with its own ok."""
+    p = _outcome_line(tmp_path, monkeypatch)
+
+    def healthy(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("ok", {"stamped_found": 4, "checked": 4, "yes": 1, "no": 3, "cleared": 3})
+        return sweep._finish("ok", {"canonicals_checked": 25, "canonicals_total": 43, "pairs": 12, "yes": 2})
+    monkeypatch.setattr(sweep, "_main", healthy)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 0
+    text = p.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    counts = json.loads(body)
+    assert status == "ok" and len(text.splitlines()) == 1
+    assert counts["canonicals_checked"] == 25 and counts["yes"] == 2, "the sweep's own counts survive"
+    assert counts["rejudge_stamped_found"] == 4 and counts["rejudge_yes"] == 1 and counts["rejudge_cleared"] == 3
+    assert sweep._OUTCOME_SCOPE == "", "the scope never outlives the run"
+
+    p.unlink()
+
+    def shim_down_then_ok(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("ok", {"checked": 4})
+        return sweep._finish("no-op:codex-shim-unreachable")
+    monkeypatch.setattr(sweep, "_main", shim_down_then_ok)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 0
+    status, _, body = p.read_text(encoding="utf-8").partition(" ")
+    assert status == "degraded:no-op-codex-shim-unreachable", "the ok second pass cannot launder the first"
+    assert json.loads(body) == {"rejudge_checked": 4}
+
+    p.unlink()
+
+    def marker_failed_then_lock_held(argv):
+        if "--rejudge-stamped" in argv:
+            return sweep._finish("no-op:lock-held")
+        return sweep._finish("degraded:marker-failed:2", {"marker_failed": 2})
+    monkeypatch.setattr(sweep, "_main", marker_failed_then_lock_held)
+    assert sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"]) == 1
+    assert p.read_text(encoding="utf-8").startswith("degraded:marker-failed:2 "), "the first pass keeps its reason at equal rank"
+
+
+def test_the_outcome_scope_is_reset_when_the_chained_pass_raises(tmp_path, monkeypatch):
+    _outcome_line(tmp_path, monkeypatch)
+
+    def boom(argv):
+        if "--rejudge-stamped" in argv:
+            raise RuntimeError("second pass blew up")
+        return 0
+    monkeypatch.setattr(sweep, "_main", boom)
+    with pytest.raises(RuntimeError):
+        sweep.main(["--apply", "--judge", "codex", "--then-rejudge-stamped"])
+    assert sweep._OUTCOME_SCOPE == ""
 
 
 def test_shim_down_no_op_reaches_the_step_outcome_file(tmp_path, monkeypatch):
@@ -1410,11 +1884,20 @@ def test_normal_run_writes_ok_with_canonical_coverage(tmp_path, monkeypatch):
     monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
     monkeypatch.setattr(_sys, "argv", ["contradiction-sweep.py", "--judge", "codex", "--limit", "2"])
     assert sweep.main() == 0
-    assert p.read_text(encoding="utf-8") == 'ok {"canonicals_checked":2,"canonicals_total":3,"pairs":0,"yes":0}\n'
+    text = p.read_text(encoding="utf-8")
+    status, _, body = text.partition(" ")
+    counts = json.loads(body)
+    assert status == "ok" and len(text.splitlines()) == 1
+    assert {k: counts[k] for k in ("canonicals_checked", "canonicals_total", "pairs", "yes")} == {
+        "canonicals_checked": 2, "canonicals_total": 3, "pairs": 0, "yes": 0}
+    assert counts["weeks_for_full_pass"] == 2 and counts["marker_failed"] == 0, "and the rotation counts beside them"
 
 
 def test_zero_canonicals_run_is_degraded_in_the_receipt(tmp_path, monkeypatch):
     p = _outcome_line(tmp_path, monkeypatch)
+    # no tenant configured: the scope is the operator's, so this is the quiet no-op (a defaulted
+    # tenant that scopes to nothing is degraded:zero-canonicals-defaulted-tenant, tested above)
+    monkeypatch.setattr(sweep.ams_env, "user_id", lambda: "")
     monkeypatch.setattr(sweep, "_codex", _types.SimpleNamespace(health=lambda: {"ok": True}))
     monkeypatch.setattr(sweep, "_preflight_codex_health", lambda: (True, False, {}))
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))

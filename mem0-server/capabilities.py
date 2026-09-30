@@ -49,8 +49,10 @@ tests/test_capabilities.py pins the doc's ids against CAPABILITIES.
 """
 
 import datetime as _dt
+import os
 
 from admission_gate import AdmissionPolicy, default_policy_for_class
+from job_liveness import read_stack_env
 
 # Freshness thresholds for the nightly receipts (dream, prune/gather, backup
 # manifest, dedup report — all daily cadence). One missed night is tolerated
@@ -142,7 +144,9 @@ CAPABILITIES = [
      "required": "brain", "escalation_documented": True},
     {"id": "dedup-job",
      "what": "daily semantic dedup sweep",
-     "probe": "job_liveness.dedup_report_age_h (report rewritten every run)",
+     "probe": ("job_liveness.dedup_summary_age_h + dedup_last_* (the job's own summary: "
+               "degraded on compared_pairs==0 with scanned>1000, a degraded/no-op outcome, "
+               "or no summary within 36h)"),
      "required": "brain", "escalation_documented": True},
     {"id": "memory-index",
      "what": "dream gather step (memory index refresh)",
@@ -203,6 +207,13 @@ CAPABILITIES = [
      "probe": ("job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + "
                "jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h"),
      "required": "optional", "escalation_documented": True},
+    # WP-4: the effective 4C promotion-gate mode was invisible, and on the brain it silently sat at the
+    # code default (shadow: log only) after the cutover, so uncorroborated facts were promoted to canonical.
+    {"id": "promotion-gate",
+     "what": "canonical auto-promotion gate enforces (not only shadows) on the brain",
+     "probe": ("checks.promotion_gate.mode (env MEM0_PROMOTION_GATE_MODE > stack.env > shadow default, "
+               "the dream's own resolution); degraded on a brain that is not enforcing"),
+     "required": "brain", "escalation_documented": True},
 ]
 
 _ROLES = ("brain", "replica")
@@ -281,6 +292,37 @@ def _age_state(age_h):
     if age_h <= DEAD_H:
         return "degraded"
     return "dead"
+
+
+# WP-4: the dedup job read 'alive' for weeks while comparing nothing, because its probe was the
+# mtime of a report it rewrites on every run. The verdict now reads what the job says it did.
+DEDUP_SUMMARY_FRESH_H = 36.0     # daily job: a summary older than this means a night was missed
+DEDUP_BLIND_MIN_SCANNED = 1000   # scanned above this with zero compared pairs is the blind-job bug
+
+
+def _dedup_job_state(jl):
+    """alive | degraded | dead | unknown for the daily semantic dedup.
+
+    degraded: no summary at all, a summary older than 36h, the job's own outcome is degraded or a
+    no-op (it could not run), or it scanned more than 1000 points and compared no pair.
+    dead: the summary is older than the nightly DEAD_H window. A job_liveness dict from before the
+    summary fields existed (no dedup_summary_* key) keeps the old report-age ladder."""
+    if "dedup_summary_age_h" not in jl:
+        return _age_state(jl.get("dedup_report_age_h"))
+    age = jl.get("dedup_summary_age_h")
+    if age is None:
+        return "degraded"
+    if age > DEAD_H:
+        return "dead"
+    if age > DEDUP_SUMMARY_FRESH_H:
+        return "degraded"
+    outcome = str(jl.get("dedup_last_outcome") or "")
+    if outcome.startswith("degraded") or outcome.startswith("no-op"):
+        return "degraded"
+    scanned, compared = jl.get("dedup_last_scanned"), jl.get("dedup_last_compared_pairs")
+    if isinstance(scanned, (int, float)) and scanned > DEDUP_BLIND_MIN_SCANNED and compared == 0:
+        return "degraded"
+    return "alive"
 
 
 def _ok_state(check):
@@ -589,7 +631,7 @@ def _state_for(row, checks, stack_version=None, now_s=None):
     if cid == "backup-pipeline":
         return _age_state(jl.get("backup_manifest_age_h"))
     if cid == "dedup-job":
-        return _age_state(jl.get("dedup_report_age_h"))
+        return _dedup_job_state(jl)
     if cid == "memory-index":
         return _age_state(jl.get("gather_age_h"))
     if cid == "sweep-job":
@@ -615,7 +657,32 @@ def _state_for(row, checks, stack_version=None, now_s=None):
         return _offline_outbox_state(jl)
     if cid == "job-queue":
         return _job_queue_state(jl)
+    if cid == "promotion-gate":
+        return _promotion_gate_state(checks.get("promotion_gate"))
     return "unknown"           # a row without an evaluator is a named blind spot
+
+
+def promotion_gate_health(role, environ=None, stack_env_path=None) -> dict:
+    """The effective 4C promotion-gate mode: {role, mode, source}. Resolution is the dream's own
+    (scripts/wsl/dream-consolidate.py): env MEM0_PROMOTION_GATE_MODE, else stack.env, else 'shadow'.
+    Never raises. Informational input to the promotion-gate capability row."""
+    environ = os.environ if environ is None else environ
+    raw = (environ.get("MEM0_PROMOTION_GATE_MODE") or "").strip()
+    source = "env"
+    if not raw:
+        raw = (read_stack_env(stack_env_path).get("MEM0_PROMOTION_GATE_MODE") or "").strip()
+        source = "stack.env"
+    if not raw:
+        raw, source = "shadow", "default"
+    return {"role": role, "mode": raw.lower(), "source": source}
+
+
+def _promotion_gate_state(check):
+    """alive when the brain enforces; degraded (the WARN state) when the brain only shadows or has the
+    gate off; unknown elsewhere - the dream, and so the gate, runs on the brain alone."""
+    if not isinstance(check, dict) or check.get("role") != "brain":
+        return "unknown"
+    return "alive" if check.get("mode") == "enforce" else "degraded"
 
 
 def _job_queue_state(jl):

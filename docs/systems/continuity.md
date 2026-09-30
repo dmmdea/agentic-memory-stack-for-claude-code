@@ -30,8 +30,8 @@ Stop / PreCompact → finalize_episode()
                      → episodes.state = 'complete'
                      → goal_text + summary_text set from L1a extraction
 
-Stale-sweep (v0.18+) → episodes.state = 'abandoned'
-                         → for in_progress rows older than N days
+Stale-sweep (episodic-reconcile, Sundays) → episodes.state = 'abandoned'
+                         → for in_progress rows whose last checkpoint is older than 7 days
 ```
 
 The critical property: after the FIRST user message in any session, there is
@@ -173,7 +173,7 @@ silently skipped (no error output).
 |---|---|---|
 | `in_progress` | `upsert_in_progress_episode()` | Every UserPromptSubmit |
 | `complete` | `finalize_episode()` | Stop / PreCompact hook |
-| `abandoned` | stale-sweep (v0.18+) | Weekly sweep of old in_progress rows |
+| `abandoned` | `episodic-reconcile.py` (`abandon_stale_in_progress`) | Sunday sweep: `in_progress` rows whose `ended_at` (the last checkpoint) is older than `--stale-days` (7); the count is in the receipt (`abandoned_stale_in_progress`). Sessions that produced no extraction used to stay `in_progress` forever. |
 
 **Idempotency:** `upsert_in_progress_episode` uses a SELECT-then-INSERT/UPDATE
 pattern (not UPSERT SQL) to handle the `state='in_progress'` filter correctly.

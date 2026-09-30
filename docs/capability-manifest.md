@@ -54,7 +54,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `dream-cycle` | nightly dream consolidation runs | job_liveness.last_dream_age_h (throttle marker content) | brain | F17 |
 | `drift-guard` | retrieval-drift guard compares around each consolidation | retrieval_drift (~/.mem0/retrieval-drift-state.json) | brain | F17 |
 | `backup-pipeline` | daily stack snapshot + manifest writer | job_liveness.backup_manifest_age_h (newest manifest age) | brain | F17 |
-| `dedup-job` | daily semantic dedup sweep | job_liveness.dedup_report_age_h (report rewritten every run) | brain | F17 |
+| `dedup-job` | daily semantic dedup sweep | job_liveness.dedup_summary_age_h + dedup_last_* (the job's own summary: degraded on compared_pairs==0 with scanned>1000, a degraded/no-op outcome, or no summary within 36h) | brain | F17 |
 | `memory-index` | dream gather step (memory index refresh) | job_liveness.gather_age_h (gather.json receipt age) | brain | F17 |
 | `sweep-job` | dream prune step (consolidation-completed receipt) | job_liveness.prune_age_h (prune.json receipt age) | brain | F17 |
 | `codex-auth` | Codex CLI auth serving dream judgment | derived: a fresh dream ran, therefore its judge authenticated | brain | F17 |
@@ -67,10 +67,22 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `brand-isolation` | brand-scoped retrieval isolation | checks.admission_probe.brand_rejected (read half) + job_liveness.brand_scope_misscoped/brand_scope_age_h (nightly write-side audit) | both | F17 |
 | `offline-outbox` | shim outbox queue/replay when the authority is unreachable | job_liveness.outbox_depth + outbox_replayed_age_h + outbox_drain_log_age_h — evaluated on the REPLICA only (F8 keeps it non-convicting on a brain box) | replica | F17 |
 | `job-queue` | durable two-phase job queue (jobs.py): claim/receipt/reap for adopted scheduled jobs | job_liveness.jobs_heartbeat_age_h (age-gates the mirror) + jobs_failed_24h + jobs_oldest_running_age_h + jobs_oldest_queued_age_h | optional | W6 |
+| `promotion-gate` | canonical auto-promotion gate enforces (not only shadows) on the brain | checks.promotion_gate.mode (env MEM0_PROMOTION_GATE_MODE > stack.env > shadow default, the dream's own resolution); degraded on a brain that is not enforcing | brain | WP-4 |
 
 Verdict rules per probe family (all thresholds live in `capabilities.py`):
 
-- **Nightly receipts** (`dream-cycle`, `backup-pipeline`, `dedup-job`, `memory-index`,
+- **`promotion-gate`** reports the 4C promotion gate's effective mode (`checks.promotion_gate.mode`, also
+  echoed as the top-level `promotion_gate_mode` on `/health/deep`), resolved the way the dream does:
+  `MEM0_PROMOTION_GATE_MODE` in the environment, else `stack.env`, else the `shadow` default.
+  `alive` when the brain enforces; `degraded` (the WARN state, never `dead_required`) when the brain
+  only shadows or has the gate off; `unknown` on a replica or with no check. The value itself is set by
+  the installer and the operator, not by this row.
+- **`dedup-job`** reads the job's own work summary (`~/.mem0/dedup-summary.jsonl`, last row), not
+  the mtime of a report it rewrites on every run (that proved "ran", and the job compared nothing
+  for weeks behind it). `degraded` when: no summary exists, the summary is older than 36 h, the
+  job's own outcome is `degraded:*` or `no-op:*`, or it scanned more than 1000 points and
+  compared zero pairs; `dead` past 96 h.
+- **Nightly receipts** (`dream-cycle`, `backup-pipeline`, `memory-index`,
   `sweep-job`): age ≤ 48h → `alive` (one missed night tolerated); ≤ 96h → `degraded`; older →
   `dead`; no signal → `unknown`.
 - **`bm25-sparse-leg`**: `sparse_leg.ok: false` → `dead`; alive but coverage < 0.95 → `degraded`

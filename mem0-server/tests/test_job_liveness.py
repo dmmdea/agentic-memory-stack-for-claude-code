@@ -41,6 +41,9 @@ BOM = chr(0xFEFF)
 
 JL_KEYS = {"role", "last_dream_age_h", "prune_age_h", "gather_age_h",
            "backup_manifest_age_h", "dedup_report_age_h",
+           # WP-4: the dedup job's own work summary (last ~/.mem0/dedup-summary.jsonl row)
+           "dedup_summary_age_h", "dedup_last_outcome", "dedup_last_scanned",
+           "dedup_last_compared_pairs", "dedup_last_skipped_no_vector",
            "morning_summary_age_h", "morning_summary_sections_48h",
            # W4 session-scoped receipts (additive -- the cross-track contract
            # grows by ADDING keys; renaming one breaks capabilities.py and the
@@ -189,6 +192,12 @@ def test_collector_full_fixture_all_fields(tmp_path):
     dedup = mem0_dir / "dedup-report.jsonl"
     dedup.write_text("{}\n", encoding="utf-8")
     os.utime(dedup, (now_s - 6 * 3600, now_s - 6 * 3600))
+    summary = mem0_dir / "dedup-summary.jsonl"
+    older = {"ts": "2023-11-14T12:00:00+00:00", "outcome": "ok", "scanned": 1, "compared_pairs": 0}
+    newest = {"ts": dt.datetime.fromtimestamp(now_s - 5 * 3600, dt.timezone.utc).isoformat(),
+              "outcome": "ok", "deletions": 3, "scanned": 16000, "skipped_no_vector": 4,
+              "compared_pairs": 90_000_000}
+    summary.write_text(json.dumps(older) + "\n" + json.dumps(newest) + "\n", encoding="utf-8")
 
     win_home = tmp_path / "winhome"
     state = win_home / ".claude" / "state"
@@ -238,6 +247,12 @@ def test_collector_full_fixture_all_fields(tmp_path):
     assert out["role"] == "brain"
     assert out["backup_manifest_age_h"] == 12.0   # newest manifest, not oldest
     assert out["dedup_report_age_h"] == 6.0
+    # the LAST summary row, not the first, and its work counts
+    assert out["dedup_summary_age_h"] == 5.0
+    assert out["dedup_last_outcome"] == "ok"
+    assert out["dedup_last_scanned"] == 16000
+    assert out["dedup_last_compared_pairs"] == 90_000_000
+    assert out["dedup_last_skipped_no_vector"] == 4
     assert out["last_dream_age_h"] == 10.0
     assert out["prune_age_h"] == 10.0
     assert out["gather_age_h"] == 10.0

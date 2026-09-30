@@ -62,7 +62,7 @@ jobs:
         # and test_judge_plan_schema.py holds that schema to the same corpus the Go decoder
         # test runs. Without it here the schema side would importorskip in CI - a test that
         # never runs is not a gate.
-        run: python -m pip install --disable-pip-version-check --quiet pytest httpx fastapi fastmcp jsonschema
+        run: python -m pip install --disable-pip-version-check --quiet pytest httpx fastapi fastmcp jsonschema numpy
       # The explicit list below is the HEADLESS subset: every file runs green on a
       # clean runner with no live stack (no Qdrant/mem0/llama-swap/Codex). The
       # remaining files in mem0-server/tests are the live-stack suites — they ship
@@ -79,6 +79,9 @@ jobs:
             mem0-server/tests/test_admission_gate.py \
             mem0-server/tests/test_ams01_history_window.py \
             mem0-server/tests/test_ams57_counts.py \
+            mem0-server/tests/test_ams_env.py \
+            mem0-server/tests/test_bundle_self_echo.py \
+            mem0-server/tests/test_automemory_dedup_exemption.py \
             mem0-server/tests/test_autopromote_actor.py \
             mem0-server/tests/test_canonical_key_provider.py \
             mem0-server/tests/test_capabilities.py \
@@ -108,8 +111,10 @@ jobs:
             mem0-server/tests/test_jobs_queue.py \
             mem0-server/tests/test_pair_cache.py \
             mem0-server/tests/test_reranker.py \
+            mem0-server/tests/test_semantic_dedup.py \
             mem0-server/tests/test_support_tier.py \
             mem0-server/tests/test_shim_offline.py \
+            mem0-server/tests/test_stamp_tier_resolution.py \
             mem0-server/tests/test_sparse_health.py \
             mem0-server/tests/test_systemd_parity.py \
             mem0-server/tests/test_tier_parity.py \
@@ -141,6 +146,7 @@ jobs:
             claude-config/tests \
             scripts/wsl/tests/test_ams_health_stamp.py \
             scripts/wsl/tests/test_ams_step_outcome.py \
+            scripts/wsl/tests/test_curation_step_receipts.py \
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \
             scripts/wsl/test_wiki_index.py \

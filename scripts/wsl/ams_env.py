@@ -101,6 +101,27 @@ def user_id() -> str:
     return kv.get("MEM0_DEFAULT_USER_ID") or kv.get("MEM0_WSL_USER") or ""
 
 
+def dense_vector(point) -> list | None:
+    """The dense embedding of a Qdrant point, whatever shape with_vector returned.
+
+    The live collection carries an unnamed dense vector plus a named 'bm25' sparse vector, so
+    with_vector=true yields {"": [768 floats], "bm25": {"indices": [...], "values": [...]}}, not a
+    bare list. A bare list is returned as is; a dict gives the unnamed "" entry, else the first
+    list-valued entry (a sparse entry is a dict, never a list); anything else is None. Callers
+    COUNT the None results - a silent skip is how the dedup ran blind for weeks."""
+    v = point.get("vector") if isinstance(point, dict) else None
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        dense = v.get("")
+        if isinstance(dense, list):
+            return dense
+        for val in v.values():
+            if isinstance(val, list):
+                return val
+    return None
+
+
 def state_dir() -> Path:
     d = _mem0_dir() / "maintenance"
     d.mkdir(parents=True, exist_ok=True)
