@@ -198,7 +198,7 @@ Wraps `GET /v1/memories`. Client-clamps `limit` at 500 (the server clamps too). 
 Wraps `GET /v1/memories/{id}` — exact read (text, metadata, tier, timestamps). Call it before update/delete/promote to confirm the right record.
 
 ### `memory_recall(query, brand=None, initiative=None, project=None, user_id="youruser")` → dict
-The proactive start-of-task pull: wraps `POST /v1/context/bundle` (checkpoint suppressed) plus a `query_class="canonical"` search. Returns `{ok, canonical, memories, goals, open_questions}` — a branded recall returns that brand's facts plus the brand-neutral set; brandless returns neutral only.
+The explicit, deeper recall, in addition to the `[MEMORY CONTEXT]` block the per-prompt hook already injects: use it when that block is empty, when you need canonical facts (the hook never injects them) or when you need another brand's scope. Wraps `POST /v1/context/bundle` (checkpoint suppressed) plus a `query_class="canonical"` search. Returns `{ok, canonical, memories, goals, open_questions}` — a branded recall returns that brand's facts plus the brand-neutral set; brandless returns neutral only.
 
 ### `memory_update(memory_id, text)` → dict
 Wraps `PUT /v1/memories/{id}`. Text only. Queues to the offline outbox when the authority is unreachable.

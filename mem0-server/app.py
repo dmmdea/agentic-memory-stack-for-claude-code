@@ -3126,9 +3126,10 @@ class ContextBundleIn(BaseModel):
     tier: Optional[str] = "frontier"
     transcript_path: Optional[str] = None
     hook_contract_version: Optional[str] = None
-    # v1.0 A1 (mandated-pull): the memory_recall MCP verb pulls the bundle on demand
-    # because the per-turn UserPromptSubmit hook is dead in the VS Code / Agent-SDK
-    # runtime. A manual pull MUST NOT upsert an episode or every recall would pollute
+    # v1.0 A1 (mandated-pull): the memory_recall MCP verb pulls the bundle on demand,
+    # an explicit deeper recall in addition to what the per-prompt UserPromptSubmit
+    # hook injects (empty block, canonical facts, another brand's scope). A manual pull
+    # MUST NOT upsert an episode or every recall would pollute
     # the SessionStart resume banner with a synthetic session, so it passes
     # checkpoint=False. The hook path omits it (default True) and keeps the original
     # checkpoint-first contract unchanged.
