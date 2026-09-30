@@ -168,7 +168,7 @@ Get-Content "$env:USERPROFILE\.claude\logs\dream.log" -Tail 40
 ```
 
 **Fixes:**
-- **Missed night (PC off, etc.)** → self-healing: at the next session start, `dream-catchup.ps1` re-runs a dream that's >48 h stale or has queued promotions. On a replica both are no-ops since 1.28.4 (the log line says `role=replica`): the brain's `ams-nightly.target` is the dream, so read its journal there. To force one now: `dream-consolidate.ps1 -Force` (respects the shared Codex lock).
+- **Missed night (PC off, etc.)** → self-healing: at the next session start, `dream-catchup.ps1` re-runs a dream that's >48 h stale or has queued promotions. On a replica both are no-ops since 1.28.4 (the log line says `role=replica`): the brain's `ams-nightly.target` is the dream, so read its journal there. A replica's `dream-consolidate.ps1 -Force` exits on its role and consolidates nothing (its log says `skipping: role=replica`). To force a dream now, run it on the authority: `ssh <brain-alias> 'bash ~/apps/mem0-scripts/ams-dream-now.sh'` (below).
 - **Task missing/broken** → re-register idempotently: rerun `install\2-windows-config.ps1`.
 - **Ran but 0 insights** → often correct (no consolidation-worthy evidence). Check the log's Codex output preview.
 - The MEMORY.md index refresh is decoupled (`memory-index-refresh.ps1`, 6-h throttle) — a down dream no longer freezes the index.
@@ -181,8 +181,11 @@ tail -20 ~/.mem0/maintenance/receipts.jsonl                    # one line per st
 cat ~/.mem0/maintenance/dream/gather.json | jq '.signals|length'
 curl -s http://<authority>:18791/health/maintenance | jq '{ok, failed_steps, degraded_steps, stale_steps, pool, usage, judge_transport}'
 ~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/codex-usage-report.py --gate   # the 25 % reserve verdict the dream read
-systemctl --user start ams-step-dream.service                 # a hand run (its own 23 h throttle still applies; --force only by hand)
+systemctl --user start ams-step-dream.service                 # the chain's own step: after a good night it is a receipted no-op ("guard: ..."), else the dream's 23 h throttle applies
+bash ~/apps/mem0-scripts/ams-dream-now.sh                     # a real forced dream now (see below)
 ```
+
+**Forcing a dream by hand.** `ams-dream-now.sh` (deployed to `~/apps/mem0-scripts` by `install/linux-authority.sh`, source `scripts/wsl/ams-dream-now.sh`) starts one dream run on the authority, outside the chain guard. It takes no arguments and reads the install record in `~/.mem0/stack.env`: it refuses (exit 3, naming the ssh form above) on any box that is not `MEM0_ROLE=brain` with `MEM0_HOST_KIND=native`, and stops with exit 2 when `MEM0_SECRETS_DIR` or one of the two `.cred` files is missing. It runs a transient user unit `ams-dream-now-<UTC timestamp>` with the same two `LoadCredentialEncrypted=` credentials, the same `Environment=` lines and the same `codex-usage-report.py --probe` pre-step as `ams-step-dream.service`, and the unit's own command without `--guarded`, plus `--force`. Two consequences: the run goes through `ams-step.sh`, so it is receipted as step `dream` like any chain step (and, like any run that is not the stamping step, it never stamps `last-chain-success`); and `--force` bypasses only the dream's own 23 h throttle, so the judge lock (a run overlapping the nightly is a quiet, receipted skip) and the Codex quota reserve (`skipping: codex quota gate`) still apply. The dream's output streams to your terminal; the unit's journal is `journalctl --user -u ams-dream-now-<timestamp>`; the exit status is the unit's. There is deliberately no `--dry-run` here: a dry run would still be receipted as a `dream` step and refresh the dream's freshness in `/health/maintenance`.
 
 A receipt with `note: "skipping: codex quota gate ..."` is the reserve rule, not a failure; `"guard: chain succeeded since the last 03:00 boundary"` is the boot re-run of a completed night; `"weekly: not Sun; no-op"` is a weekday. A step with `ok:false` names its exit code and the tail of its stderr in `note`.
 
