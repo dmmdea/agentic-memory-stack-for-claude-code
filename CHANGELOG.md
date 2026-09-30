@@ -4,6 +4,26 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.3 — a message from another agent session is never an operator correction (2026-09-30)
+
+### Fixed
+- **Messages relayed from another agent session were captured and posted as operator corrections.**
+  1.32.2 stopped task notifications, but its first drain still posted 14 peer-session messages: the
+  harness delivers a message from another agent session as the user turn (opening with the
+  `<cross-session-message` wrapper, or with its "Another Claude session sent a message:" line), and a
+  peer message that quotes "revert that" or "that's wrong" matched the correction patterns. The new
+  `Test-RelayedAgentMessage` (the wrapper at the start, or after the announcement line; the real tag,
+  followed by whitespace or `>`) makes `Test-CorrectionLikePrompt` return false, and
+  `learn-rules-drain.ps1` drops such a queued line like a machine turn. The C10 machine-turn rule is
+  unchanged: it keeps a peer message human-shaped for the memory block.
+
+### Upgrade notes
+- **PC-only.** The capture and the drain run on each PC: re-run the installer there (on Windows,
+  `install/2-windows-config.ps1`, then the WSL `deploy.sh` and `3-verify.ps1`). The authority does not
+  run them and needs no redeploy; it can take this release at its next installer run.
+- **Peer messages already posted stay in the store** until removed: `source=learn-rules`, text
+  starting with the wrapper or the announcement line.
+
 ## 1.32.2 — a task notification is never an operator correction, and the brand backfill proposes only what the resolver would route (2026-09-30)
 
 ### Fixed
