@@ -45,8 +45,9 @@ newest 8. A collection that stops existing leaves its last (up to 8) snapshots b
 plain files an operator can delete.
 
 A failed secondary snapshot warns and leaves its manifest entry `null`, but does not fail the
-night: those collections are small and rebuildable, and a red night stops the off-box copy. The
-collection list itself is read strictly: a `GET /collections` that fails, or answers with a body that
+night: those collections are small, episodes and wiki are rebuildable (the entities snapshot is the
+only copy of that collection, which is why a miss reads `degraded` and not clean), and a red night
+stops the off-box copy. The collection list itself is read strictly: a `GET /collections` that fails, or answers with a body that
 is not a collection list, reads `degraded` (`secondary-snapshot-failed`), never a clean night with no
 secondary snapshotted.
 
