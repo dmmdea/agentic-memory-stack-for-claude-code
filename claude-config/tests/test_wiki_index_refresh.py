@@ -36,7 +36,9 @@ def _fixture(tmp_path: Path, wsl_exit: int = 0):
         'tar -tf - >> "$FAKE_LOG" 2>/dev/null\n'
         f"exit {wsl_exit}\n", encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    env = {"HOME": str(home), "PATH": f"{b}{os.pathsep}/usr/bin{os.pathsep}/bin", "FAKE_LOG": str(tmp_path / "wsl.log")}
+    env = {"HOME": str(home), "USERPROFILE": str(home),
+           "HOMEDRIVE": os.path.splitdrive(str(home))[0], "HOMEPATH": os.path.splitdrive(str(home))[1],
+           "PATH": f"{b}{os.pathsep}/usr/bin{os.pathsep}/bin", "FAKE_LOG": str(tmp_path / "wsl.log")}
     return home, vault, env
 
 

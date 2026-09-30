@@ -216,7 +216,9 @@ def test_a_failed_build_leaves_no_last_build_and_fails_the_step(tmp_path):
     (home / "wiki-index" / "last-build").unlink()
     # the same run again with a builder that exits 1
     (tmp_path / "bin" / "fakepy").write_text('#!/usr/bin/env bash\nexit 1\n', encoding="utf-8")
-    env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home),
+               HOMEDRIVE=os.path.splitdrive(str(home))[0], HOMEPATH=os.path.splitdrive(str(home))[1],
+               PATH=f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
                WIKI_PY=str(tmp_path / "bin" / "fakepy"), WIKI_PULL_KEY=str(tmp_path / "nokey"), WIKI_SOURCES="op@up")
     r = subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True, env=env, timeout=60, check=False)
     assert r.returncode == 1
@@ -340,7 +342,9 @@ def test_a_pull_whose_build_fails_does_not_refresh_the_stamp_and_the_next_skip_n
     before = {n: (home / "wiki-index" / n).read_text() for n in ("last-pull", "last-build")}
     b = _fake_bin(tmp_path, f'cat "{tar}"\n')
     (b / "fakepy").write_text('#!/usr/bin/env bash\nexit 1\n', encoding="utf-8")
-    env = dict(os.environ, HOME=str(home), PATH=f"{b}{os.pathsep}{os.environ['PATH']}",
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home),
+               HOMEDRIVE=os.path.splitdrive(str(home))[0], HOMEPATH=os.path.splitdrive(str(home))[1],
+               PATH=f"{b}{os.pathsep}{os.environ['PATH']}",
                WIKI_PY=str(b / "fakepy"), WIKI_PULL_KEY=str(tmp_path / "nokey"), WIKI_SOURCES="op@up",
                AMS_OUTCOME_FILE=str(tmp_path / "outcome"))
     r = subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True, encoding="utf-8", errors="replace",
