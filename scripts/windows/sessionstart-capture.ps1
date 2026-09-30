@@ -13,8 +13,8 @@
 # land in mem0 even with the per-turn hooks dead. No scheduler, no per-turn dependency, no <24h timer.
 #
 # Fire-and-forget: spawns the worker DETACHED and exits 0 immediately so session start never blocks.
-# A per-transcript watermark prevents re-capturing the same prior session on repeated starts; the
-# extractor's own 10-min throttle + mem0 dedup bound cost further.
+# A per-transcript watermark (file name + mtime, not path) prevents re-capturing the same prior session
+# on repeated starts; the extractor's own 10-min throttle + mem0 dedup bound cost further.
 #
 # Claude Code SessionStart payload (stdin JSON): { session_id, transcript_path, cwd, source,
 # hook_event_name }; source in {startup, resume, clear, compact}.
@@ -153,13 +153,21 @@ try {
 } catch {}
 
 # Watermark: skip if this exact transcript@mtime was already captured by a previous SessionStart.
+# The key is the file name + the mtime ticks, never the path. The file name is the session uuid, so it
+# is unique across workspaces; the directory is only the way this start happened to reach the file.
+# An alias directory lists one transcript under two paths, and a path-keyed watermark took the
+# other path for a new transcript and captured it again (a second extraction and a second episode).
 $wm = Join-Path $stateDir 'last-sessionstart-capture'
-$sig = $prior.FullName + '|' + $prior.LastWriteTimeUtc.Ticks
+$sig = $prior.Name + '|' + $prior.LastWriteTimeUtc.Ticks
+# A watermark written by an earlier release is <full path>|<ticks>, through whichever of the real or an
+# alias path won the sort. Its tail is this same signature, so it still counts as captured and the
+# upgrade does not cost one extra capture.
+$legacyTail = [string][System.IO.Path]::DirectorySeparatorChar + $sig
 try {
     if (Test-Path $wm) {
         $prev = (Get-Content -Path $wm -Raw -ErrorAction SilentlyContinue)
         if ($prev) { $prev = $prev.Trim() }
-        if ($prev -eq $sig) { exit 0 }
+        if ($prev -and ($prev -eq $sig -or $prev.EndsWith($legacyTail, [System.StringComparison]::OrdinalIgnoreCase))) { exit 0 }
     }
 } catch {}
 

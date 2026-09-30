@@ -80,6 +80,11 @@ BeforeAll {
         return $link
     }
 
+    function script:Remove-Junction($Sb, [string]$Path) {
+        try { [System.IO.Directory]::Delete($Path) } catch {}
+        $Sb.Links.Remove($Path)
+    }
+
     # Delete the LINKS only. [Directory]::Delete on a junction removes the reparse point and never the target.
     function script:Remove-CaptureRoot($Sb) {
         foreach ($l in @($Sb.Links)) { try { [System.IO.Directory]::Delete($l) } catch {} }
@@ -92,6 +97,11 @@ BeforeAll {
         Set-Content -LiteralPath $path -Value '{"message":{"role":"user","content":"hello"}}' -Encoding UTF8
         [System.IO.File]::SetLastWriteTimeUtc($path, [datetime]::UtcNow.AddMinutes(-$AgeMinutes))
         return @{ Id = $id; Name = ($id + '.jsonl'); Path = $path; Ticks = (Get-Item -LiteralPath $path).LastWriteTimeUtc.Ticks }
+    }
+
+    function script:Set-TranscriptAge([string]$Path, [double]$AgeMinutes) {
+        [System.IO.File]::SetLastWriteTimeUtc($Path, [datetime]::UtcNow.AddMinutes(-$AgeMinutes))
+        return (Get-Item -LiteralPath $Path).LastWriteTimeUtc.Ticks
     }
 
     # the standard scene: one real project dir, two junction aliases of it, four sessions (S0 newest)
@@ -148,6 +158,23 @@ BeforeAll {
     function script:Reset-CaptureState($Sb) {
         Get-ChildItem -LiteralPath $Sb.Home -Filter 'spawn-*.txt' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         Get-ChildItem -LiteralPath $Sb.State -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    # ---- the watermark file --------------------------------------------------------------------------
+    function script:Get-Watermark($Sb) {
+        if (-not (Test-Path -LiteralPath $Sb.Wm)) { return $null }
+        return ([string](Get-Content -LiteralPath $Sb.Wm -Raw)).Trim()
+    }
+    # written the way the live file is: UTF-8 with a BOM and a trailing newline (Windows PowerShell 5.1 Set-Content)
+    function script:Set-Watermark($Sb, [string]$Text) {
+        [System.IO.File]::WriteAllText($Sb.Wm, $Text + "`r`n", (New-Object System.Text.UTF8Encoding($true)))
+    }
+    # the hook only rewrites the watermark after it spawned, so an untouched file proves "no capture"
+    # without waiting on a detached worker: pin the mtime in the past, compare after the run
+    function script:Set-WatermarkAge($Sb) {
+        $t = [datetime]::UtcNow.AddHours(-1)
+        [System.IO.File]::SetLastWriteTimeUtc($Sb.Wm, $t)
+        return $t
     }
 }
 
@@ -246,6 +273,118 @@ Describe 'SessionStart capture through a junction alias in projects/' {
                     $lines.Count | Should -Be 1 -Because "run $run"
                     $lines[0] | Should -Be ('SessionStart ' + (Join-Path $first $t.Name)) -Because "run $run"
                 }
+            } finally { Remove-CaptureRoot $sb }
+        }
+    }
+
+    Context 'the watermark' {
+        It 'is keyed by the file name and the mtime ticks - never by the directory the file was reached through' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                Invoke-Capture $sb
+                @(Get-SpawnLines $sb 1 1).Count | Should -Be 1
+                $wm = Get-Watermark $sb
+                $wm | Should -Be ($sb.S[0].Name + '|' + $sb.S[0].Ticks)
+                $wm | Should -Not -Match '[\\/]' -Because 'a path in the watermark is what made the alias flip look like a new transcript'
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'a watermark in the new format suppresses the capture whichever path the listing offers' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                Set-Watermark $sb ($sb.S[0].Name + '|' + $sb.S[0].Ticks)
+                $pinned = Set-WatermarkAge $sb
+                Invoke-Capture $sb
+                @(Get-SpawnLines $sb 0 2).Count | Should -Be 0
+                (Get-Item -LiteralPath $sb.Wm).LastWriteTimeUtc | Should -Be $pinned -Because 'a suppressed start must not touch the watermark'
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'a second start does not capture the same transcript again when the path it is reached through has changed (the original failure)' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-CaptureRoot
+            try {
+                # Two aliases and no real path under projects\, so whichever alias the first start used, the
+                # transcript is reachable through the other one afterwards - whatever the sort does with ties.
+                $elsewhere = Add-Dir $sb (Join-Path $sb.Root 'elsewhere\proj-x')
+                $aliases = @((Add-Junction $sb 'a-alias' $elsewhere), (Add-Junction $sb 'z-alias' $elsewhere))
+                $t = Add-Transcript $elsewhere 5
+                Invoke-Capture $sb
+                $first = @(Get-SpawnLines $sb 1 1)
+                $first.Count | Should -Be 1
+                $used = @($aliases | Where-Object { $first[0] -like ('SessionStart ' + $_ + '\*') })
+                $used.Count | Should -Be 1 -Because 'the first start went through exactly one alias'
+                Remove-Junction $sb $used[0]
+                $left = @(Get-ChildItem -Path (Join-Path $sb.Projects (Join-Path '*' '*.jsonl')) -File)
+                $left.Count | Should -Be 1 -Because 'the same transcript, at the same mtime, is now listed under the other alias only'
+                $left[0].FullName | Should -Not -Be (Join-Path $used[0] $t.Name)
+                $pinned = Set-WatermarkAge $sb
+                Invoke-Capture $sb   # another session's start: a fresh marker key, so only the watermark can stop it
+                @(Get-SpawnLines $sb 1 2).Count | Should -Be 1 -Because 'nothing about the transcript changed but the path it was listed under'
+                (Get-Item -LiteralPath $sb.Wm).LastWriteTimeUtc | Should -Be $pinned
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'a watermark an earlier release wrote (full path plus ticks) through the <Form> path still suppresses the capture' -ForEach @(
+            @{ Form = 'Real' }, @{ Form = 'AliasA' }, @{ Form = 'AliasZ' }
+        ) {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                $legacy = (Join-Path $sb[$Form] $sb.S[0].Name) + '|' + $sb.S[0].Ticks
+                Set-Watermark $sb $legacy
+                $pinned = Set-WatermarkAge $sb
+                Invoke-Capture $sb
+                @(Get-SpawnLines $sb 0 2).Count | Should -Be 0 -Because 'upgrading must not cost one extra capture'
+                (Get-Item -LiteralPath $sb.Wm).LastWriteTimeUtc | Should -Be $pinned
+                Get-Watermark $sb | Should -Be $legacy
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'a watermark of a different file whose name merely ends the same way does not suppress the capture' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                $s0 = $sb.S[0]
+                Set-Watermark $sb ('x' + $s0.Name + '|' + $s0.Ticks)   # no directory separator before the name: not a path to this file
+                Invoke-Capture $sb
+                $lines = @(Get-SpawnLines $sb 1 1)
+                $lines.Count | Should -Be 1
+                $lines[0] | Should -Be ('SessionStart ' + (Join-Path $sb.Real $s0.Name))
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'a genuinely newer transcript is still captured, on its real path' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                Set-Watermark $sb ($sb.S[0].Name + '|' + $sb.S[0].Ticks)
+                $newer = Add-Transcript $sb.Real 1
+                Invoke-Capture $sb
+                $lines = @(Get-SpawnLines $sb 1 1)
+                $lines.Count | Should -Be 1
+                $lines[0] | Should -Be ('SessionStart ' + (Join-Path $sb.Real $newer.Name))
+                Get-Watermark $sb | Should -Be ($newer.Name + '|' + $newer.Ticks)
+            } finally { Remove-CaptureRoot $sb }
+        }
+
+        It 'the same transcript with a new mtime is captured again (the watermark is the name AND the ticks)' {
+            if ($script:skipReason) { Set-ItResult -Skipped -Because $script:skipReason; return }
+            $sb = New-JunctionSandbox
+            try {
+                $s0 = $sb.S[0]
+                Invoke-Capture $sb
+                @(Get-SpawnLines $sb 1 1).Count | Should -Be 1
+                Get-Watermark $sb | Should -Be ($s0.Name + '|' + $s0.Ticks)
+                $ticks = Set-TranscriptAge $s0.Path 0.5   # the session went on and the file grew
+                $ticks | Should -Not -Be $s0.Ticks
+                Invoke-Capture $sb                        # a real second start, reading the watermark the first one wrote
+                $lines = @(Get-SpawnLines $sb 2 1)
+                $lines.Count | Should -Be 2
+                foreach ($l in $lines) { $l | Should -Be ('SessionStart ' + (Join-Path $sb.Real $s0.Name)) }
+                Get-Watermark $sb | Should -Be ($s0.Name + '|' + $ticks)
             } finally { Remove-CaptureRoot $sb }
         }
     }
