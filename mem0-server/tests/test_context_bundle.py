@@ -20,15 +20,26 @@ import httpx
 import pytest
 
 from _debris_patterns import delete_goal_rows, episodic_db_path
+from _live_guard import TEST_USER_ENV, live_test_tenant
+from _test_cleanup import delete_memory
 
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = os.environ.get("MEM0_KEY") or (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
-# Operator-agnostic live tenant: match the server's MEM0_DEFAULT_USER_ID
-# (systemd substitutes __WSL_USER__ to the install user), falling back to the
-# current user — the bundle's proactive search queries this same default tenant.
-import getpass as _getpass
-_UID = os.environ.get("MEM0_DEFAULT_USER_ID") or _getpass.getuser()
+# Live suites write under a test-* tenant only (tests/_live_guard.py refuses the stack's own).
+# The bundle's proactive search reads the SERVER's default tenant (MEM0_DEFAULT_USER_ID), so the
+# tests whose assertion is "this seeded record is absent from the bundle" only mean something on
+# a scratch server whose default tenant IS the test tenant: they set MEM0_TEST_USER_ID to it.
+_UID = live_test_tenant()
+
+
+def _require_bundle_tenant() -> None:
+    if not os.environ.get(TEST_USER_ENV, "").strip():
+        pytest.skip(
+            f"needs a scratch server whose MEM0_DEFAULT_USER_ID is a test-* tenant, named in "
+            f"{TEST_USER_ENV}: against any other tenant the bundle never searches the seeded "
+            f"record and its absence proves nothing"
+        )
 
 
 def _bundle(payload: dict) -> httpx.Response:
@@ -507,6 +518,7 @@ def test_bundle_memories_admission_gated_canonical_excluded():
     similar enough that only the admission gate explains its absence."""
     from test_episodic import _qdrant_set_tier  # operator-level tier seed helper
 
+    _require_bundle_tenant()
     unique_kw = f"bundle-canon-gate-{uuid.uuid4().hex[:10]}"
     r = httpx.post(
         f"{URL}/v1/memories",
@@ -555,15 +567,13 @@ def test_bundle_memories_admission_gated_canonical_excluded():
             _qdrant_set_tier(mid, "evidence")
         except Exception:
             pass
-        httpx.delete(
-            f"{URL}/v1/memories/{mid}?actor=test-cleanup&reason=bundle+a3+gate+cleanup",
-            headers=H, timeout=10,
-        )
+        delete_memory(URL, H, mid, reason="bundle a3 gate cleanup")
 
 
 def test_bundle_brand_filter_scopes_search():
     """brand in the bundle request becomes a search filter (same as the hook's
     filters.brand) — a cross-brand record must not surface."""
+    _require_bundle_tenant()
     unique_kw = f"bundle-brand-gate-{uuid.uuid4().hex[:10]}"
     r = httpx.post(
         f"{URL}/v1/memories",
@@ -589,10 +599,7 @@ def test_bundle_brand_filter_scopes_search():
             "cross-brand record leaked through a brand-scoped bundle"
         )
     finally:
-        httpx.delete(
-            f"{URL}/v1/memories/{mid}?actor=test-cleanup&reason=bundle+a3+brand+cleanup",
-            headers=H, timeout=10,
-        )
+        delete_memory(URL, H, mid, reason="bundle a3 brand cleanup")
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +657,13 @@ def test_bundle_warn_unknown_contract_version_caplog(caplog):
 # search over-fetches +2 and drops insight server-side.
 # ---------------------------------------------------------------------------
 def test_bundle_filters_insight_tier_server_side():
+    _require_bundle_tenant()
+    from canonical_key_provider import CanonicalKeyProvider
+    canon_key = CanonicalKeyProvider().get_key()
+    if canon_key is None:
+        # An insight point refuses a plain DELETE (403), so without the key this seed could never
+        # be removed: 42 of them piled up in a live store that way.
+        pytest.skip("canonical key unavailable: an insight seed could not be cleaned up")
     marker = f"hk6-insight-{uuid.uuid4().hex[:10]}"
     text = f"insight consolidation {marker}: sessions show the operator prefers dense evidence-first reporting"
     add = httpx.post(
@@ -658,8 +672,8 @@ def test_bundle_filters_insight_tier_server_side():
             "messages": text,
             "user_id": _UID,
             "infer": False,
-            # exact-source allowlist for insight writes; the finally-delete below is
-            # the cleanup path (conftest's test-record sweep keys off kind+source).
+            # exact-source allowlist for insight writes; the finally-block deletes through the
+            # signed path (a plain DELETE of an insight record is refused) and asserts it worked.
             "metadata": {"tier": "insight", "kind": "test",
                          "source": "c1-consolidator", "test_marker": marker},
         },
@@ -681,4 +695,4 @@ def test_bundle_filters_insight_tier_server_side():
         )
     finally:
         for mid in added_ids:
-            httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=15)
+            delete_memory(URL, H, mid, canonical_key=canon_key, reason="hk6 insight cleanup")

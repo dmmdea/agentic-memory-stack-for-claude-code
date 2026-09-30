@@ -125,7 +125,7 @@ R9-tracked deployed scripts (for example `Test-MemoryStack.ps1` and `dream-conso
 
 ### Verify (phase 3)
 
-`3-verify.ps1` runs an end-to-end smoke test and adds two structural guards beyond the service probes (see *Important flows*): the **skew guard** and the **role-aware task checks**. Since 1.25.0 it also verifies the store binary: `ams-store --version` equals `v<VERSION>`, the binary's digest equals its `.sha256` sidecar, the PostToolUse entry is the binary (exactly one stack entry), the sync hooks and the watcher line are registered when the receipt names a hub, `sync --once --hub-host <hub> --json` exits 0, and the compactor task is gone.
+`3-verify.ps1` runs an end-to-end smoke test and adds two structural guards beyond the service probes (see *Important flows*): the **skew guard** and the **role-aware task checks**. Since 1.25.0 it also verifies the store binary: `ams-store --version` equals `v<VERSION>`, the binary's digest equals its `.sha256` sidecar, the PostToolUse entry is the binary (exactly one stack entry), the sync hooks and the watcher line are registered when the receipt names a hub, `sync --once --hub-host <hub> --json` exits 0, and the compactor task is gone. Its mem0 add→search round-trip removes the smoke point it wrote (`DELETE` by the id the add returned, in the same check) and reports the check as failed when that delete does not go through, so a verify run no longer leaves a permanent `verify-test` memory in the authority.
 
 ### Linux thin client (`install/linux-client.sh`)
 

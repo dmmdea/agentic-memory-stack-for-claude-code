@@ -67,8 +67,11 @@ jobs:
       # clean runner with no live stack (no Qdrant/mem0/llama-swap/Codex). The
       # remaining files in mem0-server/tests are the live-stack suites — they ship
       # for operators to run against a real deployment and are deliberately not
-      # collected here (unguarded HTTP to :18791/:6333, or `import app` which
-      # builds the live Memory client at import time). test_egemma_embedder needs
+      # collected here (HTTP to :18791/:6333 that needs a running stack, or `import app`
+      # which builds the live Memory client at import time). Those suites are guarded:
+      # mem0-server/tests/conftest.py refuses a non-loopback MEM0_URL/QDRANT_URL unless
+      # AMS_ALLOW_LIVE_PROD_TESTS=1, and any request carrying the stack's own tenant;
+      # test_live_guard.py (listed below) pins that. test_egemma_embedder needs
       # the heavy `mem0` package and runs locally only.
       - name: Run the suites that need no live stack
         run: |
@@ -126,6 +129,9 @@ jobs:
             mem0-server/tests/test_deploy_stamp.py \
             mem0-server/tests/test_deploy_host_kind.py \
             mem0-server/tests/test_w7_server_smalls.py \
+            mem0-server/tests/test_live_guard.py \
+            mem0-server/tests/test_home_isolation.py \
+            mem0-server/tests/test_test_cleanup.py \
             claude-config/tests \
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \

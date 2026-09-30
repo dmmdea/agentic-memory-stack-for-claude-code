@@ -21,6 +21,9 @@ BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 def _run(args, tmp_path):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -29,8 +32,7 @@ def _run(args, tmp_path):
     stub = bindir / "claude"
     stub.write_text("#!/usr/bin/env bash\necho 'stub 0.0.0'\n", encoding="utf-8")
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-    env = dict(os.environ)
-    env["HOME"] = str(home)
+    env = home_env(home)
     env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
     r = subprocess.run([BASH, str(SCRIPT), *args], capture_output=True, text=True, env=env,
                        cwd=str(REPO_ROOT), timeout=120)

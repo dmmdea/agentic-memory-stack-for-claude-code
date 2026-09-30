@@ -1341,3 +1341,18 @@ function Get-TranscriptTurnsSince {
     if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
     return $joined
 }
+
+function Resolve-L1aSessionId {
+    # The session id an L1a episode is keyed on. The hook's own session id (the spawner passes it as
+    # -SessionId) wins. PreCompact hands the worker a temp snapshot named precompact-snap-<PID>.jsonl,
+    # so deriving the id from the file name posted every compaction under a phantom session; without
+    # a session id the transcript file name is still right for a Stop (<session-uuid>.jsonl). Only a
+    # plain token is accepted; a fresh GUID is the last resort.
+    param([string]$SessionId, [string]$TranscriptPath)
+    if ($SessionId -and $SessionId -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return $SessionId }
+    if ($TranscriptPath) {
+        $fname = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
+        if ($fname) { return $fname }
+    }
+    return [System.Guid]::NewGuid().ToString()
+}

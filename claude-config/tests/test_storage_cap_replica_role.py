@@ -87,7 +87,9 @@ class Box:
 
     def run(self) -> str:
         env = {
-            "HOME": str(self.home),
+            "HOME": str(self.home), "USERPROFILE": str(self.home),
+            "HOMEDRIVE": os.path.splitdrive(str(self.home))[0],
+            "HOMEPATH": os.path.splitdrive(str(self.home))[1],
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "CLAUDE_CWD": "/tmp",
             "FAKE_DIR": str(self.fake),

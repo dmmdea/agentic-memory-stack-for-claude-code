@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # v0.19 Phase A.1: inline cleanup for tests that hold the goal ids they create
 # (goals have no DELETE endpoint; conftest.py backstops anything missed).
-from _debris_patterns import delete_goal_rows
+from _debris_patterns import delete_goal_rows, episodic_db_path
 
 from episodic import (
     SCHEMA_SQL,
@@ -327,11 +327,10 @@ def test_add_link(db):
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 _KEY = os.environ.get("MEM0_KEY", "")
 H = {"X-API-Key": _KEY, "Content-Type": "application/json"}
-# Operator-agnostic live tenant: match the server's MEM0_DEFAULT_USER_ID
-# (systemd substitutes __WSL_USER__ to the install user), falling back to the
-# current user — so test records land in the tenant the conftest backstop sweeps.
-import getpass as _getpass
-_UID = os.environ.get("MEM0_DEFAULT_USER_ID") or _getpass.getuser()
+# Live suites write under a test-* tenant only (tests/_live_guard.py refuses the stack's own).
+from _live_guard import live_test_tenant  # noqa: E402
+from _test_cleanup import delete_memory  # noqa: E402
+_UID = live_test_tenant()
 
 
 def _episode_payload(**overrides) -> dict:
@@ -1522,7 +1521,7 @@ def test_memory_get_by_id_returns_full_record():
     assert "retrievable" in body, f"missing 'retrievable' field: {body}"
 
     # Cleanup
-    httpx.delete(f"{URL}/v1/memories/{memory_id}", headers=H, timeout=10)
+    delete_memory(URL, H, memory_id, reason="F3.1 exact-read cleanup")
 
 
 def test_goal_priority_endpoint():
@@ -1660,7 +1659,7 @@ def test_goal_merge_bulk_requires_hmac_user_direct():
     assert ep_r.status_code == 200, f"episode create failed: {ep_r.text}"
     eid = ep_r.json()["episode_id"]
 
-    db_path = Path.home() / ".mem0" / "episodic.db"
+    db_path = episodic_db_path()   # honours EPISODIC_DB_PATH, like every other site here
     if not db_path.exists():
         pytest.skip("episodic.db not found — cannot seed bulk links")
     conn = sqlite3.connect(str(db_path), timeout=10)
@@ -1831,10 +1830,8 @@ def test_search_query_class_canonical_filters_tiers():
         )
     finally:
         # Cleanup
-        httpx.delete(f"{URL}/v1/memories/{ev_id}?actor=test-cleanup&reason=F.4.1+test+cleanup",
-                     headers=H, timeout=10)
-        httpx.delete(f"{URL}/v1/memories/{stable_id}?actor=test-cleanup&reason=F.4.1+test+cleanup",
-                     headers=H, timeout=10)
+        delete_memory(URL, H, ev_id, reason="F.4.1 test cleanup")
+        delete_memory(URL, H, stable_id, reason="F.4.1 test cleanup")
 
 
 def _qdrant_backdate_created_at(memory_id: str, new_created_at: str) -> None:
@@ -1977,8 +1974,7 @@ def test_search_query_class_operational_recency_boost():
         )
     finally:
         for mid in (fresh_id, old_id, ancient_id):
-            httpx.delete(f"{URL}/v1/memories/{mid}?actor=test-cleanup&reason=MED-19+op+cleanup",
-                         headers=H, timeout=10)
+            delete_memory(URL, H, mid, reason="MED-19 op cleanup")
 
 
 def test_resolve_open_question_from_untracked_session_no_500():
@@ -2098,8 +2094,7 @@ def test_search_explicit_tier_canonical_filter_returns_canonical():
             _qdrant_set_tier(mid, "evidence")
         except Exception:
             pass
-        httpx.delete(f"{URL}/v1/memories/{mid}?actor=test-cleanup&reason=fixpass+canon+filter+cleanup",
-                     headers=H, timeout=10)
+        delete_memory(URL, H, mid, reason="fixpass canon filter cleanup")
 
 
 def test_episode_checkpoint_hook_contract_version_back_compat():
@@ -2259,8 +2254,7 @@ def test_search_query_class_history_returns_superseded_record():
             "superseded record must be admitted by the history (forensic) class"
         )
     finally:
-        httpx.delete(f"{URL}/v1/memories/{mid}?actor=test-cleanup&reason=v020+M12+history+e2e+cleanup",
-                     headers=H, timeout=10)
+        delete_memory(URL, H, mid, reason="v020 M12 history e2e cleanup")
 
 
 # ---------------------------------------------------------------------------

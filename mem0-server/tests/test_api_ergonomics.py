@@ -1,13 +1,13 @@
 """Verify the search request schema accepts `limit` (not `top_k`) and the
 list endpoint hard-caps at 500. Run against a live mem0 server on :18791
 with a valid X-API-Key in $env:MEM0_KEY."""
-import getpass
 import os, httpx
+from _live_guard import live_test_tenant
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = os.environ["MEM0_KEY"]
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
-# Operator-agnostic live tenant (matches the server default set via __WSL_USER__)
-UID = os.environ.get("MEM0_DEFAULT_USER_ID") or getpass.getuser()
+# A test-* tenant, never the stack's own (tests/_live_guard.py); these reads need no seeded data.
+UID = live_test_tenant()
 
 def test_search_accepts_limit():
     r = httpx.post(f"{URL}/v1/memories/search", json={

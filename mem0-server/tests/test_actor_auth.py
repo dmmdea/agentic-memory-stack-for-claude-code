@@ -24,6 +24,7 @@ KEY = os.environ["MEM0_KEY"]
 # v0.19 Phase H: key via provider (runtime tmpfs > dpapi-on-win > plaintext) —
 # conftest.py inserts mem0-server/ into sys.path before this module loads.
 from canonical_key_provider import CanonicalKeyProvider  # noqa: E402
+from _test_cleanup import delete_memory  # noqa: E402
 
 CANON_KEY = CanonicalKeyProvider().get_key()
 
@@ -46,11 +47,10 @@ def _add_evidence(text: str) -> str:
 
 
 def _delete(mid: str) -> None:
-    """Best-effort cleanup — ignore errors."""
-    try:
-        httpx.delete(f"{URL}/v1/memories/{mid}", headers=H, timeout=10)
-    except Exception:
-        pass
+    """Remove a seeded point and assert it is gone. The valid-token test leaves its point
+    canonical, which a plain DELETE cannot remove (403) - the signed path can, and a failure here
+    is a test failure, not silent debris."""
+    delete_memory(URL, H, mid, canonical_key=CANON_KEY, reason="actor-auth test cleanup")
 
 
 def test_canonical_without_token_rejected():
