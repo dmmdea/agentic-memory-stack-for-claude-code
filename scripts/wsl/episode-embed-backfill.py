@@ -31,6 +31,25 @@ for _d in _SERVER_DIRS:
 
 MAX_CONSECUTIVE_ERRORS = 5   # a dead embedder must stop the run, not burn the whole cap on failures
 
+# The two orderings are two literal statements, never one statement with the direction pasted in:
+# a query string with a formatted-in fragment is what a SQL audit rightly refuses to read past.
+COMPLETE_EPISODES_OLDEST_FIRST = """
+        SELECT e.id AS id, e.goal_text AS goal_text, e.summary_text AS summary_text, s.brand AS brand
+        FROM episodes e
+        LEFT JOIN sessions s ON e.session_id = s.session_id
+        WHERE e.state = 'complete'
+          AND e.summary_text IS NOT NULL AND TRIM(e.summary_text) <> ''
+        ORDER BY e.id ASC
+        """
+COMPLETE_EPISODES_NEWEST_FIRST = """
+        SELECT e.id AS id, e.goal_text AS goal_text, e.summary_text AS summary_text, s.brand AS brand
+        FROM episodes e
+        LEFT JOIN sessions s ON e.session_id = s.session_id
+        WHERE e.state = 'complete'
+          AND e.summary_text IS NOT NULL AND TRIM(e.summary_text) <> ''
+        ORDER BY e.id DESC
+        """
+
 
 def _existing_ids(client, collection) -> set:
     """All point ids already in the collection (idempotent skip set)."""
@@ -57,17 +76,7 @@ def backfill(conn, existing, embedder, upsert, limit=None) -> dict:
     Returns {embedded, skipped, errors, remaining, total_complete, aborted}; `remaining` counts
     indexable episodes still missing after the cap, so the caller can report the catch-up."""
     from episode_embeddings import embed_episode_summary, _indexable_summary
-    order = "DESC" if limit else "ASC"
-    rows = conn.execute(
-        f"""
-        SELECT e.id AS id, e.goal_text AS goal_text, e.summary_text AS summary_text, s.brand AS brand
-        FROM episodes e
-        LEFT JOIN sessions s ON e.session_id = s.session_id
-        WHERE e.state = 'complete'
-          AND e.summary_text IS NOT NULL AND TRIM(e.summary_text) <> ''
-        ORDER BY e.id {order}
-        """
-    ).fetchall()
+    rows = conn.execute(COMPLETE_EPISODES_NEWEST_FIRST if limit else COMPLETE_EPISODES_OLDEST_FIRST).fetchall()
     out = {"embedded": 0, "skipped": 0, "errors": 0, "remaining": 0,
            "total_complete": len(rows), "aborted": None}
     consecutive = 0
