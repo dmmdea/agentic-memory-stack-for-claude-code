@@ -4,7 +4,8 @@ Each chain step's last success, last run, duration and receipt id (from the rece
 ams-step.sh appends to ~/.mem0/maintenance/receipts.jsonl); the steps whose LATEST run failed or
 degraded (the receipt's `status`, outcome contract C1); the judge transport; pool usage with the
 85 % alarm and the pool's HEALTH; the retrieval-drift and wiki-freshness readings; the box's boot
-ids for the last 7 days. Pure functions with injected
+ids for the last 7 days; and the write path (write_path.py), whose latest failed write turns
+`ok` false. Pure functions with injected
 readers so the endpoint is testable without a chain, a pool or a journal; the route wires the
 real readers. A health endpoint never raises on a reader: a failed reader reads as unknown."""
 from __future__ import annotations
@@ -240,13 +241,30 @@ def _drift(reader: Optional[Callable[[], dict]]) -> dict:
     return out
 
 
+def _write_path(reader: Optional[Callable[[], dict]]) -> Optional[dict]:
+    """The write-path snapshot for the payload (write_path.snapshot: ok, last_ok_at, last_error_at, last_error,
+    errors_1h, writes_1h), or None when no reader is wired: the payload then has no `write_path` key and `ok` is
+    unchanged. A reader that raises, or answers with something that is not a dict, reads as unknown (`ok: None`):
+    fail-open on the reader, loud in the value."""
+    if reader is None:
+        return None
+    try:
+        snap = reader()
+        if not isinstance(snap, dict):
+            raise TypeError("a write-path reader returns a dict")
+        return dict(snap)
+    except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
+        return {"ok": None, "note": "write-path reader failed"}
+
+
 def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple],
           boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
           usage_reader: Optional[Callable[[], dict]] = None,
           pool_health_reader: Optional[Callable[[], str]] = None,
           pool_ack_reader: Optional[Callable[[], Optional[str]]] = None,
           wiki_stamp_dir: Optional[Path] = None,
-          drift_reader: Optional[Callable[[], dict]] = None) -> dict:
+          drift_reader: Optional[Callable[[], dict]] = None,
+          write_path_reader: Optional[Callable[[], dict]] = None) -> dict:
     by_step: dict[str, list[dict]] = {}
     for r in read_receipts(Path(receipts_path)):
         by_step.setdefault(r["step"], []).append(r)
@@ -348,10 +366,17 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
         jt = "none"
     ok = (not pool["alarm"] and not pool["health_alarm"] and not stale
           and not failed_steps and not degraded_steps)
+    # A write path whose latest write failed is a memory server that cannot remember, whatever the nightly chain
+    # says. Only a reading of exactly `ok: false` counts: no reader, or an unreadable one (`ok: None`), never reddens.
+    write_path = _write_path(write_path_reader)
+    if write_path is not None and write_path.get("ok") is False:
+        ok = False
     out = {"ok": ok, "steps": steps, "stale_steps": stale, "failed_steps": failed_steps,
            "degraded_steps": degraded_steps, "judge_transport": jt, "pool": pool,
            "drift": _drift(drift_reader), "wiki": _wiki(wiki_stamp_dir, now),
            "usage": usage, "boots_7d": boots, "generated": now.isoformat()}
     if dataset is not None:
         out["dataset"] = dataset
+    if write_path is not None:
+        out["write_path"] = write_path
     return out

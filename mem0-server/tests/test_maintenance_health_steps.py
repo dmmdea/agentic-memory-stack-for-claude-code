@@ -3,6 +3,7 @@
 
 Headless (no `import app`): the pure build() with injected readers. The wider endpoint contract
 (last success, pool alarm, boots, usage) stays in test_maintenance_health.py."""
+import ast
 import datetime as dt
 import json
 import os
@@ -284,6 +285,93 @@ def test_the_route_wires_the_ack_reader():
     route = src[src.index("def health_maintenance"):]
     route = route[:route.index("@app.get", 1)]
     assert "pool_ack_reader=_mh.read_pool_ack" in route
+
+
+# ---- the write path (WP-19): a write path whose latest write failed turns the verdict red ---
+# The snapshot comes from write_path.snapshot (passive: learned from real write traffic, no probe).
+# build() takes it like every other reader: injected, absent by default, never raising.
+FAILING_WP = {"ok": False, "last_ok_at": "2026-09-11T06:00:00+00:00", "last_error_at": "2026-09-11T07:55:00+00:00",
+              "last_error": "503 cold-embedder", "errors_1h": 4, "writes_1h": 9}
+HEALTHY_WP = {"ok": True, "last_ok_at": "2026-09-11T07:55:00+00:00", "last_error_at": "2026-09-11T07:40:00+00:00",
+              "last_error": "503 cold-embedder", "errors_1h": 2, "writes_1h": 9}
+RED_STEP = [_r("2026-09-11T07:00:00Z", "wiki-index", ok=False, status="failed", note="no wiki source reachable")]
+
+
+def test_a_failing_write_path_flips_ok_and_rides_in_the_payload(tmp_path):
+    out = _build(tmp_path, [], write_path_reader=lambda: dict(FAILING_WP))
+    assert out["write_path"] == FAILING_WP
+    assert out["ok"] is False
+    # Nothing else is wrong: the write path alone made the verdict red.
+    assert out["failed_steps"] == [] and out["degraded_steps"] == [] and out["stale_steps"] == []
+    assert out["pool"]["alarm"] is False and out["pool"]["health_alarm"] is False
+
+
+def test_a_healthy_write_path_rides_in_the_payload_and_leaves_ok_alone(tmp_path):
+    out = _build(tmp_path, [], write_path_reader=lambda: dict(HEALTHY_WP))
+    assert out["write_path"] == HEALTHY_WP and out["ok"] is True
+    red = _build(tmp_path, RED_STEP, write_path_reader=lambda: dict(HEALTHY_WP))
+    assert red["ok"] is False, "a healthy write path never hides a failed step"
+
+
+def test_a_failing_write_path_and_a_failed_step_are_both_reported(tmp_path):
+    out = _build(tmp_path, RED_STEP, write_path_reader=lambda: dict(FAILING_WP))
+    assert out["ok"] is False
+    assert [f["step"] for f in out["failed_steps"]] == ["wiki-index"] and out["write_path"]["ok"] is False
+
+
+def test_without_a_write_path_reader_there_is_no_write_path_and_ok_is_unchanged(tmp_path):
+    for kw in ({}, {"write_path_reader": None}):
+        green = _build(tmp_path, [], **kw)
+        assert "write_path" not in green and green["ok"] is True
+        red = _build(tmp_path, RED_STEP, **kw)
+        assert "write_path" not in red and red["ok"] is False
+
+
+def test_a_write_path_reader_that_fails_reads_as_unknown_and_fails_open(tmp_path):
+    def boom():
+        raise RuntimeError("no tracker")
+    for reader in (boom, lambda: "not a dict", lambda: None):
+        out = _build(tmp_path, [], write_path_reader=reader)
+        assert out["write_path"] == {"ok": None, "note": "write-path reader failed"}
+        assert out["ok"] is True, "a broken reader is loud in the value and does not redden the verdict"
+
+
+def test_the_payload_carries_a_copy_of_the_snapshot(tmp_path):
+    snap = dict(FAILING_WP)
+    out = _build(tmp_path, [], write_path_reader=lambda: snap)
+    out["write_path"]["ok"] = True
+    assert snap == FAILING_WP
+
+
+def test_a_real_tracker_snapshot_round_trips_through_build(tmp_path):
+    import write_path as wp
+    t = wp.WritePathTracker()
+    t.record(200, None, now=1_789_000_000.0)
+    t.record(503, "cold-embedder", now=1_789_000_060.0)
+    out = _build(tmp_path, [], write_path_reader=lambda: t.snapshot(now=1_789_000_120.0))
+    assert out["ok"] is False and out["write_path"]["last_error"] == "503 cold-embedder"
+    assert set(out["write_path"]) == {"ok", "last_ok_at", "last_error_at", "last_error", "errors_1h", "writes_1h"}
+    t.record(200, None, now=1_789_000_180.0)
+    assert _build(tmp_path, [], write_path_reader=lambda: t.snapshot(now=1_789_000_240.0))["ok"] is True
+
+
+def _dotted(node):
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def test_the_route_wires_the_write_path_snapshot():
+    """app.py cannot be imported headless, so pin the wiring on its syntax tree (a comment does not count):
+    without this argument /health/maintenance never sees a write, which is the defect this signal exists for."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    route = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "health_maintenance"]
+    assert len(route) == 1
+    builds = [c for c in ast.walk(route[0]) if isinstance(c, ast.Call) and _dotted(c.func) == "_mh.build"]
+    assert len(builds) == 1
+    wired = {k.arg: _dotted(k.value) for k in builds[0].keywords}
+    assert wired.get("write_path_reader") == "_write_path.snapshot"
 
 
 # ---- the rest of C2: drift and wiki are reported, never folded into ok ----------------------

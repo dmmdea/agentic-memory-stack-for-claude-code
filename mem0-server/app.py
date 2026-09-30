@@ -13,7 +13,7 @@ import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
 
-from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 from mem0 import Memory
 
@@ -225,6 +225,12 @@ STACK_VERSION = _resolve_stack_version()
 app = FastAPI(title="mem0 WSL", version="2.0.4-v012")
 import embedder_503 as _embedder_503  # spec §4 P1-6: embedder outages -> 503 + Retry-After (reason cold-embedder)
 _embedder_503.install(app)
+# Passive write-path health: the FINAL status of every POST /v1/memories and PUT /v1/memories/{id}
+# (the 503 embedder_503 builds, an HTTPException 500, an unhandled exception recorded as 500 and
+# re-raised) is counted in-process; /health/maintenance publishes it as `write_path`. Zero I/O, and
+# no model load: an endpoint that probed the embedder would keep it resident.
+import write_path as _write_path
+_write_path.install(app)
 
 def auth(x_api_key: Optional[str] = Header(None)):
     if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
@@ -930,10 +936,13 @@ def health() -> dict:
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
     """Spec §9 (P1-5): the nightly chain's last successes, the steps whose latest run failed or
-    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, and the box's boot
-    ids for 7 days. `ok` folds the failed/degraded steps and the pool in. Gatus probes it; the session-start
-    line reads it with a 1.5 s budget and falls back to local numbers. Never raises on a
-    reader: an unreadable pool/journal reads as unknown, not as an error."""
+    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, the box's boot ids
+    for 7 days, and the write path. `ok` folds the failed/degraded steps, the pool and the write
+    path in. Gatus probes it; the session-start line reads it with a 1.5 s budget and falls back to
+    local numbers. `write_path` is the PASSIVE record of real POST/PUT /v1/memories outcomes
+    (write_path.py): reading it never touches the embedder, so polling it cannot keep a model
+    resident. Never raises on a reader: an unreadable pool/journal reads as unknown, not as an
+    error."""
     import os as _os
     import maintenance_health as _mh
     ds = _os.environ.get("MEM0_ZFS_DATASET", "").strip()
@@ -947,7 +956,9 @@ def health_maintenance() -> dict:
                      # The operator's dated pool-health ack (env, else stack.env), read on every call.
                      pool_ack_reader=_mh.read_pool_ack,
                      wiki_stamp_dir=Path.home() / "wiki-index",
-                     drift_reader=drift_state_health)
+                     drift_reader=drift_state_health,
+                     # The write path, learned from real writes (in-process, zero I/O, no model load).
+                     write_path_reader=_write_path.snapshot)
 
 
 @app.get("/health/morning-summary")
@@ -1172,7 +1183,7 @@ def health_deep() -> dict:
     return out
 
 @app.post("/v1/memories")
-def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None)):
+def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
     # Storage cap enforcement (audit finding 2026-06-08: 341/384 backfilled points
     # exceeded the previously-documented 600-char cap which was never enforced).
@@ -1272,6 +1283,10 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
         _existing = _find_existing_by_hash(text_for_check, b.user_id, b.metadata)
         if _existing:
             log.info("add(): idempotent no-op — identical memory already stored as %s", _existing)
+            # Answered from a payload lookup, before any embed call: this 200 says nothing about the write
+            # path. Neutral, or an automated writer re-posting its transcript during an embedder outage
+            # clears write_path.ok between the 503s it gets for the new facts (write_path.py).
+            _write_path.mark_neutral(request)
             return {
                 "results": [{"id": _existing, "memory": text_for_check, "event": "NOOP_DUPLICATE"}],
                 "deduplicated": True,
@@ -1286,6 +1301,12 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
             metadata=b.metadata,
             infer=b.infer,
         )
+        # infer=False embeds every message it stores, but skips system-role and malformed ones without an
+        # embed call and answers {"results": []}: like a duplicate, that 200 says nothing about the write
+        # path. infer=True is different on purpose: mem0 embeds the incoming text (its existing-memory
+        # lookup) before it can answer at all, so its 200 is evidence (checked against mem0 2.0.4).
+        if b.infer is False and _write_path.stored_nothing(result):
+            _write_path.mark_neutral(request)
         # If this was an insight write (only path that lands non-evidence via add), log to ledger
         # so canonical-add-coverage isn't silent.
         if b.metadata and b.metadata.get("tier") == "insight":

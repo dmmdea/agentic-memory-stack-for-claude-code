@@ -20,6 +20,7 @@ from test_storage_cap_replica_role import Box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mem0-server"))
 import maintenance_health as mh  # noqa: E402
+import write_path as wp  # noqa: E402
 
 NOW = dt.datetime(2026, 9, 29, 8, 5, tzinfo=dt.timezone.utc)   # a Tuesday
 
@@ -40,13 +41,15 @@ RED = [_row("wiki-index", "2026-09-28T08:03:00Z"),
        _row("l10-audit", "2026-09-25T08:03:00Z")]
 
 
-def _payload(tmp_path, rows, *, health="ONLINE", used=500, avail=500, ack=None, drift=None, pool_reader=None):
+def _payload(tmp_path, rows, *, health="ONLINE", used=500, avail=500, ack=None, drift=None, pool_reader=None,
+             write_path=None):
     receipts = tmp_path / "receipts.jsonl"
     receipts.parent.mkdir(parents=True, exist_ok=True)
     receipts.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return mh.build(receipts, NOW, pool_reader or (lambda: (used, avail)), lambda: [], lambda: "native",
                     pool_health_reader=lambda: health, pool_ack_reader=lambda: ack,
-                    drift_reader=(lambda: drift) if drift is not None else None)
+                    drift_reader=(lambda: drift) if drift is not None else None,
+                    write_path_reader=(lambda: write_path) if write_path is not None else None)
 
 
 def _banner(tmp_path, payload, role="replica"):
@@ -105,3 +108,82 @@ def test_a_sick_pool_whose_capacity_cannot_be_read_is_still_named(tmp_path):
     p = _payload(tmp_path, HEALTHY, health="FAULTED", pool_reader=_capacity_unreadable)
     assert p["pool"]["used_pct"] is None and p["pool"]["health_alarm"] is True and p["ok"] is False
     assert _banner(tmp_path, p) == ["[AMS] brain NOT OK — pool FAULTED"]
+
+
+# ---- the write path (WP-19): the snapshot the tracker publishes, read back by the banner ----------------------
+def _tracker_snapshot(*outcomes, at=NOW):
+    """The real tracker's snapshot at `at`, after `outcomes` = (seconds before `at`, status, reason) in order."""
+    t = wp.WritePathTracker()
+    for ago, status, reason in outcomes:
+        t.record(status, reason, now=at.timestamp() - ago)
+    return t.snapshot(now=at.timestamp())
+
+
+def test_the_write_path_snapshot_carries_every_field_the_banner_reads(tmp_path):
+    p = _payload(tmp_path, HEALTHY, write_path=_tracker_snapshot((600, 200, None), (60, 503, "cold-embedder")))
+    assert p["ok"] is False, "a failing write path is folded into the top-level verdict"
+    assert {"ok", "last_error", "last_error_at"} <= set(p["write_path"])
+    assert p["write_path"]["ok"] is False and p["write_path"]["last_error"] == "503 cold-embedder"
+
+
+def test_a_failing_write_path_reads_through_the_banner(tmp_path):
+    snap = _tracker_snapshot((600, 200, None), (60, 503, "cold-embedder"))
+    p = _payload(tmp_path, HEALTHY, write_path=snap)
+    assert _banner(tmp_path, p) == [
+        "[AMS] brain NOT OK — write path failing (503 cold-embedder since 2026-09-29T08:04:00+00:00)"]
+
+
+@pytest.mark.parametrize("role", ["brain", "replica"])
+def test_a_failing_write_path_reads_on_any_role(tmp_path, role):
+    p = _payload(tmp_path, HEALTHY, write_path=_tracker_snapshot((30, 500, None)))
+    assert _banner(tmp_path, p, role) == [
+        "[AMS] brain NOT OK — write path failing (500 upstream since 2026-09-29T08:04:30+00:00)"]
+
+
+def test_a_write_path_that_recovered_is_silent_though_its_last_error_stays_on_record(tmp_path):
+    snap = _tracker_snapshot((900, 503, "cold-embedder"), (60, 201, None))
+    assert snap["ok"] is True and snap["last_error"] == "503 cold-embedder"
+    p = _payload(tmp_path, HEALTHY, write_path=snap)
+    assert p["ok"] is True
+    assert _banner(tmp_path, p) == []
+
+
+def test_a_fresh_write_path_with_nothing_recorded_is_silent(tmp_path):
+    p = _payload(tmp_path, HEALTHY, write_path=_tracker_snapshot())
+    assert p["ok"] is True and p["write_path"]["last_error"] is None
+    assert _banner(tmp_path, p) == []
+
+
+def test_a_failing_write_path_is_named_beside_a_red_night(tmp_path):
+    p = _payload(tmp_path, RED, health="DEGRADED", used=847, avail=153,
+                 drift={"alarm": True, "before_retrievable": 5, "n_total": 7},
+                 write_path=_tracker_snapshot((60, 503, "cold-embedder")))
+    assert _banner(tmp_path, p) == [
+        "[AMS] brain NOT OK — failed: wiki-index; degraded: dream; pool 84.7% DEGRADED; "
+        "write path failing (503 cold-embedder since 2026-09-29T08:04:00+00:00); stale: l10-audit; drift alarm"]
+
+
+def test_a_payload_from_a_server_that_predates_write_path_reads_as_before(tmp_path):
+    p = _payload(tmp_path, HEALTHY)
+    assert "write_path" not in p and p["ok"] is True
+    assert _banner(tmp_path, p) == []
+    p = _payload(tmp_path, RED[:2])
+    assert _banner(tmp_path, p) == ["[AMS] brain NOT OK — failed: wiki-index"]
+
+
+@pytest.mark.parametrize("write_path,line", [
+    ({"ok": False}, "[AMS] brain NOT OK — write path failing"),
+    ({"ok": False, "last_error": "503 cold-embedder"}, "[AMS] brain NOT OK — write path failing (503 cold-embedder)"),
+    ({"ok": False, "last_error_at": "2026-09-29T08:04:00+00:00"},
+     "[AMS] brain NOT OK — write path failing (since 2026-09-29T08:04:00+00:00)"),
+    ({"ok": False, "last_error": None, "last_error_at": 7}, "[AMS] brain NOT OK — write path failing"),
+])
+def test_a_thin_failing_write_path_is_still_named(tmp_path, write_path, line):
+    """The banner reads the fields defensively: whatever the failing snapshot lacks is simply not printed."""
+    assert _banner(tmp_path, {"ok": False, "write_path": write_path}) == [line]
+
+
+@pytest.mark.parametrize("write_path", [None, "down", 5, [], {}, {"ok": None, "note": "write-path reader failed"},
+                                        {"ok": True}, {"ok": "no"}])
+def test_an_unreadable_or_healthy_write_path_prints_nothing_new(tmp_path, write_path):
+    assert _banner(tmp_path, {"ok": True, "write_path": write_path}) == []

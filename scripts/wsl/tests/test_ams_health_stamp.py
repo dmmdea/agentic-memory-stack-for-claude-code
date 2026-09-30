@@ -1,8 +1,10 @@
 """ams-health-stamp.sh and ams-morning-summary.sh print the honest health verdict.
 
-The stamp is the chain's LAST reading step: it exits non-zero when a step's latest run failed or the
-pool is unhealthy, so a bad night ends in a red unit instead of a green `ok=False` line nobody reads.
-The morning summary lists degraded steps with their notes and the work counts a step reported."""
+The stamp is the chain's LAST reading step: it exits non-zero when a step's latest run failed, the
+pool is unhealthy or the write path is failing, so a bad night ends in a red unit instead of a green
+`ok=False` line nobody reads. The morning summary lists degraded steps with their notes and the work
+counts a step reported. Both name a failing write path on their health line and change no byte of a
+healthy one."""
 import json
 import os
 import shutil
@@ -104,6 +106,63 @@ def test_curl_failure_is_still_a_failed_step(tmp_path):
     assert r.returncode != 0
 
 
+# The write path: /health/maintenance folds write_path.ok into `ok`, so a night whose only fault is a write
+# path that failed its last real write printed `health ok=False failed=- degraded=- ...` with no cause and
+# exited 0: a green step over an ok=False line, the exact shape this script exists to end.
+WP_RED = {"ok": False, "last_ok_at": None, "last_error_at": "2099-01-01T04:05:00+00:00",
+          "last_error": "503 upstream", "errors_1h": 4, "writes_1h": 4}
+WP_OK = {"ok": True, "last_ok_at": "2099-01-01T04:06:00+00:00", "last_error_at": "2099-01-01T04:05:00+00:00",
+         "last_error": "503 upstream", "errors_1h": 4, "writes_1h": 5}
+GREEN_LINE = "health ok=True failed=- degraded=- pool 71.4% ONLINE"
+
+
+def test_a_failing_write_path_alone_turns_the_stamp_red_and_names_it(tmp_path):
+    r, stamp = _stamp(tmp_path, dict(BASE, ok=False, write_path=WP_RED))
+    assert r.returncode == 2, "a broken write path IS a red night"
+    assert r.stdout.splitlines()[-1] == "health ok=False failed=- degraded=- pool 71.4% ONLINE write-path 503 upstream"
+    assert stamp.exists(), "the stamp file is written before the verdict exits"
+
+
+def test_a_recovered_write_path_leaves_the_stamp_line_byte_identical(tmp_path):
+    """ok:true keeps last_error on record; only ok:false is a fault."""
+    r, _ = _stamp(tmp_path, dict(BASE, write_path=WP_OK))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[-1] == GREEN_LINE
+    r0, _ = _stamp(tmp_path / "plain", BASE)
+    assert r.stdout == r0.stdout, "a healthy write path changes not one byte of the output"
+
+
+@pytest.mark.parametrize("wp", [{"ok": None, "note": "write-path reader failed"}, "garbage", ["ok", False], 7, {}],
+                         ids=["unknown", "string", "list", "number", "empty"])
+def test_a_write_path_that_is_unknown_or_malformed_is_silent_and_not_red(tmp_path, wp):
+    """`ok:null` is the server saying it could not read the tracker: fail-open, loud in the value only."""
+    r, _ = _stamp(tmp_path, dict(BASE, write_path=wp))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[-1] == GREEN_LINE
+
+
+def test_the_write_path_is_named_beside_a_failed_step_and_an_acked_pool(tmp_path):
+    ack = {"state": "DEGRADED", "until": "2026-10-06", "active": True}
+    p = dict(BASE, ok=False, write_path=WP_RED, failed_steps=[{"step": "wiki-index", "ts": "t", "note": "n"}],
+             pool=dict(BASE["pool"], health="DEGRADED", health_alarm=False, health_ack=ack))
+    r, _ = _stamp(tmp_path, p)
+    assert r.returncode == 2
+    assert r.stdout.splitlines()[-1] == ("health ok=False failed=wiki-index degraded=- pool 71.4% DEGRADED "
+                                         "(acked until 2026-10-06) write-path 503 upstream")
+
+
+def test_a_failing_write_path_without_a_reason_still_says_so(tmp_path):
+    r, _ = _stamp(tmp_path, dict(BASE, ok=False, write_path={"ok": False, "last_error": None}))
+    assert r.returncode == 2 and r.stdout.splitlines()[-1].endswith(" write-path failing")
+
+
+def test_the_verdict_stays_one_line_whatever_the_reason_holds(tmp_path):
+    r, _ = _stamp(tmp_path, dict(BASE, ok=False, write_path=dict(WP_RED, last_error="503 up\nstream\t now")))
+    assert r.returncode == 2
+    assert len(r.stdout.splitlines()) == 2, "the first line, then exactly one verdict line"
+    assert r.stdout.splitlines()[-1].endswith("write-path 503 up stream now")
+
+
 def _summary(tmp_path, receipts, health=None):
     home = tmp_path / "home"
     d = home / ".mem0" / "maintenance"
@@ -151,6 +210,32 @@ def test_summary_health_line_survives_an_old_stamp(tmp_path):
     assert "- health ok=True stale=[] " in t and "pool 78.0% usage 2%" in t
 
 
+def test_summary_names_a_failing_write_path_and_only_then(tmp_path):
+    t = _summary(tmp_path, [_row("dream")], health=dict(BASE, ok=False, write_path=WP_RED))
+    assert "pool-health ONLINE write-path 503 upstream\n" in t
+    (tmp_path / "second").mkdir()
+    t2 = _summary(tmp_path / "second", [_row("dream")], health=dict(BASE, write_path=WP_OK))
+    assert "pool-health ONLINE\n" in t2 and "write-path" not in t2, "a healthy line is byte-identical to before"
+    (tmp_path / "third").mkdir()
+    t3 = _summary(tmp_path / "third", [_row("dream")], health=dict(BASE, write_path={"ok": None, "note": "write-path reader failed"}))
+    assert "pool-health ONLINE\n" in t3 and "write-path" not in t3, "an unreadable tracker is not a fault"
+
+
+def test_summary_writes_the_write_path_after_an_active_pool_ack(tmp_path):
+    pool = dict(BASE["pool"], health="DEGRADED", health_alarm=False,
+                health_ack={"state": "DEGRADED", "until": "2026-10-06", "active": True})
+    t = _summary(tmp_path, [_row("dream")], health=dict(BASE, ok=False, pool=pool, write_path=WP_RED))
+    assert "pool-health DEGRADED (acked until 2026-10-06) write-path 503 upstream\n" in t
+
+
+def test_summary_survives_a_malformed_write_path_and_a_missing_reason(tmp_path):
+    t = _summary(tmp_path, [_row("dream")], health=dict(BASE, write_path="garbage"))
+    assert "pool-health ONLINE\n" in t and "write-path" not in t
+    (tmp_path / "second").mkdir()
+    t2 = _summary(tmp_path / "second", [_row("dream")], health=dict(BASE, ok=False, write_path={"ok": False}))
+    assert "pool-health ONLINE write-path failing\n" in t2
+
+
 def test_summary_marks_a_receipt_without_status_by_its_ok_flag(tmp_path):
     """Receipts written before the outcome contract carry no status/work."""
     legacy = {"ts": "2099-01-01T08:00:00Z", "step": "dream", "ok": True, "exit": 0, "duration_ms": 5, "receipt_id": "x", "note": ""}
@@ -178,3 +263,25 @@ def test_red_night_receipt_note_carries_the_verdict_line(tmp_path):
     row = json.loads((home / ".mem0" / "maintenance" / "receipts.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["ok"] is False and row["status"] == "failed"
     assert row["note"] == "health ok=False failed=wiki-index degraded=- pool 71.4% ONLINE"
+
+
+def test_red_night_receipt_note_names_a_failing_write_path(tmp_path):
+    """The same run with only the write path red: the chain's last reading step fails, and the receipt note
+    (the stamp's last stdout line) says why instead of a bare `ok=False`."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    canned = tmp_path / "canned.json"
+    canned.write_text(json.dumps(dict(BASE, ok=False, write_path=WP_RED)), encoding="utf-8")
+    fake = bindir / "curl"
+    fake.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n' f'cp "{canned}" "$out"\n', encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    env = _home_env(home, PATH=f"{bindir}:{os.environ['PATH']}")
+    env.pop("MEM0_URL", None)
+    r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), "health-stamp", BASH, str(SCRIPTS / "ams-health-stamp.sh")],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 2
+    row = json.loads((home / ".mem0" / "maintenance" / "receipts.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["ok"] is False and row["status"] == "failed"
+    assert row["note"] == "health ok=False failed=- degraded=- pool 71.4% ONLINE write-path 503 upstream"
