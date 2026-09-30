@@ -245,7 +245,7 @@ The compiled client's fail-open matrix (missing lib, absent pipe, timeouts, garb
 
 - [`../../scripts/windows/stop-extract.ps1`](../../scripts/windows/stop-extract.ps1) — the Stop/PreCompact dispatcher + the PreCompact snapshot.
 - [`../../scripts/windows/l1a-extract.ps1`](../../scripts/windows/l1a-extract.ps1) — the detached Codex-backed extractor.
-- [`../../scripts/windows/sessionstart-capture.ps1`](../../scripts/windows/sessionstart-capture.ps1) — the SessionStart capture of the prior session, with the per-session same-second guard.
+- [`../../scripts/windows/sessionstart-capture.ps1`](../../scripts/windows/sessionstart-capture.ps1) — the SessionStart capture of the prior session, with the per-session same-second guard and the file-name + mtime watermark (why: [`../flows/memory-capture.md`](../flows/memory-capture.md)).
 - [`../../scripts/windows/mem0-hook-daemon.ps1`](../../scripts/windows/mem0-hook-daemon.ps1) — the resident UserPromptSubmit bundle accelerator.
 - [`../../scripts/windows/mem0-hook-client.cs`](../../scripts/windows/mem0-hook-client.cs) — the compiled thin client (fail-open exit-code contract).
 - [`../../scripts/windows/build-hook-client.ps1`](../../scripts/windows/build-hook-client.ps1) — compiles + smoke-gates the client exe.

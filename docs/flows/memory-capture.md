@@ -6,19 +6,20 @@ Deep-dive on layer 1 of [`ARCHITECTURE.md`](../../ARCHITECTURE.md): every mechan
 
 ## Trigger
 
-There is no single trigger — capture happens at four distinct moments, each hung off a different Claude Code hook or schedule:
+There is no single trigger — capture happens at five distinct moments, each hung off a different Claude Code hook or schedule:
 
 | Moment | Trigger | What's captured | Code |
 |---|---|---|---|
 | Session end / compaction | `Stop` / `PreCompact` hooks | facts + the session episode + goals + open questions | `stop-extract.ps1` → `l1a-extract.ps1` |
+| Session start | `SessionStart` hook | the same, for the *prior* session: the most recent transcript that is not this one (covers runtimes where `Stop` never fires) | `sessionstart-capture.ps1` → `l1a-extract.ps1` |
 | Every prompt | `UserPromptSubmit` | episode checkpoint + operator corrections | `mem0-hook-client.exe` → daemon → `user-prompt-lib.ps1` |
 | Nightly 3am | Task Scheduler (WakeToRun) | insights + canonical promotions + hygiene | `dream-consolidate.ps1` |
 | Compaction (query capture) | `PreCompact` (WSL side) | a redacted "what were we doing" query for the post-compact resume | `precompact_capture.py` |
 
 ## Participants
 
-- **Claude Code hooks** — `Stop`, `PreCompact`, and `UserPromptSubmit` are the entry points that fire each capture.
-- **The L1a extractor chain** — `stop-extract.ps1` (dispatcher) → `l1a-extract.ps1` (the detached session fact extractor), with shared helpers in `memory-common.ps1`.
+- **Claude Code hooks** — `Stop`, `PreCompact`, `SessionStart`, and `UserPromptSubmit` are the entry points that fire each capture.
+- **The L1a extractor chain** — `stop-extract.ps1` (dispatcher) → `l1a-extract.ps1` (the detached session fact extractor), with shared helpers in `memory-common.ps1`; `sessionstart-capture.ps1` is the second dispatcher, feeding it the prior session at SessionStart.
 - **The per-prompt hook client + resident daemon** — the compiled `mem0-hook-client` (`mem0-hook-client.cs`) → `mem0-hook-daemon.ps1` → `user-prompt-lib.ps1` / `user-prompt-extract.ps1`.
 - **The dream consolidator** — `dream-consolidate.ps1`, run nightly by Windows Task Scheduler, with `dream-catchup.ps1` and `memory-index-refresh.ps1` as its resilience spawners.
 - **The PreCompact WSL sidecar** — `precompact_capture.py`.
@@ -76,6 +77,14 @@ The other shape rules (all enforced in-prompt, all consequential downstream):
 
 **Beyond facts**, the same Codex call extracts the episode (goal: 1–2 sentences; summary: 2–4), **0–3 advanced goals** (with a one-sentence delta), **0–2 blocked goals** (with the blocker), and **0–5 open questions** — declarative uncertainties raised but unanswered, "NOT idle wondering". These feed the prospective-memory surfaces (session banners, the bundle).
 
+### SessionStart — capturing the prior session
+
+Where the per-turn hooks do not fire (the VS Code extension and Agent SDK runtimes), `Stop` never runs and a finished session's facts would never be extracted. The `SessionStart` hook closes that gap at the session boundary: `sessionstart-capture.ps1` picks the most recently modified transcript that is not the current session's, spawns the same detached `l1a-extract.ps1` on it (event name `SessionStart`) and exits 0 at once, so starting a session is never blocked.
+
+**Which transcript.** It globs `~/.claude/projects/*/*.jsonl` (two levels, no `-Recurse`) and takes the newest non-empty one by mtime. A directory junction or symlink under `projects` is an *alias* of another project directory, and the glob lists every transcript behind it a second time, at the same mtime, under a different path — while `Sort-Object` does not order ties. So the tie is broken on purpose: newest mtime first, then a file under a real directory before one reached through an alias, then the path. The path the extractor is handed, and the workspace label and brand it infers from that path, are therefore the same every time for the same file. The alias flag is read once per directory (cached by directory name), not once per file, because this runs on every session start over a listing of a thousand files or more. Aliases stay in the listing: a transcript that exists only behind a junction must still be captured.
+
+**The watermark.** `~/.claude/state/last-sessionstart-capture` holds the file name and mtime ticks of the transcript last handed to the extractor (`<file name>|<ticks>`), and the same file at the same mtime is not captured again. It is keyed by **file name + mtime, never by path**. The file name is the session uuid, so it identifies a transcript across workspaces, and the mtime says whether the session has grown since. The directory is only how one start happened to reach the file, and an alias changes it while nothing else changes: a watermark keyed by the full path took that change for a new transcript and captured it again, which — once the extractor's 10-minute throttle had passed — cost a second Codex extraction and a second `POST /v1/episodes`, and the server does not dedupe episodes. A watermark an earlier release wrote (`<full path>|<ticks>`) still counts, matched by its tail after a directory separator, so upgrading costs no extra capture. Beside it, a per-session marker in the same directory drops the second of two hooks that fire for one session in the same second.
+
 ### Per-prompt capture
 
 The compiled `UserPromptSubmit` client (exec-form hook entry — a Windows concurrent-spawn race killed the shell form; see the v1.11.0 notes) checkpoints an **in-progress episode** on every prompt (a partial unique index guarantees at most one per session) and runs `Test-CorrectionLikePrompt`: prompts shaped like operator corrections are redacted (`Redact-Secrets`, before the 2000-character cap) and append durably to `~/.mem0/learn-rules.jsonl` **the moment they happen**. Rationale: correction is the highest-value, lowest-frequency signal the operator emits; making it wait for the nightly cycle risked losing it to a crash or a missed dream.
@@ -110,6 +119,7 @@ A tiny WSL sidecar (`precompact_capture.py`) with one job: when the context is a
 | PreCompact resume query | PreCompact | `precompact-query.json` marker, consumed at the next SessionStart |
 | Failed POSTs | on write failure | DLQ `~/.claude/state/mem0-post-failures.jsonl`; poison → `mem0-post-poison.jsonl` |
 | Throttle markers | after each successful run | `~/.claude/state/` (`l1a`, `dream`, `dream-catchup`, `index-refresh`, `learn-rules-drain`) |
+| SessionStart watermark | each time the prior session is handed to the extractor | `~/.claude/state/last-sessionstart-capture` — the transcript's file name and mtime ticks, never its path |
 
 ## Success behavior
 
@@ -152,6 +162,7 @@ Secrets are redacted at the three capture entrances (the server `add()`, episode
 
 ## Testing notes
 
+- [`../../scripts/windows/tests/SessionStartCapture.Junction.Tests.ps1`](../../scripts/windows/tests/SessionStartCapture.Junction.Tests.ps1) — the SessionStart pick and watermark against real directory junctions built in a temp tree: the real path always wins a tie, an alias-only transcript is still captured, and a new-format or legacy watermark suppresses a re-capture through any path. [`SessionStartCapture.Tests.ps1`](../../scripts/windows/tests/SessionStartCapture.Tests.ps1) covers the same-second guard.
 - [`../../scripts/windows/tests/DrainDeadLetter.Tests.ps1`](../../scripts/windows/tests/DrainDeadLetter.Tests.ps1) — DLQ drain, poison-code quarantine, and the attempt cap.
 - [`../../scripts/windows/tests/MemoryCommon.Tests.ps1`](../../scripts/windows/tests/MemoryCommon.Tests.ps1) — the ship-log split, redaction, and transcript-windowing helpers.
 - [`../../scripts/windows/tests/UserPromptExtract.Tests.ps1`](../../scripts/windows/tests/UserPromptExtract.Tests.ps1) — correction detection and per-prompt admission.
@@ -163,6 +174,7 @@ Secrets are redacted at the three capture entrances (the server `add()`, episode
 ## Source map
 
 - [`../../scripts/windows/stop-extract.ps1`](../../scripts/windows/stop-extract.ps1) — the Stop/PreCompact dispatcher that snapshots the transcript and spawns the extractor detached.
+- [`../../scripts/windows/sessionstart-capture.ps1`](../../scripts/windows/sessionstart-capture.ps1) — the SessionStart dispatcher for the prior session: the candidate pick (real directory before alias), the file-name + mtime watermark, and the same-second guard.
 - [`../../scripts/windows/l1a-extract.ps1`](../../scripts/windows/l1a-extract.ps1) — the session fact extractor (throttle, DLQ drain, transcript window, inferability-gated Codex extraction, MEM-10 split).
 - [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — shared helpers: `Split-FactsByShipLog`, `Redact-Secrets`, transcript windowing, the DLQ drain, the Codex lock/throttle.
 - [`../../scripts/windows/mem0-hook-client.cs`](../../scripts/windows/mem0-hook-client.cs) — the compiled `UserPromptSubmit` client (exec-form entry).
