@@ -59,6 +59,36 @@ def _routes():
     return out
 
 
+# The routes FastAPI itself adds to `FastAPI(title=..., version=...)` when docs_url / redoc_url / openapi_url
+# are left at their defaults: the schema, Swagger UI (with its OAuth2 redirect page) and ReDoc.
+FRAMEWORK_ROUTES = ["/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"]
+FRAMEWORK_SWITCHES = {"docs_url", "redoc_url", "openapi_url", "swagger_ui_oauth2_redirect_url"}
+
+
+def test_the_docs_name_fastapis_own_routes_as_keyless_while_the_app_leaves_them_on():
+    """The AST walk above sees only `@app.<verb>` routes, so it cannot see these four, and they answer
+    without a key: the app builds `FastAPI(...)` with none of the switches that turn them off, and no
+    middleware or app-level dependency stands in front of them. The auth sentence said every endpoint
+    but the five health probes needs the key. It is true only while the framework defaults stay on;
+    turn them off in the code and this test asks for the sentence to change with it."""
+    src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "FastAPI"]
+    assert len(calls) == 1, "app.py builds exactly one FastAPI app"
+    keywords = {kw.arg for kw in calls[0].keywords}
+    assert not keywords & FRAMEWORK_SWITCHES, (
+        f"app.py now sets {sorted(keywords & FRAMEWORK_SWITCHES)}: the framework routes may be off or moved, so "
+        "docs/api-contracts.md and CLAUDE.md must say so")
+    assert "dependencies" not in keywords, "an app-level dependency may put the framework routes behind a key"
+    assert "add_middleware(" not in src and "@app.middleware" not in src, "a middleware may put the framework routes behind a key"
+    text = (REPO_ROOT / "docs" / "api-contracts.md").read_text(encoding="utf-8")
+    auth_line = next(ln for ln in text.splitlines() if ln.startswith("Auth:"))
+    missing = [r for r in FRAMEWORK_ROUTES if f"`{r}`" not in auth_line]
+    assert not missing, f"docs/api-contracts.md's auth sentence does not name FastAPI's own keyless routes {missing}"
+    guide = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    line = next(ln for ln in guide.splitlines() if "X-API-Key" in ln and "keyless" in ln)
+    assert "/openapi.json" in line and "/docs" in line and "/redoc" in line, line
+
+
 def test_api_contracts_names_exactly_the_keyless_endpoints():
     routes = _routes()
     assert len(routes) >= 30, routes   # the parser found the server's routes

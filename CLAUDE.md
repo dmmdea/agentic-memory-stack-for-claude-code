@@ -12,7 +12,7 @@ Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it 
 
 1. **mem0-server** (`mem0-server/app.py`) — FastAPI wrapper around mem0 on
    `:18791` (the authority binds its tailnet address; a dormant replica's copy is loopback).
-   Owns add/search/list/update/tier-change. `X-API-Key` auth (the five health probes are keyless).
+   Owns add/search/list/update/tier-change. `X-API-Key` auth (the five health probes are keyless, as are FastAPI's own `/openapi.json`, `/docs` and `/redoc`).
 2. **Qdrant** — vector store on `127.0.0.1:6333` (loopback only; never bind 0.0.0.0).
    768-dim collection `mem0_egemma_768`.
 3. **llama-swap** — local inference on `127.0.0.1:11436`: EmbeddingGemma-300m
