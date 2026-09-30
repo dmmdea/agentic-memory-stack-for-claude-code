@@ -37,9 +37,11 @@ func TestResolveBrand_SharedFixture(t *testing.T) {
 		if string(data) == "null" {
 			data = nil
 		}
+		// A case may carry unusable entries on purpose (a broken regex, a rule with no brand): the
+		// contract routes with the entries that are good, so the problems are logged, not fatal.
 		m, err := Parse(data)
 		if err != nil {
-			t.Fatalf("case %d: map does not load: %v", n, err)
+			t.Logf("case %d: the map loads with problems (%v)", n, err)
 		}
 		want := ""
 		if c.Expect != nil {
@@ -117,5 +119,64 @@ func TestResolveBrand_SharedBrandIsReturnedAsIs(t *testing.T) {
 	}
 	if !m.IsShared("shared-lab") || m.IsShared("other") {
 		t.Error("IsShared must answer from shared_brands only")
+	}
+}
+
+// Path separators are ONE character to the matcher (C3). The operator writes a rule with "/"
+// ("projects/client-a") and it must find the same place spelled as a Windows path, a Unix path or
+// Claude Code's hyphenated workspace slug - the string the judge actually passes. A resolver that
+// compared the raw strings would never match a slug, and every migrated fact would go untagged.
+func TestResolveBrand_SeparatorsAreOneCharacter(t *testing.T) {
+	m, err := Parse([]byte(`{"rules":[` +
+		`{"pattern":"projects/client-a","brand":"brand-a"},` +
+		`{"pattern":"beta[\\\\/ -]+labs","brand":"brand-b"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ path, want string }{
+		{"g--My-Drive-Projects-Client-A", "brand-a"},       // the hyphenated slug
+		{`G:\My Drive\Projects\Client-A\notes`, "brand-a"}, // a Windows path: backslashes and a space
+		{"/home/u/projects/client-a", "brand-a"},           // a Unix path
+		{"PROJECTS-CLIENT-A", "brand-a"},                   // case does not matter
+		{"C--Work-beta-labs", "brand-b"},                   // a separator class inside the pattern
+		{`C:\Work\beta labs\memory`, "brand-b"},
+		{"g--My-Drive-Projects-Client-B", ""}, // another place: no brand
+		{"", ""},                              // no path routes nothing
+	}
+	for _, c := range cases {
+		if got := m.Resolve(c.path, ""); got != c.want {
+			t.Errorf("Resolve(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+// An empty path routes nothing even when a pattern would match the empty string.
+func TestResolveBrand_EmptyPathRoutesNothing(t *testing.T) {
+	m, err := Parse([]byte(`{"rules":[{"pattern":".*","brand":"x"}],"content_rule_workspaces":[".*"],` +
+		`"content_rules":[{"pattern":"word","brand":"y"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Resolve("", "word"); got != "" {
+		t.Errorf("Resolve(\"\") = %q, want no brand", got)
+	}
+	if got := m.Resolve("some-path", "word"); got != "x" {
+		t.Errorf("Resolve(some-path) = %q, want the catch-all rule's brand x", got)
+	}
+}
+
+// Only the PATH side is normalised. A content rule reads the fact's own words: a space in the
+// pattern is a space in the text, not a separator.
+func TestResolveBrand_ContentRulesAreMatchedAsWritten(t *testing.T) {
+	m, err := Parse([]byte(`{"content_rule_workspaces":["mixed"],` +
+		`"content_rules":[{"pattern":"beta shop","brand":"brand-b"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Resolve("g--My-Drive-mixed", "the beta shop order"); got != "brand-b" {
+		t.Errorf("brand = %q, want brand-b: the pattern's space matches the text's space", got)
+	}
+	if got := m.Resolve("g--My-Drive-mixed", "the beta-shop order"); got != "" {
+		t.Errorf("brand = %q, want none: a content pattern is not rewritten to hyphens", got)
 	}
 }

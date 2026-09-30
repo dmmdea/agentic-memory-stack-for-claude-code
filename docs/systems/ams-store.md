@@ -598,7 +598,12 @@ in `internal/brand`, shared corpus `tests/fixtures/brand-routing-cases.jsonl` ru
 resolver) and a migrated fact carries `brand` in its metadata when it resolves: the first
 `rules` pattern matching the workspace slug decides; otherwise, for a
 `content_rule_workspaces` match, exactly one distinct brand across the `content_rules`
-over the fact body decides and zero or several decide nothing. A brand listed in
+over the fact body decides and zero or several decide nothing. Path separators are one
+character to the matcher: the slug (or path) has each backslash, slash and space read as
+`-`, and the same literals in a `rules` or `content_rule_workspaces` pattern are read
+that way too, so a rule written `projects/client-a` finds a Windows path, a Unix path and
+the hyphenated slug alike (the Python and PowerShell resolvers do the same, and the shared
+corpus pins it); `content_rules` match the fact body as written. A brand listed in
 `shared_brands` is written as-is - making it visible to every scope is the admission
 gate's job. A missing, empty or malformed map is brand-neutral and never an error.
 
