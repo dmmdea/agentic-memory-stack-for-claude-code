@@ -4,7 +4,10 @@ write_path.install(app) registers ONE middleware that records the outcome of POS
 PUT /v1/memories/{id} into the passive tracker. It has to record the FINAL response, after the
 exception handlers ran: the 503 that embedder_503.install builds from an embedder outage and the
 500 a route raises as an HTTPException are both responses by the time it looks, and an exception
-nobody handles reaches it as an exception, which it records as a 500 and re-raises.
+nobody handles reaches it as an exception, which it records as a 500 and re-raises. A 2xx that a
+route marks neutral (the add route's duplicate answer never reaches the embedder) is recorded as
+nothing, so it can neither count as a success nor clear a failure; a 5xx is recorded whatever the
+route marked.
 
 `import app` cannot run headless (it builds the live Memory client), so this builds a minimal
 FastAPI app that installs the SAME middleware (write_path.install) and the SAME embedder handler
@@ -31,7 +34,7 @@ if str(SERVER_DIR) not in sys.path:
 
 import embedder_503  # noqa: E402
 import write_path as wp  # noqa: E402
-from fastapi import BackgroundTasks, FastAPI, HTTPException  # noqa: E402
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import Response, StreamingResponse  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
@@ -57,13 +60,36 @@ def _bg_boom():
     raise RuntimeError("background task failed after the response")
 
 
-def _act(case: str, background: BackgroundTasks | None = None):
+def _act(case: str, background: BackgroundTasks | None = None, request: Request | None = None):
     """What a write route can do, named after the real failure it stands in for."""
     if case == "bg-fail":           # the NLI gate runs as a background task, after the response
         background.add_task(_bg_boom)
         return {"results": [{"id": "m1", "event": "ADD"}]}
     if case == "ok":
         return {"results": [{"id": "m1", "event": "ADD"}]}
+    # A 2xx that never reached the embedder: the route marks it neutral, as app.add() does for a duplicate.
+    if case == "neutral-dup":
+        wp.mark_neutral(request)
+        return {"results": [{"id": "m1", "memory": "hello", "event": "NOOP_DUPLICATE"}], "deduplicated": True}
+    if case == "neutral-empty":     # infer=False, every message skipped: 200 {"results": []}
+        wp.mark_neutral(request)
+        return {"results": []}
+    if case == "neutral-created":
+        wp.mark_neutral(request)
+        return Response(b'{"id": "m2"}', status_code=201, media_type="application/json")
+    # A route that marked itself neutral and then failed: the failure still counts, whatever the flag says.
+    if case == "neutral-then-503":
+        wp.mark_neutral(request)
+        raise HTTPException(503, "upstream unavailable, retry later", headers={"Retry-After": "10"})
+    if case == "neutral-then-500":
+        wp.mark_neutral(request)
+        raise HTTPException(500, "boom")
+    if case == "neutral-then-5xx-response":
+        wp.mark_neutral(request)
+        return Response(b'{"detail": "disk"}', status_code=507, media_type="application/json")
+    if case == "neutral-then-crash":
+        wp.mark_neutral(request)
+        raise RuntimeError("bug")
     if case == "embedder":          # an embed call raised outside the route's own try: embedder_503 answers
         raise httpx.ConnectError("refused")
     if case == "upstream-500":      # what app._upstream_error(e) raises for an error that is not an outage
@@ -105,12 +131,12 @@ def build_app(*, middleware: bool = True, install_middleware_first: bool = False
         wp.install(app)
 
     @app.post("/v1/memories")
-    def add(b: Body, background: BackgroundTasks, case: str = "ok"):
-        return _act(case, background)
+    def add(b: Body, background: BackgroundTasks, request: Request, case: str = "ok"):
+        return _act(case, background, request)
 
     @app.put("/v1/memories/{mid}")
-    def update(mid: str, b: Body, background: BackgroundTasks, case: str = "ok"):
-        return _act(case, background)
+    def update(mid: str, b: Body, background: BackgroundTasks, request: Request, case: str = "ok"):
+        return _act(case, background, request)
 
     # The routes that share the prefix but are not the write path: they fail loudly and must not count.
     @app.post("/v1/memories/search")
@@ -260,6 +286,77 @@ def test_other_routes_under_the_prefix_are_not_the_write_path(method, path, case
     assert _counts() == (0, 0), f"{method} {path} must not be recorded"
 
 
+# ------------------------------------------------------------ a 2xx that says nothing about the path is neutral
+NEUTRAL_2XX = ["neutral-dup", "neutral-empty", "neutral-created"]
+FRESH = {"ok": True, "last_ok_at": None, "last_error_at": None, "last_error": None, "errors_1h": 0, "writes_1h": 0}
+
+
+@pytest.mark.parametrize("case", NEUTRAL_2XX)
+def test_a_neutral_2xx_records_nothing(case):
+    c = _client()
+    assert _post(c, case).status_code in (200, 201)
+    assert wp.snapshot() == FRESH
+
+
+@pytest.mark.parametrize("case", NEUTRAL_2XX)
+@pytest.mark.parametrize("method,path", [("POST", "/v1/memories"), ("PUT", "/v1/memories/abc")])
+def test_a_neutral_2xx_during_a_failure_does_not_clear_it(method, path, case):
+    """The outage this signal exists for. Automated writers re-post whole transcripts, so most of their
+    writes are duplicates answered 200 without the embedder, interleaved with the 503s for the new facts:
+    counting those 200s as successes made `ok` flap back to true between two failures."""
+    c = _client()
+    assert _post(c, "embedder").status_code == 503
+    for _ in range(3):
+        r = c.request(method, path, params={"case": case}, json={"text": "hello"})
+        assert r.status_code in (200, 201)
+    snap = wp.snapshot()
+    assert snap["ok"] is False, "a duplicate answered 200 must not turn the path green"
+    assert snap["last_error"] == "503 cold-embedder" and snap["last_ok_at"] is None
+    assert (snap["errors_1h"], snap["writes_1h"]) == (1, 1), "a neutral answer is counted neither way"
+
+
+def test_a_real_success_after_neutral_answers_still_clears_the_failure():
+    c = _client()
+    _post(c, "embedder")
+    _post(c, "neutral-dup")
+    assert wp.snapshot()["ok"] is False
+    assert _post(c, "ok").status_code == 200
+    snap = wp.snapshot()
+    assert snap["ok"] is True and snap["last_ok_at"] is not None
+    assert (snap["errors_1h"], snap["writes_1h"]) == (1, 2)
+
+
+def test_the_neutral_mark_belongs_to_one_request_and_does_not_leak_to_the_next():
+    c = _client()
+    _post(c, "neutral-dup")
+    assert _post(c, "ok").status_code == 200
+    assert _counts() == (0, 1), "the second request is a real success and is recorded"
+
+
+@pytest.mark.parametrize("case,status,label", [
+    ("neutral-then-503", 503, "503 upstream"),
+    ("neutral-then-500", 500, "500 upstream"),
+    ("neutral-then-5xx-response", 507, "507 upstream"),
+    ("neutral-then-crash", 500, "500 upstream"),
+])
+@pytest.mark.parametrize("method,path", [("POST", "/v1/memories"), ("PUT", "/v1/memories/abc")])
+def test_a_neutral_mark_never_hides_a_failure(method, path, case, status, label):
+    """Neutral suppresses a 2xx and only a 2xx: a 5xx, or a crash, is recorded whatever the flag says."""
+    c = _client()
+    r = c.request(method, path, params={"case": case}, json={"text": "hello"})
+    assert r.status_code == status
+    snap = wp.snapshot()
+    assert snap["ok"] is False and snap["last_error"] == label
+    assert (snap["errors_1h"], snap["writes_1h"]) == (1, 1)
+
+
+def test_a_neutral_route_that_crashes_is_recorded_and_re_raised():
+    c = TestClient(build_app(), raise_server_exceptions=True)
+    with pytest.raises(RuntimeError, match="bug"):
+        _post(c, "neutral-then-crash")
+    assert wp.snapshot()["last_error"] == "500 upstream"
+
+
 # ------------------------------------------------------------------------------ the reason comes from the response
 @pytest.mark.parametrize("case,status,expected", [
     ("reason-body", 507, "507 disk-full"),
@@ -309,7 +406,8 @@ def _wire(r: httpx.Response):
 
 @pytest.mark.parametrize("case", ["ok", "created", "embedder", "upstream-500", "upstream-503", "reason-body",
                                   "not-json", "empty-502", "stream-reason", "stream-split", "huge-5xx",
-                                  "401", "crash"])
+                                  "401", "crash", *NEUTRAL_2XX, "neutral-then-503", "neutral-then-500",
+                                  "neutral-then-5xx-response", "neutral-then-crash"])
 @pytest.mark.parametrize("method,path", [("POST", "/v1/memories"), ("PUT", "/v1/memories/abc")])
 def test_the_response_is_identical_with_and_without_the_middleware(method, path, case):
     with_mw, without = _client(), _client(middleware=False)
@@ -449,3 +547,107 @@ def test_app_py_installs_the_middleware_on_its_app():
                 and [_dotted(a) for a in n.value.args] == ["app"] and not n.value.keywords]
     assert len(made) == 1 and len(installs) == 1, "app.py must call _write_path.install(app) once, at module level"
     assert installs[0] > made[0], "the middleware is installed on the app after it is created"
+
+
+# ------------------------------------------- which app.py answers are neutral (pinned on the syntax tree)
+# Every 2xx a write route can give WITHOUT the embedder must mark itself neutral, or it clears a failure.
+# Enumerated against the routes and mem0 2.0.4 (Memory.add / Memory.update):
+#   POST add(): the hash-dedup answer (NOOP_DUPLICATE) is a payload lookup; infer=False with every message
+#     skipped (system role, malformed) returns {"results": []} without an embed call. infer=True embeds the
+#     incoming text (existing-memory lookup) before it can answer at all, so its 200 is evidence, not neutral.
+#   PUT update(): Memory.update embeds the new text as its first act; its only 2xx return is after it.
+def _app_tree() -> ast.Module:
+    return ast.parse(APP_PY.read_text(encoding="utf-8"))
+
+
+def _route(tree: ast.Module, name: str) -> ast.FunctionDef:
+    fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+    assert len(fns) == 1, f"app.py must define exactly one module-level {name}()"
+    return fns[0]
+
+
+def _own_nodes(fn: ast.FunctionDef):
+    """Every node of a function, not descending into functions or classes defined inside it."""
+    stack = list(fn.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _blocks(fn: ast.FunctionDef):
+    """Every statement list of the function (bodies, else branches, handlers)."""
+    for node in [fn, *_own_nodes(fn)]:
+        if node is not fn and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        for attr in ("body", "orelse", "finalbody"):
+            block = getattr(node, attr, None)
+            if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+                yield block
+
+
+def _is_mark_neutral(stmt: ast.stmt) -> bool:
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            and _dotted(stmt.value.func) == "_write_path.mark_neutral"
+            and [_dotted(a) for a in stmt.value.args] == ["request"] and not stmt.value.keywords)
+
+
+def _line_of_call(fn: ast.FunctionDef, dotted: str) -> int:
+    lines = [n.lineno for n in _own_nodes(fn) if isinstance(n, ast.Call) and _dotted(n.func) == dotted]
+    assert len(lines) == 1, f"{fn.name}() must call {dotted}(...) exactly once"
+    return lines[0]
+
+
+def test_add_takes_the_request_it_marks():
+    tree = _app_tree()
+    params = {a.arg: _dotted(a.annotation) for a in _route(tree, "add").args.args if a.annotation is not None}
+    assert params.get("request") == "Request", "add() needs `request: Request` to mark its response neutral"
+    assert any(isinstance(n, ast.ImportFrom) and n.module == "fastapi"
+               and any(a.name == "Request" and a.asname is None for a in n.names) for n in tree.body), \
+        "app.py must import Request from fastapi"
+
+
+def test_add_marks_every_answer_it_gives_before_mem_add_neutral():
+    """The hash-dedup answer never reaches the embedder. An automated writer re-posts the whole transcript,
+    so during an embedder outage most of its writes are exactly this 200, between the 503s."""
+    add = _route(_app_tree(), "add")
+    mem_add = _line_of_call(add, "mem.add")
+    early = [(blk, i) for blk in _blocks(add) for i, s in enumerate(blk)
+             if isinstance(s, ast.Return) and s.lineno < mem_add]
+    assert early, "add() answers the duplicate before mem.add(...)"
+    for blk, i in early:
+        assert any(_is_mark_neutral(s) for s in blk[:i]), (
+            f"the return at line {blk[i].lineno} answers before mem.add(...) without touching the embedder: "
+            "call _write_path.mark_neutral(request) first in the same block")
+    dup = [blk[i] for blk, i in early if any(isinstance(n, ast.Constant) and n.value == "NOOP_DUPLICATE"
+                                             for n in ast.walk(blk[i]))]
+    assert len(dup) == 1, "exactly one early answer is the NOOP_DUPLICATE one"
+
+
+def test_add_marks_an_infer_false_add_that_stored_nothing_neutral():
+    """infer=False skips system-role and malformed messages without an embed call and answers 200 with an
+    empty `results`. infer=True is deliberately not covered: it embeds before it can answer."""
+    add = _route(_app_tree(), "add")
+    mem_add = _line_of_call(add, "mem.add")
+    guards = [s for blk in _blocks(add) for s in blk if isinstance(s, ast.If)
+              and any(isinstance(n, ast.Call) and _dotted(n.func) == "_write_path.stored_nothing"
+                      for n in ast.walk(s.test))]
+    assert len(guards) == 1, "add() must test _write_path.stored_nothing(result) once"
+    guard = guards[0]
+    assert guard.lineno > mem_add, "the check reads the result mem.add(...) returned"
+    assert isinstance(guard.test, ast.BoolOp) and isinstance(guard.test.op, ast.And)
+    assert [ast.unparse(v) for v in guard.test.values] == ["b.infer is False", "_write_path.stored_nothing(result)"]
+    assert any(_is_mark_neutral(s) for s in guard.body)
+
+
+def test_update_has_no_embedder_free_2xx_path():
+    """Memory.update embeds the new text before it does anything else, so every 2xx that PUT gives has
+    exercised the embedder and there is nothing to mark. A `return` ahead of the mem.update(...) call would be
+    an embedder-free 2xx: it has to mark itself neutral (and get a test) before this pin is relaxed."""
+    update = _route(_app_tree(), "update")
+    mem_update = _line_of_call(update, "mem.update")
+    returns = [n for n in _own_nodes(update) if isinstance(n, ast.Return)]
+    assert returns, "update() answers with a return"
+    assert all(r.lineno > mem_update for r in returns), "update() must not return before mem.update(...)"

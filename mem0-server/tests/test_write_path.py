@@ -5,7 +5,8 @@ ok:true, because nothing on that endpoint had ever looked at a write. The tracke
 traffic itself (no I/O, no model load), so it can sit on an endpoint that is polled every few
 minutes without keeping a model resident. These tests pin its rules with injected clocks:
 
-  * a 2xx is a success and a 5xx a failure; every other status says nothing about the path;
+  * a 2xx is a success and a 5xx a failure; every other status says nothing about the path, and
+    neither does a 2xx a route marks neutral (an answer that never reached the embedder);
   * ok is false while the MOST RECENT outcome is a failure, and only a later success clears it;
   * there is no time decay (silence is not health) but the counters cover the last hour only;
   * the state is bounded, thread-safe, and exactly the six fields the endpoint publishes.
@@ -18,6 +19,7 @@ import datetime as dt
 import json
 import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -294,3 +296,55 @@ def test_the_module_level_api_is_the_default_tracker(monkeypatch):
     wp.record(503, "cold-embedder", now=T0)
     assert mine.snapshot(now=T0)["last_error"] == "503 cold-embedder"
     assert wp.snapshot(now=T0) == mine.snapshot(now=T0)
+
+
+# ------------------------------------------------ the neutral mark: a 2xx that says nothing about the path
+class _Req:
+    """Just enough of a Starlette request: a `state` that takes attributes."""
+
+    def __init__(self):
+        self.state = types.SimpleNamespace()
+
+
+def test_mark_neutral_sets_the_flag_the_middleware_reads():
+    req = _Req()
+    assert wp.is_neutral(req) is False
+    wp.mark_neutral(req)
+    assert wp.NEUTRAL_KEY == "write_path_neutral"
+    assert getattr(req.state, wp.NEUTRAL_KEY) is True and wp.is_neutral(req) is True
+
+
+def test_a_request_nobody_marked_is_not_neutral():
+    assert wp.is_neutral(_Req()) is False
+    assert wp.is_neutral(types.SimpleNamespace(state=types.SimpleNamespace(write_path_neutral="yes"))) is False, \
+        "only a real True marks a response neutral"
+
+
+class _NoState:
+    @property
+    def state(self):
+        raise RuntimeError("no state on this request")
+
+
+@pytest.mark.parametrize("request_", [None, object(), types.SimpleNamespace(), types.SimpleNamespace(state=None),
+                                      _NoState()], ids=["none", "object", "no-state", "state-none", "state-raises"])
+def test_mark_neutral_never_raises_into_the_route(request_):
+    """The route calls it on its way to a 200. A health signal must not be the reason a write fails."""
+    wp.mark_neutral(request_)
+
+
+@pytest.mark.parametrize("result,expected", [
+    ({"results": []}, True),
+    ({"results": [], "relations": []}, True),
+    ({"results": [{"id": "m1", "memory": "x", "event": "ADD"}]}, False),
+    ({"results": [{"id": "m1", "event": "NOOP_DUPLICATE"}], "deduplicated": True}, False),
+    ({}, False),
+    ({"results": None}, False),
+    ({"message": "Memory updated successfully!"}, False),
+    ([], False),
+    (None, False),
+    ("", False),
+])
+def test_stored_nothing_is_true_only_for_an_empty_results_list(result, expected):
+    """mem0's add answers {"results": []} when it stored nothing. Any other shape is not that answer."""
+    assert wp.stored_nothing(result) is expected

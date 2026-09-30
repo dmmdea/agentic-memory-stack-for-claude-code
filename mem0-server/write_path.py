@@ -19,6 +19,14 @@ Rules:
 * The state lives in this process and nowhere else. A restart forgets it and reads `ok: true`
   with nulls, because there is no evidence yet either way.
 
+* A 2xx that never reached the embedder says nothing about the path, so it is NEUTRAL: it is not
+  counted and it clears nothing. The clearest case is the add route's content-hash dedup, which
+  answers 200 from a payload lookup before any embed call. Automated writers re-post whole
+  transcripts, so during an embedder outage most of their writes are exactly that 200, between the
+  503s for the new facts; counted as successes they made `ok` flap back to true. The route marks
+  such an answer with `mark_neutral(request)`; the middleware then records nothing for it. Neutral
+  suppresses a 2xx and only a 2xx: a 5xx or an unhandled exception is recorded whatever the flag says.
+
 The tracker is a plain object (`WritePathTracker`) so a test can own one; the module-level
 `record`, `snapshot` and `reset` work on the process-wide `TRACKER`, which is what the server uses.
 
@@ -43,6 +51,7 @@ MAX_REASON_CHARS = 64      # a reason is a short label, never a message
 DEFAULT_REASON = "upstream"
 WRITE_PATH_PREFIX = "/v1/memories"
 PEEK_MAX_BYTES = 4096      # a failure body bigger than this is not read for a reason (it is still sent whole)
+NEUTRAL_KEY = "write_path_neutral"   # the request.state key a route sets on a 2xx that says nothing about the path
 
 
 def _iso(epoch: float) -> str:
@@ -160,6 +169,38 @@ def reset() -> None:
     TRACKER.reset()
 
 
+# ------------------------------------------------------------------ the neutral mark (route -> middleware)
+def _log_failure(what: str) -> None:
+    """Log the exception being handled. Bookkeeping never fails a request, so not even a broken log handler may."""
+    try:
+        log.exception("write_path: %s", what)
+    except Exception:
+        pass
+
+
+def mark_neutral(request: Any) -> None:
+    """A write route calls this on a 2xx that never reached the embedder: a duplicate answered from a payload
+    lookup, an add that skipped every message. Such an answer says nothing about the write path, so the
+    middleware records nothing for it, neither a success nor a clear. It rides on `request.state`, which the
+    route's request and the middleware's share (both wrap one ASGI scope). It never raises: a health signal
+    must not be the reason a write fails."""
+    try:
+        setattr(request.state, NEUTRAL_KEY, True)
+    except Exception:
+        _log_failure("could not mark a response neutral")
+
+
+def is_neutral(request: Any) -> bool:
+    """True when a route marked this request's response neutral (only a real True counts)."""
+    return getattr(request.state, NEUTRAL_KEY, False) is True
+
+
+def stored_nothing(result: Any) -> bool:
+    """True when mem0's answer to an add lists no record at all (`{"results": []}`). With infer=False that is an
+    add whose every message was skipped, which never calls the embedder."""
+    return isinstance(result, dict) and result.get("results") == []
+
+
 # --------------------------------------------------------------------------- the HTTP middleware
 def is_write_request(method: str, path: str) -> bool:
     """`POST /v1/memories` and `PUT /v1/memories/{id}`, exactly. `/v1/memories/search` and `/diagnose`,
@@ -234,7 +275,8 @@ async def middleware(request: Any, call_next: Any) -> Any:
     Only POST /v1/memories and PUT /v1/memories/{id} are looked at; every other request goes straight
     through. The status is the one the client gets, after the exception handlers ran. An exception
     that no handler takes arrives here as an exception: it is recorded as a 500 and raised again, so
-    the server answers it as it always did."""
+    the server answers it as it always did. A 2xx the route marked neutral (`mark_neutral`) is not
+    recorded at all; a 5xx or an exception is recorded whatever the route marked."""
     if not is_write_request(request.method, request.scope.get("path", "")):
         return await call_next(request)
     try:
@@ -243,6 +285,8 @@ async def middleware(request: Any, call_next: Any) -> Any:
         _note(500, None)
         raise
     status = response.status_code
+    if 200 <= status < 300 and is_neutral(request):
+        return response          # a 2xx that never reached the embedder: not a success, so it clears nothing
     _note(status, await _reason_of(response) if status >= 500 else None)
     return response
 

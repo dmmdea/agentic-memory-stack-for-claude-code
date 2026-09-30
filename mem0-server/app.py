@@ -13,7 +13,7 @@ import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
 
-from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 from mem0 import Memory
 
@@ -1183,7 +1183,7 @@ def health_deep() -> dict:
     return out
 
 @app.post("/v1/memories")
-def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None)):
+def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
     # Storage cap enforcement (audit finding 2026-06-08: 341/384 backfilled points
     # exceeded the previously-documented 600-char cap which was never enforced).
@@ -1283,6 +1283,10 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
         _existing = _find_existing_by_hash(text_for_check, b.user_id, b.metadata)
         if _existing:
             log.info("add(): idempotent no-op — identical memory already stored as %s", _existing)
+            # Answered from a payload lookup, before any embed call: this 200 says nothing about the write
+            # path. Neutral, or an automated writer re-posting its transcript during an embedder outage
+            # clears write_path.ok between the 503s it gets for the new facts (write_path.py).
+            _write_path.mark_neutral(request)
             return {
                 "results": [{"id": _existing, "memory": text_for_check, "event": "NOOP_DUPLICATE"}],
                 "deduplicated": True,
@@ -1297,6 +1301,12 @@ def add(b: AddIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = 
             metadata=b.metadata,
             infer=b.infer,
         )
+        # infer=False embeds every message it stores, but skips system-role and malformed ones without an
+        # embed call and answers {"results": []}: like a duplicate, that 200 says nothing about the write
+        # path. infer=True is different on purpose: mem0 embeds the incoming text (its existing-memory
+        # lookup) before it can answer at all, so its 200 is evidence (checked against mem0 2.0.4).
+        if b.infer is False and _write_path.stored_nothing(result):
+            _write_path.mark_neutral(request)
         # If this was an insight write (only path that lands non-evidence via add), log to ledger
         # so canonical-add-coverage isn't silent.
         if b.metadata and b.metadata.get("tier") == "insight":
