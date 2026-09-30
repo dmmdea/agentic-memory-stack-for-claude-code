@@ -8,11 +8,11 @@
 package lint
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
-	"strings"
 	"time"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 )
 
 // ReceiptFile is the compactor/maintenance receipts JSONL under STATE_ROOT.
@@ -64,6 +64,9 @@ type ReceiptRow struct {
 	DryRun      bool      `json:"dry_run"`
 	JudgeCalled bool      `json:"judge_called"`
 	SkipStreak  int       `json:"skip_streak"`
+	// Repeat is the count a collapsed run of identical aborted rows carries (0 or 1 for
+	// a row that stands alone).
+	Repeat int `json:"repeat"`
 }
 
 // RunHistory is what the receipts say about ONE store.
@@ -74,8 +77,10 @@ type ReceiptRow struct {
 // and the store that went over the sync limit had applied, skipped, skipped. The skip
 // streak is the per-store signal both of them lacked.
 type RunHistory struct {
-	SkipStreak        int
-	LastStatus        string
+	SkipStreak int
+	LastStatus string
+	// LastReceiptUTC is the timestamp of the receipt LastStatus came from.
+	LastReceiptUTC    *time.Time
 	LastProductiveUTC *time.Time
 	// LastJudgeUTC is when this store last had a judge CALL, whatever the outcome. A
 	// rejected result is a receipt, not a retry.
@@ -100,6 +105,8 @@ func ReadRunHistory(path, workspace string) RunHistory {
 		return out
 	}
 	out.LastStatus = mine[len(mine)-1].Status
+	lastTS := mine[len(mine)-1].TS.UTC()
+	out.LastReceiptUTC = &lastTS
 	for i := len(mine) - 1; i >= 0; i-- {
 		if mine[i].Status != SkipLiveSession {
 			break
@@ -164,25 +171,8 @@ func FileAgeHours(path string, now time.Time) *float64 {
 }
 
 func readRows(path string, tail int) []ReceiptRow {
-	f, err := os.Open(path)
+	lines, err := receiptlog.ReadTailLines(path, tail)
 	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l == "" {
-			continue
-		}
-		lines = append(lines, l)
-		if tail > 0 && len(lines) > tail {
-			lines = lines[1:]
-		}
-	}
-	if err := sc.Err(); err != nil {
 		return nil
 	}
 	out := make([]ReceiptRow, 0, len(lines))
@@ -192,7 +182,14 @@ func readRows(path string, tail int) []ReceiptRow {
 		if err := json.Unmarshal([]byte(l), &r); err != nil {
 			continue
 		}
-		out = append(out, r)
+		// A collapsed run (repeat > 1) stands for that many rows, so the "last three runs
+		// all failed" window still sees the run it was. Capped: the windows are small.
+		for n := min(receiptlog.Expand(r.Repeat), maxExpand); n > 0; n-- {
+			out = append(out, r)
+		}
 	}
 	return out
 }
+
+// maxExpand bounds how many rows one collapsed row stands for when a window is computed.
+const maxExpand = 5

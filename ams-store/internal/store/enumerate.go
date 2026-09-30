@@ -96,7 +96,8 @@ func ResolveReparseTarget(dir string) string {
 // path so an alias is never processed twice (mutating through an alias = mutating the
 // real store), plus any warnings the caller should surface at startup.
 //
-// A workspace without <ws>/memory/MEMORY.md is an empty scaffold and is skipped outright.
+// A workspace without <ws>/memory/MEMORY.md is an empty scaffold and is skipped outright,
+// and a scratch or temp workspace (see exclude.go) is never a store.
 func Enumerate(projectsRoot string) ([]Store, []string, error) {
 	var warnings []string
 	entries, err := os.ReadDir(projectsRoot)
@@ -113,7 +114,11 @@ func Enumerate(projectsRoot string) ([]Store, []string, error) {
 		reparse bool
 	}
 	var dirs []dirRow
+	exclude := LoadExcludeRules(projectsRoot)
 	for _, e := range entries {
+		if exclude.Excludes(e.Name()) {
+			continue
+		}
 		fi, err := os.Lstat(filepath.Join(projectsRoot, e.Name()))
 		if err != nil {
 			continue

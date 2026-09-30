@@ -31,6 +31,8 @@ DISTRO="${3:-${WSL_DISTRO_NAME:-$(. /etc/os-release 2>/dev/null; echo "${ID:-Ubu
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 1.31.1: the ONE stack.env writer (plain-token values only; bash, sed and Python must agree).
 . "$REPO_ROOT/install/stack-env.sh"
+# The release sha stamp (DEPLOYED_SHA) the backup manifest reads; the deployed tree has no .git.
+. "$REPO_ROOT/install/deploy-stamp.sh"
 
 if [ -z "$WIN_USER" ]; then
     # Try to derive from cmd.exe
@@ -121,6 +123,9 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # the only reason the missed step was found at all. deploy.sh already stamps it; every path
     # that deploys the modules must, or the runtimes it installs are born unable to answer.
     cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
+    # ...and the commit it came from (the manifest git_sha): the shared deploy-stamp.sh contract writes one
+    # line, a 40-hex sha or "unknown", into <app>/DEPLOYED_SHA; the deployed tree has no .git.
+    deploy_stamp_write "$REPO_ROOT" "$MEM0_DIR"
     cd "$MEM0_DIR"
     python3 -m venv .venv
     ./.venv/bin/pip install --quiet --upgrade pip
@@ -153,6 +158,9 @@ else
     # A REFRESH must restamp too: an upgrade that leaves the old VERSION in place is exactly
     # how a runtime ends up reporting a release it is no longer running.
     cp "$REPO_ROOT/VERSION" "$MEM0_DIR/VERSION"
+    # ...and the commit it came from (the manifest git_sha): the shared deploy-stamp.sh contract writes one
+    # line, a 40-hex sha or "unknown", into <app>/DEPLOYED_SHA; the deployed tree has no .git.
+    deploy_stamp_write "$REPO_ROOT" "$MEM0_DIR"
     # v0.29.1: enforce the security floors on existing installs too (idempotent —
     # a no-op when already satisfied). Without this, a re-run only refreshes code
     # and an existing venv stays on a CVE-vulnerable starlette/cryptography.

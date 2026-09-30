@@ -52,6 +52,14 @@ const (
 	EmDash = "\u2014"
 )
 
+// OverTrigger reports whether an index of this many bytes and lines is over the compaction
+// trigger: either budget alone is enough. One definition, because lint, the compactor and
+// the G7 clock each testing a different subset is how a store past the line trigger sat at
+// "no clock" for days.
+func OverTrigger(bytes, lines int) bool {
+	return bytes >= TriggerBytes || lines >= TriggerLines
+}
+
 // IndexName is the one file in a store that is not a fact file.
 const IndexName = "MEMORY.md"
 

@@ -1,13 +1,13 @@
 package sync
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
+
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 )
 
 // ReceiptFile is the sync receipts JSONL under STATE_ROOT.
@@ -71,6 +71,12 @@ type Receipt struct {
 	// is the other end of Deferred: without it the audit trail shows changes going into
 	// the queue and nothing ever coming out.
 	DeferredApplied []string `json:"deferred_applied,omitempty"`
+	// DeferredStillQueued lists queued paths a live session still blocks after this
+	// pass's drain. DeferredGone lists queued deletions whose file was already absent.
+	// With DeferredApplied and Resurrected these are the four outcomes a queued entry can
+	// have, and a drain names every entry that was pending in exactly one of them.
+	DeferredStillQueued []string `json:"deferred_still_queued,omitempty"`
+	DeferredGone        []string `json:"deferred_gone,omitempty"`
 	// Removed lists workspaces whose whole directory is gone and whose tracked files
 	// this pass staged for deletion. It is a receipt field rather than a log line
 	// because a store leaving the fleet is the kind of change a human reads back later.
@@ -88,53 +94,25 @@ func ReceiptPath(stateRoot string) string { return filepath.Join(stateRoot, Rece
 // append-only and a temp-and-swap would rewrite the whole file on every sync. A failure
 // here is logged, never fatal - losing the audit line is bad, losing the sync because
 // the audit line could not be written is worse.
+//
+// The file is size-rotated (receiptlog): at 2 MB it becomes sync-receipts.jsonl.1 and only
+// three rotated generations are kept, so a fleet that syncs on every session boundary can
+// no longer grow it without bound.
 func AppendReceipt(stateRoot string, r Receipt) error {
-	if err := os.MkdirAll(stateRoot, 0o755); err != nil {
-		return fmt.Errorf("sync: create state root: %w", err)
-	}
-	b, err := json.Marshal(r)
-	if err != nil {
-		return fmt.Errorf("sync: encode receipt: %w", err)
-	}
-	f, err := os.OpenFile(ReceiptPath(stateRoot), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("sync: open receipts: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.Write(append(b, '\n')); err != nil {
+	if err := receiptlog.Append(ReceiptPath(stateRoot), r); err != nil {
 		return fmt.Errorf("sync: append receipt: %w", err)
 	}
 	return nil
 }
 
-// ReadReceipts reads the last `tail` rows of a receipts file. A missing file is not an
-// error: a fleet that has never synced has no receipts, which is different from a fleet
-// whose receipts cannot be read.
+// ReadReceipts reads the last `tail` rows of a receipts file, across the newest rotated
+// generation when the live file holds fewer. A missing file is not an error: a fleet that
+// has never synced has no receipts, which is different from a fleet whose receipts cannot
+// be read.
 func ReadReceipts(path string, tail int) ([]Receipt, error) {
-	f, err := os.Open(path)
+	lines, err := receiptlog.ReadTailLines(path, tail)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("sync: read receipts %s: %w", path, err)
-	}
-	defer f.Close()
-
-	var lines []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l == "" {
-			continue
-		}
-		lines = append(lines, l)
-		if tail > 0 && len(lines) > tail {
-			lines = lines[1:]
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("sync: scan receipts %s: %w", path, err)
+		return nil, fmt.Errorf("sync: %w", err)
 	}
 	out := make([]Receipt, 0, len(lines))
 	for _, l := range lines {

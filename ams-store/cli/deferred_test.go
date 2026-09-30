@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -230,4 +231,84 @@ func body12(first, mid, last string) string {
 		lines = append(lines, fmt.Sprintf("body line %d", i))
 	}
 	return strings.Join(append(lines, last), "\n")
+}
+
+// Every queued deletion leaves exactly one outcome field in the receipt of the pass that
+// resolves it: still queued while the session lives, then applied - or gone, when something
+// else already removed the file.
+func TestCLI_SyncReceiptsNameTheOutcomeOfEveryQueuedDeletion(t *testing.T) {
+	testutil.RequireGit(t)
+	hub := initBareHub(t)
+	sessionStart := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	facts := map[string]string{
+		"doomed.md": testutil.FactFile("doomed", "migrated by the judge", "project", "doomed body"),
+		"vanish.md": testutil.FactFile("vanish", "migrated by the judge", "project", "vanish body"),
+		"keep.md":   testutil.FactFile("keep", "stays", "project", "keep body"),
+	}
+	index := []string{"# Memory Index", "", "- [doomed](doomed.md)", "- [vanish](vanish.md)", "- [keep](keep.md)"}
+
+	other := testutil.NewSandbox(t)
+	other.AddStore("ws", index, facts)
+	attachHub(t, other, hub)
+	syncAt(t, other, sessionStart, "the other PC seeds the hub")
+	pc := testutil.NewSandbox(t)
+	pc.AddStore("ws", index, facts)
+	attachHub(t, pc, hub)
+	syncAt(t, pc, sessionStart, "this PC joins the fleet")
+
+	for _, f := range []string{"doomed.md", "vanish.md"} {
+		if err := os.Remove(filepath.Join(other.ProjectsRoot, "ws", "memory", f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncAt(t, other, sessionStart.Add(time.Minute), "the other PC deletes two facts")
+
+	// A live session on this PC: both deletions are withheld.
+	writeAt(t, filepath.Join(pc.ProjectsRoot, "ws", "session.jsonl"), "{}", sessionStart.Add(-time.Minute))
+	syncAt(t, pc, sessionStart.Add(2*time.Minute), "this PC syncs under a live session")
+	queue, err := merge.LoadDeferred(pc.StateRoot, "ws")
+	if err != nil || len(queue.Entries) != 2 {
+		t.Fatalf("the scenario needs both deletions queued: %+v (%v)", queue.Entries, err)
+	}
+
+	// Still live at the next pass: both are named as still queued, nothing else.
+	syncAt(t, pc, sessionStart.Add(3*time.Minute), "still live")
+	last := lastReceipt(t, pc)
+	if got := fmt.Sprint(sorted(last.DeferredStillQueued)); got != "[ws/memory/doomed.md ws/memory/vanish.md]" {
+		t.Errorf("deferred_still_queued = %s, want both queued deletions", got)
+	}
+	if len(last.DeferredApplied)+len(last.DeferredGone)+len(last.Resurrected) != 0 {
+		t.Errorf("a blocked drain claimed another outcome: %+v", last)
+	}
+
+	// Something else removes one file while it is queued; the session then ends.
+	if err := os.Remove(filepath.Join(pc.ProjectsRoot, "ws", "memory", "vanish.md")); err != nil {
+		t.Fatal(err)
+	}
+	syncAt(t, pc, sessionStart.Add(time.Hour), "the session is over")
+	last = lastReceipt(t, pc)
+	if got := fmt.Sprint(last.DeferredApplied); got != "[ws/memory/doomed.md]" {
+		t.Errorf("deferred_applied = %s, want only the deletion the drain performed", got)
+	}
+	if got := fmt.Sprint(last.DeferredGone); got != "[ws/memory/vanish.md]" {
+		t.Errorf("deferred_gone = %s, want the deletion another pass had already done", got)
+	}
+	if len(last.DeferredStillQueued) != 0 {
+		t.Errorf("nothing is left queued: %+v", last.DeferredStillQueued)
+	}
+}
+
+func lastReceipt(t *testing.T, sb *testutil.Sandbox) amsync.Receipt {
+	t.Helper()
+	rows, err := amsync.ReadReceipts(amsync.ReceiptPath(sb.StateRoot), 0)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("no receipts: %v", err)
+	}
+	return rows[len(rows)-1]
+}
+
+func sorted(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }

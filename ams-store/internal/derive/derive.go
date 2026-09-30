@@ -2,7 +2,6 @@ package derive
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/frontmatter"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/gitx"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/index"
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/receiptlog"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
 )
 
@@ -262,7 +262,13 @@ func Run(opt Options) (*Result, error) {
 	entries := idx.Entries()
 
 	// ---- 2. an index with entries over a store that enumerates nothing ---------------
-	if len(entries) > 0 && len(names) == 0 {
+	// The one legitimate way to get here is a store whose last fact the judge migrated:
+	// the directory enumerated cleanly (FactFiles already failed closed on an unreadable
+	// one), it is empty, and the history explains EVERY slug the index still names by a
+	// Migrated trailer. Then the lines are dangling pointers to facts that live in the
+	// corpus, and dropping them is what the blast cap already exempts. Any slug the history
+	// cannot explain keeps the abort: "empty" must never be spellable as "wiped".
+	if len(entries) > 0 && len(names) == 0 && !migrationsExplainEveryLink(opt, idx, logf) {
 		res.Status = StatusAbortedNoFactFiles
 		res.Note = "the index has entries but the store enumerated no fact files; refusing to treat every line as dangling"
 		logf("%s", res.Note)
@@ -708,6 +714,31 @@ func harvestReindexed(dir string, keep []*index.Record, res *Result, logf func(s
 	}
 }
 
+// migrationsExplainEveryLink reports whether the history has a Migrated trailer for every
+// fact file the index links to. No lookup, an empty index or a lookup error explains
+// nothing: the caller then keeps its fail-closed abort.
+func migrationsExplainEveryLink(opt Options, idx *index.Index, logf func(string, ...any)) bool {
+	if opt.Migrated == nil {
+		return false
+	}
+	linked := index.LinkedSlugs(idx.Records)
+	if len(linked) == 0 {
+		return false
+	}
+	for slug := range linked {
+		id, ok, err := opt.Migrated.MigratedID(opt.Store, slug)
+		if err != nil {
+			logf("migrated lookup %s: %v", slug, err)
+			return false
+		}
+		if !ok || id == "" {
+			return false
+		}
+	}
+	logf("the store is empty and the history explains all %d indexed slug(s) as migrated; dropping the dangling lines", len(linked))
+	return true
+}
+
 // explainedDangling counts the dangling pointers the history explains: a slug with a
 // migration trailer (the judge moved it to the corpus) or a slug a commit deleted on
 // purpose. Both are removals that consume a decision already made and synced, never
@@ -859,6 +890,10 @@ func touchDirty(opt Options, logf func(string, ...any)) {
 // never fatal and never silent: this file IS the audit trail, and both watchdogs read its
 // mtime, so a failure here otherwise masquerades as "the maintainer is dead" and sends the
 // operator to the wrong subsystem.
+//
+// The file is size-rotated, and consecutive identical aborted-* rows for one store collapse
+// into one row carrying a repeat count: a store wedged in one abort wrote 231 identical
+// rows in a week.
 func writeReceipt(opt Options, res *Result, logf func(string, ...any)) {
 	path := opt.ReceiptPath
 	if path == "" {
@@ -867,22 +902,7 @@ func writeReceipt(opt Options, res *Result, logf func(string, ...any)) {
 		}
 		path = filepath.Join(opt.Roots.StateRoot, ReceiptFile)
 	}
-	b, err := json.Marshal(res)
-	if err != nil {
-		logf("RECEIPT ENCODE FAILED: %v", err)
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
-		return
-	}
-	defer f.Close()
-	if _, err := f.Write(append(b, '\n')); err != nil {
+	if err := receiptlog.AppendCollapsing(path, res, receiptlog.SameAbortedRow); err != nil {
 		logf("RECEIPT WRITE FAILED (%s): %v", path, err)
 	}
 }

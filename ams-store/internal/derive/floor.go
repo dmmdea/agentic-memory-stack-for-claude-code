@@ -82,7 +82,7 @@ func Floor(records []*index.Record, opt FloorOptions) FloorResult {
 		}
 		// The overhead of "- [Title](slug) - " measured with a one-byte placeholder hook,
 		// so a long title eats its own budget instead of the hook's.
-		overhead := index.ByteCount(index.EntryLine(rec.Title, rec.Slug, "x", rec.Indent)) - 1
+		overhead := index.ByteCount(index.RecordLine(rec, "x")) - 1
 		budget := store.LineByteCap - overhead
 		if budget < store.MinHookBudget {
 			continue // a title that alone eats the cap cannot be floored
@@ -91,7 +91,7 @@ func Floor(records []*index.Record, opt FloorOptions) FloorResult {
 		if hook == "" {
 			continue
 		}
-		candidate := index.EntryLine(rec.Title, rec.Slug, hook, rec.Indent)
+		candidate := index.RecordLine(rec, hook)
 		newBytes := index.ByteCount(candidate)
 		if newBytes >= rec.Bytes {
 			continue // not a shortening

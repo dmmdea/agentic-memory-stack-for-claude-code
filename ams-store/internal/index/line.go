@@ -11,3 +11,14 @@ func EntryLine(title, slug, summary, indent string) string {
 	}
 	return line
 }
+
+// RecordLine rebuilds an entry record's line with a new summary, keeping the marker the
+// record carries. Every caller that rewrites an existing entry goes through here, so a
+// shortened or re-rendered line never loses its decoration.
+func RecordLine(r *Record, summary string) string {
+	line := r.Indent + "- " + r.Prefix + "[" + r.Title + "](" + r.Slug + ")"
+	if summary != "" {
+		line += " " + store.EmDash + " " + summary
+	}
+	return line
+}

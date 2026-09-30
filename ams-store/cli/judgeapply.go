@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/brand"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/judge"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/lock"
 	"github.com/dmmdea/agentic-memory-stack-for-claude-code/ams-store/internal/store"
@@ -20,6 +21,7 @@ import (
 // this verb consumes the plan file that call produces.
 const judgeApplyUsage = `usage: ams-store judge-apply --plan <file> --store <dir> [--dry-run]
                             [--max-migrations 5] [--force] [--hub] [--candidates]
+                            [--brand-map <path>]
 
 Apply a judge plan to one store under every apply-guard: strict decrease, anchor
 retention, the seal, the line round-trip, migration write-then-verify, the blast cap
@@ -27,12 +29,18 @@ and protected-set overflow. Hub-only.
 
   --plan <file>          the plan file to apply
   --store <dir>          the store (memory directory) to apply it to
-  --workspace <slug>     the workspace id; default: the store directory's parent name
+  --workspace <slug>     the workspace id; default: the store directory's parent name.
+                         A scratch or temp workspace (the store exclude rules) is not a
+                         store: --candidates prints an empty offer set and an apply
+                         reports excluded-scratch, exit 0, writing nothing
   --dry-run              report what would be applied; write nothing, post nothing
   --max-migrations <n>   cap the migrations one plan may perform (default 5)
   --force                bypass the 20 h one-attempt-per-store window, and only that
   --hub                  assert the hub role before <state-root>/role is seeded
   --candidates           print the offer set for this store and apply nothing
+  --brand-map <path>     the operator's brand map (brands.json); a migrated fact is tagged
+                         with the brand it resolves to. A missing or unreadable map is
+                         brand-neutral, never an error
   --mem0-url <url>       the corpus authority (env AMS_MEM0_URL, MEM0_URL)
   --mem0-user <id>       the corpus user id (env MEM0_USER_ID)
   --json                 machine output on stdout
@@ -60,6 +68,7 @@ type judgeApplyFlags struct {
 	hub           bool
 	candidates    bool
 	maxMigrations int
+	brandMap      string
 	mem0URL       string
 	mem0User      string
 	stateRoot     string
@@ -82,6 +91,7 @@ func runJudgeApply(env Env, args []string) int {
 	fs.BoolVar(&f.hub, "hub", false, "assert the hub role")
 	fs.BoolVar(&f.candidates, "candidates", false, "print the offer set and apply nothing")
 	fs.IntVar(&f.maxMigrations, "max-migrations", judge.DefaultMaxMigrations, "cap the judge's migrations")
+	fs.StringVar(&f.brandMap, "brand-map", "", "the brand map (brands.json)")
 	fs.StringVar(&f.mem0URL, "mem0-url", "", "the corpus authority")
 	fs.StringVar(&f.mem0User, "mem0-user", "", "the corpus user id")
 	fs.StringVar(&f.stateRoot, "state-root", "", "override the maintainer state root")
@@ -135,6 +145,15 @@ func runJudgeApply(env Env, args []string) int {
 		return ExitUsage
 	}
 
+	// A scratch or temp workspace is never a store, and the hub's judge does not enumerate
+	// (it takes the directory it is given), so the exclusion is applied here as well: a
+	// scratch store already in the hub checkout, or pushed by a PC on an older binary, must
+	// not be offered or migrated into the corpus. Both the offer set the plan is written
+	// from and the apply come through here.
+	if store.LoadExcludeRules(roots.ProjectsRoot).Excludes(workspace) {
+		return excludedWorkspace(env, workspace, f)
+	}
+
 	now := time.Time{}
 	if f.now != "" {
 		now, err = time.Parse(time.RFC3339, f.now)
@@ -179,9 +198,17 @@ func runJudgeApply(env Env, args []string) int {
 	}
 	defer func() { _ = l.Release() }()
 
+	// A brand map that cannot be read routes nothing: the run stays brand-neutral, which is
+	// what it was before the map existed. It is reported, never fatal.
+	brands, brandErr := brand.Load(f.brandMap)
+	if brandErr != nil {
+		fmt.Fprintf(env.Stderr, "ams-store judge-apply: brand map: %v; continuing brand-neutral\n", brandErr)
+	}
+
 	st := storeAt(storeDir)
 	st.Workspace = workspace
 	opt := judge.Options{
+		Brand:         brands,
 		Roots:         roots,
 		Dir:           storeDir,
 		Workspace:     workspace,
@@ -217,6 +244,9 @@ func runJudgeApply(env Env, args []string) int {
 			"shortened":    res.Shortened,
 			"migrated":     res.Migrated,
 			"line_floored": res.LineFloored,
+			"offered":      res.Offered,
+			"updated":      res.Updated,
+			"add_failed":   res.AddFailed,
 			"before_bytes": res.BeforeBytes,
 			"after_bytes":  res.AfterBytes,
 			"before_lines": res.BeforeLines,
@@ -236,8 +266,8 @@ func runJudgeApply(env Env, args []string) int {
 		return ExitOK
 	}
 
-	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (shortened=%d migrated=%d line_floored=%d, %d -> %d B)\n",
-		res.Workspace, res.Status, res.Shortened, res.Migrated, res.LineFloored, res.BeforeBytes, res.AfterBytes)
+	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (shortened=%d migrated=%d line_floored=%d updated=%d add_failed=%d, %d -> %d B)\n",
+		res.Workspace, res.Status, res.Shortened, res.Migrated, res.LineFloored, res.Updated, res.AddFailed, res.BeforeBytes, res.AfterBytes)
 	if res.Note != "" {
 		fmt.Fprintf(env.Stderr, "  %s\n", res.Note)
 	}
@@ -246,6 +276,33 @@ func runJudgeApply(env Env, args []string) int {
 	}
 	return ExitOK
 }
+
+// excludedWorkspace answers judge-apply for a scratch or temp workspace: nothing offered,
+// nothing applied, no receipt, exit 0 (an excluded store is not a failed one).
+func excludedWorkspace(env Env, workspace string, f judgeApplyFlags) int {
+	if f.candidates {
+		if f.asJSON {
+			_ = json.NewEncoder(env.Stdout).Encode(map[string]any{
+				"workspace": workspace, "shorten": []any{}, "migrate": []any{}})
+		}
+		return ExitOK
+	}
+	if f.asJSON {
+		_ = json.NewEncoder(env.Stdout).Encode(map[string]any{
+			"workspace": workspace, "status": StatusExcludedScratch,
+			"note":    "a scratch or temp workspace is not a store; nothing offered, nothing applied",
+			"offered": 0, "migrated": 0, "updated": 0, "add_failed": 0,
+			"shortened": 0, "line_floored": 0, "mem0": []string{}, "mem0_orphan": []string{},
+		})
+		return ExitOK
+	}
+	fmt.Fprintf(env.Stderr, "judge-apply %s: %s (a scratch or temp workspace is not a store)\n", workspace, StatusExcludedScratch)
+	return ExitOK
+}
+
+// StatusExcludedScratch is judge-apply's answer for an excluded workspace. It is not a
+// receipt status: no receipt is written for a workspace that is not a store.
+const StatusExcludedScratch = "excluded-scratch"
 
 func runJudgeCandidates(env Env, roots store.Roots, dir, workspace string, asJSON bool) int {
 	wsState, err := roots.WorkspaceStateDir(workspace)
