@@ -4,6 +4,651 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.0 — a hollow night reads red, a canonical demotion needs the operator's token, and jobs that only looked healthy now do their work (2026-09-30)
+
+### Fixed
+- **A chain step that exited 0 was receipted `ok` whatever it had done.** The dream could post 0 of 3
+  insights, or a sweep could do nothing, and the night still read green. `scripts/wsl/ams-step.sh` now
+  gives each job `$AMS_OUTCOME_FILE`, where it may write one line, `<status>[:<reason>] <json counts>`,
+  and the receipt carries `status` (`ok`, `degraded` or `failed`) and `work`. Exit 0 with `failed:*` is
+  receipted `ok:false`, exit 0 with `degraded:*` is `ok:true` with `status:degraded`, and text that does
+  not parse is `degraded` with `outcome-unparsable: ...`. Guard and weekly no-ops stay `ok`, and a job
+  that writes no outcome line is unchanged. When a non-ok receipt would have an empty note, the job's
+  last stdout line becomes the note, because the journal drops unit-less stdout lines.
+  `scripts/wsl/contradiction-sweep.py` writes `degraded:no-op-<reason>` for a `no-op:<reason>` run and
+  `ok {canonicals_checked, canonicals_total, pairs, yes}` for a normal one; its exit codes are
+  unchanged.
+- **`/health/maintenance` stayed green over a failed step, a degraded step or a degraded pool.** It
+  folded in only pool capacity and a 48 h staleness rule, so a failed latest run or a DEGRADED pool
+  mirror never turned it red. `mem0-server/maintenance_health.py` now adds `failed_steps` and
+  `degraded_steps` (each step's latest real run; `weekly:` and `guard:` no-op receipts are not runs, and
+  `health-stamp` is excluded), `pool.health` and `pool.health_alarm` (from `zpool list -H -o health`; an
+  unreadable pool reads `unknown` and raises no alarm), and `drift` and `wiki` blocks. `ok` now includes
+  failed steps, degraded steps and pool health. A `--weekly` step is judged against 8 days and daily
+  steps keep the 48 h rule; a weekly step that comes back `degraded` or `failed` stays listed for the
+  week, and a later `ok` run clears it. None of this applies until the authority's server restarts with
+  the new `maintenance_health.py` and `app.py`.
+- **A bad night did not end in a red step.** `scripts/wsl/ams-health-stamp.sh` now prints
+  `health ok= failed= degraded= pool <pct>% <health>` as its last line and exits 2 on `failed_steps` or
+  `pool.health_alarm`. `scripts/wsl/ams-morning-summary.sh` labels DEGRADED rows with their notes and
+  work counts and adds failed, degraded and pool health to its health line. A DEGRADED pool therefore
+  turns `ok` false and ends the health-stamp step red every night until the pool is repaired or
+  acknowledged with `MEM0_POOL_HEALTH_ACK` (below).
+- **A dream that could not post its insights lost them, and the night still read green.**
+  `scripts/wsl/dream-consolidate.py` now polls `/health/embedder` for up to 10 minutes before the
+  embed-dependent phase, then proceeds. An insight whose POST fails is spooled to
+  `~/.mem0/maintenance/dream/insight-spool.jsonl` and replayed first on the next run. The step now writes
+  a `degraded` outcome, with counts, when a night falls short; the reasons are `posted-<p>-of-<c>`,
+  `replay-failed-<n>`, `spool-backlog-<n>`, `drift-snapshot-failed` and `canonical-fetch-failed`. A dry
+  run does not report a standing spool as a backlog.
+- **The Codex usage ledger recorded 0 tokens.** `mem0-server/codex_shim_client.py` and
+  `scripts/wsl/ams_env.py` now parse usage telemetry (tokens, resolved model and effort) from stdout and
+  from stderr. A value the parser cannot find is `null`, never `0`.
+- **The SessionStart banner said only `brain NOT OK` for a pool whose capacity it could not read.** On a
+  faulted pool `zfs list` fails, so there was no capacity figure and no reason. The banner
+  (`claude-config/storage-cap-check.sh`) now names the pool's health (`pool <health>`), and
+  `claude-config/tests/test_banner_maintenance_contract.py` builds the payload with the real builder and
+  runs the real banner on it, so the field names both sides use stay pinned.
+- **Two callers sent no hook contract version.** The dream's canonical search and the SessionStart
+  bundle call now send `hook_contract_version`. The retrieval-drift guard's search calls live in a
+  separate evaluation repo and still need the same one-line stamp, so `hook_contract.missing` stays a
+  floor, not an alarm, until then (`docs/systems/codex-hooks.md`).
+- **A replica PC's SessionStart banner reported files that stop changing once the box is a replica.**
+  Its storage-cap figures, dream summary and episodic store froze on the day the authority moved, so
+  the banner kept showing old numbers as current, and the enrichment query's recency seed read the same
+  frozen `episodic.db` and seeded every session with a weeks-old goal. On a replica or client,
+  `claude-config/storage-cap-check.sh` now reads the authority's `GET /health/maintenance` (bounded),
+  the morning summary and local pool figures print only on the authority, and an unreachable authority
+  is stated as that, never backfilled from local files. `claude-config/sessionstart_bundle.py` seeds
+  the query from the authority's `GET /v1/episodes?recent=20[&brand=...]` with a 1.5 s bound and never
+  falls back to the local copy, so a failed fetch means no seed; a fresh PreCompact marker skips the
+  fetch, and the authority's own path is unchanged. On a replica SessionStart can take up to 1.5 s
+  longer when the authority is slow (a dead authority is gated earlier by the 1 s probe). Both fixes
+  reach a PC when its installer redeploys `claude-config`.
+- **The wiki index step went red after three nights with every source PC powered off at 03:00, and a
+  skipped night read green (register P6-8).** The authority only ever tried to pull at about 03:00, a
+  skip night was receipted `ok` with an empty note (so the index aged unseen until it turned red at
+  exactly 72 h), the 72 h limit measured the age of the last pull rather than the freshness of the
+  index, and each source's ssh failure reason was discarded. `scripts/wsl/wiki-index-nightly.sh` now
+  measures freshness as the age of `max(last-pull, last-build)`, and every successful build, nightly or
+  session-side (`scripts/wsl/wiki-index.sh`), writes `~/wiki-index/last-build`. The 72 h failure
+  measures that freshness. A skip night writes a `degraded` outcome only when the index is older than
+  24 h (`ok` otherwise), with each source's ssh exit status and stderr in the outcome JSON.
+- **An embedder that could not start dropped memory writes instead of queueing them (register P6-7).**
+  On 2026-09-24 the embedder could not start beside a large resident model on the authority's shared
+  GPU for about 80 minutes, which left 167 embed 500s and 39 memory-write 500s that were not queued,
+  and a hollow nightly. `retry_later` in `mem0-server/embedder_503.py` now answers 503 with Retry-After
+  for a refused or timed-out connection, a 502, 503 or 504, and llama-swap's
+  `500 upstream command exited prematurely` (the model could not start), so the shim queues the write to
+  the outbox. Every other 500, such as a context overflow or a coding error, stays a 500.
+- **A cold reranker load outlived the client timeout, and the search silently fell back to dense
+  order.** The first attempt times out at 8 s and a cold load takes longer. `mem0-server/reranker.py` now
+  retries a first-attempt `ReadTimeout` once, inside a whole-stage budget of 20 s that a test pins
+  against every caller's timeout (the MCP shim's read timeout is 30 s). `rerank_status` reports
+  `ok-after-cold-retry` when the retry worked, and `warm()` does a one-document rerank.
+  `/health/embedder` now reads llama-swap v256 and later (`status` is an object) as well as the flat
+  schema, `?warm=rerank` warms the reranker, and the SessionStart pre-warm calls it.
+  `docs/systems/reranker.md` is rewritten to the behavior that ships, and `install/llama-swap-setup.md`
+  has a corrected `ttl` paragraph.
+- **Re-running the Linux client or replica installer without `--ams-hub` dropped the fleet store and
+  blanked the recorded hub (register P6-13).** `install/linux-client.sh` and `install/linux-replica.sh`
+  now inherit `--ams-hub` from `~/.mem0/client-receipt.json` when the flag is omitted; `--ams-hub ""`
+  clears it, and with no hub given or recorded the fleet store is skipped with a `WARN`. A receipt whose
+  recorded hub cannot be read back fails the run instead of being rewritten without it. The replica
+  forwards the flag only when it was given, so the client does the inheriting. Nothing to do on deploy
+  unless a box should leave the fleet store: pass `--ams-hub ""` once.
+- **Every installer re-run deleted the operator's promotion-gate mode and brand switches.** Each
+  installer that writes `~/.mem0/stack.env` rewrites the whole file, and the operator-owned keys it
+  carries over (`STACK_ENV_OPERATOR_KEYS`, added in 1.31.3) did not include them, so a dream promotion
+  gate set to `enforce` silently went back to the code default, `shadow`. `MEM0_PROMOTION_GATE_MODE`,
+  `MEM0_SHARED_BRANDS`, `MEM0_BRAND_MAP` and `MEM0_NLI_GATE_ENABLED` are now carried
+  (`install/stack-env.sh`; `stack_env_carry` takes a skip list for a key that also has a flag).
+  `install/linux-authority.sh` gains `--promotion-gate-mode shadow|enforce`: omitted, a recorded value
+  is carried; an explicit empty value drops the line; anything else is refused before any change.
+  Nothing is written on a first install, because the operator picks `enforce` after calibrating. If an
+  earlier re-run already deleted the line, set it once with the flag.
+- **A deployed tree could not say which commit it runs.** The backup manifest's `git_sha` read `unknown`
+  on every set, because the deployed tree has no `.git`. The new `install/deploy-stamp.sh` writes the
+  release sha (or `unknown`) to a `DEPLOYED_SHA` file beside the app's `VERSION` and the deployed
+  scripts, and the authority and replica installers call it.
+- **Test runs wrote into the production authority (register P6-10).** The 2026-09-29 audit counted about
+  80 canonical test points (the cleanup signed the nonce-less format the server no longer accepts and
+  swallowed the refusal), about 80 test points under the operator's own tenant, 42 permanent
+  `3-verify` smoke points and about 900 test sessions in the episodic DB. Tests that redirected only
+  `HOME` also wrote into the real profile, because on Windows Python resolves `~` from `USERPROFILE`.
+  `mem0-server/tests/conftest.py` now has a session-scoped guard: the live suites refuse a non-loopback
+  `MEM0_URL` unless `AMS_ALLOW_LIVE_PROD_TESTS=1`, refuse the stack's own tenant, and use `test-*`
+  tenants. A shared fixture redirects `HOME`, `USERPROFILE` and `Path.home()` together across the test
+  tree, and canonical and insight cleanup signs format 2 with a nonce through the HMAC path and asserts
+  the delete. `install/3-verify.ps1` deletes its smoke point by id and fails the check if it cannot; the
+  rules are in `docs/DEVELOPMENT.md`. This release does not remove debris already in a store, which is
+  done separately after an operator-reviewed dry run.
+- **PreCompact minted a phantom session on every compaction.** It keyed the episode on the name of the
+  temporary snapshot (`precompact-snap-<PID>`), not on the session. `scripts/windows/stop-extract.ps1`
+  now passes the hook's real `session_id` to the extractor, so no `precompact-snap-*` sessions are
+  created.
+- **`scripts/upgrade-check.sh` was blind on two legs, and one of them read like a clean result (register
+  P6-9).** With no `pip-audit` installed, the security scan printed an empty `REVIEW:` that read like
+  "nothing found", and the llama-swap version regex never matched `version: v256`. A scan that did not
+  run now says `security scan UNAVAILABLE` and the script exits 2, and the llama-swap version is read
+  from `version: v<N>`. `scripts/tests/test_upgrade_check.py` drives both legs with stubbed `pip-audit`
+  and `llama-swap` output.
+- **One read-only probe of a backup could make the next night's prune delete the real databases.** The
+  per-kind prune in `scripts/wsl/stack-backup.sh` counted SQLite `-wal` and `-shm` sidecars as backups.
+  `prune_kind <kind> <ext>` now counts only `<kind>-<digits...>.<ext>` for one explicit extension per
+  kind and orders by the timestamp in the name, so sidecars, `.tmp` partials and strays never count. An
+  empty WAL with its `-shm`, and a `-shm` with no WAL, are swept; a non-empty WAL is left alone. Backup
+  databases are opened with `mode=ro&immutable=1`, which leaves no sidecars, and manifests age out with
+  their sets (newest 8). Test: `scripts/wsl/tests/test_backup_retention.py` (in the CI headless list).
+- **Qdrant's own copy of every nightly snapshot was never deleted, about 150 MB a night.** Once the copy
+  in the set is verified (byte size and sha256 equal to Qdrant's `.checksum`, else `cmp`),
+  `scripts/wsl/stack-backup.sh` keeps the newest 2 snapshots per collection server-side and deletes
+  older ones through the API. Hand-made `qdrant-*.snapshot` one-offs older than 14 days are swept. A
+  copy that fails verification is removed and nothing server-side is deleted, so a mismatch fails safe
+  and the night reads red. The first night after deploy trims the whole backlog in one go (see Upgrade
+  notes).
+- **The episodes, entities and wiki-page collections were in no backup set, and a night that lost one
+  still read `ok`.** `scripts/wsl/stack-backup.sh` now snapshots every `episodes_*`, `*_entities` and
+  `wiki_pages_*` collection into the set as `qcol-<kind>-<TS>.snapshot` (a further one of the same kind
+  as `qcol-<kind>+<collection>-<TS>.snapshot`), each kind with its own newest-8 window. The collection
+  list is parsed strictly: a response that is not a collection list reads `degraded`, not clean. A
+  failed secondary snapshot, or a failed server-side list, DELETE or sweep, does not turn the night red,
+  because a red night makes the cloud copy refuse the primary set. It writes a `degraded` outcome to
+  `AMS_OUTCOME_FILE`, with the reasons `secondary-snapshot-failed` and `server-prune-failed` and the
+  counts `secondary_snapshot_failed` and `server_prune_failed`, and exits 0; the receipt reads
+  `status: degraded`, `ok: true`, and `/health/maintenance` turns `ok` false with `stack-backup` under
+  `degraded_steps`. The episodes snapshot is in the set but is not restored automatically
+  (`docs/MIGRATION.md`).
+- **The backup manifest hard-coded its version, could not name a commit, carried no checksums and
+  sourced `stack.env`.** `scripts/wsl/stack-backup-manifest.sh` now takes `app_version` from the
+  deployed `VERSION` and `git_sha` from the `DEPLOYED_SHA` stamp (a 40-hex sha or `unknown`; a present
+  stamp is authoritative, and only a tree with no stamp file asks its checkout). Every file gets
+  `checksums` (`size`, `sha256`), further collections of a kind are listed under
+  `qdrant_extra_collections`, and `deliberately_excluded` says how each excluded collection is rebuilt.
+  `stack.env` is read by key and never sourced; sourcing it is what turned the nights of 2026-09-21 and
+  2026-09-22 red (`<user>@<host>: command not found`). `mem0-server/tests/test_stack_env_writers.py` no
+  longer lists the manifest writer among the scripts that source it.
+- **On a night that failed, the cloud copy re-copied the newest existing set, and it wrote the manifest
+  first, verified nothing and never pruned.** `scripts/wsl/ams-pcloud-copy.sh` now refuses with exit 5
+  and an outcome line (`failed:stale-set` or `failed:stack-backup-not-ok`, counts `{"age_h":N}`) when
+  the newest manifest is 26 h old or older (`AMS_PCLOUD_MAX_AGE_H`) or `stack-backup`'s latest receipt
+  is not ok. It copies only real artifacts, data files first and the manifest last, and verifies sizes
+  before the manifest travels (exit 6, `failed:copy-size-mismatch`). After a verified copy it keeps the
+  newest 7 complete sets (`AMS_PCLOUD_KEEP_SETS`, floor 1) and deletes dead partials older than the
+  newest complete set; it never deletes the newest complete set. A degraded `stack-backup` night still
+  lets the copy run, and a refusal is a failed step (`pcloud-copy` under `failed_steps`) until the next
+  good night. `docs/data-backup.md` now states that the cloud copy is not client-side encrypted and that
+  the ZFS replica lags one backup set (an RPO of about 24 h).
+- **Index pointers written with a leading marker were invisible to `ams-store`, so lint, derive and the
+  size floor never saw the busiest store.** A pointer with an emoji or a `Word:` token after `- ` did
+  not parse. `ams-store/internal/index/parse.go`, `line.go` and `render.go` (and the floor, hygiene and
+  judge callers that rewrite an entry) now keep one marker token in `Record.Prefix` and re-emit it byte
+  for byte through `index.RecordLine`. A bullet with a `.md` link that still does not parse (two marker
+  words, a `*` bullet, or a decorated line with a second `.md` link) stays opaque and becomes the
+  actionable lint kind `unparsed-pointer`, counted in `counts.unparsed_pointer`. A fenced line is not a
+  finding, and canonical lines are unchanged.
+- **A changed fact forked into a second record, because the documented update-by-id was stamped and
+  never used.** MIGRATE now updates by id (`ams-store/internal/judge/apply.go`, `migrate.go`). A fact
+  whose frontmatter carries `migrated: <id>` is read with `Get`, and only a record whose source is this
+  slug's own tag is overwritten with `PUT /v1/memories/{id}`, then read back and counted `updated`. Any
+  other case (id missing, another source) is a plain Add. A refused update, an unreadable record or a
+  read-back mismatch keeps the line and never falls back to Add, and undo never deletes an updated
+  record. The server's PUT takes text only, so `meta` is accepted by the client and not sent, and a
+  brand tag is not applied on the update path.
+- **Scratch and temp workspaces were enrolled as stores, judged and migrated into the corpus.** A slug
+  under the encoded OS temp dir, or containing `-AppData-Local-Temp-` or `-scratchpad-`, is now skipped
+  by enumeration and by `judge-apply` (`ams-store/internal/store/exclude.go`, `enumerate.go`,
+  `cli/judgeapply.go`; the list is `store_exclude` in `<projects root>/.ams/policy.json`).
+  `--candidates` prints an empty offer set, and an apply answers `excluded-scratch` with exit 0, takes
+  no lock and writes no receipt and no corpus record. A PC still on the old binary keeps the old
+  behavior, including pushing a scratch store.
+- **A store emptied by migration could not finish its derive.** In
+  `ams-store/internal/derive/derive.go`, an emptied store whose every indexed slug is explained by a
+  `Migrated:` trailer in history now drops its dangling lines and reports `applied`, where it used to
+  abort with `aborted-no-fact-files`. One unexplained slug still aborts.
+- **A first sync could push back facts the hub had deleted.** On a first join (no merge base while the
+  hub branch exists), every local-only path the hub's history deleted is now quarantined. It is copied
+  to `<state root>/quarantine/`, reported `resurrected`, left out of the merged tree and not pushed
+  (`ams-store/internal/merge/mergetree.go`, `internal/gitx/plumbing.go`, `sync/sync.go`).
+- **Store receipts grew without bound, lint findings never aged out and a queued deletion left no
+  outcome.** `sync-receipts.jsonl` and `compact-receipts.jsonl` now rotate at 2 MB and keep 3
+  generations (`ams-store/internal/receiptlog`, new); lint, judge and sync read the live file plus the
+  newest generation, and consecutive identical `aborted-*` rows for one store collapse into one row with
+  `repeat` and `first_ts`. Every queued deletion leaves exactly one outcome in the receipt of the pass
+  that resolves it: `deferred_applied`, `deferred_still_queued`, `resurrected` or `deferred_gone`
+  (`merge/deferred.go`, `sync/receipts.go`). In `ams-store/internal/lint/history.go`, `rules.go` and
+  `summary.go`, `MergeFindings` now takes a 7 day window, drops a resurrected finding whose path is gone
+  from the store (kept while a quarantine copy exists) and counts a repeated row once, and `last_status`
+  is cleared when the store's newest receipt is older than 7 days.
+- **The busiest store never converged, because the over-trigger clock counted bytes only and the
+  migration cap was five (register P5-6).** `RecordOverTrigger` now trips on bytes >= 20000 OR lines >=
+  160 (`store.OverTrigger`, in `ams-store/internal/store/constants.go` and `cli/seams.go`).
+  `scripts/wsl/ams-store-judge-apply.sh` passes `--max-migrations 15` for a store over the compaction
+  trigger and 5 for every other store; the decision is recorded in `docs/systems/ams-store.md`.
+- **A night of failed corpus writes read green, and the hub checkout was never linted.**
+  `judge-apply --json` now reports `offered`, `updated` and `add_failed`, where `add_failed` counts
+  every write that failed or failed its read-back. `scripts/wsl/ams-store-judge-apply.sh` sums the
+  counts of every `judge-apply --json`, lints the hub checkout after the apply and the closing sync, and
+  writes the step outcome with the counts `stores`, `offered`, `migrated`, `add_failed`, `updated`,
+  `actionable` and `unparsed_pointer`. The outcome is `degraded:add-failed-<n>` when offered > 0,
+  migrated == 0 and add_failed > 0; the run still exits 0. The receipt then reads `status: degraded`,
+  and `/health/maintenance` turns `ok` false with `store-judge` under `degraded_steps` until the next
+  good night. Test: `mem0-server/tests/test_ams_store_judge_wrapper.py` (in the CI headless list).
+- **Almost no fact carried a brand: the audit found brand isolation covering about 3 % of the store.**
+  The L1a worker stamped a brand on its episode but never on its facts (12,354 of 12,355 extractor facts
+  were brandless). `scripts/windows/l1a-extract.ps1` now resolves the brand before the facts loop and
+  routes each fact with its own text; an unrouted path posts no `brand` key. When the worker analyses a
+  PreCompact snapshot it routes by the real transcript (`-OriginTranscriptPath`), for facts and episode
+  alike, while the cursor stays keyed on the file it reads. `scripts/windows/user-prompt-extract.ps1`
+  and `scripts/windows/mem0-hook-daemon.ps1` no longer stamp an unrouted session with a hard-coded brand
+  on the user-decision write, and the daemon records the transcript directory as the workspace instead
+  of a constant.
+- **Dream insights never carried a brand.** In `scripts/wsl/dream-consolidate.py` an insight now takes
+  the brand held by more than half of the memories it cites (neutral sources count in the denominator),
+  never a shared label, otherwise none. The brand is part of the metadata that is posted and, when the
+  POST fails, spooled, so a spooled insight replays the next night with it. A spool line written before
+  this release has no brand and replays brandless.
+- **24 % of L1a extractions were skipped on the Codex lock with no retry, and a Codex failure kept only
+  the first line of its error.** `Acquire-CodexLockWithWait` (`scripts/windows/memory-common.ps1`, used
+  by `scripts/windows/l1a-extract.ps1`) now polls every 2 s for up to 20 s (`AMS_L1A_LOCK_WAIT_SECONDS`
+  overrides) instead of skipping when the lock is held. A waiter re-checks the throttle and the cursor
+  once it holds the lock and exits without calling Codex when another run finished meanwhile.
+  `scripts/windows/sessionstart-capture.ps1` drops a same-second duplicate SessionStart with an atomic
+  per-session marker. A Codex failure now logs the last three lines of its output (`Get-OutputTail`).
+- **The L1a worker's Codex call answered 401 when an API key outranked the ChatGPT login, and a session
+  with no extracted facts left no episode.** `Invoke-CodexSubagent`
+  (`scripts/windows/memory-common.ps1`) now clears `OPENAI_API_KEY` and `CODEX_API_KEY` from the child
+  process only and logs the auth mode, never a credential. The extraction prompt keeps the episode
+  whenever the session had substantive turns; before, no facts meant no episode.
+- **The nightly semantic dedup compared zero pairs for weeks, and its receipt still read `ok`.** Once
+  the collection gained a named sparse vector, every point's vector became a dict, and the job skipped
+  anything that was not a bare list. `dense_vector(point)` in `scripts/wsl/ams_env.py` is now the one
+  extractor: a bare list as is, a dict gives the unnamed `""` entry, else the first list value, anything
+  else `None`, which callers count. `scripts/wsl/semantic-dedup.py` compares the real dense vectors with
+  blocked numpy products per (tier, partition) group, counts `scanned`, `skipped_no_vector`,
+  `compared_pairs`, `candidates`, `planned`, `deleted` and `delete_failed`, and deletes at most
+  `--max-deletions` (default 50) per run, highest cosine first. Canonical, automemory-migrated and
+  operator-sourced insight records are still never deleted, and the restore record is written before
+  each delete. The step outcome reads `degraded:compared-0` (more than 1,000 scanned, nothing compared),
+  `degraded:skipped-no-vector` (over 1 %), `degraded:deletes-refused` or `degraded:deletes-failing` (the
+  API refused what the run planned), and the counts ride the receipt's `work`. `numpy` joins
+  `mem0-server/requirements.txt`, the installer's fresh-venv pip line and the CI pip line.
+- **The health gate read the dedup job as alive from the mtime of a report the job rewrites every run.**
+  In `mem0-server/capabilities.py` and `mem0-server/job_liveness.py`, the `dedup-job` capability now
+  reads the job's own summary. It is degraded on `compared_pairs == 0` with `scanned > 1000`, on a
+  degraded or no-op outcome, or with no summary within 36 h, and dead past 96 h.
+- **A contradiction stamp kept hiding records long after its target stopped being canonical.** In
+  `mem0-server/admission_gate.py` and `mem0-server/app.py`, a `contradicts_canonical` stamp now hides a
+  record only while its target is still tier canonical (one batched retrieve per search, a 10-minute
+  cache). A lookup error admits the record and counts `stamp_target_unresolved`, and the diagnose
+  endpoint resolves targets the same way. In the audit 98 % of the rejections were of the dead-stamp
+  kind, and they stop once the server restarts on the new code.
+- **The weekly contradiction sweep re-swept the same first 50 ids and always hid the newer fact.**
+  `scripts/wsl/contradiction-sweep.py` now defaults `--user-id` to the corpus tenant and sweeps
+  canonicals never-checked first, then longest-unchecked, writing the marker back per canonical, so
+  `--limit` is a rotating budget (`canonicals_checked/total`, `weeks_for_full_pass`). A canonical whose
+  marker write fails is not counted as checked and degrades the run. A YES whose candidate is newer than
+  the canonical goes to the review queue as `canonical-possibly-stale` (no `canonical_id`, so
+  `--promote` cannot hide it) instead of being stamped. A canonical with no dense vector is counted (all
+  skipped reads `degraded:no-vectors`), and zero canonicals under the defaulted tenant reads
+  `degraded:zero-canonicals-defaulted-tenant`.
+- **Review-queue lines and stamps that pointed at a demoted canonical could not be cleared.**
+  `--dismiss <memory_id>` and an apply-mode prune now drop `canonical-possibly-stale` lines once the
+  canonical is gone or demoted. `--then-rejudge-stamped`, added to the `ExecStart` of
+  `systemd/ams-step-contradiction-sweep.service`, runs the stamped re-judge after the sweep and now also
+  clears stamps whose target was demoted or retired. The sweep writes one outcome line per run, with the
+  counts `weeks_for_full_pass`, `marker_written`, `marker_failed`, `skipped_no_vector`,
+  `stale_canonical_routed` and `stale_review_pruned` beside `canonicals_checked`, `canonicals_total`,
+  `pairs` and `yes`. The chained re-judge adds its counts with a `rejudge_` prefix and can neither
+  replace the sweep pass's reason nor turn a degraded sweep `ok`, and a non-zero exit also says why on
+  stderr, which is the failed receipt's note.
+- **`contradiction-sweep.py --dismiss` did nothing when the Codex judge was unavailable.** With the
+  judge unreachable, `--dismiss <memory_id>` answered a no-op with exit 0 and left the queue line,
+  although it judges nothing. It now runs without the judge and drops every review-queue line for that
+  memory: exit 0 when something was removed, 1 when nothing matched.
+- **Only 14 % of episodes had an embedding, and 1,352 checkpoints were never finalized.** In
+  `scripts/wsl/episodic-reconcile.py`, `scripts/wsl/episode-embed-backfill.py` and
+  `mem0-server/episodic.py`, `in_progress` episodes untouched for 7 days now become `abandoned` (counted
+  in the receipt), and up to 500 missing episode embeddings are backfilled per run (newest first,
+  skipped when the embedder is down, stopped after 5 consecutive failures). The outcome reads
+  `degraded:embedding-coverage-<pct>` below 90 % and still exits 0. The descriptions of
+  `systemd/episodic-reconcile.service` and its timer no longer say read-only.
+- **The context bundle echoed a session's own open questions back at it.** `/v1/context/bundle`
+  (`mem0-server/app.py`, `mem0-server/episodic.py`) now leaves out goals and open questions first seen
+  in the requesting `session_id`. It ranks the rest by recency of episode link, then priority.
+- **A legitimate note kept the mojibake tripwire permanently degraded.** `mem0-server/mojibake_check.py`
+  now skips a point that carries `mojibake_ok: true`, so a note that legitimately looks like mojibake is
+  exempted by carrying that flag. Only a point with the flag is skipped; every other record is still
+  checked.
+- **A plain `install.ps1` re-run turned a replica PC into a brain.** `install.ps1` and
+  `install/2-windows-config.ps1` now keep the recorded role when `-Role` is omitted
+  (`install/role-lib.ps1`); an explicit `-Role` still wins, and first installs are unchanged. Test:
+  `scripts/windows/tests/InstallRole.Tests.ps1`.
+- **A WSL deploy could leave `DEPLOYED_SHA` empty.** `scripts/wsl/deploy.sh` now stamps it through the
+  shared contract in `install/deploy-stamp.sh` (a 40-hex sha or `unknown`), where
+  `git rev-parse HEAD > DEPLOYED_SHA || true` left an empty file when git failed, and it reads the stamp
+  back as a rollback ref only when it is a sha. `install/1-wsl-services.sh` sources the same contract
+  and stamps `DEPLOYED_SHA` beside `VERSION` at its fresh-install and refresh sites. Until an installer
+  run or `deploy.sh` has stamped the tree, the backup manifest's `git_sha` reads `unknown`.
+- **The HOME-redirect guard did not scan every directory CI collects tests from.** It now scans every
+  directory CI's pytest step collects from (derived from `.github/workflows/ci.yml`). The one offender
+  it finds, `scripts/tests/test_upgrade_check.py`, is fixed.
+- **A tool description told every session that the per-prompt hook was dead.** The MCP shim's tool
+  descriptions (`scripts/wsl/mem0-mcp-shim.py`) now say the hook is alive: `memory_recall` is an
+  explicit, deeper recall in addition to the injection, and `memory_search` is a GPU reranker with a
+  cold load after idle. The dead-hook comments elsewhere are gone (comments and docstrings only).
+
+### Security
+- **A canonical record could be demoted with the ordinary API key, then edited or deleted with no
+  token.** `PATCH /v1/memories/{id}/tier` gated only promotions into `canonical`, and the canonical write
+  gate protects a record only while it is still canonical. Any holder of the ordinary API key (every
+  session's MCP shim sends one, and `memory_demote` sends `actor=claude-autonomous`) could move a
+  canonical record to `evidence` and then `PUT` or `DELETE` it, a two-step bypass of the whole tier that
+  was found while preparing corrections to canonical records, not by the audit. A move out of
+  `canonical` now needs the operator's HMAC token for the new action word `demote`
+  (`<ts>|<nonce>|demote|<mid>|<reason>`) and a reason, and a promote token cannot be replayed as a
+  demotion (`security_invariants.tier_change_hmac_action(current, target)` holds the policy). The
+  current tier is read before any change and fails closed: a store error returns 503, a record with no
+  `tier` field reads as canonical, and a missing record returns 404. Under the per-record write lock,
+  which is keyed on the canonical UUID spelling, the handler re-reads the tier and answers 409 when a
+  record it saw as non-canonical became canonical in the meantime, or 404 when the record was deleted.
+  The write-ahead intent line is appended after that re-check, so a refused change leaves no unpaired
+  intent.
+- **Moving a record out of `canonical` is now an operator command.**
+  `bash mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence|stable|temporal]`
+  (`scripts/wsl/mem0-canonize.sh`) signs the stripped reason (the server verifies `reason.strip()`) and
+  defaults to `evidence`. Over MCP, `memory_demote` cannot move a canonical record: it returns 400
+  without a reason and 403 with one. Any automation that demoted canonicals through the plain API now
+  gets 403; none exists in this repo, but
+  `scripts/wsl/replay-ops.py` replays a queued demote as an unsigned PATCH, which lands in
+  `mutation-conflicts.jsonl` as a non-retryable 403. A record with no `tier` field now needs a signed
+  demotion too, and `scripts/wsl/tier-backfill.py` stays the operator's route to unlock one. After the
+  server restarts, an unsigned demote should return 403 and a signed one 200. Test:
+  `mem0-server/tests/test_canonical_demotion_gate.py` (headless, in the CI list).
+- **The shared redaction rules missed several provider token shapes and prose forms (register P6-11).**
+  The rule set now covers the key and token shapes of hosting, database, CDN, payment, email and VPN
+  providers, webhook-signing secrets, cloud API keys and chat-bot tokens, plus the prose forms
+  `API key <tok>` and `<label> (is|value is) <tok>` and login/password pairs. All three copies of the
+  rules (`mem0-server/redact.py`, `scripts/windows/memory-common.ps1`,
+  `claude-config/precompact_capture.py`) run against the shared `tests/fixtures/redaction-cases.jsonl`,
+  positive and negative rows, so a rule added to one copy without the others turns a case red. Nothing
+  here changes what the store keeps: the server's `add()` stays count-only and no stored record is
+  scrubbed.
+- **The nightly audit's credential flag was a six-keyword tripwire that skipped retired points
+  (register P6-11).** It flagged 1 of the 11 credential-bearing points found in the store.
+  `scripts/wsl/l10-audit.py` now builds `possible-credential` on the shared redaction rules, provider
+  prefixes and a high-entropy signal for 32+ character random-looking tokens (a seeded sample flags 94
+  to 98% of random 32 to 64 character tokens, so it is a screen, not a guarantee). It scans retired
+  points for this flag only, because a retired point is still a readable row in the vector store and in
+  every backup, and the `oversize` flag uses the migration cap for `automemory:` sources. The first L10
+  run after deploy flags retired credential-bearing points once, which is intended; review them by hand.
+- **The authority ran `cryptography` 48.0.1 with three open advisories, held there by the repo's own
+  `<49` cap (register P6-9).** GHSA-jwv3-5hgf-82ww and GHSA-m2h6-j472-rp4c are fixed in 49.0.0 and
+  GHSA-g6cj-pr64-35w5 in 50.0.0. The installer's pip lines (`install/1-wsl-services.sh`) and
+  `mem0-server/requirements.txt` now state floors instead of caps, `cryptography>=50.0.1` and
+  `mem0ai[nlp]>=2.0.4`, and agree with each other (they disagreed about both, and `mem0ai` was an exact
+  `==2.0.4` pin that had aged two minors). The installer also installs `pip-audit`; its post-condition
+  proves the floors, `pip check` and the audit tool and names the remedy when one fails, and CI runs
+  it. Re-running the authority installer applies the floors to an existing venv, so treat it as the
+  upgrade: snapshot `pip freeze` first, and run the full suite, `/health/deep` and the canaries before
+  keeping the result.
+- **A credential pasted into an operator correction sat on disk unredacted.** Capture stored the raw
+  prompt in the correction queue (`~/.mem0/learn-rules.jsonl`) with no redaction, and nothing consumed
+  it. `Add-LearnRuleCapture` (`scripts/windows/user-prompt-lib.ps1`) now runs the text through
+  `Redact-Secrets` before the 2000-character cap, and a redactor failure drops the capture rather than
+  writing the raw text. The per-prompt hook and the daemon load that lib alone, so it carries a
+  comment-stripped copy of `Redact-Secrets` with all 26 rules; `AuthorityResolution.Tests.ps1` pins it
+  identical to the `memory-common.ps1` function, and `UserPromptExtract.Tests.ps1` runs it through the
+  shared fixture. The drain redacts again what it posts, because older lines predate capture-time
+  redaction. Corrections captured before this release stay unredacted in the queue and its `.bak` until
+  pruned.
+
+### Added
+- **A planned DEGRADED pool can be acknowledged with a dated key.**
+  `MEM0_POOL_HEALTH_ACK=<STATE>:<YYYY-MM-DD>` in the authority's `~/.mem0/stack.env` (a process
+  environment value of the same name wins) names the pool state you expect and the last day (UTC) you
+  expect it, so `/health/maintenance` and the health stamp do not go red for a pool that is degraded on
+  purpose. It is read on every call, so adding or removing it needs no restart
+  (`mem0-server/maintenance_health.py`, `mem0-server/app.py`). It counts only while the pool is in
+  exactly the named state and today is on or before the date; an expired, mismatched or malformed value
+  leaves the alarm on, and `pool.health_ack.reason` says why. While it is active the health stamp and
+  the morning summary print `DEGRADED (acked until <date>)`, and installer re-runs carry the key
+  (`install/stack-env.sh`).
+- **A replica PC now refreshes the wiki index itself when it is due.**
+  `scripts/windows/memory-maintenance-spawn.ps1` starts a detached
+  `scripts/windows/wiki-index-catchup.ps1` at SessionStart when the authority reports the index older
+  than 20 h (`wiki.fresh_age_h`) or a vault page is newer than the PC's own refresh stamp, at most once
+  per 6 h and with no new scheduled task. An authority that does not report `wiki` yet falls through to
+  the page-time rule, and the authority itself never runs the catch-up. The vault directory is operator
+  configuration, `WIKI_VAULT` or the first line of `~/.mem0/wiki-vault`; with neither, the catch-up
+  does nothing. The installer deploys the operator-neutral driver `claude-config/wiki-index-refresh.sh`
+  and never overwrites an operator's own copy (a hand-written one is left as it is, with a NOTICE);
+  `docs/systems/wiki-index.md` covers the stamps, the degraded skip nights and the catch-up.
+- **A fact migrated into the corpus can now carry the brand of its workspace.**
+  `judge-apply --brand-map <path>` (`ams-store/internal/brand`, new; `cli/judgeapply.go`) adds `brand`
+  to MIGRATE metadata: the first `rules` match on the workspace slug or, in a content-ruled workspace,
+  exactly one distinct brand across the `content_rules` over the fact body; a shared label is returned
+  as it is. Path separators (backslash, slash, space) count as one character to the matcher, as in the
+  other resolvers, and a missing, empty or malformed map is brand-neutral.
+  `scripts/wsl/ams-store-judge-apply.sh` passes `--brand-map` from `MEM0_BRAND_MAP` (environment, else
+  `stack.env`) only when it is set; unset means brand-neutral, as before.
+- **The Python, PowerShell and Go brand resolvers now read one brand map the same way (contract C3).**
+  `scripts/wsl/brand_routing.py` (new) implements it: `rules` (first match on the path or slug),
+  `content_rule_workspaces` with `content_rules` (in such a workspace each fact is classified by its own
+  text: exactly one distinct brand, else none) and `shared_brands`. Separators in paths match one
+  another; a missing map is silently brand-neutral, and malformed JSON is neutral with one stderr
+  warning per problem. `Get-BrandFromTranscriptPath` in `scripts/windows/memory-common.ps1` now runs the
+  same resolution and returns brand, workspace and project, and `scripts/windows/user-prompt-lib.ps1`
+  carries a byte-identical copy (the two files do not dot-source each other on the hook hot path, and a
+  Pester test fails if they drift). With no usable rules the long-standing default rule for this stack's
+  own workspace still applies. `tests/fixtures/brand-routing-cases.jsonl` (34 cases) is the one contract
+  all three resolvers run; `claude-config/brands.example.json` holds neutral examples and
+  `docs/systems/brands.md` is new.
+- **Existing records can be tagged with a brand from a reviewed report, never automatically.**
+  `scripts/wsl/brand-backfill.py` (new) has two modes: `--dry-run --out report.jsonl` writes one row per
+  record it would tag and changes nothing, and `--apply --from report.jsonl` applies exactly the
+  reviewed rows through `PATCH /v1/memories/<id>/metadata` with actor `brand-backfill`. It refuses a row
+  whose record changed since the report (a fingerprint), is already tagged, is gone, or proposes a brand
+  the map cannot route. It never patches canonical or insight records; for those it prints the
+  `mem0-canonize.sh` HMAC command instead. With no map it exits 3.
+- **`/health/deep` now says which mode the promotion gate runs in.** `mem0-server/app.py` and
+  `mem0-server/capabilities.py` report `promotion_gate_mode` (environment, then `stack.env`, then
+  `shadow`, as the dream resolves it) and `checks.promotion_gate`, and an authority whose gate only
+  shadows shows `promotion-gate: degraded`. The value itself stays an installer and operator setting
+  (see Promotion-gate mode in the upgrade notes).
+- **Operator corrections now reach the authority instead of piling up in a local queue.** The queue
+  (`~/.mem0/learn-rules.jsonl`) was a write-only sink: the per-prompt hook appended every
+  correction-shaped prompt and nothing read it back. `scripts/windows/learn-rules-drain.ps1` (new)
+  drains it under an exclusive lock and a one-hour throttle: it stamps `test-failure` lines `dropped`
+  without posting them, and posts each pending `correction` to `/v1/memories` with `infer` off and
+  metadata `tier=evidence`, `source=learn-rules`, `kind=correction`, `captured_at`, `session_id` and
+  `brand`, then stamps it `drained` with the returned `mem0_id`. A 400, 413 or 422 stamps the line
+  `rejected`, so one poison line cannot block the queue; a connect failure, a 401, 403 or 429, or a 5xx
+  stops the run and leaves every unposted line `pending`. At most 50 corrections go out per run,
+  finished lines are pruned after 30 days (pending lines never), and the brand comes from the C3 map
+  over the transcript path and the correction's own text. `scripts/windows/memory-maintenance-spawn.ps1`
+  starts the drain at SessionStart on every role (a replica writes corrections too), and
+  `install/2-windows-config.ps1` and `scripts/windows/build-hook-client.ps1` ship it.
+- **The corrections drain cannot post an accepted correction twice, and it carries forward one typed
+  while it runs.** It rewrites the queue with a temp file and `File.Replace`, keeps one `.bak`, and
+  re-reads the queue at the commit; the status is patched textually so the original `ts` and escaping
+  survive, and a malformed line is preserved byte for byte. If the swap fails after POSTs were accepted
+  (capture's append handle is open without delete-share, or an AV/ACL lock), the commit is retried with
+  a fresh read each time, every accepted POST is journaled at once to `<queue>.pending-commit`, and the
+  next run applies that journal before it posts anything. The run then reports `aborted`
+  (`commit-failed`) and leaves the throttle open until a commit succeeds. One residual is accepted:
+  capture appends without the lock, so a line appended in the microseconds between the drain's last
+  re-read and the swap is missing from the live file (it remains in the `.bak`).
+- **A dream can be started on demand on the authority.** `/dream-now` on a replica was a silent no-op
+  with no working replacement. `scripts/wsl/ams-dream-now.sh` runs on the authority and starts one dream
+  outside the chain guard, as a transient user unit with the dream step's own credentials, environment
+  and pre-step, receipted like a chain step; it refuses anywhere but the native authority. It passes
+  `--force`, because the dream's own 23 h throttle would otherwise make it the same silent no-op, and it
+  exports the API-key path inside the command from `$CREDENTIALS_DIRECTORY`, because
+  `systemd-run -p Environment=` does not expand `%d`. Test: `scripts/wsl/tests/test_ams_dream_now.py`.
+
+### Changed
+- **The docs and the installer's llama-swap warning no longer recommend resident or CPU-only setups
+  (register P6-9).** The warning block and several docs still recommended `ttl: 0`, `always_loaded` and
+  `--n-gpu-layers 0`, which the fleet rules forbid (every model unloads at `ttl: 300` and runs on the
+  GPU). `install/1-wsl-services.sh` now shows a non-exclusive support group with `ttl: 300` and
+  `--n-gpu-layers 999`, the guidance is fixed where it appeared, and the docs gate
+  (`scripts/ci/check-docs.py`) refuses those three forms as guidance anywhere outside this changelog.
+- **Every sync commit now says which `ams-store` made it.** Every sync commit and merge-engine commit
+  carries `Ams-Store-Version: <version>`, and the receipt records `kind: once|watch`
+  (`ams-store/internal/sync/history.go`, `merger.go`, `ams-store/internal/merge/engine.go`,
+  `cli/root.go`). A watcher pass and a lagging client are therefore attributable on the hub.
+- **The admission gate admits a shared brand label like a brand-neutral record.**
+  `mem0-server/admission_gate.py` admits a label listed in the brand map's `shared_brands` or in
+  `MEM0_SHARED_BRANDS` (process environment first, then `stack.env`, since the server unit does not load
+  it), for a brandless search and for another brand's search, as it does a brand-neutral record. The
+  gate reads the map file itself (path from `MEM0_BRAND_MAP`, cached on mtime and size), so one
+  `shared_brands` list works on the server and on a PC. An unlisted brand stays fail-closed.
+- **The brand-scope audit covers every tier and counts untagged brand mentions.**
+  `scripts/wsl/brand-scope-audit.py` audits every tier (the earlier audit looked at canonical records
+  only) and writes two new metrics to the status file: `untagged_brand_mentions`, by brand plus how many
+  match several, and `unroutable_brands`. Its exit code is unchanged.
+- **The dream catch-up no longer counts operator corrections as dream debt, and the self-test watches
+  the drain instead.** `scripts/windows/dream-catchup.ps1` now counts as debt a queued promotion or a
+  gap over 48 h; correction lines no longer count, because the drain owns that queue.
+  `scripts/windows/Test-MemoryStack.ps1` gains a RECOVERY row, `corrections drain`, that WARNs when a
+  pending correction is older than 48 h, and drops the old debt probe on a state path nothing writes.
+  `docs/systems/memory-model.md`, `docs/flows/memory-capture.md`, `docs/systems/brands.md`,
+  `docs/systems/dream-skill.md`, `docs/operations.md` and `ARCHITECTURE.md` describe the drain and no
+  longer call the queue dream debt or an unimplemented loop.
+- **The front-door docs describe the stack that ships.** `ARCHITECTURE.md`, `README.md` and `CLAUDE.md`
+  still described a Windows Task Scheduler, loopback-only, CPU-inference stack. They now describe one
+  authority (native Linux, mem0 on the authority's private-network address, Qdrant on loopback, embedder
+  and reranker on the GPU with a 300 s idle unload), replica PCs and clients whose local stores are
+  dormant, and the one 17-step nightly chain with the store judge in it. The chain lists in
+  `docs/systems/installer-and-deploy.md` and `docs/operations.md` name all 17 steps and say how many,
+  `docs/api-contracts.md` names all five keyless endpoints, and
+  `mem0-server/tests/test_docs_match_code.py` holds both lists to the code.
+- **`docs/operations.md` gains the manual dream and a disk-loss runbook, and `docs/DEVELOPMENT.md` the
+  deploy steps.** The runbook, "The authority's only disk died", needs in its step 2 a plaintext copy of
+  the authority's two keys stored off the box, which this repository cannot supply.
+  `docs/DEVELOPMENT.md` now gives the three-step replica deploy and the authority deploy from a release
+  tree.
+- **The tier, consolidator and `stack.env` docs now match the code.** `docs/systems/tier-policy.md` and
+  the memory protocol snippet say that `temporal` has no `valid_until` (the one expiry field is
+  `expires_at`, stripped at add) and that the consolidator is the nightly dream (`dream-consolidator`,
+  `dream-autopromote`). `install/stack-env.sh` and the installer doc say who reads each carried
+  `stack.env` key, and that `MEM0_NLI_GATE_ENABLED` is carried but never read from that file (a test
+  pins it). The fleet ADR's phase block is closed out, and the stale CPU wording in the reranker and
+  embedder probes is dropped.
+
+### Upgrade notes
+- **Deploy the authority, then re-run the installer on every replica PC.** `install/linux-authority.sh`
+  (`deploy.sh` on a WSL authority) restarts the server on the new code and ships the chain scripts; the
+  server-side changes here (`maintenance_health.py`, `app.py`, `embedder_503.py`, `reranker.py`,
+  `redact.py`, the canonical demotion gate) apply only after that restart. A replica PC or client gets
+  the banner and enrichment-seed fixes, the PreCompact session id, the SessionStart pre-warm, the wiki
+  catch-up and the redaction rules in `memory-common.ps1` and `precompact_capture.py` only when its own
+  installer re-runs (on Windows, `install/2-windows-config.ps1`).
+- **Pool health.** A DEGRADED pool now turns `/health/maintenance` `ok` false and makes the health-stamp
+  step exit 2 every night. For a planned window add `MEM0_POOL_HEALTH_ACK=DEGRADED:<YYYY-MM-DD>` (the
+  state and the last day, UTC) to `~/.mem0/stack.env` on the authority: no restart, it holds only while
+  the pool is in exactly that state, and it lapses the day after its date. A weekly step that comes back
+  `degraded` or `failed` stays listed for the week.
+- **Promotion-gate mode.** `install/linux-authority.sh --promotion-gate-mode shadow|enforce` writes
+  `MEM0_PROMOTION_GATE_MODE` (the code default is `shadow`); omitted, a recorded value is carried, and
+  an empty value drops it. An earlier re-run may have deleted a hand-set line, so on an authority that
+  should enforce, check `~/.mem0/stack.env` and set the flag once if the line is missing.
+- **Fleet store.** A Linux client or replica re-run without `--ams-hub` now inherits the recorded hub;
+  pass `--ams-hub ""` to leave the fleet store.
+- **Wiki catch-up.** On each replica PC that mounts the vault, set `WIKI_VAULT` or write the vault
+  directory on the first line of `~/.mem0/wiki-vault`; with neither, the catch-up does nothing. A
+  hand-written `wiki-index-refresh.sh` is kept as it is.
+- **Canonical demotion.** After the restart, an unsigned demote of a canonical record should return 403
+  and a signed one 200; use `mem0-canonize.sh --action demote`. Automation that demoted through the
+  plain API now gets 403.
+- **Dependencies.** Re-running the authority installer (`install/linux-authority.sh`, or
+  `install/1-wsl-services.sh` on a WSL authority) raises `cryptography` to `>=50.0.1` and installs
+  `pip-audit`, so it needs a package index. Snapshot `pip freeze` first, and run the full suite,
+  `/health/deep` and the canaries before keeping the result; `deploy.sh` does not run pip.
+- **The first L10 run after deploy** flags retired credential-bearing points once; review them by hand.
+- **Live test suites** refuse a non-loopback `MEM0_URL` unless `AMS_ALLOW_LIVE_PROD_TESTS=1` is set.
+- **Brand map.** Set `MEM0_BRAND_MAP` on the authority (in its `~/.mem0/stack.env`, which installer
+  re-runs carry) to the path of your brand map; the map is operator data and is not in this repository.
+  `scripts/wsl/ams-store-judge-apply.sh` passes `--brand-map` only when the variable is set
+  (environment, else `stack.env`), and the Python resolvers and the admission gate fall back to
+  `~/.claude/scripts/brands.json`; with no map anywhere, everything stays brand-neutral, as before. List
+  every label that must stay visible everywhere under `shared_brands` in the map, which works on the
+  server and on a PC: once PCs run the new hooks, new facts from this stack's own workspace carry that
+  workspace's brand and drop out of brandless recall unless the label is shared. `MEM0_SHARED_BRANDS` in
+  `stack.env` reaches the authority only, because the Windows hooks read shared labels from the map and
+  their own environment. Existing untagged records change only through a reviewed
+  `scripts/wsl/brand-backfill.py --dry-run --out report.jsonl`, then `--apply --from report.jsonl`;
+  nothing tags them automatically, and a spool line written before this release replays brandless.
+- **Semantic dedup.** It compares pairs again after weeks of comparing nothing, so it starts deleting
+  near-duplicates again: up to 50 a night (`--max-deletions`), highest cosine first, with a restore
+  record in `~/.mem0/dedup-report.jsonl` written before each delete. The audit measured a backlog of
+  about 112 distinct ids, mostly install-verify and extractor near-duplicates. Run
+  `semantic-dedup.py --dry-run` once on the authority and read `~/.mem0/dedup-report.dryrun.jsonl`
+  before its first live night, or set a lower `--max-deletions` in the step's unit until you have
+  reviewed it. `numpy` is a new dependency (`mem0-server/requirements.txt`, the installer's pip line).
+  Re-running `install/linux-authority.sh` installs it into an existing venv, because that installer runs
+  the fresh-install pip line every time; the WSL installer's refresh branch and `deploy.sh` do not, and
+  the installer notes that numpy arrives with `fastembed`, so on a WSL authority check that
+  `import numpy` works in the venv before the first night.
+- **Backup.** The first nightly backup after deploy prunes in one go: the server-side Qdrant snapshots
+  to 2 per collection (about 26 files on the audited authority), the cloud mirror to 7 complete sets
+  (about 10 sets deleted) and the local manifests to 8 (about 17 deleted). That is intended and happens
+  once. The set now also carries the episodes, entities and wiki-page collections, and a night that
+  loses a secondary snapshot or a server-side delete reads `degraded`, which turns `/health/maintenance`
+  `ok` false until the next good night; a stale or failed set makes the cloud copy refuse with exit 5 or
+  6, a failed step until a good night. Watch the first live night: the Qdrant checks (the first token of
+  `.checksum` being the sha256, the snapshot list returning `name` and `creation_time`, DELETE also
+  removing the `.checksum`), the coreutils calls the scripts rely on (`stat -c`, `sha256sum`, `cmp`,
+  `xargs -d`, `find -mtime -delete`) and the deletion latency on the cloud mount have only run against
+  fakes, and a mismatch fails safe: the copy is removed, the night reads red and nothing is deleted
+  server-side. The manifest's `git_sha` reads `unknown` until an installer run, or `deploy.sh` on a WSL
+  host, stamps the tree.
+- **Episode embeddings.** `episodic-reconcile` reads `degraded` (`embedding-coverage-<pct>`, measured at
+  14 % before) until embedding coverage passes 90 %. It still exits 0, but by the health contract that
+  keeps `/health/maintenance` `ok` false and a replica PC's banner on `NOT OK` for as long. The weekly
+  run backfills 500 embeddings, so the gap closes on its own in about six Sunday runs; a one-off run of
+  `scripts/wsl/episode-embed-backfill.py` with no limit, which embeds every complete episode that is
+  missing one, closes it at once. The first run also marks `in_progress` episodes untouched for 7 days
+  `abandoned`.
+- **Curation.** The server-side changes (`admission_gate.py`, `capabilities.py`, `job_liveness.py`,
+  `episodic.py`, `mojibake_check.py`, `app.py`) apply after the authority's restart, and the chain
+  scripts and units ship with the installer. Stamps whose target is no longer canonical stop hiding
+  records at once, and a failed target lookup admits the record and is counted. The weekly sweep now
+  also runs the stamped re-judge, so it clears stamps against demoted targets and writes one combined
+  receipt. `/health/deep` shows `promotion-gate: degraded` while the gate only shadows (see
+  Promotion-gate mode above). This release does not demote the stale canonicals, unstamp later operator
+  decisions or remove the test canonicals; that is data work.
+- **Store judge.** The new `ams-store` binary has to reach the authority and every PC.
+  `install/linux-authority.sh` installs it from this version's release asset (`--ams-store-binary` and
+  `--ams-store-sums` take an offline drop), and a PC still on the old binary keeps the old behavior,
+  including pushing a scratch store. The wrapper ships with the authority installer. The first derive on
+  a store with decorated pointers parses them: dangling lines are dropped, over-cap lines shortened or
+  floored and `hook:` text harvested into fact files, so a large index reorders and syncs a batch of
+  edits. Lint reports `unparsed_pointer` findings for decorated lines with a second link until they are
+  split. A night in which every corpus write fails turns `/health/maintenance` `ok` false (`store-judge`
+  under `degraded_steps`) until the next good night.
+- **Corrections drain.** It exists on a PC only after that PC's installer re-runs (or
+  `scripts/windows/build-hook-client.ps1` for the hot list). It then runs at every SessionStart on every
+  role and posts at most 50 evidence-tier memories per hour per PC to the authority. The existing
+  backlog drains at 50 per hour, the old `test-failure` lines are stamped `dropped` and pruned 30 days
+  later, and hooks outside this repository keep appending test-failure lines and writing the subagent
+  queue until their own change is deployed. Corrections captured before this release stay unredacted in
+  the local queue and its `.bak` until pruned; the drain redacts what it posts. The self-test row
+  `corrections drain` WARNs when a pending correction is older than 48 h.
+- **Replica PCs keep their role.** A plain `install.ps1` re-run used to turn a replica into a brain.
+  With `-Role` omitted, `install.ps1` and `install/2-windows-config.ps1` now keep the recorded role, an
+  explicit `-Role` still wins, and first installs are unchanged. Re-run the installer on each replica
+  PC: the PC-side changes in this release (brand resolution in the hooks and the L1a worker, the L1a
+  lock wait, capture-time redaction of corrections and the corrections drain) reach a PC only then.
+- **Manual dream.** `scripts/wsl/ams-dream-now.sh` has run only against a fake `systemd-run`, and its
+  shape was checked against a real transient unit; it has not run against the real credentials. After
+  the deploy, run it once on the authority
+  (`ssh <authority-alias> 'bash ~/apps/mem0-scripts/ams-dream-now.sh'`) and check the dream's receipt.
+- **Disk-loss runbook.** Step 2 of "The authority's only disk died" (`docs/operations.md`) needs a
+  plaintext copy of the authority's two keys stored off the box. This repository cannot supply or check
+  it, so confirm that one exists.
+
 ## 1.31.4 — the installer stops reporting a phantom pid 0 (2026-09-23)
 
 ### Fixed
