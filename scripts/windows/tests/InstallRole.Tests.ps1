@@ -278,8 +278,14 @@ Describe 'an unusable role record stops both installers before anything is writt
             param([string]$ScriptPath, [string[]]$ScriptArgs, [string]$ProfileDir)
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $script:pwshExe
-            $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'
-            foreach ($a in $ScriptArgs) { $argLine += ' ' + $a }
+            # The real script runs through a tiny -Command wrapper that catches its terminating error and
+            # writes the exception MESSAGE itself to stderr. Matching the host's rendering of the error
+            # (ConciseView: a source-line echo, '|'-prefixed lines wrapped at the console width) broke on
+            # a narrow CI console; the message text is the same everywhere.
+            $inner = "try { & '" + $ScriptPath.Replace("'", "''") + "'"
+            foreach ($a in $ScriptArgs) { $inner += ' ' + $a }
+            $inner += '; exit $LASTEXITCODE } catch { [Console]::Error.WriteLine(''INSTALLER-THREW: '' + $_.Exception.Message); exit 1 }'
+            $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + $inner + '"'
             $psi.Arguments = $argLine
             $psi.UseShellExecute = $false
             $psi.RedirectStandardOutput = $true
