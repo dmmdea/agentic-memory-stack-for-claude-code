@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -122,13 +123,14 @@ def _act(case: str, background: BackgroundTasks | None = None, request: Request 
     raise AssertionError(f"unknown case {case}")
 
 
-def build_app(*, middleware: bool = True, install_middleware_first: bool = False) -> FastAPI:
+def build_app(*, middleware: bool = True, install_middleware_first: bool = False, installs: int = 1) -> FastAPI:
     app = FastAPI()
     if middleware and install_middleware_first:
         wp.install(app)
     embedder_503.install(app)
     if middleware and not install_middleware_first:
-        wp.install(app)
+        for _ in range(installs):
+            wp.install(app)
 
     @app.post("/v1/memories")
     def add(b: Body, background: BackgroundTasks, request: Request, case: str = "ok"):
@@ -433,6 +435,90 @@ def test_a_background_task_that_fails_after_the_response_is_not_a_failed_write()
     assert snap["ok"] is True and (snap["errors_1h"], snap["writes_1h"]) == (0, 1)
 
 
+# --------------------------------------- the middleware's own bookkeeping can never raise into the request
+def _boom(*_a, **_k):
+    raise RuntimeError("the middleware's own bookkeeping broke")
+
+
+async def _aboom(*_a, **_k):
+    raise RuntimeError("the middleware's own bookkeeping broke")
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/v1/memories"), ("PUT", "/v1/memories/abc")])
+def test_a_bug_reading_the_failure_reason_never_changes_the_response(monkeypatch, method, path):
+    """_reason_of runs on the response the client is about to get. If it breaks, the client still gets that
+    exact response, and the failure is still recorded (with the default reason)."""
+    kw = dict(params={"case": "embedder"}, json={"text": "hello"})
+    expected = _wire(_client(middleware=False).request(method, path, **kw))
+    monkeypatch.setattr(wp, "_reason_of", _aboom)
+    r = _client().request(method, path, **kw)
+    assert r.status_code == 503 and _wire(r) == expected
+    snap = wp.snapshot()
+    assert snap["ok"] is False and snap["last_error"] == "503 upstream"
+    assert (snap["errors_1h"], snap["writes_1h"]) == (1, 1)
+
+
+def test_a_bug_parsing_the_reason_cannot_lose_the_chunk_that_was_peeked(monkeypatch):
+    """The first chunk is taken off the stream to read the reason and put back. If the parser breaks after
+    that, the chunk must already be back: the client still gets the whole body."""
+    kw = dict(params={"case": "stream-reason"}, json={"text": "hello"})
+    expected = _wire(_client(middleware=False).post("/v1/memories", **kw))
+    monkeypatch.setattr(wp, "_reason_from", _boom)
+    r = _client().post("/v1/memories", **kw)
+    assert r.status_code == 503 and r.content == b'{"reason": "cold-embedder"}\n\n' and _wire(r) == expected
+    assert wp.snapshot()["last_error"] == "503 upstream"
+
+
+def test_an_unreadable_neutral_flag_records_nothing_and_changes_nothing(monkeypatch):
+    """Failing to read the flag must never turn a 2xx into a success: nothing is recorded (an unknown path is
+    not a healthy one) and the client gets exactly what the route gave. A 5xx never consults the flag."""
+    c = _client()
+    _post(c, "embedder")
+    monkeypatch.setattr(wp, "is_neutral", _boom)
+    r = _post(c, "ok")
+    assert r.status_code == 200 and r.json() == {"results": [{"id": "m1", "event": "ADD"}]}
+    snap = wp.snapshot()
+    assert snap["ok"] is False and (snap["errors_1h"], snap["writes_1h"]) == (1, 1)
+    assert _post(c, "upstream-500").status_code == 500
+    assert _counts() == (2, 2)
+
+
+@pytest.mark.parametrize("case,status", [("ok", 200), ("upstream-500", 500), ("embedder", 503)])
+def test_a_tracker_that_cannot_record_never_changes_the_response(monkeypatch, case, status):
+    kw = dict(params={"case": case}, json={"text": "hello"})
+    expected = _wire(_client(middleware=False).post("/v1/memories", **kw))
+    monkeypatch.setattr(wp, "TRACKER", types.SimpleNamespace(record=lambda *a, **k: 1 / 0))
+    r = _client().post("/v1/memories", **kw)
+    assert r.status_code == status and _wire(r) == expected
+
+
+def test_a_tracker_that_cannot_record_does_not_replace_the_routes_exception(monkeypatch):
+    monkeypatch.setattr(wp, "TRACKER", types.SimpleNamespace(record=lambda *a, **k: 1 / 0))
+    c = TestClient(build_app(), raise_server_exceptions=True)
+    with pytest.raises(RuntimeError, match="bug"):
+        _post(c, "crash")
+
+
+def _run_middleware(response):
+    async def go():
+        async def call_next(request):
+            return response
+        req = types.SimpleNamespace(method="POST", scope={"path": "/v1/memories"}, state=types.SimpleNamespace())
+        return await wp.middleware(req, call_next)
+    return asyncio.run(go())
+
+
+def test_a_response_whose_status_cannot_be_read_is_handed_back_untouched():
+    class Odd:
+        @property
+        def status_code(self):
+            raise RuntimeError("no status on this response")
+
+    odd = Odd()
+    assert _run_middleware(odd) is odd
+    assert _counts() == (0, 0)
+
+
 # ------------------------------------------------- reading the reason leaves the response stream exactly as it was
 class _Fake:
     """Just enough of a Starlette response for _reason_of: a status and a body_iterator."""
@@ -519,6 +605,34 @@ def test_without_the_install_nothing_is_recorded():
     c = _client(middleware=False)
     assert _post(c, "embedder").status_code == 503
     assert _counts() == (0, 0)
+
+
+# ------------------------------------------------------------------------------- install is idempotent
+def test_installing_the_middleware_twice_does_not_record_twice():
+    c = _client(installs=3)
+    assert _post(c, "embedder").status_code == 503
+    assert _counts() == (1, 1)
+    assert _post(c, "ok").status_code == 200
+    assert _counts() == (1, 2)
+
+
+def test_installing_again_after_the_first_request_is_a_no_op_not_an_error():
+    """Once the app has served a request Starlette refuses new middleware. A second install has nothing to add,
+    so it must not even try."""
+    app = build_app()
+    c = TestClient(app, raise_server_exceptions=False)
+    assert _post(c, "ok").status_code == 200
+    wp.install(app)
+    assert _post(c, "embedder").status_code == 503
+    assert _counts() == (1, 2)
+
+
+def test_two_apps_each_get_their_own_middleware():
+    """The marker lives on the app, not in the module: a second app is not mistaken for an installed one."""
+    a, b = build_app(), build_app()
+    ca, cb = (TestClient(x, raise_server_exceptions=False) for x in (a, b))
+    assert _post(ca, "embedder").status_code == 503 and _post(cb, "embedder").status_code == 503
+    assert _counts() == (2, 2)
 
 
 # ---------------------------------------------------------------------------------------- app.py wiring pins

@@ -52,6 +52,7 @@ DEFAULT_REASON = "upstream"
 WRITE_PATH_PREFIX = "/v1/memories"
 PEEK_MAX_BYTES = 4096      # a failure body bigger than this is not read for a reason (it is still sent whole)
 NEUTRAL_KEY = "write_path_neutral"   # the request.state key a route sets on a 2xx that says nothing about the path
+INSTALLED_KEY = "write_path_installed"   # the app.state marker: this app already has the middleware
 
 
 def _iso(epoch: float) -> str:
@@ -258,6 +259,8 @@ async def _reason_of(response: Any) -> Optional[str]:
         async for chunk in stream:
             yield chunk
 
+    # The chunk is back on the response BEFORE anything is done with it: `_reason_from` may fail (the caller
+    # guards it), but the client must never lose a byte because of it.
     response.body_iterator = replay()
     return _reason_from(first)
 
@@ -266,7 +269,29 @@ def _note(status: int, reason: Optional[str]) -> None:
     try:
         TRACKER.record(status, reason)
     except Exception:  # the tracker must never be the reason a write fails
-        log.exception("write_path: could not record a %s outcome", status)
+        _log_failure(f"could not record a {status} outcome")
+
+
+async def _record_response(request: Any, response: Any) -> None:
+    """Count what a write's response says about the path. This is the middleware's own bookkeeping and none
+    of it may reach the request: the client gets the response the route produced whatever happens here.
+
+    A bug that stops the reason being read still records the failure (as `upstream`). A bug anywhere else
+    records nothing, which reads as "no evidence", never as a success: an unreadable flag or status must
+    not clear a failure."""
+    try:
+        status = response.status_code
+        if 200 <= status < 300 and is_neutral(request):
+            return               # a 2xx that never reached the embedder: not a success, so it clears nothing
+        reason = None
+        if status >= 500:
+            try:
+                reason = await _reason_of(response)
+            except Exception:
+                _log_failure("could not read the failure reason; recording it as upstream")
+        _note(status, reason)
+    except Exception:
+        _log_failure("could not record a write outcome")
 
 
 async def middleware(request: Any, call_next: Any) -> Any:
@@ -276,7 +301,8 @@ async def middleware(request: Any, call_next: Any) -> Any:
     through. The status is the one the client gets, after the exception handlers ran. An exception
     that no handler takes arrives here as an exception: it is recorded as a 500 and raised again, so
     the server answers it as it always did. A 2xx the route marked neutral (`mark_neutral`) is not
-    recorded at all; a 5xx or an exception is recorded whatever the route marked."""
+    recorded at all; a 5xx or an exception is recorded whatever the route marked. Recording is guarded
+    (`_record_response`): the middleware's own bookkeeping never raises into the request."""
     if not is_write_request(request.method, request.scope.get("path", "")):
         return await call_next(request)
     try:
@@ -284,10 +310,7 @@ async def middleware(request: Any, call_next: Any) -> Any:
     except Exception:
         _note(500, None)
         raise
-    status = response.status_code
-    if 200 <= status < 300 and is_neutral(request):
-        return response          # a 2xx that never reached the embedder: not a success, so it clears nothing
-    _note(status, await _reason_of(response) if status >= 500 else None)
+    await _record_response(request, response)
     return response
 
 
@@ -297,5 +320,14 @@ def install(app: Any) -> None:
     Ordering: Starlette stacks ServerErrorMiddleware > user middleware > ExceptionMiddleware > routes
     whatever order things were added in, so the exception handlers (embedder_503's 503, FastAPI's
     HTTPException and validation handlers) run INSIDE this middleware and it records the response
-    they produced, not the exception they took."""
+    they produced, not the exception they took.
+
+    Idempotent: a second call on the same app registers nothing (the marker lives on `app.state`), so a
+    write is never counted twice, and a call after the app has served a request is a quiet no-op instead
+    of Starlette's "cannot add middleware after an application has started"."""
+    state = getattr(app, "state", None)
+    if getattr(state, INSTALLED_KEY, False) is True:
+        return
     app.middleware("http")(middleware)
+    if state is not None:
+        setattr(state, INSTALLED_KEY, True)
