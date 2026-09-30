@@ -208,8 +208,12 @@ Describe 'SessionStart capture through a junction alias in projects/' {
                     @{ Current = 1; Via = 'AliasZ'; Expect = 0 }   # the current transcript_path reached through an alias
                     @{ Current = 2; Via = 'AliasA'; Expect = 0 }
                     @{ Current = -1; Via = 'Real';  Expect = 0 }   # a brand-new session: nothing of its own on disk yet
+                    # the same again on a much bigger listing (12 older sessions added: 48 rows), closer to a real profile
+                    @{ Current = 0; Via = 'AliasZ'; Expect = 1; Grow = 12 }
+                    @{ Current = -1; Via = 'Real';  Expect = 0 }
                 )
                 foreach ($r in $runs) {
+                    if ($r.Grow) { foreach ($n in 1..$r.Grow) { $null = Add-Transcript $sb.Real (60 + $n) } }
                     Reset-CaptureState $sb
                     $cur = $null
                     if ($r.Current -ge 0) { $cur = $sb.S[$r.Current] }
