@@ -74,11 +74,11 @@ Patterns are case-insensitive. Path separators (backslash, slash, space) are one
 
 **Backfill.** `brand-backfill.py` fixes what the audit finds, with a person between the two steps:
 
-1. `brand-backfill.py --dry-run --out report.jsonl` writes one row per record it would tag (`id`, `tier`, `current`, `proposed`, `rule`, `text_head`, `fp`) and changes nothing. `rule` is `path` or `content`.
-2. Review the file: delete a row to skip it, set `proposed` to null to skip it, or correct the brand.
+1. `brand-backfill.py --dry-run --out report.jsonl` writes one row per record it would tag (`id`, `tier`, `current`, `proposed`, `rule`, `text_head`, `fp`) and changes nothing. `rule` is `path` or `content`. It follows the resolver's order: a path rule on the record's workspace, else on its project (`path`); else the content rules, but only when the workspace or project is a content-rule workspace or the record carries no path at all (`content`); a record whose path routes nowhere outside those workspaces gets no row.
+2. Review the file: delete a row to skip it, set `proposed` to null to skip it, or correct the brand. Read the `content` rows closely, most of all those of records with no path: a content rule names one business, so a fact about several businesses' accounts or about shared infrastructure can match exactly one of them, and a wrong business label hides that fact from every other workspace. Leaving such a row out keeps the record visible everywhere, as it is today.
 3. `brand-backfill.py --apply --from report.jsonl` applies exactly those rows through `PATCH /v1/memories/<id>/metadata` with the actor `brand-backfill` and only `{"brand": ...}`.
 
-A row is refused, not applied, when its record changed since the report (the `fp` fingerprint covers the text, brand, tier and `updated_at`), when someone tagged the record meanwhile, when the record is gone, or when the proposed brand is not one the map can route. Canonical and insight records are never patched by this tool: those tiers need the operator's HMAC signature, so `--apply` prints the exact `mem0-canonize.sh --action patch_metadata` command for each. A run without a brand map exits 3 rather than proposing nothing.
+A row is refused, not applied, when its record changed since the report (the `fp` fingerprint covers the text, brand, tier and `updated_at`), when someone tagged the record meanwhile, when the record is gone, or when the proposed brand is not one the map can route. Canonical and insight records are never patched by this tool: those tiers need the operator's HMAC signature, so `--apply` prints the exact `--action patch_metadata` command for each: `ams-canonize.sh` on a native authority (`MEM0_HOST_KIND=native`, where only the unit it starts can load the key), `mem0-canonize.sh` elsewhere. A run without a brand map exits 3 rather than proposing nothing.
 
 ## Data and state
 
