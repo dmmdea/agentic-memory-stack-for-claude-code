@@ -1147,7 +1147,7 @@ def health_deep() -> dict:
     except Exception as e:
         out["checks"]["retrieval_drift"] = {"state_present": None, "error": str(e)[:120]}
     # W4 (F11): the reranker's PASSIVE counters — what real search traffic has
-    # already proven about the CPU cross-encoder. Zero I/O; an active probe here
+    # already proven about the cross-encoder. Zero I/O; an active probe here
     # would hang deploy.sh's post-restart health gate on a cold model.
     try:
         out["checks"]["reranker"] = _rerank_health()

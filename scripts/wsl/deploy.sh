@@ -309,7 +309,7 @@ for i in $(seq 1 30); do
     [ "$i" = 30 ] && { echo "==> HEALTH GATE FAILED after 30s — check: journalctl --user -u mem0.service -n 50"; exit 1; }
 done
 # W4 (review F11): --max-time 60. This gate runs SECONDS after a restart, when the
-# CPU embedder/BM25 encoder may still be cold, and /health/deep has no server-side
+# embedder/BM25 encoder may still be cold (an idle unload is a cold load), and /health/deep has no server-side
 # deadline of its own — an unbounded curl here means one slow check hangs the deploy
 # indefinitely with no output. 60s is ~2x the verifier's own 30s budget for the same
 # endpoint, so a merely-cold box still passes; a wedged one now ABORTS the deploy
