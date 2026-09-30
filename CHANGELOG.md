@@ -4,9 +4,18 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## 1.32.2 — the brand backfill proposes only what the resolver would route (2026-09-30)
+## 1.32.2 — a task notification is never an operator correction, and the brand backfill proposes only what the resolver would route (2026-09-30)
 
 ### Fixed
+- **Background task notifications were captured and posted as operator corrections.** The correction
+  capture ran `Test-CorrectionLikePrompt` on every UserPromptSubmit prompt, machine turns included, and
+  a task notification whose tool output says "revert that" or "you forgot" matched its patterns. The
+  first 1.32 drain posted 100 queued "corrections"; 66 were task-notification blobs, stored as branded
+  evidence memories. `Test-CorrectionLikePrompt` now returns false for a machine turn (the C10 rule,
+  `Test-MachineTurnPrompt`), so neither the daemon path nor the inline path queues one, and
+  `learn-rules-drain.ps1` stamps a queued correction whose text is a machine turn `dropped` instead of
+  posting it. Dropping needs no network, so it no longer waits for the per-run budget. The drain's copy
+  of the rule is pinned to the shared machine-turn corpus.
 - **`brand-backfill.py` proposed business labels the C3 resolver would never give.** `propose()` ran the
   content rules on every record whose path did not route, and read the workspace OR the project, so a
   project rule never ran when a workspace was set. The contract (`brand_routing`) runs the content rules
@@ -21,9 +30,12 @@ in the first entries below — full pre-inversion history lives in the maintaine
   native authority. It now prints `ams-canonize.sh` there (`MEM0_HOST_KIND=native`).
 
 ### Upgrade notes
-- **Authority only.** Deploy the authority (`install/linux-authority.sh`); the backfill and the resolver
-  helper run there. A replica or client changes nothing in behaviour and can take this release at its
-  next installer run.
+- **Deploy the authority, then re-run the installer on every PC.** The backfill and the resolver helper
+  run on the authority; the capture and the drain run on each PC, so a PC keeps queueing task
+  notifications until its own installer re-runs (on Windows, `install/2-windows-config.ps1`). Lines a PC
+  already queued are dropped by its next drain once it runs the new script.
+- **Notifications already posted stay in the store** until someone removes them: they carry
+  `source=learn-rules` and text starting `<task-notification>`, so they are easy to find and delete by id.
 - **Review content rows closely.** A content rule names one business, so a fact about several
   businesses' accounts or about shared infrastructure can match exactly one of them, and a wrong label
   hides that fact from every other workspace. Leaving such a row out keeps the record visible everywhere.
