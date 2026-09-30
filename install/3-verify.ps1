@@ -324,7 +324,7 @@ Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
         $hdr = @{'X-API-Key' = $key; 'Content-Type' = 'application/json'}
         $body = @{ messages = 'smoke-test memory: agentic memory stack verify timestamp ' + (Get-Date -Format o); user_id = 'verify-test'; infer = $false; metadata = @{ source = 'install-verify'; tier = 'evidence' } } | ConvertTo-Json -Compress
         # 2026-07-25: generous timeout + bounded retry on the SEARCH side. Both legs go through
-        # the CPU-only embedder on :11436, which can take many seconds during a model swap or
+        # the embedder on :11436 (a GPU model, unloaded after 300 s idle), which can take many seconds on a cold load or
         # under concurrent load, and an add that succeeded is not necessarily searchable in the
         # same instant. With a single 15s attempt this check failed on a completely healthy box
         # and made 3-verify exit 1 — and a verifier that cries wolf stops being read.

@@ -222,8 +222,11 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
 def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, threshold: float = 0.1, rerank: bool | None = None, query_class: str = "durable", brand: str | None = None, allow_cross_brand: bool = False) -> dict:
     """Semantic search over mem0. Returns up to `limit` memories above `threshold`.
     Auto-reranks via the bge cross-encoder when limit>=5 (measured 2026-06-22 to IMPROVE
-    relevance — blind Codex A/B 7/11; adds ~2s on this CPU box, fine for a DELIBERATE search,
-    and NOT on the <500ms per-prompt bundle). Pass rerank=True/False to override the default.
+    relevance — blind Codex A/B 7/11). The reranker is a GPU model behind llama-swap that unloads
+    after 5 idle minutes: a search after an idle spell pays a cold load and may come back in dense
+    order (see `rerank_status`: failed_fallback_dense / ok-after-cold-retry, and `rerank_note`).
+    That is fine for a DELIBERATE search, and it is NOT on the <500ms per-prompt bundle.
+    Pass rerank=True/False to override the default.
     query_class: 'durable' (default) | 'operational' (recency-decayed) |
     'canonical' (REQUIRED to retrieve tier=canonical ground-truth records —
     the default class excludes them).
@@ -276,20 +279,22 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
 
 @mcp.tool
 def memory_recall(query: str, brand: str | None = None, initiative: str | None = None, project: str | None = None, user_id: str = "__WSL_USER__") -> dict:
-    """PROACTIVELY pull the memory the task you are about to start depends on — the SAME
-    admission-gated, brand-scoped, ranked context the per-prompt UserPromptSubmit hook USED
-    to inject before that hook went dead in this runtime (VS Code extension / Agent SDK).
-    Call it at the START of any substantive task that could turn on a prior decision, brand or
-    project state, a port/path/config value, or an open goal — NOT on every trivial turn
-    (over-recall is the named anti-pattern; an EMPTY result is a valid "nothing relevant is
-    stored", never a failure).
+    """Explicit, deeper recall, IN ADDITION to the per-prompt [MEMORY CONTEXT] injection. The
+    UserPromptSubmit hook already runs on every prompt and injects the top gated durable facts for
+    that prompt (K<=2, threshold-gated; nothing at all when nothing clears the gate). This verb
+    pulls the SAME admission-gated, brand-scoped, ranked bundle for a query YOU choose, plus the
+    tier=canonical ground truth the hook never injects. Use it when the injected block is empty or
+    is not what the task turns on, when you need canonical facts (locked ports, decisions, brand
+    directives), or when you need another brand's scope than the session's. NOT on every trivial
+    turn, and not just because a block was injected (over-recall is the named anti-pattern; an
+    EMPTY result is a valid "nothing relevant is stored", never a failure).
 
     Returns {ok, canonical, memories, goals, open_questions}:
       - canonical: query-relevant tier=canonical GROUND TRUTH (locked facts — reserved ports,
         locked decisions, brand directives). The default search class EXCLUDES these, so this
         verb fetches them explicitly; trust them as ground truth.
       - memories: the per-prompt bundle's top gated durable/evidence facts for `query` (K<=2,
-        threshold-gated — identical to what the dead hook would have injected).
+        threshold-gated — the same pipeline the per-prompt hook injects from).
       - goals / open_questions: open goals + questions, optionally scoped to brand/initiative.
 
     No side effects — the episode checkpoint is suppressed (checkpoint=False), so a recall never
@@ -894,7 +899,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.31.4"
+SHIM_STACK_VERSION = "1.32.0"
 
 
 def _write_start_receipt() -> None:

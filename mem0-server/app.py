@@ -1147,7 +1147,7 @@ def health_deep() -> dict:
     except Exception as e:
         out["checks"]["retrieval_drift"] = {"state_present": None, "error": str(e)[:120]}
     # W4 (F11): the reranker's PASSIVE counters — what real search traffic has
-    # already proven about the CPU cross-encoder. Zero I/O; an active probe here
+    # already proven about the cross-encoder. Zero I/O; an active probe here
     # would hang deploy.sh's post-restart health gate on a cold model.
     try:
         out["checks"]["reranker"] = _rerank_health()
@@ -3126,9 +3126,10 @@ class ContextBundleIn(BaseModel):
     tier: Optional[str] = "frontier"
     transcript_path: Optional[str] = None
     hook_contract_version: Optional[str] = None
-    # v1.0 A1 (mandated-pull): the memory_recall MCP verb pulls the bundle on demand
-    # because the per-turn UserPromptSubmit hook is dead in the VS Code / Agent-SDK
-    # runtime. A manual pull MUST NOT upsert an episode or every recall would pollute
+    # v1.0 A1 (mandated-pull): the memory_recall MCP verb pulls the bundle on demand,
+    # an explicit deeper recall in addition to what the per-prompt UserPromptSubmit
+    # hook injects (empty block, canonical facts, another brand's scope). A manual pull
+    # MUST NOT upsert an episode or every recall would pollute
     # the SessionStart resume banner with a synthetic session, so it passes
     # checkpoint=False. The hook path omits it (default True) and keeps the original
     # checkpoint-first contract unchanged.

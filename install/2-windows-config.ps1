@@ -67,6 +67,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# An omitted -Role keeps the role this box recorded (install/role-lib.ps1), the rule install.ps1 applies
+# before it calls us. Run directly, the bare default 'brain' would overwrite a replica's receipt and
+# ~/.mem0/role and register the nightly dream/dedup tasks on it. 'brain' is the FIRST-install default.
+# A record that exists but yields no role throws here, before this script writes or registers anything
+# (the first write is the receipt, far below): the box is left untouched.
+. (Join-Path $PSScriptRoot 'role-lib.ps1')
+if (-not $PSBoundParameters.ContainsKey('Role')) {
+    $RoleChoice = Resolve-InstallRole -Explicit $false -ProfileDir $env:USERPROFILE
+    $Role = $RoleChoice.Role
+    Write-Host "    role (no -Role given): $Role, $($RoleChoice.Source)"
+}
 $ClaudeDir = Join-Path $env:USERPROFILE '.claude'
 $ScriptsDir = Join-Path $ClaudeDir 'scripts'
 $LogsDir = Join-Path $ClaudeDir 'logs'
@@ -1172,10 +1183,11 @@ $psDaemonSpawn  = New-HookCommand 'mem0-hook-daemon-spawn.ps1'
 # ~/.claude/state/codex-shim.enabled exists), so registering it costs nothing until
 # the NLI write-gate is turned on.
 $psShimSpawn    = New-HookCommand 'codex-shim-spawn.ps1'
-# 2026-06-24: SessionStart capture of the PRIOR session's transcript. The per-turn
-# Stop/UserPromptSubmit hooks do NOT fire in the Claude Code VSCode-extension / Agent-SDK
-# runtime (verified via fire-marker probe), so Stop-driven capture is dead there. This
-# lifecycle hook (which DOES fire) plus PreCompact carry capture instead. Async + detached.
+# 2026-06-24: SessionStart capture of the PRIOR session's transcript. A session that ends without a
+# Stop (a killed window, a crash) is never extracted; this lifecycle hook, plus PreCompact for long
+# sessions, is the backstop. (Written when the per-turn Stop/UserPromptSubmit hooks were seen silent
+# in the Claude Code VSCode-extension / Agent-SDK runtime; that was the hook command form, fixed in
+# 1.18.0, and they fire today.) Async + detached.
 $psSessionCapture = New-HookCommand 'sessionstart-capture.ps1'
 
 # Each event maps to an ARRAY of stack-owned entries (SessionStart has two).
@@ -1202,7 +1214,7 @@ $hookEntries = [ordered]@{
         @{ markers = @('mem0-hook-daemon-spawn.ps1');                      command = $psDaemonSpawn; async = $true; timeout = 10 },
         # v0.27.1 R5: async Codex-shim pre-warm (flag-gated; no-op until the write-gate is enabled)
         @{ markers = @('codex-shim-spawn.ps1');                            command = $psShimSpawn; async = $true; timeout = 10 },
-        # 2026-06-24: prior-session capture (per-turn hooks dead in VSCode-ext/SDK runtime; this carries capture)
+        # 2026-06-24: prior-session capture (the backstop for a session that ended without a Stop)
         @{ markers = @('sessionstart-capture.ps1');                        command = $psSessionCapture; async = $true; timeout = 15 },
         # P4-1a: the maintenance spawner (detached children; launches the store watcher)
         @{ markers = @('memory-maintenance-spawn.ps1');                    command = $psMaintSpawn; async = $true; timeout = 10 }

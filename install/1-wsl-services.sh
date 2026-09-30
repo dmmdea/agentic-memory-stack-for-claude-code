@@ -324,7 +324,7 @@ fi
 # 3. Embedder model — EmbeddingGemma-300m on llama-swap :11436
 # ----------------------------------------------------------------------
 # v0.22 EmbeddingGemma migration (2026-06-13): mem0's embedder is multilingual
-# EmbeddingGemma-300m served on llama.cpp/llama-swap :11436 (CPU, OpenAI-compatible),
+# EmbeddingGemma-300m served on llama.cpp/llama-swap :11436 (a GPU model, OpenAI-compatible),
 # NOT Ollama+nomic (decommissioned — nomic is English-only, a defect for the EN/ES
 # corpus). This stage stages the GGUF to a STABLE flat path; the llama-swap MODEL
 # ENTRY itself lives in the out-of-repo llama-swap config (same as bge-reranker — see

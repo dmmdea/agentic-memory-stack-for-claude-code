@@ -2,10 +2,12 @@
 """SessionStart durable/evidence bundle enrichment (B1).
 
 The SessionStart banner already surfaces canonical facts + open goals + recent episodes, but NOT
-the ranked durable/evidence facts the per-prompt UserPromptSubmit hook used to inject before that
-hook went dead in the VS Code / Agent-SDK runtime. This helper closes that gap: it pulls the SAME
+the ranked durable/evidence facts the per-prompt UserPromptSubmit hook injects once a prompt
+exists. There is no prompt yet at session start, so this helper closes that gap: it pulls the SAME
 admission-gated /v1/context/bundle and emits a thin, distilled, advisory precis of the top
-durable/evidence fact(s) under the banner.
+durable/evidence fact(s) under the banner. (Written in June 2026, when the per-prompt hook was
+silent in the VS Code / Agent-SDK runtime; that outage was the hook command form, fixed in 1.18.0,
+and the hook fires today. The precis stays: it is the only injection before the first prompt.)
 
 Design (frontier-grounded; see docs/research and the B1 plan item):
   - SCOPE-FIRST, RANK-SECOND: at SessionStart there is NO live user query. We build a RECENCY

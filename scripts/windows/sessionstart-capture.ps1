@@ -1,16 +1,18 @@
 # sessionstart-capture.ps1 - SessionStart hook: capture the most-recent PRIOR session's transcript.
 #
-# WHY THIS EXISTS: in the Claude Code VSCode-extension / Agent-SDK runtime, the PER-TURN hooks
-# (Stop / UserPromptSubmit / PreToolUse) do NOT fire (verified 2026-06-24 with an unconditional
-# fire-marker probe: a tool call produced no marker; the session id never appears in any per-turn
-# hook log). So Stop-driven capture is dead in that runtime, which is why the corpus froze on
-# 2026-06-16 when the operator switched runtimes. The LIFECYCLE hooks (SessionStart, PreCompact)
-# DO fire (the SessionStart resume banner appears every session).
+# WHY THIS EXISTS: the Stop hook covers a clean session end and PreCompact covers a long session
+# that compacts, but a session that ends without either (a killed window, a crash, a closed laptop)
+# is never extracted. A new session's start is the one moment the previous one is certainly over.
+# (Written 2026-06-24, when the PER-TURN hooks (Stop / UserPromptSubmit / PreToolUse) were seen
+# silent in the Claude Code VSCode-extension / Agent-SDK runtime: an unconditional fire-marker probe
+# left no marker, and the corpus had frozen on 2026-06-16. That outage was the hook command form,
+# fixed in 1.18.0, and the per-turn hooks fire today; this capture stays as the backstop.)
 #
 # PreCompact already runs the extractor mid-session (covers long sessions that compact). This hook
 # covers session BOUNDARIES: at each new session start it runs the L1a extractor on the most-recently
 # modified OTHER transcript (the session that just ended), so every session's durable facts + episode
-# land in mem0 even with the per-turn hooks dead. No scheduler, no per-turn dependency, no <24h timer.
+# land in mem0 even when that session's Stop never ran. No scheduler, no per-turn dependency, no
+# <24h timer.
 #
 # Fire-and-forget: spawns the worker DETACHED and exits 0 immediately so session start never blocks.
 # A per-transcript watermark (file name + mtime, not path) prevents re-capturing the same prior session

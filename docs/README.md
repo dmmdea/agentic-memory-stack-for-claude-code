@@ -36,7 +36,7 @@ Then read the system and flow docs for the area you're changing.
 | [`systems/wiki-index.md`](./systems/wiki-index.md) | The operator's LLM Wiki as a searchable index on the brain box: the two refresh paths (session + nightly backstop) and the PC catch-up, freshness as the newer of pull and build, the forced-command pull key, why it is outside the backup set |
 | [`systems/stale-paths-audit.md`](./systems/stale-paths-audit.md) | Read-only staleness audit: memories asserting dead filesystem paths, and the hand-label worksheet that decides whether a validity schema is worth building |
 | [`systems/mem0-api.md`](./systems/mem0-api.md) | The mem0 server's REST endpoints and the MCP shim in detail |
-| [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker stage — *design doc; marked DESIGN in-file* |
+| [`systems/reranker.md`](./systems/reranker.md) | The bge-reranker-v2-m3 stage as shipped: on-demand GPU seat, cold-load cost, the budget-bounded cold retry, the fail-open dense fallback and the `rerank_status` contract |
 | [`systems/dpapi-canonical-key.md`](./systems/dpapi-canonical-key.md) | Canonical-key custody: DPAPI blob, runtime injection, recovery, rotation |
 | [`systems/key-custody.md`](./systems/key-custody.md) | Every secret the stack depends on, where each copy lives, and the verified restore path |
 | [`systems/llama-swap-binding.md`](./systems/llama-swap-binding.md) | The loopback-bind requirement for local inference — *historical record; the current setup guide is [`../install/llama-swap-setup.md`](../install/llama-swap-setup.md)* |
