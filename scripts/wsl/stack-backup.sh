@@ -14,6 +14,11 @@ TS=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR="$HOME/.mem0/backups"
 mkdir -p "$BACKUP_DIR"
 rc=0
+# Failures that must not turn the night red (a red night makes the off-box copy refuse the
+# primary set) but must not read as a clean ok either: counted here, reported once at the end
+# as the step's `degraded` outcome (see write_outcome).
+DEG_SECONDARY=0   # secondary-collection snapshots that were not taken
+DEG_PRUNE=0       # server-side snapshot list/DELETE/sweep failures (unbounded growth if nightly)
 
 # DR fix (2026-06-20): the LIVE mem0 vector collection is mem0_egemma_768 (config.py).
 # It was "memories" before the EmbeddingGemma migration; the old collection still exists
@@ -21,6 +26,15 @@ rc=0
 # stale name silently backed up the WRONG vectors. Single source of truth here so it can't
 # drift again. Override via env if the collection is ever renamed.
 QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
+# Qdrant REST base; overridable so the suite can drive the script against a fake server.
+QDRANT_URL="${MEM0_QDRANT_URL:-http://127.0.0.1:6333}"
+
+# stack.env is read BY KEY, never sourced: it is operator-edited, and one unquoted value with a
+# space made bash execute the second word and killed the 09-21 and 09-22 nightlies.
+stack_env_get() {
+  [ -f "$HOME/.mem0/stack.env" ] || return 0
+  { grep -m1 "^$1=" "$HOME/.mem0/stack.env" || true; } | cut -d= -f2- | tr -d '\r' | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
 
 echo "stack-backup: starting TS=$TS BACKUP_DIR=$BACKUP_DIR"
 
@@ -36,7 +50,7 @@ if [ -f "$HIST_SRC" ]; then
       && echo "history.db backed up" \
       || { rm -f "$HIST_DST.tmp"; echo "WARN: history.db backup failed" >&2; rc=1; }
     if [ -f "$HIST_DST" ]; then
-      result=$(sqlite3 "$HIST_DST" 'pragma integrity_check' 2>&1)
+      result=$(sqlite3 "file:$HIST_DST?mode=ro&immutable=1" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
         echo "WARN: history.db integrity_check: $result" >&2; rc=1
       else
@@ -100,7 +114,7 @@ if [ -f "$EPISODIC_SRC" ]; then
       && echo "episodic.db backed up" \
       || { rm -f "$EPISODIC_DST.tmp"; echo "WARN: episodic.db backup failed" >&2; rc=1; }
     if [ -f "$EPISODIC_DST" ]; then
-      result=$(sqlite3 "$EPISODIC_DST" 'pragma integrity_check' 2>&1)
+      result=$(sqlite3 "file:$EPISODIC_DST?mode=ro&immutable=1" 'pragma integrity_check' 2>&1)
       if [ "$result" != "ok" ]; then
         echo "WARN: episodic.db integrity_check: $result" >&2; rc=1
       else
@@ -122,7 +136,7 @@ fi
 # v1.0 Phase 7A: resolve the Windows user from the operator receipt (~/.mem0/stack.env),
 # falling back to cmd.exe — never hardcode the developer handle.
 WIN_USER_BK="${MEM0_WIN_USER:-}"
-[ -z "$WIN_USER_BK" ] && [ -f "$HOME/.mem0/stack.env" ] && WIN_USER_BK="$(. "$HOME/.mem0/stack.env" 2>/dev/null; echo "${MEM0_WIN_USER:-}")"
+[ -z "$WIN_USER_BK" ] && WIN_USER_BK="$(stack_env_get MEM0_WIN_USER)"
 [ -z "$WIN_USER_BK" ] && WIN_USER_BK="$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n ')"
 SETTINGS_SRC="/mnt/c/Users/$WIN_USER_BK/.claude/settings.json"
 SETTINGS_DST="$BACKUP_DIR/claude-settings-$TS.json"
@@ -194,56 +208,160 @@ fi
 
 echo "stack-backup: local files done (rc=$rc so far)"
 
-# ── 2. Qdrant snapshot (isolated — a crash here does NOT abort the blocks above,
-# but every skip/failure path sets rc=1 like the local-file blocks do. The vector
-# collection is the most valuable artifact in the set; on a box without jq this
-# block used to parse an empty name, WARN, and exit 0 — so every backup silently
-# shipped without it while the nightly reported success.) ──────────────────────
+# ── 2. Qdrant snapshots (isolated — a crash here does NOT abort the blocks above,
+# but every skip/failure path of the PRIMARY collection sets rc=1 like the local-file blocks
+# do. The vector collection is the most valuable artifact in the set; on a box without jq this
+# block used to parse an empty name, WARN, and exit 0 — so every backup silently shipped
+# without it while the nightly reported success.) ──────────────────────────────────────────
+QDRANT_SNAP_ROOT="${MEM0_QDRANT_SNAPSHOT_DIR:-$HOME/qdrant-server/snapshots}"
+
+# Trim one collection's server-side snapshot store: keep the newest 2 (the one just verified is
+# always among them), delete the rest through the API (which removes the .checksum too), and
+# sweep hand-made qdrant-*.snapshot one-offs older than 14 days. Before this the store grew
+# ~150 MB a night, a second full copy of the vectors that nothing ever deleted. A failure here
+# only WARNs and counts toward the degraded outcome: the backup itself is done, and a transient
+# API error must not turn the night red (which would also make the off-box copy refuse the
+# set), but a DELETE that fails every night must not read ok either.
+prune_server_snapshots() {  # <collection> <snapshot just verified>
+  local coll="$1" cur="$2" name names body
+  # curl and jq are separated on purpose: this script has no pipefail, so `curl | jq` reports jq's
+  # status alone and a failed list (empty stdin, jq exits 0) would read as "nothing to prune".
+  if ! body=$(curl -sf "$QDRANT_URL/collections/$coll/snapshots") \
+     || ! names=$(printf '%s' "$body" | jq -r --arg cur "$cur" '(.result // []) | sort_by([(.creation_time // ""), .name]) | reverse | .[2:][]?.name | select(. != $cur)'); then
+    echo "WARN: could not list server-side snapshots of $coll - not pruned" >&2
+    DEG_PRUNE=$((DEG_PRUNE + 1))
+    return 0
+  fi
+  for name in $names; do
+    case "$name" in *[!A-Za-z0-9._-]*|.*) echo "WARN: odd server-side snapshot name '$name' - not deleted" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); continue ;; esac
+    curl -sf -X DELETE "$QDRANT_URL/collections/$coll/snapshots/$name" >/dev/null \
+      && echo "qdrant: deleted old server-side snapshot $coll/$name" \
+      || { echo "WARN: could not delete server-side snapshot $coll/$name" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); }
+  done
+  find "$QDRANT_SNAP_ROOT/$coll" -maxdepth 1 -name 'qdrant-*.snapshot*' -mtime +14 -delete 2>/dev/null \
+    || { echo "WARN: could not sweep old one-off snapshots under $QDRANT_SNAP_ROOT/$coll" >&2; DEG_PRUNE=$((DEG_PRUNE + 1)); }
+  return 0
+}
+
+# Snapshot one collection into $2 and prove the copy before anything server-side is deleted:
+# byte size equal to the source, and the sha256 Qdrant wrote beside the snapshot (the
+# .checksum file) equal to the copy's; without a checksum file the two files must compare equal.
+snapshot_collection() {  # <collection> <dst>
+  local coll="$1" dst="$2" snap src want got
+  snap=$(curl -sf -X POST "$QDRANT_URL/collections/$coll/snapshots" | jq -r '.result.name // empty')
+  if [ -z "$snap" ]; then
+    echo "WARN: Qdrant snapshot request for $coll failed or returned empty name — NOT backed up" >&2
+    return 1
+  fi
+  # Validate snapshot name: no empty, no path separators, no dot-prefix (traversal guard)
+  case "$snap" in
+    ""|*/*|.*) echo "WARN: bad Qdrant snapshot name '$snap' — refusing to copy" >&2; return 1 ;;
+  esac
+  src="$QDRANT_SNAP_ROOT/$coll/$snap"
+  if [ ! -f "$src" ]; then
+    echo "WARN: Qdrant snapshot file not found at $src" >&2
+    return 1
+  fi
+  cp "$src" "$dst.tmp" && mv "$dst.tmp" "$dst" \
+    && echo "qdrant snapshot $coll/$snap -> $dst" \
+    || { rm -f "$dst.tmp"; echo "WARN: failed to copy Qdrant snapshot of $coll" >&2; return 1; }
+  test -s "$dst" || { rm -f "$dst"; echo "WARN: qdrant snapshot backup of $coll empty" >&2; return 1; }
+  if [ "$(stat -c %s "$src")" != "$(stat -c %s "$dst")" ]; then
+    rm -f "$dst"; echo "WARN: qdrant snapshot copy of $coll differs in size from the source - not kept, server-side snapshots untouched" >&2
+    return 1
+  fi
+  if [ -f "$src.checksum" ]; then
+    want=$(head -n1 "$src.checksum" | tr -d '\r' | cut -d' ' -f1)
+    got=$(sha256sum "$dst" | cut -d' ' -f1)
+    if [ "$want" != "$got" ]; then
+      rm -f "$dst"; echo "WARN: qdrant snapshot copy of $coll fails its checksum (want $want, got $got) - not kept, server-side snapshots untouched" >&2
+      return 1
+    fi
+  elif ! cmp -s "$src" "$dst"; then
+    rm -f "$dst"; echo "WARN: qdrant snapshot copy of $coll differs from the source (no checksum file to check) - not kept, server-side snapshots untouched" >&2
+    return 1
+  fi
+  prune_server_snapshots "$coll" "$snap"
+}
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "WARN: jq not installed — cannot parse the Qdrant snapshot name; vector collection NOT backed up (sudo apt install -y jq)" >&2
   rc=1
 else
-(
-  set +e
-  SNAP=$(curl -sf -X POST "http://127.0.0.1:6333/collections/$QDRANT_COLLECTION/snapshots" | jq -r '.result.name // empty')
-  if [ -z "$SNAP" ]; then
-    echo "WARN: Qdrant snapshot request failed or returned empty name — vector collection NOT backed up" >&2
-    exit 1
-  fi
-
-  # Validate snapshot name: no empty, no path separators, no dot-prefix (traversal guard)
-  case "$SNAP" in
-    ""|*/*|.*)
-      echo "WARN: bad Qdrant snapshot name '$SNAP' — refusing to copy" >&2
-      exit 1
-      ;;
-  esac
-
-  SNAP_SRC="$HOME/qdrant-server/snapshots/$QDRANT_COLLECTION/$SNAP"
-  SNAP_DST="$BACKUP_DIR/qdrant-$TS.snapshot"
-  if [ -f "$SNAP_SRC" ]; then
-    cp "$SNAP_SRC" "$SNAP_DST.tmp" && mv "$SNAP_DST.tmp" "$SNAP_DST" \
-      && echo "qdrant snapshot $SNAP -> $SNAP_DST" \
-      || { rm -f "$SNAP_DST.tmp"; echo "WARN: failed to copy Qdrant snapshot" >&2; exit 1; }
-    test -s "$SNAP_DST" || { echo "WARN: qdrant snapshot backup empty" >&2; exit 1; }
+  snapshot_collection "$QDRANT_COLLECTION" "$BACKUP_DIR/qdrant-$TS.snapshot" || rc=1
+  # The small secondary collections ride in the same set (episodes_*, *_entities, wiki_pages_*),
+  # under a distinct qcol-<kind> prefix so the qdrant-* prune glob stays disjoint. EVERY collection
+  # matching a kind is snapshotted: the first (in name order) is qcol-<kind>-<TS>.snapshot, which the
+  # manifest's fixed keys name; each further one is qcol-<kind>+<collection>-<TS>.snapshot (the "+"
+  # keeps its prune glob disjoint from the first's and gives it its own newest-8 window).
+  # A failure WARNs and reads `degraded` but does not fail the night: episodes and
+  # wiki are rebuildable, while the entities snapshot is the ONLY copy of that collection.
+  seen=""
+  colls=""
+  # Each stage is its own status: piped into `sort`, jq's failure (a 200 whose body is not a
+  # collection list) would be masked by sort's exit 0 and the night would read clean with no
+  # secondary snapshotted. A body with no .result.collections array makes jq fail (null | map).
+  if body=$(curl -sf "$QDRANT_URL/collections") && names=$(printf '%s' "$body" | jq -r '.result.collections | map(.name)[]'); then
+    colls=$(printf '%s\n' "$names" | sort)
   else
-    echo "WARN: Qdrant snapshot file not found at $SNAP_SRC" >&2
-    exit 1
+    echo "WARN: could not list Qdrant collections - secondary collections NOT snapshotted" >&2
+    DEG_SECONDARY=$((DEG_SECONDARY + 1)); colls=""
   fi
-) || rc=1
+  for coll in $colls; do
+    case "$coll" in *[!A-Za-z0-9._-]*) continue ;; esac
+    [ "$coll" = "$QDRANT_COLLECTION" ] && continue
+    case "$coll" in
+      episodes_*) kind=episodes ;;
+      *_entities) kind=entities ;;
+      wiki_pages_*) kind=wiki ;;
+      *) continue ;;
+    esac
+    case " $seen " in
+      *" $kind "*) qname="qcol-$kind+$coll-$TS.snapshot" ;;
+      *) qname="qcol-$kind-$TS.snapshot"; seen="$seen $kind" ;;
+    esac
+    snapshot_collection "$coll" "$BACKUP_DIR/$qname" \
+      || { echo "WARN: $coll snapshot failed (the set is missing this collection)" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); }
+  done
 fi
 
 echo "stack-backup: Qdrant block done"
 
 # ── 3. Prune: keep last 8 snapshots of each kind ──────────────────────────────
-# NOTE: kinds must be glob-disjoint — "audit-flags" matches audit-flags-*.*, so the
-# jsonl flags file lives under the distinct "l10-flags" prefix (see 1g).
-for kind in qdrant history tier-ledger MEMORY audit-flags episodic claude-settings \
-            l10-flags l10-state promote-review stale-worksheet; do
-  # .tmp strays are EXCLUDED (review H3): a lingering partial from a failed day,
-  # sorted newest by mtime, would otherwise occupy a retention slot and push the
-  # oldest GOOD copy out of the window.
-  ls -1t "$BACKUP_DIR/$kind"-*.* 2>/dev/null | grep -v '\.tmp$' | tail -n +9 | xargs -r rm -f
+# A retention entry is a REAL artifact: $kind-<digit...>.<ext> for one explicit extension.
+# The old glob "$kind-*.*" also counted SQLite sidecars (-wal/-shm), which any read-only
+# opener of a WAL-mode backup leaves NEWER than every real .db, so the next prune kept the
+# sidecars and deleted the databases. Sidecars, .tmp partials and strays never match, and
+# entries are ordered by the timestamp in the name, not mtime (a copy or restore rewrites mtime).
+# NOTE: kinds must be glob-disjoint - "qdrant" must not match qcol-*, and the jsonl flags file
+# lives under the distinct "l10-flags" prefix (see 1g).
+prune_kind() {  # <kind> <extension>
+  local f
+  for f in "$BACKUP_DIR/$1"-[0-9]*."$2"; do [ -f "$f" ] && printf '%s\n' "$f"; done \
+    | sort -r | tail -n +9 | xargs -r -d '\n' rm -f
+}
+for spec in qdrant:snapshot history:db tier-ledger:jsonl MEMORY:md audit-flags:baseline episodic:db \
+            claude-settings:json l10-flags:jsonl l10-state:json promote-review:jsonl \
+            stale-worksheet:jsonl; do
+  prune_kind "${spec%%:*}" "${spec#*:}"
+done
+# Secondary-collection snapshots: one retention window per collection, found by what is on disk
+# (qcol-<kind> and qcol-<kind>+<collection>), so a collection added or renamed needs no list edit.
+qcol_kinds=$(for f in "$BACKUP_DIR"/qcol-*.snapshot; do
+  [ -f "$f" ] || continue
+  b="${f##*/}"; printf '%s\n' "${b%-[0-9]*-[0-9]*.snapshot}"
+done | sort -u)
+for qk in $qcol_kinds; do prune_kind "$qk" snapshot; done
+# Orphan sidecars beside backup DBs: an empty WAL holds no unflushed transaction, so it and its
+# -shm are debris; a -shm with no -wal at all is debris too. A non-empty WAL is left alone.
+for wal in "$BACKUP_DIR"/*.db-wal; do
+  [ -e "$wal" ] || continue
+  [ -s "$wal" ] && continue
+  rm -f "$wal" "${wal%-wal}-shm"
+done
+for shm in "$BACKUP_DIR"/*.db-shm; do
+  [ -e "$shm" ] || continue
+  [ -e "${shm%-shm}-wal" ] || rm -f "$shm"
 done
 # sweep stale partials from crashed runs (older than 60 min = garbage, not a snapshot)
 find "$BACKUP_DIR" -maxdepth 1 -name '*.tmp' -mmin +60 -delete 2>/dev/null
@@ -259,6 +377,24 @@ if [ -f "$MANIFEST_SCRIPT" ]; then
 else
     echo "WARN: stack-backup-manifest.sh not found at $MANIFEST_SCRIPT" >&2
 fi
+
+# Manifests age out with their sets (a manifest for a deleted set is a restore point that lies):
+# pruned AFTER tonight's is written so the window is the same 8 as every other kind.
+prune_kind manifest json
+
+# The step outcome (contract C1, ams-step.sh exports AMS_OUTCOME_FILE): the run exits 0 when the
+# primary set is whole, but a swallowed secondary-snapshot or server-prune failure must not read
+# as a clean ok. One line, `degraded:<reasons> <counts>`; no line means ok. Unset outside a step.
+write_outcome() {
+  [ -n "${AMS_OUTCOME_FILE:-}" ] || return 0
+  local reasons=""
+  if [ "$DEG_SECONDARY" -gt 0 ]; then reasons="secondary-snapshot-failed"; fi
+  if [ "$DEG_PRUNE" -gt 0 ]; then reasons="${reasons:+$reasons,}server-prune-failed"; fi
+  [ -n "$reasons" ] || return 0
+  printf 'degraded:%s {"secondary_snapshot_failed":%d,"server_prune_failed":%d}\n' \
+    "$reasons" "$DEG_SECONDARY" "$DEG_PRUNE" > "$AMS_OUTCOME_FILE"
+}
+write_outcome
 
 echo "stack-backup: complete (rc=$rc)"
 exit $rc
