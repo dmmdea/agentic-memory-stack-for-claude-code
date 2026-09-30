@@ -21,6 +21,14 @@ BASE = {"ok": True, "steps": {}, "stale_steps": [], "failed_steps": [], "degrade
         "usage": {"used_percent": 12}, "boots_7d": ["a", "b"]}
 
 
+def _home_env(home, **extra):
+    """The child env with the home redirected on every platform: HOME alone leaves a child whose `~` is
+    read from USERPROFILE (or HOMEDRIVE+HOMEPATH) writing into the real profile."""
+    h = str(home)
+    drive, tail = os.path.splitdrive(h)
+    return dict(os.environ, HOME=h, USERPROFILE=h, HOMEDRIVE=drive, HOMEPATH=tail, **extra)
+
+
 def _stamp(tmp_path, payload, curl_exit=0):
     """Run the stamp against a fake `curl` that writes `payload` to its -o target."""
     home = tmp_path / "home"
@@ -33,7 +41,7 @@ def _stamp(tmp_path, payload, curl_exit=0):
     fake.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
                     f'[ {curl_exit} -eq 0 ] || exit {curl_exit}\ncp "{canned}" "$out"\n', encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{os.environ['PATH']}")
+    env = _home_env(home, PATH=f"{bindir}:{os.environ['PATH']}")
     r = subprocess.run([BASH, str(SCRIPTS / "ams-health-stamp.sh")], capture_output=True, text=True, env=env, timeout=60)
     return r, home / ".mem0" / "maintenance" / "health-maintenance.json"
 
@@ -103,7 +111,7 @@ def _summary(tmp_path, receipts, health=None):
     (d / "receipts.jsonl").write_text("\n".join(json.dumps(x) for x in receipts) + "\n", encoding="utf-8")
     if health is not None:
         (d / "health-maintenance.json").write_text(json.dumps(health), encoding="utf-8")
-    env = dict(os.environ, HOME=str(home), AMS_SUMMARY_NOW="2099-01-01T09:00:00Z")
+    env = _home_env(home, AMS_SUMMARY_NOW="2099-01-01T09:00:00Z")
     r = subprocess.run([BASH, str(SCRIPTS / "ams-morning-summary.sh")], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr
     return (d / "morning-summary.md").read_text(encoding="utf-8")
@@ -162,7 +170,7 @@ def test_red_night_receipt_note_carries_the_verdict_line(tmp_path):
     fake = bindir / "curl"
     fake.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n' f'cp "{canned}" "$out"\n', encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{os.environ['PATH']}")
+    env = _home_env(home, PATH=f"{bindir}:{os.environ['PATH']}")
     env.pop("MEM0_URL", None)
     r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), "health-stamp", BASH, str(SCRIPTS / "ams-health-stamp.sh")],
                        capture_output=True, text=True, env=env, timeout=60)

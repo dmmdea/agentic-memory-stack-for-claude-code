@@ -16,10 +16,18 @@ BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 
 
+def _home_env(home, **extra):
+    """The child env with the home redirected on every platform: HOME alone leaves a child whose `~` is
+    read from USERPROFILE (or HOMEDRIVE+HOMEPATH) writing into the real profile."""
+    h = str(home)
+    drive, tail = os.path.splitdrive(h)
+    return dict(os.environ, HOME=h, USERPROFILE=h, HOMEDRIVE=drive, HOMEPATH=tail, **extra)
+
+
 def _step(tmp_path, args):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    env = dict(os.environ, HOME=str(home))
+    env = _home_env(home)
     for k in ("MEM0_URL", "AMS_OUTCOME_FILE"):
         env.pop(k, None)
     r = subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), *args], capture_output=True, text=True, env=env, timeout=60)
@@ -100,7 +108,7 @@ def test_weekly_skip_and_guard_no_op_keep_status_ok(tmp_path):
     assert rows[-1]["note"].startswith("weekly:")
     mp = home / ".mem0" / "maintenance"
     (mp / "last-chain-success").write_text("4102444800\n")   # year 2100: newer than any boundary
-    env = dict(os.environ, HOME=str(home), AMS_GUARD_NOW="4102444900")
+    env = _home_env(home, AMS_GUARD_NOW="4102444900")
     env.pop("MEM0_URL", None)
     subprocess.run([BASH, str(SCRIPTS / "ams-step.sh"), "--guard", "demo", "true"], env=env, timeout=60, capture_output=True)
     last = json.loads((mp / "receipts.jsonl").read_text(encoding="utf-8").splitlines()[-1])

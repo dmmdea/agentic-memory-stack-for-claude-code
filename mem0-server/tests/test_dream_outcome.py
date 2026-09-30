@@ -12,9 +12,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from _home_isolation import apply_home
 from test_dream_consolidate import EV, INS, SIG, FakeMem0, _judge, _mod, _run
 
-INS3 = json.dumps({"insights": [
+INS3 =json.dumps({"insights": [
     {"text": f"Insight number {i} about the authority", "source_memory_ids": ["e1"], "confidence": 0.7} for i in (1, 2, 3)]})
 NONE = '{"insights":[]}'
 PROMO = "[]"   # the promote call's reply: no nominees
@@ -45,9 +46,9 @@ class Mem0(FakeMem0):
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """HOME under tmp_path so nothing touches a real ~/.mem0; the step's outcome file lives beside it."""
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setenv("HOME", str(tmp_path))
+    """HOME under tmp_path so nothing touches a real ~/.mem0; the step's outcome file lives beside it.
+    apply_home redirects every variable a platform reads (HOME, USERPROFILE, HOMEDRIVE/HOMEPATH) and Path.home()."""
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     for v in ("MEM0_PROMOTION_GATE_MODE", "MEM0_EVAL_ROOT", "MEM0_URL", "MEM0_KEY", "MEM0_API_KEY_FILE",
               "AMS_STORE_CHECKOUT", "AMS_STORE_BIN"):
