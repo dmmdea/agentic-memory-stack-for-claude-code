@@ -18,13 +18,27 @@
 # skip) and the Codex quota reserve still apply. It takes no arguments, because a --dry-run would
 # still be receipted as a `dream` step and refresh the dream's freshness in /health/maintenance.
 #
-# Two things differ from the unit file, both because systemd-run is not the unit loader:
-#   - `-p Environment=` does not expand specifiers (measured on systemd 255: %d and %h reach the
-#     process literally), so MEM0_API_KEY_FILE=%d/ams-api-key is exported inside the command from
-#     $CREDENTIALS_DIRECTORY (scripts/wsl/ams-canonize.sh does the same), and %h becomes $HOME here;
-#   - --pipe, so the dream's output reaches this terminal (or the ssh session) as it runs.
+# One thing differs from the unit file, because systemd-run is not the unit loader: `-p Environment=`
+# does not expand specifiers (measured on systemd 255: %d and %h reach the process literally), so
+# MEM0_API_KEY_FILE=%d/ams-api-key is exported inside the command from $CREDENTIALS_DIRECTORY
+# (scripts/wsl/ams-canonize.sh does the same), and %h becomes $HOME here.
 # scripts/wsl/tests/test_ams_dream_now.py compares this call with systemd/ams-step-dream.service, so
 # a credential or Environment= line added to the unit fails that test until it is added here.
+#
+# There is deliberately NO --pipe (nor --pty/--shell). With --pipe the unit's stdout is this session's
+# pipe, and the dream prints as it goes, so a dropped ssh session, a closed laptop or a Ctrl-C kills it
+# at its next print: a partial cycle (insights posted, throttle unmarked) and a `failed` dream receipt
+# that turns /health/maintenance red (measured on systemd 255: exit 120). Without it the output goes to
+# the journal exactly as the chain's does, `systemd-run --wait` still returns the unit's exit status,
+# and the unit keeps running if this session goes away. So the helper prints the journalctl command
+# that follows the unit, waits, and on completion prints the unit's result and where the dream's own
+# verdict is: the exit status says the run ended, not what the dream decided (a skip exits 0 too).
+#
+# A forced dream is a real dream. When it completes it marks the same 23 h throttle as the nightly one
+# (dream-consolidate.py marks `dream` and `index-refresh` after a good index build). Finish it after
+# 04:00 and the next 03:00 dream is less than 23 h behind it, so that night skips ("nightly throttle
+# (23h) not yet elapsed"), and on unchanged evidence a second pass only adds near-duplicate insights.
+# Run it before 04:00, or take it as standing in for the next night.
 #
 # Exit: 0 ok, 2 the install record is incomplete, 3 not the authority, 64 usage; otherwise the
 # unit's own status (systemd-run --wait returns it).
@@ -69,8 +83,12 @@ command -v systemd-run >/dev/null || fail "systemd-run not found"
 # a plain `ssh host 'cmd'` may reach a shell without the user runtime dir, and systemd-run --user needs it
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 unit="ams-dream-now-$(date -u +%Y%m%dT%H%M%SZ)"
-echo "ams-dream-now: starting $unit.service (journalctl --user -u $unit; the receipt is step 'dream' in ~/.mem0/maintenance/receipts.jsonl)" >&2
-exec systemd-run --user --pipe --wait --collect --unit="$unit" \
+say() { echo "ams-dream-now: $*" >&2; }
+say "starting $unit.service. It runs as a systemd user unit and keeps running if this session drops or you press Ctrl-C."
+say "follow it from another shell: journalctl --user -u $unit -f"
+say "the receipt is step 'dream' in ~/.mem0/maintenance/receipts.jsonl"
+rc=0
+systemd-run --user --wait --collect --unit="$unit" \
     -p "LoadCredentialEncrypted=ams-api-key:$sec/ams-api-key.cred" \
     -p "LoadCredentialEncrypted=ams-canonical-key:$sec/ams-canonical-key.cred" \
     -p "Environment=MEM0_HOST_KIND=native" \
@@ -78,4 +96,11 @@ exec systemd-run --user --pipe --wait --collect --unit="$unit" \
     -p "Environment=CODEX_HOME=$sec/codex" \
     -p "ExecStartPre=-$PY $SCRIPTS/codex-usage-report.py --probe" \
     /bin/bash -c 'export MEM0_API_KEY_FILE="$CREDENTIALS_DIRECTORY/ams-api-key"; exec "$@"' _ \
-    /bin/bash "$SCRIPTS/ams-step.sh" dream "$PY" "$SCRIPTS/dream-consolidate.py" --force
+    /bin/bash "$SCRIPTS/ams-step.sh" dream "$PY" "$SCRIPTS/dream-consolidate.py" --force || rc=$?
+if [ "$rc" -eq 0 ]; then
+    say "$unit.service finished: result success (exit 0)."
+else
+    say "$unit.service finished: result failure (exit $rc). Why: journalctl --user -u $unit"
+fi
+say "that is the unit's result, not the dream's verdict (a skip for the judge lock or the quota gate exits 0 too). The verdict is the dream's own 'dream:' lines: journalctl --user -u $unit | grep 'dream:', or tail -n 40 ~/.mem0/maintenance/logs/dream.log; the receipt is step 'dream' in ~/.mem0/maintenance/receipts.jsonl"
+exit "$rc"
