@@ -34,9 +34,13 @@ def names(h, key):
 def acked(h):
     a = (h.get("pool") or {}).get("health_ack") or {}
     return f" (acked until {a.get('until')})" if a.get("active") else ""
+def write_path(h):
+    # Named only when the server says the last real memory write failed; a healthy or unreadable tracker adds nothing.
+    w = h.get("write_path")
+    return " write-path " + " ".join(str((w.get("last_error") or "failing")).split()) if isinstance(w, dict) and w.get("ok") is False else ""
 try:
     h = json.loads((d / "health-maintenance.json").read_text(encoding="utf-8"))
-    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} failed={names(h, 'failed_steps')} degraded={names(h, 'degraded_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}% pool-health {(h.get('pool') or {}).get('health', 'unknown')}{acked(h)}")
+    lines.append(f"- health ok={h.get('ok')} stale={h.get('stale_steps')} failed={names(h, 'failed_steps')} degraded={names(h, 'degraded_steps')} pool {(h.get('pool') or {}).get('used_pct')}% usage {(h.get('usage') or {}).get('used_percent')}% pool-health {(h.get('pool') or {}).get('health', 'unknown')}{acked(h)}{write_path(h)}")
 except (OSError, ValueError): lines.append("- health stamp unavailable")
 try:
     g = json.loads((d / "dream" / "gather.json").read_text(encoding="utf-8"))

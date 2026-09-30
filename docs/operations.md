@@ -191,7 +191,7 @@ bash ~/apps/mem0-scripts/ams-dream-now.sh                     # a real forced dr
 
 A receipt with `note: "skipping: codex quota gate ..."` is the reserve rule, not a failure; `"guard: chain succeeded since the last 03:00 boundary"` is the boot re-run of a completed night; `"weekly: not Sun; no-op"` is a weekday. A step with `ok:false` names its exit code and the tail of its stderr in `note`.
 
-**Reading `status`.** Every receipt carries `status` (`ok`, `degraded` or `failed`) and `work` (counts the step reported). `degraded` means the step exited 0 but did not do its job: the dream posted 0 of 3 insights (`posted-0-of-3`; the unposted ones wait in `~/.mem0/maintenance/dream/insight-spool.jsonl` and go first next run), a queued insight could not be replayed (`replay-failed-<n>`) or was left waiting (`spool-backlog-<n>`), its drift snapshot failed, or a weekly sweep found nothing to judge (`no-op-<reason>`). The receipt is `ok:true`, so the chain still stamps its success, but `/health/maintenance` lists the step under `degraded_steps` and its `ok` is false until a later run of that step comes back `ok`. `failed_steps` lists steps whose latest run exited non-zero (or reported `failed:*`); the health stamp ends the chain red on any of those, or on a pool that is not `ONLINE`. The morning summary's Chain block prints each degraded step with its note and counts, e.g. `- dream DEGRADED 41000ms -- posted-0-of-3 [consolidated=3 posted=0]`. A `weekly:` off-day receipt does not clear a Sunday failure; only a later real run does. A `--dry-run` of the dream skips the spool replay by design, so it does not report a standing spool as `spool-backlog-<n>`.
+**Reading `status`.** Every receipt carries `status` (`ok`, `degraded` or `failed`) and `work` (counts the step reported). `degraded` means the step exited 0 but did not do its job: the dream posted 0 of 3 insights (`posted-0-of-3`; the unposted ones wait in `~/.mem0/maintenance/dream/insight-spool.jsonl` and go first next run), a queued insight could not be replayed (`replay-failed-<n>`) or was left waiting (`spool-backlog-<n>`), its drift snapshot failed, or a weekly sweep found nothing to judge (`no-op-<reason>`). The receipt is `ok:true`, so the chain still stamps its success, but `/health/maintenance` lists the step under `degraded_steps` and its `ok` is false until a later run of that step comes back `ok`. `failed_steps` lists steps whose latest run exited non-zero (or reported `failed:*`); the health stamp ends the chain red on any of those, on a pool that is not `ONLINE`, or on a failing write path (`write_path.ok: false`, named on its verdict line as `write-path <last_error>`; see "The banner says the write path is failing" below). The morning summary's Chain block prints each degraded step with its note and counts, e.g. `- dream DEGRADED 41000ms -- posted-0-of-3 [consolidated=3 posted=0]`. A `weekly:` off-day receipt does not clear a Sunday failure; only a later real run does. A `--dry-run` of the dream skips the spool replay by design, so it does not report a standing spool as `spool-backlog-<n>`.
 
 **Pool-health acknowledgment.** A pool that is DEGRADED on purpose (a planned boot-disk swap) would keep `/health/maintenance` `ok:false`, the health stamp red and a replica's banner up for the whole window. Acknowledge it with a dated key in `~/.mem0/stack.env` on the authority:
 
@@ -232,6 +232,25 @@ wsl -e bash -lc "~/apps/mem0-server/.venv/bin/python $shim < /dev/null"
 
 ---
 
+## "The banner says the write path is failing"
+
+The banner line `[AMS] brain NOT OK — write path failing (503 upstream since <time>)`, or `write_path.ok: false` on `/health/maintenance`, means the last memory write the server saw (`POST /v1/memories` or `PUT /v1/memories/{id}`) ended in a `5xx` and no write has succeeded since. The signal is **passive**: the server learns it from real write traffic and never probes, so it clears only when a write succeeds (a server restart also clears it, back to "no evidence yet"), and an hour of silence does not clear it. A `2xx` that never reached the embedder is **neutral** and clears nothing: an idempotent duplicate (`deduplicated: true`, which is what an automated writer re-posting its transcript mostly gets) and an `infer: false` add that stored nothing (`results: []`). So on a quiet system the flag can outlive the outage: it clears on the next write that stores something (a new fact, a `PUT`), not on re-posted duplicates. The fields and rules are in [systems/mem0-api.md](systems/mem0-api.md#get-healthmaintenance).
+
+```bash
+curl -s http://<authority>:18791/health/maintenance | jq '.write_path'          # ok, last_error, last_error_at, errors_1h, writes_1h
+journalctl --user -u mem0.service --since "1 hour ago" | grep -E "add failed|update failed" | tail -5   # what the failing writes raised
+curl -s http://127.0.0.1:11436/v1/models | jq '.data[] | select(.id | test("embedding"))'                # is the embedder listed, and loaded?
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv                                 # what else holds the card?
+```
+
+- **`503 upstream` (or `503 cold-embedder`):** the embedder cannot serve right now. The write routes usually report a dead embedder as `503 upstream` (they map embedder errors through `_upstream_error`, whose body names no reason); `503 cold-embedder` is the same condition reaching the dedicated handler, so read the two alike. It is not resident and could not start, or llama-swap is down or rate-limiting. The usual cause is a co-resident process holding the GPU so the embedder has no room to load; check the embedder's residency first (the `/v1/models` listing above, and what `nvidia-smi` shows on the card). Free the card, or restart llama-swap as described under "mem0 returns 500" below.
+- **`500 upstream`:** an error the server does not recognise as an outage (a coding error, a context overflow). Read the `add failed` / `update failed` traceback in the journal. **A `5xx` from any cause on a write route counts**, so a server-side bug on that route is a broken write path too, and so is one bad request that lands in the routes' catch-all (a `PUT` of an id that does not exist answers `500`): the flag stays red until the next write that stores something, so read the traceback before assuming the embedder.
+- **Hand check of the embedder:** `curl -s http://<authority>:18791/health/embedder` once. It embeds one token and therefore loads the model. Use it by hand, **never as a poll**: an uptime checker calling it (or `/health/deep`) every few minutes would keep the embedder resident and defeat the five-minute idle unload. Poll `/health/maintenance` instead, which reads only the tracker and costs nothing.
+- **After the fix,** the next write from any session that stores something (a new fact, a `PUT`) clears the flag and the banner goes quiet; re-posted duplicates do not, by design, because they never touch the embedder. If the hand check above shows the embedder healthy and nothing new is being written, the flag waits for the next new fact; restarting the server also clears it (back to "no evidence yet"). `errors_1h`, `last_error` and `last_error_at` keep the record of the outage.
+- **The nightly chain sees it too.** `ams-health-stamp.sh` ends the night red (exit `2`) on a failing write path, like a failed step, and its verdict line (the receipt note) and the morning summary's health line end `write-path <last_error>`, e.g. `health ok=False failed=- degraded=- pool 71.4% ONLINE write-path 503 upstream`. A healthy write path adds nothing to either line.
+
+---
+
 ## "mem0 returns 500"
 
 ```bash
@@ -240,6 +259,8 @@ journalctl --user -u mem0.service -n 50
 curl http://127.0.0.1:6333/collections/mem0_egemma_768     # Qdrant collection healthy?
 curl -s http://127.0.0.1:11436/v1/models | grep -o embeddinggemma   # embedder being served?
 ```
+
+A write that failed with a `5xx` also shows on `/health/maintenance` as `write_path`: see "The banner says the write path is failing" above.
 
 - **Qdrant refused** → `systemctl --user restart qdrant.service`.
 - **Embedder refused / wrong dim** → llama-swap issue. **llama-swap is per-host: it may run as a WSL systemd-user unit OR as a Windows-native process** (mirrored networking makes `:11436` reachable either way, which masks the difference until restart time — find the owner before restarting):
