@@ -119,8 +119,10 @@ jobs:
             mem0-server/tests/test_sessionstart_bundle_authority.py \
             mem0-server/tests/test_storage_cap_authority.py \
             mem0-server/tests/test_loopback_probe_pins.py \
+            mem0-server/tests/test_maintenance_health_steps.py \
             mem0-server/tests/test_machine_turn_gate.py \
             mem0-server/tests/test_dream_consolidate.py \
+            mem0-server/tests/test_dream_outcome.py \
             mem0-server/tests/test_judge_plan_schema.py \
             mem0-server/tests/test_linux_authority_installer.py \
             mem0-server/tests/test_linux_client_store.py \
@@ -134,6 +136,8 @@ jobs:
             mem0-server/tests/test_home_isolation.py \
             mem0-server/tests/test_test_cleanup.py \
             claude-config/tests \
+            scripts/wsl/tests/test_ams_health_stamp.py \
+            scripts/wsl/tests/test_ams_step_outcome.py \
             scripts/wsl/test_ship_log_classifier.py \
             scripts/wsl/test_ship_log_reclassify.py \
             scripts/wsl/test_wiki_index.py \

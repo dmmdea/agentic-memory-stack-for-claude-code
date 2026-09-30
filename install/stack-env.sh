@@ -49,8 +49,10 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 # the operator's brand map path), MEM0_NLI_GATE_ENABLED (the NLI write gate). Only the gate mode
 # has an installer flag (linux-authority.sh --promotion-gate-mode); a flag that sets a key here
 # passes its name as a skip argument to stack_env_carry so the line is written exactly once.
+# MEM0_POOL_HEALTH_ACK = the operator's dated pool-health acknowledgment, `<STATE>:<YYYY-MM-DD>`
+# (docs/systems/mem0-api.md, /health/maintenance).
 # A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED"
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK"
 
 stack_env_carry() {  # $1 = the existing stack.env, $2.. = keys to skip (set by a flag) -> "KEY=VALUE" lines for the operator-owned keys it records
     local k v file="$1" s skip

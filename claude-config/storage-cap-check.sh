@@ -370,6 +370,8 @@ try:
     if g: parts.append('degraded: ' + ', '.join(g))
     if (pool.get('alarm') or pool.get('health_alarm')) and pool.get('used_pct') is not None:
         parts.append('pool %s%% %s' % (pool.get('used_pct'), pool.get('health') or 'ONLINE'))
+    elif pool.get('health_alarm'):
+        parts.append('pool %s' % (pool.get('health') or 'unhealthy'))
     if st: parts.append('stale: ' + ', '.join(st))
     if drift.get('alarm'): parts.append('drift alarm')
     line = '[AMS] brain NOT OK' + ((' \u2014 ' + '; '.join(parts)) if parts else '')

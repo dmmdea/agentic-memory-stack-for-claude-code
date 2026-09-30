@@ -267,6 +267,15 @@ def test_a_pre_existing_brain_ssh_survives_a_render_only_rerun(tmp_path):
     assert [ln for ln in _lines(se2) if ln.startswith("MEM0_BRAIN_SSH=")] == ["MEM0_BRAIN_SSH=op@brain-alias"]
 
 
+def test_a_pool_health_ack_survives_a_render_only_rerun(tmp_path):
+    """The dated pool-health ack is hand-set (no installer flag): a re-run that dropped it would put a
+    planned-maintenance DEGRADED pool back on the alarm mid-window. Its value is a plain token."""
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\nMEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06\n")
+    assert r.returncode == 0, r.stderr
+    assert "MEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06" in _lines(se)
+    assert "MEM0_POOL_HEALTH_ACK carried over from ~/.mem0/stack.env" in r.stdout
+
+
 def test_no_brain_ssh_is_invented_when_the_receipt_has_none(tmp_path):
     r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\n")
     assert r.returncode == 0, r.stderr

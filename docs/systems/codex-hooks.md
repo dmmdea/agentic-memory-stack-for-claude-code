@@ -223,7 +223,7 @@ The daemon's named pipe is ACL'd to the current user only (inherited ACEs droppe
 ## Observability and debugging
 
 - **Logs:** `l1a.log` (extraction), `hook-daemon.log` (daemon ops), `codex-usage.jsonl` (Codex spend).
-- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew).
+- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew). The counters are per server process (since the last restart). The SessionStart enrichment call (`20.0`) and the dream's canonical search (`17.0`) stamp the version too, but `missing` is still polluted: the retrieval-drift guard's snapshot searches (about 28 a night, run from a private evaluation repo) do not stamp yet, so a nonzero `missing` is not by itself a hook regression. Open follow-up: once that repo sends the same `hook_contract_version` field, a nonzero `missing` becomes a real regression signal; until then read it as a floor, not an alarm.
 - **Staleness:** the `lib_hash` handshake makes a stale-daemon-after-deploy self-correct on the next prompt.
 - **`Test-MemoryStack.ps1`** (R9) hashes `mem0-hook-client.cs` and checks the exe is fresh against it.
 

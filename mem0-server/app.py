@@ -912,8 +912,9 @@ def health() -> dict:
 
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
-    """Spec §9 (P1-5): the nightly chain's last successes, the judge transport, pool usage
-    (alarm at 85 %) and the box's boot ids for 7 days. Gatus probes it; the session-start
+    """Spec §9 (P1-5): the nightly chain's last successes, the steps whose latest run failed or
+    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, and the box's boot
+    ids for 7 days. `ok` folds the failed/degraded steps and the pool in. Gatus probes it; the session-start
     line reads it with a 1.5 s budget and falls back to local numbers. Never raises on a
     reader: an unreadable pool/journal reads as unknown, not as an error."""
     import os as _os
@@ -923,7 +924,13 @@ def health_maintenance() -> dict:
     maint = Path.home() / ".mem0" / "maintenance"
     return _mh.build(maint / "receipts.jsonl", _dt.datetime.now(_dt.timezone.utc), pool,
                      _mh.journal_boots_reader(), codex_shim_client.judge_transport,
-                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"))
+                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
+                     # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
+                     pool_health_reader=_mh.zpool_health_reader(ds) if ds else None,
+                     # The operator's dated pool-health ack (env, else stack.env), read on every call.
+                     pool_ack_reader=_mh.read_pool_ack,
+                     wiki_stamp_dir=Path.home() / "wiki-index",
+                     drift_reader=drift_state_health)
 
 
 @app.get("/health/morning-summary")
