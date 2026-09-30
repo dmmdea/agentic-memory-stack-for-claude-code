@@ -355,7 +355,8 @@ try:
         raise ValueError
     drift = d.get('drift'); drift = drift if isinstance(drift, dict) else {}
     pool = d.get('pool'); pool = pool if isinstance(pool, dict) else {}
-    if d.get('ok') is not False and not drift.get('alarm'):
+    wpath = d.get('write_path'); wpath = wpath if isinstance(wpath, dict) else {}
+    if d.get('ok') is not False and not drift.get('alarm') and wpath.get('ok') is not False:
         raise SystemExit(0)
     def names(v):
         out = []
@@ -372,6 +373,12 @@ try:
         parts.append('pool %s%% %s' % (pool.get('used_pct'), pool.get('health') or 'ONLINE'))
     elif pool.get('health_alarm'):
         parts.append('pool %s' % (pool.get('health') or 'unhealthy'))
+    if wpath.get('ok') is False:
+        le, la = wpath.get('last_error'), wpath.get('last_error_at')
+        bits = [le] if isinstance(le, str) and le else []
+        if isinstance(la, str) and la:
+            bits.append('since ' + la)
+        parts.append('write path failing' + ((' (' + ' '.join(bits) + ')') if bits else ''))
     if st: parts.append('stale: ' + ', '.join(st))
     if drift.get('alarm'): parts.append('drift alarm')
     line = '[AMS] brain NOT OK' + ((' \u2014 ' + '; '.join(parts)) if parts else '')
