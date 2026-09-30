@@ -65,11 +65,14 @@ function Invoke-CodexSubagent {
     }
 
     function script:Invoke-L1a {
-        param($Sb, [string]$CodexJson = '', [string]$CodexFail = '', [scriptblock]$BeforeRun = $null, [int]$TimeoutSec = 90)
+        param($Sb, [string]$CodexJson = '', [string]$CodexFail = '', [scriptblock]$BeforeRun = $null, [int]$TimeoutSec = 90,
+              [string]$TranscriptPath = '', [string]$OriginTranscriptPath = '', [string]$EventName = 'Stop')
         if ($BeforeRun) { & $BeforeRun }
+        $tp = if ($TranscriptPath) { $TranscriptPath } else { $Sb.Transcript }
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
         $psi.FileName = $script:ps51
-        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Sb.Bin 'l1a-extract.ps1') + '" -TranscriptPath "' + $Sb.Transcript + '" -EventName Stop'
+        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Sb.Bin 'l1a-extract.ps1') + '" -TranscriptPath "' + $tp + '" -EventName ' + $EventName
+        if ($OriginTranscriptPath) { $psi.Arguments += ' -OriginTranscriptPath "' + $OriginTranscriptPath + '"' }
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
@@ -142,6 +145,57 @@ Describe 'L1a facts carry a brand (C3)' {
         (Invoke-L1a $own -CodexJson (New-CodexJson @('the supplier invoices monthly'))).Records[0].metadata.brand | Should -Be 'ai-ecosystem'
         $other = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
         (Invoke-L1a $other -CodexJson (New-CodexJson @('the supplier invoices monthly'))).Records[0].metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
+    }
+}
+
+# PreCompact analyses a temp snapshot (precompact-snap-<PID>.jsonl, in a directory that routes to no
+# brand) and hands the worker the real transcript as -OriginTranscriptPath. Workspace and brand are
+# read from the real path, for the facts as well as the episode (the facts loop used to run before
+# any of that was resolved, and once it was hoisted it must not fall back to the snapshot's path).
+Describe 'L1a brand follows the real transcript when a PreCompact snapshot is analysed (C3)' {
+    BeforeAll {
+        if (-not $script:haveFive1) { Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 is not present' }
+        function script:New-Snapshot($Sb) {
+            $dir = Join-Path $Sb.Root 'snap'
+            [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            $snap = Join-Path $dir 'precompact-snap-4242.jsonl'
+            Copy-Item -LiteralPath $Sb.Transcript -Destination $snap
+            return $snap
+        }
+    }
+
+    It 'facts and episode carry the brand and workspace of the real transcript, not of the snapshot directory' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Projects-ClientA' -BrandsJson $script:brandsJson
+        $snap = New-Snapshot $sb
+        $r = Invoke-L1a $sb -TranscriptPath $snap -OriginTranscriptPath $sb.Transcript -EventName PreCompact `
+            -CodexJson (New-CodexJson @('the storefront catalog lists twelve products', 'the storefront ships from one warehouse'))
+        $r.ExitCode | Should -Be 0
+        $r.Records.Count | Should -Be 2
+        foreach ($rec in $r.Records) { $rec.metadata.brand | Should -Be 'brand-a' }
+        $r.Episodes.Count | Should -Be 1
+        $r.Episodes[0].brand | Should -Be 'brand-a'
+        $r.Episodes[0].workspace | Should -Be 'g--My-Drive-Projects-ClientA'
+        $r.Episodes[0].transcript_path | Should -Be $sb.Transcript
+    }
+
+    It 'a content-rule workspace routes each fact by its own text, from the real transcript' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Projects-Mixed' -BrandsJson $script:brandsJson
+        $snap = New-Snapshot $sb
+        $facts = @('the alpha-store catalog lists twelve products', 'the beta-shop checkout uses a flat rate')
+        $r = Invoke-L1a $sb -TranscriptPath $snap -OriginTranscriptPath $sb.Transcript -EventName PreCompact -CodexJson (New-CodexJson $facts)
+        $by = @{}
+        foreach ($rec in $r.Records) { $by[$rec.text] = $rec.metadata }
+        $by[$facts[0]].brand | Should -Be 'brand-a'
+        $by[$facts[1]].brand | Should -Be 'brand-b'
+    }
+
+    It 'control: the same snapshot with no origin path lies in an unrouted directory and posts no brand' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Projects-ClientA' -BrandsJson $script:brandsJson
+        $snap = New-Snapshot $sb
+        $r = Invoke-L1a $sb -TranscriptPath $snap -EventName PreCompact -CodexJson (New-CodexJson @('the storefront catalog lists twelve products'))
+        $r.Records.Count | Should -Be 1
+        $r.Records[0].metadata.PSObject.Properties.Name | Should -Not -Contain 'brand'
+        $r.Episodes[0].brand | Should -BeNullOrEmpty
     }
 }
 
