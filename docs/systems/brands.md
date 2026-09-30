@@ -64,7 +64,7 @@ Patterns are case-insensitive. Path separators (backslash, slash, space) are one
 
 **Dream insights.** An insight takes the brand held by more than half of the memories it cites (neutral sources count in the denominator). A tie, no brand, or a shared label leaves it brand-neutral.
 
-**Admission gate.** `MEM0_SHARED_BRANDS` (environment first, then `stack.env`) is read when a policy is built; a record carrying a listed label is admitted like a null-brand record. An unlisted brand stays fail-closed. The hook's client-side backstop (`Select-AdmittedMemoryResults`) reads the same list, so it does not drop what the server just admitted.
+**Admission gate.** The shared set is the UNION of the brand map's `shared_brands` and `MEM0_SHARED_BRANDS`, on the server as everywhere else. The gate reads the map file itself (path from `MEM0_BRAND_MAP`, environment first, then `stack.env`, else `~/.claude/scripts/brands.json`; cached on the file's mtime and size, no import from `scripts/wsl`) and `MEM0_SHARED_BRANDS` (environment first, then `stack.env`) when a policy is built; a record carrying a listed label is admitted like a null-brand record. An unlisted brand stays fail-closed. The hook's client-side backstop (`Select-AdmittedMemoryResults`) reads the PC's map and the `MEM0_SHARED_BRANDS` environment variable, so it does not drop what the server just admitted. Because the PC has no `stack.env`, the map's `shared_brands` is the one place that works on both sides: a label set only in the brain's `stack.env` is admitted by the server but dropped by a PC whose environment lacks it.
 
 ## Important flows
 

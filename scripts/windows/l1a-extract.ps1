@@ -154,6 +154,19 @@ $turns
     }
     if ($lockResult.waited -gt 0) {
         Write-MemoryLog -Component 'l1a' -Message "  codex lock acquired after $($lockResult.waited)s wait"
+        # The throttle and the turn window above were evaluated BEFORE the wait. A run on the same
+        # transcript (Stop + PreCompact, parallel Stops) may have finished meanwhile: it marked the
+        # throttle and advanced the cursor, so this window is stale, and running codex on it would
+        # spend quota and post paraphrased near-duplicates that the server's byte-identical hash
+        # cannot catch. Re-check both, and give the lock back if the work is already done.
+        $cursorNow = Get-L1aCursor -TranscriptPath $TranscriptPath
+        $throttleBlocks = -not (Test-Throttle -Name 'l1a' -MinIntervalSeconds 600)
+        $cursorReached = ($cursorNow -ne $cursor) -and ($advanceTo -gt 0) -and ($cursorNow -ge $advanceTo)
+        if ($throttleBlocks -or $cursorReached) {
+            Write-MemoryLog -Component 'l1a' -Message '  another run finished while this one waited for the lock; skipping this extraction'
+            Release-CodexLock
+            exit 0
+        }
     }
 
     Write-MemoryLog -Component 'l1a' -Message '  calling codex subagent for extraction'

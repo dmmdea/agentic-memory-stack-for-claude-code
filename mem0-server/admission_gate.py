@@ -296,13 +296,52 @@ def _stack_env_value(key: str) -> Optional[str]:
     return _stack_env_cache["kv"].get(key)
 
 
+_brand_map_cache: dict = {}
+
+
+def _brand_map_path() -> Path:
+    """The brand map's path: MEM0_BRAND_MAP (process environment, then stack.env), else the
+    default ~/.claude/scripts/brands.json. Same order scripts/wsl/brand_routing.py uses; the server
+    imports nothing from scripts/wsl, so the rule is restated here and pinned by a test."""
+    raw = (os.environ.get("MEM0_BRAND_MAP") or "").strip() or (_stack_env_value("MEM0_BRAND_MAP") or "").strip()
+    return Path(raw) if raw else Path.home() / ".claude" / "scripts" / "brands.json"
+
+
+def _map_shared_brands() -> tuple[str, ...]:
+    """The brand map's `shared_brands` list (lower-cased), or () when the file is missing,
+    unreadable, not a JSON object or has no such list. Cached on the file's (path, mtime, size)
+    so a search request does not re-parse the map on every policy build."""
+    path = _brand_map_path()
+    try:
+        st = path.stat()
+    except OSError:
+        return ()
+    stamp = (str(path), st.st_mtime_ns, st.st_size)
+    if _brand_map_cache.get("stamp") != stamp:
+        found: tuple[str, ...] = ()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            listed = data.get("shared_brands") if isinstance(data, dict) else None
+            if isinstance(listed, list):
+                found = tuple(str(b).strip().lower() for b in listed if isinstance(b, str) and b.strip())
+        except (OSError, ValueError):
+            log.warning("brand map %s is unreadable or malformed; its shared_brands are ignored", path)
+        _brand_map_cache["stamp"] = stamp
+        _brand_map_cache["value"] = found
+    return _brand_map_cache["value"]
+
+
 def _shared_brands_from_env() -> tuple[str, ...]:
-    """C3: MEM0_SHARED_BRANDS - comma-separated brand labels every scope may see. The process
-    environment wins; stack.env is the fallback. Absent/empty -> () (no shared brands)."""
+    """C3: the labels every scope may see: the brand map's `shared_brands` UNION the
+    comma-separated MEM0_SHARED_BRANDS (process environment wins over stack.env for that key; an
+    explicitly empty env clears the stack.env list but not the map's). The same union
+    scripts/wsl/brand_routing.shared_brands computes, so a label configured in either place
+    behaves the same here and in the resolver. Neither set -> () (no shared brands)."""
     raw = os.environ.get("MEM0_SHARED_BRANDS")
     if raw is None:
         raw = _stack_env_value("MEM0_SHARED_BRANDS") or ""
-    return tuple(sorted({b.strip().lower() for b in raw.split(",") if b.strip()}))
+    listed = {b.strip().lower() for b in raw.split(",") if b.strip()}
+    return tuple(sorted(listed | set(_map_shared_brands())))
 
 
 def default_policy_for_class(query_class: str) -> AdmissionPolicy:

@@ -184,6 +184,45 @@ Describe 'L1a codex lock: wait and retry instead of skipping (capture-l1a-codex-
         $sw.Elapsed.TotalSeconds | Should -BeGreaterThan 3.5 -Because 'the run waited before giving up'
     }
 
+    # A waiter that lost the race to a run on the SAME transcript (Stop + PreCompact, parallel Stops)
+    # built its window before the lock; once the winner has marked the throttle and advanced the
+    # cursor, that window is stale and re-running codex on it would spend quota and post paraphrased
+    # near-duplicate facts. The child below plays the winner: after 3 s it writes the state a finished
+    # run leaves behind, then releases the lock.
+    It 'a waiter whose winner already marked the throttle exits without calling codex' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $lock = Hold-CodexLock $sb
+        $stamp = Join-Path $sb.Home '.claude\state\last-l1a'
+        $cmd = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '$stamp' -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -NoNewline; Remove-Item -LiteralPath '$lock' -Force"
+        $rel = Start-Process -FilePath 'pwsh' -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', $cmd
+        $env:AMS_L1A_LOCK_WAIT_SECONDS = '15'
+        try { $r = Invoke-L1a $sb -CodexJson (New-CodexJson @('the supplier invoices monthly')) } finally { Remove-Item Env:AMS_L1A_LOCK_WAIT_SECONDS -ErrorAction SilentlyContinue }
+        $null = $rel.WaitForExit(20000)
+        $r.ExitCode | Should -Be 0
+        $r.Log | Should -Match 'codex lock acquired after \d+s wait'
+        $r.Log | Should -Match 'another run finished while this one waited'
+        $r.Prompt | Should -BeNullOrEmpty -Because 'codex must not run on the stale window'
+        $r.Records.Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\codex.lock') | Should -BeFalse -Because 'the waiter releases the lock it took'
+    }
+
+    It 'a waiter whose winner already advanced the cursor to this transcript length exits without calling codex' {
+        $sb = New-L1aSandbox -Slug 'g--My-Drive-Elsewhere'
+        $lock = Hold-CodexLock $sb
+        $len = (Get-Item -LiteralPath $sb.Transcript).Length
+        $cursorFile = Join-Path $sb.Home ('.claude\state\l1a-cursor-' + [System.IO.Path]::GetFileNameWithoutExtension($sb.Transcript) + '.txt')
+        $cmd = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '$cursorFile' -Value $len -NoNewline -Encoding ASCII; Remove-Item -LiteralPath '$lock' -Force"
+        $rel = Start-Process -FilePath 'pwsh' -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', $cmd
+        $env:AMS_L1A_LOCK_WAIT_SECONDS = '15'
+        try { $r = Invoke-L1a $sb -CodexJson (New-CodexJson @('the supplier invoices monthly')) } finally { Remove-Item Env:AMS_L1A_LOCK_WAIT_SECONDS -ErrorAction SilentlyContinue }
+        $null = $rel.WaitForExit(20000)
+        $r.ExitCode | Should -Be 0
+        $r.Log | Should -Match 'another run finished while this one waited'
+        $r.Prompt | Should -BeNullOrEmpty -Because 'codex must not run on the stale window'
+        $r.Records.Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $sb.Home '.claude\state\codex.lock') | Should -BeFalse
+    }
+
     It 'the default wait is 20 seconds' {
         (Get-Content (Join-Path $script:winDir 'l1a-extract.ps1') -Raw) | Should -Match '\$lockWaitSeconds = 20'
     }

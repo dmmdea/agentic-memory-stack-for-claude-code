@@ -199,7 +199,7 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 - **The daemon is an accelerator, never a dependency** — every failure falls back to a behavior byte-identical to the no-daemon path.
 - **Hooks never block:** stop-extract and the extractor exit 0 always; the client maps a blocking child exit `2` to `0`.
 - **PreCompact snapshots before compaction** — the pre-compaction transcript is preserved for extraction.
-- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator. A run that finds it held waits (polling every 2 s, 20 s by default; `AMS_L1A_LOCK_WAIT_SECONDS` overrides) before it skips.
+- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator. A run that finds it held waits (polling every 2 s, 20 s by default; `AMS_L1A_LOCK_WAIT_SECONDS` overrides) before it skips. A run that waited re-checks the 10-minute throttle and the transcript cursor once it holds the lock, and releases it without calling Codex when another run on the same transcript finished meanwhile (its window is stale).
 - **The ChatGPT login is what Codex authenticates with** — `Invoke-CodexSubagent` clears `OPENAI_API_KEY` and `CODEX_API_KEY` from the child's environment (an API-key credential would preempt the login) and logs the auth mode to `codex.log`, never a credential.
 - **One SessionStart start per session per second** — an atomic per-session marker in `~/.claude/state/` lets exactly one of several same-second SessionStart hooks spawn the extractor.
 - **The throttle is marked only after success** — a transient failure never silences the next 10 minutes.

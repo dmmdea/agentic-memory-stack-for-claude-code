@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from admission_gate import AdmissionPolicy
 
 
@@ -850,3 +851,81 @@ def test_shared_brand_skips_the_brand_coherence_floor(tmp_path, monkeypatch):
                              brand_coherence_floor=0.20, shared_brands=("shared-a",))
     r = _result(brand="shared-a"); r["score"] = 0.01
     assert policy.evaluate(r, scope={"brand": "brand-b"}, query_class="durable").admit is True
+
+
+# --- C3 shared brands: the brand map's `shared_brands` key is honored by the gate ---------------
+
+def _write_map(path, shared):
+    import json as _json
+    path.write_text(_json.dumps({"rules": [], "shared_brands": shared}), encoding="utf-8")
+    return path
+
+
+def test_map_shared_brands_alone_make_the_gate_treat_the_label_as_neutral(tmp_path, monkeypatch):
+    """brands.json-only configuration: no MEM0_SHARED_BRANDS anywhere, the map lists the label."""
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("MEM0_BRAND_MAP", raising=False)
+    (tmp_path / ".claude" / "scripts").mkdir(parents=True)
+    _write_map(tmp_path / ".claude" / "scripts" / "brands.json", ["Shared-Map"])
+    policy = default_policy_for_class("durable")
+    assert policy.shared_brands == ("shared-map",)
+    assert policy.evaluate(_result(brand="shared-map"), scope={}, query_class="durable").admit is True
+    assert policy.evaluate(_result(brand="brand-a"), scope={}, query_class="durable").reason == "brand_scope_required:brand-a"
+
+
+def test_gate_unions_map_and_env_shared_brands_like_the_resolver(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch, stack_env="MEM0_SHARED_BRANDS=shared-s\n")
+    monkeypatch.setenv("MEM0_BRAND_MAP", str(_write_map(tmp_path / "m.json", ["shared-m"])))
+    assert default_policy_for_class("durable").shared_brands == ("shared-m", "shared-s")
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "shared-e")
+    assert default_policy_for_class("durable").shared_brands == ("shared-e", "shared-m")
+    monkeypatch.setenv("MEM0_SHARED_BRANDS", "")
+    assert default_policy_for_class("durable").shared_brands == ("shared-m",), "empty env clears the env list, not the map's"
+
+
+def test_gate_finds_the_map_through_stack_env_and_agrees_with_brand_routing(tmp_path, monkeypatch):
+    """MEM0_BRAND_MAP in stack.env names the map; the gate and scripts/wsl/brand_routing resolve the same set."""
+    import importlib.util
+    from admission_gate import default_policy_for_class
+    m = _write_map(tmp_path / "custom-brands.json", ["shared-m", "SHARED-x"])
+    _shared_home(tmp_path, monkeypatch, stack_env=f"MEM0_BRAND_MAP={m}\nMEM0_SHARED_BRANDS=shared-s\n")
+    monkeypatch.delenv("MEM0_BRAND_MAP", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "brand_routing_pin", Path(__file__).resolve().parents[2] / "scripts" / "wsl" / "brand_routing.py")
+    br = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(br)
+    gate = set(default_policy_for_class("durable").shared_brands)
+    assert gate == {"shared-m", "shared-x", "shared-s"}
+    assert gate == br.shared_brands(br.load_brand_map())
+
+
+def test_gate_map_read_is_cached_and_refreshes_when_the_file_changes(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    m = _write_map(tmp_path / "m.json", ["shared-one"])
+    monkeypatch.setenv("MEM0_BRAND_MAP", str(m))
+    assert default_policy_for_class("durable").shared_brands == ("shared-one",)
+    reads = []
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (reads.append(str(self)), real(self, *a, **k))[1])
+    default_policy_for_class("durable")
+    assert str(m) not in reads, "an unchanged map is served from the cache"
+    _write_map(m, ["shared-two-longer"])
+    assert default_policy_for_class("durable").shared_brands == ("shared-two-longer",)
+
+
+def test_gate_ignores_a_missing_or_malformed_map(tmp_path, monkeypatch):
+    from admission_gate import default_policy_for_class
+    _shared_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEM0_BRAND_MAP", str(tmp_path / "absent.json"))
+    assert default_policy_for_class("durable").shared_brands == ()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MEM0_BRAND_MAP", str(bad))
+    assert default_policy_for_class("durable").shared_brands == ()
+    bad.write_text('["a list"]', encoding="utf-8")
+    assert default_policy_for_class("durable").shared_brands == ()
+    bad.write_text('{"shared_brands": "shared-a"}', encoding="utf-8")
+    assert default_policy_for_class("durable").shared_brands == ()
