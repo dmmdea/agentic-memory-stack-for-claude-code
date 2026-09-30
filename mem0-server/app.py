@@ -8,6 +8,7 @@ import json
 import hashlib
 import logging
 import threading
+import uuid as _uuid
 import datetime as _dt
 from pathlib import Path
 from typing import Optional, Any, List
@@ -488,11 +489,20 @@ _ADD_FORBIDDEN_META = {"retrievable", "expires_at", "created_at", "tier_actor",
 # One lock per memory id serializes PUT, PATCH /tier, PATCH /metadata and the
 # NLI stamp for that id only. Registry grows one small Lock per distinct id
 # written this process lifetime — bounded in practice by the corpus.
+# The key is the canonical UUID spelling: Qdrant resolves the hyphenated, simple, braced and
+# urn:uuid spellings (any case) of one id to the same point, so keying on the raw path string
+# gave one record several locks and let a differently spelled request escape the serialization.
 _MID_LOCKS: dict = {}
 _MID_LOCKS_GUARD = threading.Lock()
 
+def _mid_lock_key(mid) -> str:
+    try:
+        return str(_uuid.UUID(str(mid).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return str(mid)
+
 def _mid_write_lock(mid):
-    key = str(mid)
+    key = _mid_lock_key(mid)
     with _MID_LOCKS_GUARD:
         lk = _MID_LOCKS.get(key)
         if lk is None:
@@ -902,8 +912,9 @@ def health() -> dict:
 
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
-    """Spec §9 (P1-5): the nightly chain's last successes, the judge transport, pool usage
-    (alarm at 85 %) and the box's boot ids for 7 days. Gatus probes it; the session-start
+    """Spec §9 (P1-5): the nightly chain's last successes, the steps whose latest run failed or
+    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, and the box's boot
+    ids for 7 days. `ok` folds the failed/degraded steps and the pool in. Gatus probes it; the session-start
     line reads it with a 1.5 s budget and falls back to local numbers. Never raises on a
     reader: an unreadable pool/journal reads as unknown, not as an error."""
     import os as _os
@@ -913,7 +924,13 @@ def health_maintenance() -> dict:
     maint = Path.home() / ".mem0" / "maintenance"
     return _mh.build(maint / "receipts.jsonl", _dt.datetime.now(_dt.timezone.utc), pool,
                      _mh.journal_boots_reader(), codex_shim_client.judge_transport,
-                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"))
+                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
+                     # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
+                     pool_health_reader=_mh.zpool_health_reader(ds) if ds else None,
+                     # The operator's dated pool-health ack (env, else stack.env), read on every call.
+                     pool_ack_reader=_mh.read_pool_ack,
+                     wiki_stamp_dir=Path.home() / "wiki-index",
+                     drift_reader=drift_state_health)
 
 
 @app.get("/health/morning-summary")
@@ -2120,7 +2137,8 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
                 x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce")):
     """Update a memory's tier. Server-enforced actor requirements per tier.
-    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B).
+    Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B),
+    and so does a move OUT of canonical (session 12: signed action "demote"; see the gate below).
     v0.19 Phase G: the token is validated as format-2
     (<ts>|<nonce>|promote|<mid>|<reason>) via security_invariants —
     nonce + replay protection, HMAC verified before the nonce is burned (MED-8).
@@ -2137,6 +2155,27 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     reason = (b.reason or "").strip()
     if not actor:
         raise HTTPException(400, "actor is required (e.g., 'user-direct', 'c1-consolidator', 'claude-autonomous')")
+    # Canonical DEMOTION gate: a move OUT of canonical signs its own "demote" action. Without
+    # it an API-key holder could demote a canonical record and then PUT or DELETE it with no
+    # token, because assert_writable gates those only while the record is still canonical.
+    # fetch_current_tier fails closed: a store error is a 503, and a point with no tier field
+    # reads as canonical. A point that does not exist is a 404 (nothing to change).
+    current_tier = None
+    if b.tier != "canonical":
+        from security_invariants import fetch_current_tier, tier_change_hmac_action, _NOT_FOUND
+        _ct = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+        if _ct == _NOT_FOUND:
+            raise HTTPException(404, f"memory {mid} not found")
+        current_tier = _ct
+        if tier_change_hmac_action(current_tier, b.tier) == "demote":
+            if not reason:
+                raise HTTPException(400, "demoting a canonical record requires non-empty 'reason' (audit-trail policy)")
+            from security_invariants import validate_hmac_user_direct
+            validate_hmac_user_direct(
+                mid, "demote", reason,
+                x_user_direct_token, x_user_direct_ts,
+                x_user_direct_nonce=x_user_direct_nonce,
+            )
     if b.tier == "canonical":
         if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct" and actor not in CANONICAL_AUTOPROMOTE_ALLOWED:
             raise HTTPException(403,
@@ -2204,36 +2243,61 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         transport = "autonomous"
     elif b.tier == "canonical" and x_user_direct_token:
         transport = "cli-user-direct"
+    elif current_tier == "canonical" and x_user_direct_token:
+        transport = "cli-user-direct"
     else:
         transport = "rest-api"
-    # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
-    # change can never complete without an audit trace. If this append fails the
-    # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
-    # would be worse than useless (the tier would already have changed).
-    try:
-        _append_ledger({
-            "ts": now, "event": "tier-change-intent", "memory_id": mid,
-            "tier": b.tier, "actor": actor, "reason": reason or None,
-            "transport": transport, "status": "intent",
-            "judge_model": (b.judge_model or None), "schema_version": "v18",
-        })
-    except Exception as e:
-        log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
-        raise HTTPException(
-            503,
-            "audit ledger unavailable (intent append failed); tier change refused "
-            f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
-        )
+    class _TierRaced(Exception):
+        """The record became canonical between the gate's read and this write."""
+
     try:
         # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
         # without this, a promotion landing inside the PUT window was silently
         # demoted by the PUT's stale-tier upsert (store and ledger disagreed).
         with _mid_write_lock(mid):
+            # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
+            # between would let this unsigned change move a record that is canonical NOW, so a
+            # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            if b.tier != "canonical" and current_tier != "canonical":
+                _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
+                if _tier_now == _NOT_FOUND:
+                    # Deleted while this change was in flight: nothing to change, and no ledger line.
+                    raise HTTPException(404, f"memory {mid} not found")
+                if _tier_now == "canonical":
+                    raise _TierRaced()
+            # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
+            # change can never complete without an audit trace. If this append fails the
+            # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
+            # would be worse than useless (the tier would already have changed). It sits
+            # after the re-check so a refused (409) change leaves no unpaired intent line;
+            # PUT appends its ledger line under the same lock, so the lock order matches.
+            try:
+                _append_ledger({
+                    "ts": now, "event": "tier-change-intent", "memory_id": mid,
+                    "tier": b.tier, "actor": actor, "reason": reason or None,
+                    "transport": transport, "status": "intent",
+                    "judge_model": (b.judge_model or None), "schema_version": "v18",
+                })
+            except Exception as e:
+                log.exception("AMS-22: tier-change intent ledger append failed; refusing mutation")
+                raise HTTPException(
+                    503,
+                    "audit ledger unavailable (intent append failed); tier change refused "
+                    f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
+                )
             mem.vector_store.client.set_payload(
                 collection_name=mem.vector_store.collection_name,
                 payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
                 points=[mid],
             )
+    except _TierRaced:
+        raise HTTPException(409, (
+            "the record became canonical while this tier change was in flight; retry. "
+            "Moving it out of canonical needs the signed 'demote' token "
+            "(mem0-canonize.sh --action demote)."
+        ))
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("tier-update failed")
         raise _upstream_error(e)

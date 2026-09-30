@@ -10,6 +10,9 @@ SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "wsl"
 sys.path.insert(0, str(SCRIPTS))
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 def _mod():
     spec = importlib.util.spec_from_file_location("memory_index_refresh", SCRIPTS / "memory-index-refresh.py")
     m = importlib.util.module_from_spec(spec)
@@ -19,8 +22,7 @@ def _mod():
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     return tmp_path
 

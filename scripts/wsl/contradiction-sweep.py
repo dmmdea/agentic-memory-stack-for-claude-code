@@ -184,8 +184,15 @@ SWEEP_LOG = Path.home() / ".mem0" / "contradiction-sweep.jsonl"
 REVIEW_QUEUE = Path.home() / ".mem0" / "contradiction-promote-review.jsonl"
 # Single-runner mutex for the rejudge: two concurrent SessionStart triggers (two terminals/IDE
 # windows opened together) must not launch two --apply runs against the same store (2026-06-30).
-REJUDGE_LOCK = Path.home() / ".mem0" / ".rejudge-stamped.lock"
-EVIDENCE_LOCK = Path.home() / ".mem0" / ".evidence-sweep.lock"  # evidence-vs-evidence sweep mutex
+def _lock_path(env_var: str, default_name: str) -> Path:
+    """A single-runner lock lives under ~/.mem0 unless the environment moves it: a test (or a
+    second instance on the same host) must be able to take the lock without touching the real one."""
+    override = (os.environ.get(env_var) or "").strip()
+    return Path(override) if override else Path.home() / ".mem0" / default_name
+
+
+REJUDGE_LOCK = _lock_path("MEM0_REJUDGE_LOCK", ".rejudge-stamped.lock")
+EVIDENCE_LOCK = _lock_path("MEM0_EVIDENCE_LOCK", ".evidence-sweep.lock")  # evidence-vs-evidence sweep mutex
 PAIR_TIMEOUT_S = 30.0
 COLD_LOAD_TIMEOUT_S = 120.0
 PROMPT_TEXT_MAX_CHARS = 1500  # MAX_MEMORY_CHARS — payloads never legally exceed it
@@ -502,6 +509,33 @@ def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
 def exit_code_for(outcome: str) -> int:
     """degraded:* -> 1 (systemd oneshot visibly fails); ok / no-op:* -> 0."""
     return 1 if str(outcome).startswith("degraded") else 0
+
+
+def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
+    """Step outcome contract (C1, scripts/wsl/ams-step.sh): under the chain, ONE line in
+    $AMS_OUTCOME_FILE lets the receipt say what exit 0 cannot. A no-op run (the shim was down, no
+    canonicals, every pair skipped) exits 0 by design so the weekly unit is not noisy, but it did
+    nothing: it reads `degraded:no-op-<reason>` there, and a real run reads `ok {counts}`. degraded:*
+    and fatal:* already exit non-zero, so the exit code is their signal and they write nothing."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    if outcome == "ok":
+        head = "ok"
+    elif outcome.startswith("no-op:"):
+        head = "degraded:no-op-" + "-".join(outcome[len("no-op:"):].split())
+    else:
+        return
+    try:
+        Path(path).write_text(f"{head} {json.dumps(counts or {}, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:  # the receipt hint must never fail the sweep
+        print(f"contradiction-sweep: outcome file write failed (non-fatal): {e}", flush=True)
+
+
+def _finish(outcome: str, counts: Optional[dict] = None) -> int:
+    """Every mode's last line: record the outcome for the step receipt, return the unit's exit code."""
+    _write_outcome(outcome, counts)
+    return exit_code_for(outcome)
 
 
 def judge_pair(http: httpx.Client, model: str, canonical_text: str,
@@ -1184,7 +1218,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
         print("contradiction-sweep: rejudge-stamped: another run holds the lock — skipping", flush=True)
         _append_summary({"mode": "rejudge-stamped", "dry_run": dry_run, "judge": args.judge,
                          "outcome": "no-op:lock-held", "skipped": "single-runner lock held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
@@ -1305,7 +1339,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                      "cleared_ids": cleared_ids, "kept_ids": kept_ids, "outcome": outcome})
     print(f"contradiction-sweep: rejudge-stamped done. checked={checked} yes={yes} no={no} "
           f"cleared={cleared} queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    return _finish(outcome, {"stamped_found": len(stamped), "checked": checked, "yes": yes, "no": no, "cleared": cleared})
 
 
 def scroll_noncanonical(http: httpx.Client, user_id: Optional[str] = None) -> list[dict]:
@@ -1361,7 +1395,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     if not _acquire_lock(EVIDENCE_LOCK):
         print("contradiction-sweep: evidence-sweep: another run holds the lock — skipping", flush=True)
         _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "outcome": "no-op:lock-held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
@@ -1453,10 +1487,10 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                      "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
           f"queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    return _finish(outcome, {"anchors": anchors, "pairs": pairs, "queued": queued})
 
 
-PAIRS_LOCK = Path.home() / ".mem0" / ".retrieval-pairs.lock"
+PAIRS_LOCK = _lock_path("MEM0_PAIRS_LOCK", ".retrieval-pairs.lock")
 PAIRS_RECEIPT = Path.home() / ".mem0" / "retrieval-pairs-yield.json"
 RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
 
@@ -1517,7 +1551,8 @@ def resolve_supersede_precheck(loser_id: str, winner_id: str,
         return "loser and winner are the same record"
     if loser_payload.get("tier") == "canonical":
         return ("loser is CANONICAL — canonicals are never superseded by this "
-                "path (demote first via the tier API if that is really intended)")
+                "path (if that is really intended, the operator demotes it first: "
+                "mem0-canonize.sh --action demote <id> \"<reason>\")")
     if loser_payload.get("superseded_by"):
         return (f"loser already superseded by {loser_payload.get('superseded_by')} "
                 "— refusing to overwrite an existing resolution")
@@ -1625,7 +1660,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         print("contradiction-sweep: --retrieval-pairs already running (lock held) — exiting", flush=True)
         _append_summary({"mode": "retrieval-pairs", "dry_run": True,
                          "outcome": "no-op:lock-held"})
-        return 0
+        return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     outcome = "ok"
     judged_stats = None  # assigned in the judged block; must exist for the
@@ -1827,7 +1862,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
     _append_summary({"mode": "retrieval-pairs", "dry_run": not judged,
                      "judged_stats": judged_stats if judged else None,
                      "outcome": outcome})
-    return exit_code_for(outcome)
+    return _finish(outcome, judged_stats if judged else None)
 
 
 def main() -> int:
@@ -1951,7 +1986,7 @@ def main() -> int:
                              "outcome": "no-op:codex-bridge-unavailable",
                              "skipped": "codex_shim_client import failed",
                              "searched": [str(c) for c in _BRIDGE_CANDIDATES]})
-            return 0
+            return _finish("no-op:codex-bridge-unavailable")
         _ok, _ensured, _h = _preflight_codex_health()
         if not _ok:
             print(f"contradiction-sweep: --judge codex but the Codex shim is unreachable "
@@ -1962,7 +1997,7 @@ def main() -> int:
                              "outcome": "no-op:codex-shim-unreachable",
                              "skipped": f"codex shim health: {_h.get('error_type')}",
                              "ensure_attempted": _ensured})
-            return 0
+            return _finish("no-op:codex-shim-unreachable")
 
     if args.rejudge_stamped:
         return run_rejudge_stamped(args, dry_run)
@@ -2231,7 +2266,10 @@ def main() -> int:
           f"yes={yes_count} no={no_count} skipped={skipped_pairs} "
           f"stamped={stamped_count} cleared={cleared_count} (dry_run={dry_run}) "
           f"summary -> {SWEEP_LOG}", flush=True)
-    return exit_code_for(outcome)
+    # canonicals_checked/total: only `--limit` canonicals are judged per week (50 of 122 = three
+    # weeks to cover the set even when healthy), so the receipt has to say how much was covered.
+    return _finish(outcome, {"canonicals_checked": len(canonicals), "canonicals_total": canonical_total,
+                             "pairs": pairs_checked, "yes": yes_count})
 
 
 if __name__ == "__main__":

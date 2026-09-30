@@ -19,7 +19,6 @@ The contract pinned here:
 from __future__ import annotations
 
 import importlib.util
-import os
 import re
 import shutil
 import subprocess
@@ -32,6 +31,9 @@ SCRIPT = REPO_ROOT / "install" / "linux-authority.sh"
 LIB = REPO_ROOT / "install" / "stack-env.sh"
 BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
+
+
+from _home_isolation import home_env  # noqa: E402
 
 
 def _load(name, path):
@@ -50,8 +52,7 @@ def _run(args, tmp_path, stack_env=None):
     sec.mkdir(exist_ok=True)
     (sec / "ams-api-key.cred").write_bytes(b"x" * 64)
     (sec / "ams-canonical-key.cred").write_bytes(b"y" * 64)
-    env = dict(os.environ)
-    env["HOME"] = str(home)
+    env = home_env(home)
     r = subprocess.run([BASH, str(SCRIPT), *args, "--secrets-dir", str(sec)],
                        capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     return r, home
@@ -229,7 +230,7 @@ def _source_like(script, stack_env_path):
     """Run the consumer's own sourcing statement (deploy.sh runs under set -euo pipefail)."""
     home = stack_env_path.parent.parent
     return subprocess.run([BASH, "-c", 'set -euo pipefail; . "$HOME/.mem0/stack.env"; printf "%s" "${MEM0_WIKI_SOURCES:-}"'],
-                          capture_output=True, text=True, timeout=30, env={**os.environ, "HOME": str(home)})
+                          capture_output=True, text=True, timeout=30, env=home_env(home))
 
 
 def test_every_sourcing_consumer_accepts_the_rendered_receipt_and_rejected_the_legacy_line(tmp_path):
@@ -264,6 +265,15 @@ def test_a_pre_existing_brain_ssh_survives_a_render_only_rerun(tmp_path):
     r2, se2 = _render(tmp_path, name="render2")
     assert r2.returncode == 0, r2.stderr
     assert [ln for ln in _lines(se2) if ln.startswith("MEM0_BRAIN_SSH=")] == ["MEM0_BRAIN_SSH=op@brain-alias"]
+
+
+def test_a_pool_health_ack_survives_a_render_only_rerun(tmp_path):
+    """The dated pool-health ack is hand-set (no installer flag): a re-run that dropped it would put a
+    planned-maintenance DEGRADED pool back on the alarm mid-window. Its value is a plain token."""
+    r, se = _render(tmp_path, stack_env="MEM0_WSL_USER=tenant\nMEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06\n")
+    assert r.returncode == 0, r.stderr
+    assert "MEM0_POOL_HEALTH_ACK=DEGRADED:2026-10-06" in _lines(se)
+    assert "MEM0_POOL_HEALTH_ACK carried over from ~/.mem0/stack.env" in r.stdout
 
 
 def test_no_brain_ssh_is_invented_when_the_receipt_has_none(tmp_path):

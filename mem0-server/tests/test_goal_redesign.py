@@ -36,6 +36,9 @@ episodic = importlib.util.module_from_spec(_espec)
 _espec.loader.exec_module(episodic)
 
 
+from _home_isolation import home_env  # noqa: E402
+
+
 @pytest.fixture()
 def conn(tmp_path):
     c = episodic._connect_to(tmp_path / "e.db")
@@ -169,11 +172,9 @@ def test_promoter_writes_the_jobs_receipt_contract(tmp_path):
     This gap was caught live by the pre-timer wire test; pinned so it cannot
     return. Exercised via subprocess under a throwaway HOME (no-op path)."""
     import json as _j
-    import os as _os
     import subprocess
     import sys as _sys
-    env = dict(_os.environ)
-    env["HOME"] = str(tmp_path)
+    env = home_env(tmp_path)   # HOME alone leaves Windows resolving ~ from the REAL USERPROFILE
     env["JOBS_IDEMPOTENCY_KEY"] = "pin-key-123"
     r = subprocess.run(
         [_sys.executable, str(REPO_ROOT / "scripts" / "wsl" / "goal-recurrence-promote.py"), "--apply"],

@@ -26,12 +26,20 @@ Exit codes: 0 for every completed OR deliberately skipped cycle (throttle, quota
 signals; the receipt note says which); 4 when the authority is unreachable; 5 when a phase
 FAILED (judge call failed, malformed judge JSON, index build failed). A failed phase must
 receipt ok:false, or /health/maintenance could never report a dream that breaks every night.
+
+Step outcome (C1, scripts/wsl/ams-step.sh): exit 0 says the dream finished, not that it did its job.
+Under the chain it also writes one line to $AMS_OUTCOME_FILE - `ok {counts}` or `degraded:<reasons>
+{counts}` (posted-<p>-of-<c>, drift-snapshot-failed, canonical-fetch-failed) - counts being
+{signals, consolidated, posted, spooled, replayed}. Phase 3 waits for a warm embedder first (up to
+10 min), and an insight whose POST fails is spooled to dream/insight-spool.jsonl and replayed first
+on the next run.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -74,6 +82,17 @@ GATHER_TIMEOUT_S = 180
 SYNTH_TIMEOUT_S = 240
 MORNING_ROTATE_BYTES = 131072
 MORNING_KEEP_SECTIONS = 20
+# The embedder idles out after 5 minutes and llama-swap can fail its cold load (2026-09-24: 167 x 500 in
+# 96 minutes around the 03:00 chain). Phase 3 embeds (drift snapshot, insight POSTs), so it waits for a
+# warm embedder first: 21 probes 30 s apart = 10 minutes, then proceeds and lets the outcome say what broke.
+EMBEDDER_WAIT_S = 600
+EMBEDDER_STEP_S = 30
+# An insight POST that fails is spooled here and replayed FIRST on the next run: the consolidator's
+# output is one night's judge spend, and a 500 at post time must not be the end of it.
+SPOOL_NAME = "insight-spool.jsonl"
+# hook_contract.py KNOWN_HOOK_CONTRACT_VERSIONS: '17.0' is the /v1/memories/search wire contract. The dream's
+# own searches carried no version, which is what /health/deep hook_contract.missing mostly counted.
+SEARCH_HOOK_CONTRACT_VERSION = "17.0"
 
 # ---- store judge (register P4-1b) --------------------------------------------------------
 # The fleet's per-workspace auto-memory stores are maintained deterministically on every PC
@@ -118,6 +137,15 @@ def _parse_ts(s) -> dt.datetime | None:
         return None
 
 
+def _sleep(seconds: float) -> None:
+    """The embedder wait's clock, one seam so a test does not sit through ten minutes."""
+    time.sleep(seconds)
+
+
+def _insight_hash(text: str) -> str:
+    return hashlib.sha256(" ".join(str(text).split()).encode("utf-8")).hexdigest()[:24]
+
+
 def _clip(s, n: int) -> str:
     s = "" if s is None else str(s)
     return s if len(s) <= n else s[:n]
@@ -142,6 +170,13 @@ class Mem0Client:
     def health(self) -> bool:
         try:
             return bool(self._get("/health").get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def health_embedder(self) -> bool:
+        """True once GET /health/embedder answers ok (it warms the embedder; a cold or dead one is a 503)."""
+        try:
+            return bool(self._get("/health/embedder", timeout=30.0).get("ok"))
         except Exception:  # noqa: BLE001
             return False
 
@@ -188,7 +223,8 @@ class Mem0Client:
     def search_canonical(self) -> list[dict]:
         # FIX 6 + A4a: filter-only fetch so the COMPLETE canonical set comes back; the server
         # requires a scope key in filters (user_id) or it 500s.
-        body = {"query": "", "filters": {"tier": "canonical", "user_id": self.user_id}, "limit": 1000}
+        body = {"query": "", "filters": {"tier": "canonical", "user_id": self.user_id}, "limit": 1000,
+                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
         r = self.http.post(f"{self.url}/v1/memories/search", headers=self.h, json=body, timeout=10.0)
         r.raise_for_status()
         d = r.json()
@@ -621,6 +657,14 @@ class Dream:
         self.ms = {"gather": 0, "consolidate": 0}
         self.posted = 0
         self.promoted = 0
+        # What the night lost or did not do, for the step outcome (C1): see outcome().
+        self.n_signals = 0
+        self.consolidated = 0
+        self.spooled = 0
+        self.replayed = 0
+        self.replay_failed = 0
+        self.drift_snapshot_failed = False
+        self.canonical_fetch_failed = False
 
     # -- receipts -------------------------------------------------------------------------
     def save_phase(self, phase: str, payload: dict) -> None:
@@ -632,7 +676,9 @@ class Dream:
         ms = int(out.get("duration_ms") or (time.monotonic() - t0) * 1000)
         if out.get("ok"):
             ams_env.write_usage(component, tokens_used=out.get("tokens_used", 0), duration_ms=ms, status="ok",
-                                model_requested=model, effort_requested=effort, outcome="ok", **(extra or {}))
+                                model_requested=model, effort_requested=effort, outcome="ok",
+                                model_resolved=out.get("model_resolved"), effort_resolved=out.get("effort_resolved"),
+                                **(extra or {}))
         else:
             et = out.get("error_type", "")
             outcome = "timeout" if et == "client_timeout" else "exit_nonzero"
@@ -693,13 +739,149 @@ class Dream:
             log(f"  drift {phase} snapshot (exit={rc}): {text}")
             if rc != 0 or not out.exists():
                 log(f"  drift {phase} snapshot FAILED (exit={rc}) -- skipping drift compare this cycle (no false alarm)")
+                self.drift_snapshot_failed = self.drift_snapshot_failed or phase == "before"
                 self.drift_heartbeat("snapshot-failure")
                 return None
             return str(out)
         except Exception as e:  # noqa: BLE001
             log(f"  drift {phase} snapshot FAILED (non-fatal): {e}")
+            self.drift_snapshot_failed = self.drift_snapshot_failed or phase == "before"
             self.drift_heartbeat("snapshot-failure")
             return None
+
+    # -- embedder preflight + insight spool (2026-09-24 night) ------------------------------
+    def _wait_for_embedder(self) -> None:
+        """Poll /health/embedder before the embed-dependent phases: up to EMBEDDER_WAIT_S in
+        EMBEDDER_STEP_S steps, then PROCEED (a dead embedder is then an outcome, not a hang).
+        A client with no probe, and a dry run (posts nothing, snapshots nothing), skip it."""
+        probe = getattr(self.mem0, "health_embedder", None)
+        if self.dry or probe is None:
+            return
+        probes = EMBEDDER_WAIT_S // EMBEDDER_STEP_S + 1
+        for i in range(probes):
+            if probe():
+                if i:
+                    log(f"  embedder ready after {i * EMBEDDER_STEP_S}s")
+                return
+            if i < probes - 1:
+                log(f"  embedder not ready; waiting {EMBEDDER_STEP_S}s ({i + 1}/{probes - 1})")
+                _sleep(EMBEDDER_STEP_S)
+        log(f"  embedder still not ready after {EMBEDDER_WAIT_S}s; proceeding (failed insight posts will be spooled)")
+
+    def _spool_path(self) -> Path:
+        return self.state / SPOOL_NAME
+
+    def _spool_read(self) -> list[dict]:
+        entries = []
+        try:
+            for ln in self._spool_path().read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    log("  insight spool: dropped an unparsable line")
+                    continue
+                if isinstance(e, dict) and e.get("text"):
+                    entries.append(e)
+        except OSError:
+            pass
+        return entries
+
+    def _spool_write(self, entries: list[dict]) -> None:
+        p = self._spool_path()
+        if not entries:
+            p.unlink(missing_ok=True)
+            return
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text("".join(json.dumps(e, ensure_ascii=False, default=str) + "\n" for e in entries), encoding="utf-8")
+        os.replace(tmp, p)
+
+    def _spool_add(self, text: str, metadata: dict, lineage: list) -> bool:
+        """Queue an insight whose POST failed. Deduplicated by content hash, so the same insight
+        failing on two nights is one line. False when it was already queued."""
+        h = _insight_hash(text)
+        entries = self._spool_read()
+        if any(e.get("hash") == h for e in entries):
+            return False
+        entries.append({"hash": h, "text": text, "metadata": metadata, "lineage": list(lineage),
+                        "spooled_at": self.now.isoformat()})
+        try:
+            self._spool_write(entries)
+        except OSError as e:   # the loss is then visible as posted < consolidated, not a traceback at 3 am
+            log(f"  insight spool: write failed, this insight is not queued: {e}")
+            return False
+        return True
+
+    def _replay_spool(self) -> set:
+        """Post last runs' spooled insights before tonight's own. A success removes its line (and touches
+        its lineage exactly as the original post would have); a failure keeps it for the next run.
+        Returns the hashes that landed, so tonight's regenerated copy of one is not posted twice."""
+        landed: set = set()
+        entries = self._spool_read()
+        if not entries:
+            return landed
+        log(f"  insight spool: replaying {len(entries)} queued insight(s)")
+        keep = []
+        for e in entries:
+            try:
+                ok = self.mem0.add(e["text"], e.get("metadata") or {})
+            except Exception as ex:  # noqa: BLE001
+                log(f"  insight spool: replay failed (kept): {ex}")
+                ok = False
+            if not ok:
+                keep.append(e)
+                self.replay_failed += 1
+                continue
+            landed.add(e.get("hash") or _insight_hash(e["text"]))
+            self.replayed += 1
+            for mid in e.get("lineage") or []:
+                try:
+                    self.mem0.patch_metadata(mid, {"touched_by_dream": self.now.isoformat()}, "dream-consolidator",
+                                             "cited as source_memory_id by insight")
+                except Exception as ex:  # noqa: BLE001
+                    log(f"  PATCH touched_by_dream failed for {mid}: {ex}")
+        self._spool_write(keep)
+        return landed
+
+    # -- the step outcome (C1) ----------------------------------------------------------------
+    def outcome(self, out: dict) -> tuple[str, dict]:
+        """`<status>[:<reason>]` and the counts for ams-step.sh's receipt. exit 0 says the dream finished;
+        this says whether it did its job: an insight it could not post, a drift guard that could not
+        snapshot, a canonical set it could not fetch, a queued insight it could not replay, a backlog it
+        never got to. Several reasons join with a comma. `spool_depth` is the post-run line count, read
+        from the file, so a standing backlog is visible on every night, replayed or not."""
+        spool_depth = len(self._spool_read())
+        work = {"signals": self.n_signals, "consolidated": self.consolidated, "posted": self.posted,
+                "spooled": self.spooled, "replayed": self.replayed,
+                "replay_failed": self.replay_failed, "spool_depth": spool_depth}
+        if out.get("failed") or out.get("unreachable"):
+            return f"failed:{'mem0-unreachable' if out.get('unreachable') else out.get('phase')}", work
+        reasons = []
+        if self.posted < self.consolidated:
+            reasons.append(f"posted-{self.posted}-of-{self.consolidated}")
+        if self.replay_failed:
+            reasons.append(f"replay-failed-{self.replay_failed}")
+        elif not self.dry and spool_depth > self.spooled:
+            # queued insights from earlier nights that this night never tried (no signals, phase 3 not reached);
+            # a dry run skips the replay by design, so the queue it left alone is not a degraded night
+            reasons.append(f"spool-backlog-{spool_depth - self.spooled}")
+        if self.drift_snapshot_failed:
+            reasons.append("drift-snapshot-failed")
+        if self.canonical_fetch_failed:
+            reasons.append("canonical-fetch-failed")
+        return ("degraded:" + ",".join(reasons) if reasons else "ok"), work
+
+    def _write_outcome(self, outcome: str, work: dict) -> None:
+        """One line to $AMS_OUTCOME_FILE (ams-step.sh exports it). A night the dream skipped on purpose
+        (throttle, quota, lock, dedup mutex) writes none: that reads ok, as before."""
+        path = os.environ.get("AMS_OUTCOME_FILE")
+        if not path:
+            return
+        try:
+            Path(path).write_text(f"{outcome} {json.dumps(work, separators=(',', ':'))}\n", encoding="utf-8")
+        except OSError as e:
+            log(f"  outcome file write failed (non-fatal): {e}")
 
     # -- morning summary ------------------------------------------------------------------
     def _append_morning(self, section: str) -> None:
@@ -894,6 +1076,14 @@ class Dream:
         return {"stores": len(stores), "decisions": decided, "written": True, "note": "ok"}
 
     def run(self) -> dict:
+        out = self._cycle()
+        outcome, work = self.outcome(out)
+        out["outcome"], out["work"] = outcome, work
+        if out.get("phase") not in ("throttle", "quota", "lock"):
+            self._write_outcome(outcome, work)
+        return out
+
+    def _cycle(self) -> dict:
         args = self.args
         if not self.dry and not args.force and not ams_env.throttle_ok("dream", THROTTLE_S):
             log("skipping: nightly throttle (23h) not yet elapsed")
@@ -962,6 +1152,7 @@ class Dream:
             return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}", "failed": True}
         parsed = extract_json(g.get("response", ""), "signals")
         signals = list(parsed.get("signals") or []) if parsed else []
+        self.n_signals = len(signals)
         self.save_phase("gather", {"signals": signals, "codex_ms": self.ms["gather"], "tokens": self.tokens["gather"], "dry_run": self.dry})
         log(f"  gathered {len(signals)} signals (codex {self.ms['gather']}ms, {self.tokens['gather']} tokens)")
         if not signals:
@@ -979,10 +1170,13 @@ class Dream:
                 log(f"  {note}")
                 return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": note}
 
+        # Phase 3 embeds (the drift snapshot, the insight POSTs): wait for a warm embedder first.
+        self._wait_for_embedder()
         drift_before = self.drift_snapshot("before")
 
         # ---- phase 3: consolidate
         log("=== phase 3: consolidate ===")
+        replayed_hashes = self._replay_spool() if not self.dry else set()
         signal_bullets = _lines(f"- [{s.get('kind')} p{s.get('priority')}] {s.get('text')}" for s in signals)
         evidence = [e for e in all_ev if _tier(e) in ("evidence", None)][:30]
         evidence_bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in evidence)
@@ -1006,6 +1200,7 @@ class Dream:
                 text = str(ins.get("text") or "").strip()
                 if not text:
                     continue
+                self.consolidated += 1
                 lineage = []
                 for raw in ins.get("source_memory_ids") or []:
                     rid = str(raw or "")
@@ -1024,14 +1219,22 @@ class Dream:
                     conf = float(ins.get("confidence")) if ins.get("confidence") is not None else None
                 except (TypeError, ValueError):
                     conf = None
+                if _insight_hash(text) in replayed_hashes:
+                    # last night's spooled copy of this very insight landed a moment ago: it is stored
+                    log("  insight already stored by the spool replay; not posting a duplicate")
+                    self.posted += 1
+                    continue
+                metadata = {"tier": "insight", "category": "insight", "confidence": conf,
+                            "source_memory_ids": lineage, "window_evidence_count": len(evidence),
+                            "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
+                            "dream_phase": "consolidate", "source": "dream-consolidator"}
                 try:
-                    ok = self.mem0.add(text, {"tier": "insight", "category": "insight", "confidence": conf,
-                                              "source_memory_ids": lineage, "window_evidence_count": len(evidence),
-                                              "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
-                                              "dream_phase": "consolidate", "source": "dream-consolidator"})
+                    ok = self.mem0.add(text, metadata)
                 except Exception as e:  # noqa: BLE001
-                    log(f"  insight post failed (non-fatal): {e}")
+                    log(f"  insight post failed (non-fatal; spooled for the next run): {e}")
                     ok = False
+                if not ok:
+                    self.spooled += int(self._spool_add(text, metadata, lineage))
                 if ok:
                     self.posted += 1
                     for mid in lineage:
@@ -1051,6 +1254,7 @@ class Dream:
             canonical_norm = [" ".join(t.split()).lower().strip() for t in canonical_facts]
         except Exception as e:  # noqa: BLE001
             log(f"  autopromote: canonical fetch failed (non-fatal): {e}")
+            self.canonical_fetch_failed = True
         bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 160)}" for e in candidates[:50])
         codex_json, codex_failed, promote_ms = None, False, None
         if not candidates:

@@ -9,12 +9,14 @@ sys.path.insert(0, str(SCRIPTS))
 import autopromote_lib as ap  # noqa: E402
 
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 @pytest.fixture(autouse=True)
 def _sandbox_home(tmp_path, monkeypatch):
     """The verdict tests exercise the real ams_env.write_usage path: keep every ledger row under
     tmp_path, never in the operator's ~/.mem0 (the first run wrote 30 test rows there)."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir(exist_ok=True)
 
 

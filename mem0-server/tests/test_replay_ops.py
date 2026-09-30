@@ -7,6 +7,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MOD_PATH = REPO_ROOT / "scripts" / "wsl" / "replay-ops.py"
 
+from _home_isolation import apply_home  # noqa: E402
+
+
 @pytest.fixture()
 def ro():
     try:
@@ -229,13 +232,13 @@ def test_brain_may_replay_into_loopback(ro, tmp_path, monkeypatch):
 
 def test_unmarked_box_defaults_to_brain(ro, tmp_path, monkeypatch):
     """A box with no ~/.mem0/role is a single-machine install, where loopback is correct."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    apply_home(monkeypatch, tmp_path)
     (tmp_path / ".mem0").mkdir()
     assert ro._role() == "brain"
 
 def test_canonize_op_runs_over_ssh_and_confirms(ro, tmp_path, monkeypatch):
     # v1.23 P2-8: a queued canonization executes on the authority over SSH (token minted there)
-    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    apply_home(monkeypatch, tmp_path); (tmp_path / ".mem0").mkdir()
     (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
     calls = []
     class P:  # fake CompletedProcess
@@ -248,7 +251,7 @@ def test_canonize_op_runs_over_ssh_and_confirms(ro, tmp_path, monkeypatch):
     assert conf["argv"] == ["m1", "why"] and conf["requester"] == "pc1" and conf["confirmed_ts"].endswith("Z")
 
 def test_canonize_op_unreachable_is_kept_not_conflicted(ro, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    apply_home(monkeypatch, tmp_path); (tmp_path / ".mem0").mkdir()
     (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
     class P:
         returncode = 255; stdout = ""; stderr = "unreachable"
@@ -283,7 +286,7 @@ def test_canonize_op_unreachable_is_kept_not_conflicted(ro, tmp_path, monkeypatc
     assert not (tmp_path / ".mem0" / "canonize-confirmations.jsonl").exists()
 
 def test_canonize_op_refused_by_authority_is_a_conflict(ro, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path)); (tmp_path / ".mem0").mkdir()
+    apply_home(monkeypatch, tmp_path); (tmp_path / ".mem0").mkdir()
     (tmp_path / ".mem0" / "replica.env").write_text("BRAIN_SSH='fakebrain'\n", encoding="utf-8")
     class P:
         returncode = 4; stdout = ""; stderr = "Error: memory not found"
