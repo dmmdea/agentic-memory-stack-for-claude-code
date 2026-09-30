@@ -37,18 +37,10 @@ def test_protection_is_prefix_anchored_not_substring():
 
 
 def _decide(p_older, p_newer):
-    """Mirror of the keep/delete branch in _run(): returns 'delete-newer',
-    'delete-older' (the pair was swapped) or 'skip'.
-
-    Kept in step with the source by test_decision_mirror_matches_source below.
-    """
-    if p_newer.get("tier") == "canonical":
-        return "skip"
-    if sd._is_migration_protected(p_newer):
-        if p_older.get("tier") == "canonical" or sd._is_migration_protected(p_older):
-            return "skip"
-        return "delete-older"
-    return "delete-newer"
+    """The REAL keep/delete decision (semantic-dedup.decide_pair): 'delete-newer',
+    'delete-older' (the pair was swapped) or 'skip'. It used to be a hand-kept mirror of a branch
+    inside _run(); the decision is now a function, so these tests exercise the code that runs."""
+    return sd.decide_pair(p_older, p_newer)
 
 
 def test_canonical_is_kept_not_deleted():
@@ -90,23 +82,29 @@ def test_canonical_paired_with_a_migration_deletes_neither():
     assert _decide(older, newer) == "skip"
 
 
-def test_decision_mirror_matches_source():
-    """Guard against this file's `_decide` drifting from the real branch.
+def test_migration_guard_and_canonical_guard_are_independent():
+    """The two guards are separate checks, not a chain: an older canonical record must not
+    switch the migration check off, and the canonical swap never puts canonical on the deleted side."""
+    # older canonical, newer ordinary: delete the newer, the canonical survives
+    assert _decide({"tier": "canonical"}, {"tier": "evidence"}) == "delete-newer"
+    # newer migration against an ordinary older: the migration is kept, the older goes
+    assert _decide({"tier": "evidence"}, {"source": "automemory:g--ws/a.md", "tier": "evidence"}) == "delete-older"
+    # the deleted side is never canonical, in any combination
+    for older in ({"tier": "canonical"}, {"tier": "evidence"}, {"source": "automemory:x/y.md"}):
+        for newer in ({"tier": "canonical"}, {"tier": "evidence"}, {"source": "automemory:x/y.md"}):
+            verdict = _decide(older, newer)
+            deleted = {"delete-newer": newer, "delete-older": older}.get(verdict)
+            assert deleted is None or deleted.get("tier") != "canonical"
+            assert deleted is None or not sd._is_migration_protected(deleted)
 
-    Pins the two structural properties the source must keep: the canonical and migration
-    guards are INDEPENDENT ifs (not a chain), and the canonical swap moves the canonical to
-    the kept side.
-    """
-    src = (REPO_ROOT / "scripts" / "wsl" / "semantic-dedup.py").read_text(encoding="utf-8")
-    assert "elif _is_migration_protected(p_newer):" not in src, (
-        "the migration guard must not be chained off the canonical branch")
-    assert "if _is_migration_protected(p_newer):" in src
-    assert 'if p_newer.get("tier") == "canonical":\n                        continue' in src, (
-        "a canonical record on the newer side must be skipped, never deleted")
-    assert "newer, older = older, newer" in src, "the migration swap must still exist"
-    # The pre-existing inverted swap on the OLDER-canonical branch must be gone: it moved the
-    # canonical record onto the side this job deletes.
-    assert 'if p_older.get("tier") == "canonical":\n                        newer, older = older, newer' not in src
+
+def test_operator_insight_is_never_deleted_but_consolidator_insight_is():
+    op = {"tier": "insight", "source": "user-direct"}
+    consolidator = {"tier": "insight", "source": "c1-consolidator"}
+    assert _decide(consolidator, op) == "delete-older"        # keep the operator's, drop the older auto one
+    assert _decide(op, op) == "skip"
+    assert _decide(op, consolidator) == "delete-newer"
+    assert _decide(consolidator, consolidator) == "delete-newer"
 
 
 def test_unrelated_pairs_keep_the_old_behaviour():

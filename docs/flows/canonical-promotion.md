@@ -56,6 +56,8 @@ After the nightly consolidation writes its insights, phase 3.5 may autonomously 
 | `enforce` (opt-in) | a BLOCK verdict — **or** a gate *error* (fail-safe) — skips the canonize; the nominee stays `evidence` |
 | `off` | kill switch — no verdict computed |
 
+**The effective mode is visible.** `/health/deep` reports `promotion_gate_mode` (and `checks.promotion_gate`, resolved the way the Python dream does: `MEM0_PROMOTION_GATE_MODE` in the environment, else `stack.env`, else `shadow`), and the `promotion-gate` capability reads `degraded` (a WARN, never `dead_required`) on a brain that is not enforcing. On the native brain nothing sets the variable unless the installer or the operator does, so a brain left on the `shadow` default promotes uncorroborated facts to canonical while only *logging* that the gate would have blocked them. The value itself is an operator decision carried by the installer, not by the health check.
+
 The single place that turns a verdict into a skipped promotion is the unit-tested `Resolve-GateBlocked`: `off`/`shadow` *never* block; only `enforce` does. So on a default install the 4C verdict is observed and recorded, but promotion behavior is identical to having no gate — enforcement is a deliberate, reversible operator flip.
 
 ### Where both paths converge — the server tier gate

@@ -299,6 +299,10 @@ def _run_main(monkeypatch, db, *, readyz_ok=True, present=None, present_raises=N
     monkeypatch.setattr(recon, "history_deleted_ids", fake_hist)
     monkeypatch.setattr(recon, "history_delete_row_count", fake_hist_total)
     monkeypatch.setattr(recon, "ledger_deleted", fake_led)
+    # WP-4: the weekly run also abandons stale checkpoints and backfills episode embeddings; these
+    # pre-existing orphan-classification flows must never reach the network or the embedder
+    monkeypatch.setattr(recon, "run_embedding_backfill", lambda limit, db_path: {"not_run": "test"})
+    monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
 
     def fake_get(url, **kw):
         if not readyz_ok:
@@ -499,3 +503,256 @@ def test_wholly_unparseable_ledger_segment_raises(tmp_path):
     with pytest.raises(OSError, match="unreadable"):
         recon.ledger_deleted(["x"], ledger_dir=tmp_path)
 
+
+
+# ---------------------------------------------------------------------------
+# WP-4: orphan in_progress episodes are abandoned; missing embeddings are backfilled (bounded)
+# ---------------------------------------------------------------------------
+#
+# Every prompt opens an in_progress checkpoint episode that only a later extraction finalizes; sessions
+# that produced nothing stayed in_progress forever (1,352 of them, 25 % of all episodes), and the
+# documented stale-sweep to 'abandoned' was never written. Separately the semantic layer covered 14 %
+# of eligible episodes because the backfill had no trigger and the reconcile only measured the gap.
+
+import datetime as _dtmod
+import importlib.util as _ilu
+import json as _json
+
+_SERVER = str(REPO_ROOT / "mem0-server")
+if _SERVER not in _sys.path:
+    _sys.path.insert(0, _SERVER)
+
+_NOW = _dtmod.datetime(2026, 9, 29, 12, 0, tzinfo=_dtmod.timezone.utc)
+
+
+def _real_ledger(tmp_path, rows):
+    """A ledger with the REAL schema (episodic.init_schema), rows = [(state, ended_at)]."""
+    from episodic import _connect_to, init_schema
+    db = tmp_path / "episodic.db"
+    conn = _connect_to(db)
+    init_schema(conn)
+    for i, (state, ended) in enumerate(rows, start=1):
+        # one session per episode: the schema allows at most ONE in_progress episode per session
+        conn.execute("INSERT INTO sessions (session_id, started_at) VALUES (?, '2026-01-01T00:00:00+00:00')",
+                     (f"s{i}",))
+        conn.execute(
+            "INSERT INTO episodes (id, session_id, started_at, ended_at, goal_text, summary_text, state) "
+            "VALUES (?, ?, ?, ?, '', ?, ?)", (i, f"s{i}", ended, ended, "x" * 80, state))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _states(db):
+    c = sqlite3.connect(db)
+    try:
+        return dict(c.execute("SELECT id, state FROM episodes").fetchall())
+    finally:
+        c.close()
+
+
+def test_abandon_stale_in_progress_only_touches_old_checkpoints(tmp_path):
+    day = _dtmod.timedelta(days=1)
+    iso = lambda d: (_NOW - d).isoformat()      # noqa: E731
+    db = _real_ledger(tmp_path, [
+        ("in_progress", iso(10 * day)),          # 1: orphaned checkpoint -> abandoned
+        ("in_progress", iso(1 * day)),           # 2: a live session's checkpoint -> untouched
+        ("complete", iso(30 * day)),             # 3: finished, old -> untouched
+        ("abandoned", iso(30 * day)),            # 4: already abandoned -> untouched
+        ("in_progress", iso(8 * day)),           # 5: past the window -> abandoned
+        ("in_progress", "not-a-timestamp"),      # 6: unparseable age -> left alone, never guessed
+    ])
+    n = recon.abandon_stale_in_progress(db, days=7, now=_NOW)
+    assert n == 2
+    assert _states(db) == {1: "abandoned", 2: "in_progress", 3: "complete", 4: "abandoned",
+                           5: "abandoned", 6: "in_progress"}
+    # idempotent: a second sweep finds nothing left to abandon
+    assert recon.abandon_stale_in_progress(db, days=7, now=_NOW) == 0
+
+
+def test_abandon_is_fail_soft_on_a_ledger_it_cannot_write(tmp_path):
+    """The reconcile must still produce its receipt when the sweep cannot run (no state column,
+    unreadable db): 0 abandoned and an error string, never an exception."""
+    db = _ledger_with(tmp_path, [])            # the minimal test ledger has no `state` column
+    n, err = recon.try_abandon_stale(db, days=7, now=_NOW)
+    assert n == 0 and err and "state" in err
+
+
+def test_coverage_outcome_degrades_below_ninety_percent():
+    assert recon.coverage_outcome({"eligible": 3628, "embedded": 519, "missing": 3109}) == \
+        "degraded:embedding-coverage-14"
+    assert recon.coverage_outcome({"eligible": 100, "embedded": 90, "missing": 10}) is None
+    assert recon.coverage_outcome({"eligible": 100, "embedded": 89, "missing": 11}) == \
+        "degraded:embedding-coverage-89"
+    # more points than eligible episodes (stale points for retired episodes) is full coverage, not >100 %
+    assert recon.coverage_outcome({"eligible": 100, "embedded": 140, "missing": 0}) is None
+    # nothing eligible, or the probe itself failed: no verdict from coverage
+    assert recon.coverage_outcome({"eligible": 0, "embedded": 0, "missing": 0}) is None
+    assert recon.coverage_outcome({"eligible": None, "embedded": None, "missing": None, "error": "x"}) is None
+
+
+class _FakeBackfill:
+    def __init__(self, result=None, error=None):
+        self.result, self.error, self.calls = result or {"embedded": 7, "skipped": 0, "errors": 0,
+                                                         "remaining": 0, "total_complete": 7}, error, []
+
+    def run(self, limit=None, db_path=None):
+        self.calls.append({"limit": limit, "db_path": db_path})
+        if self.error:
+            raise self.error
+        return dict(self.result)
+
+
+def test_backfill_is_bounded_and_skipped_when_the_embedder_is_down(monkeypatch, tmp_path):
+    fake = _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("down")))
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db")
+    assert out["not_run"] == "embedder-down" and fake.calls == []
+
+    monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db")
+    assert fake.calls == [{"limit": 500, "db_path": tmp_path / "e.db"}]
+    assert out["embedded"] == 7 and "not_run" not in out
+
+
+def test_backfill_failure_is_fail_soft(monkeypatch, tmp_path):
+    monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(recon, "_load_backfill", lambda: _FakeBackfill(error=ImportError("no qdrant_client")))
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db")
+    assert out["error"].startswith("ImportError") and out["embedded"] == 0
+
+
+def _main_with_episodes(monkeypatch, tmp_path, coverage, args=(), backfill=None):
+    """main() over a real-schema ledger with a stubbed coverage probe and backfill."""
+    db = _real_ledger(tmp_path, [("in_progress", (_NOW - _dtmod.timedelta(days=20)).isoformat())])
+    monkeypatch.setattr(recon, "embedding_coverage", lambda conn, http: dict(coverage))
+    fake = backfill or _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    outcome_file = tmp_path / "outcome.txt"
+    monkeypatch.setenv("AMS_OUTCOME_FILE", str(outcome_file))
+    summaries = []
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(recon, "history_deleted_ids", lambda ids, db_path=None: set())
+    monkeypatch.setattr(recon, "history_delete_row_count", lambda db_path=None: 1)
+    monkeypatch.setattr(recon, "ledger_deleted", lambda ids, ledger_dir=None: {})
+    monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(recon, "qdrant_present_ids", lambda http, ids: set())
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--db", str(db), *args])
+    rc = recon.main()
+    return rc, summaries[-1], fake, outcome_file, db
+
+
+def test_main_abandons_orphans_backfills_and_degrades_on_low_coverage(monkeypatch, tmp_path):
+    rc, s, fake, outcome_file, db = _main_with_episodes(
+        monkeypatch, tmp_path, {"eligible": 1000, "embedded": 400, "missing": 600})
+    assert s["abandoned_stale_in_progress"] == 1 and _states(db) == {1: "abandoned"}
+    assert fake.calls and fake.calls[0]["limit"] == 500
+    assert s["embedding_backfill"]["embedded"] == 7
+    assert s["outcome"] == "degraded:embedding-coverage-40"
+    assert rc == 0, "a catching-up coverage gap is reported, it does not fail the unit"
+    status, _, body = outcome_file.read_text(encoding="utf-8").partition(" ")
+    assert status == "degraded:embedding-coverage-40"
+    counts = _json.loads(body)
+    assert counts["abandoned"] == 1 and counts["embedded"] == 7 and counts["coverage_pct"] == 40
+
+
+def test_main_reads_ok_when_coverage_is_healthy(monkeypatch, tmp_path):
+    rc, s, fake, outcome_file, db = _main_with_episodes(
+        monkeypatch, tmp_path, {"eligible": 1000, "embedded": 950, "missing": 50})
+    assert rc == 0 and s["outcome"] == "ok"
+    assert outcome_file.read_text(encoding="utf-8").startswith("ok ")
+
+
+def test_low_coverage_never_masks_a_worse_outcome(monkeypatch, tmp_path):
+    """Precedence is unchanged: an infrastructure or orphan verdict stays the headline."""
+    monkeypatch.setattr(recon, "qdrant_present_ids", lambda http, ids: set())
+    db = _real_ledger(tmp_path, [("complete", _NOW.isoformat())])
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE IF NOT EXISTS episode_links (id INTEGER PRIMARY KEY, episode_id INTEGER, "
+              "link_type TEXT, target_kind TEXT, target_id TEXT)")
+    c.execute("INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) "
+              "VALUES (1, 'produced_evidence', 'mem0', 'vanished')")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(recon, "embedding_coverage", lambda conn, http: {"eligible": 10, "embedded": 1, "missing": 9})
+    monkeypatch.setattr(recon, "_load_backfill", lambda: _FakeBackfill())
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: None)
+    monkeypatch.setattr(recon, "history_deleted_ids", lambda ids, db_path=None: set())
+    monkeypatch.setattr(recon, "history_delete_row_count", lambda db_path=None: 1)
+    monkeypatch.setattr(recon, "ledger_deleted", lambda ids, ledger_dir=None: {})
+    monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--db", str(db)])
+    assert recon.main() == 1
+
+
+def test_backfill_flag_zero_disables_it(monkeypatch, tmp_path):
+    rc, s, fake, _, _ = _main_with_episodes(
+        monkeypatch, tmp_path, {"eligible": 10, "embedded": 10, "missing": 0}, args=["--backfill-limit", "0"])
+    assert fake.calls == [] and s["embedding_backfill"] == {"not_run": "disabled"}
+
+
+# --- the backfill script itself: bounded, newest first, fail-open per row, aborts on a dead embedder ---
+
+def _load_backfill_script():
+    spec = _ilu.spec_from_file_location("episode_embed_backfill", REPO_ROOT / "scripts" / "wsl" / "episode-embed-backfill.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Emb:
+    def __init__(self, fail_from=None):
+        self.n, self.fail_from = 0, fail_from
+
+    def embed(self, text, memory_action=None):
+        self.n += 1
+        if self.fail_from is not None and self.n >= self.fail_from:
+            raise RuntimeError("embedder down")
+        return [0.1, 0.2, 0.3]
+
+
+def _backfill_db(tmp_path, n=8):
+    from episodic import _connect_to, init_schema
+    conn = _connect_to(tmp_path / "b.db")
+    init_schema(conn)
+    conn.execute("INSERT INTO sessions (session_id, started_at, brand) VALUES ('s1', 'a', 'brand-x')")
+    for i in range(1, n + 1):
+        conn.execute("INSERT INTO episodes (id, session_id, started_at, ended_at, goal_text, summary_text, state) "
+                     "VALUES (?, 's1', 'a', 'b', 'g', ?, 'complete')", (i, "summary text " * 8))
+    conn.execute("INSERT INTO episodes (id, session_id, started_at, ended_at, goal_text, summary_text, state) "
+                 "VALUES (99, 's1', 'a', 'b', '', ?, 'in_progress')", ("checkpoint " * 12,))
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def test_backfill_script_respects_limit_newest_first_and_reports_remaining(tmp_path):
+    mod = _load_backfill_script()
+    conn = _backfill_db(tmp_path)
+    seen = []
+    out = mod.backfill(conn, {8}, _Emb(), lambda ep, vec, payload: seen.append(ep), limit=3)
+    conn.close()
+    assert seen == [7, 6, 5], "newest first, existing (8) skipped, capped at the limit"
+    assert out["embedded"] == 3 and out["remaining"] == 4 and out["errors"] == 0
+    assert 99 not in seen, "an in_progress checkpoint is never indexed"
+
+
+def test_backfill_script_without_a_limit_embeds_everything_oldest_first(tmp_path):
+    mod = _load_backfill_script()
+    conn = _backfill_db(tmp_path, n=4)
+    seen = []
+    out = mod.backfill(conn, set(), _Emb(), lambda ep, vec, payload: seen.append((ep, payload["brand"])))
+    conn.close()
+    assert seen == [(1, "brand-x"), (2, "brand-x"), (3, "brand-x"), (4, "brand-x")]
+    assert out["embedded"] == 4 and out["remaining"] == 0
+
+
+def test_backfill_script_stops_after_consecutive_embed_failures(tmp_path):
+    mod = _load_backfill_script()
+    conn = _backfill_db(tmp_path, n=20)
+    out = mod.backfill(conn, set(), _Emb(fail_from=3), lambda ep, vec, payload: None, limit=500)
+    conn.close()
+    assert out["embedded"] == 2 and out["errors"] == mod.MAX_CONSECUTIVE_ERRORS
+    assert out["aborted"] and out["remaining"] == 18

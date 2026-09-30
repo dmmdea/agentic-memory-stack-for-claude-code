@@ -34,6 +34,9 @@ anyio>=4.3.0
 # ships silently dead (mem0 fail-softs to dense-only). Floor-only, no cap —
 # the /health/deep sparse_leg canary is the drift tripwire, not a version pin.
 fastembed>=0.3.1
+# WP-4: scripts/wsl/semantic-dedup.py (nightly) scores near-duplicates with blocked numpy matrix
+# products. It arrives transitively with fastembed; named here so the dedup never depends on that.
+numpy>=1.26
 
 # Dev / audit tools
 # pip-audit is installed by the installer (both branches) and required by its post-condition;

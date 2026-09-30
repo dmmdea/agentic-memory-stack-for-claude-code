@@ -50,6 +50,7 @@ GREEN_CHECKS = {
     "mojibake": {"ok": True, "scanned": 100, "hits": 0, "sample_ids": [],
                  "elapsed_ms": 12},
     "pending_contradiction_reviews": 0,
+    "promotion_gate": {"role": "brain", "mode": "enforce", "source": "stack.env"},
     "reranker": {"last_rerank_ok_ts": NOW_S - 3600, "consecutive_rerank_failures": 0,
                  "ok_total": 12, "fail_total": 0, "last_error": None},
     "admission_probe": {"ok": True, "tier_rejected": True, "brand_rejected": True,
@@ -58,6 +59,10 @@ GREEN_CHECKS = {
         "role": "brain",
         "last_dream_age_h": 10.0, "prune_age_h": 10.0, "gather_age_h": 10.0,
         "backup_manifest_age_h": 12.0, "dedup_report_age_h": 12.0,
+        # WP-4: the dedup-job verdict reads the job's own summary (work counts), not the mtime
+        "dedup_summary_age_h": 12.0, "dedup_last_outcome": "ok",
+        "dedup_last_scanned": 16000, "dedup_last_compared_pairs": 90_000_000,
+        "dedup_last_skipped_no_vector": 0,
         "morning_summary_age_h": 10.0, "morning_summary_sections_48h": 2,
         "l1a_attempt_age_h": 0.5, "l1a_success_age_h": 2.0,
         "sessionstart_banner_age_h": 1.0,
@@ -87,6 +92,7 @@ PROBE_BACKED = [
     "memory-index", "sweep-job", "codex-auth",
 ]
 # W4: formerly 'none -- W4' (always unknown), now each with a real evaluator.
+WP4_ROWS = ["promotion-gate"]
 W4_REVIVED = [
     "reranker", "l1a-extraction", "sessionstart-banner", "mcp-shim",
     "admission-gate", "tier-policy", "brand-isolation", "offline-outbox",
@@ -113,7 +119,7 @@ def _ev(checks, role="brain", **kw):
 def test_GREEN_CHECKS_truth_table():
     out = _ev(GREEN_CHECKS)
     assert out["role"] == "brain"
-    for cid in PROBE_BACKED + W4_REVIVED:
+    for cid in PROBE_BACKED + W4_REVIVED + WP4_ROWS:
         assert out["states"][cid] == "alive", cid
     assert out["dead_required"] == []
     assert out["unknown"] == []
@@ -220,12 +226,48 @@ def test_drift_snapshot_failures_dead():
 
 
 def test_nightly_receipt_ladder():
-    # alive <= 48h, degraded <= 96h, dead beyond, unknown on no signal.
+    # The dream-cycle row keeps the plain age ladder: alive <= 48h, degraded <= 96h, dead beyond,
+    # unknown on no signal.
     for age, want in ((10.0, "alive"), (60.0, "degraded"),
                       (200.0, "dead"), (None, "unknown")):
-        jl = dict(GREEN_CHECKS["job_liveness"], dedup_report_age_h=age)
+        jl = dict(GREEN_CHECKS["job_liveness"], last_dream_age_h=age)
         out = _ev(_checks(job_liveness=jl))
-        assert out["states"]["dedup-job"] == want, (age, want)
+        assert out["states"]["dream-cycle"] == want, (age, want)
+
+
+def test_dedup_job_reads_work_not_mtime():
+    """The finding: the dedup capability read the mtime of a report the job unlinks and rewrites on
+    every run, so it said 'alive' while the job compared nothing for ~54 nights. It now reads the
+    job's own summary: what it scanned and compared, and how old that summary is."""
+    def state(**kw):
+        jl = dict(GREEN_CHECKS["job_liveness"], **kw)
+        return _ev(_checks(job_liveness=jl))["states"]["dedup-job"]
+
+    assert state() == "alive"
+    # scanned a real corpus, compared zero pairs: the exact bug, however fresh the file is
+    assert state(dedup_last_scanned=16000, dedup_last_compared_pairs=0, dedup_report_age_h=0.1) == "degraded"
+    # a tiny corpus that legitimately has nothing to compare is not the bug
+    assert state(dedup_last_scanned=800, dedup_last_compared_pairs=0) == "alive"
+    # exactly at the 1000 line still counts as small (the rule is scanned > 1000)
+    assert state(dedup_last_scanned=1000, dedup_last_compared_pairs=0) == "alive"
+    # the job's own degraded / no-op outcome is surfaced
+    assert state(dedup_last_outcome="degraded:skipped-no-vector") == "degraded"
+    assert state(dedup_last_outcome="no-op:backend-unreachable:ConnectError") == "degraded"
+    # a missing summary is degraded (the old probe said 'unknown' or, off a stale report, 'alive')
+    assert state(dedup_summary_age_h=None, dedup_last_outcome=None, dedup_last_scanned=None,
+                 dedup_last_compared_pairs=None) == "degraded"
+    # older than 36 h: a night was missed; beyond four nights it is dead, not late
+    assert state(dedup_summary_age_h=30.0) == "alive"
+    assert state(dedup_summary_age_h=40.0) == "degraded"
+    assert state(dedup_summary_age_h=200.0) == "dead"
+
+
+def test_dedup_job_falls_back_to_report_age_on_an_old_liveness_shape():
+    """A job_liveness dict from before the summary fields existed has no dedup_summary_* keys at
+    all: keep the age ladder rather than convicting on absent keys."""
+    jl = {k: v for k, v in GREEN_CHECKS["job_liveness"].items() if not k.startswith("dedup_summary")
+          and not k.startswith("dedup_last")}
+    assert _ev(_checks(job_liveness=jl))["states"]["dedup-job"] == "alive"
 
 
 def test_codex_auth_derived_never_dead():
@@ -677,3 +719,45 @@ def test_new_rows_never_raise_on_a_legacy_checks_dict():
     for cid in W4_REVIVED:
         assert out["states"][cid] == "unknown", cid
     assert out["dead_required"] == []
+
+
+# ======================================================================
+# WP-4 -- the promotion gate's effective mode is visible
+# ======================================================================
+#
+# The dream resolves the 4C promotion gate as env > stack.env > 'shadow'. On the brain nothing set it,
+# so every verdict was only logged and uncorroborated facts were promoted to canonical anyway - with
+# nothing on /health/deep saying so. The row makes the effective mode visible and reads 'degraded'
+# (the WARN state) for a brain that is not enforcing. The VALUE is set by the installer, not here.
+
+def test_promotion_gate_mode_precedence_env_then_stack_env_then_default(tmp_path):
+    from capabilities import promotion_gate_health
+    stack = tmp_path / "stack.env"
+    stack.write_text("MEM0_ROLE=brain\nMEM0_PROMOTION_GATE_MODE=enforce\n", encoding="utf-8")
+    assert promotion_gate_health("brain", environ={"MEM0_PROMOTION_GATE_MODE": " Shadow "},
+                                 stack_env_path=stack) == {"role": "brain", "mode": "shadow", "source": "env"}
+    assert promotion_gate_health("brain", environ={}, stack_env_path=stack) == {
+        "role": "brain", "mode": "enforce", "source": "stack.env"}
+    assert promotion_gate_health("brain", environ={}, stack_env_path=tmp_path / "missing.env") == {
+        "role": "brain", "mode": "shadow", "source": "default"}
+
+
+def test_promotion_gate_row_warns_on_a_brain_that_only_shadows():
+    def state(mode, role="brain", check=True):
+        checks = _checks(promotion_gate={"role": role, "mode": mode, "source": "default"})
+        if not check:
+            checks.pop("promotion_gate")
+        return _ev(checks, role=role)["states"]["promotion-gate"]
+
+    assert state("enforce") == "alive"
+    assert state("shadow") == "degraded"          # the finding: brain + shadow
+    assert state("off") == "degraded"             # a disabled gate is not enforcing either
+    assert state("shadow", role="replica") == "unknown"   # the dream (and the gate) run on the brain only
+    assert state("enforce", check=False) == "unknown"
+    # a WARN, never a conviction: degraded rows are not dead_required
+    out = _ev(_checks(promotion_gate={"role": "brain", "mode": "shadow", "source": "default"}))
+    assert "promotion-gate" not in out["dead_required"]
+
+
+def test_promotion_gate_row_is_documented():
+    assert "promotion-gate" in _doc_table_ids()

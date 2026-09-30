@@ -27,6 +27,10 @@ from reranker import rerank as bge_rerank
 from reranker import rerank_health as _rerank_health
 from reranker import warm as _rerank_warm, RAN_STATUSES as _RERANK_RAN_STATUSES
 from admission_gate import apply_admission
+# WP-4: contradicts_canonical stamps are enforced only while their target is still canonical; the
+# gate resolves targets through this fetcher (registered below, once `mem` exists).
+from admission_gate import set_stamp_tier_fetcher as _set_stamp_tier_fetcher
+from admission_gate import resolve_stamp_tiers as _resolve_stamp_tiers
 # W5 T1.3: the PURE evaluate path for the diagnose endpoint — never
 # apply_admission there (it mutates the MEM-8 counters + audit log).
 from admission_gate import default_policy_for_class
@@ -44,9 +48,11 @@ from sparse_health import encode_with_selfheal   # AMS-09b: bounded sentinel un-
 # text_lemmatized — exact store-side parity for the keyword union leg.
 from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize_bm25
 from mojibake_check import mojibake_health       # AMS-10: CP437 corpus tripwire
+from mojibake_check import PAYLOAD_KEYS          # WP-4: fields the scan reads (text + the mojibake_ok allowlist)
 from job_liveness import job_liveness_health     # W3: nightly-job receipt ages (informational)
 from drift_state import drift_state_health       # W3: retrieval-drift guard state (informational)
 from capabilities import evaluate as evaluate_capabilities  # W3: capability manifest (informational)
+from capabilities import promotion_gate_health as _promotion_gate_health  # WP-4: effective gate mode
 # W4: in-process admission self-probe. Calls AdmissionPolicy.evaluate() DIRECTLY —
 # never apply_admission, which would bump the MEM-8 daily counters this endpoint
 # reports and append to ~/.mem0/admission-rejected.jsonl on every health read.
@@ -169,6 +175,17 @@ mem = Memory.from_config(build_config())
 from config import build_embedder
 mem.embedding_model = build_embedder()
 log.info("mem0 initialized (embedder: EmbeddingGemma-300m prefix-shim, collection: mem0_egemma_768)")
+
+def _stamp_tier_fetch(ids):
+    """One batched retrieve of the CURRENT tier of each contradicts_canonical target (payload-only,
+    no vectors). Ids absent from Qdrant are simply not returned (the gate reads that as dangling)."""
+    recs = mem.vector_store.client.retrieve(
+        collection_name=mem.vector_store.collection_name, ids=list(ids),
+        with_payload=["tier"], with_vectors=False)
+    return {str(r.id): (getattr(r, "payload", None) or {}).get("tier") for r in recs}
+
+
+_set_stamp_tier_fetcher(_stamp_tier_fetch)
 
 # v0.29 R4: ensure the semantic episode collection exists (idempotent). Non-fatal
 # — if it fails, the raw-trace fallback search simply no-ops (fail-soft).
@@ -1102,7 +1119,7 @@ def health_deep() -> dict:
     def _mj_scroll(offset, limit):
         return mem.vector_store.client.scroll(
             mem.vector_store.collection_name,
-            with_payload=["data", "text_lemmatized"], with_vectors=False,
+            with_payload=list(PAYLOAD_KEYS), with_vectors=False,
             limit=limit, offset=offset,
         )
     out["checks"]["mojibake"] = mojibake_health(_mj_scroll)
@@ -1145,6 +1162,9 @@ def health_deep() -> dict:
         out["checks"]["admission_probe"] = {"ok": False, "error": str(e)[:120]}
     try:
         _cap_role = (out["checks"].get("job_liveness") or {}).get("role")
+        # WP-4: the effective 4C promotion-gate mode (env > stack.env > shadow) and its WARN row
+        out["checks"]["promotion_gate"] = _promotion_gate_health(_cap_role)
+        out["promotion_gate_mode"] = out["checks"]["promotion_gate"]["mode"]
         out["checks"]["capabilities"] = evaluate_capabilities(
             out["checks"], _cap_role, stack_version=STACK_VERSION)
     except Exception as e:
@@ -1842,7 +1862,12 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                       "created_at": payload.get("created_at")}
         scope = {"user_id": user_id, "brand": b.brand,
                  "allow_cross_brand": b.allow_cross_brand}
-        adm = default_policy_for_class(qc).evaluate(adm_record, scope, qc)
+        # WP-4: same stamp-target resolution as the live gate, or the verdict diverges from what
+        # search really does (a stamp against a demoted target is ignored there).
+        _stamp = target_meta.get("contradicts_canonical")
+        adm = default_policy_for_class(qc).evaluate(
+            adm_record, scope, qc,
+            stamp_tiers=(_resolve_stamp_tiers([_stamp]) if _stamp else None))
         # -- probe 4: rerank delta, bounded to the overfetch-sized pool
         # (review: NEVER the 500-pool — multi-minute CPU) --
         rerank_probe = {"requested": bool(b.rerank), "ran": False,
@@ -3270,8 +3295,11 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # (fail-closed) before deriving only_brand_neutral — `not "  "` is False
             # otherwise, dropping the gate to admit-all (audit MED, goals/OQ variant).
             _bb = b.brand.strip() if isinstance(b.brand, str) else b.brand
-            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"])
-            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"])
+            # WP-4: never serve a session its OWN goals/open questions (they are minted from the
+            # session you are in, so they were echoed straight back: 41 % of prompts), and rank what
+            # is left by how recently an episode touched it rather than by priority alone.
+            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
+            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
     except Exception:
         log.exception("bundle: goals/open_questions failed (non-fatal)")
         out.setdefault("goals", [])

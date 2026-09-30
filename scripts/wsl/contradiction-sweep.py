@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import subprocess
 import sys
@@ -377,21 +378,8 @@ def parse_verdict(content: str) -> Optional[bool]:
     return None
 
 
-def dense_vector(point: dict) -> Optional[list]:
-    """Extract the unnamed dense vector from a Qdrant point. The collection
-    carries the default unnamed 768-d vector plus a named 'bm25' sparse vector,
-    so with_vector=true returns a dict keyed by name ('' = dense)."""
-    v = point.get("vector")
-    if isinstance(v, list):
-        return v
-    if isinstance(v, dict):
-        dense = v.get("")
-        if isinstance(dense, list):
-            return dense
-        for val in v.values():  # defensive: first list-valued entry
-            if isinstance(val, list):
-                return val
-    return None
+# WP-4: the one shared extractor (ams_env.dense_vector); the name stays for the callers below.
+dense_vector = ams_env.dense_vector
 
 
 def parse_created(point: dict) -> Optional[dt.datetime]:
@@ -412,6 +400,45 @@ def is_older(neighbor: dict, anchor: dict) -> bool:
     an unparseable timestamp on either side returns False, so we never supersede on unknown order."""
     nc, ac = parse_created(neighbor), parse_created(anchor)
     return bool(nc and ac and nc < ac)
+
+
+def _checked_epoch(point: dict) -> float:
+    """contradiction_checked_at of a point as an epoch, -inf when absent or unparseable (so a
+    never-checked canonical sorts before every checked one)."""
+    raw = (point.get("payload") or {}).get("contradiction_checked_at")
+    if not raw:
+        return float("-inf")
+    try:
+        return dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return float("-inf")
+
+
+def order_canonicals(canonicals: list[dict]) -> list[dict]:
+    """Rotation order: never-checked first, then the longest-unchecked, ties on id. With --limit this
+    makes the cut a rotating budget. The sweep used to take the same first N ids in scroll order
+    every week, so the canonicals sorting after that cut were never judged."""
+    return sorted(canonicals, key=lambda p: (_checked_epoch(p), str(p.get("id"))))
+
+
+def sweep_coverage(total: int, processed: int) -> dict:
+    """{canonicals_checked, canonical_total, weeks_for_full_pass}: how many canonicals this run
+    covered and how many weekly runs a full pass takes at that rate (None = no progress)."""
+    if total <= 0:
+        weeks = 0
+    elif processed <= 0:
+        weeks = None
+    else:
+        weeks = math.ceil(total / processed)
+    return {"canonicals_checked": processed, "canonical_total": total, "weeks_for_full_pass": weeks}
+
+
+def resolve_user_id(arg: Optional[str]) -> Optional[str]:
+    """--user-id defaulting to the corpus tenant (ams_env.user_id()). An explicit empty string means
+    every user; with no tenant configured the sweep is unscoped, as before."""
+    if arg is None:
+        return ams_env.user_id() or None
+    return arg or None
 
 
 def same_brand_scope(canonical_brand, candidate_brand) -> bool:
@@ -492,15 +519,27 @@ def model_available(models_json, model: str) -> bool:
 
 
 def run_outcome(canonical_total: int, pairs_checked: int, skipped_pairs: int,
-                aborted: Optional[str]) -> str:
+                aborted: Optional[str], all_no_vector: bool = False,
+                marker_failed: int = 0, user_id_defaulted: bool = False) -> str:
     """v0.20 M7: classify a completed run for the JSONL summary + R6c.
     'ok' | 'degraded:<reason>' (exit nonzero) | 'no-op:<reason>' (exit 0,
     R6c WARNs). pairs_checked==0 with canonicals present is 'ok' — the
-    idempotent steady state where every candidate was checked recently."""
+    idempotent steady state where every candidate was checked recently.
+
+    Zero canonicals is a quiet no-op only when the operator chose the scope: --user-id defaults to
+    the corpus tenant, and a wrong tenant scopes to zero canonicals, which exited 0 and read ok.
+    Any failed rotation-marker write degrades (unlike a Qdrant query blip, it is a broken write path,
+    and a canonical whose marker keeps failing stays at the front of the rotation every week)."""
     if aborted:
         return _outcome_for_abort(aborted)
     if canonical_total == 0:
-        return "no-op:zero-canonicals"
+        return ("degraded:zero-canonicals-defaulted-tenant" if user_id_defaulted
+                else "no-op:zero-canonicals")
+    if all_no_vector:
+        # every canonical in the run lacked a dense vector: a shape change, not a quiet week
+        return "degraded:no-vectors"
+    if marker_failed > 0:
+        return f"degraded:marker-failed:{marker_failed}"
     if pairs_checked > 0 and skipped_pairs == pairs_checked:
         return "no-op:all-pairs-skipped"
     return "ok"
@@ -511,31 +550,97 @@ def exit_code_for(outcome: str) -> int:
     return 1 if str(outcome).startswith("degraded") else 0
 
 
+_OUTCOME_RANK = {"ok": 0, "degraded": 1, "failed": 2}
+_OUTCOME_SCOPE = ""   # "rejudge" while main() runs the chained second pass: its counts sit beside the sweep's
+
+
+def _c1_status(outcome: str) -> str:
+    """The sweep's outcome vocabulary in the C1 grammar of scripts/wsl/ams-step.sh:
+    `<status>[:<reason>]`, status = ok | degraded | failed, the reason without whitespace.
+      ok           -> ok
+      no-op:<r>    -> degraded:no-op-<r>   exit 0 by design (the weekly unit is not noisy), but the run
+                                           did nothing, so it must not read ok in the receipt
+      degraded:<r> -> degraded:<r>         (exits non-zero; ams-step then reads the receipt as failed)
+      fatal:<r>    -> failed:<r>
+      degraded / failed (already C1) pass through
+      anything else (refused:*, a future outcome) -> degraded:<outcome>: a line the receipt cannot
+      read as ok must never be able to read as ok.
+    Whitespace folds to '-' (the abort grammar carries spaces, and the reason ends at the first one)."""
+    o = "-".join(str(outcome).split())[:160] or "ok"
+    if o == "ok":
+        return "ok"
+    if o.startswith("no-op:"):
+        return "degraded:no-op-" + o[len("no-op:"):]
+    if o.startswith("fatal:"):
+        return "failed:" + o[len("fatal:"):]
+    if o.split(":", 1)[0] in ("degraded", "failed"):
+        return o
+    return "degraded:" + o
+
+
+def _read_outcome_line(path: Path) -> tuple:
+    """(status token, counts) of the line already in the outcome file; ("", {}) when there is none."""
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return "", {}
+    if not lines:
+        return "", {}
+    status, _, body = lines[-1].strip().partition(" ")
+    try:
+        counts = json.loads(body) if body.strip() else {}
+    except ValueError:
+        counts = {}
+    return status, counts if isinstance(counts, dict) else {}
+
+
 def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
-    """Step outcome contract (C1, scripts/wsl/ams-step.sh): under the chain, ONE line in
-    $AMS_OUTCOME_FILE lets the receipt say what exit 0 cannot. A no-op run (the shim was down, no
-    canonicals, every pair skipped) exits 0 by design so the weekly unit is not noisy, but it did
-    nothing: it reads `degraded:no-op-<reason>` there, and a real run reads `ok {counts}`. degraded:*
-    and fatal:* already exit non-zero, so the exit code is their signal and they write nothing."""
+    """Step outcome contract (C1, scripts/wsl/ams-step.sh): under the chain ams-step.sh exports
+    $AMS_OUTCOME_FILE and reads ONE line from it, `<status>[:<reason>] <json counts>`, which lets the
+    receipt say what exit 0 cannot. A no-op run (the shim was down, no canonicals, every pair skipped)
+    exits 0 by design, but it did nothing: it reads `degraded:no-op-<reason>`; a real run reads
+    `ok {counts}`; a degraded run (exit 1) and a fatal one write their line too, because the receipt
+    takes `work` from it even when the exit code has already made the step `failed`.
+
+    One line per run, never a downgrade. main() runs the sweep and then the stamped re-judge
+    (--then-rejudge-stamped) against the same file: the second pass finishing ok must not overwrite the
+    first pass's degraded line, and its counts are added beside the sweep's (prefixed with the scope
+    so `yes` from the sweep is not lost to `yes` from the re-judge) rather than over them."""
     path = os.environ.get("AMS_OUTCOME_FILE")
     if not path:
         return
-    if outcome == "ok":
-        head = "ok"
-    elif outcome.startswith("no-op:"):
-        head = "degraded:no-op-" + "-".join(outcome[len("no-op:"):].split())
-    else:
-        return
+    status = _c1_status(outcome)
+    counts = {(f"{_OUTCOME_SCOPE}_{k}" if _OUTCOME_SCOPE else k): v for k, v in (counts or {}).items()}
     try:
-        Path(path).write_text(f"{head} {json.dumps(counts or {}, separators=(',', ':'))}\n", encoding="utf-8")
-    except OSError as e:  # the receipt hint must never fail the sweep
+        p = Path(path)
+        prior_status, prior_counts = _read_outcome_line(p)
+        prior_rank = _OUTCOME_RANK.get(prior_status.split(":", 1)[0], -1)
+        new_rank = _OUTCOME_RANK[status.split(":", 1)[0]]
+        if _OUTCOME_SCOPE:
+            if prior_rank >= new_rank:
+                status = prior_status      # the sweep pass keeps its reason; this pass only adds counts
+            counts = {**prior_counts, **counts}
+        elif prior_rank > new_rank:
+            return                         # never downgrade
+        p.write_text(f"{status} {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except (OSError, TypeError, ValueError) as e:  # the receipt hint must never fail the sweep
         print(f"contradiction-sweep: outcome file write failed (non-fatal): {e}", flush=True)
 
 
 def _finish(outcome: str, counts: Optional[dict] = None) -> int:
-    """Every mode's last line: record the outcome for the step receipt, return the unit's exit code."""
+    """The last line of a leg: record the outcome with the leg's counts for the step receipt, return
+    the unit's exit code. (_append_summary already wrote the status line for every path that logs a
+    summary; this adds the counts at the end of a leg.)
+
+    A non-zero exit also says WHY on stderr: ams-step.sh records such a run as `failed` and takes the
+    stderr tail as the receipt's note (the last stdout line only when stderr is empty), and the chained
+    re-judge prints after a failed sweep pass, so without this line the note would be the second
+    pass's last line, not the reason the run failed."""
     _write_outcome(outcome, counts)
-    return exit_code_for(outcome)
+    rc = exit_code_for(outcome)
+    if rc:
+        print(f"contradiction-sweep: exit {rc}: {outcome}", file=sys.stderr, flush=True)
+    return rc
 
 
 def judge_pair(http: httpx.Client, model: str, canonical_text: str,
@@ -858,6 +963,26 @@ def stamp_candidate(http: httpx.Client, candidate_id: str, checked_at: str,
     return True
 
 
+def mark_canonical_checked(http: httpx.Client, canonical_id: str, checked_at: str) -> bool:
+    """Write the sweep's rotation marker (contradiction_checked_at) onto a CANONICAL point through the
+    trusted-actor PATCH. order_canonicals sorts on it, so without this write the rotation would never
+    advance: the marker used to exist only on candidates."""
+    try:
+        r = http.patch(
+            f"{MEM0}/v1/memories/{canonical_id}/metadata",
+            json={"metadata": {"contradiction_checked_at": checked_at}, "actor": ACTOR,
+                  "reason": f"contradiction sweep rotation marker: canonical swept @ {checked_at}"},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as e:
+        print(f"contradiction-sweep: MARK EXCEPTION {canonical_id}: {e}", flush=True)
+        return False
+    if r.status_code != 200:
+        print(f"contradiction-sweep: MARK FAIL {canonical_id}: mem0={r.status_code} body={r.text[:200]}", flush=True)
+        return False
+    return True
+
+
 def resolve_action(verdict: Optional[bool], was_pending: bool, no_auto_promote: bool) -> str:
     """What a rejudge verdict does. SAFE policy (no_auto_promote=True, 2026-06-30): a YES on an
     advisory-pending record is QUEUED for human review, never auto-hidden — Codex over-promotes
@@ -872,9 +997,19 @@ def resolve_action(verdict: Optional[bool], was_pending: bool, no_auto_promote: 
     return "queue-review" if no_auto_promote else "promote"
 
 
-def _queued_ids(path) -> set:
-    """memory_ids already in the review queue (for idempotent append)."""
-    ids: set = set()
+STALE_KIND = "canonical-possibly-stale"
+
+
+def _queue_key(rec: dict) -> tuple:
+    """Idempotency key of a review-queue line: (memory_id, kind, stale canonical). A promote line has
+    no kind and no stale canonical; the stale kind names the canonical it doubts. Keying on memory_id
+    alone let a candidate already queued for promote swallow its canonical-possibly-stale record."""
+    return (rec.get("memory_id"), rec.get("kind") or "", rec.get("stale_canonical_id") or "")
+
+
+def _queued_keys(path) -> set:
+    """Keys (see _queue_key) already in the review queue, for idempotent append."""
+    keys: set = set()
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -882,21 +1017,21 @@ def _queued_ids(path) -> set:
                 if not line:
                     continue
                 try:
-                    ids.add(json.loads(line).get("memory_id"))
-                except ValueError:
+                    keys.add(_queue_key(json.loads(line)))
+                except (ValueError, AttributeError):
                     pass
     except OSError:
         pass
-    return ids
+    return keys
 
 
 def append_review_queue(path, record: dict) -> bool:
-    """Append a YES-promote candidate to the human-review queue (one JSON line), IDEMPOTENT by
-    memory_id so a re-flagged candidate isn't duplicated across weekly runs. Never raises —
-    returns False on any write failure (the queue is advisory, must not crash the sweep)."""
+    """Append a candidate to the human-review queue (one JSON line), IDEMPOTENT by _queue_key so a
+    re-flagged candidate isn't duplicated across weekly runs while a different kind of record for the
+    same memory still lands. Never raises: returns False on any write failure (the queue is advisory,
+    must not crash the sweep)."""
     try:
-        mid = record.get("memory_id")
-        if mid and mid in _queued_ids(path):
+        if record.get("memory_id") and _queue_key(record) in _queued_keys(path):
             return True  # already queued -> idempotent no-op
         record.setdefault("ts", _iso_now())
         p = Path(path)
@@ -908,9 +1043,9 @@ def append_review_queue(path, record: dict) -> bool:
         return False
 
 
-def remove_from_review_queue(path, memory_id) -> int:
-    """Drop all queue lines for memory_id (called after a human --promote, so the review count
-    reflects only OUTSTANDING candidates). Returns lines removed. Never raises."""
+def _drop_queue_lines(path, should_drop) -> int:
+    """Rewrite the queue without the lines should_drop(record) accepts; returns lines removed.
+    Unparseable lines are kept verbatim. Never raises."""
     try:
         p = Path(path)
         if not p.is_file():
@@ -926,7 +1061,7 @@ def remove_from_review_queue(path, memory_id) -> int:
                 except ValueError:
                     kept.append(s)
                     continue
-                if rec.get("memory_id") == memory_id:
+                if isinstance(rec, dict) and should_drop(rec):
                     removed += 1
                 else:
                     kept.append(s)
@@ -937,6 +1072,46 @@ def remove_from_review_queue(path, memory_id) -> int:
         return removed
     except OSError:
         return 0
+
+
+def remove_from_review_queue(path, memory_id, exclude_kinds: tuple = ()) -> int:
+    """Drop the queue lines for memory_id (called after a human --promote or --dismiss, so the review
+    count reflects only OUTSTANDING candidates), except lines whose kind is in exclude_kinds. Returns
+    lines removed. Never raises."""
+    return _drop_queue_lines(
+        path, lambda rec: rec.get("memory_id") == memory_id and (rec.get("kind") or "") not in exclude_kinds)
+
+
+def prune_stale_review_entries(http: httpx.Client, path) -> int:
+    """Drop canonical-possibly-stale lines whose stale canonical is no longer a live canonical (demoted,
+    retired or gone): the doubt they record is settled, and nothing else ever removed them, so the queue
+    only grew and pending_contradiction_reviews trended to permanent degraded. A canonical that cannot be
+    looked up (transport or HTTP error) keeps its lines: absent and errored are different answers, as in
+    fetch_point_info. Returns lines removed."""
+    wanted: set = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("kind") == STALE_KIND and rec.get("stale_canonical_id"):
+                    wanted.add(str(rec["stale_canonical_id"]))
+    except OSError:
+        return 0
+    settled: set = set()
+    for cid in sorted(wanted):
+        try:
+            info = fetch_point_info(http, cid)
+        except (httpx.HTTPError, OSError, ValueError):
+            continue
+        if info is None or info["tier"] != "canonical" or info["retired"]:
+            settled.add(cid)
+    if not settled:
+        return 0
+    return _drop_queue_lines(
+        path, lambda rec: rec.get("kind") == STALE_KIND and str(rec.get("stale_canonical_id")) in settled)
 
 
 def _acquire_lock(path, stale_s: int = 3600) -> bool:
@@ -986,12 +1161,26 @@ def run_promote(mem0_http: httpx.Client, memory_id: str) -> int:
     ok = stamp_candidate(mem0_http, memory_id, _iso_now(), contradicts=str(canonical_id),
                          justification="human-confirmed promote from review queue", pending=False)
     if ok:
-        remove_from_review_queue(str(REVIEW_QUEUE), memory_id)  # outstanding-only review count
+        # outstanding-only review count; the stale record for the same memory is a different question
+        remove_from_review_queue(str(REVIEW_QUEUE), memory_id, exclude_kinds=(STALE_KIND,))
         print(f"contradiction-sweep: --promote {memory_id}: ENFORCED (hidden) vs canonical "
               f"{canonical_id} — human-confirmed", flush=True)
         return 0
     print(f"contradiction-sweep: --promote {memory_id}: stamp FAILED", flush=True)
     return 1
+
+
+def run_dismiss(memory_id: str) -> int:
+    """--dismiss <memory_id>: the operator's answer to a review-queue line that needs no stamp, chiefly
+    canonical-possibly-stale (--promote refuses it: it has no canonical_id). Drops every queue line for
+    memory_id. Exit 0 when something was removed, 1 when nothing matched."""
+    removed = remove_from_review_queue(str(REVIEW_QUEUE), memory_id)
+    if not removed:
+        print(f"contradiction-sweep: --dismiss {memory_id}: not found in review queue "
+              f"({REVIEW_QUEUE}) - nothing to dismiss", flush=True)
+        return 1
+    print(f"contradiction-sweep: --dismiss {memory_id}: removed {removed} review-queue line(s)", flush=True)
+    return 0
 
 
 def run_unstamp(mem0_http: httpx.Client, memory_id: str) -> int:
@@ -1130,6 +1319,12 @@ def _append_summary(record: dict) -> None:
             f.write(json.dumps(record) + "\n")
     except OSError as e:  # advisory log must never crash the sweep
         print(f"contradiction-sweep: summary append failed (non-fatal): {e}", flush=True)
+    # Every terminal path (preflight failures, no-ops, all four legs) logs its summary here, so this
+    # is the net that gives each of them its C1 status line, including a path added later that
+    # forgets _finish: an exit-0 run that did nothing must never be able to read ok. The leg's counts
+    # arrive with _finish, which overwrites this line at the end of the leg.
+    if record.get("outcome"):
+        _write_outcome(str(record["outcome"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1168,6 +1363,14 @@ def fetch_point_text(http: httpx.Client, point_id: str) -> Optional[str]:
     / HTTP / parse failure — the caller MUST NOT treat that as absence: conflating a transient
     Qdrant blip with a missing canonical would let run_rejudge_stamped CLEAR a real contradiction
     flag on a hiccup (audit v0.27.3 HIGH). 'absent' and 'errored' must be distinguishable."""
+    info = fetch_point_info(http, point_id)
+    return None if info is None else info["text"]
+
+
+def fetch_point_info(http: httpx.Client, point_id: str) -> Optional[dict]:
+    """{text, tier, retired} for a point, or None when it is CONFIRMED ABSENT. Same absent-versus-
+    errored contract as fetch_point_text (RAISES on a transport/HTTP/parse failure). The tier and the
+    retired flag let the stamped re-judge treat a demoted or retired target as no canonical at all."""
     r = http.post(f"{QDRANT}/collections/{COLLECTION}/points",
                   json={"ids": [point_id], "with_payload": True}, timeout=15.0)
     r.raise_for_status()
@@ -1175,7 +1378,8 @@ def fetch_point_text(http: httpx.Client, point_id: str) -> Optional[str]:
     if not pts:
         return None  # confirmed absent
     pl = pts[0].get("payload") or {}
-    return pl.get("data") or pl.get("memory") or ""
+    return {"text": pl.get("data") or pl.get("memory") or "", "tier": pl.get("tier"),
+            "retired": bool(pl.get("retrievable") is False or pl.get("retired_at"))}
 
 
 def run_rejudge_stamped(args, dry_run: bool) -> int:
@@ -1251,19 +1455,33 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             # canonical is also a skip (no verdict possible), never a dangling-clear. Only a
             # confirmed-absent canonical clears (a verdict isn't possible against a gone record).
             try:
-                can_text = fetch_point_text(qdrant_http, str(canonical_id))
+                can_info = fetch_point_info(qdrant_http, str(canonical_id))
             except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
                 skipped += 1
                 print(f"  SKIP {cid}: transient fetch error for canonical {canonical_id} — NOT clearing "
                       f"({type(e).__name__}: {str(e)[:80]})", flush=True)
                 continue
-            if can_text is None:
+            if can_info is None:
                 print(f"  CLEAR {cid}: referenced canonical {canonical_id} CONFIRMED absent (dangling)", flush=True)
                 if not dry_run and stamp_candidate(mem0_http, cid, _iso_now(), clear=True,
                                                    justification="rejudge: referenced canonical confirmed absent"):
                     cleared += 1
                 cleared_ids.append({"memory_id": cid, "reason": "dangling-canonical"})
                 continue
+            # WP-4: a stamp is only meaningful against a LIVE canonical. A target that has been retired
+            # or demoted (stable / evidence / ...) is treated like a dangling reference: nothing left to
+            # contradict, so the stamp is cleared without spending a judge call. (The admission gate
+            # already ignores such stamps; this removes them from the record.)
+            _dead = ("target-retired" if can_info.get("retired")
+                     else (f"target-demoted:{can_info.get('tier')}" if can_info.get("tier") != "canonical" else None))
+            if _dead:
+                print(f"  CLEAR {cid}: referenced canonical {canonical_id} is no longer live ({_dead})", flush=True)
+                if not dry_run and stamp_candidate(mem0_http, cid, _iso_now(), clear=True,
+                                                   justification=f"rejudge: {_dead}"):
+                    cleared += 1
+                cleared_ids.append({"memory_id": cid, "canonical_id": str(canonical_id), "reason": _dead})
+                continue
+            can_text = can_info["text"]
             if not str(can_text).strip():
                 skipped += 1
                 print(f"  SKIP {cid}: canonical {canonical_id} present but empty text — NOT clearing", flush=True)
@@ -1399,6 +1617,7 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     anchors = pairs = queued = skipped = 0
+    ev_skipped_no_vector = 0   # WP-4: counted, never a silent continue
     ev_cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     consec_fail = 0  # fail fast if the judge dies mid-run (mirrors the canonical sweep)
     aborted = None
@@ -1416,6 +1635,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
             a_text = a_pl.get("data") or a_pl.get("memory")
             a_user = a_pl.get("user_id")
             vec = dense_vector(anchor)
+            if vec is None:
+                ev_skipped_no_vector += 1
             if not a_text or not a_user or vec is None:
                 continue
             try:
@@ -1482,7 +1703,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
     outcome = _outcome_for_abort(aborted) if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
                      "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
-                     "skipped": skipped, "queued_ids": queued_ids, "outcome": outcome,
+                     "skipped": skipped, "skipped_no_vector": ev_skipped_no_vector,
+                     "queued_ids": queued_ids, "outcome": outcome,
                      "cache_hits": int(ev_cache_stats.get("cache_hits", 0)),
                      "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
@@ -1693,6 +1915,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         eligible = []
         canonical_member = 0
         ineligible = 0
+        nv_skipped_no_vector = 0   # WP-4: novelty-baseline anchors with no dense vector (counted)
         for pair, qhs in ranked:
             a, b = payloads.get(pair[0]), payloads.get(pair[1])
             if not a or not b:
@@ -1731,6 +1954,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                 can_id = str(can.get("id"))
                 vec = dense_vector(can)
                 can_user = (can.get("payload") or {}).get("user_id")
+                if vec is None:
+                    nv_skipped_no_vector += 1
                 if vec is None or not can_user:
                     continue
                 for nb in query_similar(qdrant_http, vec, can_user, can_id,
@@ -1746,6 +1971,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                 a_id = str(anchor.get("id"))
                 a_user = (anchor.get("payload") or {}).get("user_id")
                 vec = dense_vector(anchor)
+                if vec is None:
+                    nv_skipped_no_vector += 1
                 if vec is None or not a_user:
                     continue
                 for nb in query_similar(qdrant_http, vec, a_user, a_id,
@@ -1827,6 +2054,7 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
             "pairs_canonical_member": canonical_member,
             "pairs_ineligible": ineligible,
             "pairs_novel_vs_storage_sweep": novel,
+            "novelty_skipped_no_vector": nv_skipped_no_vector,
             "novelty_baseline": "canonical-neighborhood UNION evidence-sweep reach",
             "ids_source": ("returned_top_ids (top-3 per row until the [:10] "
                            "widening deploys — co-occurrence is a lower bound)"),
@@ -1865,7 +2093,27 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
     return _finish(outcome, judged_stats if judged else None)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """Entry point. --then-rejudge-stamped chains the stamped re-judge (--rejudge-stamped, same
+    --judge/--apply) AFTER the sweep in the same process, so the weekly unit runs both under ONE chain
+    step and one receipt (a second step would need its own name in the chain). The worse exit wins.
+    A dry run does not chain: it would only print the same decisions twice."""
+    global _OUTCOME_SCOPE
+    argv = list(sys.argv[1:] if argv is None else argv)
+    chain = "--then-rejudge-stamped" in argv
+    argv = [a for a in argv if a != "--then-rejudge-stamped"]
+    rc = _main(argv)
+    if chain and "--apply" in argv and "--rejudge-stamped" not in argv:
+        # both passes report into ONE outcome line: the second never overwrites the first's reason or counts
+        _OUTCOME_SCOPE = "rejudge"
+        try:
+            rc = max(rc, _main(argv + ["--rejudge-stamped"]))
+        finally:
+            _OUTCOME_SCOPE = ""
+    return rc
+
+
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="v0.19 I.3: offline contradiction sweep")
     parser.add_argument("--apply", action="store_true",
                         help="stamp verdicts (default: dry-run, print only)")
@@ -1884,7 +2132,12 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"llama-swap judge model (default {DEFAULT_MODEL})")
     parser.add_argument("--user-id", default=None,
-                        help="restrict the sweep to one user_id's canonicals")
+                        help="restrict the sweep to one user_id's canonicals (default: the corpus tenant, "
+                             "ams_env.user_id(); pass an empty string for every user)")
+    parser.add_argument("--then-rejudge-stamped", action="store_true",
+                        help="after the sweep, also run --rejudge-stamped with the same --judge and "
+                             "--apply (handled by main(); clears NO-verdict, dangling and demoted-target "
+                             "stamps). The weekly unit uses this to run both passes under one chain step.")
     parser.add_argument("--unstamp", default=None, metavar="MEMORY_ID",
                         help="clear a false-positive contradicts_canonical stamp "
                              "on this memory via the trusted-actor PATCH "
@@ -1907,6 +2160,10 @@ def main() -> int:
                         help="human-confirm a queued review candidate: enforce (HIDE) MEMORY_ID against "
                              "the canonical recorded in the review queue, then exit. The reviewed-and-"
                              "approved counterpart to the safe auto-CLEAR loop.")
+    parser.add_argument("--dismiss", default=None, metavar="MEMORY_ID",
+                        help="drop every review-queue line for MEMORY_ID, then exit. The way out for a "
+                             "canonical-possibly-stale line, which --promote refuses (no canonical_id); "
+                             "the sweep also prunes such lines by itself once the canonical is demoted.")
     parser.add_argument("--evidence-sweep", action="store_true",
                         help="evidence-vs-evidence mode: anchor on the most-recent NON-canonical facts, "
                              "find OLDER near-duplicate neighbors, judge contradiction (newer wins), and "
@@ -1941,8 +2198,11 @@ def main() -> int:
     parser.add_argument("--winner", metavar="WINNER_ID",
                         help="the newer record LOSER_ID is superseded by (required with "
                              "--resolve-supersede)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     dry_run = not args.apply
+    user_id_defaulted = args.user_id is None      # the operator did not choose a scope
+    args.user_id = resolve_user_id(args.user_id)
+    user_id_defaulted = user_id_defaulted and args.user_id is not None
 
     if args.resolve_supersede:
         if not args.winner:
@@ -1962,7 +2222,9 @@ def main() -> int:
     # v0.27.3: when judging with Codex, the Windows shim must be reachable. Preflight it; if it is
     # NOT, record a NO-OP (exit 0 — NOT a hard failure, so the weekly timer is not noisy) and never
     # silently fall back to the local judge (that is the misrouting the model-routing audit fixed).
-    if args.judge == "codex" and not args.unstamp and not args.promote:
+    # The operator's remediation modes judge nothing, so the preflight never gates them: a judge
+    # outage must not turn --unstamp / --promote / --dismiss into an exit-0 no-op.
+    if args.judge == "codex" and not args.unstamp and not args.promote and not args.dismiss:
         if _codex is None:
             # Receipt-gated: the two cases look identical here but mean opposite things.
             #   - No install receipt -> a fresh box or a half-finished deploy legitimately has no
@@ -2018,6 +2280,9 @@ def main() -> int:
         with httpx.Client(headers={"X-API-Key": api_key,
                                    "Content-Type": "application/json"}) as mem0_http:
             return run_unstamp(mem0_http, args.unstamp)
+
+    if args.dismiss:
+        return run_dismiss(args.dismiss)      # queue file only: no backend, no judge
 
     if args.promote:
         # human-confirmed enforce from the review queue — no sweep, no judging, no shim needed.
@@ -2103,10 +2368,18 @@ def main() -> int:
     consecutive_llm_failures = 0   # v0.20 M7: dead/loading judge -> abort, not N skips
     canonicals: list[dict] = []
     canonical_total = 0            # v0.20 L6: pre-slice total (truncation surfaced)
+    canonicals_checked = 0         # WP-4: swept end to end this run (the rotation marker was written)
+    canonicals_query_failed = 0    # candidate query failed: NOT marked, keeps its place at the front
+    skipped_no_vector = 0          # WP-4: no dense vector - counted, never a silent continue
+    marker_written = marker_failed = 0   # rotation-marker PATCH results (apply mode only)
+    stale_review_pruned = 0        # canonical-possibly-stale queue lines whose canonical is gone
+    stale_routed = 0               # YES pairs whose candidate is NEWER than the canonical
     aborted: Optional[str] = None
     try:
         canonicals = scroll_canonicals(qdrant_http, user_id=args.user_id)
         canonical_total = len(canonicals)
+        # WP-4 rotation: never-checked first, then longest-unchecked, so --limit is a budget
+        canonicals = order_canonicals(canonicals)
         if args.limit > 0:
             canonicals = canonicals[: args.limit]
         if canonical_total > len(canonicals):
@@ -2126,12 +2399,22 @@ def main() -> int:
             vec = dense_vector(can)
             if not can_text or not can_user or vec is None:
                 print(f"  canonical {can_id}: missing text/user_id/vector — skipped", flush=True)
+                if vec is None:
+                    skipped_no_vector += 1
+                if not dry_run:
+                    # marked anyway: a canonical that can never be swept would otherwise sit at the
+                    # front of the rotation forever and eat the budget every week
+                    if mark_canonical_checked(mem0_http, can_id, _iso_now()):
+                        marker_written += 1
+                    else:
+                        marker_failed += 1
                 continue
             try:
                 raw = query_similar(qdrant_http, vec, can_user, can_id,
                                     fetch_n=max(args.top_k * 3, args.top_k))
             except (httpx.HTTPError, OSError) as e:
                 print(f"  canonical {can_id}: candidate query failed — {e}", flush=True)
+                canonicals_query_failed += 1
                 continue
             candidates = []
             for pt in raw:
@@ -2190,7 +2473,28 @@ def main() -> int:
                 print(f"    {label} {cand_id} ({str(cand_text)[:60]!r}): {detail}"
                       + (" [re-judge of stamped candidate]" if was_stamped else ""),
                       flush=True)
-                if not dry_run:
+                # WP-4 direction: the sweep assumed the canonical is the truth. A YES whose candidate is
+                # NEWER than the canonical may be the CORRECTION (the canonical the stale one), so it is
+                # routed to the review queue instead of hiding the newer fact. Only the checked-at
+                # marker is written on the candidate (so it is not re-judged every week); an existing
+                # stamp is left as it is. The queue entry deliberately has no canonical_id: --promote
+                # (which would HIDE the candidate) must not be able to act on it.
+                route_stale = bool(verdict) and is_older(can, cand)
+                if route_stale:
+                    stale_routed += 1
+                    print(f"    CANONICAL-POSSIBLY-STALE {can_id}: candidate {cand_id} is NEWER than the "
+                          f"canonical - routed to review, not stamped", flush=True)
+                if not dry_run and route_stale:
+                    append_review_queue(str(REVIEW_QUEUE), {
+                        "memory_id": cand_id, "stale_canonical_id": can_id,
+                        "kind": "canonical-possibly-stale",
+                        "candidate_text": str(cand_text)[:300],
+                        "justification": ("contradiction sweep: newer fact judged to contradict an older "
+                                          f"canonical - the canonical may be stale: {detail[:160]}")})
+                    if stamp_candidate(mem0_http, cand_id, _iso_now(),
+                                       justification="routed to review: canonical possibly stale"):
+                        stamped_count += 1
+                elif not dry_run:
                     checked_at = _iso_now()
                     clear = was_stamped and not verdict  # NO on a stamped record
                     # v0.29.4: a LOCAL (advisory) judge stamps the PENDING key — the
@@ -2222,6 +2526,24 @@ def main() -> int:
                                 "cleared_stamp": _was,
                                 "justification": detail[:200]})
                             print(f"    CLEARED stale stamp on {cand_id} (was {_was})", flush=True)
+            if not aborted:
+                # the canonical was swept end to end (0 eligible candidates counts): advance its
+                # rotation marker, or order_canonicals would put it first again next week
+                # (apply mode: only when the marker landed, or a failing marker would report full
+                # coverage while the rotation never advanced and the same head is re-taken)
+                if dry_run:
+                    canonicals_checked += 1
+                elif mark_canonical_checked(mem0_http, can_id, _iso_now()):
+                    canonicals_checked += 1
+                    marker_written += 1
+                else:
+                    marker_failed += 1
+        if not dry_run and not aborted:
+            # the queue only ever grew: drop stale-canonical doubts whose canonical is no longer canonical
+            try:
+                stale_review_pruned = prune_stale_review_entries(qdrant_http, str(REVIEW_QUEUE))
+            except (httpx.HTTPError, OSError, ValueError) as e:
+                print(f"contradiction-sweep: review-queue prune failed (non-fatal): {e}", flush=True)
     except (httpx.HTTPError, OSError) as e:
         # Mid-run backend failure: degrade with partial counts, never crash.
         aborted = f"{type(e).__name__}: {str(e)[:120]}"
@@ -2232,7 +2554,10 @@ def main() -> int:
         llm_http.close()
         mem0_http.close()
 
-    outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted)
+    outcome = run_outcome(canonical_total, pairs_checked, skipped_pairs, aborted,
+                          all_no_vector=bool(canonicals) and skipped_no_vector == len(canonicals),
+                          marker_failed=marker_failed, user_id_defaulted=user_id_defaulted)
+    coverage = sweep_coverage(canonical_total, canonicals_checked)
     summary = {
         "ts": run_ts,
         "dry_run": dry_run,
@@ -2243,6 +2568,14 @@ def main() -> int:
         "model": args.model,
         "canonical_total": canonical_total,   # v0.20 L6: pre-slice total
         "canonical_count": len(canonicals),   # processed (post --limit slice)
+        **coverage,                           # WP-4: checked/total + weeks for a full pass
+        "user_id": args.user_id,
+        "skipped_no_vector": skipped_no_vector,
+        "marker_written": marker_written,
+        "marker_failed": marker_failed,
+        "stale_review_pruned": stale_review_pruned,
+        "canonicals_query_failed": canonicals_query_failed,
+        "stale_canonical_routed": stale_routed,
         "pairs_checked": pairs_checked,
         "yes_count": yes_count,
         "no_count": no_count,
@@ -2262,14 +2595,23 @@ def main() -> int:
         summary["aborted"] = aborted
     _append_summary(summary)
     print(f"contradiction-sweep: done. outcome={outcome} "
-          f"canonicals={len(canonicals)}/{canonical_total} pairs={pairs_checked} "
+          f"canonicals={canonicals_checked}/{canonical_total} "
+          f"(full pass in {coverage['weeks_for_full_pass']} weekly runs) "
+          f"pairs={pairs_checked} "
           f"yes={yes_count} no={no_count} skipped={skipped_pairs} "
           f"stamped={stamped_count} cleared={cleared_count} (dry_run={dry_run}) "
           f"summary -> {SWEEP_LOG}", flush=True)
-    # canonicals_checked/total: only `--limit` canonicals are judged per week (50 of 122 = three
-    # weeks to cover the set even when healthy), so the receipt has to say how much was covered.
-    return _finish(outcome, {"canonicals_checked": len(canonicals), "canonicals_total": canonical_total,
-                             "pairs": pairs_checked, "yes": yes_count})
+    # The receipt's counts. canonicals_checked/total: only `--limit` canonicals are judged per week
+    # (50 of 122 = three weeks to cover the set even when healthy), so the receipt has to say how much
+    # was covered - and `checked` means swept end to end with the rotation marker landed, not merely
+    # selected. The rest is what a broken rotation or a stale-canonical route looks like from outside.
+    return _finish(outcome, {
+        "canonicals_checked": canonicals_checked, "canonicals_total": canonical_total,
+        "pairs": pairs_checked, "yes": yes_count,
+        "weeks_for_full_pass": coverage["weeks_for_full_pass"],
+        "marker_written": marker_written, "marker_failed": marker_failed,
+        "skipped_no_vector": skipped_no_vector,
+        "stale_canonical_routed": stale_routed, "stale_review_pruned": stale_review_pruned})
 
 
 if __name__ == "__main__":

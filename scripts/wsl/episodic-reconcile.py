@@ -17,8 +17,18 @@ Findings:
 Output: one JSONL summary line per run -> ~/.mem0/episodic-reconciliation.jsonl
   (read by Test-MemoryStack's reconciliation freshness row). outcome = 'ok' | 'degraded:<reason>'.
 
-This job is READ-ONLY by construction: the SQLite connection is opened mode=ro, and there is no
---apply (there is nothing to mutate — orphaned links are reported for awareness, not deleted).
+The link/orphan reconciliation stays READ-ONLY by construction: its SQLite connection is opened
+mode=ro and orphaned links are reported for awareness, never deleted. WP-4 (session-12 audit) added
+two bounded, receipted maintenance steps the weekly run now performs before it reads:
+  * stale checkpoints: an `in_progress` episode whose last checkpoint (ended_at) is older than
+    --stale-days (default 7) is set to `abandoned` - the documented stale-sweep that was never written.
+    Every prompt opens an in_progress checkpoint that only a later extraction finalizes, so sessions
+    that produced nothing stayed in_progress forever. The count is in the receipt. This is the ONE
+    write, made over its own short read-write connection; rows are never deleted or otherwise edited.
+  * embedding backfill: up to --backfill-limit (default 500; 0 disables) complete episodes missing
+    from the episode-vector collection are embedded, newest first, through
+    scripts/wsl/episode-embed-backfill.py, skipped when /health/embedder is down. Coverage below 90 %
+    of eligible episodes reads `degraded:embedding-coverage-<pct>` (a catching-up gap: reported, exit 0).
 
 Weekly systemd-user timer: episodic-reconcile.timer (after contradiction-sweep).
 """
@@ -26,12 +36,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
 import httpx
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
+import ams_env  # noqa: E402  (URL from authority-url)
 
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "mem0_egemma_768"  # the live collection (config.py collection_name)
@@ -166,8 +181,51 @@ def reconcile_outcome(db_present: bool, qdrant_ok: bool,
     return "ok"
 
 
+COVERAGE_DEGRADE_PCT = 90           # embedded / eligible episodes below this reads degraded
+STALE_IN_PROGRESS_DAYS = 7          # an in_progress checkpoint untouched this long is orphaned
+BACKFILL_PER_RUN = 500              # bounded embeds per weekly run
+COVERAGE_OUTCOME_PREFIX = "degraded:embedding-coverage-"
+
+
 def exit_code_for(outcome: str) -> int:
-    return 1 if str(outcome).startswith("degraded") else 0
+    """degraded:* -> 1 (the unit visibly fails) EXCEPT an embedding-coverage gap: that is a backlog
+    the bounded backfill is working down, so it is reported (outcome + step receipt) and exits 0."""
+    o = str(outcome)
+    if o.startswith(COVERAGE_OUTCOME_PREFIX):
+        return 0
+    return 1 if o.startswith("degraded") else 0
+
+
+def coverage_pct(cov: dict):
+    """Embedded / eligible as a whole percent (capped at 100: stale points for retired episodes can
+    push the collection past the eligible count), or None when nothing can be said."""
+    try:
+        eligible, embedded = int(cov.get("eligible")), int(cov.get("embedded"))
+    except (TypeError, ValueError):
+        return None
+    if eligible <= 0 or cov.get("error"):
+        return None
+    return int(min(embedded, eligible) * 100 / eligible)
+
+
+def coverage_outcome(cov: dict):
+    """'degraded:embedding-coverage-<pct>' when fewer than COVERAGE_DEGRADE_PCT % of eligible episodes
+    have a vector, else None. The gap used to be measured every week and reported ok."""
+    pct = coverage_pct(cov)
+    if pct is not None and pct < COVERAGE_DEGRADE_PCT:
+        return f"{COVERAGE_OUTCOME_PREFIX}{pct}"
+    return None
+
+
+def _write_outcome(outcome: str, counts: dict) -> None:
+    """The step-outcome line ams-step.sh reads: '<status>[:<reason>] <compact json counts>'."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(f"{outcome} {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"episodic-reconcile: outcome file write failed (non-fatal): {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +248,58 @@ def read_episode_links(conn: sqlite3.Connection) -> list[dict]:
 
 def existing_episode_ids(conn: sqlite3.Connection) -> set:
     return {r[0] for r in conn.execute("SELECT id FROM episodes").fetchall()}
+
+
+def abandon_stale_in_progress(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None) -> int:
+    """Set `in_progress` episodes whose last checkpoint (ended_at) is older than `days` to
+    `abandoned`; returns how many. The ONLY write this script makes, over its own short read-write
+    connection (the ledger connection everywhere else is mode=ro). An unparseable ended_at is left
+    alone rather than guessed at. Idempotent."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = (now - dt.timedelta(days=days)).isoformat()
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        cur = conn.execute(
+            "UPDATE episodes SET state = 'abandoned' WHERE state = 'in_progress' "
+            "AND julianday(ended_at) IS NOT NULL AND julianday(ended_at) < julianday(?)", (cutoff,))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def try_abandon_stale(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None):
+    """(count, error): abandon_stale_in_progress that never raises - the reconcile must still write
+    its receipt when the sweep cannot run."""
+    try:
+        return abandon_stale_in_progress(db_path, days, now), None
+    except (sqlite3.Error, OSError) as e:
+        return 0, f"{type(e).__name__}: {str(e)[:100]}"
+
+
+def _load_backfill():
+    """The sibling episode-embed-backfill.py (hyphenated name: loaded by path, deployed flat)."""
+    path = Path(__file__).resolve().with_name("episode-embed-backfill.py")
+    spec = importlib.util.spec_from_file_location("episode_embed_backfill", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_embedding_backfill(limit: int, db_path: Path) -> dict:
+    """Embed up to `limit` missing episode summaries. Not run (never an error) when the embedder is
+    down: the seat unloads when idle and /health/embedder warms it as ACTIVE work, so a healthy answer
+    means the backfill can run. Fail-soft: any failure is reported in the result, not raised."""
+    try:
+        httpx.get(f"{ams_env.mem0_url()}/health/embedder", timeout=30.0).raise_for_status()
+    except (httpx.HTTPError, OSError) as e:
+        print(f"episodic-reconcile: embedder unavailable - backfill skipped ({type(e).__name__})", flush=True)
+        return {"not_run": "embedder-down"}
+    try:
+        res = _load_backfill().run(limit=limit, db_path=db_path)
+    except Exception as e:  # noqa: BLE001 - the reconcile must still write its receipt
+        return {"embedded": 0, "error": f"{type(e).__name__}: {str(e)[:100]}"}
+    return dict(res)
 
 
 def embedding_coverage(conn: sqlite3.Connection, http: httpx.Client) -> dict:
@@ -351,6 +461,10 @@ def main() -> int:
     parser.add_argument("--limit-sample", type=int, default=20,
                         help="max orphaned/dangling ids recorded in the JSONL sample (default 20)")
     parser.add_argument("--db", default=str(EPISODIC_DB), help="episode ledger path (default ~/.mem0/episodic.db)")
+    parser.add_argument("--stale-days", type=int, default=STALE_IN_PROGRESS_DAYS,
+                        help=f"abandon in_progress episodes untouched this many days (default {STALE_IN_PROGRESS_DAYS})")
+    parser.add_argument("--backfill-limit", type=int, default=BACKFILL_PER_RUN,
+                        help=f"embed at most this many missing episode summaries per run (default {BACKFILL_PER_RUN}; 0 disables)")
     args = parser.parse_args()
     run_ts = _iso_now()
     db_path = Path(args.db)
@@ -368,6 +482,14 @@ def main() -> int:
         print(f"episodic-reconcile: Qdrant unreachable: {e}", flush=True)
         _append_summary({"outcome": "degraded:qdrant-unreachable", "ts": run_ts, "skipped": str(e)[:120]})
         return 1
+
+    # WP-4: abandon orphaned checkpoints, then backfill missing embeddings, BEFORE the read-only pass
+    # below so the coverage figure it reports is the one AFTER this run's catch-up.
+    abandoned, abandon_error = try_abandon_stale(db_path, args.stale_days)
+    if abandon_error:
+        print(f"episodic-reconcile: stale-checkpoint sweep skipped ({abandon_error})", flush=True)
+    backfill = (run_embedding_backfill(args.backfill_limit, db_path) if args.backfill_limit > 0
+                else {"not_run": "disabled"})
 
     conn = open_ledger_ro(db_path)
     coverage: dict = {"eligible": None, "embedded": None, "missing": None}
@@ -461,16 +583,28 @@ def main() -> int:
         "history_delete_rows_total": history_delete_total,
         "ledger_parse_errors": dict(LEDGER_PARSE_ERRORS),
         "embedding_coverage": coverage,   # AMS-19
+        "abandoned_stale_in_progress": abandoned,
+        "abandon_error": abandon_error,
+        "embedding_backfill": backfill,
         "outcome": outcome,
     }
+    # WP-4: coverage is a verdict now, not only a number. It never masks a worse outcome (infra,
+    # orphans): the headline stays whatever failed first.
+    if outcome == "ok":
+        outcome = coverage_outcome(coverage) or "ok"
+        summary["outcome"] = outcome
     _append_summary(summary)
+    _write_outcome(outcome, {"abandoned": abandoned, "embedded": backfill.get("embedded", 0),
+                             "coverage_pct": coverage_pct(coverage),
+                             "orphaned": n_orphan, "dangling": n_dangling})
     n_ex = len(split["explained"]) if split else "n/a"
     n_un = len(split["unexplained"]) if split else "n/a"
     print(f"episodic-reconcile: done. links={len(links)} memory_links={result['memory_links']} "
           f"orphaned={n_orphan} (explained={n_ex} unexplained={n_un} "
           f"evidence_errors={evidence_errors or 'none'}) dangling={n_dangling} "
           f"episode-embeddings missing={coverage.get('missing')}/"
-          f"{coverage.get('eligible')} (READ-ONLY) outcome={outcome} -> {RECON_LOG}",
+          f"{coverage.get('eligible')} abandoned_stale={abandoned} "
+          f"backfilled={backfill.get('embedded', 0)} outcome={outcome} -> {RECON_LOG}",
           flush=True)
     return exit_code_for(outcome)
 

@@ -768,8 +768,16 @@ def list_goals(
     limit: int = 50,
     only_brand_neutral: bool = False,
     initiative: str | None = None,
+    exclude_session_id: str | None = None,
+    rank_by_recency: bool = False,
 ) -> list[dict[str, Any]]:
     """List goals with optional filters. Returns list of dicts.
+
+    WP-4 (context bundle): exclude_session_id leaves out goals whose first_seen_session_id is that
+    session (a goal minted from the session you are in was being echoed straight back at it; NULL
+    first-seen rows stay). rank_by_recency orders by how recently an episode linked the goal
+    (episode_links, newest first; never-linked goals last), then priority, then updated_at, instead
+    of priority alone. Both default off: the admin/MCP listings are unchanged.
 
     v0.21 Phase A (M2): only_brand_neutral=True restricts to brand-neutral
     (NULL-brand) rows — used by context_bundle when the session brand is unknown
@@ -808,7 +816,15 @@ def list_goals(
         else:
             sql += " AND parent_goal_id = ?"
             args.append(parent_goal_id)
-    sql += " ORDER BY priority, updated_at DESC LIMIT ?"
+    if exclude_session_id:
+        sql += " AND (first_seen_session_id IS NULL OR first_seen_session_id != ?)"
+        args.append(exclude_session_id)
+    if rank_by_recency:
+        sql += (" ORDER BY COALESCE((SELECT MAX(datetime(el.created_at)) FROM episode_links el"
+                " WHERE el.target_kind = 'goal' AND el.target_id = CAST(goals.id AS TEXT)), '') DESC,"
+                " priority, updated_at DESC LIMIT ?")
+    else:
+        sql += " ORDER BY priority, updated_at DESC LIMIT ?"
     args.append(limit)
     cur = conn.execute(sql, args)
     return [dict(r) for r in cur.fetchall()]
@@ -1241,8 +1257,16 @@ def list_open_questions(
     limit: int = 20,
     only_brand_neutral: bool = False,
     initiative: str | None = None,
+    exclude_session_id: str | None = None,
+    rank_by_recency: bool = False,
 ) -> list[dict[str, Any]]:
     """List with status + brand filters.
+
+    WP-4 (context bundle): exclude_session_id leaves out questions first seen in that session (the
+    extractor mints open questions from the session you are in and the next prompt used to serve
+    them straight back; NULL first-seen rows stay). rank_by_recency orders by the end of the episode
+    that raised the question (its first_seen episode; updated_at when none), newest first, then
+    priority, instead of priority alone. Both default off.
 
     v0.21 Phase A (M2): only_brand_neutral=True restricts to brand-neutral
     (NULL-brand) rows — used by context_bundle for unknown-brand sessions so
@@ -1254,23 +1278,30 @@ def list_open_questions(
     PLUS cross-cutting (NULL-initiative) rows. When None (admin/global listing),
     unfiltered on initiative (preserves the existing behavior).
     """
-    sql = "SELECT * FROM open_questions WHERE 1=1"
+    sql = "SELECT oq.* FROM open_questions oq LEFT JOIN episodes ep ON ep.id = oq.first_seen_episode_id WHERE 1=1"
     args: list[Any] = []
     if status is not None:
-        sql += " AND status = ?"
+        sql += " AND oq.status = ?"
         args.append(status)
     # M2 review L4: normalize empty/whitespace brand to None (mirrors the memory
     # Layer-2 brand normalization) so it takes the brand-neutral path, not AND brand=''.
     _b = brand.strip() if isinstance(brand, str) else brand
     if _b:
-        sql += " AND brand = ?"
+        sql += " AND oq.brand = ?"
         args.append(_b)
     elif only_brand_neutral:
-        sql += " AND brand IS NULL"
+        sql += " AND oq.brand IS NULL"
     if initiative is not None:
-        sql += " AND (initiative = ? OR initiative IS NULL)"
+        sql += " AND (oq.initiative = ? OR oq.initiative IS NULL)"
         args.append(initiative)
-    sql += " ORDER BY priority, updated_at DESC LIMIT ?"
+    if exclude_session_id:
+        sql += " AND (oq.first_seen_session_id IS NULL OR oq.first_seen_session_id != ?)"
+        args.append(exclude_session_id)
+    if rank_by_recency:
+        sql += (" ORDER BY COALESCE(datetime(ep.ended_at), datetime(oq.updated_at), '') DESC,"
+                " oq.priority, oq.updated_at DESC LIMIT ?")
+    else:
+        sql += " ORDER BY oq.priority, oq.updated_at DESC LIMIT ?"
     args.append(limit)
     cur = conn.execute(sql, args)
     return [dict(r) for r in cur.fetchall()]
