@@ -302,7 +302,12 @@ Describe 'an unusable role record stops both installers before anything is writt
             $se = $proc.StandardError.ReadToEndAsync()
             if (-not $proc.WaitForExit(180000)) { try { $proc.Kill() } catch { $null = $_ }; throw "installer child timed out: $ScriptPath" }
             $proc.WaitForExit()
-            [pscustomobject]@{ ExitCode = $proc.ExitCode; Text = (($so.Result + "`n" + $se.Result) -replace '\s+', ' ') }
+            # pwsh's default ConciseView wraps a long error message at the host's width and starts each
+            # continuation line with '|'; a CI runner's narrow width split the phrase the tests look
+            # for. Drop those leading markers before collapsing whitespace, so the text is the same at
+            # any width.
+            $raw = ($so.Result + "`n" + $se.Result) -replace '(?m)^[ \t]*\|[ \t]?', ''
+            [pscustomobject]@{ ExitCode = $proc.ExitCode; Text = ($raw -replace '\s+', ' ') }
         }
     }
 
