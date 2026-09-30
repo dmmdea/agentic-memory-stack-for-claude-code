@@ -699,3 +699,60 @@ def test_insight_brand_counts_only_the_lineage_it_cites(home, monkeypatch):
     m = _mod()
     md = _insight_metadata(m, monkeypatch, ["brand-y", "brand-x", "brand-x"], sources=["e2", "e3"])
     assert md["brand"] == "brand-x", "e1 (brand-y) is in the window but is not a source of this insight"
+
+
+class _FailingAddMem0(FakeMem0):
+    """The insight POST answers 500 (embedder down) for the first `fail_adds` calls, then lands."""
+
+    def __init__(self, *a, fail_adds=0, **kw):
+        super().__init__(*a, **kw)
+        self.fail_adds = fail_adds
+        self.attempts = 0
+
+    def add(self, text, metadata):
+        self.attempts += 1
+        if self.attempts <= self.fail_adds:
+            raise RuntimeError("500 Internal Server Error")
+        return super().add(text, metadata)
+
+
+def _spool_lines(home):
+    p = home / ".mem0" / "maintenance" / "dream" / "insight-spool.jsonl"
+    return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()] if p.exists() else []
+
+
+def test_a_spooled_insight_replays_the_next_night_with_its_brand(home, monkeypatch):
+    """An insight whose POST failed is spooled and replayed first on the next run (C1). Its brand is
+    decided when it is consolidated, so it has to be in the metadata that is SPOOLED: the replay posts
+    that dict unchanged, on a night whose own evidence window need not hold the sources any more."""
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, ""))
+    ev = [_branded("e1", "brand-x"), _branded("e2", "brand-x"), _branded("e3", None)]
+    ins = json.dumps({"insights": [{"text": "a consolidated insight", "source_memory_ids": ["e1", "e2", "e3"],
+                                    "confidence": 0.8}]})
+    # night 1: the POST fails, the insight is spooled with the brand it was consolidated under
+    out = _run(m, ["--force"], mem0=_FailingAddMem0(ev, fail_adds=99), judge=_judge(SIG, ins, "[]"))
+    assert out["posted"] == 0
+    spooled = _spool_lines(home)
+    assert len(spooled) == 1 and spooled[0]["metadata"]["brand"] == "brand-x"
+    # night 2: a healthy authority; tonight's evidence is brandless and none of the spooled insight's
+    # sources, and the judge has nothing new to say. Only the replay posts, and it keeps the brand.
+    fm = FakeMem0([_branded("e9", None)])
+    _run(m, ["--force"], mem0=fm, judge=_judge(SIG, '{"insights":[]}', "[]"))
+    assert [t for t, _ in fm.added] == ["a consolidated insight"]
+    assert fm.added[0][1]["brand"] == "brand-x", "the replayed insight kept the brand it was consolidated under"
+    assert _spool_lines(home) == [], "a replayed line leaves the spool"
+
+
+def test_a_spooled_insight_with_no_majority_replays_brandless(home, monkeypatch):
+    """The other half: no brand is invented on the replay path either."""
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, ""))
+    ev = [_branded("e1", "brand-x"), _branded("e2", "brand-y")]
+    ins = json.dumps({"insights": [{"text": "a split insight", "source_memory_ids": ["e1", "e2"], "confidence": 0.8}]})
+    _run(m, ["--force"], mem0=_FailingAddMem0(ev, fail_adds=99), judge=_judge(SIG, ins, "[]"))
+    assert "brand" not in _spool_lines(home)[0]["metadata"]
+    fm = FakeMem0([_branded("e9", "brand-z")])
+    _run(m, ["--force"], mem0=fm, judge=_judge(SIG, '{"insights":[]}', "[]"))
+    assert [t for t, _ in fm.added] == ["a split insight"]
+    assert "brand" not in fm.added[0][1], "tonight's brand-z evidence must not leak onto last night's insight"
