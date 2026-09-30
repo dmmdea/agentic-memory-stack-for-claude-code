@@ -27,6 +27,10 @@ SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 DRY=""
 [ "${1:-}" = "--dry-run" ] && DRY="--dry-run"
+# The release sha stamp (DEPLOYED_SHA) is written by ONE contract, install/deploy-stamp.sh, the one the
+# installers use: a 40-hex sha or the word "unknown", never the empty file that a bare
+# `git rev-parse HEAD > DEPLOYED_SHA || true` leaves when git cannot read the checkout.
+. "$REPO_ROOT/install/deploy-stamp.sh"
 
 # Operator receipt (WIN_USER / DISTRO for unit sentinels); WSL user is always $USER.
 [ -f "$HOME/.mem0/stack.env" ] && . "$HOME/.mem0/stack.env"
@@ -254,7 +258,7 @@ if [ "${MEM0_ROLE:-brain}" = "replica" ]; then
             cat "$_cerr"; rm -f "$_cerr"; exit 1
         fi
         rm -f "$_cerr"
-        git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
+        deploy_stamp_write "$REPO_ROOT" "$APP_DIR"
         echo "    replica (dormant): server modules byte-compile OK; import smoke deferred to the watcher's /health/deep gate"
         echo "==> replica with a dormant local mem0: files synced, NO restart, no health gate (this box reads the authority)"
         echo "==> deploy complete (replica, local mem0 left dormant)."
@@ -275,8 +279,10 @@ echo "    import smoke OK"
 # --- 4a2. W5 T4.4: remember what is being replaced, for the rollback hint ---
 # The retrieval gate (5b) can only fire AFTER the restart, when new code is
 # already live — the honest remedy on a red gate is a rollback, and the hint
-# must name a real ref. DEPLOYED_SHA is written on every successful deploy.
-PREV_SHA="$(cat "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || echo '<previous-main>')"
+# must name a real ref. DEPLOYED_SHA is written on every successful deploy: a 40-hex sha, or the
+# word "unknown" (install/deploy-stamp.sh), and only a sha is a ref to roll back to.
+PREV_SHA="$(head -n1 "$APP_DIR/DEPLOYED_SHA" 2>/dev/null | tr -d '[:space:]' || true)"
+[[ "$PREV_SHA" =~ ^[0-9a-f]{40}$ ]] || PREV_SHA='<previous-main>'
 
 # --- 4b. AMS-09b (W5 review F2): idempotent durable fastembed-cache seed ---
 # The unit pins FASTEMBED_CACHE_PATH to a reboot-surviving dir and runs
@@ -357,7 +363,7 @@ else
     fi
     echo "    retrieval families gate OK"
 fi
-git -C "$REPO_ROOT" rev-parse HEAD > "$APP_DIR/DEPLOYED_SHA" 2>/dev/null || true
+deploy_stamp_write "$REPO_ROOT" "$APP_DIR"
 
 _full_gate_opt=""
 case "$MEM0_HEALTH_URL" in http://127.0.0.1:*) ;; *) _full_gate_opt="AMS_ALLOW_LIVE_PROD_TESTS=1 " ;; esac   # the suites refuse a non-loopback target otherwise

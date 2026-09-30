@@ -86,10 +86,11 @@ under `degraded_steps`. The entities collection has no rebuild path, so a missin
 `app_version` and `git_sha` come from the `VERSION` and `DEPLOYED_SHA` stamps written beside the
 server modules (the deployed tree has no `.git`): by `deploy.sh` on a WSL host, and by the
 installers (`install/linux-authority.sh`, `install/linux-replica.sh`, `install/1-wsl-services.sh`)
-on every install and refresh, because `deploy.sh` refuses a native host. The installers write it
-only through the shared `install/deploy-stamp.sh` contract: one line, a 40-hex sha or the word
-`unknown` (an install from a tree with no `.git` and no stamp of its own), so a stale sha is never
-kept. The stamp is authoritative for the manifest: `git_sha` is its 40-hex sha, and `unknown` when
+on every install and refresh, because `deploy.sh` refuses a native host. The installers and
+`deploy.sh` write it only through the shared `install/deploy-stamp.sh` contract: one line, a 40-hex
+sha or the word `unknown` (a tree with no readable `.git` and no stamp of its own), so a stale sha
+is never kept and a checkout git cannot read never leaves an empty file. `deploy.sh` reads the
+stamp back as the rollback ref it prints after a red retrieval gate, and takes only a sha for it. The stamp is authoritative for the manifest: `git_sha` is its 40-hex sha, and `unknown` when
 the stamp reads `unknown` or is empty or malformed, because a checkout that happens to be reachable
 names its own commit, not the deployed one. Only a tree with no stamp file at all (the writer
 running straight from a checkout no installer deployed) asks that checkout; with none, it says

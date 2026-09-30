@@ -68,6 +68,66 @@ def test_write_puts_one_line_named_DEPLOYED_SHA_in_each_directory(tmp_path):
     assert SHA[:12] in r.stdout
 
 
+DEPLOY = REPO_ROOT / "scripts" / "wsl" / "deploy.sh"
+
+
+def test_deploy_sh_stamps_only_through_the_contract_and_reads_it_back_as_a_ref(tmp_path):
+    """deploy.sh wrote DEPLOYED_SHA with `git rev-parse HEAD > file 2>/dev/null || true`. The redirect
+    truncates the file before git runs, so a checkout git cannot read (an invalid .git, a safe.directory
+    refusal) left an EMPTY stamp: the backup manifest read no evidence, and the next deploy printed
+    `git checkout ` as its rollback ref. The contract (deploy_stamp_write) writes a 40-hex sha or the
+    word `unknown`, so deploy.sh now goes through it at both stamp sites, and the rollback reader takes
+    only a sha (`unknown` is not a ref)."""
+    code = [ln for ln in DEPLOY.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
+    joined = "\n".join(code)
+    assert '. "$REPO_ROOT/install/deploy-stamp.sh"' in joined, "deploy.sh must source the contract"
+    inline = [ln for ln in code if re.search(r'>\s*"[^"]*DEPLOYED_SHA', ln)]
+    assert not inline, f"an inline DEPLOYED_SHA writer bypasses the contract: {inline}"
+    calls = [ln.strip() for ln in code if "deploy_stamp_write " in ln]
+    assert calls == ['deploy_stamp_write "$REPO_ROOT" "$APP_DIR"'] * 2, \
+        "both stamp sites (the dormant-replica exit and the end of a full deploy) go through the contract"
+
+    def stamp(checkout):
+        app = tmp_path / f"app-{checkout.name}"
+        app.mkdir()
+        script = 'set -euo pipefail; REPO_ROOT="$1"; APP_DIR="$2"; . "$3"; ' + calls[0]
+        r = subprocess.run([BASH, "-c", script, "stamp", checkout.as_posix(), app.as_posix(), LIB.as_posix()],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        return (app / "DEPLOYED_SHA").read_text(encoding="utf-8")
+
+    head = _git_repo(tmp_path / "repo")
+    assert stamp(tmp_path / "repo") == head + "\n"
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    (unreadable / ".git").write_text("not a gitfile\n", encoding="utf-8")   # git fails; the old writer left 0 bytes
+    assert stamp(unreadable) == "unknown\n"
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert stamp(bare) == "unknown\n"
+
+    # the reader that names the rollback ref: a sha is a ref, `unknown` / an empty file / no file are not
+    start = next(i for i, ln in enumerate(code) if ln.startswith("PREV_SHA="))
+    end = next(i for i in range(start, len(code)) if "<previous-main>" in code[i])
+    reader = "\n".join(code[start:end + 1])
+    app = tmp_path / "app-reader"
+    app.mkdir()
+
+    def ref(content):
+        f = app / "DEPLOYED_SHA"
+        f.unlink(missing_ok=True)
+        if content is not None:
+            f.write_text(content, encoding="utf-8")
+        script = 'set -euo pipefail; APP_DIR="$1"; ' + reader + '; printf "%s" "$PREV_SHA"'
+        r = subprocess.run([BASH, "-c", script, "reader", app.as_posix()], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+
+    assert ref(SHA + "\n") == SHA
+    for stale in ("unknown\n", "", "\n", None):
+        assert ref(stale) == "<previous-main>", repr(stale)
+
+
 @pytest.mark.parametrize("installer", ["linux-authority.sh", "linux-replica.sh"])
 def test_the_installers_that_stamp_VERSION_stamp_the_sha_beside_it(installer):
     """Neither installer runs hermetically past --render-only, so the wiring is pinned by text:
