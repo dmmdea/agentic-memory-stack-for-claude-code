@@ -194,13 +194,17 @@ Request: {"tier": "canonical", "actor": "user-direct", "reason": "the operator s
 - `actor` is required (a free-text label; the enforced rules are tier-specific below). `tier` must be in `PROMOTE_ALLOWED_TIERS` (`evidence`, `stable`, `canonical`, `insight`, `temporal`).
 - `tier=canonical` requires `actor=user-direct` **or** `actor=dream-autopromote` (the nightly autopromotion), a non-empty `reason`, **and** a valid HMAC user-direct token — headers `X-User-Direct-Token` / `-Ts` / `-Nonce`, signing format-2 `<ts>|<nonce>|promote|<mid>|<reason>` (produced by `mem0-canonize.sh`; the nonce-less format-1 was removed in v0.20). A canonical promote from any other actor, or without the nonce, → `403`. The canonical text is run through the imperative-canary → `422` if it reads as a standing order rather than a declarative fact.
 - `tier=insight` requires `actor` in the exact allowlist `{c1-consolidator, dream-consolidator, c1-dream-consolidator}`. Any other actor → `403`.
-- `tier in {evidence, stable, temporal}` accepts `claude-autonomous` — autonomous Claude can only ever set these.
+- `tier in {evidence, stable, temporal}` accepts `claude-autonomous` — autonomous Claude can only ever set these, and only on a record that is not canonical.
+- **Moving a record out of `canonical`** (to any other tier) needs the same kind of token signed for the action word `demote` (`<ts>|<nonce>|demote|<mid>|<reason>`, produced by `mem0-canonize.sh --action demote [--tier evidence|stable|temporal]`) and a non-empty `reason`. Without it → `403`; a promote token cannot be replayed as a demotion. A record with no `tier` field reads as canonical (fail-closed), so an unsigned change to it is also `403`. The tier is re-read under the record's write lock: if the record became canonical while an unsigned change was in flight → `409` (retry, or sign it). A move to a non-canonical tier on a record that does not exist (or was deleted mid-flight) → `404`. The per-record write lock keys on the canonical UUID spelling, so every spelling of one id serializes on the same lock.
 
 ```
 Response 200: {"ok": true, "memory_id": "...", "tier": "canonical", "actor": "user-direct", "ts": "2026-..."}
-Response 400: missing actor, missing reason for canonical, invalid tier
-Response 403: actor/tier enforcement rejected, or canonical promote without nonce
+Response 400: missing actor, missing reason for a canonical promotion or a demotion, invalid tier
+Response 403: actor/tier enforcement rejected, canonical promote without nonce, or a move out of canonical without the signed demote token
+Response 404: a move to a non-canonical tier on a record that does not exist (or was deleted mid-flight)
+Response 409: the record became canonical while an unsigned tier change was in flight
 Response 422: imperative text rejected from canonical
+Response 503: the tier could not be read (store unreachable) or the audit intent line could not be written
 ```
 
 ### `PATCH /v1/memories/{id}/metadata`
