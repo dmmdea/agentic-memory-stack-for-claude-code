@@ -2641,9 +2641,9 @@ def _main(argv=None) -> int:
     parser.add_argument("--apply-partial", action="store_true",
                         help="--supersede-markers --apply: also annotate PARTIAL markers (scope partial, "
                              "detail = the marker's qualifier). A partial annotation never hides a record.")
-    parser.add_argument("--only", default=None, metavar="ID[,ID...]",
+    parser.add_argument("--only", default=None, metavar="IDS",
                         help="--supersede-markers: restrict what --apply / --apply-partial writes to these "
-                             "record ids (the report still lists every marker)")
+                             "comma-separated record ids (the report still lists every marker)")
     args = parser.parse_args(argv)
     dry_run = not args.apply
     user_id_defaulted = args.user_id is None      # the operator did not choose a scope
