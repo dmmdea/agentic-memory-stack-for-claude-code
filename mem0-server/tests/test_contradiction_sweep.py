@@ -2588,8 +2588,19 @@ def test_the_new_modes_default_to_a_dry_run_and_apply_flips_it(monkeypatch):
                     ("u", True, "partial"), ("u", False, "full")]
 
 
-def test_apply_partial_and_only_are_refused_outside_an_apply_markers_run(monkeypatch):
+def test_apply_partial_needs_supersede_markers_and_apply_and_only_needs_supersede_markers(monkeypatch):
+    """--apply-partial is refused outside --supersede-markers and without --apply (partial annotations
+    ride on an apply run); --only is refused only outside --supersede-markers."""
     monkeypatch.setattr(sweep, "run_supersede_markers", lambda args, dry_run: (_ for _ in ()).throw(AssertionError("must not run")))
     assert sweep.main(["--supersede-markers", "--apply-partial"]) == 2, "partial annotations ride on --apply"
     assert sweep.main(["--apply-partial"]) == 2
     assert sweep.main(["--only", "abc"]) == 2
+
+
+def test_only_is_accepted_with_supersede_markers_even_without_apply(monkeypatch):
+    """The other half of the rule above: in a dry run --only is not an error (nothing is written, so it
+    restricts nothing); it is refused only when --supersede-markers is absent."""
+    seen = []
+    monkeypatch.setattr(sweep, "run_supersede_markers", lambda args, dry_run: (seen.append((dry_run, args.only)) or 0))
+    assert sweep.main(["--supersede-markers", "--only", "abc"]) == 0
+    assert seen == [(True, "abc")]
