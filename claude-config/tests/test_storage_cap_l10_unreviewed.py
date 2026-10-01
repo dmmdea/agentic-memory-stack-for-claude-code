@@ -102,6 +102,21 @@ def test_contradiction_review_queue_prints_own_line(tmp_path):
     assert "[storage-cap] 2 contradiction" not in out
 
 
+def test_contradiction_review_banner_names_the_command_for_each_kind_of_line(tmp_path):
+    """The queue holds contradiction lines (--promote) and, since 1.32.4, supersede lines, which
+    --promote refuses and --resolve-supersede handles. The one banner line serves both."""
+    mem0 = tmp_path / ".mem0"
+    mem0.mkdir(parents=True, exist_ok=True)
+    rows = ['{"memory_id":"a","canonical_id":"c"}',
+            '{"memory_id":"b","canonical_id":"w","kind":"supersede"}']
+    (mem0 / "contradiction-promote-review.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    out = _run_with_fake_home(tmp_path)
+    line = next(ln for ln in out.splitlines() if "await review" in ln)
+    assert "--promote <id>" in line and "contradiction" in line
+    assert "--resolve-supersede <id> --winner <w>" in line and "supersede" in line
+    assert "contradiction-promote-review.jsonl" in line, "the list pointer stays"
+
+
 def test_contradiction_review_queue_silent_when_empty(tmp_path):
     mem0 = tmp_path / ".mem0"
     mem0.mkdir(parents=True, exist_ok=True)
