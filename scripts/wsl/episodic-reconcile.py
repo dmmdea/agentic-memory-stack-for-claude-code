@@ -23,12 +23,22 @@ two bounded, receipted maintenance steps the weekly run now performs before it r
   * stale checkpoints: an `in_progress` episode whose last checkpoint (ended_at) is older than
     --stale-days (default 7) is set to `abandoned` - the documented stale-sweep that was never written.
     Every prompt opens an in_progress checkpoint that only a later extraction finalizes, so sessions
-    that produced nothing stayed in_progress forever. The count is in the receipt. This is the ONE
+    that produced nothing stayed in_progress forever. The receipt says how many and which. This is the ONE
     write, made over its own short read-write connection; rows are never deleted or otherwise edited.
   * embedding backfill: up to --backfill-limit (default 500; 0 disables) complete episodes missing
     from the episode-vector collection are embedded, newest first, through
-    scripts/wsl/episode-embed-backfill.py, skipped when /health/embedder is down. Coverage below 90 %
+    scripts/wsl/episode-embed-backfill.py, after polling /health/embedder for a cold seat (skipped when it
+    stays down for the whole window). Coverage below 90 %
     of eligible episodes reads `degraded:embedding-coverage-<pct>` (a catching-up gap: reported, exit 0).
+
+1.32.4: the same two upkeep steps also run DAILY as their own chain step, `--upkeep` (systemd/
+ams-step-episode-upkeep.service): abandon stale checkpoints + a bounded (200) vector backfill, and nothing
+else (the orphan / drift / coverage pass stays Sunday-only). The abandon sweep selects ids, closes them under
+one write lock, receipts which (`abandoned_sample`, `abandoned_oldest_ended_at`, `in_progress_remaining`,
+`would_abandon`), runs BEFORE the Qdrant readiness gate (it is SQLite-only) and has a `--dry-run` that writes
+nothing. The upkeep receipt (`"mode": "upkeep"`) carries the backfill's exact per-id gap (`missing`,
+`missing_ids`, `remaining`), and a degraded state (`embedder-down`, `embed-errors-<n>`, `remaining-<n>`,
+`backfill-failed`, `abandon-failed`) is reported through the step outcome line with exit 0.
 
 Weekly systemd-user timer: episodic-reconcile.timer (after contradiction-sweep).
 """
@@ -185,6 +195,7 @@ def reconcile_outcome(db_present: bool, qdrant_ok: bool,
 COVERAGE_DEGRADE_PCT = 90           # embedded / eligible episodes below this reads degraded
 STALE_IN_PROGRESS_DAYS = 7          # an in_progress checkpoint untouched this long is orphaned
 BACKFILL_PER_RUN = 500              # bounded embeds per weekly run
+UPKEEP_BACKFILL_PER_RUN = 200       # bounded embeds per DAILY upkeep run (the daily step has little to catch up)
 EMBEDDER_WAIT_S = 120               # how long the backfill preflight waits for a cold embedder ...
 EMBEDDER_STEP_S = 15                # ... probing this often (a cold start is seconds; a dead seat is not)
 COVERAGE_OUTCOME_PREFIX = "degraded:embedding-coverage-"
@@ -253,31 +264,96 @@ def existing_episode_ids(conn: sqlite3.Connection) -> set:
     return {r[0] for r in conn.execute("SELECT id FROM episodes").fetchall()}
 
 
-def abandon_stale_in_progress(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None) -> int:
-    """Set `in_progress` episodes whose last checkpoint (ended_at) is older than `days` to
-    `abandoned`; returns how many. The ONLY write this script makes, over its own short read-write
-    connection (the ledger connection everywhere else is mode=ro). An unparseable ended_at is left
-    alone rather than guessed at. Idempotent."""
+def select_stale_in_progress(conn: sqlite3.Connection, cutoff: str) -> list:
+    """(id, session_id, ended_at) of every `in_progress` episode whose last checkpoint (ended_at) is
+    older than `cutoff`, oldest first. An unparseable ended_at is left alone rather than guessed at."""
+    return conn.execute(
+        "SELECT id, session_id, ended_at FROM episodes WHERE state = 'in_progress' "
+        "AND julianday(ended_at) IS NOT NULL AND julianday(ended_at) < julianday(?) "
+        "ORDER BY julianday(ended_at) ASC, id ASC", (cutoff,)).fetchall()
+
+
+def abandon_ids(conn: sqlite3.Connection, ids: list, cutoff: str) -> int:
+    """Set the selected episodes to `abandoned`; returns how many changed. Every row is re-checked at
+    write time (still `in_progress`, still older than `cutoff`), so a checkpoint or a finalize that landed
+    after the SELECT is never clobbered: the sweep only ever closes what is STILL stale."""
+    changed = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        # REFUTED semgrep sqlalchemy-execute-raw-query: the only thing concatenated is the PLACEHOLDER
+        # count ("?,?,?"); every value is bound as a parameter, so no input text reaches the SQL string.
+        q = ("UPDATE episodes SET state = 'abandoned' WHERE state = 'in_progress' "
+             "AND julianday(ended_at) IS NOT NULL AND julianday(ended_at) < julianday(?) "
+             "AND id IN (" + ",".join("?" * len(chunk)) + ")")
+        # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+        changed += conn.execute(q, [cutoff, *chunk]).rowcount
+    return changed
+
+
+def sweep_stale_in_progress(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None, *,
+                            dry_run: bool = False, sample_cap: int = 20) -> dict:
+    """Close the stale checkpoints and say exactly which. Returns the receipt fields:
+    would_abandon (the rows selected), abandoned (the rows changed; 0 on a dry run),
+    abandoned_sample ({id, session_id, ended_at}, at most `sample_cap`), abandoned_oldest_ended_at,
+    in_progress_remaining (after the sweep) and dry_run.
+
+    The one write this script makes to the ledger, over its own short read-write connection (every other
+    ledger connection here is mode=ro; a dry run uses one too). It is SQLite-only: it needs neither Qdrant
+    nor the embedder. SELECT and UPDATE share one BEGIN IMMEDIATE, so a checkpoint cannot slip in between
+    them (it waits for the commit, then finds no in_progress row and opens a fresh one), and the UPDATE
+    re-checks each row anyway. Rows are never deleted and their text is not touched. Idempotent."""
     now = now or dt.datetime.now(dt.timezone.utc)
     cutoff = (now - dt.timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn = open_ledger_ro(db_path) if dry_run else sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
     try:
-        cur = conn.execute(
-            "UPDATE episodes SET state = 'abandoned' WHERE state = 'in_progress' "
-            "AND julianday(ended_at) IS NOT NULL AND julianday(ended_at) < julianday(?)", (cutoff,))
-        conn.commit()
-        return cur.rowcount
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = select_stale_in_progress(conn, cutoff)
+            abandoned = 0 if dry_run else abandon_ids(conn, [r[0] for r in rows], cutoff)
+            remaining = int(conn.execute("SELECT COUNT(*) FROM episodes WHERE state = 'in_progress'").fetchone()[0])
+            if not dry_run:
+                conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return {"would_abandon": len(rows), "abandoned": abandoned,
+                "abandoned_sample": [{"id": r[0], "session_id": r[1], "ended_at": r[2]} for r in rows[:sample_cap]],
+                "abandoned_oldest_ended_at": rows[0][2] if rows else None,
+                "in_progress_remaining": remaining, "dry_run": dry_run}
     finally:
         conn.close()
 
 
-def try_abandon_stale(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None):
-    """(count, error): abandon_stale_in_progress that never raises - the reconcile must still write
+def abandon_stale_in_progress(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None) -> int:
+    """How many stale `in_progress` episodes sweep_stale_in_progress set to `abandoned`. Idempotent."""
+    return sweep_stale_in_progress(db_path, days, now)["abandoned"]
+
+
+def try_sweep_stale(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None, *,
+                    dry_run: bool = False, sample_cap: int = 20):
+    """(receipt fields, error): sweep_stale_in_progress that never raises - the reconcile must still write
     its receipt when the sweep cannot run."""
     try:
-        return abandon_stale_in_progress(db_path, days, now), None
+        return sweep_stale_in_progress(db_path, days, now, dry_run=dry_run, sample_cap=sample_cap), None
     except (sqlite3.Error, OSError) as e:
-        return 0, f"{type(e).__name__}: {str(e)[:100]}"
+        return ({"would_abandon": 0, "abandoned": 0, "abandoned_sample": [], "abandoned_oldest_ended_at": None,
+                 "in_progress_remaining": None, "dry_run": dry_run}, f"{type(e).__name__}: {str(e)[:100]}")
+
+
+def try_abandon_stale(db_path: Path, days: int = STALE_IN_PROGRESS_DAYS, now=None):
+    """(count, error): abandon_stale_in_progress that never raises."""
+    info, error = try_sweep_stale(db_path, days, now)
+    return info["abandoned"], error
+
+
+def _sweep_fields(sweep: dict, abandon_error) -> dict:
+    """The sweep's part of a receipt line (weekly and upkeep alike)."""
+    return {"abandoned_stale_in_progress": sweep["abandoned"], "abandon_error": abandon_error,
+            "would_abandon": sweep["would_abandon"], "abandoned_sample": sweep["abandoned_sample"],
+            "abandoned_oldest_ended_at": sweep["abandoned_oldest_ended_at"],
+            "in_progress_remaining": sweep["in_progress_remaining"], "dry_run": sweep["dry_run"]}
 
 
 def _load_backfill():
@@ -304,6 +380,36 @@ def run_embedding_backfill(limit: int, db_path: Path, *, wait_s: float = EMBEDDE
     except Exception as e:  # noqa: BLE001 - the reconcile must still write its receipt
         return {"embedded": 0, "error": f"{type(e).__name__}: {str(e)[:100]}"}
     return dict(res)
+
+
+def run_upkeep_backfill(limit: int, db_path: Path, *, dry_run: bool = False,
+                        wait_s: float = EMBEDDER_WAIT_S) -> dict:
+    """The upkeep's bounded vector backfill. episode-embed-backfill.py DIFFS FIRST (SQL-eligible episodes
+    minus the ids in Qdrant), so it polls /health/embedder (`wait_s`) and builds the embedder only when
+    something is missing: a clean night makes no embedder call and keeps the 5-minute idle unload. On a dry
+    run it only reports the gap. Fail-soft: a failure (Qdrant unreachable, ...) is reported in the result."""
+    try:
+        res = _load_backfill().run(limit=limit, db_path=db_path, dry_run=dry_run, wait_embedder_s=wait_s)
+    except Exception as e:  # noqa: BLE001 - the upkeep must still write its receipt
+        return {"embedded": 0, "error": f"{type(e).__name__}: {str(e)[:100]}"}
+    return dict(res)
+
+
+def backfill_reason(res: dict):
+    """The degraded reason a backfill result earns, None when it is clean. Mirrors episode-embed-backfill.py
+    outcome_for (a test pins the two together): the job could not diff at all, the embedder never came up,
+    rows failed, or a backlog is left after the cap."""
+    if res.get("error"):
+        return "backfill-failed"
+    if res.get("aborted") == "embedder-down" or res.get("not_run") == "embedder-down":
+        return "embedder-down"
+    errors = int(res.get("errors") or 0)
+    if errors:
+        return f"embed-errors-{errors}"
+    remaining = int(res.get("remaining") or 0)
+    if remaining:
+        return f"remaining-{remaining}"
+    return None
 
 
 def embedding_coverage(conn: sqlite3.Connection, http: httpx.Client) -> dict:
@@ -460,23 +566,95 @@ def _append_summary(record: dict) -> None:
         print(f"episodic-reconcile: summary append failed (non-fatal): {e}", flush=True)
 
 
+def _record(record: dict, dry_run: bool) -> None:
+    """Append the receipt line, or on a dry run print it and write nothing (a dry run must not look like a
+    real run to the freshness row that reads the JSONL)."""
+    if dry_run:
+        record.setdefault("ts", _iso_now())
+        print(f"episodic-reconcile: dry-run {json.dumps(record)}", flush=True)
+    else:
+        _append_summary(record)
+
+
+def run_upkeep(args, db_path: Path, run_ts: str, backfill_limit: int) -> int:
+    """`--upkeep`, the daily chain step: close the stale checkpoints and run the bounded vector backfill,
+    nothing else (no orphan, drift or coverage pass: those stay in the Sunday run). Both halves are
+    fail-soft and independent: the sweep is SQLite-only and the backfill talks to Qdrant and the embedder
+    itself, so an outage on one never stops the other. A degraded state is reported through the outcome
+    line and exits 0 (the chain's next steps still run); only a missing ledger fails the step."""
+    sweep, abandon_error = try_sweep_stale(db_path, args.stale_days, dry_run=args.dry_run,
+                                           sample_cap=args.limit_sample)
+    if abandon_error:
+        print(f"episodic-reconcile: stale-checkpoint sweep skipped ({abandon_error})", flush=True)
+    backfill = (run_upkeep_backfill(backfill_limit, db_path, dry_run=args.dry_run) if backfill_limit > 0
+                else {"not_run": "disabled"})
+    reasons = (["abandon-failed"] if abandon_error else []) + [r for r in [backfill_reason(backfill)] if r]
+    outcome = "dry-run" if args.dry_run else (f"degraded:{','.join(reasons)}" if reasons else "ok")
+    cap = args.limit_sample
+    summary = {
+        "ts": run_ts,
+        "mode": "upkeep",
+        "stale_days": args.stale_days,
+        **_sweep_fields(sweep, abandon_error),
+        # the backfill's own per-id diff: exact, unlike the coverage probe's count (SQL TRIM vs Python strip,
+        # stale points masking real gaps), so a gap of 4 reads as 4 and names the 4 episodes
+        "missing": backfill.get("missing"),
+        "missing_ids": list(backfill.get("missing_ids") or [])[:cap],
+        "remaining": backfill.get("remaining"),
+        "remaining_ids": list(backfill.get("remaining_ids") or [])[:cap],
+        "embedding_backfill": {k: v for k, v in backfill.items() if k not in ("missing_ids", "remaining_ids")},
+        "outcome": outcome,
+    }
+    _record(summary, args.dry_run)
+    if not args.dry_run:
+        _write_outcome(outcome, {"abandoned": sweep["abandoned"], "in_progress_remaining": sweep["in_progress_remaining"],
+                                 "embedded": backfill.get("embedded", 0), "missing": backfill.get("missing"),
+                                 "remaining": backfill.get("remaining"), "errors": backfill.get("errors", 0)})
+    print(f"episodic-reconcile: upkeep done. abandoned_stale={sweep['abandoned']} (would_abandon="
+          f"{sweep['would_abandon']}) in_progress_remaining={sweep['in_progress_remaining']} "
+          f"missing={backfill.get('missing')} embedded={backfill.get('embedded', 0)} "
+          f"remaining={backfill.get('remaining')} outcome={outcome} -> {RECON_LOG}", flush=True)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v0.27.4 R5: non-destructive episodic-ledger reconciliation")
     parser.add_argument("--limit-sample", type=int, default=20,
-                        help="max orphaned/dangling ids recorded in the JSONL sample (default 20)")
+                        help="max orphaned/dangling/abandoned/missing ids recorded in a JSONL sample (default 20)")
     parser.add_argument("--db", default=str(EPISODIC_DB), help="episode ledger path (default ~/.mem0/episodic.db)")
     parser.add_argument("--stale-days", type=int, default=STALE_IN_PROGRESS_DAYS,
                         help=f"abandon in_progress episodes untouched this many days (default {STALE_IN_PROGRESS_DAYS})")
-    parser.add_argument("--backfill-limit", type=int, default=BACKFILL_PER_RUN,
-                        help=f"embed at most this many missing episode summaries per run (default {BACKFILL_PER_RUN}; 0 disables)")
+    parser.add_argument("--backfill-limit", type=int, default=None,
+                        help=f"embed at most this many missing episode summaries per run (default {BACKFILL_PER_RUN}; "
+                             f"{UPKEEP_BACKFILL_PER_RUN} with --upkeep; 0 disables)")
+    parser.add_argument("--upkeep", action="store_true",
+                        help="the daily step: abandon stale checkpoints + the bounded vector backfill ONLY (no "
+                             "orphan / drift / coverage pass)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="report what would be abandoned (and, with --upkeep, how many vectors are missing); "
+                             "write nothing: no ledger change, no embeds, no receipt line")
     args = parser.parse_args()
     run_ts = _iso_now()
     db_path = Path(args.db)
+    backfill_limit = args.backfill_limit if args.backfill_limit is not None else (
+        UPKEEP_BACKFILL_PER_RUN if args.upkeep else BACKFILL_PER_RUN)
 
     if not db_path.exists():
         print(f"episodic-reconcile: episodic.db not found at {db_path}", flush=True)
-        _append_summary({"outcome": "degraded:no-episodic-db", "ts": run_ts, "db": str(db_path)})
+        _record({"outcome": "degraded:no-episodic-db", "ts": run_ts, "db": str(db_path),
+                 **({"mode": "upkeep"} if args.upkeep else {})}, args.dry_run)
         return 1
+
+    if args.upkeep:
+        return run_upkeep(args, db_path, run_ts, backfill_limit)
+
+    # WP-4 / 1.32.4: abandon orphaned checkpoints FIRST. The sweep is SQLite-only, so a Qdrant outage must
+    # not stop it (it used to sit behind the readiness gate below).
+    sweep, abandon_error = try_sweep_stale(db_path, args.stale_days, dry_run=args.dry_run,
+                                           sample_cap=args.limit_sample)
+    abandoned = sweep["abandoned"]
+    if abandon_error:
+        print(f"episodic-reconcile: stale-checkpoint sweep skipped ({abandon_error})", flush=True)
 
     qdrant_ok = True
     try:
@@ -484,16 +662,18 @@ def main() -> int:
     except (httpx.HTTPError, OSError) as e:
         qdrant_ok = False
         print(f"episodic-reconcile: Qdrant unreachable: {e}", flush=True)
-        _append_summary({"outcome": "degraded:qdrant-unreachable", "ts": run_ts, "skipped": str(e)[:120]})
+        _record({"outcome": "degraded:qdrant-unreachable", "ts": run_ts, "skipped": str(e)[:120],
+                 **_sweep_fields(sweep, abandon_error)}, args.dry_run)
         return 1
 
-    # WP-4: abandon orphaned checkpoints, then backfill missing embeddings, BEFORE the read-only pass
-    # below so the coverage figure it reports is the one AFTER this run's catch-up.
-    abandoned, abandon_error = try_abandon_stale(db_path, args.stale_days)
-    if abandon_error:
-        print(f"episodic-reconcile: stale-checkpoint sweep skipped ({abandon_error})", flush=True)
-    backfill = (run_embedding_backfill(args.backfill_limit, db_path) if args.backfill_limit > 0
-                else {"not_run": "disabled"})
+    # Then backfill missing embeddings, BEFORE the read-only pass below so the coverage figure it reports
+    # is the one AFTER this run's catch-up.
+    if args.dry_run:
+        backfill = {"not_run": "dry-run"}
+    elif backfill_limit > 0:
+        backfill = run_embedding_backfill(backfill_limit, db_path)
+    else:
+        backfill = {"not_run": "disabled"}
 
     conn = open_ledger_ro(db_path)
     coverage: dict = {"eligible": None, "embedded": None, "missing": None}
@@ -513,7 +693,8 @@ def main() -> int:
     except (httpx.HTTPError, OSError, ValueError) as e:
         # ValueError = a malformed 200 (see qdrant_present_ids) — degrade, never false-orphan.
         print(f"episodic-reconcile: Qdrant point-fetch failed: {e}", flush=True)
-        _append_summary({"outcome": "degraded:qdrant-fetch-failed", "ts": run_ts, "skipped": str(e)[:120]})
+        _record({"outcome": "degraded:qdrant-fetch-failed", "ts": run_ts, "skipped": str(e)[:120],
+                 **_sweep_fields(sweep, abandon_error)}, args.dry_run)
         return 1
     finally:
         http.close()
@@ -587,8 +768,7 @@ def main() -> int:
         "history_delete_rows_total": history_delete_total,
         "ledger_parse_errors": dict(LEDGER_PARSE_ERRORS),
         "embedding_coverage": coverage,   # AMS-19
-        "abandoned_stale_in_progress": abandoned,
-        "abandon_error": abandon_error,
+        **_sweep_fields(sweep, abandon_error),
         "embedding_backfill": backfill,
         "outcome": outcome,
     }
@@ -597,10 +777,11 @@ def main() -> int:
     if outcome == "ok":
         outcome = coverage_outcome(coverage) or "ok"
         summary["outcome"] = outcome
-    _append_summary(summary)
-    _write_outcome(outcome, {"abandoned": abandoned, "embedded": backfill.get("embedded", 0),
-                             "coverage_pct": coverage_pct(coverage),
-                             "orphaned": n_orphan, "dangling": n_dangling})
+    _record(summary, args.dry_run)
+    if not args.dry_run:
+        _write_outcome(outcome, {"abandoned": abandoned, "embedded": backfill.get("embedded", 0),
+                                 "coverage_pct": coverage_pct(coverage),
+                                 "orphaned": n_orphan, "dangling": n_dangling})
     n_ex = len(split["explained"]) if split else "n/a"
     n_un = len(split["unexplained"]) if split else "n/a"
     print(f"episodic-reconcile: done. links={len(links)} memory_links={result['memory_links']} "

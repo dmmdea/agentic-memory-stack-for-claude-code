@@ -596,8 +596,8 @@ class _FakeBackfill:
         self.result, self.error, self.calls = result or {"embedded": 7, "skipped": 0, "errors": 0,
                                                          "remaining": 0, "total_complete": 7}, error, []
 
-    def run(self, limit=None, db_path=None):
-        self.calls.append({"limit": limit, "db_path": db_path})
+    def run(self, limit=None, db_path=None, **kw):
+        self.calls.append({"limit": limit, "db_path": db_path, **kw})
         if self.error:
             raise self.error
         return dict(self.result)
@@ -1052,3 +1052,315 @@ def test_the_embedder_is_built_only_inside_the_gap_gate():
     assert holders and set(holders) <= {"make_embedder", "run"}, holders
     assert not [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
                 and getattr(n, "module", None) == "config"]
+
+
+# --- 1.32.4: the daily upkeep closes stale checkpoints and retries missed vectors ----------------------
+#
+# `abandon_stale_in_progress` shipped in 1.32.0 but only runs in the Sunday chain step, after the Qdrant
+# readiness gate, with no dry-run and a bare count for a receipt: 1,063 episodes sat `in_progress` (1,009 of
+# them older than 7 days) and nobody could see what the first run would touch. It now selects ids and closes
+# them under one write lock, says which, runs before the Qdrant gate (it is SQLite-only), and a new
+# `--upkeep` mode (the daily chain step) does that plus the bounded vector backfill and nothing else.
+
+_DAY = _dtmod.timedelta(days=1)
+
+
+def _iso_ago(days):
+    return (_NOW - days * _DAY).isoformat()
+
+
+def _stale_ledger(tmp_path):
+    return _real_ledger(tmp_path, [
+        ("in_progress", _iso_ago(30)),      # 1: the oldest orphan
+        ("in_progress", _iso_ago(10)),      # 2
+        ("in_progress", _iso_ago(1)),       # 3: a live session's checkpoint
+        ("complete", _iso_ago(40)),         # 4: finished
+        ("in_progress", _iso_ago(8)),       # 5
+    ])
+
+
+def _ledger_snapshot(db):
+    c = sqlite3.connect(db)
+    try:
+        return c.execute("SELECT id, session_id, started_at, ended_at, goal_text, summary_text FROM episodes "
+                         "ORDER BY id").fetchall()
+    finally:
+        c.close()
+
+
+def test_sweep_dry_run_reports_what_it_would_close_and_writes_nothing(tmp_path):
+    db = _stale_ledger(tmp_path)
+    before = db.read_bytes()
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW, dry_run=True)
+    assert info["would_abandon"] == 3 and info["abandoned"] == 0 and info["dry_run"] is True
+    assert [s["id"] for s in info["abandoned_sample"]] == [1, 2, 5]
+    assert info["in_progress_remaining"] == 4
+    assert db.read_bytes() == before, "not one byte of the ledger changed"
+    assert _states(db) == {1: "in_progress", 2: "in_progress", 3: "in_progress", 4: "complete", 5: "in_progress"}
+
+
+def test_sweep_receipt_names_the_rows_it_closed(tmp_path):
+    db = _stale_ledger(tmp_path)
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW, sample_cap=2)
+    assert info["abandoned"] == 3 and info["would_abandon"] == 3 and info["dry_run"] is False
+    assert info["abandoned_sample"] == [{"id": 1, "session_id": "s1", "ended_at": _iso_ago(30)},
+                                        {"id": 2, "session_id": "s2", "ended_at": _iso_ago(10)}], \
+        "oldest first, capped by sample_cap"
+    assert info["abandoned_oldest_ended_at"] == _iso_ago(30)
+    assert info["in_progress_remaining"] == 1, "only the live session's checkpoint is left"
+    assert _states(db) == {1: "abandoned", 2: "abandoned", 3: "in_progress", 4: "complete", 5: "abandoned"}
+    again = recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert again["abandoned"] == 0 and again["abandoned_oldest_ended_at"] is None, "idempotent"
+
+
+def test_sweep_never_deletes_or_rewrites_a_row(tmp_path):
+    db = _stale_ledger(tmp_path)
+    before = _ledger_snapshot(db)
+    recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert _ledger_snapshot(db) == before, "only the state column moves: no row deleted, no text rewritten"
+
+
+def test_a_row_that_stopped_being_stale_after_the_select_is_not_clobbered(tmp_path):
+    db = _stale_ledger(tmp_path)
+    cutoff = _iso_ago(7)
+    conn = sqlite3.connect(db)
+    ids = [r[0] for r in recon.select_stale_in_progress(conn, cutoff)]
+    assert ids == [1, 2, 5]
+    # between the SELECT and the UPDATE: episode 1 is finalized, episode 2 gets a fresh checkpoint
+    conn.execute("UPDATE episodes SET state = 'complete' WHERE id = 1")
+    conn.execute("UPDATE episodes SET ended_at = ? WHERE id = 2", (_NOW.isoformat(),))
+    conn.commit()
+    assert recon.abandon_ids(conn, ids, cutoff) == 1
+    conn.commit()
+    conn.close()
+    assert _states(db) == {1: "complete", 2: "in_progress", 3: "in_progress", 4: "complete", 5: "abandoned"}
+
+
+def test_a_competing_writer_is_locked_out_between_the_select_and_the_update(tmp_path, monkeypatch):
+    """The checkpoint hook writes to the same ledger. The sweep takes the write lock BEFORE it selects
+    (BEGIN IMMEDIATE), so a checkpoint waits for the commit and then opens a fresh row instead of
+    bumping one the sweep is about to close."""
+    db = _stale_ledger(tmp_path)
+    real_select = recon.select_stale_in_progress
+    seen = {}
+
+    def spying_select(conn, cutoff):
+        rows = real_select(conn, cutoff)
+        other = sqlite3.connect(db, timeout=0.1)
+        try:
+            other.execute("UPDATE episodes SET ended_at = ? WHERE id = 2", (_NOW.isoformat(),))
+            other.commit()
+            seen["locked"] = False
+        except sqlite3.OperationalError as e:
+            seen["locked"] = "locked" in str(e)
+        finally:
+            other.close()
+        return rows
+
+    monkeypatch.setattr(recon, "select_stale_in_progress", spying_select)
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert seen == {"locked": True} and info["abandoned"] == 3
+
+
+def test_the_sweep_rolls_back_when_it_fails_midway(tmp_path, monkeypatch):
+    db = _stale_ledger(tmp_path)
+
+    def boom(conn, ids, cutoff):
+        conn.execute("UPDATE episodes SET state = 'abandoned' WHERE id = 1")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(recon, "abandon_ids", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert _states(db)[1] == "in_progress", "a half-done sweep leaves the ledger as it was"
+    info, err = recon.try_sweep_stale(db, days=7, now=_NOW)
+    assert info["abandoned"] == 0 and "disk I/O error" in err
+
+
+def test_the_default_staleness_window_is_still_seven_days(monkeypatch, tmp_path):
+    assert recon.STALE_IN_PROGRESS_DAYS == 7
+    db = _real_ledger(tmp_path, [("in_progress", (_dtmod.datetime.now(_dtmod.timezone.utc) - 6 * _DAY).isoformat()),
+                                 ("in_progress", (_dtmod.datetime.now(_dtmod.timezone.utc) - 8 * _DAY).isoformat())])
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], db=db)
+    assert _states(db) == {1: "in_progress", 2: "abandoned"} and r.rc == 0
+
+
+class _Boom:
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, *a, **kw):
+        raise AssertionError(f"{self.name} must not run in this mode")
+
+
+def _main_run(monkeypatch, tmp_path, args=(), rows=None, backfill=None, coverage=None, http_get=None,
+              outcome=True, db=None):
+    """main() over a real-schema ledger. --upkeep makes every orphan / drift / coverage / Qdrant seam raise."""
+    db = db or _real_ledger(tmp_path, rows if rows is not None else [("in_progress", _iso_ago(20))])
+    fake = backfill or _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    summaries = []
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    out_file = tmp_path / "outcome.txt"
+    if outcome:
+        monkeypatch.setenv("AMS_OUTCOME_FILE", str(out_file))
+    else:
+        monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    healthy = _types.SimpleNamespace(raise_for_status=lambda: None)
+    if "--upkeep" in args:
+        for name in ("read_episode_links", "existing_episode_ids", "embedding_coverage", "qdrant_present_ids",
+                     "history_deleted_ids", "history_delete_row_count", "ledger_deleted"):
+            monkeypatch.setattr(recon, name, _Boom(name))
+        monkeypatch.setattr(recon.httpx, "get", http_get or _Boom("httpx.get (the Qdrant gate / embedder probe)"))
+    else:
+        monkeypatch.setattr(recon, "embedding_coverage",
+                            lambda conn, http: dict(coverage or {"eligible": 10, "embedded": 10, "missing": 0}))
+        monkeypatch.setattr(recon, "history_deleted_ids", lambda ids, db_path=None: set())
+        monkeypatch.setattr(recon, "history_delete_row_count", lambda db_path=None: 1)
+        monkeypatch.setattr(recon, "ledger_deleted", lambda ids, ledger_dir=None: {})
+        monkeypatch.setattr(recon, "qdrant_present_ids", lambda http, ids: set())
+        monkeypatch.setattr(recon.httpx, "get", http_get or (lambda url, **kw: healthy))
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--db", str(db), *args])
+    rc = recon.main()
+    return _types.SimpleNamespace(rc=rc, summaries=summaries, fake=fake, outcome_file=out_file, db=db)
+
+
+def _outcome(r):
+    status, _, body = r.outcome_file.read_text(encoding="utf-8").strip().partition(" ")
+    return status, _json.loads(body)
+
+
+def test_the_weekly_sweep_runs_before_the_qdrant_gate(monkeypatch, tmp_path):
+    """The sweep is SQLite-only: a Qdrant outage must not stop it (it used to sit after the readiness gate)."""
+    def qdrant_down(url, **kw):
+        raise httpx.ConnectError("qdrant down")
+
+    r = _main_run(monkeypatch, tmp_path, http_get=qdrant_down, outcome=False)
+    assert r.rc == 1 and _states(r.db) == {1: "abandoned"}
+    s = r.summaries[-1]
+    assert s["outcome"] == "degraded:qdrant-unreachable" and s["abandoned_stale_in_progress"] == 1
+    assert s["abandoned_sample"][0]["id"] == 1 and r.fake.calls == []
+
+
+def test_the_weekly_receipt_carries_the_sweep_fields(monkeypatch, tmp_path):
+    r = _main_run(monkeypatch, tmp_path, ["--limit-sample", "1"], rows=[
+        ("in_progress", _iso_ago(30)), ("in_progress", _iso_ago(20))])
+    s = r.summaries[-1]
+    assert s["abandoned_stale_in_progress"] == 2 and s["would_abandon"] == 2 and s["dry_run"] is False
+    assert [x["id"] for x in s["abandoned_sample"]] == [1], "capped by --limit-sample"
+    assert s["abandoned_oldest_ended_at"] == _iso_ago(30) and s["in_progress_remaining"] == 0
+
+
+def test_main_dry_run_changes_nothing_and_appends_no_receipt(monkeypatch, tmp_path, capsys):
+    r = _main_run(monkeypatch, tmp_path, ["--dry-run"])
+    assert _states(r.db) == {1: "in_progress"}, "nothing abandoned"
+    assert r.summaries == [] and r.fake.calls == [] and not r.outcome_file.exists()
+    out = capsys.readouterr().out
+    assert '"would_abandon": 1' in out and '"dry_run": true' in out
+
+
+def test_upkeep_closes_stale_rows_and_backfills_and_skips_every_other_pass(monkeypatch, tmp_path):
+    bf = _FakeBackfill({"embedded": 3, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 3,
+                        "missing": 3, "missing_ids": [4, 5, 6], "remaining_ids": []})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=bf)
+    assert r.rc == 0 and _states(r.db) == {1: "abandoned"}
+    assert bf.calls == [{"limit": 200, "db_path": r.db, "dry_run": False, "wait_embedder_s": recon.EMBEDDER_WAIT_S}]
+    s = r.summaries[-1]
+    assert s["mode"] == "upkeep" and s["outcome"] == "ok" and s["abandoned_stale_in_progress"] == 1
+    assert not {"orphaned_count", "dangling_count", "embedding_coverage", "total_links"} & set(s)
+    status, counts = _outcome(r)
+    assert status == "ok" and counts["abandoned"] == 1 and counts["embedded"] == 3 and counts["missing"] == 3
+    assert counts["remaining"] == 0 and counts["in_progress_remaining"] == 0
+
+
+def test_upkeep_backfill_limit_defaults_to_200_and_zero_disables_it(monkeypatch, tmp_path):
+    assert recon.UPKEEP_BACKFILL_PER_RUN == 200 and recon.BACKFILL_PER_RUN == 500
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--backfill-limit", "7"])
+    assert r.fake.calls[0]["limit"] == 7
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    r = _main_run(monkeypatch, zero, ["--upkeep", "--backfill-limit", "0"])
+    assert r.fake.calls == [] and r.summaries[-1]["embedding_backfill"] == {"not_run": "disabled"}
+    assert r.summaries[-1]["outcome"] == "ok"
+
+
+def test_the_weekly_mode_keeps_its_500_embed_cap(monkeypatch, tmp_path):
+    r = _main_run(monkeypatch, tmp_path)
+    assert r.fake.calls == [{"limit": 500, "db_path": r.db}]
+
+
+@pytest.mark.parametrize("backfill, status", [
+    (_FakeBackfill({"embedded": 0, "skipped": 0, "errors": 1, "remaining": 4, "total_complete": 4, "missing": 4,
+                    "aborted": "embedder-down"}), "degraded:embedder-down"),
+    (_FakeBackfill({"embedded": 1, "skipped": 0, "errors": 2, "remaining": 3, "total_complete": 4, "missing": 4}),
+     "degraded:embed-errors-2"),
+    (_FakeBackfill({"embedded": 200, "skipped": 0, "errors": 0, "remaining": 800, "total_complete": 1000,
+                    "missing": 1000}), "degraded:remaining-800"),
+    (_FakeBackfill(error=httpx.ConnectError("qdrant down")), "degraded:backfill-failed"),
+], ids=["embedder-down", "embed-errors", "remaining", "backfill-failed"])
+def test_upkeep_reports_a_degraded_state_through_the_outcome_line_and_exits_zero(monkeypatch, tmp_path, backfill, status):
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=backfill)
+    assert r.rc == 0, "reported, not failed: the chain's next steps still run"
+    assert _outcome(r)[0] == status and r.summaries[-1]["outcome"] == status
+    assert _states(r.db) == {1: "abandoned"}, "the SQLite sweep still ran: a Qdrant or embedder outage never stops it"
+
+
+def test_upkeep_names_every_reason_when_the_sweep_and_the_backfill_both_fail(monkeypatch, tmp_path):
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(recon, "sweep_stale_in_progress", locked)
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 2, "total_complete": 2, "missing": 2})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=bf)
+    assert r.rc == 0 and _outcome(r)[0] == "degraded:abandon-failed,remaining-2"
+    assert "database is locked" in r.summaries[-1]["abandon_error"]
+
+
+def test_upkeep_receipt_reports_the_exact_per_id_gap(monkeypatch, tmp_path):
+    """A coverage percentage reads '99 % ok' with 4 vectors missing; the receipt lists the ids."""
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 4, "total_complete": 3583,
+                        "missing": 4, "missing_ids": [101, 102, 103, 104], "remaining_ids": [101, 102, 103, 104]})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--limit-sample", "2"], backfill=bf)
+    s = r.summaries[-1]
+    assert s["missing"] == 4 and s["remaining"] == 4
+    assert s["missing_ids"] == [101, 102] and s["remaining_ids"] == [101, 102], "ids capped by --limit-sample"
+    assert "missing_ids" not in s["embedding_backfill"] and s["embedding_backfill"]["missing"] == 4
+    assert _outcome(r)[0] == "degraded:remaining-4"
+
+
+def test_upkeep_dry_run_reports_and_writes_nothing(monkeypatch, tmp_path, capsys):
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 4, "total_complete": 10,
+                        "missing": 4, "missing_ids": [7, 8, 9, 10], "remaining_ids": [7, 8, 9, 10], "dry_run": True})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--dry-run"], backfill=bf)
+    assert r.rc == 0 and _states(r.db) == {1: "in_progress"}
+    assert bf.calls == [{"limit": 200, "db_path": r.db, "dry_run": True, "wait_embedder_s": recon.EMBEDDER_WAIT_S}]
+    assert r.summaries == [] and not r.outcome_file.exists()
+    out = capsys.readouterr().out
+    assert '"would_abandon": 1' in out and '"missing": 4' in out and '"mode": "upkeep"' in out
+
+
+def test_upkeep_without_a_ledger_is_a_failed_run(monkeypatch, tmp_path):
+    summaries = []
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--upkeep", "--db", str(tmp_path / "absent.db")])
+    assert recon.main() == 1
+    assert summaries[-1]["outcome"] == "degraded:no-episodic-db" and summaries[-1]["mode"] == "upkeep"
+
+
+@pytest.mark.parametrize("res", [
+    {"embedded": 5, "remaining": 0, "errors": 0},
+    {"embedded": 0, "remaining": 4, "errors": 1, "aborted": "embedder-down"},
+    {"embedded": 2, "remaining": 18, "errors": 5, "aborted": "5 consecutive embed failures (last: x)"},
+    {"embedded": 9, "remaining": 1, "errors": 1},
+    {"embedded": 200, "remaining": 800, "errors": 0},
+    {"embedded": 0, "error": "ConnectError: qdrant"},
+])
+def test_the_reconcile_and_the_backfill_script_read_a_result_the_same_way(res):
+    reason = recon.backfill_reason(res)
+    assert ("ok" if reason is None else f"degraded:{reason}") == _load_backfill_script().outcome_for(res)
+
+
+def test_the_weekly_step_unit_and_the_wsl_timer_keep_their_schedule():
+    """The Sunday episodic-reconcile step stays as it is: the daily work is its own step."""
+    unit = (REPO_ROOT / "systemd" / "ams-step-episodic-reconcile.service").read_text(encoding="utf-8")
+    assert "--guarded --weekly Sun episodic-reconcile" in unit and "--upkeep" not in unit
