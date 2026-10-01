@@ -71,9 +71,18 @@ def test_ids_are_validated_and_self_supersession_refused():
 
 def test_brands_compare_case_insensitively_and_null_or_shared_brands_are_neutral():
     assert ss.precheck(L, W, _rec(brand="Brand-A"), _rec(brand="brand-a")) is None
-    assert ss.precheck(L, W, _rec(brand=None), _rec(brand="brand-a")) is None
-    assert ss.precheck(L, W, _rec(brand="shared"), _rec(brand="brand-a"),
+    assert ss.precheck(L, W, _rec(brand="brand-a"), _rec(brand=None)) is None       # branded -> neutral
+    assert ss.precheck(L, W, _rec(brand="brand-a"), _rec(brand="shared"),
                        shared_brands=("shared",)) is None
+    assert ss.precheck(L, W, _rec(brand=None), _rec(brand="shared"), shared_brands=("shared",)) is None
+
+
+@pytest.mark.parametrize("loser_brand", [None, "", "shared"])
+def test_a_neutral_record_is_never_hidden_behind_a_branded_one(loser_brand):
+    """The neutral fact is visible in every scope, the branded winner only in its own: hiding the
+    neutral one would erase the fact for every other brand."""
+    r = ss.precheck(L, W, _rec(brand=loser_brand), _rec(brand="brand-a"), shared_brands=("shared",))
+    assert r is not None and (r.status, r.code) == (403, "cross-brand")
 
 
 def test_the_same_winner_again_is_a_noop_not_a_refusal():
@@ -92,11 +101,24 @@ def test_partial_noop_needs_the_same_winner_and_detail():
 
 # ---- payloads -----------------------------------------------------------------------------------
 
-def test_full_payload_stamps_three_keys_and_never_trusts_the_source_for_identity():
-    p = ss.full_payload(W, NOW, source="memory_supersede")
-    assert p == {"superseded_by": W, "superseded_at": NOW, "superseded_via": "memory_supersede"}
-    assert ss.full_payload(W, NOW)["superseded_via"] == ss.ENDPOINT_ACTOR
-    assert ss.full_payload(W, NOW, source="a b/../c\n")["superseded_via"] == "a-b-..-c"
+def test_full_payload_stamps_three_server_values_and_a_lowercase_winner():
+    """superseded_via is the server's own stamp: a caller label could forge provenance, so it only
+    reaches the ledger line, as a caller-declared `source`."""
+    assert ss.full_payload(W.upper(), NOW) == {"superseded_by": W, "superseded_at": NOW,
+                                               "superseded_via": ss.ENDPOINT_ACTOR}
+    assert ss.clean_source("a b/../c\n") == "a-b-..-c"
+    assert ss.clean_source("x" * 200) == "x" * ss.SOURCE_MAX_CHARS
+
+
+def test_detail_and_reason_are_capped_for_every_scope():
+    assert ss.precheck(L, W, _rec(), _rec(), scope="full", detail="d" * 301).code == "detail-too-long"
+    assert ss.precheck(L, W, _rec(), _rec(), reason="r" * 501).code == "reason-too-long"
+    assert ss.precheck(L, W, _rec(), _rec(), reason="r" * 500) is None
+    assert ss.clear_precheck(L, _rec(superseded_by=W), "full", reason="r" * 501).code == "reason-too-long"
+
+
+def test_a_winner_with_retired_at_counts_as_retired():
+    assert ss.precheck(L, W, _rec(), _rec(retired_at="2026-09-01T00:00:00Z")).code == "winner-retired"
 
 
 def test_partial_payload_appends_and_is_bounded():
@@ -191,3 +213,150 @@ def test_live_record_shapes():
                "25feded5-d916-48e1-9daf-70f2ef8956dd (the 'Current main = 6552b5e, VERSION 1.20.4' "
                "figure only): the repo released v1.32.1 to v1.32.3 on 2026-09-30.")
     assert ss.classify_text(partial).kind == "partial"
+
+
+# ---- full is the narrow case (security review, 1.32.4) ------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    f"Fact.\nSUPERSEDED (price figure only) by mem0 {W}: new price",
+    f"Fact.\nSUPERSEDED in part by mem0 {W}",
+    f"Fact.\nSUPERSEDED partially by mem0 {W}",
+    f"Fact.\nSUPERSEDED the price only by mem0 {W}",
+    f"Fact.\nSUPERSEDED, in part, by mem0 {W}",
+    f"Fact.\nSUPERSEDED (but still valid for X) by mem0 {W}",
+    f"Fact.\nSUPERSEDED 2026-09-30 by mem0 {W}: the 'X' figure only",
+    f"Fact.\nSUPERSEDED 2026-09-30 by mem0 {W}: only the port number is stale, the rest still holds",
+    f"Fact.\nSUPERSEDED by mem0 {W}: REVERTED, this record is current again",
+    f"Fact.\nSUPERSEDED by mem0 {W}. Port only.",
+    f"Fact.\nSUPERSEDED by mem0 {W}\nThe port line above still holds",
+    f"Fact.\nSUPERSEDED 2026-09-30 by mem0 {W}: port number now 5; the rest remains valid",
+])
+def test_ambiguous_or_scoped_markers_are_never_full(text):
+    m = ss.classify_text(text)
+    assert m is not None and m.kind != "full", (text, m)
+
+
+@pytest.mark.parametrize("text", [
+    f"Fact.\nSUPERSEDED 2026-09-30 by mem0 {W}: four tiers declare it, not only the two.",
+    f"Fact.\nSUPERSEDED 2026-09-30T13:58Z by mem0 {W}: launched detached (no shared console) since 09-23.",
+    f"Fact. SUPERSEDED on 2026-09-30 by mem0 {W}: replaced.",
+    f"Fact.\n[SUPERSEDED 2026-09-30 by mem0 {W}: replaced]",
+    f"Fact — SUPERSEDED 2026-09-30 by mem0 {W}: replaced.",
+])
+def test_a_plain_dated_marker_is_full(text):
+    m = ss.classify_text(text)
+    assert (m.kind, m.winner_id) == ("full", W), (text, m)
+
+
+# ---- the write transaction ------------------------------------------------------------------------
+
+class _Store:
+    def __init__(self, records, fail_set=False):
+        self.records = {k: dict(v) for k, v in records.items()}
+        self.fail_set = fail_set
+        self.calls = []
+
+    def read(self, mid):
+        self.calls.append(("read", mid))
+        rec = self.records.get(mid)
+        return dict(rec) if rec is not None else None
+
+    def set_payload(self, mid, payload):
+        self.calls.append(("set", mid))
+        if self.fail_set:
+            raise RuntimeError("store down")
+        self.records[mid].update(payload)
+
+    def delete_keys(self, mid, keys):
+        self.calls.append(("delete_keys", mid))
+        for k in keys:
+            self.records[mid].pop(k, None)
+
+
+class _Ledger:
+    def __init__(self, fail=False):
+        self.lines, self.fail = [], fail
+
+    def __call__(self, entry):
+        if self.fail:
+            raise OSError("disk full")
+        self.lines.append(dict(entry))
+
+
+def test_run_supersede_full_writes_after_the_intent_line():
+    store, ledger = _Store({L: _rec(), W: _rec()}), _Ledger()
+    out = ss.run_supersede(store, ledger, mid=L, winner_id=W.upper(), scope="full",
+                           reason="r", source="memory_supersede", now_iso=NOW)
+    assert out["hidden"] is True and out["noop"] is False and out["winner_id"] == W
+    assert store.records[L]["superseded_by"] == W
+    assert store.records[L]["superseded_via"] == ss.ENDPOINT_ACTOR
+    assert [line["event"] for line in ledger.lines] == ["supersede-intent"]
+    assert ledger.lines[0]["source"] == "memory_supersede" and ledger.lines[0]["actor"] == ss.ENDPOINT_ACTOR
+    assert out["_entry"]["event"] == "supersede"
+    assert store.calls.index(("set", L)) > store.calls.index(("read", W))
+
+
+def test_run_supersede_refusal_writes_nothing():
+    store, ledger = _Store({L: _rec(tier="canonical"), W: _rec()}), _Ledger()
+    with pytest.raises(ss.Refused) as e:
+        ss.run_supersede(store, ledger, mid=L, winner_id=W, now_iso=NOW)
+    assert e.value.refusal.code == "loser-canonical"
+    assert ledger.lines == [] and ("set", L) not in store.calls
+
+
+def test_run_supersede_without_a_ledger_writes_nothing():
+    store = _Store({L: _rec(), W: _rec()})
+    with pytest.raises(ss.LedgerUnavailable):
+        ss.run_supersede(store, _Ledger(fail=True), mid=L, winner_id=W, now_iso=NOW)
+    assert "superseded_by" not in store.records[L] and ("set", L) not in store.calls
+
+
+def test_run_supersede_store_error_propagates_after_the_intent():
+    store, ledger = _Store({L: _rec(), W: _rec()}, fail_set=True), _Ledger()
+    with pytest.raises(RuntimeError):
+        ss.run_supersede(store, ledger, mid=L, winner_id=W, now_iso=NOW)
+    assert [line["event"] for line in ledger.lines] == ["supersede-intent"]
+
+
+def test_run_supersede_repeat_is_a_noop_and_partial_appends():
+    store, ledger = _Store({L: _rec(superseded_by=W), W: _rec()}), _Ledger()
+    out = ss.run_supersede(store, ledger, mid=L, winner_id=W, now_iso=NOW)
+    assert out["noop"] is True and ledger.lines == [] and ("set", L) not in store.calls
+    store2 = _Store({L: _rec(), W: _rec()})
+    out2 = ss.run_supersede(store2, _Ledger(), mid=L, winner_id=W, scope="partial",
+                            detail="the figure", now_iso=NOW)
+    assert out2["hidden"] is False
+    assert store2.records[L]["partially_superseded_by"][-1]["detail"] == "the figure"
+    assert "superseded_by" not in store2.records[L]
+
+
+def test_run_unsupersede_clears_after_the_intent_and_noops_when_clear():
+    store, ledger = _Store({L: _rec(superseded_by=W, superseded_at=NOW, superseded_via="x")}), _Ledger()
+    out = ss.run_unsupersede(store, ledger, mid=L, scope="full", reason="wrong winner", now_iso=NOW)
+    assert out["noop"] is False and "superseded_by" not in store.records[L]
+    assert ledger.lines[0]["event"] == "unsupersede-intent"
+    assert ledger.lines[0]["cleared"]["superseded_by"] == W
+    again = ss.run_unsupersede(store, _Ledger(), mid=L, scope="full", now_iso=NOW)
+    assert again["noop"] is True
+    with pytest.raises(ss.Refused):
+        ss.run_unsupersede(_Store({L: _rec(tier="canonical", superseded_by=W)}), _Ledger(),
+                           mid=L, now_iso=NOW)
+
+
+# ---- the rules the delete and tier paths share ---------------------------------------------------
+
+@pytest.mark.parametrize("payload,protected", [
+    (None, True), ({"tier": None}, True), ({}, True), ({"tier": "canonical"}, True),
+    ({"tier": "insight"}, True), ({"tier": "evidence"}, False), ({"tier": "stable"}, False),
+])
+def test_cascade_never_deletes_a_protected_or_unreadable_member(payload, protected):
+    assert ss.cascade_protected(payload) is protected
+
+
+def test_a_superseded_record_is_never_promoted_into_a_protected_tier():
+    r = ss.promotion_refusal({"tier": "evidence", "superseded_by": W}, "canonical")
+    assert r is not None and (r.status, r.code) == (409, "superseded-record")
+    assert ss.promotion_refusal({"tier": "evidence", "superseded_by": W}, "insight") is not None
+    assert ss.promotion_refusal({"tier": "evidence", "superseded_by": W}, "stable") is None
+    assert ss.promotion_refusal({"tier": "evidence"}, "canonical") is None
+    assert ss.promotion_refusal({"tier": "evidence", "partially_superseded_by": [{}]}, "canonical") is None

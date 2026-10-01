@@ -144,14 +144,16 @@ def _handler(name: str, end_marker: str) -> str:
     return src[start:src.index(end_marker, start)]
 
 
-def test_supersede_endpoint_enforces_the_policy_under_both_locks_and_audits_first():
+def test_supersede_endpoint_runs_the_transaction_under_both_locks():
+    """The order (read both, precheck, intent line, write) lives in supersession.run_supersede and is
+    executed headless in test_supersession.py; the endpoint must call it under both locks."""
     body = _handler("supersede_memory", "@app.delete(")
     assert body.index("auth(x_api_key)") < body.index("_supersede_locks(mid, b.winner_id)")
     lock_at = body.index("with _supersede_locks(mid, b.winner_id):")
-    assert lock_at < body.index("_supersede_read(mid)") < body.index("_ss.precheck(")
-    assert body.index("_ss.precheck(") < body.index('"supersede-intent"') < body.index("set_payload(")
-    assert '"actor": _ss.ENDPOINT_ACTOR' in body
+    assert lock_at < body.index("_supersede_call(") < body.index("_ss.run_supersede")
     assert "shared_brands=_shared_brands_from_env()" in body
+    assert "reason=b.reason" in body and "detail=b.detail" in body
+    assert body.index("_supersede_call(") < body.index("return _supersede_finish(out)")
 
 
 def test_supersede_body_has_no_actor_field():
@@ -162,10 +164,45 @@ def test_supersede_body_has_no_actor_field():
     assert "actor" not in model.split('"""')[0].replace("ledger actor", "")
 
 
-def test_unsupersede_endpoint_rechecks_and_audits_first():
+def test_unsupersede_endpoint_runs_the_transaction_under_the_lock():
     body = _handler("unsupersede_memory", "# v0.16: Goal endpoints")
-    assert body.index("auth(x_api_key)") < body.index("_ss.clear_precheck(")
-    assert body.index("_ss.clear_precheck(") < body.index('"unsupersede-intent"') < body.index("delete_payload(")
+    assert body.index("auth(x_api_key)") < body.index("with _supersede_locks(mid):")
+    assert body.index("with _supersede_locks(mid):") < body.index("_ss.run_unsupersede")
+    assert "reason=reason" in body
+
+
+def test_supersede_call_maps_refusals_and_a_missing_ledger():
+    body = _handler("_supersede_call", "def _supersede_finish(")
+    assert "except _ss.Refused as e:" in body and "e.refusal.status" in body
+    assert "except _ss.LedgerUnavailable" in body and "503" in body
+    assert "fn(_SupersedeStore(), _append_ledger, **kw)" in body
+
+
+def test_cascade_never_deletes_a_protected_member_through_a_supersession_link():
+    src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
+    start = src.index('@app.delete("/v1/memories/{mid}")')
+    nxt = src.find("@app.", start + 10)
+    body = src[start:] if nxt < 0 else src[start:nxt]
+    loop = body[body.index("for _linked_id in chain_ids:"):]
+    assert loop.index("_ss.cascade_protected(_linked_payload)") < loop.index("mem.delete(memory_id=_linked_id)")
+    assert "cascade_skipped.append(_linked_id)" in loop
+    assert '"cascade_skipped_protected"' in body
+
+
+def test_a_plain_delete_names_the_records_it_leaves_superseded():
+    src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
+    start = src.index('@app.delete("/v1/memories/{mid}")')
+    nxt = src.find("@app.", start + 10)
+    body = src[start:] if nxt < 0 else src[start:nxt]
+    tail = body[body.index("if not cascade:"):]
+    assert '"superseded_by"' in tail and '"orphaned_supersessions"' in tail
+    assert "except Exception:" in tail, "the report is fail-soft: it may never fail a delete"
+
+
+def test_a_superseded_record_is_never_promoted_into_a_protected_tier():
+    body = _handler("update_tier", "def update_metadata(")
+    locked = body[body.index("with _mid_write_lock(mid):"):]
+    assert locked.index("_ss.promotion_refusal(_supersede_read(mid), b.tier)") < locked.index('"tier-change-intent"')
 
 
 def test_put_names_a_hand_written_marker():

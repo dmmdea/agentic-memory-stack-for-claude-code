@@ -186,6 +186,12 @@ TRUSTED_PATCH_ACTORS: dict[str, frozenset[str]] = {
 # (admission_gate.AdmissionPolicy.evaluate, steps 1b and 1c). No metadata PATCH may put one on a
 # canonical record, whatever its actor string: a canonical leaves default retrieval only through
 # the operator's signed path (demote first: mem0-canonize.sh --action demote).
+# Scope, stated plainly: this closes the hole for CANONICAL records only. The trusted and legacy actor
+# strings themselves are still unauthenticated, so an API-key holder that sends one can still stamp
+# that actor's keys on a non-canonical record (the sweep's contradicts_canonical on an insight or
+# evidence record, backfill-apply-v013's retrievable=false, system's expires_at). The sweep stamps
+# insight candidates by design, so insight is not added here; closing the rest needs a credential for
+# server-side actors, not a string (register follow-up).
 RETRIEVAL_HIDE_KEYS = frozenset({"superseded_by", "contradicts_canonical"})
 
 # PATCH /v1/memories/{id}/metadata key policy. It lived inline in the app.py handler; 1.32.4 moved

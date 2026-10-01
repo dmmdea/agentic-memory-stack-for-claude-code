@@ -130,6 +130,7 @@ Returns one record by id: text, metadata (incl. tier), timestamps. Use before up
 - `canonical` — requires `actor="user-direct"` (or the server-side `dream-autopromote` allowlist), a **non-empty `reason`**, AND a valid HMAC format-2 user-direct token: headers `X-User-Direct-Token` / `X-User-Direct-Ts` / `X-User-Direct-Nonce` signing `<ts>|<nonce>|promote|<mid>|<reason>` (403 without them; the nonce is burned server-side for replay protection). `scripts/wsl/mem0-canonize.sh` is the only shipped producer of that token. Imperative-phrased text is rejected 422 (canonical is declarative facts only).
 - `insight` — requires an actor from the consolidator allowlist (403 otherwise).
 - `evidence` / `stable` / `temporal` — any non-empty actor.
+- Since 1.32.4 a record that carries `superseded_by` is never moved into `canonical` or `insight` (409 `superseded-record`): it would be a hidden canonical, and the supersession link would let a cascade delete reach it. Clear the supersession first (`DELETE /v1/memories/{mid}/supersede`). A partial annotation does not block a promotion.
 
 **Response 200:**
 ```json
@@ -154,13 +155,13 @@ The **only writer of `superseded_by`**. Before it, a session that learned a fact
 {
   "winner_id": "<uuid of the newer record>",
   "scope": "full",                  // "full" (default) hides the record | "partial" annotates one stale claim
-  "detail": "the old port number",  // REQUIRED for "partial" (max 300 characters): which claim is out of date
-  "reason": "free text for the ledger",
-  "source": "memory_supersede"      // caller label for audit only (sanitized, max 64 characters); authorises nothing
+  "detail": "the old port number",  // REQUIRED for "partial" (max 300 characters, any scope): which claim is out of date
+  "reason": "free text for the ledger",  // max 500 characters
+  "source": "memory_supersede"      // caller-declared label, ledger line only (sanitized, max 64 characters); authorises and proves nothing
 }
 ```
 
-- `scope: "full"` sets `superseded_by`, `superseded_at` and `superseded_via` (the sanitized `source`, else `supersede-endpoint`). The admission gate then hides the record in the `durable`, `operational` and `canonical` query classes; `history` still returns it.
+- `scope: "full"` sets `superseded_by` (the winner id, lower-cased), `superseded_at` and `superseded_via` (always `supersede-endpoint`: a caller label could forge provenance, so `source` reaches only the ledger line). The admission gate then hides the record in the `durable`, `operational` and `canonical` query classes; `history` still returns it.
 - `scope: "partial"` appends `{winner_id, detail, at}` to `partially_superseded_by` (the 20 newest are kept). The gate does not read that key: a partial supersession **never hides** a record. Search results carry the list in `metadata`, and the MCP shim adds a `partial_supersession_note`.
 - Both records are read fail-closed (a store error is `503`, nothing written) and locked in sorted key order. An **intent ledger line** (`supersede-intent`) is written before the mutation (`503`, nothing changed, if it cannot be), a `supersede` line after. The server stamps the actor (`supersede-endpoint`); a body never sets it. A repeated identical call changes nothing.
 
@@ -173,14 +174,15 @@ The **only writer of `superseded_by`**. Before it, a session that learned a fact
 | 400 | `bad-id` | `{mid}` or `winner_id` is not a memory id (UUID) |
 | 400 | `bad-scope` | `scope` is neither `full` nor `partial` |
 | 400 | `self` | a record cannot supersede itself |
-| 400 | `detail-required`, `detail-too-long` | a partial without a `detail`, or one over 300 characters |
+| 400 | `detail-required`, `detail-too-long` | a partial without a `detail`, or a `detail` over 300 characters (any scope) |
+| 400 | `reason-too-long` | a `reason` over 500 characters |
 | 404 | `loser-not-found`, `winner-not-found` | the record or the winner does not exist |
 | 403 | `loser-canonical` | the record is `canonical` (or carries no tier, which counts as canonical): it leaves default retrieval only through the operator's signed path (`mem0-canonize.sh --action demote`, then supersede) |
 | 403 | `loser-insight` | the record is an `insight`: only its consolidator or a signed token changes it |
-| 409 | `loser-retired`, `winner-retired` | either record is retired (`retrievable=false`) |
+| 409 | `loser-retired`, `winner-retired` | either record is retired (`retrievable=false` or a `retired_at` stamp) |
 | 409 | `winner-superseded` | the winner is itself superseded: point at the newest record |
 | 403 | `cross-tenant` | the two records belong to different users |
-| 403 | `cross-brand` | the two carry different brands (a label in `shared_brands` counts as neutral) |
+| 403 | `cross-brand` | the two carry different brands, or a brand-neutral record would be hidden behind a branded winner (the fact would vanish for every other brand); a label in `shared_brands` counts as neutral, and a branded record may be superseded by a neutral one |
 | 409 | `already-superseded` | the record is already superseded by a *different* winner (clear it first with `DELETE`), or a partial note is asked of a record already fully superseded |
 | 503 | — | the store could not be read, or the intent ledger line could not be written; nothing was changed, retry |
 
@@ -188,15 +190,15 @@ The MCP tool `memory_supersede` wraps this route (below).
 
 ### `DELETE /v1/memories/{mid}/supersede` — undo a supersession (1.32.4)
 
-**Query params:** `scope` — `full` (default; clears `superseded_by`, `superseded_at` and `superseded_via`, so the record returns to default retrieval), `partial` (clears `partially_superseded_by`) or `all`; `reason` (optional, ledgered). The same tier rules as the write: a `canonical` or `insight` target is refused (`403 loser-canonical` / `loser-insight`), a missing one is `404 loser-not-found`, a bad scope or id is `400 bad-scope` / `bad-id`. Nothing to clear is a no-op. Like the write it appends an intent ledger line first (`unsupersede-intent`, then `unsupersede` with the cleared values) and answers `503` without changing anything if it cannot.
+**Query params:** `scope` — `full` (default; clears `superseded_by`, `superseded_at` and `superseded_via`, so the record returns to default retrieval), `partial` (clears `partially_superseded_by`) or `all`; `reason` (optional, ledgered, max 500 characters: `400 reason-too-long`). The same tier rules as the write: a `canonical` or `insight` target is refused (`403 loser-canonical` / `loser-insight`), a missing one is `404 loser-not-found`, a bad scope or id is `400 bad-scope` / `bad-id`. Nothing to clear is a no-op. Like the write it appends an intent ledger line first (`unsupersede-intent`, then `unsupersede` with the cleared values) and answers `503` without changing anything if it cannot.
 
 **Response 200:** `{"ok": true, "memory_id", "scope", "noop": false}`.
 
 ### `DELETE /v1/memories/{mid}`
 
-**Query params:** `actor`, `reason` (optional, ledgered), `cascade` (default false — `true` also deletes records superseded by the target). `canonical`/`insight` targets require the user-direct HMAC headers (`mem0-canonize.sh --action delete`).
+**Query params:** `actor`, `reason` (optional, ledgered), `cascade` (default false — `true` also deletes records superseded by the target). `canonical`/`insight` targets require the user-direct HMAC headers (`mem0-canonize.sh --action delete`). Since 1.32.4 any API-key holder can create a `superseded_by` link (the supersede door), so the cascade **never deletes a `canonical`, `insight` or tier-less member, nor one it cannot read**: the root's authorisation does not extend through the link. Those members are kept and listed.
 
-**Response 200:** mem0 `delete()` return value. Always appends a `delete` ledger entry (with the prior payload's source) so destructive ops are audit-covered.
+**Response 200:** mem0 `delete()` return value, plus (1.32.4) `cascade_skipped_protected: [ids]` when a cascade kept protected members, and `orphaned_supersessions: [ids]` (first 50, fail-soft) when a plain delete removed a record that others are superseded by: they stay hidden behind a winner that no longer exists until someone clears (`DELETE /v1/memories/{id}/supersede`) or re-points them. Always appends a `delete` ledger entry (with the prior payload's source) so destructive ops are audit-covered.
 
 ### Goals / open-questions / episodes / context-bundle routes (one-line contracts)
 

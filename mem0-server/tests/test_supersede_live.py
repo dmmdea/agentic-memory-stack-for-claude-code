@@ -183,3 +183,19 @@ def test_a_hand_written_marker_gets_a_note(made):
     assert body.get("supersede_marker", {}).get("kind") == "full"
     assert "memory_supersede" in body.get("supersede_note", "")
     assert not _meta(a).get("superseded_by"), "a marker never hides by itself"
+
+
+def test_a_superseded_record_is_never_promoted_into_canonical(made):
+    """Security review, 1.32.4: a superseded canonical would be hidden and reachable by an unsigned
+    cascade delete through its supersession link, so the promotion is refused until it is cleared."""
+    tag = uuid.uuid4().hex[:10]
+    old = _add(f"supersede-live {tag}: old")
+    new = _add(f"supersede-live {tag}: new")
+    made += [old, new]
+    assert _supersede(old, new).status_code == 200
+    if CANONICAL_KEY is None:
+        pytest.skip("canonical key not configured on this box")
+    with pytest.raises(httpx.HTTPStatusError) as e:
+        _promote(old)
+    assert e.value.response.status_code == 409 and "superseded-record" in e.value.response.text
+    assert _meta(old).get("tier") == "evidence"

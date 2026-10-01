@@ -2332,6 +2332,13 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
             # between would let this unsigned change move a record that is canonical NOW, so a
             # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            # 1.32.4: a superseded record never enters a protected tier (it would be a hidden
+            # canonical, and its supersession link would expose it to an unsigned cascade delete).
+            if b.tier in ("canonical", "insight"):
+                import supersession as _ss
+                _refusal = _ss.promotion_refusal(_supersede_read(mid), b.tier)
+                if _refusal:
+                    raise HTTPException(_refusal.status, f"{_refusal.code}: {_refusal.message}")
             if b.tier != "canonical" and current_tier != "canonical":
                 _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
                 if _tier_now == _NOT_FOUND:
@@ -2473,6 +2480,21 @@ def _supersede_read(mid: str) -> Optional[dict]:
     return dict(pts[0].payload or {}) if pts else None
 
 
+class _SupersedeStore:
+    """The Qdrant side of supersession.run_supersede / run_unsupersede."""
+
+    def read(self, mid: str) -> Optional[dict]:
+        return _supersede_read(mid)
+
+    def set_payload(self, mid: str, payload: dict) -> None:
+        mem.vector_store.client.set_payload(
+            collection_name=mem.vector_store.collection_name, payload=payload, points=[mid])
+
+    def delete_keys(self, mid: str, keys: list) -> None:
+        mem.vector_store.client.delete_payload(
+            collection_name=mem.vector_store.collection_name, keys=keys, points=[mid])
+
+
 @contextlib.contextmanager
 def _supersede_locks(*mids):
     """Both records' write locks, taken in sorted key order (deadlock-free against single-lock holders)."""
@@ -2482,6 +2504,36 @@ def _supersede_locks(*mids):
         yield
 
 
+def _supersede_call(fn, **kw) -> dict:
+    """Run one supersession transaction and map its outcomes to HTTP."""
+    import supersession as _ss
+    try:
+        return fn(_SupersedeStore(), _append_ledger, **kw)
+    except _ss.Refused as e:
+        raise HTTPException(e.refusal.status, f"{e.refusal.code}: {e.refusal.message}")
+    except _ss.LedgerUnavailable as e:
+        log.exception("supersede intent ledger append failed; refusing")
+        raise HTTPException(503, "audit ledger unavailable (intent append failed); nothing was "
+                                 f"written — retry when ~/.mem0 is writable: {str(e)[:120]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("supersede write failed")
+        raise _upstream_error(e)
+
+
+def _supersede_finish(out: dict) -> dict:
+    """Append the completion ledger line (fail-soft: the intent line is the audit floor)."""
+    entry = out.pop("_entry", None)
+    if entry is not None:
+        try:
+            _append_ledger(entry)
+        except Exception:
+            log.exception("ledger append failed for %s (the intent line is the audit floor)",
+                          entry.get("event"))
+    return out
+
+
 @app.post("/v1/memories/{mid}/supersede")
 def supersede_memory(mid: str, b: SupersedeIn, x_api_key: Optional[str] = Header(None)):
     """Record that `mid` is superseded by `b.winner_id` (1.32.4; supersession.py has the rules).
@@ -2489,53 +2541,20 @@ def supersede_memory(mid: str, b: SupersedeIn, x_api_key: Optional[str] = Header
     scope="full" sets superseded_by, so the admission gate hides the record outside the history
     class; scope="partial" appends {winner_id, detail, at} to partially_superseded_by and never
     hides it. The server enforces the refusal matrix whoever calls (a canonical or insight record,
-    a retired or superseded winner, a different user or brand are refused) and stamps the ledger
-    actor itself. A repeated call is a no-op. Undo: DELETE /v1/memories/{id}/supersede."""
+    a retired or superseded winner, a different user, a different brand or a branded winner over a
+    neutral record are refused), caps detail and reason, and stamps the actor itself. A repeated
+    call is a no-op. Undo: DELETE /v1/memories/{id}/supersede."""
     auth(x_api_key)
     import supersession as _ss
     from admission_gate import _shared_brands_from_env
     if not _ss.is_memory_id(mid) or not _ss.is_memory_id(b.winner_id):
         raise HTTPException(400, "bad-id: both ids must be memory ids (UUIDs)")
     with _supersede_locks(mid, b.winner_id):
-        loser = _supersede_read(mid)
-        winner = _supersede_read(b.winner_id)
-        refusal = _ss.precheck(mid, b.winner_id, loser, winner, scope=b.scope, detail=b.detail,
-                               shared_brands=_shared_brands_from_env())
-        if refusal:
-            raise HTTPException(refusal.status, f"{refusal.code}: {refusal.message}")
-        if _ss.is_noop(loser, b.winner_id, b.scope, b.detail):
-            return {"ok": True, "memory_id": mid, "winner_id": b.winner_id, "scope": b.scope,
-                    "noop": True, "hidden": bool(loser.get("superseded_by"))}
-        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        if b.scope == "full":
-            payload = _ss.full_payload(b.winner_id, now, source=b.source)
-        else:
-            payload = _ss.partial_payload(loser, b.winner_id, b.detail, now)
-        payload["updated_at"] = now
-        entry = {"event": "supersede", "memory_id": mid, "winner_id": b.winner_id,
-                 "scope": b.scope, "detail": (b.detail or "").strip() or None,
-                 "actor": _ss.ENDPOINT_ACTOR, "source": _ss.clean_source(b.source),
-                 "reason": (b.reason or None), "prior_tier": loser.get("tier"),
-                 "transport": "rest-api"}
-        # Write-ahead audit (the AMS-22 pattern): no record is hidden without a ledger line first.
-        try:
-            _append_ledger({**entry, "event": "supersede-intent", "status": "intent"})
-        except Exception as e:
-            log.exception("supersede intent ledger append failed; refusing")
-            raise HTTPException(503, "audit ledger unavailable (intent append failed); nothing was "
-                                     f"written — retry when ~/.mem0 is writable: {str(e)[:120]}")
-        try:
-            mem.vector_store.client.set_payload(
-                collection_name=mem.vector_store.collection_name, payload=payload, points=[mid])
-        except Exception as e:
-            log.exception("supersede write failed")
-            raise _upstream_error(e)
-    try:
-        _append_ledger(entry)
-    except Exception:
-        log.exception("ledger append failed for supersede (the intent line is the audit floor)")
-    return {"ok": True, "memory_id": mid, "winner_id": b.winner_id, "scope": b.scope,
-            "noop": False, "hidden": b.scope == "full"}
+        out = _supersede_call(
+            _ss.run_supersede, mid=mid, winner_id=b.winner_id, scope=b.scope, detail=b.detail,
+            reason=b.reason, source=b.source, shared_brands=_shared_brands_from_env(),
+            now_iso=_dt.datetime.now(_dt.timezone.utc).isoformat())
+    return _supersede_finish(out)
 
 
 @app.delete("/v1/memories/{mid}/supersede")
@@ -2549,38 +2568,9 @@ def unsupersede_memory(mid: str, scope: str = Query("full"), reason: Optional[st
     if not _ss.is_memory_id(mid):
         raise HTTPException(400, "bad-id: the id must be a memory id (UUID)")
     with _supersede_locks(mid):
-        loser = _supersede_read(mid)
-        refusal = _ss.clear_precheck(mid, loser, scope)
-        if refusal:
-            raise HTTPException(refusal.status, f"{refusal.code}: {refusal.message}")
-        if not _ss.has_supersession(loser, scope):
-            return {"ok": True, "memory_id": mid, "scope": scope, "noop": True}
-        keys = list(_ss.clear_keys(scope))
-        entry = {"event": "unsupersede", "memory_id": mid, "scope": scope,
-                 "cleared": {k: loser.get(k) for k in keys if loser.get(k) not in (None, "", [])},
-                 "actor": _ss.ENDPOINT_ACTOR, "reason": (reason or None),
-                 "prior_tier": loser.get("tier"), "transport": "rest-api"}
-        try:
-            _append_ledger({**entry, "event": "unsupersede-intent", "status": "intent"})
-        except Exception as e:
-            log.exception("unsupersede intent ledger append failed; refusing")
-            raise HTTPException(503, "audit ledger unavailable (intent append failed); nothing was "
-                                     f"changed — retry when ~/.mem0 is writable: {str(e)[:120]}")
-        try:
-            mem.vector_store.client.delete_payload(
-                collection_name=mem.vector_store.collection_name, keys=keys, points=[mid])
-            mem.vector_store.client.set_payload(
-                collection_name=mem.vector_store.collection_name,
-                payload={"updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()},
-                points=[mid])
-        except Exception as e:
-            log.exception("unsupersede write failed")
-            raise _upstream_error(e)
-    try:
-        _append_ledger(entry)
-    except Exception:
-        log.exception("ledger append failed for unsupersede (the intent line is the audit floor)")
-    return {"ok": True, "memory_id": mid, "scope": scope, "noop": False}
+        out = _supersede_call(_ss.run_unsupersede, mid=mid, scope=scope, reason=reason,
+                              now_iso=_dt.datetime.now(_dt.timezone.utc).isoformat())
+    return _supersede_finish(out)
 
 # ---------------------------------------------------------------------------
 # v0.16: Goal endpoints
@@ -3711,6 +3701,7 @@ def delete(
             "audit ledger unavailable (intent append failed); delete refused "
             f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
         )
+    cascade_skipped: list[str] = []
     # H6/H11 fix: mem0ai 2.0.4 signature is mem.delete(memory_id) -- no delete_linked kwarg.
     # Cascade is implemented here: query Qdrant for superseded-by chain, delete each member
     # individually (non-cascade via mem0 API), and write a separate ledger entry per deletion
@@ -3756,6 +3747,7 @@ def delete(
         # Delete ancestors first (oldest end of chain), then the root (mid)
         _cascade_actor = actor or "rest-api"
         _cascade_reason = reason or f"cascade DELETE /v1/memories/{mid}"
+        import supersession as _ss
         for _linked_id in chain_ids:
             try:
                 _linked_payload = None
@@ -3768,6 +3760,14 @@ def delete(
                         _linked_payload = _lp[0].payload if hasattr(_lp[0], "payload") else _lp[0].get("payload")
                 except Exception:
                     pass
+                # 1.32.4: any API-key holder can create a superseded_by link (the supersede door), so
+                # the cascade never deletes a protected member through one, nor one it cannot read:
+                # the root's authorisation does not extend to a canonical or insight record.
+                if _ss.cascade_protected(_linked_payload):
+                    cascade_skipped.append(_linked_id)
+                    log.warning("cascade: skipped protected or unreadable chain member %s (root=%s)",
+                                _linked_id, mid)
+                    continue
                 mem.delete(memory_id=_linked_id)
                 try:
                     _append_ledger({
@@ -3811,4 +3811,26 @@ def delete(
         })
     except Exception:
         log.exception("ledger append failed for delete")
+    extra: dict = {}
+    if cascade_skipped:
+        extra["cascade_skipped_protected"] = cascade_skipped
+    if not cascade:
+        # 1.32.4: records superseded by the one just deleted stay hidden behind a missing winner.
+        # Name them (fail-soft) so the caller can clear or re-point them; nothing is changed here.
+        try:
+            _orph = mem.vector_store.client.scroll(
+                collection_name=mem.vector_store.collection_name,
+                scroll_filter={"must": [{"key": "superseded_by",
+                                         "match": {"value": str(mid).strip().lower()}}]},
+                with_payload=False, with_vectors=False, limit=50,
+            )
+            _orph_ids = [str(p.id) for p in ((_orph[0] if _orph else None) or [])]
+            if _orph_ids:
+                extra["orphaned_supersessions"] = _orph_ids
+                log.warning("delete %s left %d record(s) superseded by a deleted winner: %s",
+                            mid, len(_orph_ids), _orph_ids[:10])
+        except Exception:
+            log.warning("delete %s: could not list records superseded by it", mid)
+    if extra and isinstance(result, dict):
+        result = {**result, **extra}
     return result
