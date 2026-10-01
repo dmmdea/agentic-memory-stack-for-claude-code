@@ -389,10 +389,11 @@ except BaseException:
 " 2>/dev/null
 fi
 # WP-2: a replica's recent sessions come from the authority (its own episodic.db froze at the
-# cutover). GET /v1/episodes?recent=20 (1.5 s), keep the 5 newest that have a goal, label the source.
-# Authority reachable but the read fails -> one "unavailable" line, so the gap is never silent.
+# cutover). GET /v1/episodes?recent=20&state=complete (1.5 s; unfinished sessions have no goal and the
+# newest ended_at, so without the filter they can fill the window), keep the 5 newest that have a goal,
+# label the source. Authority reachable but the read fails -> one "unavailable" line, never silent.
 if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
-  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20" 2>/dev/null)
+  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20&state=complete" 2>/dev/null)
   _epout=$(printf '%s' "$_eps" | python3 -c "
 import sys, json
 try:

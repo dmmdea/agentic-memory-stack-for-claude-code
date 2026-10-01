@@ -489,7 +489,15 @@ def episodic_search(
     """Search past episodic memory (sessions) by keyword + optional date range + brand filter.
 
     Returns episodes ranked by FTS5 relevance. Each result has: id, session_id,
-    started_at, ended_at, goal_text, summary_text, brand, workspace, project, rank.
+    started_at, ended_at, goal_text, summary_text, state, brand, workspace, project, rank.
+
+    state is 'complete' (finished: goal_text and summary_text are the extracted episode),
+    'in_progress' (the session is still running, or ended without being finalized) or
+    'abandoned' (an in_progress row nobody finished). An unfinished row has an empty
+    goal_text, and its summary_text shows only the person's own prompts so far, never
+    background task notifications or messages relayed from another agent session; the
+    keyword match still runs on the stored text, so such a row can match words it no
+    longer shows.
 
     Use cases:
     - "what was I working on Tuesday?" → episodic_search("memory stack", since="2026-06-10")
@@ -520,8 +528,13 @@ def episodic_recent(limit: int = 7, brand: str | None = None) -> list:
     """Return the last N episodes ordered by ended_at descending.
 
     Default limit=7 — a cognitive working-memory anchor (Miller's Law).
-    Each result has: id, session_id, started_at, ended_at, goal_text, summary_text,
+    Each result has: id, session_id, started_at, ended_at, goal_text, summary_text, state,
     brand, workspace, project.
+
+    state is 'complete', 'in_progress' or 'abandoned'. Unfinished rows (in_progress, abandoned)
+    carry the newest ended_at, an empty goal_text, and a summary_text that shows only the
+    person's own prompts so far, never task notifications or relayed agent messages; the
+    finished sessions are the 'complete' rows.
 
     Use cases:
     - "what have I been working on lately?" → episodic_recent()
@@ -544,8 +557,9 @@ def episodic_recent(limit: int = 7, brand: str | None = None) -> list:
 def episodic_get(episode_id: int) -> dict:
     """Fetch full detail for one episode by its integer id.
 
-    Returns all episode fields plus linked_memories: a list of mem0 memory IDs
-    (cross-references) that were produced or cited in that session.
+    Returns all episode fields (including state) plus linked_memories: a list of mem0 memory IDs
+    (cross-references) that were produced or cited in that session. This is the drill-down: an
+    unfinished episode's summary_text comes back as stored, raw running log included.
 
     Use this after episodic_search or episodic_recent to drill into a specific
     episode and see which mem0 facts were created/cited during that session.

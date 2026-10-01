@@ -756,3 +756,65 @@ def test_a_spooled_insight_with_no_majority_replays_brandless(home, monkeypatch)
     _run(m, ["--force"], mem0=fm, judge=_judge(SIG, '{"insights":[]}', "[]"))
     assert [t for t, _ in fm.added] == ["a split insight"]
     assert "brand" not in fm.added[0][1], "tonight's brand-z evidence must not leak onto last night's insight"
+
+
+# ---------------------------------------------------------------------------------------------
+# 1.32.4: the recent episodes the dream gathers are finished sessions, never a running summary
+# ---------------------------------------------------------------------------------------------
+class _MixedEpisodesMem0(FakeMem0):
+    """What a server returns when unfinished rows are in the window: they have no goal, and their
+    summary is the prompts typed so far (before the fix, with machine turns in it)."""
+
+    def episodes(self, recent):
+        return [
+            {"ended_at": "2026-09-11T09:00:00", "brand": "b", "goal_text": "", "state": "in_progress",
+             "summary_text": "<task-notification> unfinished machine text | typed so far"},
+            {"ended_at": "2026-09-11T08:30:00", "brand": "b", "goal_text": "", "state": "abandoned",
+             "summary_text": "an abandoned running summary"},
+            {"ended_at": "2026-09-10T08:18:00", "brand": "b", "goal_text": "Ship the release", "state": "complete",
+             "summary_text": "Shipped it."},
+            {"ended_at": "2026-09-09T08:18:00", "brand": "b", "goal_text": "Older server row", "summary_text": "no state field"},
+        ]
+
+
+def test_the_gather_prompt_carries_finished_episodes_only(home):
+    m = _mod()
+    seen = {}
+
+    def j(prompt, **kw):
+        seen["p"] = prompt
+        return {"ok": True, "response": '{"signals":[]}', "tokens_used": 1, "duration_ms": 1}
+    _run(m, [], mem0=_MixedEpisodesMem0(EV), judge=j)
+    assert "Ship the release" in seen["p"]
+    assert "Older server row" in seen["p"], "a row without a state field (an older server) is kept"
+    assert "unfinished machine text" not in seen["p"] and "typed so far" not in seen["p"]
+    assert "abandoned running summary" not in seen["p"], "no summary_text fallback for a row that is not complete"
+    assert json.loads((home / ".mem0" / "maintenance" / "dream" / "orient.json").read_text())["recent_episodes_count"] == 2
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _RecordingHttp:
+    def __init__(self, payload):
+        self.payload, self.urls = payload, []
+
+    def get(self, url, headers=None, timeout=None):
+        self.urls.append(url)
+        return _Resp(self.payload)
+
+
+def test_the_client_asks_the_authority_for_finished_episodes_only():
+    m = _mod()
+    http = _RecordingHttp([{"goal_text": "g", "state": "complete"}])
+    rows = m.Mem0Client("http://authority.invalid:1", "k", "u", http=http).episodes(7)
+    assert http.urls == ["http://authority.invalid:1/v1/episodes?recent=7&state=complete"]
+    assert rows == [{"goal_text": "g", "state": "complete"}]

@@ -3495,7 +3495,7 @@ def episodes_count(
     brand: Optional[str] = Query(None),
     x_api_key: Optional[str] = Header(None),
 ):
-    """Return {count, last_ended_at} for health checks and Test-MemoryStack."""
+    """Return {count, last_ended_at, last_complete_ended_at} for health checks and Test-MemoryStack."""
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
@@ -3509,13 +3509,19 @@ def episodes_count(
 def list_episodes(
     recent: int = Query(10),
     brand: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
     x_api_key: Optional[str] = Header(None),
 ):
-    """List last N episodes by ended_at desc. Default recent=10."""
+    """List last N episodes by ended_at desc. Default recent=10.
+
+    ``state`` (complete | in_progress | abandoned) narrows the window to one state; without it the
+    unfinished rows, which carry the newest ``ended_at``, can fill it. The summary of a row that is
+    not complete comes back without the machine turns (task notifications, relayed agent messages)
+    the running summary once recorded."""
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_recent(conn, recent, brand)
+            return _episodic_recent(conn, recent, brand, state)
     except Exception as e:
         log.exception("episode list failed")
         raise _upstream_error(e)

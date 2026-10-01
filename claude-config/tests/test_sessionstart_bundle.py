@@ -298,13 +298,15 @@ class _FakeResp:
 class _Authority:
     """The authority behind urllib.request.urlopen. GET /v1/episodes behaves like mem0-server's
     episodic.recent(): newest first (ended_at DESC), `recent=` caps the rows, `brand=` narrows to that brand
-    (unless honour_brand is False: an authority that ignores the parameter). POST /v1/context/bundle
+    (unless honour_brand is False: an authority that ignores the parameter), `state=` narrows to that state
+    (unless honour_state is False: an older server). POST /v1/context/bundle
     answers with `memories`. Every request is recorded, including the ones that then fail."""
 
     def __init__(self, memories=()):
         self.episodes = []
         self.memories = list(memories)
         self.honour_brand = True
+        self.honour_state = True
         self.episodes_fault = None  # an exception to raise, or raw bytes to serve as the response body
         self.bundle_fault = None
         self.calls = []
@@ -334,6 +336,8 @@ class _Authority:
             rows = sorted(self.episodes, key=lambda r: r.get("ended_at") or "", reverse=True)
             if self.honour_brand and params.get("brand"):
                 rows = [r for r in rows if r.get("brand") == params["brand"]]
+            if self.honour_state and params.get("state"):
+                rows = [r for r in rows if r.get("state", "complete") == params["state"]]
             return _FakeResp(json.dumps(rows[: int(params.get("recent", 10))]).encode("utf-8"))
         if req.get_method() == "POST" and parts.path == "/v1/context/bundle":
             if isinstance(self.bundle_fault, BaseException):
@@ -483,8 +487,21 @@ def test_brandless_replica_seeds_from_the_authoritys_newest_goal_overall(box, au
     _boot(capsys, "--initiative", "brand-a-platform")
     assert _prompts(authority) == ["brand-b newest"]
     (get,) = authority.episode_gets()
-    assert get["params"] == {"recent": "20"}  # no brand given, so none is sent
+    assert get["params"] == {"recent": "20", "state": "complete"}  # no brand given, so none is sent
     assert local_db_opens == []
+
+
+def test_unfinished_sessions_never_crowd_the_seed_window(box, authority, local_db_opens, capsys):
+    """Unfinished sessions carry no goal and always the newest ended_at: twenty of them used to fill
+    the recent=20 window, so the seed was lost. The client asks for finished episodes only."""
+    box.frozen_replica()
+    unfinished = [dict(_episode("", f"2026-09-30T{h:02d}:00:00Z", "brand-a"), state="in_progress")
+                  for h in range(20)]
+    authority.episodes = unfinished + [dict(_episode(FRESH_GOAL, "2026-09-29T10:00:00Z", "brand-a"),
+                                            state="complete")]
+    _boot(capsys, *SCOPE)
+    assert _prompts(authority) == [FRESH_GOAL]
+    assert authority.episode_gets()[0]["params"]["state"] == "complete"
 
 
 # --- replica, authority unreachable: NO seed, and no fallback to the frozen local copy ---
@@ -561,7 +578,7 @@ def test_replica_seed_is_the_requested_brands_newest_goal(box, authority, local_
     ]
     _boot(capsys, *SCOPE)
     assert _prompts(authority) == [FRESH_GOAL]
-    assert authority.episode_gets()[0]["params"] == {"recent": "20", "brand": "brand-a"}
+    assert authority.episode_gets()[0]["params"] == {"recent": "20", "state": "complete", "brand": "brand-a"}
 
 
 def test_replica_url_encodes_the_brand_so_it_cannot_inject_query_parameters(box, authority, capsys):
@@ -569,7 +586,7 @@ def test_replica_url_encodes_the_brand_so_it_cannot_inject_query_parameters(box,
     odd = "brand a&recent=1&x=y"  # a space, '&' and '=' must all arrive as ONE brand value
     authority.episodes = [_episode(FRESH_GOAL, "2026-09-28T10:00:00Z", odd)]
     _boot(capsys, "--brand", odd)
-    assert authority.episode_gets()[0]["params"] == {"recent": "20", "brand": odd}
+    assert authority.episode_gets()[0]["params"] == {"recent": "20", "state": "complete", "brand": odd}
     assert _prompts(authority) == [FRESH_GOAL]
 
 

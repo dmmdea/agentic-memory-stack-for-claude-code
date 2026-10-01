@@ -23,8 +23,10 @@ Phase 0 closes this hole with three complementary mechanisms.
 ```
 UserPromptSubmit → upsert_in_progress_episode()
                      → episodes.state = 'in_progress'
+                     → summary_text = what the person typed (a task notification or a
+                       relayed agent message adds nothing to it; the checkpoint still lands)
 
-(session proceeds; more UserPromptSubmit events → message_count++)
+(session proceeds; more UserPromptSubmit events → message_count++, ended_at moves)
 
 Stop / PreCompact → finalize_episode()
                      → episodes.state = 'complete'
@@ -91,6 +93,33 @@ idle, or kill the hidden powershell running `mem0-hook-daemon.ps1`).
 4. POST to `http://127.0.0.1:18791/v1/episodes/checkpoint` with `{session_id, prompt_text[:300], brand, workspace, project}`.
 5. Server calls `upsert_in_progress_episode()` — creates or updates the in_progress row.
 6. Proceed to Phase 0.B decision detection.
+
+**The running summary records what a person typed.** Claude Code raises UserPromptSubmit for
+background task notifications and for messages another agent session relays, as well as for human
+prompts, and the checkpoint POST fires for all of them (the Windows hooks are unchanged). The server
+(`episodic.upsert_in_progress_episode`) decides what enters `summary_text`:
+
+- A **non-human turn** (`hook_contract.is_non_human_turn`: a prompt starting `<task-notification>`, or a
+  relayed agent message, meaning the `<cross-session-message` wrapper or the `Another Claude session sent a message:`
+  announcement line followed by the wrapper) appends nothing, and a session that opens with one inserts an empty
+  summary. The checkpoint still lands: `ended_at` moves and `sessions.message_count` counts the turn, because
+  the stale-episode clock reads `ended_at`. The memory block keeps its own rule (C10): a relayed message stays
+  human-shaped there, only a task notification is a machine turn; the two verdicts are pinned to the shared
+  corpus `scripts/windows/tests/fixtures/machine-turn-prompts.json` (`machine_turn`, `relayed_agent_message`).
+- A **human prompt** appends its first 200 characters (the opening prompt is stored at 300), joined with
+  ` | `. The join is exact: no leading or trailing pipe or space of real text is stripped.
+- The summary is capped at 800 characters. Past the cap the **opening ask is kept, then a single `…` gap
+  marker, then as many of the newest prompts as fit**, so a long session's summary shows how it began and where it
+  is now instead of freezing on its first prompts.
+
+**Reading an unfinished row.** `recent()` (`GET /v1/episodes`, MCP `episodic_recent`) and `search_fts()`
+(`POST /v1/episodes/search`, MCP `episodic_search`) scrub the `summary_text` of every row whose state is not
+`complete` (`episodic.scrub_running_summary`): segments that start with a task notification, a relayed message or
+the announcement line are dropped, and a dangling `…` marker with them. That cleans up the rows written before the
+write side filtered, with no database write. Finished rows are returned as stored, and `GET /v1/episodes/{id}`
+(the drill-down) stays raw. `search_fts` also returns each row's `state`, and `GET /v1/episodes?state=complete` (or
+`in_progress`, `abandoned`) narrows a window to one state. A machine segment that itself contained ` | ` leaves a
+fragment, and the keyword match still runs on the stored text, so an unfinished row can match words it no longer shows.
 
 **Performance contract:** sub-200ms. No Codex calls. No heavy I/O. One HTTP POST
 to localhost. Failures logged to `~/.claude/logs/user-prompt-extract.log`, never block.
@@ -171,7 +200,7 @@ silently skipped (no error output).
 
 | State | Who writes | When |
 |---|---|---|
-| `in_progress` | `upsert_in_progress_episode()` | Every UserPromptSubmit |
+| `in_progress` | `upsert_in_progress_episode()` | Every UserPromptSubmit (the row's `ended_at` and the session's `message_count` move on every one; only a human prompt adds to `summary_text`) |
 | `complete` | `finalize_episode()` | Stop / PreCompact hook |
 | `abandoned` | `episodic-reconcile.py` (`abandon_stale_in_progress`) | Sunday sweep: `in_progress` rows whose `ended_at` (the last checkpoint) is older than `--stale-days` (7); the count is in the receipt (`abandoned_stale_in_progress`). Sessions that produced no extraction used to stay `in_progress` forever. |
 
@@ -200,6 +229,11 @@ a Python-side helper that catches `OperationalError: duplicate column name` so
 3. **Hook timing:** UserPromptSubmit fires BEFORE the assistant responds, so the
    `in_progress` episode captures the user's prompt, not the assistant's output.
    The final `goal_text` and `summary_text` are only accurate after Stop finalizes.
+   An unfinished row has an empty `goal_text` and a `summary_text` that is the person's prompts so far
+   (never task notifications or relayed messages); readers that want sessions look at `state='complete'`
+   rows: the `MEMORY.md` "Recent episodes" section, the dream's episode context and the staleness row
+   of `Test-MemoryStack.ps1` (which reads `last_complete_ended_at` from `GET /v1/episodes/count`, the newest
+   finished episode, because every checkpoint moves `last_ended_at`).
 
 4. **Decision false negatives:** The numbered-option detector requires the assistant
    turn to be in the last 8 lines of the transcript. Long tool-use sequences between

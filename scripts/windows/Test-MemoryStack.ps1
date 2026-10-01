@@ -1337,11 +1337,18 @@ if ($key) {
     try {
         $countResp = Invoke-RestMethod -Uri "$TmsAuthorityUrl/v1/episodes/count" -Headers @{'X-API-Key'=$key} -TimeoutSec 5
         $n        = if ($countResp.count) { [int]$countResp.count } else { 0 }
-        $lastIso  = $countResp.last_ended_at
+        # 1.32.4: every prompt's checkpoint moves last_ended_at, so it cannot show the Stop-hook extraction
+        # stopping. A server that reports last_complete_ended_at (the newest FINISHED episode) is read through
+        # it, and a null there means nothing was ever finished; only an older server falls back to last_ended_at.
+        $hasFinishedClock = [bool]$countResp.PSObject.Properties['last_complete_ended_at']
+        $lastIso  = if ($hasFinishedClock) { $countResp.last_complete_ended_at } else { $countResp.last_ended_at }
+        $lastWord = if ($hasFinishedClock) { 'last finished' } else { 'last' }
         if ($n -ge 1 -and $lastIso) {
             $ageHours = [int]((Get-Date) - [DateTime]::Parse($lastIso)).TotalHours
-            if ($ageHours -lt 168) { Add-Check 'RECOVERY' 'episodic.db :v0.15' 'OK'   "$n episodes; last ${ageHours}h ago" }
-            else                   { Add-Check 'RECOVERY' 'episodic.db :v0.15' 'WARN' "$n episodes but last ${ageHours}h ago (stale — L1a Stop hook may be failing)" }
+            if ($ageHours -lt 168) { Add-Check 'RECOVERY' 'episodic.db :v0.15' 'OK'   "$n episodes; $lastWord ${ageHours}h ago" }
+            else                   { Add-Check 'RECOVERY' 'episodic.db :v0.15' 'WARN' "$n episodes but $lastWord ${ageHours}h ago (stale — L1a Stop hook may be failing)" }
+        } elseif ($n -ge 1 -and $hasFinishedClock) {
+            Add-Check 'RECOVERY' 'episodic.db :v0.15' 'WARN' "$n episodes but none finished (L1a Stop hook may be failing)"
         } elseif ($n -ge 1) {
             Add-Check 'RECOVERY' 'episodic.db :v0.15' 'WARN' "$n episodes; last_ended_at unset"
         } else {

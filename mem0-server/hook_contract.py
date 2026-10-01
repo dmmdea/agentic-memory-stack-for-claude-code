@@ -18,6 +18,7 @@ Test-MemoryStack journal drift row can exclude test-generated WARNs.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 log = logging.getLogger("mem0-server")
@@ -58,6 +59,63 @@ def is_machine_turn_prompt(prompt: Optional[str]) -> bool:
     if not isinstance(prompt, str) or not prompt:
         return False
     return prompt.lstrip(_MACHINE_TURN_LEADING_WS).startswith(MACHINE_TURN_MARKER)
+
+
+# 1.32.4: a message another agent session sends to this one arrives as the user turn, opening with
+# the <cross-session-message wrapper or with its one-line announcement followed by the wrapper. It is
+# that agent speaking, not the person. C10 deliberately keeps such a turn human-shaped for the memory
+# block (is_machine_turn_prompt above stays exactly as it was, and the corpus keeps machine_turn=false
+# for it), so this is a separate verdict: the episode running summary uses it, through
+# is_non_human_turn, to keep both kinds of turn out of what the recent-sessions view shows.
+# It is a port of Test-RelayedAgentMessage in scripts/windows/user-prompt-lib.ps1, pinned to the same
+# corpus through each case's relayed_agent_message field. The wrapper must be followed by a whitespace
+# character or '>': .NET's \s is [\f\n\r\t\v\x85\p{Z}], spelled out here because Python's \s also
+# takes the C0 separators \x1c-\x1f.
+RELAYED_MESSAGE_ANNOUNCEMENT = "Another Claude session sent a message:"
+# .NET's \s, spelled out as code points: \f \n \r \t \v (9-13), NEL (0x85) and the
+# Unicode separators \p{Z} (space, NBSP, 0x1680, 0x2000-0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000)
+_DOTNET_WHITESPACE = "".join(map(chr, [
+    *range(9, 14), 0x85, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+]))
+_RELAYED_WRAPPER = re.compile("<cross-session-message[" + re.escape(_DOTNET_WHITESPACE) + ">]")
+
+
+def is_relayed_agent_message(prompt: Optional[str]) -> bool:
+    """True when the prompt is a message another agent session sent to this one. Same rule as the
+    Windows lib: after the six leading whitespace characters, the prompt either starts with the
+    wrapper, or starts with the announcement line and carries the wrapper after it. A prompt that
+    only quotes the wrapper mid-text does not match. None, empty and non-string input read as
+    human; never raises."""
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    t = prompt.lstrip(_MACHINE_TURN_LEADING_WS)
+    if _RELAYED_WRAPPER.match(t):
+        return True
+    return t.startswith(RELAYED_MESSAGE_ANNOUNCEMENT) and _RELAYED_WRAPPER.search(t) is not None
+
+
+def is_non_human_turn(prompt: Optional[str]) -> bool:
+    """True when nobody typed the prompt: a background task notification or a message relayed from
+    another agent session. The episode running summary records only what a person typed."""
+    return is_machine_turn_prompt(prompt) or is_relayed_agent_message(prompt)
+
+
+RELAYED_MESSAGE_WRAPPER_OPEN = "<cross-session-message"
+
+
+def is_non_human_preview(preview: Optional[str]) -> bool:
+    """True when a STORED preview (a prompt cut to its first 200 or 300 characters) starts like a
+    non-human turn. For the read side of the episode running summary, which has to clean up rows
+    written before the write side filtered. Looser than is_non_human_turn on purpose: the cut can
+    have lost the wrapper behind the announcement line, and can end right after the wrapper's name,
+    so the announcement line alone matches and the wrapper needs no character after it."""
+    if not isinstance(preview, str) or not preview:
+        return False
+    t = preview.lstrip(_MACHINE_TURN_LEADING_WS)
+    if t.startswith(MACHINE_TURN_MARKER) or t.startswith(RELAYED_MESSAGE_ANNOUNCEMENT):
+        return True
+    return t.startswith(RELAYED_MESSAGE_WRAPPER_OPEN) and (
+        t == RELAYED_MESSAGE_WRAPPER_OPEN or _RELAYED_WRAPPER.match(t) is not None)
 
 
 def warn_hook_contract_version(endpoint: str, version: Optional[str]) -> None:
