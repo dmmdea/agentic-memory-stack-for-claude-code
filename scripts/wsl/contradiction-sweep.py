@@ -1114,6 +1114,42 @@ def prune_stale_review_entries(http: httpx.Client, path) -> int:
         path, lambda rec: rec.get("kind") == STALE_KIND and str(rec.get("stale_canonical_id")) in settled)
 
 
+SUPERSEDE_KIND = "supersede"
+
+
+def prune_resolved_supersede_entries(http: httpx.Client, path) -> int:
+    """Drop supersede review lines whose loser already carries superseded_by. The resolution was
+    recorded (by --resolve-supersede, by a session through memory_supersede, or by --supersede-markers),
+    so the review the line asks for is settled; only --resolve-supersede dequeued before, so a session's
+    own resolution left the line counting in pending_contradiction_reviews for good. A loser that cannot
+    be looked up (transport or HTTP error) keeps its lines, and so does one that is gone: absent and
+    errored are different answers, as in prune_stale_review_entries. Returns lines removed."""
+    wanted: set = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("kind") == SUPERSEDE_KIND and rec.get("memory_id"):
+                    wanted.add(str(rec["memory_id"]))
+    except OSError:
+        return 0
+    settled: set = set()
+    for mid in sorted(wanted):
+        try:
+            info = fetch_point_info(http, mid)
+        except (httpx.HTTPError, OSError, ValueError):
+            continue
+        if info is not None and info.get("superseded_by"):
+            settled.add(mid)
+    if not settled:
+        return 0
+    return _drop_queue_lines(
+        path, lambda rec: rec.get("kind") == SUPERSEDE_KIND and str(rec.get("memory_id")) in settled)
+
+
 def _acquire_lock(path, stale_s: int = 3600) -> bool:
     """Atomic single-runner lock via mkdir (mkdir fails if the dir already exists). Reclaims a lock
     older than stale_s (a crashed prior run). Returns True if acquired. FAIL-OPEN on an unexpected
@@ -1368,7 +1404,7 @@ def fetch_point_text(http: httpx.Client, point_id: str) -> Optional[str]:
 
 
 def fetch_point_info(http: httpx.Client, point_id: str) -> Optional[dict]:
-    """{text, tier, retired} for a point, or None when it is CONFIRMED ABSENT. Same absent-versus-
+    """{text, tier, retired, superseded_by} for a point, or None when it is CONFIRMED ABSENT. Same absent-versus-
     errored contract as fetch_point_text (RAISES on a transport/HTTP/parse failure). The tier and the
     retired flag let the stamped re-judge treat a demoted or retired target as no canonical at all."""
     r = http.post(f"{QDRANT}/collections/{COLLECTION}/points",
@@ -1379,7 +1415,8 @@ def fetch_point_info(http: httpx.Client, point_id: str) -> Optional[dict]:
         return None  # confirmed absent
     pl = pts[0].get("payload") or {}
     return {"text": pl.get("data") or pl.get("memory") or "", "tier": pl.get("tier"),
-            "retired": bool(pl.get("retrievable") is False or pl.get("retired_at"))}
+            "retired": bool(pl.get("retrievable") is False or pl.get("retired_at")),
+            "superseded_by": pl.get("superseded_by") or None}
 
 
 def run_rejudge_stamped(args, dry_run: bool) -> int:
@@ -1756,17 +1793,12 @@ def _read_retrieval_rows(days: int) -> tuple[list[dict], dict]:
     return rows, counts
 
 
-SUPERSEDE_RESOLVE_ACTOR = "supersession-resolve-v030"
-
-
 def resolve_supersede_precheck(loser_id: str, winner_id: str,
                                loser_payload: Optional[dict]) -> Optional[str]:
-    """Pure refusal matrix for the operator's --resolve-supersede step.
-    Returns a refusal reason, or None when the write may proceed.
-
-    AMS-36: superseded_by's ONLY writer is the operator resolve step, so this
-    precheck is the entire safety surface between a review-queue entry and a
-    record being hidden from default retrieval."""
+    """Friendly pre-flight for the operator's --resolve-supersede step: a refusal reason in plain
+    words, or None. NOT the safety surface: since 1.32.4 POST /v1/memories/{id}/supersede is the
+    only writer of superseded_by and enforces the full refusal matrix (supersession.precheck) on
+    every call, so this only saves a round trip for the common refusals."""
     if not loser_payload:
         return f"loser {loser_id} not found in the store"
     if loser_id == winner_id:
@@ -1782,11 +1814,13 @@ def resolve_supersede_precheck(loser_id: str, winner_id: str,
 
 
 def run_resolve_supersede(args, dry_run: bool) -> int:
-    """AMS-36 operator resolve step: write superseded_by=<winner> on <loser>
-    via the trusted-actor PATCH path (actor supersession-resolve-v030 — the
-    field's ONLY writer). Dry-run by default. The judging sweeps queue
-    candidates; a human runs this; the admission gate then excludes the loser
-    from default retrieval (v0.19 I.1) while forensic reads keep it."""
+    """Operator resolve step for a queued supersede review: POST /v1/memories/<loser>/supersede
+    (scope full, source "resolve-supersede"). The server owns the refusal matrix and stamps the
+    ledger actor, so the pre-flight below only saves a round trip. Dry-run by default. The judging
+    sweeps queue candidates; a human runs this; the admission gate then excludes the loser from
+    default retrieval (v0.19 I.1) while forensic reads keep it. On success the loser's review-queue
+    lines go (as after --promote), so a resolved line stops counting in pending_contradiction_reviews
+    and the SessionStart banner."""
     loser, winner = str(args.resolve_supersede), str(args.winner)
     try:
         api_key = _api_key_or_raise()
@@ -1817,20 +1851,20 @@ def run_resolve_supersede(args, dry_run: bool) -> int:
             print("contradiction-sweep: resolve-supersede DRY-RUN — add --apply to write "
                   f"superseded_by={winner} on {loser}", flush=True)
             return 0
-        r = http.patch(
-            f"{MEM0}/v1/memories/{loser}/metadata",
-            json={"metadata": {"superseded_by": winner},
-                  "actor": SUPERSEDE_RESOLVE_ACTOR,
+        r = http.post(
+            f"{MEM0}/v1/memories/{loser}/supersede",
+            json={"winner_id": winner, "scope": "full", "source": "resolve-supersede",
                   "reason": f"operator supersede resolution: {loser} superseded by {winner}"},
             timeout=10.0)
         if r.status_code != 200:
-            print(f"contradiction-sweep: resolve-supersede FAIL — mem0={r.status_code} "
+            print(f"contradiction-sweep: resolve-supersede REFUSED/FAIL — mem0={r.status_code} "
                   f"body={r.text[:200]}", flush=True)
             return 1
+        removed = remove_from_review_queue(str(REVIEW_QUEUE), loser, exclude_kinds=(STALE_KIND,))
         print(f"contradiction-sweep: RESOLVED — {loser} superseded_by={winner} "
-              f"(actor {SUPERSEDE_RESOLVE_ACTOR})", flush=True)
+              f"({removed} review-queue line(s) dequeued)", flush=True)
         _append_summary({"mode": "resolve-supersede", "dry_run": False,
-                         "loser": loser, "winner": winner, "outcome": "ok"})
+                         "loser": loser, "winner": winner, "dequeued": removed, "outcome": "ok"})
         return 0
     except (httpx.HTTPError, OSError) as e:
         print(f"contradiction-sweep: resolve-supersede FAIL — {type(e).__name__}: {e}", flush=True)
@@ -2191,10 +2225,11 @@ def _main(argv=None) -> int:
                              "judge per run — bounds the weekly Codex spend; the pair cache "
                              "makes re-judging a prior week's pair free (default 40)")
     parser.add_argument("--resolve-supersede", metavar="LOSER_ID",
-                        help="OPERATOR resolve step for a queued supersede review: write "
-                             "superseded_by=<--winner> on LOSER_ID via the trusted-actor PATCH "
-                             "path. Dry-run by default; add --apply to write. Refuses canonical "
-                             "losers and already-superseded records.")
+                        help="OPERATOR resolve step for a queued supersede review: record "
+                             "LOSER_ID as superseded by <--winner> through POST "
+                             "/v1/memories/<id>/supersede (scope full; the server enforces the "
+                             "refusal matrix). Dry-run by default; add --apply to write. The "
+                             "resolved review-queue line is dequeued.")
     parser.add_argument("--winner", metavar="WINNER_ID",
                         help="the newer record LOSER_ID is superseded by (required with "
                              "--resolve-supersede)")
@@ -2373,6 +2408,7 @@ def _main(argv=None) -> int:
     skipped_no_vector = 0          # WP-4: no dense vector - counted, never a silent continue
     marker_written = marker_failed = 0   # rotation-marker PATCH results (apply mode only)
     stale_review_pruned = 0        # canonical-possibly-stale queue lines whose canonical is gone
+    supersede_review_pruned = 0    # supersede queue lines whose loser already carries superseded_by
     stale_routed = 0               # YES pairs whose candidate is NEWER than the canonical
     aborted: Optional[str] = None
     try:
@@ -2544,6 +2580,11 @@ def _main(argv=None) -> int:
                 stale_review_pruned = prune_stale_review_entries(qdrant_http, str(REVIEW_QUEUE))
             except (httpx.HTTPError, OSError, ValueError) as e:
                 print(f"contradiction-sweep: review-queue prune failed (non-fatal): {e}", flush=True)
+            # and supersede lines whose loser is already superseded (resolved by a session or a converter)
+            try:
+                supersede_review_pruned = prune_resolved_supersede_entries(qdrant_http, str(REVIEW_QUEUE))
+            except (httpx.HTTPError, OSError, ValueError) as e:
+                print(f"contradiction-sweep: supersede-queue prune failed (non-fatal): {e}", flush=True)
     except (httpx.HTTPError, OSError) as e:
         # Mid-run backend failure: degrade with partial counts, never crash.
         aborted = f"{type(e).__name__}: {str(e)[:120]}"
@@ -2574,6 +2615,7 @@ def _main(argv=None) -> int:
         "marker_written": marker_written,
         "marker_failed": marker_failed,
         "stale_review_pruned": stale_review_pruned,
+        "supersede_review_pruned": supersede_review_pruned,
         "canonicals_query_failed": canonicals_query_failed,
         "stale_canonical_routed": stale_routed,
         "pairs_checked": pairs_checked,
@@ -2611,7 +2653,8 @@ def _main(argv=None) -> int:
         "weeks_for_full_pass": coverage["weeks_for_full_pass"],
         "marker_written": marker_written, "marker_failed": marker_failed,
         "skipped_no_vector": skipped_no_vector,
-        "stale_canonical_routed": stale_routed, "stale_review_pruned": stale_review_pruned})
+        "stale_canonical_routed": stale_routed, "stale_review_pruned": stale_review_pruned,
+        "supersede_review_pruned": supersede_review_pruned})
 
 
 if __name__ == "__main__":

@@ -1138,19 +1138,157 @@ def test_resolve_supersede_precheck_matrix():
         "L", "W", {"tier": "evidence", "superseded_by": "other"})
 
 
-def test_supersede_resolve_actor_is_registered_with_exactly_one_key():
-    """The sweep's actor name and the server's TRUSTED_PATCH_ACTORS entry must
-    agree, and the allowlist must be exactly {superseded_by} — a wider set
-    would let the resolve step smuggle other forbidden keys."""
+def test_supersede_resolve_goes_through_the_endpoint_not_a_patch_actor():
+    """1.32.4: superseded_by has one writer, POST /v1/memories/{id}/supersede. The old PATCH actor
+    ("supersession-resolve-v030") was an actor STRING, which any API-key holder could send, so the
+    server entry is gone and this step must not carry (or send) it any more."""
     import importlib.util as _ilu
     si_path = REPO_ROOT / "mem0-server" / "security_invariants.py"
-    _s = _ilu.spec_from_file_location("security_invariants_ams36", si_path)
+    _s = _ilu.spec_from_file_location("security_invariants_door", si_path)
     si = _ilu.module_from_spec(_s)
     _s.loader.exec_module(si)
-    actor = sweep.SUPERSEDE_RESOLVE_ACTOR
-    assert actor in si.TRUSTED_PATCH_ACTORS, \
-        f"{actor} not registered in TRUSTED_PATCH_ACTORS — the resolve PATCH would 403"
-    assert si.TRUSTED_PATCH_ACTORS[actor] == frozenset({"superseded_by"})
+    assert "supersession-resolve-v030" not in si.TRUSTED_PATCH_ACTORS
+    assert not hasattr(sweep, "SUPERSEDE_RESOLVE_ACTOR"), "the dead PATCH actor must be gone"
+    src = SCRIPT.read_text(encoding="utf-8")
+    i = src.find("def run_resolve_supersede")
+    j = src.find("\ndef ", i + 10)
+    body = src[i:j]
+    assert "/supersede" in body, "the resolve step must call the supersede endpoint"
+    assert ".patch(" not in body, "no metadata PATCH may write superseded_by"
+    assert '"resolve-supersede"' in body, "the endpoint call names its source"
+
+
+# ---- operator modes that talk to mem0 (1.32.4): a fake client that records every call ------------
+
+LOSER = "11111111-1111-4111-8111-111111111111"
+WINNER = "22222222-2222-4222-8222-222222222222"
+OTHER = "33333333-3333-4333-8333-333333333333"
+
+
+class _Resp:
+    def __init__(self, status=200, body=None):
+        self.status_code = status
+        self._body = {"ok": True} if body is None else body
+        self.text = json.dumps(self._body)
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                str(self.status_code), request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(self.status_code, request=httpx.Request("GET", "http://x")))
+
+
+class _FakeMem0:
+    """Stands in for httpx.Client: records every call, answers each through `answer(method, url, kw)`."""
+
+    def __init__(self, calls, answer=None):
+        self.calls = calls
+        self._answer = answer
+
+    def _do(self, method, url, **kw):
+        self.calls.append({"method": method, "url": url, **kw})
+        return self._answer(method, url, kw) if self._answer else _Resp()
+
+    def get(self, url, **kw):
+        return self._do("GET", url, **kw)
+
+    def post(self, url, **kw):
+        return self._do("POST", url, **kw)
+
+    def patch(self, url, **kw):
+        return self._do("PATCH", url, **kw)
+
+    def delete(self, url, **kw):
+        return self._do("DELETE", url, **kw)
+
+    def close(self):
+        pass
+
+
+def _queue_lines(path):
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _wire_resolve(monkeypatch, tmp_path, loser_payload, winner_payload, answer=None):
+    """run_resolve_supersede with Qdrant payload reads and the mem0 client faked."""
+    import types as _types
+    payloads = {LOSER: loser_payload, WINNER: winner_payload}
+    calls: list = []
+
+    def fake_post(url, json=None, timeout=None):
+        pl = payloads.get((json or {}).get("ids", [None])[0])
+        return _Resp(200, {"result": [{"id": (json or {})["ids"][0], "payload": pl}] if pl else []})
+
+    queue = tmp_path / "review.jsonl"
+    queue.write_text("\n".join(json.dumps(r) for r in (
+        {"memory_id": LOSER, "canonical_id": WINNER, "kind": "supersede"},
+        {"memory_id": LOSER, "stale_canonical_id": OTHER, "kind": sweep.STALE_KIND},
+        {"memory_id": OTHER, "canonical_id": WINNER, "kind": "supersede"},
+    )) + "\n", encoding="utf-8")
+    summaries: list = []
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", queue)
+    monkeypatch.setattr(sweep, "_api_key_or_raise", lambda: "k")
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep.httpx, "post", fake_post)
+    monkeypatch.setattr(sweep.httpx, "Client", lambda *a, **k: _FakeMem0(calls, answer))
+    return calls, queue, summaries, _types.SimpleNamespace(resolve_supersede=LOSER, winner=WINNER)
+
+
+_EVIDENCE = {"tier": "evidence", "data": "old fact", "user_id": "u"}
+_NEWER = {"tier": "evidence", "data": "new fact", "user_id": "u"}
+
+
+def test_resolve_supersede_apply_posts_to_the_endpoint_and_dequeues(monkeypatch, tmp_path):
+    calls, queue, summaries, args = _wire_resolve(monkeypatch, tmp_path, _EVIDENCE, _NEWER)
+    assert sweep.run_resolve_supersede(args, dry_run=False) == 0
+    assert [c["method"] for c in calls] == ["POST"], "the endpoint is the only mem0 write"
+    assert calls[0]["url"].endswith(f"/v1/memories/{LOSER}/supersede")
+    body = calls[0]["json"]
+    assert body["winner_id"] == WINNER and body["scope"] == "full"
+    assert body["source"] == "resolve-supersede"
+    assert body["reason"] == f"operator supersede resolution: {LOSER} superseded by {WINNER}"
+    assert "actor" not in body, "the server stamps the actor; a body never sets it"
+    left = _queue_lines(queue)
+    assert {(r["memory_id"], r["kind"]) for r in left} == {
+        (LOSER, sweep.STALE_KIND), (OTHER, "supersede")}, (
+        "the resolved loser's supersede line is dequeued; its stale-canonical doubt and other "
+        "memories' lines stay")
+    assert summaries and summaries[-1]["mode"] == "resolve-supersede"
+
+
+def test_resolve_supersede_dry_run_writes_and_dequeues_nothing(monkeypatch, tmp_path):
+    calls, queue, _s, args = _wire_resolve(monkeypatch, tmp_path, _EVIDENCE, _NEWER)
+    before = queue.read_text(encoding="utf-8")
+    assert sweep.run_resolve_supersede(args, dry_run=True) == 0
+    assert calls == [], "a dry run makes no mem0 call at all"
+    assert queue.read_text(encoding="utf-8") == before
+
+
+def test_resolve_supersede_server_refusal_keeps_the_queue_line(monkeypatch, tmp_path):
+    refusal = lambda m, u, kw: _Resp(403, {"detail": "winner-superseded: point at the newest record"})  # noqa: E731
+    calls, queue, _s, args = _wire_resolve(monkeypatch, tmp_path, _EVIDENCE, _NEWER, refusal)
+    before = queue.read_text(encoding="utf-8")
+    assert sweep.run_resolve_supersede(args, dry_run=False) == 1
+    assert len(calls) == 1
+    assert queue.read_text(encoding="utf-8") == before, "a refused resolution is still outstanding"
+
+
+def test_resolve_supersede_repeat_call_is_a_noop_and_still_dequeues(monkeypatch, tmp_path):
+    noop = lambda m, u, kw: _Resp(200, {"ok": True, "noop": True, "hidden": True})  # noqa: E731
+    calls, queue, _s, args = _wire_resolve(monkeypatch, tmp_path, _EVIDENCE, _NEWER, noop)
+    assert sweep.run_resolve_supersede(args, dry_run=False) == 0
+    assert all(r["memory_id"] != LOSER or r["kind"] == sweep.STALE_KIND for r in _queue_lines(queue))
+
+
+def test_resolve_supersede_local_precheck_stays_a_friendly_preflight(monkeypatch, tmp_path):
+    """A canonical loser is refused locally before any write (the server refuses it too)."""
+    calls, queue, _s, args = _wire_resolve(
+        monkeypatch, tmp_path, {"tier": "canonical", "data": "locked"}, _NEWER)
+    assert sweep.run_resolve_supersede(args, dry_run=False) == 1
+    assert calls == []
 
 
 def test_judged_pairs_mode_queues_and_never_stamps():
@@ -1431,6 +1569,7 @@ def _sweep_rig(monkeypatch, canonicals, candidates=None, verdicts=None, query_fa
     monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
     # the queue prune reads the real review file and asks Qdrant: never from a unit test
     monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: 0)
+    monkeypatch.setattr(sweep, "prune_resolved_supersede_entries", lambda http, path: 0)
     return stamps, queued, summaries, seen_user
 
 
@@ -1739,6 +1878,67 @@ def test_the_sweep_prunes_stale_queue_entries_in_apply_mode_only(monkeypatch, tm
     monkeypatch.setattr(sweep, "prune_stale_review_entries", lambda http, path: (calls.append(path) or 3))
     sweep.main(["--apply", "--judge", "codex"])
     assert calls == [str(q)] and summaries[-1]["stale_review_pruned"] == 3
+
+
+def test_the_sweep_prunes_resolved_supersede_entries_in_apply_mode_only(monkeypatch, tmp_path):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    _sweep_rig(monkeypatch, [_can("c1")])
+    calls = []
+    monkeypatch.setattr(sweep, "prune_resolved_supersede_entries",
+                        lambda http, path: (calls.append(path) or 2))
+    sweep.main(["--judge", "codex"])                      # dry run: the queue is not touched
+    assert calls == []
+    _, _, summaries, _ = _sweep_rig(monkeypatch, [_can("c1")])
+    monkeypatch.setattr(sweep, "prune_resolved_supersede_entries",
+                        lambda http, path: (calls.append(path) or 2))
+    sweep.main(["--apply", "--judge", "codex"])
+    assert calls == [str(q)] and summaries[-1]["supersede_review_pruned"] == 2
+
+
+def _payload_client(payloads):
+    """Fake Qdrant points lookup: id -> payload dict (None = absent; 'ERR' = server error)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        pid = json.loads(request.content)["ids"][0]
+        pl = payloads.get(pid)
+        if pl == "ERR":
+            return httpx.Response(500, json={})
+        if pl is None:
+            return httpx.Response(200, json={"result": []})
+        return httpx.Response(200, json={"result": [{"id": pid, "payload": pl}]})
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_prune_resolved_supersede_entries_drops_only_settled_supersede_lines(tmp_path):
+    """A supersede review line is settled once its loser carries superseded_by, whoever wrote it (the
+    resolve step, a session through memory_supersede, or the markers converter). Everything else in
+    the queue stays: unresolved losers, losers that cannot be looked up (absent and errored are not
+    'settled'), other kinds of line for the same memory."""
+    q = tmp_path / "q.jsonl"
+    for mid in ("m-done", "m-open", "m-blip", "m-gone"):
+        _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": mid, "canonical_id": "w1", "kind": "supersede"})
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "m-done", "canonical_id": "c1"})        # a promote line
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "m-done", "stale_canonical_id": "c2",
+                                       "kind": sweep.STALE_KIND})
+    http = _payload_client({"m-done": {"tier": "evidence", "superseded_by": "w1"},
+                            "m-open": {"tier": "evidence"},
+                            "m-blip": "ERR", "m-gone": None})
+    assert sweep.prune_resolved_supersede_entries(http, str(q)) == 1
+    left = sorted((r["memory_id"], r.get("kind") or "promote") for r in _queue_lines(q))
+    assert left == [("m-blip", "supersede"), ("m-done", sweep.STALE_KIND), ("m-done", "promote"),
+                    ("m-gone", "supersede"), ("m-open", "supersede")]
+
+
+def test_prune_resolved_supersede_entries_reads_no_store_without_supersede_lines(tmp_path):
+    q = tmp_path / "q.jsonl"
+    _REAL_APPEND_REVIEW_QUEUE(str(q), {"memory_id": "p1", "canonical_id": "c9"})
+
+    def boom(request):
+        raise AssertionError("no lookup is needed when the queue holds no supersede line")
+    assert sweep.prune_resolved_supersede_entries(
+        httpx.Client(transport=httpx.MockTransport(boom)), str(q)) == 0
+    assert sweep.prune_resolved_supersede_entries(
+        httpx.Client(transport=httpx.MockTransport(boom)), str(tmp_path / "absent.jsonl")) == 0
 
 
 # --- step outcome contract (C1): the chain receipt must not read a no-op sweep as success ---
