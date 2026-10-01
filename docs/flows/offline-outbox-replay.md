@@ -40,7 +40,7 @@ The default is correct on the **brain box**, where the authority *is* local. A *
 
 ### Queueing a write offline
 
-A mutating tool call routes through `_authority_only`, which sends the request to the authority **only**, with a short **1.5 s connect timeout**. On a connect-level failure it raises `OfflineError`; the tool catches it and calls `_queue_op`, which appends one JSON line to `~/.mem0/outbox.jsonl` and returns `{event: "QUEUED_OFFLINE", op, key}`. This covers every mutating tool: `add`, `update`, `delete`, `promote`/`demote`, and the goal / open-question mutations. Crucially, an offline write is **never** redirected to the local replica — it queues.
+A mutating tool call routes through `_authority_only`, which sends the request to the authority **only**, with a short **1.5 s connect timeout**. On a connect-level failure it raises `OfflineError`; the tool catches it and calls `_queue_op`, which appends one JSON line to `~/.mem0/outbox.jsonl` and returns `{event: "QUEUED_OFFLINE", op, key}`. This covers every mutating tool: `add`, `update`, `delete`, `promote`/`demote`, `supersede`/`unsupersede`, and the goal / open-question mutations (a refusal the authority answers, a `4xx`, is a real answer and is never queued). Crucially, an offline write is **never** redirected to the local replica — it queues.
 
 Reads are the mirror image and out of scope here, with one tie-in: an offline search or recall merges any queued Outbox `add` whose text substring-matches the query, tagged `pending_sync: true`, so a fact written minutes ago offline is still findable before it has replayed.
 

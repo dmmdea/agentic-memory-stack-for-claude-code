@@ -544,3 +544,25 @@ def test_operations_no_longer_sends_a_superseded_record_to_unstamp():
     line = next(ln for ln in ops.splitlines() if ln.startswith("- **Superseded"))
     assert "--unsupersede" in line and "--unstamp" in line, line
     assert "`SUPERSEDED" in ops and "--supersede-markers" in ops, "a known-issues row and the runbook line"
+
+
+def test_the_offline_docs_list_supersede_and_unsupersede_among_the_queued_writes():
+    for rel in ("docs/systems/offline-travel.md", "docs/flows/offline-outbox-replay.md"):
+        line = next(ln for ln in _doc_text(rel).splitlines() if "This covers every mutating tool" in ln)
+        assert "`supersede`" in line and "`unsupersede`" in line, f"{rel}: {line}"
+
+
+def test_the_markers_runbook_states_the_narrow_full_rule_the_rows_and_the_orphan_report():
+    """The runbook is what the operator reads before --apply, so its description of FULL has to be the
+    parser's: a cue it names must make a marker partial, and 'not only' must not."""
+    import supersession
+    doc = " ".join(_doc_text("docs/systems/reconciliation.md").split())
+    for needle in ("between `SUPERSEDED` and `by`", "scope cue", "`marker_text`", "`orphaned_supersessions`",
+                   "inside a sentence"):
+        assert needle in doc, f"docs/systems/reconciliation.md does not say {needle!r}"
+    for cue in ("only", "in part", "figure", "except", "still holds", "the rest remains", "reverted"):
+        assert f"`{cue}`" in doc, f"the runbook does not name the scope cue {cue!r}"
+        marker = supersession.classify_text(f"SUPERSEDED 2026-09-30 by mem0 {WINNER}: the port, {cue} here")
+        assert marker.kind == "partial", f"{cue!r} is named as a scope cue but the parser says {marker.kind}"
+    full = supersession.classify_text(f"SUPERSEDED 2026-09-30 by mem0 {WINNER}: not only the port moved")
+    assert full.kind == "full", "'not only' is not a scope cue"
