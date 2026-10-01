@@ -108,7 +108,7 @@ The `episodic.db` SQLite + FTS5 sidecar that records one episode per session (go
 
 ## Machine Turn
 
-A `UserPromptSubmit` event that no person typed: a background task notification, whose prompt starts with `<task-notification>` whether it opens its own turn or was queued behind a running one. It keeps the episode checkpoint and gets no `[MEMORY CONTEXT]` block (C10). See [memory-retrieval.md](flows/memory-retrieval.md).
+A `UserPromptSubmit` event that no person typed: a background task notification, whose prompt starts with `<task-notification>` whether it opens its own turn or was queued behind a running one. It keeps the episode checkpoint and gets no `[MEMORY CONTEXT]` block (C10). A message relayed from another agent session is a separate verdict (`relayed_agent_message` in the shared corpus): it stays human-shaped for the memory block, but, like a machine turn, it adds nothing to an unfinished episode's running summary (`hook_contract.is_non_human_turn`). See [memory-retrieval.md](flows/memory-retrieval.md) and [continuity.md](systems/continuity.md).
 
 ## Session Injection State
 

@@ -170,11 +170,11 @@ Returns one record by id: text, metadata (incl. tier), timestamps. Use before up
 | `PATCH /v1/open_questions/{oq_id}/resolve` | resolve with resolution text + session id |
 | `PATCH /v1/open_questions/{oq_id}/status` | set question status |
 | `POST /v1/episodes` | finalize/write an episode (session summary) |
-| `POST /v1/episodes/checkpoint` | fast in-progress episode upsert (per-prompt hook) |
-| `POST /v1/episodes/search` | FTS5 episode search (since/until/brand) |
-| `GET /v1/episodes` | recent episodes (`recent`, `brand`) |
-| `GET /v1/episodes/count` | episode count |
-| `GET /v1/episodes/{episode_id}` | episode detail + linked mem0 memory ids |
+| `POST /v1/episodes/checkpoint` | fast in-progress episode upsert (per-prompt hook). A prompt nobody typed (a task notification or a message relayed from another agent session) still lands as a checkpoint, moving `ended_at` and `message_count`, but adds nothing to the running `summary_text` |
+| `POST /v1/episodes/search` | FTS5 episode search (since/until/brand); each result carries `state` (`complete` / `in_progress` / `abandoned`), and the `summary_text` of a row that is not `complete` comes back without machine turns |
+| `GET /v1/episodes` | recent episodes (`recent`, `brand`, optional `state` to narrow to one state); each row carries `state`, and the `summary_text` of a row that is not `complete` comes back without machine turns |
+| `GET /v1/episodes/count` | `{count, last_ended_at, last_complete_ended_at}`: the newest `ended_at` of any episode (every checkpoint moves it) and of finished ones only |
+| `GET /v1/episodes/{episode_id}` | episode detail (raw, including an unfinished row's running log) + linked mem0 memory ids |
 | `POST /v1/context/bundle` | one-round-trip bundle: episode checkpoint + gated memories + goals + open questions (the per-prompt hook / `memory_recall` wire). The goals and open questions exclude rows first seen in the requesting `session_id` and are ranked by recency of episode link, then priority. A `prompt` that starts with `<task-notification>` is a machine turn: the checkpoint still runs, the sections come back empty and the response carries `machine_turn: true` (additive field, C10) |
 
 ---
@@ -218,9 +218,9 @@ Wraps `DELETE /v1/memories/{id}`. Queues to the offline outbox when the authorit
 
 ### Episodic tools (one-line contracts)
 
-- `episodic_search(query, since=None, until=None, brand=None, limit=10)` — FTS5 search over past sessions; ISO-8601 date bounds.
-- `episodic_recent(limit=7, brand=None)` — last N episodes by `ended_at`.
-- `episodic_get(episode_id)` — full episode detail + linked mem0 memory ids.
+- `episodic_search(query, since=None, until=None, brand=None, limit=10)` — FTS5 search over past sessions; ISO-8601 date bounds. Results carry `state`; an unfinished row's summary shows only the person's own prompts.
+- `episodic_recent(limit=7, brand=None)` — last N episodes by `ended_at`, each with its `state`; unfinished rows (the newest by `ended_at`) have an empty goal and a summary of the person's own prompts so far.
+- `episodic_get(episode_id)` — full episode detail + linked mem0 memory ids (the raw drill-down).
 
 ### Goal tools (one-line contracts)
 

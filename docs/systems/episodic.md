@@ -106,6 +106,18 @@ Claude Code session ends
 
 The Codex call is shared (one call returns both facts AND episode) so no extra cost vs v0.14.
 
+### Per-prompt checkpoint (the unfinished episode)
+
+Before the session ends, every UserPromptSubmit upserts one `state='in_progress'` row for the session
+(`episodic.upsert_in_progress_episode`, reached through `POST /v1/episodes/checkpoint` and the context bundle's
+checkpoint). Its `goal_text` is empty and its `summary_text` is a running log of the person's prompts: a 300-character
+opening prompt, then a 200-character preview of each later one, joined with ` | ` and capped at 800 characters (past
+the cap the opening ask stays, then one `…` marker, then the newest previews that fit). A prompt nobody typed, meaning a
+background task notification or a message relayed from another agent session (`hook_contract.is_non_human_turn`),
+appends nothing, but its checkpoint still lands: `ended_at` moves and `sessions.message_count` counts it. The Stop-hook
+write above then finalizes the row to `state='complete'` and replaces the running log with the extracted summary.
+Details and the state table: [`continuity.md`](./continuity.md).
+
 If the episode POST fails, it is logged to `l1a.log` and does NOT abort fact posting. Episodes are best-effort bonus signal — the existing fact path is the primary write.
 
 ### Brand inference
@@ -129,10 +141,16 @@ Brand is inferred from the Claude Code project directory name (transcript path s
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/episodes` | Write one episode (L1a Stop hook) |
-| `POST` | `/v1/episodes/search` | FTS5 keyword search; returns `{results, count}` |
-| `GET` | `/v1/episodes` | List last N episodes (`?recent=N&brand=...`) |
-| `GET` | `/v1/episodes/{id}` | Full episode detail + linked mem0 IDs |
-| `GET` | `/v1/episodes/count` | `{count, last_ended_at}` for health checks |
+| `POST` | `/v1/episodes/search` | FTS5 keyword search; returns `{results, count}`, each row with its `state` |
+| `GET` | `/v1/episodes` | List last N episodes (`?recent=N&brand=...&state=complete`; `state` is optional) |
+| `GET` | `/v1/episodes/{id}` | Full episode detail + linked mem0 IDs (raw: the running log of an unfinished row is not scrubbed) |
+| `GET` | `/v1/episodes/count` | `{count, last_ended_at, last_complete_ended_at}` for health checks |
+
+**Unfinished rows on the read path.** `search` and the list return the `summary_text` of a row whose `state` is not
+`complete` with the machine segments (task notifications, relayed agent messages) scrubbed out, so it shows only the
+person's own prompts; finished rows are returned as stored. The keyword match runs on the stored text, so an unfinished row
+can match words it no longer shows, and a machine segment that itself contained ` | ` can leave a fragment.
+`last_ended_at` is moved by every prompt's checkpoint; `last_complete_ended_at` is the newest finished episode only.
 
 **Important:** `/v1/episodes/count` and `/v1/episodes/search` (POST) are registered BEFORE `/v1/episodes/{id}` in `app.py` — FastAPI matches routes in declaration order and a literal `/count` path must not be matched as an integer `{episode_id}`.
 
@@ -153,11 +171,11 @@ episodic_get(42)
 
 ### Dream-consolidator gather phase (Phase 2)
 
-`dream-consolidate.ps1` calls `Get-RecentEpisodes(7)` during Phase 2 (Gather) to add episodic context to the consolidation prompt. This lets the consolidator detect goal-continuity and contradictions across sessions — e.g., if the same goal appears blocked across three episodes, it surfaces as a priority consolidation signal.
+`dream-consolidate.ps1` calls `Get-RecentEpisodes(7)` during Phase 2 (Gather) to add episodic context to the consolidation prompt (finished episodes only: it asks for `state=complete` and skips a row with no goal; the authority-side `dream-consolidate.py` does the same). This lets the consolidator detect goal-continuity and contradictions across sessions — e.g., if the same goal appears blocked across three episodes, it surfaces as a priority consolidation signal.
 
 ### MEMORY.md hydration
 
-`scripts/wsl/memory-index-build.py` appends a "Recent episodes" section (last 7 episodes) after the tier index. Format:
+`scripts/wsl/memory-index-build.py` appends a "Recent episodes" section (last 7 finished episodes, `state='complete'`) after the tier index. Format:
 
 ```
 ## Recent episodes (last 7)
@@ -194,9 +212,10 @@ sqlite3 ~/.mem0/episodic.db "SELECT * FROM schema_meta;"
 **Disk usage:** ~1–2 KB per episode. At 10 sessions/day × 365 days ≈ 3.6–7.3 MB/year. No pruning needed in v0.15.
 
 **Health check:** `Test-MemoryStack.ps1` includes an `episodic.db :v0.15` row:
-- `OK` — at least 1 episode, last < 168h ago
+- `OK` — at least 1 episode, last finished < 168h ago (read from `last_complete_ended_at`: a per-prompt checkpoint moves `last_ended_at`, so it cannot show the Stop-hook extraction stopping; a server that does not report the field falls back to `last_ended_at`)
 - `WARN: empty` — normal post-ship until first real Stop event lands an episode with non-null goal
-- `WARN: stale` — episodes exist but last > 7 days ago; investigate `l1a.log`
+- `WARN: stale` — episodes exist but the last finished one is > 7 days old; investigate `l1a.log`
+- `WARN: none finished` — episodes exist (checkpoints) but none was ever finalized; investigate `l1a.log`
 - `FAIL` — server error; check mem0 service health
 
 ## v0.16 Hook Columns
@@ -219,4 +238,5 @@ v0.16 work is prompt extension + endpoint reads — no schema migration needed b
 - **Goal/summary length (M4):** no server-side cap on `goal_text`/`summary_text`. Practical cap comes from the Codex prompt ("1-2 sentences"/"2-4 sentences"). v0.15.1 patch: add `max_length=2000` validators to `EpisodeIn`.
 - **No UI dashboard:** deferred; query via sqlite3 CLI or MCP tools.
 - **Cross-PC sync:** none. `episodic.db` lives in `~/.mem0/` on the authority only; replicas receive it through the snapshot restore path. (An earlier revision claimed Syncthing covered `~/.mem0/`; verified 2026-09-10: no Syncthing folder is paired to it on any box.)
+- **Unfinished rows carry the newest `ended_at`:** an `in_progress` (or `abandoned`) episode has an empty goal and every checkpoint moves its `ended_at`, so a plain "last N" list (`recent()`, `GET /v1/episodes`, `sqlite3 ... ORDER BY ended_at DESC`) is mostly unfinished rows. Ask for `state='complete'` when you want sessions. A row written before the machine-turn filter may still hold task-notification and relayed-message text in its stored `summary_text`; the read path scrubs it for display and the stored text is left as it is (the drill-down, `GET /v1/episodes/{id}`, shows it raw).
 - **L5 WARN masking:** `Test-MemoryStack WARN: empty` persists indefinitely on broken Stop hook. If you see this > 2 days after active work sessions, check `l1a.log`.
