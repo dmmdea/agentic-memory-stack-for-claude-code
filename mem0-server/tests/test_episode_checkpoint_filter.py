@@ -257,3 +257,197 @@ def test_both_checkpoint_routes_go_through_the_one_upsert():
     bundle = src[src.index("def context_bundle("):src.index('@app.post("/v1/episodes")')]
     assert "_checkpoint_core(EpisodeCheckpointIn(" in bundle
     assert "is_non_human_turn" not in src, "the filter belongs in episodic.py, where it is headless-testable"
+
+
+# ---------------------------------------------------------------------------
+# Read side: scrub_running_summary
+# ---------------------------------------------------------------------------
+
+NOTIFICATION = "<task-notification>\n<task-id>b0c1d2e3f</task-id>\n<status>completed</status>\n</task-notification>"
+RELAYED = 'Another Claude session sent a message:\n<cross-session-message from="uds:example">please check the deploy'
+WRAPPER_ONLY = '<cross-session-message from="uds:example" from-name="peer">please check the deploy'
+
+
+def _stored(*previews):
+    """What the running summary holds: each preview cut to its stored 200 characters."""
+    return SEP.join(p[:200] for p in previews)
+
+
+def test_scrub_drops_every_kind_of_machine_segment():
+    text = _stored("fix the login bug", NOTIFICATION, RELAYED, WRAPPER_ONLY, "then add a test")
+    assert episodic.scrub_running_summary(text) == "fix the login bug | then add a test"
+
+
+def test_scrub_skips_the_same_leading_whitespace_as_the_write_side():
+    text = _stored("keep me", " \r\n\t " + NOTIFICATION, "\n  " + RELAYED, "\f\v" + WRAPPER_ONLY)
+    assert episodic.scrub_running_summary(text) == "keep me"
+
+
+def test_scrub_reads_a_truncated_segment():
+    """A stored preview is cut at 200 characters, so the wrapper may be gone behind the announcement
+    line, or the tag name may be the last thing left."""
+    text = SEP.join(["human ask", "Another Claude session sent a message:", "<cross-session-message",
+                     "<cross-session-message>", "after"])
+    assert episodic.scrub_running_summary(text) == "human ask | after"
+
+
+def test_scrub_keeps_human_segments_that_only_resemble_a_wrapper():
+    keep = ["<cross-session-messages> are they noisy?",          # a different tag
+            "why did this <task-notification> fire twice?",      # quoted mid-text
+            "<Cross-Session-Message> wrong case",                 # the wrapper is case-sensitive
+            "Another Claude session said hi",                     # not the announcement line
+            "<task-notifications> plural"]
+    text = SEP.join(keep)
+    assert episodic.scrub_running_summary(text) == text
+
+
+def test_scrub_leaves_clean_text_byte_for_byte_and_is_idempotent():
+    clean = "alpha | | beta |  | gamma |"
+    assert episodic.scrub_running_summary(clean) == clean
+    dirty = _stored("alpha", NOTIFICATION, "beta")
+    once = episodic.scrub_running_summary(dirty)
+    assert episodic.scrub_running_summary(once) == once
+
+
+def test_scrub_drops_a_dangling_gap_marker_but_keeps_an_interior_one():
+    machine = NOTIFICATION[:200]
+    assert episodic.scrub_running_summary(SEP.join([machine, GAP, "newest ask"])) == "newest ask"
+    assert episodic.scrub_running_summary(SEP.join(["opening ask", GAP, machine])) == "opening ask"
+    assert episodic.scrub_running_summary(SEP.join(["opening ask", GAP, machine, "newest ask"])) == (
+        SEP.join(["opening ask", GAP, "newest ask"]))
+    assert episodic.scrub_running_summary(SEP.join(["opening ask", GAP, "newest ask"])) == (
+        SEP.join(["opening ask", GAP, "newest ask"]))
+
+
+def test_scrub_of_nothing_but_machine_text_is_empty_and_non_text_passes_through():
+    assert episodic.scrub_running_summary(_stored(NOTIFICATION, RELAYED)) == ""
+    assert episodic.scrub_running_summary("") == ""
+    assert episodic.scrub_running_summary(None) is None
+
+
+def test_scrub_cleans_a_summary_written_before_the_fix():
+    """The backlog: every prompt appended raw, then capped at 800 characters."""
+    legacy = SEP.join(["ship the thing", NOTIFICATION[:200], RELAYED[:200], "looks right", NOTIFICATION[:200]])[:800]
+    assert episodic.scrub_running_summary(legacy) == "ship the thing | looks right"
+
+
+def test_the_preview_verdict_agrees_with_the_turn_verdict_on_the_corpus():
+    from hook_contract import is_non_human_preview, is_non_human_turn
+    for case in CORPUS:
+        if is_non_human_turn(case["prompt"]):
+            assert is_non_human_preview(case["prompt"][:200]) is True, case["name"]
+            assert is_non_human_preview(case["prompt"][:300]) is True, case["name"]
+        elif not case["prompt"].lstrip().startswith("Another Claude session sent a message:"):
+            assert is_non_human_preview(case["prompt"][:200]) is False, case["name"]
+    assert is_non_human_preview(None) is False and is_non_human_preview("") is False
+
+
+# ---------------------------------------------------------------------------
+# Read side: recent() and search_fts() scrub unfinished rows, never finished ones
+# ---------------------------------------------------------------------------
+
+_ENDED = {"done": "2026-10-01T00:00:01+00:00", "stale": "2026-10-01T00:00:02+00:00", "live": "2026-10-01T00:00:03+00:00"}
+_FINISHED_SUMMARY = "rotated | <task-notification> kept verbatim on a finished row | verified"
+
+
+def _seed(db):
+    """One finished session, one abandoned and one unfinished; the last two carry machine text that
+    reached the summary before the fix."""
+    dirty = _stored("rotate the signing key", NOTIFICATION, RELAYED, "then verify the rotation")
+    for sid, state, goal, summary in (
+        ("done", "complete", "Rotate the signing key", _FINISHED_SUMMARY),
+        ("stale", "abandoned", "", dirty),
+        ("live", "in_progress", "", dirty),
+    ):
+        episodic.create_session(db, sid, started_at="2026-10-01T00:00:00+00:00", brand="acme")
+        db.execute(
+            "INSERT INTO episodes (session_id, started_at, ended_at, goal_text, summary_text, state) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, "2026-10-01T00:00:00+00:00", _ENDED[sid], goal, summary, state))
+    db.commit()
+    return dirty
+
+
+def test_recent_scrubs_unfinished_rows_and_leaves_finished_ones_alone(db):
+    _seed(db)
+    rows = {r["session_id"]: r for r in episodic.recent(db, limit=10)}
+    assert rows["live"]["summary_text"] == "rotate the signing key | then verify the rotation"
+    assert rows["stale"]["summary_text"] == "rotate the signing key | then verify the rotation"
+    assert rows["done"]["summary_text"] == _FINISHED_SUMMARY
+    assert rows["live"]["state"] == "in_progress" and rows["done"]["state"] == "complete"
+
+
+def test_recent_scrubs_on_the_brand_path_too(db):
+    _seed(db)
+    rows = {r["session_id"]: r for r in episodic.recent(db, limit=10, brand="acme")}
+    assert set(rows) == {"live", "stale", "done"}
+    assert "task-notification" not in rows["live"]["summary_text"] and "cross-session" not in rows["live"]["summary_text"]
+    assert "Another Claude session" not in rows["stale"]["summary_text"]
+
+
+def test_recent_can_ask_for_one_state_so_unfinished_rows_do_not_crowd_the_window(db):
+    _seed(db)
+    assert [r["session_id"] for r in episodic.recent(db, limit=1)] == ["live"]
+    assert [r["session_id"] for r in episodic.recent(db, limit=1, state="complete")] == ["done"]
+    assert [r["session_id"] for r in episodic.recent(db, limit=5, brand="acme", state="abandoned")] == ["stale"]
+    assert episodic.recent(db, limit=5, state="no-such-state") == []
+
+
+def test_search_fts_scrubs_unfinished_rows_returns_state_and_leaves_finished_ones_alone(db):
+    _seed(db)
+    rows = {r["session_id"]: r for r in episodic.search_fts(db, "rotate")}
+    assert rows["live"]["state"] == "in_progress" and rows["done"]["state"] == "complete"
+    assert rows["live"]["summary_text"] == "rotate the signing key | then verify the rotation"
+    assert rows["done"]["summary_text"] == _FINISHED_SUMMARY
+
+
+def test_get_episode_stays_raw(db):
+    dirty = _seed(db)
+    live_id = db.execute("SELECT id FROM episodes WHERE session_id = 'live'").fetchone()[0]
+    ep = episodic.get_episode(db, live_id)
+    assert ep["summary_text"] == dirty and ep["state"] == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# count_episodes: a finished-only clock beside the all-states one
+# ---------------------------------------------------------------------------
+
+def test_count_reports_when_an_episode_was_last_finished(db):
+    _seed(db)
+    got = episodic.count_episodes(db)
+    assert got["count"] == 3
+    assert got["last_ended_at"] == _ENDED["live"], "a checkpoint moves the all-states clock"
+    assert got["last_complete_ended_at"] == _ENDED["done"], "only a finalize moves this one"
+
+
+def test_count_complete_clock_is_none_when_nothing_was_finished(db, clock):
+    _prompt(db, "just started")
+    got = episodic.count_episodes(db)
+    assert got["count"] == 1 and got["last_ended_at"] is not None
+    assert got["last_complete_ended_at"] is None
+    assert episodic.count_episodes(db, since="2999-01-01") == {
+        "count": 0, "last_ended_at": None, "last_complete_ended_at": None}
+
+
+def test_count_complete_clock_honours_the_brand_and_since_filters(db):
+    _seed(db)
+    assert episodic.count_episodes(db, brand="acme")["last_complete_ended_at"] == _ENDED["done"]
+    assert episodic.count_episodes(db, brand="nobody")["last_complete_ended_at"] is None
+    assert episodic.count_episodes(db, since=_ENDED["stale"])["last_complete_ended_at"] is None
+
+
+def test_the_list_route_passes_the_state_filter_to_recent():
+    """app.py cannot be imported headless: GET /v1/episodes takes an optional ``state`` and hands it to
+    recent(), so a caller that wants finished sessions can ask for them (the dream clients do)."""
+    src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    route = src[src.index("def list_episodes("):src.index('@app.get("/v1/episodes/{episode_id}")')]
+    assert "state: Optional[str] = Query(None)" in route
+    assert "_episodic_recent(conn, recent, brand, state)" in route
+
+
+def test_the_count_route_passes_the_dict_through():
+    """app.py cannot be imported headless: the route must return count_episodes' dict as is, so the new
+    field reaches Test-MemoryStack without a second edit."""
+    src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    route = src[src.index('@app.get("/v1/episodes/count")'):src.index('@app.get("/v1/episodes")')]
+    assert "return _episodic_count(conn, since, brand)" in route

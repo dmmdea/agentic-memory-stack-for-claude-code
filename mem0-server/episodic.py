@@ -24,7 +24,7 @@ from typing import Any
 
 # A flat sibling import: the server modules live in one directory both in the repo (mem0-server/) and
 # deployed (~/apps/mem0-server/), and hook_contract.py is in the installer's MEM0_MODULES.
-from hook_contract import is_non_human_turn
+from hook_contract import is_non_human_preview, is_non_human_turn
 
 log = logging.getLogger(__name__)
 
@@ -500,6 +500,38 @@ def _append_running_summary(
         used += cost
     # a legacy summary whose own opening segment is longer than the cap is cut, never overflowed
     return RUNNING_SUMMARY_SEP.join([first, RUNNING_SUMMARY_GAP, *kept])[:cap]
+
+
+def scrub_running_summary(text: str | None) -> str | None:
+    """Return a running summary without the segments nobody typed.
+
+    The read side of the same rule the write side applies: split on `` | ``, drop each segment that
+    (after the same leading-whitespace trim) starts with ``<task-notification>``, with
+    ``<cross-session-message`` (followed by whitespace, ``>`` or the end of the segment, since a
+    stored preview is cut) or with the ``Another Claude session sent a message:`` announcement line,
+    drop a gap marker left dangling at either end, and rejoin. Text with nothing to drop comes back
+    byte for byte. It cleans up rows written before the write side filtered, without touching the
+    database. None and the empty string pass through.
+
+    Limit: a machine segment that itself contained `` | `` was split by the join, and the part after
+    the pipe is not recognisable as machine text; it survives as a fragment.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    kept = [seg for seg in text.split(RUNNING_SUMMARY_SEP) if not is_non_human_preview(seg)]
+    while kept and kept[0] == RUNNING_SUMMARY_GAP:
+        kept.pop(0)
+    while kept and kept[-1] == RUNNING_SUMMARY_GAP:
+        kept.pop()
+    return RUNNING_SUMMARY_SEP.join(kept)
+
+
+def _scrub_unfinished(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Scrub the running summary of every row that is not ``complete`` (in place; returns *rows*)."""
+    for row in rows:
+        if row.get("state") != "complete":
+            row["summary_text"] = scrub_running_summary(row.get("summary_text"))
+    return rows
 
 
 def upsert_in_progress_episode(
@@ -1052,8 +1084,10 @@ def search_fts(
 ) -> list[dict[str, Any]]:
     """Keyword search over episode goal_text + summary_text via FTS5 MATCH.
 
-    Returns a list of episode dicts enriched with ``sessions.brand`` and
-    the FTS5 ``rank`` score (lower is better).
+    Returns a list of episode dicts enriched with ``sessions.brand``, the episode ``state`` and
+    the FTS5 ``rank`` score (lower is better). The match runs on the stored text, but the
+    ``summary_text`` of a row that is not ``complete`` comes back scrubbed of machine segments
+    (``scrub_running_summary``), so an unfinished row can match on text it no longer shows.
 
     v0.29 R4: ``only_brand_neutral=True`` restricts to brand-neutral (NULL-brand)
     episodes — used by the context_bundle raw-trace fallback when the session
@@ -1092,7 +1126,7 @@ def search_fts(
 
     sql = f"""
         SELECT e.id, e.session_id, e.started_at, e.ended_at,
-               e.goal_text, e.summary_text,
+               e.goal_text, e.summary_text, e.state,
                e.source_msg_start, e.source_msg_end,
                e.open_questions, e.advanced_goals, e.blocked_goals,
                e.created_at, s.brand, s.workspace, s.project,
@@ -1105,26 +1139,33 @@ def search_fts(
         LIMIT ?
     """  # nosec — where_sql contains only hard-coded AND/column refs + ? placeholders
     rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+    return _scrub_unfinished([dict(r) for r in rows])
 
 
 def recent(
     conn: sqlite3.Connection,
     limit: int = 10,
     brand: str | None = None,
+    state: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return last *limit* episodes ordered by ended_at DESC."""
+    """Return last *limit* episodes ordered by ended_at DESC.
+
+    ``state`` (``complete`` / ``in_progress`` / ``abandoned``) narrows the window to one state, so
+    a caller that wants finished sessions is not crowded out by the unfinished ones that always
+    carry the newest ``ended_at``. The running summary of a row that is not ``complete`` is scrubbed
+    of machine segments (``scrub_running_summary``); a finished row is returned as stored.
+    """
     if brand:
         rows = conn.execute(
             """
             SELECT e.*, s.brand, s.workspace, s.project
             FROM episodes e
             LEFT JOIN sessions s ON e.session_id = s.session_id
-            WHERE s.brand = ?
+            WHERE s.brand = ? AND (? IS NULL OR e.state = ?)
             ORDER BY e.ended_at DESC
             LIMIT ?
             """,
-            (brand, limit),
+            (brand, state, state, limit),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1132,12 +1173,13 @@ def recent(
             SELECT e.*, s.brand, s.workspace, s.project
             FROM episodes e
             LEFT JOIN sessions s ON e.session_id = s.session_id
+            WHERE (? IS NULL OR e.state = ?)
             ORDER BY e.ended_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (state, state, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _scrub_unfinished([dict(r) for r in rows])
 
 
 def get_episode(
@@ -1170,7 +1212,12 @@ def count_episodes(
     since: str | None = None,
     brand: str | None = None,
 ) -> dict[str, Any]:
-    """Return ``{count, last_ended_at}`` for health checks / Test-MemoryStack."""
+    """Return ``{count, last_ended_at, last_complete_ended_at}`` for health checks / Test-MemoryStack.
+
+    ``last_ended_at`` is the newest ``ended_at`` of any episode; every prompt's checkpoint moves it.
+    ``last_complete_ended_at`` is the newest of the finished ones only, so it stops moving when the
+    Stop-hook extraction stops, which is the signal a staleness check wants.
+    """
     where_parts = []
     params: list[Any] = []
 
@@ -1185,13 +1232,15 @@ def count_episodes(
     where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
     sql = f"""
-        SELECT COUNT(*) AS cnt, MAX(e.ended_at) AS last_ended_at
+        SELECT COUNT(*) AS cnt, MAX(e.ended_at) AS last_ended_at,
+               MAX(CASE WHEN e.state = 'complete' THEN e.ended_at END) AS last_complete_ended_at
         FROM episodes e {join_sql} {where_sql}
     """  # nosec — no user data in sql template; params are parameterized
     row = conn.execute(sql, params).fetchone()
     return {
         "count": row["cnt"] if row else 0,
         "last_ended_at": row["last_ended_at"] if row else None,
+        "last_complete_ended_at": row["last_complete_ended_at"] if row else None,
     }
 
 

@@ -97,6 +97,24 @@ def is_non_human_turn(prompt: Optional[str]) -> bool:
     return is_machine_turn_prompt(prompt) or is_relayed_agent_message(prompt)
 
 
+RELAYED_MESSAGE_WRAPPER_OPEN = "<cross-session-message"
+
+
+def is_non_human_preview(preview: Optional[str]) -> bool:
+    """True when a STORED preview (a prompt cut to its first 200 or 300 characters) starts like a
+    non-human turn. For the read side of the episode running summary, which has to clean up rows
+    written before the write side filtered. Looser than is_non_human_turn on purpose: the cut can
+    have lost the wrapper behind the announcement line, and can end right after the wrapper's name,
+    so the announcement line alone matches and the wrapper needs no character after it."""
+    if not isinstance(preview, str) or not preview:
+        return False
+    t = preview.lstrip(_MACHINE_TURN_LEADING_WS)
+    if t.startswith(MACHINE_TURN_MARKER) or t.startswith(RELAYED_MESSAGE_ANNOUNCEMENT):
+        return True
+    return t.startswith(RELAYED_MESSAGE_WRAPPER_OPEN) and (
+        t == RELAYED_MESSAGE_WRAPPER_OPEN or _RELAYED_WRAPPER.match(t) is not None)
+
+
 def warn_hook_contract_version(endpoint: str, version: Optional[str]) -> None:
     """Log-and-count contract-version validation. NEVER rejects (back-compat:
     pre-v0.18 hooks and direct API callers don't send the field)."""
