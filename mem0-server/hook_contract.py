@@ -72,9 +72,12 @@ def is_machine_turn_prompt(prompt: Optional[str]) -> bool:
 # character or '>': .NET's \s is [\f\n\r\t\v\x85\p{Z}], spelled out here because Python's \s also
 # takes the C0 separators \x1c-\x1f.
 RELAYED_MESSAGE_ANNOUNCEMENT = "Another Claude session sent a message:"
-_RELAYED_WRAPPER = re.compile(
-    "<cross-session-message[\f\n\r\t\v\x85 \xa0  -     　>]"
-)
+# .NET's \s, spelled out as code points: \f \n \r \t \v (9-13), NEL (0x85) and the
+# Unicode separators \p{Z} (space, NBSP, 0x1680, 0x2000-0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000)
+_DOTNET_WHITESPACE = "".join(map(chr, [
+    *range(9, 14), 0x85, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+]))
+_RELAYED_WRAPPER = re.compile("<cross-session-message[" + re.escape(_DOTNET_WHITESPACE) + ">]")
 
 
 def is_relayed_agent_message(prompt: Optional[str]) -> bool:

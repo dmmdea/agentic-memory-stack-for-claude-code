@@ -96,7 +96,7 @@ def test_relayed_verdict_is_an_exact_port_of_the_powershell_predicate():
     lead = " \t\r\n\f\v"
     assert hook_contract.is_relayed_agent_message(lead + w) is True
     # a character outside the six-char trim set is NOT skipped
-    assert hook_contract.is_relayed_agent_message(" " + w) is False
+    assert hook_contract.is_relayed_agent_message("\xa0" + w) is False
     assert hook_contract.is_relayed_agent_message("\x1c" + w) is False
     # the announcement is matched ordinally, so any case or spacing difference is a miss
     assert hook_contract.is_relayed_agent_message("another claude session sent a message:\n" + w) is False
@@ -106,8 +106,8 @@ def test_relayed_verdict_is_an_exact_port_of_the_powershell_predicate():
     assert hook_contract.is_relayed_agent_message("<cross-session-message>") is True
     assert hook_contract.is_relayed_agent_message("<cross-session-message\nfrom=x>") is True
     # .NET's \s covers the Unicode space separators and NEL, but not the C0 separators Python's \s adds
-    assert hook_contract.is_relayed_agent_message("<cross-session-message from=x>") is True
-    assert hook_contract.is_relayed_agent_message("<cross-session-message　from=x>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message\xa0from=x>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message\u3000from=x>") is True
     assert hook_contract.is_relayed_agent_message("<cross-session-message\x85from=x>") is True
     assert hook_contract.is_relayed_agent_message("<cross-session-message\x1cfrom=x>") is False
     # the announcement alone is not enough; the wrapper may sit anywhere after it

@@ -462,7 +462,7 @@ def add_link(
 # " | ", capped. Past the cap the opening ask stays and the newest previews follow it, one gap marker
 # between them, so a long session's summary shows how it began and where it is now.
 RUNNING_SUMMARY_SEP = " | "
-RUNNING_SUMMARY_GAP = "…"
+RUNNING_SUMMARY_GAP = "\u2026"  # horizontal ellipsis
 RUNNING_SUMMARY_CAP = 800
 
 
