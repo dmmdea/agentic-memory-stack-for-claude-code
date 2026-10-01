@@ -153,6 +153,80 @@ def test_memory_unsupersede_queues_offline_and_propagates_a_refusal(shim, monkey
     assert len(_outbox(shim)) == 1, "a refusal queues nothing"
 
 
+# ---- the caller reads the server's reason, not just the status line -------------------------------
+
+_CODES = {
+    409: "winner-superseded: point at the newest record in the chain (memory_get_by_id shows it)",
+    403: "cross-brand: a record of one brand cannot be hidden behind another brand's winner",
+    404: "not-found: no record has that id",
+}
+
+
+def _call(shim, tool, **kw):
+    if tool == "memory_supersede":
+        return _tool(shim, tool)(LOSER, WINNER, **kw)
+    return _tool(shim, tool)(LOSER, **kw)
+
+
+@pytest.mark.parametrize("tool", ["memory_supersede", "memory_unsupersede"])
+@pytest.mark.parametrize("status", sorted(_CODES))
+def test_a_refusal_carries_the_status_and_the_servers_reason_to_the_caller(shim, monkeypatch, tool, status):
+    """raise_for_status alone says "Client error '409 Conflict' for url ...": a session could not tell
+    loser-canonical from winner-superseded from cross-brand, so it could not act on the refusal."""
+    _answer(monkeypatch, shim, status=status, body={"detail": _CODES[status]})
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _call(shim, tool)
+    msg = str(ei.value)
+    assert str(status) in msg and _CODES[status] in msg
+    assert ei.value.response.status_code == status, "callers can still branch on the status"
+    assert _outbox(shim) == [], "a refusal is never queued"
+
+
+@pytest.mark.parametrize("tool", ["memory_supersede", "memory_unsupersede"])
+def test_a_long_refusal_detail_is_capped_and_a_non_text_detail_is_rendered(shim, monkeypatch, tool):
+    _answer(monkeypatch, shim, status=409, body={"detail": "winner-superseded: " + "x" * 2000})
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _call(shim, tool)
+    assert "winner-superseded: " in str(ei.value) and len(str(ei.value)) < 450
+    # a request the server's own validation rejects answers a list of error objects, not a string
+    _answer(monkeypatch, shim, status=422, body={"detail": [{"loc": ["body", "scope"],
+                                                             "msg": "unexpected scope"}]})
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _call(shim, tool, scope="bogus")
+    assert "422" in str(ei.value) and "unexpected scope" in str(ei.value)
+
+
+@pytest.mark.parametrize("tool", ["memory_supersede", "memory_unsupersede"])
+def test_a_refusal_without_a_json_body_still_names_the_status(shim, monkeypatch, tool):
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        return httpx.Response(400, text="the proxy rejected the request body",
+                              request=httpx.Request(method, url))
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _call(shim, tool)
+    assert "400" in str(ei.value) and "the proxy rejected the request body" in str(ei.value)
+
+
+@pytest.mark.parametrize("tool", ["memory_supersede", "memory_unsupersede"])
+def test_a_server_error_other_than_503_keeps_the_plain_status_error_and_is_not_queued(shim, monkeypatch, tool):
+    """Only a 4xx is a refusal with a reason to relay; a 500 is not, and it must not queue either."""
+    _answer(monkeypatch, shim, status=500, body={"detail": "boom"})
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _call(shim, tool)
+    assert "Server error '500" in str(ei.value)
+    assert _outbox(shim) == []
+
+
+def test_the_other_mutating_tools_keep_the_plain_status_error(shim, monkeypatch):
+    """The reason relay is scoped to the supersede door: memory_delete and memory_promote behave as before."""
+    _answer(monkeypatch, shim, status=409, body={"detail": "loser-canonical: nope"})
+    for call in (lambda: _tool(shim, "memory_delete")(LOSER),
+                 lambda: _tool(shim, "memory_promote")(LOSER)):
+        with pytest.raises(httpx.HTTPStatusError) as ei:
+            call()
+        assert "Client error '409" in str(ei.value) and "loser-canonical" not in str(ei.value)
+
+
 # ---- memory_update: text only, and the server's marker note reaches the caller --------------------
 
 def test_memory_update_passes_the_servers_supersede_note_through_unchanged(shim, monkeypatch):

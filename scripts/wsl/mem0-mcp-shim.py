@@ -92,11 +92,29 @@ def _request(method: str, path: str, *, json: dict | None = None, params: dict |
         return r.json(), source
     raise OfflineError(f"authority and local replica both unreachable: {last_exc}")
 
+_REFUSAL_DETAIL_MAX = 300
+
+def _refusal_detail(r) -> str:
+    """The server's own words for a refusal ("<code>: <what to do instead>"), capped. FastAPI
+    answers a string detail for the door's refusals and a list of error objects for a request its
+    validation rejects; a body that is not JSON at all falls back to the response text."""
+    try:
+        detail = r.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if detail is None:
+        detail = r.text
+    elif not isinstance(detail, str):
+        detail = _json.dumps(detail, default=str)
+    return " ".join(str(detail).split())[:_REFUSAL_DETAIL_MAX]
+
 def _authority_only(method: str, path: str, *, json: dict | None = None,
-                    params: dict | None = None) -> dict:
+                    params: dict | None = None, explain_refusal: bool = False) -> dict:
     """Writes/mutations: authority only. Raise OfflineError on connect failure, or on a
     _RETRYABLE_STATUS answer, so the caller queues to the outbox instead of losing the
-    write (a 503 means the authority cannot serve right now, not that the op is bad)."""
+    write (a 503 means the authority cannot serve right now, not that the op is bad).
+    explain_refusal (the supersede door's two tools): a 4xx raises an HTTPStatusError whose message
+    carries the status and the server's detail, so the caller can read WHY it was refused."""
     extra = {"params": params} if params else {}
     try:
         r = httpx.request(method, f"{AUTHORITY_URL}{path}", json=json,
@@ -105,6 +123,10 @@ def _authority_only(method: str, path: str, *, json: dict | None = None,
         raise OfflineError()
     if r.status_code in _RETRYABLE_STATUS:
         raise OfflineError(f"authority answered {r.status_code} (retryable); queueing")
+    if explain_refusal and 400 <= r.status_code < 500:
+        raise httpx.HTTPStatusError(
+            f"authority refused with {r.status_code} {r.reason_phrase}: {_refusal_detail(r)}",
+            request=r.request, response=r)
     r.raise_for_status()
     return r.json()
 
@@ -462,13 +484,15 @@ def memory_supersede(memory_id: str, superseded_by: str, scope: str = "full",
     The server enforces the rules whoever calls: a canonical or insight record is refused (its change
     goes through the operator's signed path: mem0-canonize.sh), so is a retired record, a winner that
     is itself superseded (point at the newest one), a winner of another user or brand, and a record
-    already superseded by a different winner. A refusal raises with the reason code; it is never
+    already superseded by a different winner. A refusal raises with the HTTP status and the server's
+    reason ("<code>: <what to do instead>", e.g. winner-superseded, cross-brand); it is never
     queued. A repeated identical call is a no-op. Offline or on a 503 the call queues to the outbox
     like the other writes. Undo with memory_unsupersede."""
     body = {"winner_id": superseded_by, "scope": scope, "detail": detail, "reason": reason,
             "source": "memory_supersede"}
     try:
-        return _authority_only("POST", f"/v1/memories/{memory_id}/supersede", json=body)
+        return _authority_only("POST", f"/v1/memories/{memory_id}/supersede", json=body,
+                               explain_refusal=True)
     except OfflineError:
         return _queue_op("supersede", {"memory_id": memory_id, "superseded_by": superseded_by,
                                        "scope": scope, "detail": detail, "reason": reason})
@@ -478,13 +502,15 @@ def memory_unsupersede(memory_id: str, scope: str = "full", reason: str | None =
     """Undo a supersession (a wrong winner, or a fact that turned out to still hold). scope='full'
     clears the full supersession (the record returns to default searches), 'partial' clears the
     partial annotations, 'all' clears both. query_class='history' finds a hidden record's id. The
-    same tier rules as memory_supersede apply (canonical and insight are refused); nothing to clear
+    same tier rules as memory_supersede apply (canonical and insight are refused; the error carries
+    the HTTP status and the server's reason code and text, and is never queued); nothing to clear
     is a no-op. Queues to the outbox when the authority is unreachable."""
     params = {"scope": scope}
     if reason:
         params["reason"] = reason
     try:
-        return _authority_only("DELETE", f"/v1/memories/{memory_id}/supersede", params=params)
+        return _authority_only("DELETE", f"/v1/memories/{memory_id}/supersede", params=params,
+                               explain_refusal=True)
     except OfflineError:
         return _queue_op("unsupersede", {"memory_id": memory_id, "scope": scope, "reason": reason})
 
