@@ -62,6 +62,14 @@ Resilience: llama-swap down or per-pair timeout -> log + skip pair (the sweep
 degrades, never crashes mid-pair). The first LLM call allows 120s for model
 cold-load; the 120s budget persists until the judge answers once.
 
+Supersede door modes (1.32.4; both judge nothing, so the Codex preflight never gates them):
+--resolve-supersede LOSER --winner W [--apply] records a queued supersede review through
+POST /v1/memories/<id>/supersede; --unsupersede ID [--scope full|partial|all] [--apply] undoes one
+(DELETE on the same route); --supersede-markers [--apply] [--apply-partial] [--only ID,...] finds the
+hand-written "SUPERSEDED ... by mem0 <id>" markers sessions appended to record text before the door
+existed, writes ~/.mem0/supersede-markers.json, and with --apply converts only the full markers
+whose winner is fine. Never scheduled.
+
 Every run (including dry-run) appends one JSONL summary line to
 ~/.mem0/contradiction-sweep.jsonl — read by Test-MemoryStack's RECOVERY
 "contradiction sweep" freshness row. Weekly systemd-user timer:
@@ -114,6 +122,13 @@ try:
     import pair_cache as _pair_cache
 except Exception:  # noqa: BLE001
     _pair_cache = None
+# 1.32.4: the supersede door's pure rules and the hand-written-marker parser (mem0-server/
+# supersession.py, same bridge). Its own guard: only --supersede-markers needs it, and that mode
+# reports a missing module as degraded instead of crashing the others.
+try:
+    import supersession as _supersession
+except Exception:  # noqa: BLE001
+    _supersession = None
 
 
 def _install_is_provisioned() -> bool:
@@ -1290,14 +1305,15 @@ def run_unstamp(mem0_http: httpx.Client, memory_id: str) -> int:
 # Qdrant access
 # ---------------------------------------------------------------------------
 
-def scroll_canonicals(http: httpx.Client, user_id: Optional[str] = None) -> list[dict]:
-    """All tier=canonical points with payload + dense vector."""
+def scroll_canonicals(http: httpx.Client, user_id: Optional[str] = None,
+                      with_vector: bool = True) -> list[dict]:
+    """All tier=canonical points with payload + dense vector (with_vector=False: payload only)."""
     must = [{"key": "tier", "match": {"value": "canonical"}}]
     if user_id:
         must.append({"key": "user_id", "match": {"value": user_id}})
     points, offset = [], None
     while True:
-        body = {"limit": 64, "with_payload": True, "with_vector": True,
+        body = {"limit": 64, "with_payload": True, "with_vector": with_vector,
                 "filter": {"must": must}}
         if offset is not None:
             body["offset"] = offset
@@ -1873,6 +1889,370 @@ def run_resolve_supersede(args, dry_run: bool) -> int:
         http.close()
 
 
+MARKERS_RECEIPT = Path.home() / ".mem0" / "supersede-markers.json"
+MARKER_TEXT_CHARS = 160
+PARTIAL_FALLBACK_DETAIL = "hand-written partial marker"
+# supersession.precheck code -> the winner-side state the receipt names. Any other code is a refusal on
+# the loser's side and reads "refused:<code>".
+_MARKER_STATE_BY_CODE = {
+    "self": "self", "winner-not-found": "missing", "winner-retired": "retired",
+    "winner-superseded": "already-superseded", "cross-tenant": "cross-user", "cross-brand": "cross-brand",
+}
+
+
+def _shared_brands() -> tuple:
+    """The labels every scope may see (the server's rule, through the same bridge). Unreadable -> ()
+    which only makes the report stricter: the door itself decides on --apply."""
+    try:
+        from admission_gate import _shared_brands_from_env
+        return tuple(_shared_brands_from_env())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def partial_detail(qualifier: Optional[str]) -> str:
+    """The detail a partial annotation carries: the marker's own qualifier, else a fixed label. A partial
+    note must say which claim is out of date, and a bare 'partially superseded by' says none."""
+    return (qualifier or "").strip()[:_supersession.DETAIL_MAX_CHARS] or PARTIAL_FALLBACK_DETAIL
+
+
+def marker_winner_state(loser_id: str, loser: dict, winner_id: Optional[str], winner: Optional[dict],
+                        scope: str, detail: Optional[str], shared_brands=()) -> str:
+    """Whether a marker can become a supersession through the door: "ok", or why not (missing | retired |
+    already-superseded | cross-brand | cross-user | self | refused:<code>). It asks the door's own refusal
+    matrix, so the report and the endpoint cannot disagree."""
+    refusal = _supersession.precheck(loser_id, str(winner_id or ""), loser, winner, scope=scope,
+                                     detail=detail, shared_brands=shared_brands)
+    if refusal is None:
+        return "ok"
+    return _MARKER_STATE_BY_CODE.get(refusal.code, f"refused:{refusal.code}")
+
+
+def _point_text(payload: dict) -> str:
+    return str(payload.get("data") or payload.get("memory") or "")
+
+
+def marker_candidates(points: list) -> list:
+    """(point, marker) for every record whose text carries a hand-written marker and that is not already
+    superseded (superseded_by unset) and still retrievable (retrievable is not False)."""
+    out = []
+    for p in points:
+        pl = p.get("payload") or {}
+        if pl.get("superseded_by") or pl.get("retrievable") is False:
+            continue
+        marker = _supersession.classify_text(_point_text(pl))
+        if marker is not None:
+            out.append((p, marker))
+    return out
+
+
+def build_marker_rows(candidates: list, payloads: dict, shared_brands=()) -> list:
+    """One report row per candidate: id, kind (full | partial | mention | no-target), winner_id, the winner
+    state (None for a mention or a marker with no id: nothing would be written), the qualifier and the
+    first MARKER_TEXT_CHARS of the text. A partial whose annotation is already recorded says so."""
+    rows = []
+    for p, marker in candidates:
+        pl = p.get("payload") or {}
+        lid = str(p.get("id"))
+        state = None
+        if marker.kind in ("full", "partial"):
+            scope = "full" if marker.kind == "full" else "partial"
+            detail = partial_detail(marker.qualifier) if scope == "partial" else None
+            state = marker_winner_state(lid, pl, marker.winner_id, payloads.get(marker.winner_id),
+                                        scope, detail, shared_brands)
+        row = {"id": lid, "kind": marker.kind, "winner_id": marker.winner_id, "winner_state": state,
+               "qualifier": marker.qualifier, "text": _point_text(pl)[:MARKER_TEXT_CHARS]}
+        if (marker.kind == "partial" and state == "ok"
+                and _supersession.is_noop(pl, marker.winner_id, "partial", partial_detail(marker.qualifier))):
+            row["already_annotated"] = True
+        rows.append(row)
+    return rows
+
+
+def canonical_marker_rows(points: list) -> list:
+    """Canonical records that carry a marker: reported as refused:canonical, never actioned. A canonical
+    leaves default retrieval only through the operator's signed path."""
+    out = []
+    for p in points:
+        pl = p.get("payload") or {}
+        marker = _supersession.classify_text(_point_text(pl))
+        if marker is not None:
+            out.append({"id": str(p.get("id")), "kind": marker.kind, "winner_id": marker.winner_id,
+                        "winner_state": "refused:canonical", "qualifier": marker.qualifier,
+                        "text": _point_text(pl)[:MARKER_TEXT_CHARS]})
+    return out
+
+
+def dangling_supersession_rows(points: list, payloads: dict) -> list:
+    """Records whose superseded_by names a winner that is gone or retired: the record is hidden and
+    nothing replaces it. Report only; nothing clears these today."""
+    out = []
+    for p in points:
+        pl = p.get("payload") or {}
+        wid = str(pl.get("superseded_by") or "").strip().lower()
+        if not wid:
+            continue
+        w = payloads.get(wid)
+        if w is None:
+            state = "missing"
+        elif w.get("retrievable") is False or w.get("retired_at"):
+            state = "retired"
+        else:
+            continue
+        out.append({"id": str(p.get("id")), "superseded_by": wid, "winner_state": state,
+                    "text": _point_text(pl)[:MARKER_TEXT_CHARS]})
+    return out
+
+
+def resolve_winner_payloads(http: httpx.Client, ids, known: dict) -> dict:
+    """{id: payload} for every id: the scrolled records first, then one bulk point read for the rest. An id
+    that does not exist (or is not a memory id at all) is absent from the result and reads as missing; a
+    read that FAILS raises, so an outage is never mistaken for a missing winner."""
+    out: dict = {}
+    miss = []
+    for i in sorted({str(x).strip().lower() for x in ids if x}):
+        if i in known:
+            out[i] = known[i]
+        elif _supersession.is_memory_id(i):
+            miss.append(i)
+    for start in range(0, len(miss), 128):
+        r = http.post(f"{QDRANT}/collections/{COLLECTION}/points",
+                      json={"ids": miss[start:start + 128], "with_payload": True}, timeout=30.0)
+        r.raise_for_status()
+        for pt in r.json().get("result") or []:
+            out[str(pt.get("id")).strip().lower()] = pt.get("payload") or {}
+    return out
+
+
+def apply_marker_rows(http: httpx.Client, rows: list, apply_partial: bool = False, only=None) -> dict:
+    """Convert report rows through POST /v1/memories/<id>/supersede (source "supersede-markers"). Only a FULL
+    marker whose winner state is ok is converted (scope full); with apply_partial a PARTIAL marker whose
+    winner state is ok is annotated (scope partial, detail = its qualifier): it never hides the record.
+    `only` (a set of lowercase ids) restricts either. A per-row refusal is recorded on the row and the run
+    continues; a 503 or a transport failure stops it (the authority said ask again later). Mutates the
+    rows (`applied`) and returns the counts."""
+    stats = {"applied_full": 0, "applied_partial": 0, "noop": 0, "refused": 0, "aborted": None}
+    for row in rows:
+        if row.get("winner_state") != "ok" or row.get("kind") not in ("full", "partial"):
+            continue
+        if only is not None and str(row["id"]).lower() not in only:
+            continue
+        scope = "full" if row["kind"] == "full" else "partial"
+        if scope == "partial" and not apply_partial:
+            continue
+        if row.get("already_annotated"):
+            row["applied"] = "noop"
+            stats["noop"] += 1
+            continue
+        body = {"winner_id": row["winner_id"], "scope": scope, "source": "supersede-markers",
+                "reason": f"converted a hand-written SUPERSEDED marker ({row['kind']}) in the record text"}
+        if scope == "partial":
+            body["detail"] = partial_detail(row.get("qualifier"))
+        try:
+            r = http.post(f"{MEM0}/v1/memories/{row['id']}/supersede", json=body, timeout=10.0)
+        except httpx.HTTPError as e:
+            stats["aborted"] = f"{type(e).__name__}: {str(e)[:120]}"
+            break
+        if r.status_code == 503:
+            stats["aborted"] = "mem0 answered 503 (retryable): " + r.text[:100]
+            break
+        if r.status_code != 200:
+            row["applied"] = f"refused:{r.status_code}"
+            row["apply_detail"] = r.text[:200]
+            stats["refused"] += 1
+            print(f"  REFUSED {row['id']} ({row['kind']}): mem0={r.status_code} {r.text[:120]}", flush=True)
+            continue
+        try:
+            noop = bool((r.json() or {}).get("noop"))
+        except ValueError:
+            noop = False
+        row["applied"] = "noop" if noop else "ok"
+        stats["noop" if noop else f"applied_{scope}"] += 1
+        print(f"  {'NOOP' if noop else 'APPLIED'} {row['id']}: scope={scope} winner={row['winner_id']}", flush=True)
+    return stats
+
+
+def _write_receipt(path: Path, receipt: dict) -> None:
+    """Atomic: a reader never sees a torn file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(receipt, indent=1) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _parse_only(raw) -> Optional[set]:
+    if raw is None:
+        return None
+    return {x.strip().lower() for x in str(raw).split(",") if x.strip()}
+
+
+def run_supersede_markers(args, dry_run: bool) -> int:
+    """--supersede-markers: the hand-written "SUPERSEDED <date> by mem0 <id>" markers sessions appended to a
+    record's text before the supersede door existed. The admission gate reads superseded_by, never text,
+    so those facts stayed in default searches. This judges nothing: it scrolls the store, classifies every
+    marker with the door's own parser (full | partial | mention | no-target) and its winner (ok | missing |
+    retired | already-superseded | cross-brand | cross-user | self), reports canonical records that carry
+    a marker as refused:canonical and records whose superseded_by names a missing or retired winner as
+    dangling, and writes ~/.mem0/supersede-markers.json.
+
+    DRY-RUN by default. --apply converts only FULL markers whose winner is ok, through the endpoint (the
+    server re-checks everything); --apply-partial (with --apply) also annotates PARTIAL markers, which
+    never hides a record; --only ID[,ID...] restricts what is written. Never scheduled."""
+    apply_partial = bool(getattr(args, "apply_partial", False))
+    only = _parse_only(getattr(args, "only", None))
+    print(f"contradiction-sweep: SUPERSEDE-MARKERS dry_run={dry_run} apply_partial={apply_partial} "
+          f"only={sorted(only) if only is not None else 'all'}", flush=True)
+    summary = {"mode": "supersede-markers", "dry_run": dry_run, "apply_partial": apply_partial}
+    if _supersession is None:
+        print("contradiction-sweep: FAIL - supersession.py is not importable through the mem0-server "
+              f"bridge (searched {', '.join(str(c) for c in _BRIDGE_CANDIDATES)})", flush=True)
+        _append_summary({**summary, "outcome": "degraded:supersession-module-missing"})
+        return _finish("degraded:supersession-module-missing")
+    try:
+        httpx.get(f"{QDRANT}/readyz", timeout=5.0).raise_for_status()
+    except (httpx.HTTPError, OSError) as e:
+        print(f"contradiction-sweep: FAIL preflight - Qdrant unreachable: {e}", flush=True)
+        _append_summary({**summary, "outcome": "degraded:qdrant-unreachable", "skipped": str(e)[:120]})
+        return _finish("degraded:qdrant-unreachable")
+    api_key = ""
+    if not dry_run:
+        try:
+            api_key = _api_key_or_raise()
+            httpx.get(f"{MEM0}/health", timeout=5.0).raise_for_status()
+        except (httpx.HTTPError, OSError) as e:
+            print(f"contradiction-sweep: FAIL preflight - mem0 unreachable (needed for --apply): {e}", flush=True)
+            _append_summary({**summary, "outcome": "degraded:mem0-unreachable", "skipped": str(e)[:120]})
+            return _finish("degraded:mem0-unreachable")
+    qdrant_http = httpx.Client()
+    mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    aborted: Optional[str] = None
+    rows: list = []
+    canon_rows: list = []
+    dangling: list = []
+    scanned = scanned_canonical = 0
+    stats = {"applied_full": 0, "applied_partial": 0, "noop": 0, "refused": 0, "aborted": None}
+    try:
+        noncanonical = scroll_noncanonical(qdrant_http, user_id=args.user_id)
+        canonical = scroll_canonicals(qdrant_http, user_id=args.user_id, with_vector=False)
+        scanned, scanned_canonical = len(noncanonical), len(canonical)
+        known = {str(p.get("id")).strip().lower(): (p.get("payload") or {}) for p in noncanonical + canonical}
+        candidates = marker_candidates(noncanonical)
+        hidden = [p for p in noncanonical if (p.get("payload") or {}).get("superseded_by")]
+        wanted = [m.winner_id for _, m in candidates if m.kind in ("full", "partial")]
+        wanted += [str((p.get("payload") or {}).get("superseded_by")) for p in hidden]
+        payloads = resolve_winner_payloads(qdrant_http, wanted, known)
+        rows = build_marker_rows(candidates, payloads, _shared_brands())
+        canon_rows = canonical_marker_rows(canonical)
+        dangling = dangling_supersession_rows(hidden, payloads)
+        if not dry_run:
+            stats = apply_marker_rows(mem0_http, rows, apply_partial=apply_partial, only=only)
+            aborted = stats["aborted"]
+    except (httpx.HTTPError, OSError, ValueError) as e:
+        aborted = f"{type(e).__name__}: {str(e)[:120]}"
+        print(f"contradiction-sweep: supersede-markers ABORT: {aborted}", flush=True)
+    finally:
+        qdrant_http.close()
+        mem0_http.close()
+    all_rows = rows + canon_rows
+    by_kind: dict = {}
+    by_state: dict = {}
+    for r in all_rows:
+        if r["winner_state"] != "refused:canonical":
+            by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+        if r["winner_state"]:
+            by_state[r["winner_state"]] = by_state.get(r["winner_state"], 0) + 1
+    counts = {
+        "by_kind": by_kind, "by_state": by_state, "markers": len(rows),
+        "refused_canonical": len(canon_rows), "dangling": len(dangling),
+        "would_convert_full": sum(1 for r in rows if r["kind"] == "full" and r["winner_state"] == "ok"),
+        "would_annotate_partial": sum(1 for r in rows if r["kind"] == "partial" and r["winner_state"] == "ok"
+                                      and not r.get("already_annotated")),
+        "applied_full": stats["applied_full"], "applied_partial": stats["applied_partial"],
+        "apply_noop": stats["noop"], "apply_refused": stats["refused"],
+    }
+    outcome = _outcome_for_abort(aborted) if aborted else "ok"
+    if not aborted:
+        try:
+            _write_receipt(MARKERS_RECEIPT, {
+                "ts": _iso_now(), "dry_run": dry_run, "apply_partial": apply_partial,
+                "user_id": args.user_id, "scanned": scanned, "scanned_canonical": scanned_canonical,
+                "counts": counts, "rows": all_rows, "dangling": dangling})
+        except OSError as e:
+            print(f"contradiction-sweep: receipt not written ({MARKERS_RECEIPT}): {e}", flush=True)
+            outcome = "degraded:receipt-not-written"
+    for r in all_rows:
+        print(f"  {r['kind']:9} {str(r['winner_state']):22} {r['id']} -> {r['winner_id']}  "
+              f"{r['text'][:60]!r}", flush=True)
+    for d in dangling:
+        print(f"  DANGLING  {d['winner_state']:9} {d['id']} superseded_by={d['superseded_by']}", flush=True)
+    print(f"contradiction-sweep: supersede-markers done. scanned={scanned}+{scanned_canonical} canonical "
+          f"markers={len(rows)} {by_kind} convertible_full={counts['would_convert_full']} "
+          f"annotatable_partial={counts['would_annotate_partial']} refused_canonical={len(canon_rows)} "
+          f"dangling={len(dangling)} applied_full={stats['applied_full']} "
+          f"applied_partial={stats['applied_partial']} (dry_run={dry_run}) -> {MARKERS_RECEIPT}", flush=True)
+    _append_summary({**summary, "scanned": scanned, "markers": len(rows),
+                     "full": by_kind.get("full", 0), "partial": by_kind.get("partial", 0),
+                     "mention": by_kind.get("mention", 0), "no_target": by_kind.get("no-target", 0),
+                     "convertible_full": counts["would_convert_full"],
+                     "annotatable_partial": counts["would_annotate_partial"],
+                     "refused_canonical": len(canon_rows), "dangling": len(dangling),
+                     "applied_full": stats["applied_full"], "applied_partial": stats["applied_partial"],
+                     "apply_refused": stats["refused"], "outcome": outcome})
+    return _finish(outcome, {"markers": len(rows), "convertible_full": counts["would_convert_full"],
+                             "applied_full": stats["applied_full"], "dangling": len(dangling)})
+
+
+def run_unsupersede(args, dry_run: bool) -> int:
+    """--unsupersede <id> [--scope full|partial|all]: undo a supersession through DELETE
+    /v1/memories/<id>/supersede (the same tier rules as the write; the server refuses a canonical or
+    insight record). Dry-run by default: it reads the record and says what --apply would clear. Replaces
+    the old pointer to --unstamp, which only ever cleared contradicts_canonical."""
+    mid, scope = str(args.unsupersede), str(getattr(args, "scope", "full") or "full")
+    try:
+        api_key = _api_key_or_raise()
+    except OSError as e:
+        print(f"contradiction-sweep: --unsupersede needs ~/.mem0/api-key: {e}", flush=True)
+        return 1
+    with httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"}) as http:
+        try:
+            r = http.get(f"{MEM0}/v1/memories/{mid}", timeout=10.0)
+            r.raise_for_status()
+            before = r.json()
+        except (httpx.HTTPError, ValueError) as e:
+            print(f"contradiction-sweep: --unsupersede read failed for {mid}: "
+                  f"{type(e).__name__}: {str(e)[:200]}", flush=True)
+            return 1
+        meta = before.get("metadata") or {}
+        full, partial = meta.get("superseded_by"), meta.get("partially_superseded_by")
+        print(f"contradiction-sweep: --unsupersede {mid} scope={scope} BEFORE: superseded_by={full!r} "
+              f"partially_superseded_by={len(partial) if isinstance(partial, list) else partial!r} "
+              f"tier={before.get('tier')!r} memory={str(before.get('memory'))[:80]!r}", flush=True)
+        has = {"full": bool(full), "partial": bool(partial), "all": bool(full or partial)}[scope]
+        if not has:
+            print(f"contradiction-sweep: --unsupersede {mid}: nothing to clear for scope {scope}", flush=True)
+            return 0
+        if dry_run:
+            print(f"contradiction-sweep: --unsupersede DRY-RUN - add --apply to clear scope {scope} on {mid}",
+                  flush=True)
+            return 0
+        try:
+            r = http.delete(f"{MEM0}/v1/memories/{mid}/supersede", timeout=10.0,
+                            params={"scope": scope, "reason": f"operator --unsupersede (scope {scope})"})
+        except httpx.HTTPError as e:
+            print(f"contradiction-sweep: --unsupersede FAIL {mid}: {type(e).__name__}: {e}", flush=True)
+            return 1
+        if r.status_code != 200:
+            print(f"contradiction-sweep: --unsupersede REFUSED/FAIL {mid}: mem0={r.status_code} "
+                  f"body={r.text[:200]}", flush=True)
+            return 1
+        print(f"contradiction-sweep: --unsupersede {mid}: scope {scope} cleared"
+              + (" (nothing was recorded)" if (r.json() or {}).get("noop") else
+                 " - the record is admitted again in durable/operational"), flush=True)
+        _append_summary({"mode": "unsupersede", "dry_run": False, "memory_id": mid, "scope": scope,
+                         "outcome": "ok"})
+        return 0
+
+
 def pairs_supersession_order(pid_a: str, a: dict, pid_b: str, b: dict):
     """Order a co-retrieval pair for the supersession judge (older <- newer).
 
@@ -2233,6 +2613,25 @@ def _main(argv=None) -> int:
     parser.add_argument("--winner", metavar="WINNER_ID",
                         help="the newer record LOSER_ID is superseded by (required with "
                              "--resolve-supersede)")
+    parser.add_argument("--unsupersede", metavar="MEMORY_ID",
+                        help="undo a supersession through DELETE /v1/memories/<id>/supersede; --scope "
+                             "picks what to clear. Dry-run by default; add --apply to clear.")
+    parser.add_argument("--scope", choices=["full", "partial", "all"], default="full",
+                        help="--unsupersede: clear the full supersession (default), the partial "
+                             "annotations, or both")
+    parser.add_argument("--supersede-markers", action="store_true",
+                        help="find the hand-written 'SUPERSEDED ... by mem0 <id>' markers in record text, "
+                             "classify each (full | partial | mention | no-target) and its winner, report "
+                             "canonical records that carry one and dangling superseded_by pointers, and "
+                             "write ~/.mem0/supersede-markers.json. Dry-run by default; --apply converts "
+                             "only FULL markers whose winner is ok, through the supersede endpoint. "
+                             "Judges nothing; never scheduled.")
+    parser.add_argument("--apply-partial", action="store_true",
+                        help="--supersede-markers --apply: also annotate PARTIAL markers (scope partial, "
+                             "detail = the marker's qualifier). A partial annotation never hides a record.")
+    parser.add_argument("--only", default=None, metavar="ID[,ID...]",
+                        help="--supersede-markers: restrict what --apply / --apply-partial writes to these "
+                             "record ids (the report still lists every marker)")
     args = parser.parse_args(argv)
     dry_run = not args.apply
     user_id_defaulted = args.user_id is None      # the operator did not choose a scope
@@ -2244,6 +2643,20 @@ def _main(argv=None) -> int:
             print("contradiction-sweep: --resolve-supersede requires --winner <id>", flush=True)
             return 2
         return run_resolve_supersede(args, dry_run=dry_run)
+
+    # The supersede door's other operator modes judge nothing, so they sit before the Codex preflight:
+    # a judge outage must not turn them into an exit-0 no-op.
+    if (args.apply_partial or args.only is not None) and not args.supersede_markers:
+        print("contradiction-sweep: --apply-partial and --only belong to --supersede-markers", flush=True)
+        return 2
+    if args.apply_partial and not args.apply:
+        print("contradiction-sweep: --apply-partial adds partial annotations to an --apply run; "
+              "pass --apply too (without it this is a dry run)", flush=True)
+        return 2
+    if args.unsupersede:
+        return run_unsupersede(args, dry_run=dry_run)
+    if args.supersede_markers:
+        return run_supersede_markers(args, dry_run=dry_run)
 
     if args.retrieval_pairs:
         # Operator fork taken 2026-08-09 (decision 3.5 "ok"): --apply now runs

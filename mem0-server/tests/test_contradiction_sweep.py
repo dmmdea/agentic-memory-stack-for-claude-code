@@ -1207,6 +1207,12 @@ class _FakeMem0:
     def close(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 def _queue_lines(path):
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -1214,7 +1220,6 @@ def _queue_lines(path):
 
 def _wire_resolve(monkeypatch, tmp_path, loser_payload, winner_payload, answer=None):
     """run_resolve_supersede with Qdrant payload reads and the mem0 client faked."""
-    import types as _types
     payloads = {LOSER: loser_payload, WINNER: winner_payload}
     calls: list = []
 
@@ -2132,3 +2137,360 @@ def test_lock_paths_default_to_the_home_mem0_dir(monkeypatch):
     assert fresh.REJUDGE_LOCK == Path.home() / ".mem0" / ".rejudge-stamped.lock"
     assert fresh.EVIDENCE_LOCK == Path.home() / ".mem0" / ".evidence-sweep.lock"
     assert fresh.PAIRS_LOCK == Path.home() / ".mem0" / ".retrieval-pairs.lock"
+
+
+# ---- --unsupersede (1.32.4): the undo, DELETE /v1/memories/{id}/supersede ---------------------------
+
+def _wire_unsupersede(monkeypatch, record, answer=None):
+    calls: list = []
+
+    def route(method, url, kw):
+        if method == "GET":
+            return _Resp(200, record) if record is not None else _Resp(404, {"detail": "not found"})
+        return answer(method, url, kw) if answer else _Resp(200, {"ok": True, "noop": False})
+    summaries: list = []
+    monkeypatch.setattr(sweep, "_api_key_or_raise", lambda: "k")
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep.httpx, "Client", lambda *a, **k: _FakeMem0(calls, route))
+    return calls, summaries, _types.SimpleNamespace(unsupersede=LOSER, scope="full")
+
+
+_HIDDEN = {"id": LOSER, "tier": "evidence", "memory": "old fact",
+           "metadata": {"superseded_by": WINNER, "superseded_at": "2026-09-30T00:00:00+00:00"}}
+
+
+def test_unsupersede_is_a_dry_run_by_default_and_makes_no_write(monkeypatch):
+    calls, _s, args = _wire_unsupersede(monkeypatch, _HIDDEN)
+    assert sweep.run_unsupersede(args, dry_run=True) == 0
+    assert [c["method"] for c in calls] == ["GET"], "a dry run only reads the record"
+
+
+def test_unsupersede_apply_deletes_through_the_endpoint_with_scope_and_reason(monkeypatch):
+    calls, summaries, args = _wire_unsupersede(monkeypatch, _HIDDEN)
+    args.scope = "all"
+    assert sweep.run_unsupersede(args, dry_run=False) == 0
+    (delete,) = [c for c in calls if c["method"] == "DELETE"]
+    assert delete["url"].endswith(f"/v1/memories/{LOSER}/supersede")
+    assert delete["params"]["scope"] == "all" and delete["params"]["reason"]
+    assert not [c for c in calls if c["method"] in ("PATCH", "POST")]
+    assert summaries[-1]["mode"] == "unsupersede" and summaries[-1]["outcome"] == "ok"
+
+
+def test_unsupersede_with_nothing_to_clear_for_the_scope_writes_nothing(monkeypatch):
+    partial_only = {**_HIDDEN, "metadata": {"partially_superseded_by": [{"winner_id": WINNER}]}}
+    calls, _s, args = _wire_unsupersede(monkeypatch, partial_only)
+    assert sweep.run_unsupersede(args, dry_run=False) == 0          # scope full: nothing hidden
+    assert [c["method"] for c in calls] == ["GET"]
+    args.scope = "partial"
+    calls.clear()
+    assert sweep.run_unsupersede(args, dry_run=False) == 0
+    assert [c["method"] for c in calls] == ["GET", "DELETE"]
+
+
+def test_unsupersede_reports_a_server_refusal_and_a_missing_record(monkeypatch):
+    refuse = lambda m, u, kw: _Resp(403, {"detail": "loser-canonical: signed path only"})  # noqa: E731
+    calls, _s, args = _wire_unsupersede(monkeypatch, _HIDDEN, refuse)
+    assert sweep.run_unsupersede(args, dry_run=False) == 1
+    calls, _s, args = _wire_unsupersede(monkeypatch, None)
+    assert sweep.run_unsupersede(args, dry_run=False) == 1
+    assert [c["method"] for c in calls] == ["GET"]
+
+
+# ---- --supersede-markers (1.32.4): find hand-written SUPERSEDED markers, convert through the door ---
+
+W_OK = "aaaaaaaa-0000-4000-8000-000000000001"
+W_GONE = "aaaaaaaa-0000-4000-8000-000000000002"
+W_RETIRED = "aaaaaaaa-0000-4000-8000-000000000003"
+W_CHAINED = "aaaaaaaa-0000-4000-8000-000000000004"
+W_BRAND = "aaaaaaaa-0000-4000-8000-000000000005"
+W_USER = "aaaaaaaa-0000-4000-8000-000000000006"
+R_FULL = "bbbbbbbb-0000-4000-8000-000000000001"
+R_FULL2 = "bbbbbbbb-0000-4000-8000-000000000002"
+R_PART = "bbbbbbbb-0000-4000-8000-000000000003"
+R_PART_BARE = "bbbbbbbb-0000-4000-8000-000000000004"
+R_MENTION = "bbbbbbbb-0000-4000-8000-000000000005"
+R_NOTARGET = "bbbbbbbb-0000-4000-8000-000000000006"
+R_GONE = "bbbbbbbb-0000-4000-8000-000000000007"
+R_RETIRED = "bbbbbbbb-0000-4000-8000-000000000008"
+R_CHAINED = "bbbbbbbb-0000-4000-8000-000000000009"
+R_BRAND = "bbbbbbbb-0000-4000-8000-00000000000a"
+R_USER = "bbbbbbbb-0000-4000-8000-00000000000b"
+R_DONE = "bbbbbbbb-0000-4000-8000-00000000000c"
+R_OFF = "bbbbbbbb-0000-4000-8000-00000000000d"
+R_CANON = "cccccccc-0000-4000-8000-000000000001"
+R_DANGLING = "dddddddd-0000-4000-8000-000000000001"
+R_DANGLING2 = "dddddddd-0000-4000-8000-000000000002"
+
+_FULL_MARKER = "SUPERSEDED 2026-09-30 by mem0 {w}: the old value"
+_PARTIAL_MARKER = "SUPERSEDED 2026-09-30 by mem0 {w} (the 'X' figure only): the rest stands"
+
+
+def _mp(pid, text, **payload):
+    """A scrolled Qdrant point: an evidence record of tenant u."""
+    return {"id": pid, "payload": {"data": text, "tier": "evidence", "user_id": "u", **payload}}
+
+
+_WINNERS = {
+    W_OK: {"data": "newer fact", "tier": "evidence", "user_id": "u"},
+    W_RETIRED: {"data": "x", "tier": "evidence", "user_id": "u", "retrievable": False},
+    W_CHAINED: {"data": "x", "tier": "evidence", "user_id": "u", "superseded_by": W_OK},
+    W_BRAND: {"data": "x", "tier": "evidence", "user_id": "u", "brand": "brand-b"},
+    W_USER: {"data": "x", "tier": "evidence", "user_id": "someone-else"},
+}   # W_GONE is deliberately absent from the store
+
+
+def _marker_points():
+    return [
+        _mp(R_FULL, _FULL_MARKER.format(w=W_OK)),
+        _mp(R_FULL2, _FULL_MARKER.format(w=W_OK)),
+        _mp(R_PART, _PARTIAL_MARKER.format(w=W_OK)),
+        _mp(R_PART_BARE, f"partially SUPERSEDED by mem0 {W_OK}: the rest stands"),
+        _mp(R_MENTION, f"This fact was superseded by mem0 {W_OK} in September"),
+        _mp(R_NOTARGET, "SUPERSEDED by the newer figure"),
+        _mp(R_GONE, _FULL_MARKER.format(w=W_GONE)),
+        _mp(R_RETIRED, _FULL_MARKER.format(w=W_RETIRED)),
+        _mp(R_CHAINED, _FULL_MARKER.format(w=W_CHAINED)),
+        _mp(R_BRAND, _FULL_MARKER.format(w=W_BRAND), brand="brand-a"),
+        _mp(R_USER, _FULL_MARKER.format(w=W_USER)),
+        _mp(R_DONE, _FULL_MARKER.format(w=W_OK), superseded_by=W_OK),            # already superseded
+        _mp(R_OFF, _FULL_MARKER.format(w=W_OK), retrievable=False),               # retired
+        _mp(R_DANGLING, "a fact whose winner is gone", superseded_by=W_GONE),
+        _mp(R_DANGLING2, "a fact whose winner was retired", superseded_by=W_RETIRED),
+        _mp("eeeeeeee-0000-4000-8000-000000000001", "a plain fact with no marker"),
+    ]
+
+
+def _wire_markers(monkeypatch, tmp_path, points=None, canonical=(), winners=None, answer=None):
+    """Drive run_supersede_markers against fakes: the two scrolls, the winner point reads and mem0."""
+    store = dict(_WINNERS if winners is None else winners)
+    calls: list = []
+
+    def route(method, url, kw):
+        if "/points" in url:
+            ids = kw["json"]["ids"]
+            return _Resp(200, {"result": [{"id": i, "payload": store[i]} for i in ids if i in store]})
+        return answer(method, url, kw) if answer else _Resp(200, {"ok": True, "noop": False})
+    summaries: list = []
+    receipt = tmp_path / "supersede-markers.json"
+    pts = _marker_points() if points is None else points
+    monkeypatch.setattr(sweep, "MARKERS_RECEIPT", receipt)
+    monkeypatch.setattr(sweep, "_api_key_or_raise", lambda: "k")
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(sweep, "_shared_brands", lambda: ())
+    monkeypatch.setattr(sweep.httpx, "get", lambda *a, **k: _types.SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(sweep, "scroll_noncanonical", lambda http, user_id=None: list(pts))
+    monkeypatch.setattr(sweep, "scroll_canonicals",
+                        lambda http, user_id=None, with_vector=True: list(canonical))
+    monkeypatch.setattr(sweep.httpx, "Client", lambda *a, **k: _FakeMem0(calls, route))
+    args = _types.SimpleNamespace(user_id="u", apply_partial=False, only=None)
+    return calls, summaries, receipt, args
+
+
+def _door_calls(calls):
+    return [c for c in calls if "/supersede" in c["url"]]
+
+
+def _rows(receipt):
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    return {r["id"]: r for r in data["rows"]}, data
+
+
+def test_markers_dry_run_classifies_every_marker_and_writes_nothing_but_the_receipt(monkeypatch, tmp_path):
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    assert sweep.run_supersede_markers(args, dry_run=True) == 0
+    assert _door_calls(calls) == [], "without --apply nothing is written, whatever the receipt says"
+    assert not [c for c in calls if c["method"] in ("PATCH", "DELETE")]
+    rows, data = _rows(receipt)
+    state = {rid: (r["kind"], r["winner_state"]) for rid, r in rows.items()}
+    assert state[R_FULL] == ("full", "ok")
+    assert state[R_PART] == ("partial", "ok")
+    assert state[R_PART_BARE] == ("partial", "ok")
+    assert state[R_MENTION][0] == "mention" and state[R_NOTARGET] == ("no-target", None)
+    assert state[R_GONE] == ("full", "missing")
+    assert state[R_RETIRED] == ("full", "retired")
+    assert state[R_CHAINED] == ("full", "already-superseded")
+    assert state[R_BRAND] == ("full", "cross-brand")
+    assert state[R_USER] == ("full", "cross-user")
+    assert R_DONE not in rows and R_OFF not in rows, "already superseded or retired records are not candidates"
+    assert "eeeeeeee-0000-4000-8000-000000000001" not in rows
+    assert summaries[-1]["mode"] == "supersede-markers" and summaries[-1]["dry_run"] is True
+    assert summaries[-1]["outcome"] == "ok"
+
+
+def test_markers_receipt_rows_carry_the_documented_fields(monkeypatch, tmp_path):
+    long_text = _FULL_MARKER.format(w=W_OK) + " " + "x" * 400
+    _c, _s, receipt, args = _wire_markers(monkeypatch, tmp_path, points=[_mp(R_FULL, long_text),
+                                                                          _mp(R_PART, _PARTIAL_MARKER.format(w=W_OK))])
+    assert sweep.run_supersede_markers(args, dry_run=True) == 0
+    rows, data = _rows(receipt)
+    row = rows[R_FULL]
+    assert set(row) == {"id", "kind", "winner_id", "winner_state", "qualifier", "text"}
+    assert row["winner_id"] == W_OK and len(row["text"]) == 160 and row["text"] == long_text[:160]
+    assert rows[R_PART]["qualifier"] == "(the 'X' figure only)"
+    counts = data["counts"]
+    assert counts["by_kind"] == {"full": 1, "partial": 1}
+    assert counts["would_convert_full"] == 1 and counts["would_annotate_partial"] == 1
+    assert not list(receipt.parent.glob("*.tmp")), "the receipt is written atomically"
+
+
+def test_markers_apply_converts_only_full_markers_whose_winner_is_ok(monkeypatch, tmp_path):
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    door = _door_calls(calls)
+    written = {c["url"].split("/")[-2]: c for c in door}
+    assert set(written) == {R_FULL, R_FULL2}, (
+        "only FULL markers with an ok winner are converted: partial, mention, no-target and every "
+        "missing / retired / chained / cross-brand / cross-user winner is left alone")
+    for c in door:
+        assert c["method"] == "POST" and c["json"]["scope"] == "full" and c["json"]["winner_id"] == W_OK
+        assert c["json"]["source"] == "supersede-markers" and c["json"]["reason"]
+        assert "detail" not in c["json"]
+    rows, data = _rows(receipt)
+    assert rows[R_FULL]["applied"] == "ok" and "applied" not in rows[R_PART]
+    assert summaries[-1]["applied_full"] == 2 and summaries[-1]["applied_partial"] == 0
+    assert not [c for c in calls if c["method"] in ("PATCH", "DELETE")]
+
+
+def test_markers_apply_partial_writes_scope_partial_only_and_never_hides(monkeypatch, tmp_path):
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    args.apply_partial = True
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    by_id = {c["url"].split("/")[-2]: c["json"] for c in _door_calls(calls)}
+    assert set(by_id) == {R_FULL, R_FULL2, R_PART, R_PART_BARE}
+    assert by_id[R_PART]["scope"] == "partial" and by_id[R_PART]["detail"] == "(the 'X' figure only)"
+    assert by_id[R_PART_BARE]["scope"] == "partial"
+    assert by_id[R_PART_BARE]["detail"] == "hand-written partial marker", "an empty qualifier gets the fixed label"
+    assert by_id[R_FULL]["scope"] == "full"
+    assert all(j["scope"] == "partial" for rid, j in by_id.items() if rid in (R_PART, R_PART_BARE)), (
+        "a partial marker is never sent as a full supersession")
+    assert summaries[-1]["applied_partial"] == 2 and summaries[-1]["applied_full"] == 2
+
+
+def test_markers_only_restricts_what_apply_writes(monkeypatch, tmp_path):
+    calls, _s, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    args.only = f" {R_FULL2.upper()} , {R_PART}"
+    args.apply_partial = True
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    assert {c["url"].split("/")[-2] for c in _door_calls(calls)} == {R_FULL2, R_PART}
+    rows, _d = _rows(receipt)
+    assert R_FULL in rows, "the report still lists every marker; --only restricts the writes"
+
+
+def test_markers_a_refusal_is_recorded_and_the_run_continues(monkeypatch, tmp_path):
+    def refuse_first(method, url, kw):
+        return (_Resp(409, {"detail": "winner-retired: x"}) if R_FULL in url
+                else _Resp(200, {"ok": True, "noop": False}))
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path, answer=refuse_first)
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    rows, _d = _rows(receipt)
+    assert rows[R_FULL]["applied"] == "refused:409" and rows[R_FULL2]["applied"] == "ok"
+    assert summaries[-1]["apply_refused"] == 1 and summaries[-1]["applied_full"] == 1
+
+
+def test_markers_a_503_aborts_the_apply_as_degraded(monkeypatch, tmp_path):
+    calls, summaries, receipt, args = _wire_markers(
+        monkeypatch, tmp_path, answer=lambda m, u, kw: _Resp(503, {"detail": "audit ledger unavailable"}))
+    assert sweep.run_supersede_markers(args, dry_run=False) == 1
+    assert len(_door_calls(calls)) == 1, "the authority said ask again later: stop, do not hammer it"
+    assert summaries[-1]["outcome"].startswith("degraded")
+
+
+def test_markers_report_canonical_records_that_carry_a_marker_and_never_touch_them(monkeypatch, tmp_path):
+    canon = [{"id": R_CANON, "payload": {"data": _FULL_MARKER.format(w=W_OK), "tier": "canonical",
+                                         "user_id": "u"}},
+             {"id": "cccccccc-0000-4000-8000-000000000002",
+              "payload": {"data": "a plain locked fact", "tier": "canonical", "user_id": "u"}}]
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path, canonical=canon)
+    args.apply_partial = True
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    rows, data = _rows(receipt)
+    assert rows[R_CANON]["winner_state"] == "refused:canonical" and rows[R_CANON]["kind"] == "full"
+    assert R_CANON not in {c["url"].split("/")[-2] for c in _door_calls(calls)}
+    assert data["counts"]["refused_canonical"] == 1
+    assert "cccccccc-0000-4000-8000-000000000002" not in rows
+
+
+def test_markers_report_dangling_supersessions_and_never_repair_them(monkeypatch, tmp_path):
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    args.apply_partial = True
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    dangling = {d["id"]: d["winner_state"] for d in data["dangling"]}
+    assert dangling == {R_DANGLING: "missing", R_DANGLING2: "retired"}
+    assert data["counts"]["dangling"] == 2 and summaries[-1]["dangling"] == 2
+    assert R_DANGLING not in {c["url"].split("/")[-2] for c in _door_calls(calls)}
+    assert not [c for c in calls if c["method"] in ("PATCH", "DELETE")]
+
+
+def test_markers_an_already_annotated_partial_is_not_written_again(monkeypatch, tmp_path):
+    annotated = _mp(R_PART, _PARTIAL_MARKER.format(w=W_OK),
+                    partially_superseded_by=[{"winner_id": W_OK, "detail": "(the 'X' figure only)",
+                                              "at": "2026-09-30T00:00:00+00:00"}])
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path, points=[annotated])
+    args.apply_partial = True
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    assert _door_calls(calls) == []
+    rows, _d = _rows(receipt)
+    assert rows[R_PART]["applied"] == "noop"
+
+
+def test_marker_winner_state_matrix_shares_the_servers_refusal_codes():
+    sup = sweep._supersession
+    loser = {"tier": "evidence", "user_id": "u"}
+    ok = {"tier": "evidence", "user_id": "u"}
+    def state(winner):
+        return sweep.marker_winner_state(R_FULL, loser, W_OK, winner, "full", None)
+    assert state(ok) == "ok"
+    assert state(None) == "missing"
+    assert state({**ok, "retrievable": False}) == "retired"
+    assert state({**ok, "superseded_by": W_CHAINED}) == "already-superseded"
+    assert state({**ok, "user_id": "other"}) == "cross-user"
+    assert sweep.marker_winner_state(R_FULL, {**loser, "brand": "a"}, W_OK, {**ok, "brand": "b"},
+                                     "full", None) == "cross-brand"
+    assert sweep.marker_winner_state(R_FULL, {**loser, "brand": "a"}, W_OK, {**ok, "brand": "shared"},
+                                     "full", None, shared_brands=("shared",)) == "ok"
+    assert sweep.marker_winner_state(R_FULL, loser, R_FULL, loser, "full", None) == "self"
+    assert sweep.marker_winner_state(R_FULL, {"tier": "insight"}, W_OK, ok, "full", None) == "refused:loser-insight"
+    assert sup.precheck(R_FULL, W_OK, loser, ok) is None, "the sweep and the door share one matrix"
+
+
+def test_markers_use_the_bridged_supersession_module_and_never_patch():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "import supersession as _supersession" in src, "the parser comes through the sys.path bridge"
+    i = src.find("def run_supersede_markers")
+    j = src.find("\ndef ", i + 10)
+    body = src[i:j]
+    assert ".patch(" not in body and "stamp_candidate(" not in body, "the converter only POSTs the door"
+    helpers = src[src.find("def marker_candidates"):i]
+    assert "_supersession.classify_text(" in helpers, "markers are recognised by the shared parser"
+
+
+def test_the_new_modes_are_wired_before_the_codex_preflight(monkeypatch, tmp_path):
+    """Neither mode judges anything, so a judge outage must not turn them into an exit-0 no-op (or, on a
+    provisioned box with no bridge, a fatal exit 2), as for --unstamp / --promote / --dismiss."""
+    monkeypatch.setattr(sweep, "_codex", None)
+    monkeypatch.setattr(sweep, "_install_is_provisioned", lambda: True)
+    monkeypatch.setattr(sweep, "_append_summary", lambda rec: None)
+    monkeypatch.setattr(sweep, "run_supersede_markers", lambda args, dry_run: 7)
+    monkeypatch.setattr(sweep, "run_unsupersede", lambda args, dry_run: 8)
+    assert sweep.main(["--supersede-markers"]) == 7
+    assert sweep.main(["--unsupersede", LOSER]) == 8
+
+
+def test_the_new_modes_default_to_a_dry_run_and_apply_flips_it(monkeypatch):
+    seen = []
+    monkeypatch.setattr(sweep, "run_supersede_markers", lambda args, dry_run: (seen.append(("m", dry_run, args.apply_partial, args.only)) or 0))
+    monkeypatch.setattr(sweep, "run_unsupersede", lambda args, dry_run: (seen.append(("u", dry_run, args.scope)) or 0))
+    sweep.main(["--supersede-markers"])
+    sweep.main(["--supersede-markers", "--apply", "--apply-partial", "--only", "a,b"])
+    sweep.main(["--unsupersede", LOSER, "--scope", "partial"])
+    sweep.main(["--unsupersede", LOSER, "--apply"])
+    assert seen == [("m", True, False, None), ("m", False, True, "a,b"),
+                    ("u", True, "partial"), ("u", False, "full")]
+
+
+def test_apply_partial_and_only_are_refused_outside_an_apply_markers_run(monkeypatch):
+    monkeypatch.setattr(sweep, "run_supersede_markers", lambda args, dry_run: (_ for _ in ()).throw(AssertionError("must not run")))
+    assert sweep.main(["--supersede-markers", "--apply-partial"]) == 2, "partial annotations ride on --apply"
+    assert sweep.main(["--apply-partial"]) == 2
+    assert sweep.main(["--only", "abc"]) == 2
