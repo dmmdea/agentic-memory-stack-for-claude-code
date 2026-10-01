@@ -3495,7 +3495,7 @@ def episodes_count(
     brand: Optional[str] = Query(None),
     x_api_key: Optional[str] = Header(None),
 ):
-    """Return {count, last_ended_at} for health checks and Test-MemoryStack."""
+    """Return {count, last_ended_at, last_complete_ended_at} for health checks and Test-MemoryStack."""
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:

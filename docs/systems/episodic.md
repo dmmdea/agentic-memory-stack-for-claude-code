@@ -171,7 +171,7 @@ episodic_get(42)
 
 ### Dream-consolidator gather phase (Phase 2)
 
-`dream-consolidate.ps1` calls `Get-RecentEpisodes(7)` during Phase 2 (Gather) to add episodic context to the consolidation prompt (finished episodes only: it asks for `state=complete` and skips a row with no goal; the authority-side `dream-consolidate.py` does the same). This lets the consolidator detect goal-continuity and contradictions across sessions — e.g., if the same goal appears blocked across three episodes, it surfaces as a priority consolidation signal.
+`dream-consolidate.ps1` calls `Get-RecentEpisodes(7)` during Phase 2 (Gather) to add episodic context to the consolidation prompt (finished episodes only: it asks for `state=complete` and skips a row with no goal; the authority-side `dream-consolidate.py` also asks for `state=complete` and skips any row that is not complete, falling back to a complete row's summary when it has no goal). This lets the consolidator detect goal-continuity and contradictions across sessions — e.g., if the same goal appears blocked across three episodes, it surfaces as a priority consolidation signal.
 
 ### MEMORY.md hydration
 

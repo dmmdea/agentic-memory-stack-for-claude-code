@@ -234,7 +234,7 @@ def test_replica_recent_sessions_come_from_the_authority(tmp_path):
     assert "live goal 4" in out
     assert "live goal 5" not in out, "only the 5 newest goal-bearing rows"
     assert "FROZEN-LOCAL-GOAL" not in out
-    assert "/v1/episodes?recent=20" in box.calls()
+    assert "/v1/episodes?recent=20&state=complete" in box.calls()
 
 
 def test_replica_recent_sessions_read_failure_prints_one_unavailable_line(tmp_path):

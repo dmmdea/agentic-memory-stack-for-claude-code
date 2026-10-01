@@ -478,6 +478,8 @@ def _append_running_summary(
     opening ask) is kept, then a single gap marker, then as many of the newest segments as fit, so the
     summary neither freezes on the first prompts nor loses how the session started. A summary that
     already carries a gap marker never gains a second one. No snippet leaves the summary as it is.
+    Segments are found by splitting on `` | ``, so an opening ask that itself contains `` | `` counts as
+    several segments and only its first one is protected when the cap trims.
     """
     existing = existing or ""
     if not snippet:

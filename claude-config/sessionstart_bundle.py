@@ -180,12 +180,14 @@ def recent_goal_for_brand(db_path: str, brand) -> "str | None":
 
 def fetch_recent_goal_from_authority(url: str, key: str, brand, limit: int = RECENT_EPISODES,
                                      timeout: float = EPISODES_TIMEOUT) -> "str | None":
-    """GET /v1/episodes?recent=<limit>[&brand=<brand>] and pick the seed (pick_authority_goal). The brand
-    is forwarded so the server's window is THAT brand's newest episodes (the local query's `s.brand = ?`,
-    not the newest few across every brand), and pick_authority_goal re-checks it, so an authority that
-    ignores the parameter still cannot lend another brand's goal. None on any error, timeout or malformed
-    body: no seed, never an exception, and a session start waits `timeout` at most."""
-    params = {"recent": limit}
+    """GET /v1/episodes?recent=<limit>&state=complete[&brand=<brand>] and pick the seed
+    (pick_authority_goal). The brand is forwarded so the server's window is THAT brand's newest episodes
+    (the local query's `s.brand = ?`, not the newest few across every brand), and pick_authority_goal
+    re-checks it, so an authority that ignores the parameter still cannot lend another brand's goal.
+    state=complete keeps unfinished sessions (no goal, and always the newest ended_at) from filling the
+    window; an older server ignores it and the blank-goal skip still applies. None on any error,
+    timeout or malformed body: no seed, never an exception, and a session start waits `timeout` at most."""
+    params = {"recent": limit, "state": "complete"}
     if brand:
         params["brand"] = brand
     try:
