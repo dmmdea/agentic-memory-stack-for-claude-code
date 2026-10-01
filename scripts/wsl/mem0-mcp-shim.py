@@ -92,13 +92,15 @@ def _request(method: str, path: str, *, json: dict | None = None, params: dict |
         return r.json(), source
     raise OfflineError(f"authority and local replica both unreachable: {last_exc}")
 
-def _authority_only(method: str, path: str, *, json: dict | None = None) -> dict:
+def _authority_only(method: str, path: str, *, json: dict | None = None,
+                    params: dict | None = None) -> dict:
     """Writes/mutations: authority only. Raise OfflineError on connect failure, or on a
     _RETRYABLE_STATUS answer, so the caller queues to the outbox instead of losing the
     write (a 503 means the authority cannot serve right now, not that the op is bad)."""
+    extra = {"params": params} if params else {}
     try:
         r = httpx.request(method, f"{AUTHORITY_URL}{path}", json=json,
-                          headers=_headers(), timeout=_timeout())
+                          headers=_headers(), timeout=_timeout(), **extra)
     except _FAILOVER_EXC:
         raise OfflineError()
     if r.status_code in _RETRYABLE_STATUS:
@@ -167,6 +169,24 @@ mcp = FastMCP("mem0")
 def _headers() -> dict:
     return {"X-API-Key": MEM0_KEY, "Content-Type": "application/json"}
 
+def _partial_supersession_note(items) -> str | None:
+    """1.32.4: a record whose payload carries partially_superseded_by has ONE claim that a newer
+    record corrected while the rest stands. The gate does not hide it (a partial supersession never
+    hides), so nothing else tells the caller. Counted client-side from the results themselves, as
+    recall reads created_at: under `metadata` (the search shape) or at the top level."""
+    n = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        md = it.get("metadata") if isinstance(it.get("metadata"), dict) else {}
+        if md.get("partially_superseded_by") or it.get("partially_superseded_by"):
+            n += 1
+    if not n:
+        return None
+    return (f"{n} result(s) carry a partial supersession (metadata.partially_superseded_by): one claim "
+            "in each is out of date, see its detail, and the rest still stands. They were NOT "
+            "withheld; check the detail before relying on the claim it names")
+
 @mcp.tool
 def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, metadata: dict | None = None) -> dict:
     """Add a memory to mem0. Set infer=False to store as-is; True to LLM-extract facts.
@@ -229,7 +249,9 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     Pass rerank=True/False to override the default.
     query_class: 'durable' (default) | 'operational' (recency-decayed) |
     'canonical' (REQUIRED to retrieve tier=canonical ground-truth records —
-    the default class excludes them).
+    the default class excludes them) | 'history' (forensic: the hide checks are off, so
+    superseded and contradicting-canonical records come back too; use it to find or audit a
+    record that a default search withholds, see `withheld_note`).
     brand: scope the search to one brand (e.g. 'myapp', 'ai-ecosystem') —
     pass it when working in a brand context. v0.19 fail-closed default: a
     search WITHOUT brand returns only brand-neutral (null-brand) records.
@@ -275,6 +297,10 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
         data["withheld_note"] = (
             f"{_n_sup} superseded and {_n_con} contradicting-canonical result(s) "
             "withheld — use query_class='history' for forensics")
+    # 1.32.4: a partial supersession never hides a record, so say which results carry one
+    _pnote = _partial_supersession_note(data.get("results"))
+    if _pnote:
+        data["partial_supersession_note"] = _pnote
     return data
 
 @mcp.tool
@@ -332,6 +358,10 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
                 f"{_n_sup} superseded and {_n_con} contradicting-canonical "
                 "result(s) withheld — use memory_search query_class='history' "
                 "for forensics")
+        # 1.32.4: bundle memories that carry a partial supersession (never hidden, so say so)
+        _pnote = _partial_supersession_note(out["memories"])
+        if _pnote:
+            out["partial_supersession_note"] = _pnote
         # W5 T2.2: oldest/newest age summary — BUNDLE memories only (the
         # canonical leg ages well by design and would make every recall read
         # 'old'; offline _pending_adds carry no created_at and are skipped).
@@ -402,11 +432,61 @@ def memory_delete(memory_id: str) -> dict:
 
 @mcp.tool
 def memory_update(memory_id: str, text: str) -> dict:
-    """Update a memory's text content."""
+    """Update a memory's text content. Text only: it never changes what a search returns.
+
+    Never append a "SUPERSEDED ... by <id>" marker to the text to retire a stale fact. The search
+    filter reads the superseded_by field, not the text, so a marker leaves the stale record in every
+    default search. Record the supersession with memory_supersede instead. When the new text does hold
+    such a marker the answer carries `supersede_note` (and `supersede_marker`): the server noticed it
+    and did nothing about it."""
     try:
         return _authority_only("PUT", f"/v1/memories/{memory_id}", json={"text": text})
     except OfflineError:
         return _queue_op("update", {"memory_id": memory_id, "text": text})
+
+@mcp.tool
+def memory_supersede(memory_id: str, superseded_by: str, scope: str = "full",
+                     detail: str | None = None, reason: str | None = None) -> dict:
+    """Record that a newer memory replaces an old one: the one door that retires a stale fact.
+    memory_id is the OLD record, superseded_by the id of the NEWER record (call memory_get_by_id on
+    both first; memory_add the new fact before superseding the old one).
+
+    scope='full' (default): the new record replaces the whole old one. The old record is withheld
+    from default searches and recall (query_class='history' still returns it), so the newer fact
+    surfaces instead.
+    scope='partial' + detail: ONE claim in the old record is out of date and the rest still stands.
+    Say which claim in `detail` (max 300 characters, e.g. "the port number"). The record is NOT
+    hidden: it stays in searches and carries a partial_supersession_note. If the text itself must
+    change, memory_update it as well.
+
+    The server enforces the rules whoever calls: a canonical or insight record is refused (its change
+    goes through the operator's signed path: mem0-canonize.sh), so is a retired record, a winner that
+    is itself superseded (point at the newest one), a winner of another user or brand, and a record
+    already superseded by a different winner. A refusal raises with the reason code; it is never
+    queued. A repeated identical call is a no-op. Offline or on a 503 the call queues to the outbox
+    like the other writes. Undo with memory_unsupersede."""
+    body = {"winner_id": superseded_by, "scope": scope, "detail": detail, "reason": reason,
+            "source": "memory_supersede"}
+    try:
+        return _authority_only("POST", f"/v1/memories/{memory_id}/supersede", json=body)
+    except OfflineError:
+        return _queue_op("supersede", {"memory_id": memory_id, "superseded_by": superseded_by,
+                                       "scope": scope, "detail": detail, "reason": reason})
+
+@mcp.tool
+def memory_unsupersede(memory_id: str, scope: str = "full", reason: str | None = None) -> dict:
+    """Undo a supersession (a wrong winner, or a fact that turned out to still hold). scope='full'
+    clears the full supersession (the record returns to default searches), 'partial' clears the
+    partial annotations, 'all' clears both. query_class='history' finds a hidden record's id. The
+    same tier rules as memory_supersede apply (canonical and insight are refused); nothing to clear
+    is a no-op. Queues to the outbox when the authority is unreachable."""
+    params = {"scope": scope}
+    if reason:
+        params["reason"] = reason
+    try:
+        return _authority_only("DELETE", f"/v1/memories/{memory_id}/supersede", params=params)
+    except OfflineError:
+        return _queue_op("unsupersede", {"memory_id": memory_id, "scope": scope, "reason": reason})
 
 @mcp.tool
 def memory_promote(memory_id: str, tier: str = "stable", reason: str | None = None) -> dict:

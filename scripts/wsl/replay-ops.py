@@ -108,6 +108,19 @@ def dispatch(op: str, args: dict) -> httpx.Response:
         r = httpx.put(f"{AUTHORITY}/v1/memories/{args['memory_id']}", json={"text": args["text"]}, headers=h, timeout=t)
     elif op == "delete":
         r = httpx.delete(f"{AUTHORITY}/v1/memories/{args['memory_id']}", headers=h, timeout=t)
+    elif op == "supersede":
+        # 1.32.4: the memory_supersede tool queued offline; the door enforces its refusal matrix on the
+        # replay too, so a permanent 4xx (a winner retired meanwhile, a canonical loser) is a conflict.
+        r = httpx.post(f"{AUTHORITY}/v1/memories/{args['memory_id']}/supersede",
+                       json={"winner_id": args["superseded_by"], "scope": args.get("scope") or "full",
+                             "detail": args.get("detail"), "reason": args.get("reason"),
+                             "source": "memory_supersede"}, headers=h, timeout=t)
+    elif op == "unsupersede":
+        params = {"scope": args.get("scope") or "full"}
+        if args.get("reason"):
+            params["reason"] = args["reason"]
+        r = httpx.delete(f"{AUTHORITY}/v1/memories/{args['memory_id']}/supersede",
+                         params=params, headers=h, timeout=t)
     elif op in ("promote", "demote"):
         r = httpx.patch(f"{AUTHORITY}/v1/memories/{args['memory_id']}/tier",
                         json={"tier": args["tier"], "actor": "claude-autonomous", "reason": args.get("reason")}, headers=h, timeout=t)
