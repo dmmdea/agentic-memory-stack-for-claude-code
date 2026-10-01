@@ -122,6 +122,32 @@ def dense_vector(point) -> list | None:
     return None
 
 
+def wait_for_embedder(url: str, total_s: float, step_s: float, *, sleep=time.sleep, get=None) -> bool:
+    """Poll GET <url>/health/embedder until it answers 2xx; True then, False once the window is spent.
+
+    The embedder unloads after 5 idle minutes and takes seconds to come back, so the first GET of a job
+    often answers 503 (or refuses the connection) while that very request starts the load: a one-shot
+    probe read that as 'down' and skipped the whole run. The window is counted in probes, not wall time
+    (int(total_s // step_s) + 1 of them, `step_s` apart), so a caller's injected `sleep` decides how long
+    it really takes. Each probe is itself bounded (30 s). /health/embedder embeds a token, which keeps the
+    model resident: call this only when there is embedding work to do (docs/operations.md: never poll that
+    endpoint on a schedule). httpx is imported here, not at module scope: ams_env stays stdlib-only for
+    the jobs that never poll."""
+    import httpx
+    if get is None:
+        get = httpx.get
+    probe_url = f"{url.rstrip('/')}/health/embedder"
+    probes = int(total_s // step_s) + 1 if step_s > 0 else 1
+    for n in range(probes):
+        try:
+            get(probe_url, timeout=30.0).raise_for_status()
+            return True
+        except (httpx.HTTPError, OSError):
+            if n < probes - 1:
+                sleep(step_s)
+    return False
+
+
 def state_dir() -> Path:
     d = _mem0_dir() / "maintenance"
     d.mkdir(parents=True, exist_ok=True)

@@ -607,13 +607,38 @@ def test_backfill_is_bounded_and_skipped_when_the_embedder_is_down(monkeypatch, 
     fake = _FakeBackfill()
     monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
     monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("down")))
-    out = recon.run_embedding_backfill(500, tmp_path / "e.db")
+    sleeps = []
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db", wait_s=30, step_s=15, sleep=sleeps.append)
     assert out["not_run"] == "embedder-down" and fake.calls == []
+    assert sleeps == [15, 15], "it polled the whole window before giving up"
 
     monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
     out = recon.run_embedding_backfill(500, tmp_path / "e.db")
     assert fake.calls == [{"limit": 500, "db_path": tmp_path / "e.db"}]
     assert out["embedded"] == 7 and "not_run" not in out
+
+
+def test_a_cold_embedder_is_waited_for_not_skipped(monkeypatch, tmp_path):
+    """The first GET of a job lands on an unloaded seat and answers 503 while it loads: a one-shot
+    probe read that as 'down' and skipped the whole run (the weekly backfill, and the backfill the
+    daily upkeep makes). It polls /health/embedder through the shared ams_env.wait_for_embedder."""
+    fake = _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    answers, sleeps, urls = [503, 503, 200], [], []
+
+    def get(url, **kw):
+        urls.append(url)
+        return httpx.Response(answers.pop(0), request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(recon.httpx, "get", get)
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db", wait_s=120, step_s=15, sleep=sleeps.append)
+    assert sleeps == [15, 15] and len(urls) == 3 and all(u.endswith("/health/embedder") for u in urls)
+    assert out["embedded"] == 7 and "not_run" not in out
+    assert fake.calls == [{"limit": 500, "db_path": tmp_path / "e.db"}]
+
+
+def test_the_reconcile_polls_for_two_minutes_every_fifteen_seconds_by_default():
+    assert (recon.EMBEDDER_WAIT_S, recon.EMBEDDER_STEP_S) == (120, 15)
 
 
 def test_backfill_failure_is_fail_soft(monkeypatch, tmp_path):

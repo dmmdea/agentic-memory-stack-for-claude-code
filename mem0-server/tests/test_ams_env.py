@@ -131,3 +131,91 @@ def test_dense_vector_bare_list_and_fallbacks():
     assert m.dense_vector({}) is None
     assert m.dense_vector({"vector": "nope"}) is None
     assert m.dense_vector(None) is None
+
+
+# ---- 1.32.4 WP-2: wait_for_embedder polls /health/embedder instead of one-shot-probing a cold seat ----
+#
+# The embedder unloads after 5 idle minutes and takes seconds to come back, so the first GET of a job
+# often answers 503 (or refuses the connection) while that very request starts the load. A one-shot
+# probe read that as 'embedder down' and skipped the whole run. The wait polls for a bounded window.
+
+class _Ok:
+    def raise_for_status(self):
+        return None
+
+
+def test_wait_for_embedder_true_after_k_cold_probes():
+    import httpx
+    m = _load()
+    urls, sleeps, k = [], [], 3
+
+    def get(url, timeout=None):
+        urls.append(url)
+        if len(urls) <= k:
+            raise httpx.ConnectError("cold")
+        return _Ok()
+
+    assert m.wait_for_embedder("http://authority.invalid:18791", 120, 15, sleep=sleeps.append, get=get) is True
+    assert urls == ["http://authority.invalid:18791/health/embedder"] * (k + 1)
+    assert sleeps == [15] * k, "one step between probes, and no sleep after the one that answered"
+
+
+def test_wait_for_embedder_treats_a_503_response_as_not_yet():
+    """A 503 is a RESPONSE, not an exception: the cold seat answers it while it loads."""
+    import httpx
+    m = _load()
+    answers = [503, 503, 200]
+    sleeps = []
+
+    def handler(request):
+        return httpx.Response(answers.pop(0))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        ok = m.wait_for_embedder("http://authority.invalid:18791", 60, 10, sleep=sleeps.append, get=client.get)
+    assert ok is True and sleeps == [10, 10]
+
+
+def test_wait_for_embedder_gives_up_after_the_window_and_the_probe_count_is_deterministic():
+    import httpx
+    m = _load()
+    calls, sleeps = [], []
+
+    def get(url, timeout=None):
+        calls.append(url)
+        raise httpx.ReadTimeout("still loading")
+
+    assert m.wait_for_embedder("http://x:1", 60, 15, sleep=sleeps.append, get=get) is False
+    assert len(calls) == 5 and sleeps == [15, 15, 15, 15], "60 s / 15 s: five probes, four waits"
+
+
+def test_wait_for_embedder_with_no_window_probes_once_and_never_sleeps():
+    import httpx
+    m = _load()
+    calls, sleeps = [], []
+
+    def get(url, timeout=None):
+        calls.append(url)
+        raise httpx.ConnectError("down")
+
+    assert m.wait_for_embedder("http://x:1", 0, 15, sleep=sleeps.append, get=get) is False
+    assert len(calls) == 1 and sleeps == []
+    assert m.wait_for_embedder("http://x:1", 30, 0, sleep=sleeps.append, get=get) is False, "a zero step cannot loop"
+    assert len(calls) == 2 and sleeps == []
+
+
+def test_wait_for_embedder_defaults_to_httpx_get_and_trims_the_trailing_slash(monkeypatch):
+    import httpx
+    m = _load()
+    seen = []
+    monkeypatch.setattr(httpx, "get", lambda url, timeout=None: seen.append((url, timeout)) or _Ok())
+    assert m.wait_for_embedder("http://x:1/", 0, 15) is True
+    assert seen == [("http://x:1/health/embedder", 30.0)]
+
+
+def test_ams_env_stays_stdlib_only_at_import():
+    """httpx is imported inside wait_for_embedder: ams_env is loaded by jobs that never poll."""
+    import ast
+    tree = ast.parse((SCRIPTS / "ams_env.py").read_text(encoding="utf-8"))
+    top = {a.name.split(".")[0] for n in tree.body if isinstance(n, ast.Import) for a in n.names}
+    top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom) and n.module}
+    assert "httpx" not in top

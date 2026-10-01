@@ -41,6 +41,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -184,6 +185,8 @@ def reconcile_outcome(db_present: bool, qdrant_ok: bool,
 COVERAGE_DEGRADE_PCT = 90           # embedded / eligible episodes below this reads degraded
 STALE_IN_PROGRESS_DAYS = 7          # an in_progress checkpoint untouched this long is orphaned
 BACKFILL_PER_RUN = 500              # bounded embeds per weekly run
+EMBEDDER_WAIT_S = 120               # how long the backfill preflight waits for a cold embedder ...
+EMBEDDER_STEP_S = 15                # ... probing this often (a cold start is seconds; a dead seat is not)
 COVERAGE_OUTCOME_PREFIX = "degraded:embedding-coverage-"
 
 
@@ -286,14 +289,15 @@ def _load_backfill():
     return mod
 
 
-def run_embedding_backfill(limit: int, db_path: Path) -> dict:
-    """Embed up to `limit` missing episode summaries. Not run (never an error) when the embedder is
-    down: the seat unloads when idle and /health/embedder warms it as ACTIVE work, so a healthy answer
-    means the backfill can run. Fail-soft: any failure is reported in the result, not raised."""
-    try:
-        httpx.get(f"{ams_env.mem0_url()}/health/embedder", timeout=30.0).raise_for_status()
-    except (httpx.HTTPError, OSError) as e:
-        print(f"episodic-reconcile: embedder unavailable - backfill skipped ({type(e).__name__})", flush=True)
+def run_embedding_backfill(limit: int, db_path: Path, *, wait_s: float = EMBEDDER_WAIT_S,
+                           step_s: float = EMBEDDER_STEP_S, sleep=time.sleep) -> dict:
+    """Embed up to `limit` missing episode summaries. Not run (never an error) when the embedder stays
+    down for the whole wait window: the seat unloads when idle and /health/embedder warms it as ACTIVE
+    work, so a healthy answer means the backfill can run. A cold seat answers 503 while it loads, so the
+    preflight POLLS (ams_env.wait_for_embedder) instead of reading one 503 as 'down' and skipping the run.
+    Fail-soft: any failure is reported in the result, not raised."""
+    if not ams_env.wait_for_embedder(ams_env.mem0_url(), wait_s, step_s, sleep=sleep):
+        print(f"episodic-reconcile: embedder unavailable for {wait_s:g} s - backfill skipped", flush=True)
         return {"not_run": "embedder-down"}
     try:
         res = _load_backfill().run(limit=limit, db_path=db_path)
