@@ -136,6 +136,9 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # transitive deps — starlette>=1.3.1 (CVE-2026-54282/54283, FastAPI request path),
     # cryptography>=50.0.1 (GHSA-g6cj-pr64-35w5 fixed in 50.0.0, GHSA-jwv3-5hgf-82ww and
     # GHSA-m2h6-j472-rp4c fixed in 49.0.0). Both deps come in transitively otherwise.
+    # pyjwt>=2.15.0 (CVE-2026-101918, a RecursionError in PyJWKClient, fixed in 2.15.0) is
+    # transitive too (fastmcp -> mcp); no repo code imports it. Quote every spec that
+    # carries a comparison: an unquoted >= is a shell redirect that installs it unpinned.
     # These are FLOORS, never caps or exact pins (house rule: updatable, not pinned into
     # staleness): a cap on cryptography once kept a reinstall from taking a security fix.
     # mem0ai[nlp]>=2.0.4 likewise; mem0-server/requirements.txt documents the same set
@@ -150,7 +153,7 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # — is the defense against a future breaking fastembed release.
     # numpy: scripts/wsl/semantic-dedup.py scores duplicate pairs with blocked matrix products
     # (it arrives transitively with fastembed today; the dedup must not depend on that).
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' pip-audit
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' pip-audit
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -173,7 +176,7 @@ else
     # a live box actually takes on re-run. Adding it only to the fresh-install
     # line would never heal an existing venv (that is exactly how the leg died:
     # a venv rebuild dropped it and nothing re-installed it).
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 

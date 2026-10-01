@@ -17,6 +17,7 @@ INSTALLER = (ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
 FLOORS = {
     "cryptography": ">=50.0.1",
     "mem0ai[nlp]": ">=2.0.4",
+    "pyjwt": ">=2.15.0",
     "starlette": ">=1.3.1",
 }
 
@@ -59,6 +60,27 @@ def test_requirements_and_both_installer_lines_carry_the_same_floors():
 def test_pip_audit_is_installed_on_both_installer_branches_and_listed():
     assert "pip-audit" in FRESH and "pip-audit" in REFRESH
     assert "pip-audit" in _requirement_specs()
+
+
+def _raw_pip_specs(pattern):
+    """The pip arguments of the installer line matching `pattern`, exactly as bash will see them."""
+    hits = [ln for ln in INSTALLER.splitlines() if re.search(pattern, ln)]
+    assert len(hits) == 1, f"expected exactly one installer pip line matching {pattern!r}, got {hits}"
+    return hits[0].split(" install ", 1)[1].split(" || ")[0]
+
+
+def test_every_comparison_spec_on_the_installer_pip_lines_is_quoted_in_the_raw_line():
+    """Unquoted `pkg>=1.2` is a shell redirect: bash installs unpinned `pkg` and writes a file named
+    `=1.2`. The shlex tokenizing above hides that (it never redirects), so look at the RAW text:
+    once the quoted spans are removed, no `<` or `>` may remain in the pip arguments."""
+    for label, pattern in (("fresh", r"pip install --quiet 'mem0ai"), ("refresh", r'\.venv/bin/pip" install --quiet ')):
+        raw = _raw_pip_specs(pattern)
+        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "", raw)
+        assert "<" not in unquoted and ">" not in unquoted, (
+            f"installer {label} pip line has a version comparison outside quotes (a shell redirect, "
+            f"not a floor): {raw}")
+        for floor_name, floor in FLOORS.items():
+            assert f"'{floor_name}{floor}'" in raw, f"installer {label} line: {floor_name}{floor} must be single-quoted"
 
 
 def test_no_cap_or_exact_pin_survives_in_the_dependency_sources():
