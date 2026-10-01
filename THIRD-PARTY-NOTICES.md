@@ -13,6 +13,7 @@ The stack **installs / fetches** the components below at install time — it doe
 | [FastAPI](https://github.com/fastapi/fastapi), [pydantic](https://github.com/pydantic/pydantic) | MIT | pip |
 | [uvicorn](https://github.com/encode/uvicorn), [starlette](https://github.com/encode/starlette), [httpx](https://github.com/encode/httpx) | BSD-3-Clause | pip |
 | [cryptography](https://github.com/pyca/cryptography) | Apache-2.0 / BSD | pip (transitive) |
+| [PyJWT](https://github.com/jpadilla/pyjwt) | MIT | pip (transitive; the installer sets its security floor) |
 | [llama-swap](https://github.com/mostlygeek/llama-swap), [llama.cpp](https://github.com/ggml-org/llama.cpp) | MIT | operator-provided local inference stack |
 
 ## Models (fetched at install; NOT redistributed by this repo)
