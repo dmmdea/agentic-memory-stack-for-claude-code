@@ -364,3 +364,27 @@ def test_dream_gather_leaves_superseded_records_out_and_keeps_partial_ones(monke
         return httpx.Response(200, json=body)
     client = m.Mem0Client("http://x", "k", "u", http=httpx.Client(transport=httpx.MockTransport(answer)))
     assert [p["id"] for p in client.all_points()] == ["live", "part"]
+
+
+# ---- the protocol snippet the installers append to CLAUDE.md ------------------------------------------
+
+def _protocol() -> str:
+    return (REPO_ROOT / "claude-config" / "claude-md-memory-protocol.md").read_text(encoding="utf-8")
+
+
+def test_protocol_teaches_correcting_a_fact_through_the_door():
+    text = _protocol()
+    assert text.startswith("## Memory tier protocol (agentic-memory-stack)"), (
+        "the installers append the snippet only when this exact heading is absent")
+    i = text.index("**Correcting a fact.**")
+    section = " ".join(text[i:].split())
+    for needle in ("memory_get_by_id", "memory_add", "memory_supersede", 'scope="partial"', "detail=",
+                   "memory_update", "memory_unsupersede", "canonical", "never append"):
+        assert needle.lower() in section.lower(), f"the 'Correcting a fact' step must mention {needle!r}"
+    assert "SUPERSEDED" in section, "it names the marker text sessions must not write"
+
+
+def test_protocol_no_longer_claims_there_is_no_supersession_field():
+    text = " ".join(_protocol().split())
+    assert "`valid_from`/`valid_to`/`supersedes` schema" not in text
+    assert "superseded_by" in text and "memory_supersede" in text
