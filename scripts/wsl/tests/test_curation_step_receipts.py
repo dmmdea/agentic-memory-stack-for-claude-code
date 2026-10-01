@@ -157,6 +157,50 @@ def test_episodic_reconcile_with_a_coverage_gap_is_a_degraded_receipt_that_still
     assert w["coverage_pct"] == 40 and w["abandoned"] == 1 and w["embedded"] == 7
 
 
+# ------------------------------------------------------------------ the daily episode upkeep
+
+def test_episode_upkeep_ok_run_is_an_ok_receipt_with_the_counts(tmp_path):
+    r, row = _receipt(tmp_path, "episode-upkeep", "episodic-upkeep-ok")
+    assert r.returncode == 0, r.stderr
+    assert row["step"] == "episode-upkeep"
+    assert row["ok"] is True and row["status"] == "ok" and row["exit"] == 0 and row["note"] == ""
+    w = row["work"]
+    assert w["abandoned"] == 1 and w["embedded"] == 3 and w["missing"] == 3 and w["remaining"] == 0
+    assert w["in_progress_remaining"] == 0
+
+
+def test_episode_upkeep_with_the_embedder_down_is_a_degraded_receipt_that_still_exits_zero(tmp_path):
+    """The embedder never came up: the vectors are still missing, which must read degraded (not ok), while
+    the SQLite sweep still ran and the chain's next steps still run (exit 0)."""
+    r, row = _receipt(tmp_path, "episode-upkeep", "episodic-upkeep-embedder-down")
+    assert r.returncode == 0, r.stderr
+    assert row["ok"] is True and row["status"] == "degraded" and row["note"] == "embedder-down"
+    w = row["work"]
+    assert w["abandoned"] == 1 and w["embedded"] == 0 and w["missing"] == 4 and w["remaining"] == 4
+
+
+def test_a_missed_vector_turns_the_maintenance_verdict_red_until_the_next_clean_upkeep(tmp_path):
+    """The point of the daily step: a gap of 4 is no longer '99 % ok'. /health/maintenance reads the step's
+    latest receipt; a degraded one turns `ok` false and a later clean run clears it."""
+    import datetime as dt
+
+    sys.path.insert(0, str(SCRIPTS.parents[1] / "mem0-server"))
+    import maintenance_health as mh
+
+    home = _run(tmp_path, "episode-upkeep", "episodic-upkeep-embedder-down")[1]
+    receipts = home / ".mem0" / "maintenance" / "receipts.jsonl"
+
+    def verdict():
+        return mh.build(receipts, dt.datetime.now(dt.timezone.utc), pool_reader=lambda: (10, 90),
+                        boots_reader=lambda: [], judge_transport=lambda: "native")
+
+    out = verdict()
+    assert out["ok"] is False
+    assert {d["step"]: d["note"] for d in out["degraded_steps"]} == {"episode-upkeep": "embedder-down"}
+    _run(tmp_path, "episode-upkeep", "episodic-upkeep-ok")
+    assert verdict()["degraded_steps"] == []
+
+
 # ------------------------------------------------------------------ the consumer of the receipts
 
 def test_curation_receipts_turn_the_maintenance_verdict_red_until_a_later_ok_run(tmp_path):

@@ -72,6 +72,31 @@ def test_every_step_is_a_unit_in_chain_order():
         assert r.returncode == 0, r.stderr
 
 
+def test_episode_upkeep_is_a_daily_step_pinned_beside_the_ordered_chain():
+    """1.32.4: the daily step that closes stale in_progress episodes and embeds the vectors a cold embedder
+    missed. Like store-judge and wiki-index it is NOT in ORDER: it follows the dream (which warms the embedder
+    for up to 10 minutes) and finishes before the backup snapshots its vectors, so no existing unit's After=
+    had to change. The weekly episodic-reconcile step stays the Sunday orphan / drift / coverage pass."""
+    t = (SYSTEMD / "ams-step-episode-upkeep.service").read_text(encoding="utf-8")
+    assert "Requires=" not in t and "WantedBy=ams-nightly.target" in t and "PartOf=ams-nightly.target" in t
+    assert "After=mem0.service ams-step-dream.service\n" in t, "the dream warms the embedder first"
+    assert "Before=ams-step-stack-backup.service\n" in t, "the backup must see the vectors it embeds"
+    exec_line = next(ln for ln in t.splitlines() if ln.startswith("ExecStart="))
+    assert exec_line == ("ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded episode-upkeep "
+                         "%h/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/episodic-reconcile.py --upkeep")
+    assert "--weekly" not in t, "daily, not Sundays only"
+    assert "LoadCredentialEncrypted=ams-api-key:__SECRETS_DIR__/ams-api-key.cred" in t
+    assert "Environment=MEM0_API_KEY_FILE=%d/ams-api-key" in t and "Environment=MEM0_HOST_KIND=native" in t
+    assert "CODEX_HOME" not in t and "/tmp/" not in t and "/home/" not in t
+    assert "episode-upkeep" not in ORDER and "episode-upkeep" not in WEEKLY
+    # nothing downstream was re-pointed at it: ORDER's own After= chain is untouched
+    for s in ORDER:
+        text = (SYSTEMD / f"ams-step-{s}.service").read_text(encoding="utf-8")
+        assert "ams-step-episode-upkeep" not in text, s
+    weekly = (SYSTEMD / "ams-step-episodic-reconcile.service").read_text(encoding="utf-8")
+    assert "--guarded --weekly Sun episodic-reconcile" in weekly and "--upkeep" not in weekly
+
+
 def test_guarded_checks_but_never_stamps(tmp_path):
     r, rows, home = _step(tmp_path, ["--guarded", "demo", "true"])
     assert r.returncode == 0 and not (home / ".mem0" / "maintenance" / "last-chain-success").exists()

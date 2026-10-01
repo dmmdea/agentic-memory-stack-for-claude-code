@@ -4,7 +4,7 @@
 
 A persistent, multi-tier, **measurably faithful** memory backend for [Claude Code](https://docs.claude.com/en/docs/claude-code): one always-on Linux **authority** holds the memory, and any number of Windows + WSL2 or Linux PCs use it. It captures durable facts from your sessions, consolidates them into higher-order insights, surfaces the right one before each prompt, and governs against drift — with a causal-intervention eval proving the memory actually changes behavior.
 
-> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), one 17-step nightly chain on the authority (consolidation, dedup, backups, health), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a canonical-key credential kept out of the store (a systemd credential on the authority, a DPAPI blob on a Windows-hosted brain).
+> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), one 18-step nightly chain on the authority (consolidation, dedup, backups, health), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a canonical-key credential kept out of the store (a systemd credential on the authority, a DPAPI blob on a Windows-hosted brain).
 >
 > **What it is NOT:** a Claude Code feature. It's external infrastructure: one authority install on a Linux box, plus a PC install on each machine you code on (Windows hooks and WSL, or a Linux client).
 
