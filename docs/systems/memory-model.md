@@ -45,7 +45,7 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 
 - **Purpose:** everything auto-captured lands here first. It is deliberately *mid-trust*: retrievable and useful, but never authoritative — a future agent should verify an `evidence` fact before consequential action.
 - **Written by:** the L1a extractor (session facts), MCP `memory_add`.
-- **Lifecycle:** born at extraction → surfaced by durable/operational searches → candidates for **promotion** (dream nightly nomination → 4C gate → `canonical`) or **hiding** (superseded/contradicted via reconciliation) → **decays** on the durable path by Weibull half-life ~365 d (env-gated) and is flagged for review after 90 d without reinforcement (decay-scan).
+- **Lifecycle:** born at extraction → surfaced by durable/operational searches → candidates for **promotion** (dream nightly nomination → 4C gate → `canonical`) or **hiding** (superseded/contradicted via reconciliation, or retired by a session's own `memory_supersede`) → **decays** on the durable path by Weibull half-life ~365 d (env-gated) and is flagged for review after 90 d without reinforcement (decay-scan).
 - **Example:** `"llama-swap serves EmbeddingGemma on :11436; Ollama is decommissioned."`
 
 #### `temporal` — explicitly perishable (write-side parking)
@@ -151,11 +151,13 @@ flowchart LR
     E -->|promote| S[stable]
     I -->|promote| C
     C -->|"demote (HMAC, ledgered)"| S
-    E -->|"contradict/supersede verdict (queue-gated, or weekly-sweep auto-enforced)"| H["hidden (forensic history only)"]
+    E -->|"contradict/supersede verdict (queue-gated, weekly-sweep auto-enforced) or a session's memory_supersede"| H["hidden (forensic history only)"]
     T -->|"expires_at / decay"| G["expired"]
 ```
 
 Demotion exists (`memory_demote`) and is ledgered like promotion. Hiding is human-gated on the evidence-vs-evidence and re-judge paths, and auto-enforced only by the weekly canonical sweep's authoritative Codex verdicts — always reversible (`--unstamp`) and always forensic-visible; see [`reconciliation.md`](./reconciliation.md) for the exact per-path matrix.
+
+**Superseding (1.32.4).** A session that learns a fact is stale retires it itself: `memory_supersede(old, new)` records that the newer memory replaces the whole older one (`superseded_by`; the admission gate then withholds the old record outside the `history` class), and `scope="partial"` with a `detail` annotates one stale claim in a record that otherwise stands (`partially_superseded_by`, which never hides). The server enforces the refusals whoever calls: a `canonical`, `insight` or tier-less record is never superseded this way (a canonical leaves default retrieval only through the operator's signed demote), and a retired record or winner, a winner that is itself superseded, a different user's or brand's winner and a second winner are refused. Every supersession is ledgered and reversible (`memory_unsupersede`, `contradiction-sweep.py --unsupersede`). Appending `SUPERSEDED ... by <id>` to a record's text does nothing: the gate reads the field, never the text. See [`reconciliation.md`](./reconciliation.md) and [api-contracts](../api-contracts.md).
 
 ### The life of a memory — a worked example
 
@@ -189,7 +191,7 @@ Changing any tier's semantics, a query class's admitted-tier set, or the decay p
 ## Invariants and assumptions
 
 - `canonical` is the anchor set every other record is judged against; **no plain write can create it** — only the HMAC-signed CLI or the 4C-gated dream autopromotion.
-- Nothing is ever hidden without a forensic escape hatch: the `history` class always sees superseded/contradicted (and, since v0.20, canonical) records; every hide is reversible and ledgered.
+- Nothing is ever hidden without a forensic escape hatch: the `history` class always sees superseded/contradicted (and, since v0.20, canonical) records; every hide is reversible (`--unstamp`, `--unsupersede`, `memory_unsupersede`) and ledgered.
 - Each semantic record is atomic — one claim per record — so it stands alone when retrieved individually.
 - `temporal` is admitted by no query class today; it is write-side parking, not a retrieval tier.
 

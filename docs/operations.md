@@ -96,6 +96,12 @@ $PY ~/apps/mem0-scripts/contradiction-sweep.py --rejudge-stamped --judge codex -
 # demoted the canonical (or decided it is fine), drop the line; the weekly sweep also drops it by itself when its
 # stale_canonical_id is no longer a live canonical
 $PY ~/apps/mem0-scripts/contradiction-sweep.py --dismiss <memory_id>
+
+# A `kind: supersede` line (a sweep judged the OLDER record stale; its canonical_id is the NEWER one) is a staleness review, not a
+# contradiction, so --promote refuses it. Record the supersession (dry-run first, --apply writes; it also dequeues the line),
+# and undo it if you got it wrong (--scope partial|all for partial annotations):
+$PY ~/apps/mem0-scripts/contradiction-sweep.py --resolve-supersede <older_id> --winner <newer_id> --apply
+$PY ~/apps/mem0-scripts/contradiction-sweep.py --unsupersede <older_id> --apply
 ```
 
 The Codex judge needs the Windows shim up (`:18792`; it self-starts at session start when enabled, idle-stops after 4 h). Since 2026-08-24 every judged run brings it up on demand itself — the units' `ExecStartPre` spawns it (inlining `codex-shim-spawn.ps1` + a curl health poll) and the sweep has an in-run backstop (`ensure-codex-shim.sh`, WSL interop, which invokes that same spawn ps1) — so `outcome=no-op:codex-shim-unreachable` now means the bring-up **also** failed (the receipt's `ensure_attempted` says whether it ran): check `~/.claude/logs/codex-shim.log`, then run `bash ~/apps/mem0-scripts/ensure-codex-shim.sh` by hand. It deliberately refuses to fall back to a local judge.
@@ -136,7 +142,7 @@ tail -20 ~/.mem0/admission-rejected.jsonl
 #    Pass brand="..." or allow_cross_brand=true deliberately.
 ```
 
-- **Superseded / contradicts-canonical** → that's reconciliation; `--unstamp` if wrong (section above).
+- **Superseded / contradicts-canonical** → that's reconciliation: `--unstamp <id>` if a contradiction stamp is wrong, `--unsupersede <id>` (or the `memory_unsupersede` tool) if a supersession is (section above). A record whose text says `SUPERSEDED ... by mem0 <id>` but still surfaces was never superseded: the text is not read, only the `superseded_by` field is. Retire it with `memory_supersede`, or find and convert the old hand-written markers with `contradiction-sweep.py --supersede-markers` (runbook in [`reconciliation.md`](./systems/reconciliation.md#hand-written-markers---supersede-markers)).
 - **It's `insight` tier and you expected it in the per-prompt block** → insights are deliberately filtered from the hot path; use `memory_search`.
 - **Nothing injected at all on a prompt** → abstention-first: nothing cleared the 0.30 gate. That's correct behavior for off-domain prompts.
 
@@ -341,3 +347,4 @@ Liveness (services, health, MCP registration, hooks SHA-match) + invariants (sea
 | Sweep flags valid historical ship-logs as stale | contradiction prompt reused for the supersession question | FIXED — dedicated STALE/KEEP judge (precision 35→67%) |
 | Embedder first-call timeout after idle | llama-swap cold model load | EXPECTED — retry / generous deep-health timeout |
 | An unfinished session's summary in `episodic_recent` / the recent-sessions view was task notifications and relayed agent messages | the in-progress episode's running summary appended every UserPromptSubmit prompt, machine turns included, and the readers returned it verbatim | FIXED v1.32.4 — the running summary records only what a person typed (the checkpoint still lands), the read path scrubs unfinished rows (which also cleans the existing backlog without a database write), and `MEMORY.md`'s "Recent episodes", the dream and the `episodic.db` health row look at finished episodes ([`systems/continuity.md`](./systems/continuity.md)) |
+| A fact marked `SUPERSEDED ... by mem0 <id>` in its text still appears in searches | sessions had no door for retiring a fact and appended text with `memory_update`; the admission gate reads the `superseded_by` field, never text | FIXED 1.32.4 — `memory_supersede` is the one door (server-enforced, ledgered, reversible); `contradiction-sweep.py --supersede-markers` reports the existing markers and `--apply` converts the full ones |

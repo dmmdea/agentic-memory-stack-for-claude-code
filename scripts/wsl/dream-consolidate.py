@@ -211,6 +211,9 @@ class Mem0Client:
                 pl = p.get("payload") or {}
                 if pl.get("retrievable") is False:
                     continue
+                # a superseded fact must not feed the consolidation; a partial annotation does not hide
+                if pl.get("superseded_by"):
+                    continue
                 meta = {k: v for k, v in pl.items() if k not in ("data", "memory", "hash", "user_id")}
                 pts.append({"id": str(p.get("id")), "memory": pl.get("data") or pl.get("memory") or "",
                             "created_at": pl.get("created_at") or "", "updated_at": pl.get("updated_at") or "",

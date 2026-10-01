@@ -118,6 +118,9 @@ def main():
     for p in pts:
         pl = p.get("payload") or {}
         if pl.get("retrievable") is False: continue
+        # a superseded fact is hidden from search by the admission gate; this reads the store directly,
+        # so it applies the same rule (a PARTIAL supersession, partially_superseded_by, never hides)
+        if pl.get("superseded_by"): continue
         tier = pl.get("tier", "evidence")
         if tier == "evidence": continue   # plain evidence stays out of the index
         text = pl.get("data") or pl.get("memory") or ""

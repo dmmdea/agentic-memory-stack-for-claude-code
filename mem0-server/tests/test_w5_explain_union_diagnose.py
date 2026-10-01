@@ -62,9 +62,10 @@ def _seed(text: str, metadata: dict | None = None) -> str:
 
 def _qdrant_set_payload(memory_id: str, **kv) -> None:
     """Direct Qdrant payload write — the house FORBIDDEN_KEYS-bypass test
-    pattern (test_brand_isolation._qdrant_set_payload): superseded_by has NO
-    API writer by design and retrievable is trusted-actor-only, so retrieval-
-    gating fixtures are stamped at the store layer."""
+    pattern (test_brand_isolation._qdrant_set_payload): superseded_by is written
+    only by POST /v1/memories/{id}/supersede (which needs a real winner record
+    and enforces its refusal matrix) and retrievable is trusted-actor-only, so
+    retrieval-gating fixtures are stamped at the store layer."""
     from qdrant_client import QdrantClient
     from qdrant_client.models import PointStruct
 

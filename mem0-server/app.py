@@ -5,6 +5,7 @@ Exposes same REST surface as official mem0 server (POST/GET/PUT/DELETE /v1/memor
 import os
 import hmac
 import json
+import contextlib
 import hashlib
 import logging
 import threading
@@ -367,6 +368,14 @@ class MetadataIn(BaseModel):
     actor: Optional[str] = None   # who triggered this — logged to ledger
     reason: Optional[str] = None
 
+class SupersedeIn(BaseModel):
+    # 1.32.4: POST /v1/memories/{id}/supersede, the only writer of superseded_by (supersession.py).
+    winner_id: str                  # the newer record that replaces this one (or one claim in it)
+    scope: str = "full"             # "full" hides the record; "partial" annotates one stale claim
+    detail: Optional[str] = None    # required for "partial": which claim is out of date
+    reason: Optional[str] = None    # free text for the ledger
+    source: Optional[str] = None    # caller label for audit (e.g. "memory_supersede"); authorises nothing
+
 # v0.16: goal sub-models (used in EpisodeIn and GoalIn)
 class GoalAdvanceItem(BaseModel):
     goal_title: str
@@ -506,7 +515,9 @@ NLI_GATE_FETCH = _env_int("MEM0_NLI_GATE_FETCH", 25)
 # only the gate (server-side) or a trusted-actor PATCH may write these (audit HIGH).
 _ADD_FORBIDDEN_META = {"retrievable", "expires_at", "created_at", "tier_actor",
                        "superseded_by", "contradicts_canonical", "contradiction_checked_at",
-                       "nli_gate_checked_at", "contradicts_canonical_pending"}
+                       "nli_gate_checked_at", "contradicts_canonical_pending",
+                       # 1.32.4: written only by POST /v1/memories/{id}/supersede (supersession.py)
+                       "superseded_at", "superseded_via", "partially_superseded_by"}
 
 # AMS-01/F4 (2026-08-07): per-record write lock. uvicorn runs single-worker and
 # these sync-def handlers execute in the threadpool, so two requests CAN
@@ -2175,6 +2186,18 @@ def update(
                     _pre_payload.get("user_id"),
                     _carryover.get("brand"),
                 )
+            # 1.32.4: a hand-written "SUPERSEDED ... by mem0 <id>" marker does nothing for
+            # retrieval (the gate reads superseded_by, never text). Say so to the caller.
+            try:
+                import supersession as _ss
+                _marker = _ss.classify_text(b.text)
+                if (_marker and _marker.kind in ("full", "partial")
+                        and not _pre_payload.get("superseded_by") and isinstance(result, dict)):
+                    result = {**result, "supersede_note": _ss.SUPERSEDE_NOTE,
+                              "supersede_marker": {"kind": _marker.kind,
+                                                   "winner_id": _marker.winner_id}}
+            except Exception:
+                log.exception("supersede marker note failed (non-fatal)")
             return result
         except HTTPException:
             raise
@@ -2309,6 +2332,13 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
             # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
             # between would let this unsigned change move a record that is canonical NOW, so a
             # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            # 1.32.4: a superseded record never enters a protected tier (it would be a hidden
+            # canonical, and its supersession link would expose it to an unsigned cascade delete).
+            if b.tier in ("canonical", "insight"):
+                import supersession as _ss
+                _refusal = _ss.promotion_refusal(_supersede_read(mid), b.tier)
+                if _refusal:
+                    raise HTTPException(_refusal.status, f"{_refusal.code}: {_refusal.message}")
             if b.tier != "canonical" and current_tier != "canonical":
                 _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
                 if _tier_now == _NOT_FOUND:
@@ -2401,81 +2431,11 @@ def update_metadata(
         actor=(b.actor or ""), reason=(b.reason or ""),
         x_user_direct_nonce=x_user_direct_nonce,
     )
-    # v0.13 hardening: block lifecycle-critical keys that gate retrieval semantics.
-    # These should only be written by trusted server-side flows (re-extract, decay, dream).
-    # Callers can stamp arbitrary OTHER metadata (test_patch, custom_tags, etc.) but
-    # cannot flip retrieval gates via the generic shallow-merge endpoint.
-    # H8 fix: TRUSTED_PATCH_ACTORS (e.g. stamp-retired-v013) may also write retired_at
-    # on canonical/insight records without requiring a full HMAC user-direct token.
-    # v0.19 I.3: the allowlist is per-actor (dict actor -> frozenset of exact keys).
-    from security_invariants import TRUSTED_PATCH_ACTORS
-    # v0.20 Phase B (M1/M3/M11): the v0.19 retrieval-gating keys (superseded_by
-    # rejected at admission_gate I.1, contradicts_canonical at I.3, plus the
-    # sweep's idempotency marker contradiction_checked_at) joined FORBIDDEN_KEYS
-    # so an arbitrary API-key holder cannot censor retrieval via the generic
-    # shallow-merge endpoint. The per-actor TRUSTED_PATCH_ACTORS dict is the
-    # ONLY write path (contradiction-sweep-v019 -> its two contradiction keys).
-    # superseded_by: writable by exactly ONE actor since AMS-36 (2026-08-09) —
-    # supersession-resolve-v030 in TRUSTED_PATCH_ACTORS (security_invariants),
-    # the operator's resolve step for supersede reviews. The judging sweeps
-    # still cannot write it (they queue for review); every other actor stays
-    # blocked, exactly as this comment used to promise for all.
-    FORBIDDEN_KEYS = {"retrievable", "expires_at", "created_at", "tier_actor",
-                      "superseded_by", "contradicts_canonical", "contradiction_checked_at",
-                      "contradicts_canonical_pending",  # v0.29.4: only the sweep actor writes it
-                      "nli_gate_checked_at"}  # W2: symmetric with the other check-markers —
-                                              # the gate's server-side stamp is its only writer
-    forbidden_hit = FORBIDDEN_KEYS & set(b.metadata.keys())
-    if forbidden_hit:
-        # v0.20 Final (adversarial-review MED, mixed-key bypass): every forbidden
-        # key the caller sends must be INDIVIDUALLY authorized for that actor.
-        # The old logic set a single global `allowed = True` if ANY legacy
-        # per-key/actor rule matched, so actor='system' could smuggle
-        # superseded_by past the gate alongside tier_actor. Now the legacy
-        # server-flow actors carry an exact key set (mirroring the old rules),
-        # unioned with TRUSTED_PATCH_ACTORS, and the whole forbidden_hit must be
-        # a subset — superseded_by stays blocked for ALL actors (no actor lists
-        # it).
-        actor = (b.actor or "").strip().lower()
-        # Legacy server-flow actors, each scoped to the EXACT keys it may write
-        # (mirrors the previous per-key rules but as a per-actor key set, so a
-        # forbidden key cannot be smuggled in alongside an authorized one).
-        _LEGACY_ACTOR_KEYS = {
-            "backfill-apply-v013": {"retrievable"},
-            "decay-scan": {"expires_at"},
-            "system": {"expires_at", "tier_actor"},
-        }
-        allowed_keys = set(_LEGACY_ACTOR_KEYS.get(actor, set()))
-        allowed_keys |= set(TRUSTED_PATCH_ACTORS.get(actor, frozenset()))
-        if not (forbidden_hit <= allowed_keys):
-            raise HTTPException(
-                403,
-                f"forbidden metadata keys {sorted(forbidden_hit - allowed_keys)} "
-                f"require trusted actor; got actor={actor!r}",
-            )
-    # H8: allow TRUSTED_PATCH_ACTORS to write their per-actor allowed keys (e.g.
-    # retired_at for stamp-retired-v013, contradicts_canonical +
-    # contradiction_checked_at for contradiction-sweep-v019) without the
-    # canonical HMAC gate — the HMAC gate above would have blocked them because
-    # assert_writable requires a user-direct token for canonical records; trusted actors get
-    # a bypass specifically for their allowed keys.
-    # NOTE: this re-checks for the specific trusted-actor bypass AFTER assert_writable already
-    # ran; since assert_writable returned without raising for these actors (trusted-actor
-    # allowlist check below), we proceed. For canonical records NOT covered by the allowlist,
-    # assert_writable already raised 403 above — we never reach here.
-    # v0.19 I.3: per-actor exact key allowlist (TRUSTED_PATCH_ACTORS is now a
-    # dict actor -> frozenset of keys) so each trusted actor can write ONLY its
-    # own stamps.
-    _actor_lower = (b.actor or "").strip().lower()
-    if _actor_lower in TRUSTED_PATCH_ACTORS:
-        _actor_allowed_keys = TRUSTED_PATCH_ACTORS[_actor_lower]
-        _not_allowed_keys = set(b.metadata.keys()) - _actor_allowed_keys
-        if _not_allowed_keys:
-            raise HTTPException(
-                403,
-                f"trusted actor {_actor_lower!r} may only write keys {sorted(_actor_allowed_keys)}; "
-                f"disallowed keys in request: {sorted(_not_allowed_keys)}",
-            )
+    # Key-level policy (forbidden retrieval-gating keys, legacy server-flow actors, per-actor
+    # TRUSTED_PATCH_ACTORS allowlists): security_invariants.authorize_metadata_patch, a pure
+    # function since 1.32.4 so the whole decision is testable headless.
+    from security_invariants import authorize_metadata_patch
+    authorize_metadata_patch(current_tier, b.actor, b.metadata.keys())
     # Bump updated_at so lead-7 sort by recency in memory-index-build.py is correct
     merged = dict(b.metadata)
     merged["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -2503,6 +2463,114 @@ def update_metadata(
     except Exception:
         log.exception("ledger append failed for metadata-merge")
     return {"ok": True, "memory_id": mid, "merged_keys": sorted(merged.keys())}
+
+
+def _supersede_read(mid: str) -> Optional[dict]:
+    """Fail-closed point read for the supersede door: None = not found, a store error = 503."""
+    try:
+        pts = mem.vector_store.client.retrieve(
+            collection_name=mem.vector_store.collection_name,
+            ids=[mid], with_payload=True, with_vectors=False,
+        )
+    except Exception as e:
+        _status = getattr(e, "status_code", None)
+        if isinstance(_status, int) and 400 <= _status < 500:
+            raise HTTPException(400, f"supersede: the store rejected id {mid!r}: {str(e)[:120]}")
+        raise HTTPException(503, f"supersede: store read failed, nothing was written: {str(e)[:120]}")
+    return dict(pts[0].payload or {}) if pts else None
+
+
+class _SupersedeStore:
+    """The Qdrant side of supersession.run_supersede / run_unsupersede."""
+
+    def read(self, mid: str) -> Optional[dict]:
+        return _supersede_read(mid)
+
+    def set_payload(self, mid: str, payload: dict) -> None:
+        mem.vector_store.client.set_payload(
+            collection_name=mem.vector_store.collection_name, payload=payload, points=[mid])
+
+    def delete_keys(self, mid: str, keys: list) -> None:
+        mem.vector_store.client.delete_payload(
+            collection_name=mem.vector_store.collection_name, keys=keys, points=[mid])
+
+
+@contextlib.contextmanager
+def _supersede_locks(*mids):
+    """Both records' write locks, taken in sorted key order (deadlock-free against single-lock holders)."""
+    with contextlib.ExitStack() as stack:
+        for key in sorted({_mid_lock_key(m) for m in mids}):
+            stack.enter_context(_mid_write_lock(key))
+        yield
+
+
+def _supersede_call(fn, **kw) -> dict:
+    """Run one supersession transaction and map its outcomes to HTTP."""
+    import supersession as _ss
+    try:
+        return fn(_SupersedeStore(), _append_ledger, **kw)
+    except _ss.Refused as e:
+        raise HTTPException(e.refusal.status, f"{e.refusal.code}: {e.refusal.message}")
+    except _ss.LedgerUnavailable as e:
+        log.exception("supersede intent ledger append failed; refusing")
+        raise HTTPException(503, "audit ledger unavailable (intent append failed); nothing was "
+                                 f"written — retry when ~/.mem0 is writable: {str(e)[:120]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("supersede write failed")
+        raise _upstream_error(e)
+
+
+def _supersede_finish(out: dict) -> dict:
+    """Append the completion ledger line (fail-soft: the intent line is the audit floor)."""
+    entry = out.pop("_entry", None)
+    if entry is not None:
+        try:
+            _append_ledger(entry)
+        except Exception:
+            log.exception("ledger append failed for %s (the intent line is the audit floor)",
+                          entry.get("event"))
+    return out
+
+
+@app.post("/v1/memories/{mid}/supersede")
+def supersede_memory(mid: str, b: SupersedeIn, x_api_key: Optional[str] = Header(None)):
+    """Record that `mid` is superseded by `b.winner_id` (1.32.4; supersession.py has the rules).
+
+    scope="full" sets superseded_by, so the admission gate hides the record outside the history
+    class; scope="partial" appends {winner_id, detail, at} to partially_superseded_by and never
+    hides it. The server enforces the refusal matrix whoever calls (a canonical or insight record,
+    a retired or superseded winner, a different user, a different brand or a branded winner over a
+    neutral record are refused), caps detail and reason, and stamps the actor itself. A repeated
+    call is a no-op. Undo: DELETE /v1/memories/{id}/supersede."""
+    auth(x_api_key)
+    import supersession as _ss
+    from admission_gate import _shared_brands_from_env
+    if not _ss.is_memory_id(mid) or not _ss.is_memory_id(b.winner_id):
+        raise HTTPException(400, "bad-id: both ids must be memory ids (UUIDs)")
+    with _supersede_locks(mid, b.winner_id):
+        out = _supersede_call(
+            _ss.run_supersede, mid=mid, winner_id=b.winner_id, scope=b.scope, detail=b.detail,
+            reason=b.reason, source=b.source, shared_brands=_shared_brands_from_env(),
+            now_iso=_dt.datetime.now(_dt.timezone.utc).isoformat())
+    return _supersede_finish(out)
+
+
+@app.delete("/v1/memories/{mid}/supersede")
+def unsupersede_memory(mid: str, scope: str = Query("full"), reason: Optional[str] = Query(None),
+                       x_api_key: Optional[str] = Header(None)):
+    """Undo a supersession: scope full | partial | all removes those keys (the record reappears in
+    default retrieval once superseded_by is gone). Same tier rules as POST; nothing to clear is a
+    no-op."""
+    auth(x_api_key)
+    import supersession as _ss
+    if not _ss.is_memory_id(mid):
+        raise HTTPException(400, "bad-id: the id must be a memory id (UUID)")
+    with _supersede_locks(mid):
+        out = _supersede_call(_ss.run_unsupersede, mid=mid, scope=scope, reason=reason,
+                              now_iso=_dt.datetime.now(_dt.timezone.utc).isoformat())
+    return _supersede_finish(out)
 
 # ---------------------------------------------------------------------------
 # v0.16: Goal endpoints
@@ -3633,6 +3701,7 @@ def delete(
             "audit ledger unavailable (intent append failed); delete refused "
             f"— retry when ~/.mem0 is writable: {str(e)[:120]}",
         )
+    cascade_skipped: list[str] = []
     # H6/H11 fix: mem0ai 2.0.4 signature is mem.delete(memory_id) -- no delete_linked kwarg.
     # Cascade is implemented here: query Qdrant for superseded-by chain, delete each member
     # individually (non-cascade via mem0 API), and write a separate ledger entry per deletion
@@ -3678,6 +3747,7 @@ def delete(
         # Delete ancestors first (oldest end of chain), then the root (mid)
         _cascade_actor = actor or "rest-api"
         _cascade_reason = reason or f"cascade DELETE /v1/memories/{mid}"
+        import supersession as _ss
         for _linked_id in chain_ids:
             try:
                 _linked_payload = None
@@ -3690,6 +3760,14 @@ def delete(
                         _linked_payload = _lp[0].payload if hasattr(_lp[0], "payload") else _lp[0].get("payload")
                 except Exception:
                     pass
+                # 1.32.4: any API-key holder can create a superseded_by link (the supersede door), so
+                # the cascade never deletes a protected member through one, nor one it cannot read:
+                # the root's authorisation does not extend to a canonical or insight record.
+                if _ss.cascade_protected(_linked_payload):
+                    cascade_skipped.append(_linked_id)
+                    log.warning("cascade: skipped protected or unreadable chain member %s (root=%s)",
+                                _linked_id, mid)
+                    continue
                 mem.delete(memory_id=_linked_id)
                 try:
                     _append_ledger({
@@ -3733,4 +3811,26 @@ def delete(
         })
     except Exception:
         log.exception("ledger append failed for delete")
+    extra: dict = {}
+    if cascade_skipped:
+        extra["cascade_skipped_protected"] = cascade_skipped
+    if not cascade:
+        # 1.32.4: records superseded by the one just deleted stay hidden behind a missing winner.
+        # Name them (fail-soft) so the caller can clear or re-point them; nothing is changed here.
+        try:
+            _orph = mem.vector_store.client.scroll(
+                collection_name=mem.vector_store.collection_name,
+                scroll_filter={"must": [{"key": "superseded_by",
+                                         "match": {"value": str(mid).strip().lower()}}]},
+                with_payload=False, with_vectors=False, limit=50,
+            )
+            _orph_ids = [str(p.id) for p in ((_orph[0] if _orph else None) or [])]
+            if _orph_ids:
+                extra["orphaned_supersessions"] = _orph_ids
+                log.warning("delete %s left %d record(s) superseded by a deleted winner: %s",
+                            mid, len(_orph_ids), _orph_ids[:10])
+        except Exception:
+            log.warning("delete %s: could not list records superseded by it", mid)
+    if extra and isinstance(result, dict):
+        result = {**result, **extra}
     return result

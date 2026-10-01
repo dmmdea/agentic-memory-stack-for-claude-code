@@ -102,6 +102,26 @@ SCHEMA: dict[str, dict] = {
         "required": ["ts", "event", "memory_id", "merged_keys", "actor"],
         "optional": ["reason", "transport", "prior_tier", "schema_version"],
     },
+    # 1.32.4: POST/DELETE /v1/memories/{id}/supersede, the only writer of superseded_by. Each write
+    # appends an intent line BEFORE the mutation (the AMS-22 pattern) and a completion line after.
+    "supersede": {
+        "required": ["ts", "event", "memory_id", "winner_id", "scope", "actor"],
+        "optional": ["detail", "source", "reason", "prior_tier", "transport", "status",
+                     "schema_version"],
+    },
+    "supersede-intent": {
+        "required": ["ts", "event", "memory_id", "winner_id", "scope", "actor"],
+        "optional": ["detail", "source", "reason", "prior_tier", "transport", "status",
+                     "schema_version"],
+    },
+    "unsupersede": {
+        "required": ["ts", "event", "memory_id", "scope", "actor"],
+        "optional": ["cleared", "reason", "prior_tier", "transport", "status", "schema_version"],
+    },
+    "unsupersede-intent": {
+        "required": ["ts", "event", "memory_id", "scope", "actor"],
+        "optional": ["cleared", "reason", "prior_tier", "transport", "status", "schema_version"],
+    },
     "delete": {
         "required": ["ts", "event", "memory_id", "actor"],
         "optional": ["reason", "prior_tier", "prior_source", "transport", "cascade", "status", "schema_version"],

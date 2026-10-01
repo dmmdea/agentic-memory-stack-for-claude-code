@@ -2217,9 +2217,11 @@ def test_search_query_class_history_returns_superseded_record():
 
     superseded_by is stamped through the direct-Qdrant-upsert precedent
     (_qdrant_set_tier above / test_brand_isolation._qdrant_set_payload): the
-    key has NO API writer by design since v0.20 Phase B — even trusted actors
-    get 403 on the PATCH /metadata path (test_h_fixes), so operator-level test
-    tooling seeds the stamp the same way the gate-key tests do."""
+    key has NO metadata-PATCH writer since v0.20 Phase B — even trusted actors
+    get 403 on that path (test_h_fixes) — and since 1.32.4 its one writer is
+    POST /v1/memories/{id}/supersede, which needs a real winner record, so
+    operator-level test tooling seeds the stamp the same way the gate-key
+    tests do."""
     from test_brand_isolation import _qdrant_set_payload
 
     unique_kw = f"qclass-history-e2e-{uuid.uuid4().hex[:10]}"

@@ -10,6 +10,11 @@ The policy matrix (current_tier × action):
                                            canonical record and then PUT/DELETE it with no token.
 - insight   × PUT/DELETE/PATCH-metadata  → require actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct
 - stable / evidence / temporal × any     → no extra gate (existing flow unchanged)
+- canonical × PATCH-metadata with a hide key (RETRIEVAL_HIDE_KEYS: superseded_by, contradicts_canonical)
+                                         → refused (403) for EVERY actor, trusted ones included
+                                           (authorize_metadata_patch, 1.32.4): a trusted actor skips the
+                                           HMAC check, so an actor string must never be enough to hide a
+                                           canonical; it leaves default retrieval only through the signed path.
 
 Two signed-payload formats (INTENTIONALLY DISTINCT for backward compat):
   1. Tier-promotion legacy (v0.14, PATCH /tier path — DEPRECATED in v0.19,
@@ -169,17 +174,89 @@ TRUSTED_PATCH_ACTORS: dict[str, frozenset[str]] = {
     # re-judge promotes it to contradicts_canonical (enforced). Same trusted actor.
     "contradiction-sweep-v019": frozenset({"contradicts_canonical", "contradiction_checked_at",
                                            "contradicts_canonical_pending"}),
-    # AMS-36 (2026-08-09, operator-approved): the supersession RESOLVE step.
-    # superseded_by had NO writer anywhere — the field was documented, consumed
-    # (admission I.1 rejects on it; the cascade walk reads it) and never once
-    # produced. The producer chain is now: judged retrieval-pairs / evidence
-    # sweep -> human review queue -> the operator resolves via
-    # `contradiction-sweep.py --resolve-supersede` -> THIS actor writes the
-    # field. Exactly one key; the sweep itself still cannot write it (judging
-    # and resolving stay separated — Codex over-promotes, so the enforcement
-    # keystroke remains human).
-    "supersession-resolve-v030": frozenset({"superseded_by"}),
+    # superseded_by is deliberately absent. AMS-36 (2026-08-09) gave it one PATCH writer, the actor
+    # string "supersession-resolve-v030", but an actor string is not a credential: any API-key
+    # holder could send it, and the trusted-actor early return in assert_writable skips the
+    # canonical HMAC check, so it could hide ANY record. Since 1.32.4 the only writer is
+    # POST /v1/memories/{id}/supersede, whose refusal matrix (supersession.precheck) the server
+    # enforces whoever calls it.
 }
+
+# Metadata keys the admission gate reads to HIDE a record from default retrieval
+# (admission_gate.AdmissionPolicy.evaluate, steps 1b and 1c). No metadata PATCH may put one on a
+# canonical record, whatever its actor string: a canonical leaves default retrieval only through
+# the operator's signed path (demote first: mem0-canonize.sh --action demote).
+# Scope, stated plainly: this closes the hole for CANONICAL records only. The trusted and legacy actor
+# strings themselves are still unauthenticated, so an API-key holder that sends one can still stamp
+# that actor's keys on a non-canonical record (the sweep's contradicts_canonical on an insight or
+# evidence record, backfill-apply-v013's retrievable=false, system's expires_at). The sweep stamps
+# insight candidates by design, so insight is not added here; closing the rest needs a credential for
+# server-side actors, not a string (register follow-up).
+RETRIEVAL_HIDE_KEYS = frozenset({"superseded_by", "contradicts_canonical"})
+
+# PATCH /v1/memories/{id}/metadata key policy. It lived inline in the app.py handler; 1.32.4 moved
+# it here, unchanged, so the whole metadata-write decision (assert_writable, then this) is a pure
+# function the headless suite can drive.
+#
+# v0.13 + v0.20 Phase B (M1/M3/M11): lifecycle and retrieval-gating keys a caller must not set
+# through the generic shallow-merge endpoint, or any API-key holder could censor retrieval.
+METADATA_FORBIDDEN_KEYS = frozenset({
+    "retrievable", "expires_at", "created_at", "tier_actor",
+    "superseded_by", "contradicts_canonical", "contradiction_checked_at",
+    "contradicts_canonical_pending",  # v0.29.4: only the sweep actor writes it
+    "nli_gate_checked_at",            # W2: the NLI gate's server-side stamp is its only writer
+    # 1.32.4: the supersede door's own keys (supersession.SUPERSEDE_KEYS); no PATCH actor lists them.
+    "superseded_at", "superseded_via", "partially_superseded_by",
+})
+
+# Legacy server-flow actors, each scoped to the EXACT forbidden keys it may write, so a forbidden
+# key cannot be smuggled in alongside an authorized one (v0.20 Final, mixed-key bypass).
+LEGACY_PATCH_ACTOR_KEYS: dict[str, frozenset[str]] = {
+    "backfill-apply-v013": frozenset({"retrievable"}),
+    "decay-scan": frozenset({"expires_at"}),
+    "system": frozenset({"expires_at", "tier_actor"}),
+}
+
+
+def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], keys) -> None:
+    """Key-level authorisation for PATCH /metadata. Runs after assert_writable.
+
+    Every forbidden key in the request must be individually allowed for the actor (legacy
+    server-flow keys unioned with the actor's TRUSTED_PATCH_ACTORS keys), and a trusted actor may
+    write ONLY its own keys. A hide key (RETRIEVAL_HIDE_KEYS) is refused on a canonical record for
+    every actor: the trusted-actor early return in assert_writable skips the HMAC check, so the
+    actor string alone must never be enough to hide a canonical. Raises HTTPException(403).
+    """
+    keys = set(keys)
+    actor_lower = (actor or "").strip().lower()
+    hide_hit = RETRIEVAL_HIDE_KEYS & keys
+    if hide_hit and current_tier == "canonical":
+        raise HTTPException(
+            403,
+            f"metadata keys {sorted(hide_hit)} would hide a CANONICAL record; a canonical leaves "
+            "default retrieval only through the signed path (demote it first: "
+            "mem0-canonize.sh --action demote <id> \"<reason>\")",
+        )
+    forbidden_hit = METADATA_FORBIDDEN_KEYS & keys
+    if forbidden_hit:
+        allowed_keys = set(LEGACY_PATCH_ACTOR_KEYS.get(actor_lower, frozenset()))
+        allowed_keys |= set(TRUSTED_PATCH_ACTORS.get(actor_lower, frozenset()))
+        if not (forbidden_hit <= allowed_keys):
+            raise HTTPException(
+                403,
+                f"forbidden metadata keys {sorted(forbidden_hit - allowed_keys)} "
+                f"require trusted actor; got actor={actor_lower!r}",
+            )
+    if actor_lower in TRUSTED_PATCH_ACTORS:
+        actor_allowed_keys = TRUSTED_PATCH_ACTORS[actor_lower]
+        not_allowed_keys = keys - actor_allowed_keys
+        if not_allowed_keys:
+            raise HTTPException(
+                403,
+                f"trusted actor {actor_lower!r} may only write keys {sorted(actor_allowed_keys)}; "
+                f"disallowed keys in request: {sorted(not_allowed_keys)}",
+            )
+
 
 # H5: sentinel for fetch_current_tier when the point does NOT exist in Qdrant.
 _NOT_FOUND = "__NOT_FOUND__"

@@ -586,13 +586,14 @@ if [ "$_ROLE" = brain ] && [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
 fi
 
 # Contradiction review queue: the safe resolver QUEUES genuine contradictions for human review
-# instead of auto-hiding — surface the outstanding count so the operator promotes the real ones.
+# instead of auto-hiding — surface the outstanding count so the operator promotes the real ones
+# (--promote for a contradiction line, --resolve-supersede for a supersede line: the banner names both).
 # MEM-13 (2026-07-03): own line, not the [storage-cap] warnings blob — the queue must be visible
 # even when nothing is over cap. /health/deep mirrors it as checks.pending_contradiction_reviews.
 RQ="$HOME/.mem0/contradiction-promote-review.jsonl"
 if [ "$_ROLE" = brain ] && [ -s "$RQ" ]; then
   nrev=$(grep -c . "$RQ" 2>/dev/null)
-  [ "${nrev:-0}" -gt 0 ] && echo "${nrev} contradiction verdict(s) await review (genuine? -> contradiction-sweep.py --promote <id>; list -> ~/.mem0/contradiction-promote-review.jsonl)"
+  [ "${nrev:-0}" -gt 0 ] && echo "${nrev} contradiction verdict(s) await review (contradiction -> contradiction-sweep.py --promote <id>; supersede -> contradiction-sweep.py --resolve-supersede <id> --winner <w>; list -> ~/.mem0/contradiction-promote-review.jsonl)"
 fi
 
 # W3 AMS-05 heartbeat digest — one own-line (MEM-13 convention), silent when all
