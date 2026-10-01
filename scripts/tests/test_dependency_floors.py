@@ -83,6 +83,19 @@ def test_every_comparison_spec_on_the_installer_pip_lines_is_quoted_in_the_raw_l
             assert f"'{floor_name}{floor}'" in raw, f"installer {label} line: {floor_name}{floor} must be single-quoted"
 
 
+def test_the_linux_client_venv_carries_the_pyjwt_floor_quoted():
+    """The thin-client venv installs fastmcp, which pulls mcp and PyJWT: it needs the same security
+    floor as the server venv, quoted (an unquoted `>=` is a shell redirect)."""
+    client = (ROOT / "install" / "linux-client.sh").read_text(encoding="utf-8")
+    pip_line = next(ln for ln in client.splitlines()
+                    if '.venv/bin/pip" install' in ln and "'fastmcp>=3'" in ln)
+    assert f"'pyjwt{FLOORS['pyjwt']}'" in pip_line, pip_line
+    unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "", pip_line)
+    assert "<" not in unquoted and ">" not in unquoted, pip_line
+    plan_line = next(ln for ln in client.splitlines() if ln.lstrip().startswith('if plan "python3 -m venv'))
+    assert f"'pyjwt{FLOORS['pyjwt']}'" in plan_line, "the dry-run plan names the floor too"
+
+
 def test_no_cap_or_exact_pin_survives_in_the_dependency_sources():
     for name, text in (("requirements.txt", REQ), ("1-wsl-services.sh", INSTALLER)):
         assert "<49" not in text, f"{name}: the cryptography cap is back"
