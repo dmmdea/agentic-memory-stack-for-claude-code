@@ -3485,7 +3485,7 @@ def create_episode(b: EpisodeIn, background_tasks: BackgroundTasks, x_api_key: O
                             lambda ep, vec, payload: upsert_episode_embedding(mem.vector_store.client, ep, vec, payload),
                             _episode_embed_gate, episode_id, b.summary, _ep_payload)
                     else:
-                        log.warning("episode embed deferred ep=%s skipped (retry cap); the daily upkeep step will "
+                        log.warning("episode embed not deferred ep=%s (retry cap); the daily upkeep step will "
                                     "embed it", episode_id)
             except Exception:
                 if _slot:

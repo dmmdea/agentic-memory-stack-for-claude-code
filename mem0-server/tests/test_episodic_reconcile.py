@@ -1375,3 +1375,12 @@ def test_the_backfill_script_dir_is_appended_after_the_server_dir_so_it_never_sh
     server = {p.name for p in (REPO_ROOT / "mem0-server").glob("*.py")}
     scripts = {p.name for p in (REPO_ROOT / "scripts" / "wsl").glob("*.py")}
     assert not server & scripts, f"a module name exists in both dirs: {sorted(server & scripts)}"
+
+
+def test_limit_sample_refuses_a_negative_cap(monkeypatch, capsys):
+    """A negative --limit-sample used to slice away the LAST entries instead of capping."""
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--limit-sample", "-1"])
+    with pytest.raises(SystemExit) as e:
+        recon.main()
+    assert e.value.code == 2
+    assert "must be 0 or more" in capsys.readouterr().err

@@ -617,9 +617,16 @@ def run_upkeep(args, db_path: Path, run_ts: str, backfill_limit: int) -> int:
     return 0
 
 
+def _non_negative_int(value: str) -> int:
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v0.27.4 R5: non-destructive episodic-ledger reconciliation")
-    parser.add_argument("--limit-sample", type=int, default=20,
+    parser.add_argument("--limit-sample", type=_non_negative_int, default=20,
                         help="max orphaned/dangling/abandoned/missing ids recorded in a JSONL sample (default 20)")
     parser.add_argument("--db", default=str(EPISODIC_DB), help="episode ledger path (default ~/.mem0/episodic.db)")
     parser.add_argument("--stale-days", type=int, default=STALE_IN_PROGRESS_DAYS,

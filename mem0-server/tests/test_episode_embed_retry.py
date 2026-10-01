@@ -316,6 +316,8 @@ def test_create_episode_schedules_the_retry_in_the_background_and_leaves_the_res
     assert "_episode_embed_gate.acquire(episode_id)" in handler, "capped: one per episode, a small global number"
     assert "background_tasks.add_task(" in handler and "run_deferred_embed" in handler
     assert "episode embed deferred ep=%s" in handler
+    assert handler.count("\"episode embed deferred ep=%s") == 1, "an over-cap refusal must not read as a scheduled deferral"
+    assert "episode embed not deferred ep=%s (retry cap)" in handler
     assert "episode embed deferral failed" in handler, "scheduling is itself fail-soft: it may never fail the write"
     assert "embed_with_cold_retry(" not in body and "time.sleep" not in body, "nothing waits inside the request"
 
