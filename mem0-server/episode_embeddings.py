@@ -16,9 +16,13 @@ embedder (both live on the `mem` object in app.py), which keeps it unit-testable
 """
 from __future__ import annotations
 
+import logging
 import random
+import threading
 import time
 from typing import Optional
+
+log = logging.getLogger("mem0-server")   # the server's own logger: the greppable lines below land in its journal
 
 EPISODE_COLLECTION = "episodes_egemma_768"
 EPISODE_DIMS = 768
@@ -143,6 +147,55 @@ def embed_with_cold_retry(embedder, text: Optional[str], *, delays=COLD_RETRY_DE
                 raise
             sleep(wait)
             attempt += 1
+
+
+class DeferredEmbedGate:
+    """Caps the finalize-time background retries: at most one in flight per episode id and `cap` overall.
+    A background task holds a worker thread while it sleeps through the backoff, so an outage that
+    finalizes a burst of sessions must not queue unbounded sleepers. A retry refused here is not lost:
+    the daily upkeep step (episodic-reconcile --upkeep) embeds whatever is still missing."""
+
+    def __init__(self, cap: int = 4):
+        self.cap = cap
+        self._active: set = set()
+        self._lock = threading.Lock()
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def acquire(self, episode_id) -> bool:
+        with self._lock:
+            if episode_id in self._active or len(self._active) >= self.cap:
+                return False
+            self._active.add(episode_id)
+            return True
+
+    def release(self, episode_id) -> None:
+        with self._lock:
+            self._active.discard(episode_id)
+
+
+def run_deferred_embed(embedder, upsert, gate: DeferredEmbedGate, episode_id: int, summary: str, payload: dict,
+                       **retry_kw) -> None:
+    """The background half of create_episode's embed: cold-retry the embed, then upsert the vector with the
+    same payload the in-request attempt would have written. Never raises (it runs after the response) and
+    always frees its gate slot. `upsert(ep_id, vector, payload)` writes one point; `retry_kw` is
+    embed_with_cold_retry's delays / budget_s / sleep / clock. Greppable outcomes:
+    'episode embed recovered ep=<id>' and 'episode embed gave up ep=<id> ...'."""
+    try:
+        vec = embed_with_cold_retry(embedder, summary, **retry_kw)
+        if vec is None:
+            log.warning("episode embed gave up ep=%s (empty summary)", episode_id)
+            return
+        upsert(episode_id, vec, payload)
+        log.info("episode embed recovered ep=%s", episode_id)
+    except Exception as e:  # noqa: BLE001 - a background task has nowhere to raise to
+        log.warning("episode embed gave up ep=%s (%s: %s); the daily upkeep step will retry it",
+                    episode_id, type(e).__name__, str(e)[:120])
+    finally:
+        gate.release(episode_id)
 
 
 def ensure_episode_collection(client, dims: int = EPISODE_DIMS, collection: str = EPISODE_COLLECTION) -> bool:

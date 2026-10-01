@@ -96,8 +96,13 @@ from episode_embeddings import (
     embed_episode_summary,
     upsert_episode_embedding,
     search_episodes_semantic,
+    DeferredEmbedGate,
+    run_deferred_embed,
     _indexable_summary as _episode_indexable_summary,
 )
+# 1.32.4: finalize-time embeds that hit a cold embedder are retried in the background, capped (one per
+# episode id, a small global number): see create_episode and episode_embeddings.DeferredEmbedGate.
+_episode_embed_gate = DeferredEmbedGate()
 
 # Read API key (file mode 600)
 from canonical_key_provider import api_key_path as _api_key_path  # spec §4: MEM0_API_KEY_FILE on the native authority
@@ -3330,7 +3335,7 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
 
 
 @app.post("/v1/episodes")
-def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
+def create_episode(b: EpisodeIn, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None)):
     """Write one episode (session goal + summary) to episodic.db.
     Called automatically by the L1a Stop hook at session end.
     v0.16: also processes advanced_goals / blocked_goals / open_questions."""
@@ -3457,17 +3462,35 @@ def create_episode(b: EpisodeIn, x_api_key: Optional[str] = Header(None)):
         # Fail-soft — the committed SQLite episode is the source of truth; a Qdrant
         # hiccup must never fail the episode write (and never re-embeds the noisy
         # in_progress checkpoint, since this fires once per episode at finalize).
+        # 1.32.4: a COLD embedder (restarting, unloaded, 'exited prematurely') used to drop the vector
+        # for good. The hook that posts this episode gives up after 5 s, so nothing waits here: the
+        # retry runs as a background task after the response, capped by _episode_embed_gate, and what
+        # it cannot recover the daily upkeep step (episodic-reconcile --upkeep) embeds.
+        _ep_payload = {"brand": b.brand, "goal": (b.goal or "")[:300], "summary": (b.summary or "")[:800]}
         try:
             if _episode_indexable_summary(b.summary):
                 _ep_vec = embed_episode_summary(mem.embedding_model, b.summary)
                 if _ep_vec is not None:
-                    upsert_episode_embedding(
-                        mem.vector_store.client, episode_id, _ep_vec,
-                        {"brand": b.brand, "goal": (b.goal or "")[:300],
-                         "summary": (b.summary or "")[:800]},
-                    )
-        except Exception:
+                    upsert_episode_embedding(mem.vector_store.client, episode_id, _ep_vec, _ep_payload)
+        except Exception as e:
             log.exception("episode embed/upsert failed (non-fatal)")
+            _slot = False
+            try:
+                if _embedder_503.retry_later(e) is not None:
+                    _slot = _episode_embed_gate.acquire(episode_id)
+                    if _slot:
+                        log.warning("episode embed deferred ep=%s", episode_id)
+                        background_tasks.add_task(
+                            run_deferred_embed, mem.embedding_model,
+                            lambda ep, vec, payload: upsert_episode_embedding(mem.vector_store.client, ep, vec, payload),
+                            _episode_embed_gate, episode_id, b.summary, _ep_payload)
+                    else:
+                        log.warning("episode embed deferred ep=%s skipped (retry cap); the daily upkeep step will "
+                                    "embed it", episode_id)
+            except Exception:
+                if _slot:
+                    _episode_embed_gate.release(episode_id)
+                log.exception("episode embed deferral failed (non-fatal)")
 
         return {"ok": True, "session_id": b.session_id, "episode_id": episode_id}
     except Exception as e:
