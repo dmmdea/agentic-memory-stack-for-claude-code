@@ -10,6 +10,11 @@ The policy matrix (current_tier × action):
                                            canonical record and then PUT/DELETE it with no token.
 - insight   × PUT/DELETE/PATCH-metadata  → require actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct
 - stable / evidence / temporal × any     → no extra gate (existing flow unchanged)
+- canonical × PATCH-metadata with a hide key (RETRIEVAL_HIDE_KEYS: superseded_by, contradicts_canonical)
+                                         → refused (403) for EVERY actor, trusted ones included
+                                           (authorize_metadata_patch, 1.32.4): a trusted actor skips the
+                                           HMAC check, so an actor string must never be enough to hide a
+                                           canonical; it leaves default retrieval only through the signed path.
 
 Two signed-payload formats (INTENTIONALLY DISTINCT for backward compat):
   1. Tier-promotion legacy (v0.14, PATCH /tier path — DEPRECATED in v0.19,

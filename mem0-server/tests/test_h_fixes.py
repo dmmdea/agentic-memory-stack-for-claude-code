@@ -417,9 +417,10 @@ def test_h8_untrusted_actor_still_blocked_from_retired_at_on_canonical():
 # sweep's idempotency marker contradiction_checked_at). v0.20 adds all three to
 # FORBIDDEN_KEYS so an arbitrary API-key holder cannot censor retrieval via the
 # generic shallow-merge endpoint; the per-actor TRUSTED_PATCH_ACTORS dict
-# remains the ONLY write path (contradiction-sweep-v019 keeps its two keys;
-# superseded_by has NO API writer and stays fully blocked until a future
-# supersession-writer registers as a trusted actor).
+# remains the ONLY write path (contradiction-sweep-v019 keeps its two keys).
+# superseded_by has NO metadata-PATCH writer for any actor: since 1.32.4 its one
+# writer is POST /v1/memories/{id}/supersede (supersession.py), which enforces
+# its own refusal matrix whoever calls it and stamps the actor itself.
 
 _V020_GATE_KEYS = ("superseded_by", "contradicts_canonical", "contradiction_checked_at")
 
@@ -537,8 +538,9 @@ def test_v020_contradiction_sweep_actor_still_writes_its_two_keys():
 
 
 def test_v020_sweep_actor_cannot_write_superseded_by():
-    """v0.20 M1/M3/M11: superseded_by has NO trusted API writer — even
-    contradiction-sweep-v019 (a trusted actor for OTHER keys) gets 403."""
+    """v0.20 M1/M3/M11: superseded_by has NO metadata-PATCH writer — even
+    contradiction-sweep-v019 (a trusted actor for OTHER keys) gets 403. The
+    supersede endpoint is its only writer (1.32.4)."""
     mid = _post_evidence(f"v020-sweep-superseded-{uuid.uuid4()}")
     try:
         r = _patch_md(mid, {"superseded_by": "m-x"},
