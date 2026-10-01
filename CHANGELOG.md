@@ -4,6 +4,91 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.4 — unfinished sessions read clean and close daily, missed episode vectors come back, and a real supersede door (2026-10-01)
+
+### Fixed
+- **Unfinished sessions showed machine text.** An unfinished episode keeps a running summary of the
+  prompts typed so far, and every UserPromptSubmit prompt went into it, machine turns included: background
+  task notifications and messages relayed from another agent session. The recent-sessions view
+  (`GET /v1/episodes`, MCP `episodic_recent`) and episode search returned that text verbatim. A machine
+  turn or a relayed message now appends nothing (`hook_contract.is_relayed_agent_message`, an exact port of
+  `Test-RelayedAgentMessage`, pinned to the shared corpus with the PowerShell function; `ended_at` still
+  moves, so the checkpoint contract and the stale clock hold), and both views scrub such segments from any
+  row that is not complete, which also cleans the existing backlog without rewriting it. The running
+  summary no longer freezes on the first prompts once it reaches its cap (it keeps the opening ask and the
+  newest prompts) and no longer eats leading or trailing pipes.
+- **Unfinished sessions crowded the readers that want finished ones.** They carry no goal and always the
+  newest `ended_at`, so they filled the windows read by the MEMORY.md index, both dreams, the session-start
+  seed and the replica's recent-sessions banner. Those readers now ask for `state=complete`
+  (`GET /v1/episodes` takes an optional `state`; an older server ignores it and the old blank-goal skips
+  still apply), `episodic_search` results carry `state`, and the Test-MemoryStack staleness row reads the
+  new `last_complete_ended_at`.
+- **Stale unfinished sessions closed only on Sundays.** The closer added in 1.32.0 (`in_progress` rows idle
+  more than 7 days become `abandoned`) ran only in the weekly `episodic-reconcile` step, had no dry run,
+  recorded only a count, and sat behind the Qdrant readiness gate although it touches only SQLite. It now
+  also runs nightly in the new chain step `episode-upkeep` (`episodic-reconcile.py --upkeep`; 18 steps),
+  runs before the Qdrant gate, takes `--dry-run`, guards against a checkpoint racing in, and receipts a
+  sample, the oldest `ended_at` and the remaining count. Rows are never deleted or rewritten.
+- **A session finalized while the embedder was down never got its search vector** until the weekly
+  reconcile or a hand backfill. A cold-shaped embed failure (connection refused, 503, or a 500 "upstream
+  command exited prematurely") now schedules a bounded background retry after the response, and
+  `episode-upkeep` embeds whatever is still missing every night (diff first: no embedder call when nothing
+  is missing).
+- **The vector backfill gave up on a cold start.** `episode-embed-backfill.py` retries a cold-shaped
+  failure per row inside a run budget, can wait for the embedder first, writes the ams-step outcome line
+  and reports the exact number still missing; the Sunday reconcile polls a cold embedder instead of
+  skipping its whole backfill on one 503. A context-overflow 500 is still never retried.
+- **Facts "superseded" by appended text stayed in default searches.** With no way to retire a stale fact,
+  sessions appended `SUPERSEDED <date> by mem0 <id>: ...` to the text; the admission gate reads the
+  `superseded_by` field, never the text. New door: `POST /v1/memories/{id}/supersede` (scope `full` hides
+  the record outside the `history` class; scope `partial` with a `detail` annotates one stale claim and never
+  hides) and `DELETE` to undo, with the MCP tools `memory_supersede` / `memory_unsupersede` (queued offline
+  like the other writes; a refusal names its code and is never queued). `PUT` answers a hand-written marker
+  with a `supersede_note`. `contradiction-sweep.py --resolve-supersede` goes through the door and dequeues
+  its review line; `--unsupersede` undoes; `--supersede-markers` lists every hand-written marker
+  (dry run; `--apply` converts only FULL markers with a valid winner, `--apply-partial` annotates partial
+  ones). FULL is the narrow case: anything scoped or ambiguous is partial and never hides. The MEMORY.md
+  index and the nightly dream also skip superseded records now (partial ones stay). The memory protocol
+  snippet gains "Correcting a fact".
+
+### Security
+- **Any holder of the ordinary API key could hide any record, canonical included.** The only guard on
+  `superseded_by` was the request body's free-text `actor` (`supersession-resolve-v030`), and the
+  trusted-actor path in `assert_writable` skips the canonical HMAC check; the sweep's actor string could
+  hide a canonical the same way through `contradicts_canonical`. `superseded_by` now has no metadata-PATCH
+  writer at all (the supersede door is its only writer and enforces its refusal matrix whoever calls:
+  canonical, insight or tier-less records, retired or superseded winners, another user, another brand, or a
+  branded winner over a brand-neutral record are refused), and no actor may put a hide key on a canonical
+  record. The PATCH key policy moved unchanged into `security_invariants.authorize_metadata_patch` so the
+  whole decision is tested headless. Scope, stated plainly: the trusted and legacy actor strings remain
+  unauthenticated for non-canonical records (for example the sweep's `contradicts_canonical` on an insight);
+  closing that needs a credential for server-side actors.
+- **A supersession link could reach a canonical record through a cascade delete.** Because any API-key
+  holder can now create a `superseded_by` link, `DELETE ...?cascade=true` never deletes a canonical, insight,
+  tier-less or unreadable chain member through one (it returns them as `cascade_skipped_protected`), and
+  `PATCH /tier` refuses to move a superseded record into canonical or insight (`409 superseded-record`). A
+  plain delete names the records it leaves superseded by a missing winner (`orphaned_supersessions`).
+- **PyJWT >= 2.15.0** (CVE-2026-101918, RecursionError in PyJWKClient; pulled in by fastmcp through mcp).
+  The floor is on both server pip lines, asserted by the installer's post-condition, and on the Linux
+  thin-client venv; a raw-line test keeps every floor single-quoted (an unquoted `>=` is a shell redirect
+  that installs an unpinned package).
+
+### Upgrade notes
+- **Fleet-wide, and it needs a package index.** Server code, a chain unit and a dependency floor change:
+  deploy the authority with `install/linux-authority.sh` from a release tree of the tag (it raises PyJWT,
+  installs and enables the new `ams-step-episode-upkeep` unit, and restarts mem0; snapshot `pip freeze`
+  first). On each PC run the full `install.ps1` (phase 1 raises PyJWT in the WSL venv the MCP shim runs on;
+  phase 2 deploys the shim, the banner and the hooks); `deploy.sh` alone does not run pip. Re-run
+  `install/linux-client.sh` on a Linux thin client. Check `pip show pyjwt` afterwards: 3-verify does not.
+- **The new MCP tools appear after a Claude Code session restart** (the shim is loaded at session start).
+- **The first `episode-upkeep` night closes the whole stale backlog at once** (every `in_progress` row idle
+  more than 7 days). To see it first: `episodic-reconcile.py --upkeep --dry-run` on the authority.
+- **Hand-written markers already in the store stay until converted.** Run
+  `contradiction-sweep.py --supersede-markers` (dry run; read `~/.mem0/supersede-markers.json`), then
+  `--apply --only <ids>` for the FULL rows you accept; `--apply-partial` annotates partial ones.
+- **The memory protocol snippet in an existing CLAUDE.md is not rewritten by the installer**; the MCP tool
+  docstrings carry the same rule.
+
 ## 1.32.3 — a message from another agent session is never an operator correction (2026-09-30)
 
 ### Fixed

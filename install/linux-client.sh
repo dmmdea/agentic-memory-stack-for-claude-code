@@ -151,12 +151,13 @@ fi
 
 # ---------------------------------------------------------------- 3. venv + scripts
 say "[3] client venv at $CLIENT_DIR and scripts in $SCRIPTS_DIR"
-if plan "python3 -m venv $CLIENT_DIR/.venv; pip install 'fastmcp>=3' httpx; deploy $CLIENT_FILES with __WSL_USER__ -> $USER_ID"; then :; else
+if plan "python3 -m venv $CLIENT_DIR/.venv; pip install 'fastmcp>=3' httpx 'pyjwt>=2.15.0'; deploy $CLIENT_FILES with __WSL_USER__ -> $USER_ID"; then :; else
     mkdir -p "$CLIENT_DIR" "$SCRIPTS_DIR"
     [ -x "$CLIENT_DIR/.venv/bin/python" ] || python3 -m venv "$CLIENT_DIR/.venv"
     "$CLIENT_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
-    # Floors only, no caps (house rule): the shim needs fastmcp>=3 and httpx.
-    "$CLIENT_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check 'fastmcp>=3' httpx
+    # Floors only, no caps (house rule): the shim needs fastmcp>=3 and httpx. fastmcp pulls mcp, which
+    # pulls PyJWT: the same security floor as the server venv (CVE-2026-101918, fixed in 2.15.0).
+    "$CLIENT_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check 'fastmcp>=3' httpx 'pyjwt>=2.15.0'
     "$CLIENT_DIR/.venv/bin/python" -c 'import fastmcp, httpx' || fail "shim dependencies failed to import in the venv"
     # The deployed copies carry the operator sentinel __WSL_USER__ (the mem0 tenant every tool
     # defaults to). The Windows installer resolves it at deploy time; so must this one, or every
