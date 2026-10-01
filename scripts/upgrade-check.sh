@@ -5,7 +5,7 @@
 # /upgrade-memory-stack skill can present a plan. Makes NO changes.
 #
 # Dependency policy: floors, not caps. The installer sets minimums (cryptography, starlette,
-# mem0ai) and nothing pins a version below "latest"; the /health/deep sparse_leg canary and
+# pyjwt, mem0ai) and nothing pins a version below "latest"; the /health/deep sparse_leg canary and
 # the hook contract are the tripwires for a breaking release. Only the transitive majors below
 # are held back.
 #   protobuf/thinc  majors held (breaking-change risk; transitive via mem0ai[nlp]/spaCy)
