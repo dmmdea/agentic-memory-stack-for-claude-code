@@ -212,3 +212,41 @@ def test_a_conflict_or_missing_scanner_names_its_remedy_not_just_the_network(tmp
     assert "pip install pip-audit" in noaudit.stderr
     fatal = re.search(r'PYEOF\' \|\| \{ echo "([^"]*)"', INSTALLER).group(1)
     assert "pip check" in fatal and "network" in fatal and "conflict" in fatal
+
+
+# ---- the native authority and the Linux replica reuse the fresh pip line ------------------
+
+import os
+import shutil
+
+import pytest
+
+BASH = shutil.which("bash")
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("script", ["linux-authority.sh", "linux-replica.sh"])
+def test_the_authority_and_replica_installers_hand_every_floor_to_pip_intact(tmp_path, script):
+    """Both read PIP_SPECS from the fresh pip line of install/1-wsl-services.sh with grep and sed, then
+    eval it into their own pip call. The quoted floors must survive that round trip as single
+    arguments: lose a quote and `pyjwt>=2.15.0` becomes a redirect (an unpinned install, a stray
+    file named `=2.15.0`). This runs the scripts' own two lines against a stub pip."""
+    lines = (ROOT / "install" / script).read_text(encoding="utf-8").splitlines()
+    assign = [ln for ln in lines if ln.startswith("PIP_SPECS=")]
+    run = [ln for ln in lines if ln.lstrip().startswith("eval ") and "$PIP_SPECS" in ln]
+    assert len(assign) == 1 and len(run) == 1, (assign, run)
+    app = tmp_path / "app"
+    (app / ".venv" / "bin").mkdir(parents=True)
+    pip = app / ".venv" / "bin" / "pip"
+    pip.write_text('#!/bin/sh\nprintf "%s\n" "$@" > "$(dirname "$0")/../argv.txt"\n', encoding="utf-8")
+    pip.chmod(0o755)
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {**os.environ, "WSL_INSTALLER": str(ROOT / "install" / "1-wsl-services.sh"), "MEM0_APP": str(app)}
+    r = subprocess.run([BASH, "-c", assign[0] + "\n" + run[0]], cwd=str(work), env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    argv = (app / ".venv" / "argv.txt").read_text(encoding="utf-8").split()
+    for name, floor in FLOORS.items():
+        assert f"{name}{floor}" in argv, f"{script}: {name}{floor} did not reach pip as one argument: {argv}"
+    assert list(work.iterdir()) == [], f"{script}: the eval wrote a stray file: {list(work.iterdir())}"

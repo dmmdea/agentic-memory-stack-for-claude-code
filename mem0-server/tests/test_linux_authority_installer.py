@@ -66,6 +66,17 @@ def test_dry_run_writes_nothing(tmp_path):
     assert not (home / ".config").exists()
 
 
+def test_the_dry_run_plan_carries_the_security_floors_from_the_wsl_installer(tmp_path):
+    """The authority has no pip line of its own: it reads the fresh one from 1-wsl-services.sh, so a
+    floor added there (pyjwt, CVE-2026-101918) reaches the authority with no other edit. The plan the
+    dry run prints is that line, quotes intact (an unquoted >= would be a redirect when it is eval'd)."""
+    r, _home = _run(["--bind-ip", "192.0.2.9", "--dry-run"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    plan = next(ln for ln in r.stdout.splitlines() if "[dry-run] venv with" in ln)
+    for spec in ("'pyjwt>=2.15.0'", "'cryptography>=50.0.1'", "'starlette>=1.3.1'"):
+        assert spec in plan, f"{spec} missing from the authority's pip plan: {plan}"
+
+
 def test_render_only_unit_set_is_native(tmp_path):
     out = tmp_path / "render"
     r, home = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
