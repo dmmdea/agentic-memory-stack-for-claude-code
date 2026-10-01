@@ -1903,6 +1903,7 @@ def run_resolve_supersede(args, dry_run: bool) -> int:
 
 MARKERS_RECEIPT = Path.home() / ".mem0" / "supersede-markers.json"
 MARKER_TEXT_CHARS = 160
+MARKER_EXCERPT_CHARS = 200       # what a row's marker_text keeps, counted from the marker itself
 PARTIAL_FALLBACK_DETAIL = "hand-written partial marker"
 # supersession.precheck code -> the winner-side state the receipt names. Any other code is a refusal on
 # the loser's side and reads "refused:<code>".
@@ -1944,6 +1945,12 @@ def _point_text(payload: dict) -> str:
     return str(payload.get("data") or payload.get("memory") or "")
 
 
+def _marker_excerpt(payload: dict, marker) -> str:
+    """The marker itself: the text from where the parser found it. A row's `text` is the head of the
+    record and the marker usually sits at the end, so this is what the operator has to see."""
+    return _point_text(payload)[marker.start:marker.start + MARKER_EXCERPT_CHARS]
+
+
 def marker_candidates(points: list) -> list:
     """(point, marker) for every record whose text carries a hand-written marker and that is not already
     superseded (superseded_by unset) and still retrievable (retrievable is not False)."""
@@ -1960,8 +1967,9 @@ def marker_candidates(points: list) -> list:
 
 def build_marker_rows(candidates: list, payloads: dict, shared_brands=()) -> list:
     """One report row per candidate: id, kind (full | partial | mention | no-target), winner_id, the winner
-    state (None for a mention or a marker with no id: nothing would be written), the qualifier and the
-    first MARKER_TEXT_CHARS of the text. A partial whose annotation is already recorded says so."""
+    state (None for a mention or a marker with no id: nothing would be written), the qualifier, the first
+    MARKER_TEXT_CHARS of the text and marker_text (the MARKER_EXCERPT_CHARS from the marker itself). A
+    partial whose annotation is already recorded says so."""
     rows = []
     for p, marker in candidates:
         pl = p.get("payload") or {}
@@ -1973,7 +1981,8 @@ def build_marker_rows(candidates: list, payloads: dict, shared_brands=()) -> lis
             state = marker_winner_state(lid, pl, marker.winner_id, payloads.get(marker.winner_id),
                                         scope, detail, shared_brands)
         row = {"id": lid, "kind": marker.kind, "winner_id": marker.winner_id, "winner_state": state,
-               "qualifier": marker.qualifier, "text": _point_text(pl)[:MARKER_TEXT_CHARS]}
+               "qualifier": marker.qualifier, "text": _point_text(pl)[:MARKER_TEXT_CHARS],
+               "marker_text": _marker_excerpt(pl, marker)}
         if (marker.kind == "partial" and state == "ok"
                 and _supersession.is_noop(pl, marker.winner_id, "partial", partial_detail(marker.qualifier))):
             row["already_annotated"] = True
@@ -1991,7 +2000,8 @@ def canonical_marker_rows(points: list) -> list:
         if marker is not None:
             out.append({"id": str(p.get("id")), "kind": marker.kind, "winner_id": marker.winner_id,
                         "winner_state": "refused:canonical", "qualifier": marker.qualifier,
-                        "text": _point_text(pl)[:MARKER_TEXT_CHARS]})
+                        "text": _point_text(pl)[:MARKER_TEXT_CHARS],
+                        "marker_text": _marker_excerpt(pl, marker)})
     return out
 
 
@@ -2085,11 +2095,24 @@ def apply_marker_rows(http: httpx.Client, rows: list, apply_partial: bool = Fals
 
 
 def _write_receipt(path: Path, receipt: dict) -> None:
-    """Atomic: a reader never sees a torn file."""
+    """Atomic and owner-only: a reader never sees a torn file, and the receipt (record ids and text
+    excerpts) is 0600. The temp is PID-unique, so two runs never write one file, and is created 0600
+    before any content lands in it; a failed write leaves no temp behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(receipt, indent=1) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), 0o600)      # a leftover temp of this PID keeps its old mode otherwise
+            f.write(json.dumps(receipt, indent=1) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _parse_only(raw) -> Optional[set]:
@@ -2105,7 +2128,8 @@ def run_supersede_markers(args, dry_run: bool) -> int:
     marker with the door's own parser (full | partial | mention | no-target) and its winner (ok | missing |
     retired | already-superseded | cross-brand | cross-user | self), reports canonical records that carry
     a marker as refused:canonical and records whose superseded_by names a missing or retired winner as
-    dangling, and writes ~/.mem0/supersede-markers.json.
+    dangling, and writes ~/.mem0/supersede-markers.json (0600; each row carries marker_text, the marker
+    itself; an --apply that aborts partway still writes it, with an "aborted" reason).
 
     DRY-RUN by default. --apply converts only FULL markers whose winner is ok, through the endpoint (the
     server re-checks everything); --apply-partial (with --apply) also annotates PARTIAL markers, which
@@ -2183,18 +2207,24 @@ def run_supersede_markers(args, dry_run: bool) -> int:
         "apply_noop": stats["noop"], "apply_refused": stats["refused"],
     }
     outcome = _outcome_for_abort(aborted) if aborted else "ok"
-    if not aborted:
+    # An --apply that stopped partway is the case that needs the receipt most (the rows already
+    # converted are the record of what changed), so it is written with the reason. Only a run with no
+    # rows at all (the scroll or a read failed before any row existed) has nothing to record.
+    if all_rows or not aborted:
+        receipt = {"ts": _iso_now(), "dry_run": dry_run, "apply_partial": apply_partial,
+                   "user_id": args.user_id, "scanned": scanned, "scanned_canonical": scanned_canonical,
+                   "counts": counts, "rows": all_rows, "dangling": dangling}
+        if aborted:
+            receipt["aborted"] = aborted
         try:
-            _write_receipt(MARKERS_RECEIPT, {
-                "ts": _iso_now(), "dry_run": dry_run, "apply_partial": apply_partial,
-                "user_id": args.user_id, "scanned": scanned, "scanned_canonical": scanned_canonical,
-                "counts": counts, "rows": all_rows, "dangling": dangling})
+            _write_receipt(MARKERS_RECEIPT, receipt)
         except OSError as e:
             print(f"contradiction-sweep: receipt not written ({MARKERS_RECEIPT}): {e}", flush=True)
-            outcome = "degraded:receipt-not-written"
+            if not aborted:
+                outcome = "degraded:receipt-not-written"
     for r in all_rows:
         print(f"  {r['kind']:9} {str(r['winner_state']):22} {r['id']} -> {r['winner_id']}  "
-              f"{r['text'][:60]!r}", flush=True)
+              f"{r['marker_text'][:60]!r}", flush=True)
     for d in dangling:
         print(f"  DANGLING  {d['winner_state']:9} {d['id']} superseded_by={d['superseded_by']}", flush=True)
     print(f"contradiction-sweep: supersede-markers done. scanned={scanned}+{scanned_canonical} canonical "

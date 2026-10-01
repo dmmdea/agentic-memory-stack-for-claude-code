@@ -10,6 +10,9 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import os
+import stat
+import sys
 from pathlib import Path
 
 import httpx
@@ -2324,13 +2327,109 @@ def test_markers_receipt_rows_carry_the_documented_fields(monkeypatch, tmp_path)
     assert sweep.run_supersede_markers(args, dry_run=True) == 0
     rows, data = _rows(receipt)
     row = rows[R_FULL]
-    assert set(row) == {"id", "kind", "winner_id", "winner_state", "qualifier", "text"}
+    assert set(row) == {"id", "kind", "winner_id", "winner_state", "qualifier", "text", "marker_text"}
     assert row["winner_id"] == W_OK and len(row["text"]) == 160 and row["text"] == long_text[:160]
+    assert row["marker_text"] == long_text[:200], "a marker at the start of the text: the 200 characters from it"
     assert rows[R_PART]["qualifier"] == "(the 'X' figure only)"
     counts = data["counts"]
     assert counts["by_kind"] == {"full": 1, "partial": 1}
     assert counts["would_convert_full"] == 1 and counts["would_annotate_partial"] == 1
     assert not list(receipt.parent.glob("*.tmp")), "the receipt is written atomically"
+
+
+def test_markers_rows_carry_the_marker_itself_not_just_the_start_of_the_record(monkeypatch, tmp_path):
+    """The marker usually sits at the END of a record, past the 160-character head the row's `text`
+    keeps, so a dry-run reader never saw what --apply acts on. marker_text is text[start:start+200]."""
+    marker = _FULL_MARKER.format(w=W_OK)
+    preface = "Port allocation notes for the ingest service. " * 12       # 540 chars, no marker in the head
+    tail_text = preface + marker + " " + "y" * 400
+    canon = [{"id": R_CANON, "payload": {"data": preface + marker, "tier": "canonical", "user_id": "u"}}]
+    _c, _s, receipt, args = _wire_markers(
+        monkeypatch, tmp_path, canonical=canon,
+        points=[_mp(R_FULL, tail_text), _mp(R_PART, preface + _PARTIAL_MARKER.format(w=W_OK))])
+    assert sweep.run_supersede_markers(args, dry_run=True) == 0
+    rows, _d = _rows(receipt)
+    assert "SUPERSEDED" not in rows[R_FULL]["text"], "the head alone does not show the marker"
+    assert rows[R_FULL]["marker_text"].startswith(marker)
+    assert rows[R_FULL]["marker_text"] == tail_text[len(preface):len(preface) + 200]
+    assert len(rows[R_FULL]["marker_text"]) == 200
+    assert rows[R_PART]["marker_text"] == (preface + _PARTIAL_MARKER.format(w=W_OK))[len(preface):]
+    assert rows[R_CANON]["marker_text"] == marker, "a canonical row (refused:canonical) shows its marker too"
+
+
+def test_markers_receipt_is_owner_only_and_replaces_a_wider_one(monkeypatch, tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits")
+    _c, _s, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    receipt.write_text("{}", encoding="utf-8")
+    os.chmod(receipt, 0o644)
+    assert sweep.run_supersede_markers(args, dry_run=True) == 0
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600, "record ids and text excerpts are not world-readable"
+    assert "rows" in json.loads(receipt.read_text(encoding="utf-8")), "the old receipt was replaced"
+
+
+def test_write_receipt_goes_through_a_pid_unique_temp_and_cleans_up_after_a_failure(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    target = out / "supersede-markers.json"
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append((Path(src), Path(dst), Path(src).exists()))
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", spy)
+    sweep._write_receipt(target, {"rows": []})
+    (src, dst, existed), = seen
+    assert dst == target and existed and src != target
+    assert str(os.getpid()) in src.name, "two concurrent runs never share a temp file"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"rows": []}
+    assert [p.name for p in out.iterdir()] == [target.name], "no temp left behind"
+
+    def boom(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        sweep._write_receipt(target, {"rows": [1]})
+    assert [p.name for p in out.iterdir()] == [target.name], "a failed replace leaves no temp"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"rows": []}, "and the old receipt stands"
+
+
+def test_markers_an_apply_that_aborts_partway_still_writes_the_receipt(monkeypatch, tmp_path):
+    """The rows already converted are the audit trail of what changed; losing them because the run
+    stopped on a 503 leaves the operator with writes and no record of which."""
+    answers = iter([_Resp(200, {"ok": True, "noop": False}), _Resp(503, {"detail": "audit ledger unavailable"})])
+    calls, summaries, receipt, args = _wire_markers(
+        monkeypatch, tmp_path, points=[_mp(R_FULL, _FULL_MARKER.format(w=W_OK)),
+                                       _mp(R_FULL2, _FULL_MARKER.format(w=W_OK))],
+        answer=lambda m, u, kw: next(answers))
+    assert sweep.run_supersede_markers(args, dry_run=False) == 1
+    assert len(_door_calls(calls)) == 2
+    rows, data = _rows(receipt)
+    assert "503" in data["aborted"], "the receipt says why the run stopped"
+    assert rows[R_FULL]["applied"] == "ok", "the rows already processed keep their applied field"
+    assert "applied" not in rows[R_FULL2], "the row that hit the 503 was not written"
+    assert data["counts"]["applied_full"] == 1
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600 or sys.platform == "win32"
+    assert summaries[-1]["outcome"].startswith("degraded"), "an aborted run is still a degraded run"
+
+
+def test_markers_a_run_that_completes_has_no_aborted_field(monkeypatch, tmp_path):
+    _c, _s, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    assert sweep.run_supersede_markers(args, dry_run=False) == 0
+    assert "aborted" not in json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_markers_a_failed_scan_writes_no_receipt_and_leaves_the_old_one(monkeypatch, tmp_path):
+    """No rows exist when the scroll fails, so there is nothing to record: the previous receipt stays."""
+    calls, summaries, receipt, args = _wire_markers(monkeypatch, tmp_path)
+    receipt.write_text('{"previous": true}', encoding="utf-8")
+
+    def down(http, user_id=None):
+        raise httpx.ConnectError("qdrant went away")
+    monkeypatch.setattr(sweep, "scroll_noncanonical", down)
+    assert sweep.run_supersede_markers(args, dry_run=True) == 1
+    assert json.loads(receipt.read_text(encoding="utf-8")) == {"previous": True}
+    assert summaries[-1]["outcome"].startswith("degraded")
 
 
 def test_markers_apply_converts_only_full_markers_whose_winner_is_ok(monkeypatch, tmp_path):
