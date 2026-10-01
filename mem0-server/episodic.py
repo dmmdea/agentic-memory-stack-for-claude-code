@@ -22,6 +22,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# A flat sibling import: the server modules live in one directory both in the repo (mem0-server/) and
+# deployed (~/apps/mem0-server/), and hook_contract.py is in the installer's MEM0_MODULES.
+from hook_contract import is_non_human_turn
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -454,6 +458,50 @@ def add_link(
 # v0.17 Phase 0.A — Within-session checkpoint functions
 # ---------------------------------------------------------------------------
 
+# The running summary of an unfinished episode: one preview per prompt a person typed, joined with
+# " | ", capped. Past the cap the opening ask stays and the newest previews follow it, one gap marker
+# between them, so a long session's summary shows how it began and where it is now.
+RUNNING_SUMMARY_SEP = " | "
+RUNNING_SUMMARY_GAP = "…"
+RUNNING_SUMMARY_CAP = 800
+
+
+def _append_running_summary(
+    existing: str | None,
+    snippet: str | None,
+    cap: int = RUNNING_SUMMARY_CAP,
+) -> str:
+    """Append *snippet* to a running summary and return the new summary (never longer than *cap*).
+
+    The pieces are joined with `` | `` exactly as given: no character-set strip, so the leading or
+    trailing pipes and spaces of real text survive. Over the cap, the first segment (the session's
+    opening ask) is kept, then a single gap marker, then as many of the newest segments as fit, so the
+    summary neither freezes on the first prompts nor loses how the session started. A summary that
+    already carries a gap marker never gains a second one. No snippet leaves the summary as it is.
+    """
+    existing = existing or ""
+    if not snippet:
+        return existing
+    joined = snippet if not existing else existing + RUNNING_SUMMARY_SEP + snippet
+    if len(joined) <= cap:
+        return joined
+    segments = joined.split(RUNNING_SUMMARY_SEP)
+    first = segments[0]
+    rest = [seg for seg in segments[1:] if seg != RUNNING_SUMMARY_GAP]  # an earlier trim's marker is re-placed below
+    if not rest:
+        return first[:cap]
+    used = len(first) + len(RUNNING_SUMMARY_SEP) + len(RUNNING_SUMMARY_GAP)  # the marker's room is reserved up front
+    kept: list[str] = []
+    for seg in reversed(rest):
+        cost = len(RUNNING_SUMMARY_SEP) + len(seg)
+        if used + cost > cap:
+            break
+        kept.insert(0, seg)
+        used += cost
+    # a legacy summary whose own opening segment is longer than the cap is cut, never overflowed
+    return RUNNING_SUMMARY_SEP.join([first, RUNNING_SUMMARY_GAP, *kept])[:cap]
+
+
 def upsert_in_progress_episode(
     conn: sqlite3.Connection,
     session_id: str,
@@ -469,8 +517,16 @@ def upsert_in_progress_episode(
     Called by the UserPromptSubmit hook on every user message so partial state
     survives VS Code restarts (the Stop hook may never fire on interruption).
 
+    The running summary records what a person typed. A prompt nobody typed (a background
+    task notification, or a message relayed from another agent session:
+    ``hook_contract.is_non_human_turn``) still lands as a checkpoint (``ended_at`` moves and
+    ``sessions.message_count`` counts it) but appends nothing to ``summary_text``, and a
+    session that opens with one starts with an empty summary.
+
     Returns (episode_id, action) where action is 'created' or 'updated'.
     """
+    if is_non_human_turn(prompt_text):
+        prompt_text = None
     now = _iso_now()
     # Ensure session exists (upsert — safe to call on existing session)
     create_session(
@@ -494,15 +550,9 @@ def upsert_in_progress_episode(
     if row:
         # UPDATE existing in_progress episode
         episode_id = row["id"]
-        # Append prompt preview to running summary (first 200 chars, separated by " | ")
-        existing_summary = row["summary_text"] or ""
-        if prompt_text:
-            snippet = prompt_text[:200]
-            new_summary = (existing_summary + " | " + snippet).strip(" | ") if existing_summary else snippet
-        else:
-            new_summary = existing_summary
-        # Cap summary at 800 chars (running log, not final summary)
-        new_summary = new_summary[:800]
+        # Append a prompt preview (first 200 chars) to the running summary, capped at 800 chars
+        # (running log, not final summary)
+        new_summary = _append_running_summary(row["summary_text"], prompt_text[:200] if prompt_text else None)
         conn.execute(
             """
             UPDATE episodes
