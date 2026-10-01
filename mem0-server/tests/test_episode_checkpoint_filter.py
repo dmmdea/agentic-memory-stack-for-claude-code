@@ -451,3 +451,39 @@ def test_the_count_route_passes_the_dict_through():
     src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
     route = src[src.index('@app.get("/v1/episodes/count")'):src.index('@app.get("/v1/episodes")')]
     assert "return _episodic_count(conn, since, brand)" in route
+
+
+# ---------------------------------------------------------------------------
+# Other readers: the MEMORY.md "Recent episodes" index lists finished episodes only
+# ---------------------------------------------------------------------------
+
+def _load_get_recent_episodes():
+    """memory-index-build.py scrolls the live store at import time, so lift the one function out of its
+    source instead of importing the script."""
+    src = (REPO_ROOT / "scripts" / "wsl" / "memory-index-build.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "get_recent_episodes")
+    ns = {"Path": Path}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "memory-index-build.py", "exec"), ns)  # noqa: S102
+    return ns["get_recent_episodes"]
+
+
+def test_the_index_lists_finished_episodes_and_skips_unfinished_ones(tmp_path, monkeypatch):
+    from _home_isolation import apply_home
+    home = apply_home(monkeypatch, tmp_path / "home")
+    conn = _connect_to(home / ".mem0" / "episodic.db")
+    init_schema(conn)
+    for i, (state, goal, ended) in enumerate((
+        ("complete", "Ship the old release", "2026-09-01T00:00:00+00:00"),
+        ("complete", "Rotate the signing key", "2026-09-02T00:00:00+00:00"),
+        ("in_progress", "", "2026-10-01T00:00:00+00:00"),
+        ("abandoned", "", "2026-10-02T00:00:00+00:00"),
+    )):
+        episodic.create_session(conn, f"s{i}", started_at=ended)
+        conn.execute(
+            "INSERT INTO episodes (session_id, started_at, ended_at, goal_text, summary_text, state) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"s{i}", ended, ended, goal, "<task-notification> running summary", state))
+    conn.commit()
+    conn.close()
+
+    rows = _load_get_recent_episodes()(7)
+    assert [r["goal_text"] for r in rows] == ["Rotate the signing key", "Ship the old release"]

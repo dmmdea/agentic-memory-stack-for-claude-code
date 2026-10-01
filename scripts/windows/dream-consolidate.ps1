@@ -318,10 +318,14 @@ function Get-RecentEpisodes {
     try {
         $key = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
         if (-not $key) { return '' }
-        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/episodes?recent=$Limit" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
+        # state=complete: the unfinished rows carry the newest ended_at and would fill the window (an older
+        # server ignores the parameter, so rows without a goal are skipped below either way)
+        $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/episodes?recent=$Limit&state=complete" -Headers @{'X-API-Key' = $key} -TimeoutSec 5
         if (-not $r) { return '' }
         $lines = @()
         foreach ($e in $r) {
+            # an unfinished or abandoned row has no goal; its text is the prompts typed so far, not an episode summary
+            if (-not $e.goal_text) { continue }
             $ended = if ($e.ended_at) { ([string]$e.ended_at).Substring(0, [Math]::Min(10, ([string]$e.ended_at).Length)) } else { '?' }
             $brand = if ($e.brand) { $e.brand } else { 'unknown' }
             $goal = if ($e.goal_text) {

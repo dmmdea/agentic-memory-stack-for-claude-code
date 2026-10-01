@@ -59,7 +59,10 @@ def get_active_goals(n=5):
 
 
 def get_recent_episodes(n=7):
-    """Read last N episodes from episodic.db for the MEMORY.md index. Returns list or empty list."""
+    """Read last N finished episodes from episodic.db for the MEMORY.md index. Returns list or empty list.
+
+    Only state='complete' rows: an unfinished (in_progress or abandoned) one has no goal and carries the
+    newest ended_at, so it would crowd real episodes out of the index as a blank line."""
     EPISODIC_DB = Path.home() / ".mem0" / "episodic.db"
     if not EPISODIC_DB.exists():
         return []
@@ -70,6 +73,7 @@ def get_recent_episodes(n=7):
             cur = conn.execute("""
                 SELECT e.id, e.goal_text, e.summary_text, e.ended_at, s.brand
                 FROM episodes e LEFT JOIN sessions s ON e.session_id = s.session_id
+                WHERE e.state = 'complete'
                 ORDER BY e.ended_at DESC LIMIT ?
             """, (n,))
             return [dict(r) for r in cur.fetchall()]

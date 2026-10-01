@@ -238,7 +238,9 @@ class Mem0Client:
         return list(self._get(f"/v1/open_questions?status={status}&limit={limit}") or [])
 
     def episodes(self, recent: int) -> list[dict]:
-        return list(self._get(f"/v1/episodes?recent={recent}") or [])
+        # finished sessions only: the unfinished ones carry the newest ended_at and would fill the window
+        # (an older server ignores ?state=, and _cycle drops unfinished rows by their state either way)
+        return list(self._get(f"/v1/episodes?recent={recent}&state=complete") or [])
 
     def add(self, text: str, metadata: dict):
         body = {"messages": text, "user_id": self.user_id, "infer": False, "metadata": metadata}
@@ -1136,7 +1138,10 @@ class Dream:
         # the consolidator and the 200 newest promotion candidates are all slices of it.
         all_ev = list(self._soft("store scroll", lambda: self.mem0.all_points()))
         insights = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in all_ev if _tier(e) == "insight")
-        episodes = self._soft("episodes", lambda: self.mem0.episodes(7))
+        # a row that is not complete (in_progress, abandoned) has no goal, and its summary is the prompts
+        # typed so far, not an episode summary: skip it rather than fall back to that text
+        episodes = [e for e in self._soft("episodes", lambda: self.mem0.episodes(7))
+                    if e.get("state", "complete") == "complete"]
         ep_lines = _lines(f"- [{_clip(e.get('ended_at') or '?', 10)}] {e.get('brand') or 'unknown'}: {_clip(e.get('goal_text') or e.get('summary_text') or '', 130)}" for e in episodes)
         open_goals = _lines(f"- [{g.get('brand') or 'unknown'}] [P{g.get('priority') or 3}] {g.get('title')}" for g in self._soft("goals", lambda: self.mem0.goals("open", 5)))
         blocked = _lines(f"- [{g.get('brand') or 'unknown'}] {g.get('title')}" for g in self._soft("blocked goals", lambda: self.mem0.goals("blocked", 3)))
