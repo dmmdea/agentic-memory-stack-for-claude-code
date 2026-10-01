@@ -4,7 +4,7 @@ A persistent, multi-tier, **measurably faithful** memory backend for Claude Code
 
 > **How to read this doc.** Skim the [bird's-eye view](#birds-eye-view) and the [six layers](#the-six-functional-layers) for the mental model; use the [component code map](#component-code-map) and [ports table](#processes--ports) as reference while reading code. Per-component deep-dives live in `docs/systems/`; end-to-end pipeline walkthroughs in `docs/flows/`; day-2 operations in [`docs/operations.md`](./docs/operations.md); the API surface in [`docs/api-contracts.md`](./docs/api-contracts.md); the full doc map in [`docs/README.md`](./docs/README.md).
 
-**Current shape** (see the `VERSION` file for the release): one **authority**, a native-Linux box, runs the memory server, Qdrant, llama-swap (the embedder and the reranker, on the GPU) and the one nightly chain of 17 steps, with the Codex CLI on demand as the judge; every other machine is a **replica PC** or **client** whose Claude Code hooks, MCP shim and SessionStart banner talk to the authority. See [Topology](#topology-one-authority-many-pcs).
+**Current shape** (see the `VERSION` file for the release): one **authority**, a native-Linux box, runs the memory server, Qdrant, llama-swap (the embedder and the reranker, on the GPU) and the one nightly chain of 18 steps, with the Codex CLI on demand as the judge; every other machine is a **replica PC** or **client** whose Claude Code hooks, MCP shim and SessionStart banner talk to the authority. See [Topology](#topology-one-authority-many-pcs).
 
 ---
 
@@ -20,7 +20,7 @@ Exactly one box holds write authority (the [One-Brain Rule](./docs/architecture/
 
 **Host kinds.** `MEM0_HOST_KIND=native` (recorded in `~/.mem0/stack.env` by the installers) is a plain Linux box; the other kind is a WSL2 distro on a Windows PC. A Windows + WSL2 box can still be installed as the authority (`install.ps1 -Role brain`, with Task Scheduler and per-job timers doing what the chain does below), but the shipped deployment is the native one and this document describes it. `deploy.sh` is the WSL deploy path and refuses a native host; the authority is deployed by re-running `install/linux-authority.sh` from the updated checkout.
 
-**The one nightly chain.** `ams-nightly.timer` fires at 03:00 local (`Persistent=true`, and the last step arms an RTC wake for 02:45) and starts `ams-nightly.target`. Its steps are `systemd/ams-step-*.service` units ordered by `After=`, never `Requires=`, so a failed step never stops the backup, and each runs through `scripts/wsl/ams-step.sh`, which appends a receipt (`~/.mem0/maintenance/receipts.jsonl`) that `GET /health/maintenance` folds. **The chain is 17 steps:** `dream` → `semantic-dedup` and `store-judge` → `index-refresh` → `wiki-index` beside `goal-recurrence-promote` → the Sunday jobs `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` → `stack-backup` → `syncoid` → `pcloud-copy` → `morning-summary` → `health-stamp` → `rtcwake`. The System A hub and judge (`ams-store`, [System A store client](./docs/systems/ams-store.md)) are part of it: `store-judge` applies the plan the dream wrote for the harness's own per-workspace memory stores to the authority's hub checkout and syncs it. `store-judge` and `wiki-index` are rendered only where a hub or a wiki source is configured, so an install without them runs 15 (details: [installer and deploy](./docs/systems/installer-and-deploy.md), [operations](./docs/operations.md)).
+**The one nightly chain.** `ams-nightly.timer` fires at 03:00 local (`Persistent=true`, and the last step arms an RTC wake for 02:45) and starts `ams-nightly.target`. Its steps are `systemd/ams-step-*.service` units ordered by `After=`, never `Requires=`, so a failed step never stops the backup, and each runs through `scripts/wsl/ams-step.sh`, which appends a receipt (`~/.mem0/maintenance/receipts.jsonl`) that `GET /health/maintenance` folds. **The chain is 18 steps:** `dream` → `semantic-dedup` and `store-judge` → `index-refresh` → `wiki-index` beside `goal-recurrence-promote` and `episode-upkeep` (daily, after the dream and before the backup: it closes `in_progress` episodes idle for more than 7 days and embeds the episode vectors a cold embedder missed) → the Sunday jobs `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` → `stack-backup` → `syncoid` → `pcloud-copy` → `morning-summary` → `health-stamp` → `rtcwake`. The System A hub and judge (`ams-store`, [System A store client](./docs/systems/ams-store.md)) are part of it: `store-judge` applies the plan the dream wrote for the harness's own per-workspace memory stores to the authority's hub checkout and syncs it. `store-judge` and `wiki-index` are rendered only where a hub or a wiki source is configured, so an install without them runs 16 (details: [installer and deploy](./docs/systems/installer-and-deploy.md), [operations](./docs/operations.md)).
 
 ---
 
@@ -38,7 +38,7 @@ flowchart LR
         MEM0["mem0 FastAPI server :18791<br/>tailnet address only<br/>tiers, admission gate, context bundle,<br/>episodic / goals / open-questions"]
         QD["Qdrant 127.0.0.1:6333<br/>mem0_egemma_768 (768-d cosine)<br/>+ episodes and wiki collections"]
         LS["llama-swap 127.0.0.1:11436<br/>EmbeddingGemma-300m (embed) + bge-reranker-v2-m3 (rerank)<br/>GPU, unload after 300 s idle"]
-        CHAIN["ams-nightly.timer 03:00<br/>17-step chain"]
+        CHAIN["ams-nightly.timer 03:00<br/>18-step chain"]
         JUDGE["Codex CLI (native judge)"]
         STORE["System A hub checkout<br/>ams-store judge-apply"]
     end
@@ -164,7 +164,7 @@ A self-writing store drifts unless something hunts stale and contradicting facts
 
 ### 6. Ops, security + the tool surface
 
-**Scheduled hygiene** (all unattended). On the authority everything scheduled is the one chain above: 17 steps, one receipt each.
+**Scheduled hygiene** (all unattended). On the authority everything scheduled is the one chain above: 18 steps, one receipt each.
 
 | Step | Runs | What |
 |---|---|---|
@@ -174,6 +174,7 @@ A self-writing store drifts unless something hunts stale and contradicting facts
 | `index-refresh` | nightly | MEMORY.md index refresh, decoupled from the dream |
 | `wiki-index` | nightly, with a wiki source | the LLM Wiki's semantic index (backstop for the session-side refresh) |
 | `goal-recurrence-promote` | nightly | promotes goals that recur across sessions |
+| `episode-upkeep` | nightly, after the dream | closes `in_progress` episodes idle for more than 7 days (rows kept, never deleted) and embeds the episode summaries whose vector a cold embedder missed (a per-id diff, at most 200 a night); the receipt names the missing episodes and reads `degraded` while any is still missing |
 | `decay-scan`, `goals-stale-sweep`, `contradiction-sweep`, `episodic-reconcile`, `retrieval-pairs` | Sundays (`--weekly Sun`) | expire/flag decayed records; stale goal hygiene; weekly Codex-judged contradiction pass; mem0 ↔ episodic link reconciliation (orphan detection, stale in-progress episodes, embedding back-fill); retrieval-pair judging |
 | `stack-backup` | nightly | SQLite online backups + Qdrant snapshots + ledgers/config, integrity-checked, with a manifest. **Retention: last 8 daily snapshots kept ≈ an 8-day restore window**; the only step that stamps `last-chain-success` |
 | `syncoid` | nightly, when its script exists | off-box ZFS replication of the dataset |

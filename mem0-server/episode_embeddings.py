@@ -16,9 +16,13 @@ embedder (both live on the `mem` object in app.py), which keeps it unit-testable
 """
 from __future__ import annotations
 
+import logging
 import random
+import threading
 import time
 from typing import Optional
+
+log = logging.getLogger("mem0-server")   # the server's own logger: the greppable lines below land in its journal
 
 EPISODE_COLLECTION = "episodes_egemma_768"
 EPISODE_DIMS = 768
@@ -97,6 +101,101 @@ def embed_episode_summary(embedder, summary_text: Optional[str]) -> Optional[lis
     # MEM-12: bounded 429 retry (llama-swap burst) — see _embed_with_429_retry.
     vec = _embed_with_429_retry(embedder, summary_text, memory_action="add")
     return list(vec) if vec is not None else None
+
+
+# 1.32.4: a cold embedder used to drop an episode vector for good. The embedder unloads after 5 idle
+# minutes and a restart or a failed start answers 500 'exited prematurely' / 503 / a refused
+# connection for a while; the shim's own retry covers 429 only (its contract is pinned) and the
+# finalize POST cannot wait (its hook times out at 5 s). The cold retry therefore lives HERE, above
+# the embedder, and both callers share it: the finalize-time background retry in app.py and the
+# episode-embed-backfill script. Waits are seconds-scale (embedder_503.RETRY_AFTER_S is 10), not the
+# shim's sub-second 429 backoff.
+COLD_RETRY_DELAYS_S = (10, 20)
+COLD_RETRY_BUDGET_S = 60.0
+
+
+def is_cold_embed_error(exc: BaseException) -> bool:
+    """True when `exc` means the embedder cannot serve RIGHT NOW (embedder_503.retry_later). What
+    embed_with_cold_retry raises after giving up on a cold embedder is still such an error, so this is how
+    a caller tells 'the seat never came up' from 'the request itself is broken'."""
+    from embedder_503 import retry_later  # lazy: it pulls fastapi, and this module stays import-light
+    return retry_later(exc) is not None
+
+
+def embed_with_cold_retry(embedder, text: Optional[str], *, delays=COLD_RETRY_DELAYS_S,
+                          budget_s: float = COLD_RETRY_BUDGET_S, sleep=time.sleep,
+                          clock=time.monotonic) -> Optional[list]:
+    """embed_episode_summary that rides out a cold or restarting embedder.
+
+    Retries ONLY when embedder_503.retry_later(exc) says the embedder cannot serve right now (refused or
+    timed-out connection, 502/503/504, llama-swap's 500 'exited prematurely'): sleeps max(retry_after,
+    delays[n]) and tries again, at most len(delays) times and never sleeping past `budget_s` since the
+    call began. Any other exception (a context-overflow 500, a 4xx, a coding error) is raised at once,
+    unretried, and so is the last cold one when the retries or the budget run out."""
+    start = clock()
+    attempt = 0
+    while True:
+        try:
+            return embed_episode_summary(embedder, text)
+        except Exception as e:
+            from embedder_503 import retry_later  # lazy, see is_cold_embed_error
+            retry_after = retry_later(e)
+            if retry_after is None or attempt >= len(delays):
+                raise
+            wait = max(retry_after, delays[attempt])
+            if clock() - start + wait > budget_s:
+                raise
+            sleep(wait)
+            attempt += 1
+
+
+class DeferredEmbedGate:
+    """Caps the finalize-time background retries: at most one in flight per episode id and `cap` overall.
+    A background task holds a worker thread while it sleeps through the backoff, so an outage that
+    finalizes a burst of sessions must not queue unbounded sleepers. A retry refused here is not lost:
+    the daily upkeep step (episodic-reconcile --upkeep) embeds whatever is still missing."""
+
+    def __init__(self, cap: int = 4):
+        self.cap = cap
+        self._active: set = set()
+        self._lock = threading.Lock()
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def acquire(self, episode_id) -> bool:
+        with self._lock:
+            if episode_id in self._active or len(self._active) >= self.cap:
+                return False
+            self._active.add(episode_id)
+            return True
+
+    def release(self, episode_id) -> None:
+        with self._lock:
+            self._active.discard(episode_id)
+
+
+def run_deferred_embed(embedder, upsert, gate: DeferredEmbedGate, episode_id: int, summary: str, payload: dict,
+                       **retry_kw) -> None:
+    """The background half of create_episode's embed: cold-retry the embed, then upsert the vector with the
+    same payload the in-request attempt would have written. Never raises (it runs after the response) and
+    always frees its gate slot. `upsert(ep_id, vector, payload)` writes one point; `retry_kw` is
+    embed_with_cold_retry's delays / budget_s / sleep / clock. Greppable outcomes:
+    'episode embed recovered ep=<id>' and 'episode embed gave up ep=<id> ...'."""
+    try:
+        vec = embed_with_cold_retry(embedder, summary, **retry_kw)
+        if vec is None:
+            log.warning("episode embed gave up ep=%s (empty summary)", episode_id)
+            return
+        upsert(episode_id, vec, payload)
+        log.info("episode embed recovered ep=%s", episode_id)
+    except Exception as e:  # noqa: BLE001 - a background task has nowhere to raise to
+        log.warning("episode embed gave up ep=%s (%s: %s); the daily upkeep step will retry it",
+                    episode_id, type(e).__name__, str(e)[:120])
+    finally:
+        gate.release(episode_id)
 
 
 def ensure_episode_collection(client, dims: int = EPISODE_DIMS, collection: str = EPISODE_COLLECTION) -> bool:

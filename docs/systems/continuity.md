@@ -32,7 +32,7 @@ Stop / PreCompact → finalize_episode()
                      → episodes.state = 'complete'
                      → goal_text + summary_text set from L1a extraction
 
-Stale-sweep (episodic-reconcile, Sundays) → episodes.state = 'abandoned'
+Stale-sweep (episode-upkeep daily; episodic-reconcile Sundays too) → episodes.state = 'abandoned'
                          → for in_progress rows whose last checkpoint is older than 7 days
 ```
 
@@ -202,7 +202,7 @@ silently skipped (no error output).
 |---|---|---|
 | `in_progress` | `upsert_in_progress_episode()` | Every UserPromptSubmit (the row's `ended_at` and the session's `message_count` move on every one; only a human prompt adds to `summary_text`) |
 | `complete` | `finalize_episode()` | Stop / PreCompact hook |
-| `abandoned` | `episodic-reconcile.py` (`abandon_stale_in_progress`) | Sunday sweep: `in_progress` rows whose `ended_at` (the last checkpoint) is older than `--stale-days` (7); the count is in the receipt (`abandoned_stale_in_progress`). Sessions that produced no extraction used to stay `in_progress` forever. |
+| `abandoned` | `episodic-reconcile.py` (`sweep_stale_in_progress`) | The daily `episode-upkeep` step (`--upkeep`) and the Sunday run: `in_progress` rows whose `ended_at` (the last checkpoint) is older than `--stale-days` (7). The receipt names them (`abandoned_sample`, `abandoned_oldest_ended_at`, `in_progress_remaining`). Sessions that produced no extraction used to stay `in_progress` forever. Rows are never deleted and their text is not rewritten; `--dry-run` reports `would_abandon` and writes nothing. |
 
 **Idempotency:** `upsert_in_progress_episode` uses a SELECT-then-INSERT/UPDATE
 pattern (not UPSERT SQL) to handle the `state='in_progress'` filter correctly.

@@ -1574,8 +1574,15 @@ try {
 # non-ok outcome, or >14d stale; OK on a fresh clean run. Weekly timer Sun 05:30.
 try {
     $erLog = "$TmsHomeUnc\.mem0\episodic-reconciliation.jsonl"
+    # 1.32.4: the daily episode-upkeep step appends its own lines ("mode":"upkeep") to this file. They carry
+    # no orphan / drift / coverage fields and land every night, so this WEEKLY row reads the last reconcile
+    # line, not the last line (a dead Sunday run would otherwise hide behind a fresh daily upkeep line).
+    $erRuns = @()
     if (Test-Path $erLog) {
-        $erRuns = @(Get-Content $erLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} })
+        $erRuns = @(Get-Content $erLog | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { -not ($_.PSObject.Properties['mode'] -and [string]$_.mode -eq 'upkeep') })
+    }
+    if ($erRuns.Count -gt 0) {
         $erLast = $erRuns[-1]
         $erAge = (Get-Date) - [datetime]$erLast.ts
         $erOutcome = if ($erLast.PSObject.Properties['outcome']) { [string]$erLast.outcome } else { 'n/a' }

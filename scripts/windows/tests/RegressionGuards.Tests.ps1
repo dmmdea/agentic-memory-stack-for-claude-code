@@ -324,6 +324,13 @@ Describe 'W2 stop-the-bleeding guards stay wired (audit 2026-08-07: AMS-01/09/10
         $script:tmsCode | Should -Not -Match "'learn-rules\.jsonl', 'promote-queue\.jsonl'" -Because 'the old debt probe read a state path nothing writes; the drain owns the queue'
     }
 
+    It '1.32.4: the episodic reconcile row reads the last WEEKLY line, not the daily episode-upkeep lines in the same JSONL' {
+        # episodic-reconcile.py --upkeep appends a "mode":"upkeep" line every night to the file the Sunday run
+        # also writes. Without this filter the row would judge the newest upkeep line (no orphan or drift
+        # fields) and a dead Sunday run would hide behind a fresh daily one.
+        $script:tmsCode | Should -Match '(?s)episodic-reconciliation\.jsonl.{0,400}\[string\]\$_\.mode -eq .upkeep..{0,200}\$erLast = \$erRuns\[-1\]' -Because 'the row must drop mode=upkeep lines before it picks the last run'
+    }
+
     It 'the new headless suites actually gate CI (silent-not-gating is the W1 failure class)' {
         foreach ($t in 'test_payload_carryover.py', 'test_sparse_health.py', 'test_mojibake_check.py',
                        'test_capabilities.py', 'test_job_liveness.py') {

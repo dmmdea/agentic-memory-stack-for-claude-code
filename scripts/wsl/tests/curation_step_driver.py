@@ -137,8 +137,44 @@ def _episodic(scenario: str) -> int:
     return recon.main()
 
 
+def _episodic_upkeep(scenario: str) -> int:
+    """`episodic-reconcile.py --upkeep` (the daily episode-upkeep step) over a ledger with one stale checkpoint,
+    its vector backfill faked. Nothing may touch Qdrant or the embedder directly: httpx.get raises."""
+    sys.path.insert(0, str(SERVER))
+    from episodic import _connect_to, init_schema      # the REAL ledger schema
+
+    recon = _load("episodic_reconcile", "episodic-reconcile.py")
+    db = Path.home() / ".mem0" / "episodic.db"
+    conn = _connect_to(db)
+    init_schema(conn)
+    stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=20)).isoformat()
+    conn.execute("INSERT INTO sessions (session_id, started_at) VALUES ('s1', ?)", (stale,))
+    conn.execute("INSERT INTO episodes (id, session_id, started_at, ended_at, goal_text, summary_text, state) "
+                 "VALUES (1, 's1', ?, ?, '', ?, 'in_progress')", (stale, stale, "x" * 80))
+    conn.commit()
+    conn.close()
+    if scenario == "episodic-upkeep-ok":
+        result = {"embedded": 3, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 3,
+                  "missing": 3, "missing_ids": [4, 5, 6], "remaining_ids": []}
+    elif scenario == "episodic-upkeep-embedder-down":
+        result = {"embedded": 0, "skipped": 0, "errors": 0, "remaining": 4, "total_complete": 4, "missing": 4,
+                  "missing_ids": [4, 5, 6, 7], "remaining_ids": [4, 5, 6, 7], "aborted": "embedder-down"}
+    else:
+        raise SystemExit(f"unknown episodic scenario {scenario}")
+
+    def no_network(*a, **k):
+        raise AssertionError("the upkeep must not call httpx directly (Qdrant gate / embedder probe)")
+
+    recon._load_backfill = lambda: types.SimpleNamespace(run=lambda limit=None, db_path=None, **kw: dict(result))
+    recon.httpx.get = no_network
+    sys.argv = ["episodic-reconcile.py", "--db", str(db), "--upkeep"]
+    return recon.main()
+
+
 def main() -> int:
     scenario = sys.argv[1]
+    if scenario.startswith("episodic-upkeep"):
+        return _episodic_upkeep(scenario)
     if scenario.startswith("sweep-"):
         return _sweep(scenario)
     if scenario.startswith("dedup-"):

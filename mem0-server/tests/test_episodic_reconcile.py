@@ -596,8 +596,8 @@ class _FakeBackfill:
         self.result, self.error, self.calls = result or {"embedded": 7, "skipped": 0, "errors": 0,
                                                          "remaining": 0, "total_complete": 7}, error, []
 
-    def run(self, limit=None, db_path=None):
-        self.calls.append({"limit": limit, "db_path": db_path})
+    def run(self, limit=None, db_path=None, **kw):
+        self.calls.append({"limit": limit, "db_path": db_path, **kw})
         if self.error:
             raise self.error
         return dict(self.result)
@@ -607,13 +607,38 @@ def test_backfill_is_bounded_and_skipped_when_the_embedder_is_down(monkeypatch, 
     fake = _FakeBackfill()
     monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
     monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("down")))
-    out = recon.run_embedding_backfill(500, tmp_path / "e.db")
+    sleeps = []
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db", wait_s=30, step_s=15, sleep=sleeps.append)
     assert out["not_run"] == "embedder-down" and fake.calls == []
+    assert sleeps == [15, 15], "it polled the whole window before giving up"
 
     monkeypatch.setattr(recon.httpx, "get", lambda url, **kw: _types.SimpleNamespace(raise_for_status=lambda: None))
     out = recon.run_embedding_backfill(500, tmp_path / "e.db")
     assert fake.calls == [{"limit": 500, "db_path": tmp_path / "e.db"}]
     assert out["embedded"] == 7 and "not_run" not in out
+
+
+def test_a_cold_embedder_is_waited_for_not_skipped(monkeypatch, tmp_path):
+    """The first GET of a job lands on an unloaded seat and answers 503 while it loads: a one-shot
+    probe read that as 'down' and skipped the whole run (the weekly backfill, and the backfill the
+    daily upkeep makes). It polls /health/embedder through the shared ams_env.wait_for_embedder."""
+    fake = _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    answers, sleeps, urls = [503, 503, 200], [], []
+
+    def get(url, **kw):
+        urls.append(url)
+        return httpx.Response(answers.pop(0), request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(recon.httpx, "get", get)
+    out = recon.run_embedding_backfill(500, tmp_path / "e.db", wait_s=120, step_s=15, sleep=sleeps.append)
+    assert sleeps == [15, 15] and len(urls) == 3 and all(u.endswith("/health/embedder") for u in urls)
+    assert out["embedded"] == 7 and "not_run" not in out
+    assert fake.calls == [{"limit": 500, "db_path": tmp_path / "e.db"}]
+
+
+def test_the_reconcile_polls_for_two_minutes_every_fifteen_seconds_by_default():
+    assert (recon.EMBEDDER_WAIT_S, recon.EMBEDDER_STEP_S) == (120, 15)
 
 
 def test_backfill_failure_is_fail_soft(monkeypatch, tmp_path):
@@ -756,3 +781,606 @@ def test_backfill_script_stops_after_consecutive_embed_failures(tmp_path):
     conn.close()
     assert out["embedded"] == 2 and out["errors"] == mod.MAX_CONSECUTIVE_ERRORS
     assert out["aborted"] and out["remaining"] == 18
+
+
+# --- 1.32.4: the backfill rides out a cold start, diffs first, and reports a verdict ---------------------
+#
+# Its first run after an embedder restart left four vectors missing (500 'exited prematurely' while the seat
+# started; the second run embedded them), and nothing told the operator. Cold-shaped failures are retried per
+# row inside a RUN budget (episode_embeddings.embed_with_cold_retry); a seat that does not come up aborts the
+# run as 'embedder-down'; the SQL-eligible minus Qdrant-ids diff comes first so a run with nothing missing
+# makes no embedder call at all; and under ams-step it writes the one outcome line the chain reads.
+
+COLD_START_BODY = {"error": {"message": "unspecific error: upstream command exited prematurely",
+                             "type": "server_error"}}
+CTX_OVERFLOW_BODY = {"error": {"message": "input is too large to process", "type": "server_error"}}
+_REQ = httpx.Request("POST", "http://embedder.invalid/v1/embeddings")
+
+
+def _http_error(status, body):
+    return httpx.HTTPStatusError(f"HTTP {status}", request=_REQ,
+                                 response=httpx.Response(status, json=body, request=_REQ))
+
+
+class _ScriptedEmb:
+    """embed() raises each queued exception in turn (None = succeed), then succeeds forever."""
+
+    def __init__(self, *script):
+        self.script, self.n = list(script), 0
+
+    def embed(self, text, memory_action=None):
+        self.n += 1
+        err = self.script.pop(0) if self.script else None
+        if err is not None:
+            raise err
+        return [0.1, 0.2, 0.3]
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.now += s
+
+
+def _run_backfill(tmp_path, emb, n=1, existing=None, limit=None, **kw):
+    mod, clock, written = _load_backfill_script(), _FakeClock(), []
+    conn = _backfill_db(tmp_path, n=n)
+    out = mod.backfill(conn, set(existing or ()), emb, lambda ep, vec, payload: written.append(ep), limit=limit,
+                       sleep=clock.sleep, clock=clock.monotonic, **kw)
+    conn.close()
+    return out, clock, written
+
+
+@pytest.mark.parametrize("cold", [
+    lambda: _http_error(500, COLD_START_BODY),
+    lambda: _http_error(503, {"error": "loading"}),
+    lambda: httpx.ConnectError("refused"),
+], ids=["500-exited-prematurely", "503", "connect-error"])
+def test_backfill_retries_one_cold_failure_and_embeds_the_row(tmp_path, cold):
+    emb = _ScriptedEmb(cold())
+    out, clock, written = _run_backfill(tmp_path, emb, n=1)
+    assert emb.n == 2 and out["embedded"] == 1 and out["errors"] == 0 and out["aborted"] is None
+    assert written == [1] and len(clock.sleeps) == 1 and clock.sleeps[0] >= 10
+
+
+def test_backfill_does_not_retry_a_context_overflow_500(tmp_path):
+    emb = _ScriptedEmb(_http_error(500, CTX_OVERFLOW_BODY))
+    out, clock, written = _run_backfill(tmp_path, emb, n=3)
+    assert emb.n == 3 and clock.sleeps == [], "a request that can never fit is not replayed"
+    assert out["errors"] == 1 and out["embedded"] == 2 and out["aborted"] is None
+
+
+def test_backfill_aborts_as_embedder_down_when_the_seat_never_comes_up_without_burning_the_budget(tmp_path):
+    emb = _ScriptedEmb(*[httpx.ConnectError("refused")] * 50)
+    out, clock, written = _run_backfill(tmp_path, emb, n=20)
+    assert out["aborted"] == "embedder-down" and out["errors"] >= 1 and out["embedded"] == 0
+    assert emb.n == 3 and clock.sleeps == [10, 20], "one row's retries, then stop: not five rows of them"
+    assert out["remaining"] == 20 and written == []
+
+
+def test_backfill_run_budget_is_shared_across_rows(tmp_path):
+    """Each cold row spends from ONE run budget: a flapping seat cannot cost budget-per-row."""
+    cold = httpx.ConnectError("refused")
+    emb = _ScriptedEmb(cold, None, cold, cold, cold)       # row 1 recovers after 10 s; row 2 never does
+    out, clock, written = _run_backfill(tmp_path, emb, n=6, retry_budget_s=15)
+    assert clock.sleeps == [10], "row 1 spent 10 of the 15 s: row 2 cannot afford its own 10 s wait"
+    assert emb.n == 3 and out["embedded"] == 1 and out["aborted"] == "embedder-down" and out["remaining"] == 5
+
+
+def test_backfill_still_stops_after_consecutive_plain_failures(tmp_path):
+    out, clock, _ = _run_backfill(tmp_path, _Emb(fail_from=3), n=20, limit=500)
+    assert out["embedded"] == 2 and out["aborted"] and out["aborted"] != "embedder-down"
+    assert out["errors"] == _load_backfill_script().MAX_CONSECUTIVE_ERRORS and clock.sleeps == []
+
+
+def test_backfill_with_nothing_missing_makes_zero_embedder_calls(tmp_path):
+    emb = _ScriptedEmb()
+    out, clock, written = _run_backfill(tmp_path, emb, n=4, existing={1, 2, 3, 4})
+    assert emb.n == 0 and written == [] and clock.sleeps == []
+    assert out["embedded"] == 0 and out["missing"] == 0 and out["remaining"] == 0 and out["missing_ids"] == []
+
+
+def test_backfill_reports_the_exact_per_id_gap(tmp_path):
+    """The coverage probe is a count diff (SQL TRIM vs Python strip, stale points masking real gaps); the
+    backfill's own diff is per id, so a gap of 4 reads as 4 ids, not '99 %'."""
+    out, _, written = _run_backfill(tmp_path, _ScriptedEmb(), n=8, existing={8}, limit=3)
+    assert written == [7, 6, 5]
+    assert out["missing"] == 7 and out["missing_ids"] == [7, 6, 5, 4, 3, 2, 1]
+    assert out["remaining"] == 4 and out["remaining_ids"] == [4, 3, 2, 1]
+
+
+def test_a_whitespace_padded_short_summary_is_not_counted_missing(tmp_path):
+    """Eligibility is Python strip() >= 64 chars: a row SQLite's TRIM would count (tabs and newlines survive
+    TRIM) but the indexer never embeds must not show up as a missing vector."""
+    mod = _load_backfill_script()
+    conn = _backfill_db(tmp_path, n=2)
+    conn.execute("UPDATE episodes SET summary_text = ? WHERE id = 1", ("\t\n" * 40 + "short",))
+    conn.commit()
+    out = mod.backfill(conn, set(), _ScriptedEmb(), lambda *a: None)
+    conn.close()
+    assert out["missing_ids"] == [2] and out["embedded"] == 1
+
+
+def _core(tmp_path, n=4, existing=(), embedder=None, wait_result=True, **kw):
+    mod, clock = _load_backfill_script(), _FakeClock()
+    conn = _backfill_db(tmp_path, n=n)
+    calls = {"embedder": 0, "wait": []}
+    written = []
+
+    def make_embedder():
+        calls["embedder"] += 1
+        return embedder or _ScriptedEmb()
+
+    def wait(total_s):
+        calls["wait"].append(total_s)
+        return wait_result
+
+    out = mod._run_core(conn, set(existing), make_embedder, lambda ep, vec, payload: written.append(ep),
+                        wait=wait, sleep=clock.sleep, clock=clock.monotonic, **kw)
+    conn.close()
+    return out, calls, written
+
+
+def test_run_with_nothing_missing_builds_no_embedder_and_does_not_wait(tmp_path):
+    out, calls, written = _core(tmp_path, n=3, existing={1, 2, 3}, wait_embedder_s=120)
+    assert calls == {"embedder": 0, "wait": []} and written == []
+    assert out["missing"] == 0 and out["embedded"] == 0 and out["remaining"] == 0
+
+
+def test_run_dry_run_reports_the_gap_and_touches_nothing(tmp_path):
+    out, calls, written = _core(tmp_path, n=4, existing={4}, dry_run=True, wait_embedder_s=120)
+    assert calls == {"embedder": 0, "wait": []} and written == []
+    assert out["missing"] == 3 and out["missing_ids"] == [1, 2, 3] and out["embedded"] == 0
+    assert out["remaining"] == 3 and out["dry_run"] is True
+
+
+def test_run_waits_for_the_embedder_only_when_something_is_missing(tmp_path):
+    out, calls, written = _core(tmp_path, n=3, existing={1}, wait_embedder_s=120)
+    assert calls["wait"] == [120] and calls["embedder"] == 1 and written == [2, 3] and out["embedded"] == 2
+
+
+def test_run_that_cannot_reach_the_embedder_aborts_without_building_it(tmp_path):
+    out, calls, written = _core(tmp_path, n=3, wait_embedder_s=120, wait_result=False)
+    assert calls["embedder"] == 0 and written == []
+    assert out["aborted"] == "embedder-down" and out["remaining"] == 3 and out["embedded"] == 0
+
+
+def test_run_without_a_wait_window_goes_straight_to_the_embedder(tmp_path):
+    out, calls, written = _core(tmp_path, n=2)
+    assert calls == {"embedder": 1, "wait": []} and written == [1, 2]
+
+
+@pytest.mark.parametrize("res, expected", [
+    ({"embedded": 5, "remaining": 0, "errors": 0}, "ok"),
+    ({"embedded": 0, "remaining": 0, "errors": 0, "missing": 0}, "ok"),
+    ({"embedded": 0, "remaining": 4, "errors": 0, "aborted": "embedder-down"}, "degraded:embedder-down"),
+    ({"embedded": 2, "remaining": 18, "errors": 5, "aborted": "5 consecutive embed failures (last: x)"},
+     "degraded:embed-errors-5"),
+    ({"embedded": 9, "remaining": 1, "errors": 1}, "degraded:embed-errors-1"),
+    ({"embedded": 200, "remaining": 800, "errors": 0}, "degraded:remaining-800"),
+    ({"embedded": 0, "error": "ConnectError: qdrant"}, "degraded:backfill-failed"),
+])
+def test_backfill_outcome_verdicts(res, expected):
+    assert _load_backfill_script().outcome_for(res) == expected
+
+
+def _main_script(monkeypatch, tmp_path, res, argv=(), outcome=True):
+    mod = _load_backfill_script()
+    seen = {}
+
+    def fake_run(**kw):
+        seen.update(kw)
+        return dict(res)
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    out_file = tmp_path / "outcome.txt"
+    if outcome:
+        monkeypatch.setenv("AMS_OUTCOME_FILE", str(out_file))
+    else:
+        monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    return mod, mod.main(list(argv)), seen, out_file
+
+
+def test_script_cli_flags_reach_run(monkeypatch, tmp_path):
+    ok = {"embedded": 0, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 0, "missing": 0}
+    _, rc, seen, _ = _main_script(monkeypatch, tmp_path, ok, [
+        "--limit", "7", "--db", str(tmp_path / "x.db"), "--wait-embedder", "90", "--retry-budget-s", "45"])
+    assert rc == 0
+    assert seen == {"limit": 7, "db_path": str(tmp_path / "x.db"), "wait_embedder_s": 90.0,
+                    "retry_budget_s": 45.0, "dry_run": False}
+
+
+def test_script_with_no_arguments_keeps_the_hand_run_behaviour(monkeypatch, tmp_path):
+    ok = {"embedded": 3, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 3, "missing": 3}
+    _, rc, seen, _ = _main_script(monkeypatch, tmp_path, ok, outcome=False)
+    assert rc == 0 and seen["limit"] is None, "all rows, oldest first"
+    assert seen["wait_embedder_s"] == 0
+
+
+def test_script_rejects_a_zero_limit(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        _main_script(monkeypatch, tmp_path, {}, ["--limit", "0"])
+
+
+@pytest.mark.parametrize("res, status", [
+    ({"embedded": 4, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 4, "missing": 4}, "ok"),
+    ({"embedded": 0, "skipped": 0, "errors": 1, "remaining": 4, "total_complete": 4, "missing": 4,
+      "aborted": "embedder-down"}, "degraded:embedder-down"),
+    ({"embedded": 1, "skipped": 0, "errors": 2, "remaining": 3, "total_complete": 4, "missing": 4},
+     "degraded:embed-errors-2"),
+    ({"embedded": 2, "skipped": 0, "errors": 0, "remaining": 6, "total_complete": 8, "missing": 8},
+     "degraded:remaining-6"),
+])
+def test_script_writes_the_ams_step_outcome_line_and_exits_zero_for_a_reported_state(
+        monkeypatch, tmp_path, res, status):
+    _, rc, _, out_file = _main_script(monkeypatch, tmp_path, res)
+    assert rc == 0, "a degraded state under ams-step is reported through the line, not the exit code"
+    got, _, body = out_file.read_text(encoding="utf-8").strip().partition(" ")
+    assert got == status
+    counts = _json.loads(body)
+    assert counts["embedded"] == res["embedded"] and counts["remaining"] == res["remaining"]
+    assert counts["errors"] == res["errors"] and counts["missing"] == res["missing"]
+
+
+def test_script_without_the_outcome_file_keeps_the_legacy_exit_one_on_errors(monkeypatch, tmp_path):
+    bad = {"embedded": 1, "skipped": 0, "errors": 2, "remaining": 3, "total_complete": 4, "missing": 4}
+    _, rc, _, out_file = _main_script(monkeypatch, tmp_path, bad, outcome=False)
+    assert rc == 1 and not out_file.exists()
+    clean = {"embedded": 4, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 4, "missing": 4}
+    assert _main_script(monkeypatch, tmp_path, clean, outcome=False)[1] == 0
+
+
+def test_dry_run_with_a_limit_lists_the_ids_in_the_order_the_real_run_would_take_them(tmp_path):
+    out, calls, _ = _core(tmp_path, n=6, existing={6}, dry_run=True, limit=2)
+    assert out["missing_ids"] == [5, 4, 3, 2, 1] and calls["embedder"] == 0
+
+
+def test_the_embedder_is_built_only_inside_the_gap_gate():
+    """build_embedder imports mem0 and wires llama-swap: it must be reachable only through the factory that
+    _run_core calls once something is missing, never at import time or on a nothing-missing run."""
+    import ast
+    src = (REPO_ROOT / "scripts" / "wsl" / "episode-embed-backfill.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    holders = [fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+               for n in ast.walk(fn) if isinstance(n, ast.ImportFrom) and n.module == "config"]
+    assert holders and set(holders) <= {"make_embedder", "run"}, holders
+    assert not [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
+                and getattr(n, "module", None) == "config"]
+
+
+# --- 1.32.4: the daily upkeep closes stale checkpoints and retries missed vectors ----------------------
+#
+# `abandon_stale_in_progress` shipped in 1.32.0 but only runs in the Sunday chain step, after the Qdrant
+# readiness gate, with no dry-run and a bare count for a receipt: 1,063 episodes sat `in_progress` (1,009 of
+# them older than 7 days) and nobody could see what the first run would touch. It now selects ids and closes
+# them under one write lock, says which, runs before the Qdrant gate (it is SQLite-only), and a new
+# `--upkeep` mode (the daily chain step) does that plus the bounded vector backfill and nothing else.
+
+_DAY = _dtmod.timedelta(days=1)
+
+
+def _iso_ago(days):
+    return (_NOW - days * _DAY).isoformat()
+
+
+def _stale_ledger(tmp_path):
+    return _real_ledger(tmp_path, [
+        ("in_progress", _iso_ago(30)),      # 1: the oldest orphan
+        ("in_progress", _iso_ago(10)),      # 2
+        ("in_progress", _iso_ago(1)),       # 3: a live session's checkpoint
+        ("complete", _iso_ago(40)),         # 4: finished
+        ("in_progress", _iso_ago(8)),       # 5
+    ])
+
+
+def _ledger_snapshot(db):
+    c = sqlite3.connect(db)
+    try:
+        return c.execute("SELECT id, session_id, started_at, ended_at, goal_text, summary_text FROM episodes "
+                         "ORDER BY id").fetchall()
+    finally:
+        c.close()
+
+
+def test_sweep_dry_run_reports_what_it_would_close_and_writes_nothing(tmp_path):
+    db = _stale_ledger(tmp_path)
+    before = db.read_bytes()
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW, dry_run=True)
+    assert info["would_abandon"] == 3 and info["abandoned"] == 0 and info["dry_run"] is True
+    assert [s["id"] for s in info["abandoned_sample"]] == [1, 2, 5]
+    assert info["in_progress_remaining"] == 4
+    assert db.read_bytes() == before, "not one byte of the ledger changed"
+    assert _states(db) == {1: "in_progress", 2: "in_progress", 3: "in_progress", 4: "complete", 5: "in_progress"}
+
+
+def test_sweep_receipt_names_the_rows_it_closed(tmp_path):
+    db = _stale_ledger(tmp_path)
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW, sample_cap=2)
+    assert info["abandoned"] == 3 and info["would_abandon"] == 3 and info["dry_run"] is False
+    assert info["abandoned_sample"] == [{"id": 1, "session_id": "s1", "ended_at": _iso_ago(30)},
+                                        {"id": 2, "session_id": "s2", "ended_at": _iso_ago(10)}], \
+        "oldest first, capped by sample_cap"
+    assert info["abandoned_oldest_ended_at"] == _iso_ago(30)
+    assert info["in_progress_remaining"] == 1, "only the live session's checkpoint is left"
+    assert _states(db) == {1: "abandoned", 2: "abandoned", 3: "in_progress", 4: "complete", 5: "abandoned"}
+    again = recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert again["abandoned"] == 0 and again["abandoned_oldest_ended_at"] is None, "idempotent"
+
+
+def test_sweep_never_deletes_or_rewrites_a_row(tmp_path):
+    db = _stale_ledger(tmp_path)
+    before = _ledger_snapshot(db)
+    recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert _ledger_snapshot(db) == before, "only the state column moves: no row deleted, no text rewritten"
+
+
+def test_a_row_that_stopped_being_stale_after_the_select_is_not_clobbered(tmp_path):
+    db = _stale_ledger(tmp_path)
+    cutoff = _iso_ago(7)
+    conn = sqlite3.connect(db)
+    ids = [r[0] for r in recon.select_stale_in_progress(conn, cutoff)]
+    assert ids == [1, 2, 5]
+    # between the SELECT and the UPDATE: episode 1 is finalized, episode 2 gets a fresh checkpoint
+    conn.execute("UPDATE episodes SET state = 'complete' WHERE id = 1")
+    conn.execute("UPDATE episodes SET ended_at = ? WHERE id = 2", (_NOW.isoformat(),))
+    conn.commit()
+    assert recon.abandon_ids(conn, ids, cutoff) == 1
+    conn.commit()
+    conn.close()
+    assert _states(db) == {1: "complete", 2: "in_progress", 3: "in_progress", 4: "complete", 5: "abandoned"}
+
+
+def test_a_competing_writer_is_locked_out_between_the_select_and_the_update(tmp_path, monkeypatch):
+    """The checkpoint hook writes to the same ledger. The sweep takes the write lock BEFORE it selects
+    (BEGIN IMMEDIATE), so a checkpoint waits for the commit and then opens a fresh row instead of
+    bumping one the sweep is about to close."""
+    db = _stale_ledger(tmp_path)
+    real_select = recon.select_stale_in_progress
+    seen = {}
+
+    def spying_select(conn, cutoff):
+        rows = real_select(conn, cutoff)
+        other = sqlite3.connect(db, timeout=0.1)
+        try:
+            other.execute("UPDATE episodes SET ended_at = ? WHERE id = 2", (_NOW.isoformat(),))
+            other.commit()
+            seen["locked"] = False
+        except sqlite3.OperationalError as e:
+            seen["locked"] = "locked" in str(e)
+        finally:
+            other.close()
+        return rows
+
+    monkeypatch.setattr(recon, "select_stale_in_progress", spying_select)
+    info = recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert seen == {"locked": True} and info["abandoned"] == 3
+
+
+def test_the_sweep_rolls_back_when_it_fails_midway(tmp_path, monkeypatch):
+    db = _stale_ledger(tmp_path)
+
+    def boom(conn, ids, cutoff):
+        conn.execute("UPDATE episodes SET state = 'abandoned' WHERE id = 1")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(recon, "abandon_ids", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        recon.sweep_stale_in_progress(db, days=7, now=_NOW)
+    assert _states(db)[1] == "in_progress", "a half-done sweep leaves the ledger as it was"
+    info, err = recon.try_sweep_stale(db, days=7, now=_NOW)
+    assert info["abandoned"] == 0 and "disk I/O error" in err
+
+
+def test_the_default_staleness_window_is_still_seven_days(monkeypatch, tmp_path):
+    assert recon.STALE_IN_PROGRESS_DAYS == 7
+    db = _real_ledger(tmp_path, [("in_progress", (_dtmod.datetime.now(_dtmod.timezone.utc) - 6 * _DAY).isoformat()),
+                                 ("in_progress", (_dtmod.datetime.now(_dtmod.timezone.utc) - 8 * _DAY).isoformat())])
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], db=db)
+    assert _states(db) == {1: "in_progress", 2: "abandoned"} and r.rc == 0
+
+
+class _Boom:
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, *a, **kw):
+        raise AssertionError(f"{self.name} must not run in this mode")
+
+
+def _main_run(monkeypatch, tmp_path, args=(), rows=None, backfill=None, coverage=None, http_get=None,
+              outcome=True, db=None):
+    """main() over a real-schema ledger. --upkeep makes every orphan / drift / coverage / Qdrant seam raise."""
+    db = db or _real_ledger(tmp_path, rows if rows is not None else [("in_progress", _iso_ago(20))])
+    fake = backfill or _FakeBackfill()
+    monkeypatch.setattr(recon, "_load_backfill", lambda: fake)
+    summaries = []
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    out_file = tmp_path / "outcome.txt"
+    if outcome:
+        monkeypatch.setenv("AMS_OUTCOME_FILE", str(out_file))
+    else:
+        monkeypatch.delenv("AMS_OUTCOME_FILE", raising=False)
+    healthy = _types.SimpleNamespace(raise_for_status=lambda: None)
+    if "--upkeep" in args:
+        for name in ("read_episode_links", "existing_episode_ids", "embedding_coverage", "qdrant_present_ids",
+                     "history_deleted_ids", "history_delete_row_count", "ledger_deleted"):
+            monkeypatch.setattr(recon, name, _Boom(name))
+        monkeypatch.setattr(recon.httpx, "get", http_get or _Boom("httpx.get (the Qdrant gate / embedder probe)"))
+    else:
+        monkeypatch.setattr(recon, "embedding_coverage",
+                            lambda conn, http: dict(coverage or {"eligible": 10, "embedded": 10, "missing": 0}))
+        monkeypatch.setattr(recon, "history_deleted_ids", lambda ids, db_path=None: set())
+        monkeypatch.setattr(recon, "history_delete_row_count", lambda db_path=None: 1)
+        monkeypatch.setattr(recon, "ledger_deleted", lambda ids, ledger_dir=None: {})
+        monkeypatch.setattr(recon, "qdrant_present_ids", lambda http, ids: set())
+        monkeypatch.setattr(recon.httpx, "get", http_get or (lambda url, **kw: healthy))
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--db", str(db), *args])
+    rc = recon.main()
+    return _types.SimpleNamespace(rc=rc, summaries=summaries, fake=fake, outcome_file=out_file, db=db)
+
+
+def _outcome(r):
+    status, _, body = r.outcome_file.read_text(encoding="utf-8").strip().partition(" ")
+    return status, _json.loads(body)
+
+
+def test_the_weekly_sweep_runs_before_the_qdrant_gate(monkeypatch, tmp_path):
+    """The sweep is SQLite-only: a Qdrant outage must not stop it (it used to sit after the readiness gate)."""
+    def qdrant_down(url, **kw):
+        raise httpx.ConnectError("qdrant down")
+
+    r = _main_run(monkeypatch, tmp_path, http_get=qdrant_down, outcome=False)
+    assert r.rc == 1 and _states(r.db) == {1: "abandoned"}
+    s = r.summaries[-1]
+    assert s["outcome"] == "degraded:qdrant-unreachable" and s["abandoned_stale_in_progress"] == 1
+    assert s["abandoned_sample"][0]["id"] == 1 and r.fake.calls == []
+
+
+def test_the_weekly_receipt_carries_the_sweep_fields(monkeypatch, tmp_path):
+    r = _main_run(monkeypatch, tmp_path, ["--limit-sample", "1"], rows=[
+        ("in_progress", _iso_ago(30)), ("in_progress", _iso_ago(20))])
+    s = r.summaries[-1]
+    assert s["abandoned_stale_in_progress"] == 2 and s["would_abandon"] == 2 and s["dry_run"] is False
+    assert [x["id"] for x in s["abandoned_sample"]] == [1], "capped by --limit-sample"
+    assert s["abandoned_oldest_ended_at"] == _iso_ago(30) and s["in_progress_remaining"] == 0
+
+
+def test_main_dry_run_changes_nothing_and_appends_no_receipt(monkeypatch, tmp_path, capsys):
+    r = _main_run(monkeypatch, tmp_path, ["--dry-run"])
+    assert _states(r.db) == {1: "in_progress"}, "nothing abandoned"
+    assert r.summaries == [] and r.fake.calls == [] and not r.outcome_file.exists()
+    out = capsys.readouterr().out
+    assert '"would_abandon": 1' in out and '"dry_run": true' in out
+
+
+def test_upkeep_closes_stale_rows_and_backfills_and_skips_every_other_pass(monkeypatch, tmp_path):
+    bf = _FakeBackfill({"embedded": 3, "skipped": 0, "errors": 0, "remaining": 0, "total_complete": 3,
+                        "missing": 3, "missing_ids": [4, 5, 6], "remaining_ids": []})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=bf)
+    assert r.rc == 0 and _states(r.db) == {1: "abandoned"}
+    assert bf.calls == [{"limit": 200, "db_path": r.db, "dry_run": False, "wait_embedder_s": recon.EMBEDDER_WAIT_S}]
+    s = r.summaries[-1]
+    assert s["mode"] == "upkeep" and s["outcome"] == "ok" and s["abandoned_stale_in_progress"] == 1
+    assert not {"orphaned_count", "dangling_count", "embedding_coverage", "total_links"} & set(s)
+    status, counts = _outcome(r)
+    assert status == "ok" and counts["abandoned"] == 1 and counts["embedded"] == 3 and counts["missing"] == 3
+    assert counts["remaining"] == 0 and counts["in_progress_remaining"] == 0
+
+
+def test_upkeep_backfill_limit_defaults_to_200_and_zero_disables_it(monkeypatch, tmp_path):
+    assert recon.UPKEEP_BACKFILL_PER_RUN == 200 and recon.BACKFILL_PER_RUN == 500
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--backfill-limit", "7"])
+    assert r.fake.calls[0]["limit"] == 7
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    r = _main_run(monkeypatch, zero, ["--upkeep", "--backfill-limit", "0"])
+    assert r.fake.calls == [] and r.summaries[-1]["embedding_backfill"] == {"not_run": "disabled"}
+    assert r.summaries[-1]["outcome"] == "ok"
+
+
+def test_the_weekly_mode_keeps_its_500_embed_cap(monkeypatch, tmp_path):
+    r = _main_run(monkeypatch, tmp_path)
+    assert r.fake.calls == [{"limit": 500, "db_path": r.db}]
+
+
+@pytest.mark.parametrize("backfill, status", [
+    (_FakeBackfill({"embedded": 0, "skipped": 0, "errors": 1, "remaining": 4, "total_complete": 4, "missing": 4,
+                    "aborted": "embedder-down"}), "degraded:embedder-down"),
+    (_FakeBackfill({"embedded": 1, "skipped": 0, "errors": 2, "remaining": 3, "total_complete": 4, "missing": 4}),
+     "degraded:embed-errors-2"),
+    (_FakeBackfill({"embedded": 200, "skipped": 0, "errors": 0, "remaining": 800, "total_complete": 1000,
+                    "missing": 1000}), "degraded:remaining-800"),
+    (_FakeBackfill(error=httpx.ConnectError("qdrant down")), "degraded:backfill-failed"),
+], ids=["embedder-down", "embed-errors", "remaining", "backfill-failed"])
+def test_upkeep_reports_a_degraded_state_through_the_outcome_line_and_exits_zero(monkeypatch, tmp_path, backfill, status):
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=backfill)
+    assert r.rc == 0, "reported, not failed: the chain's next steps still run"
+    assert _outcome(r)[0] == status and r.summaries[-1]["outcome"] == status
+    assert _states(r.db) == {1: "abandoned"}, "the SQLite sweep still ran: a Qdrant or embedder outage never stops it"
+
+
+def test_upkeep_names_every_reason_when_the_sweep_and_the_backfill_both_fail(monkeypatch, tmp_path):
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(recon, "sweep_stale_in_progress", locked)
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 2, "total_complete": 2, "missing": 2})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep"], backfill=bf)
+    assert r.rc == 0 and _outcome(r)[0] == "degraded:abandon-failed,remaining-2"
+    assert "database is locked" in r.summaries[-1]["abandon_error"]
+
+
+def test_upkeep_receipt_reports_the_exact_per_id_gap(monkeypatch, tmp_path):
+    """A coverage percentage reads '99 % ok' with 4 vectors missing; the receipt lists the ids."""
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 4, "total_complete": 3583,
+                        "missing": 4, "missing_ids": [101, 102, 103, 104], "remaining_ids": [101, 102, 103, 104]})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--limit-sample", "2"], backfill=bf)
+    s = r.summaries[-1]
+    assert s["missing"] == 4 and s["remaining"] == 4
+    assert s["missing_ids"] == [101, 102] and s["remaining_ids"] == [101, 102], "ids capped by --limit-sample"
+    assert "missing_ids" not in s["embedding_backfill"] and s["embedding_backfill"]["missing"] == 4
+    assert _outcome(r)[0] == "degraded:remaining-4"
+
+
+def test_upkeep_dry_run_reports_and_writes_nothing(monkeypatch, tmp_path, capsys):
+    bf = _FakeBackfill({"embedded": 0, "skipped": 0, "errors": 0, "remaining": 4, "total_complete": 10,
+                        "missing": 4, "missing_ids": [7, 8, 9, 10], "remaining_ids": [7, 8, 9, 10], "dry_run": True})
+    r = _main_run(monkeypatch, tmp_path, ["--upkeep", "--dry-run"], backfill=bf)
+    assert r.rc == 0 and _states(r.db) == {1: "in_progress"}
+    assert bf.calls == [{"limit": 200, "db_path": r.db, "dry_run": True, "wait_embedder_s": recon.EMBEDDER_WAIT_S}]
+    assert r.summaries == [] and not r.outcome_file.exists()
+    out = capsys.readouterr().out
+    assert '"would_abandon": 1' in out and '"missing": 4' in out and '"mode": "upkeep"' in out
+
+
+def test_upkeep_without_a_ledger_is_a_failed_run(monkeypatch, tmp_path):
+    summaries = []
+    monkeypatch.setattr(recon, "_append_summary", lambda rec: summaries.append(rec))
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--upkeep", "--db", str(tmp_path / "absent.db")])
+    assert recon.main() == 1
+    assert summaries[-1]["outcome"] == "degraded:no-episodic-db" and summaries[-1]["mode"] == "upkeep"
+
+
+@pytest.mark.parametrize("res", [
+    {"embedded": 5, "remaining": 0, "errors": 0},
+    {"embedded": 0, "remaining": 4, "errors": 1, "aborted": "embedder-down"},
+    {"embedded": 2, "remaining": 18, "errors": 5, "aborted": "5 consecutive embed failures (last: x)"},
+    {"embedded": 9, "remaining": 1, "errors": 1},
+    {"embedded": 200, "remaining": 800, "errors": 0},
+    {"embedded": 0, "error": "ConnectError: qdrant"},
+])
+def test_the_reconcile_and_the_backfill_script_read_a_result_the_same_way(res):
+    reason = recon.backfill_reason(res)
+    assert ("ok" if reason is None else f"degraded:{reason}") == _load_backfill_script().outcome_for(res)
+
+
+def test_the_weekly_step_unit_and_the_wsl_timer_keep_their_schedule():
+    """The Sunday episodic-reconcile step stays as it is: the daily work is its own step."""
+    unit = (REPO_ROOT / "systemd" / "ams-step-episodic-reconcile.service").read_text(encoding="utf-8")
+    assert "--guarded --weekly Sun episodic-reconcile" in unit and "--upkeep" not in unit
+
+
+def test_the_backfill_script_dir_is_appended_after_the_server_dir_so_it_never_shadows_a_server_module():
+    """The server dir is inserted first (index 0); the script dir only supplies the ams_env sibling, so it
+    goes AFTER it. No module name is shared today, but ~/apps/mem0-scripts is where a collision would bite."""
+    src = (REPO_ROOT / "scripts" / "wsl" / "episode-embed-backfill.py").read_text(encoding="utf-8")
+    assert "sys.path.insert(0, os.path.dirname" not in src
+    assert src.index("sys.path.insert(0, str(_d))") < src.index("sys.path.append(_HERE)")
+    server = {p.name for p in (REPO_ROOT / "mem0-server").glob("*.py")}
+    scripts = {p.name for p in (REPO_ROOT / "scripts" / "wsl").glob("*.py")}
+    assert not server & scripts, f"a module name exists in both dirs: {sorted(server & scripts)}"
+
+
+def test_limit_sample_refuses_a_negative_cap(monkeypatch, capsys):
+    """A negative --limit-sample used to slice away the LAST entries instead of capping."""
+    monkeypatch.setattr(_sys, "argv", ["episodic-reconcile.py", "--limit-sample", "-1"])
+    with pytest.raises(SystemExit) as e:
+        recon.main()
+    assert e.value.code == 2
+    assert "must be 0 or more" in capsys.readouterr().err
