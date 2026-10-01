@@ -96,11 +96,19 @@ def test_installer_post_condition_asserts_the_floors_pip_check_and_pip_audit():
     m = re.search(r"<<'PYEOF'.*?\nPYEOF\n", INSTALLER.split("Post-conditions for BOTH branches", 1)[1], re.S)
     assert m, "post-condition block not found"
     block = m.group(0)
-    for name, floor in (("starlette", "1.3.1"), ("cryptography", "50.0.1"), ("mem0ai", "2.0.4")):
+    for name, floor in (("starlette", "1.3.1"), ("cryptography", "50.0.1"), ("pyjwt", "2.15.0"), ("mem0ai", "2.0.4")):
         assert f'"{name}": "{floor}"' in block, f"post-condition does not assert {name}>={floor}"
     assert '"pip", "check"' in block, "post-condition must run pip check"
     assert "pip-audit" in block, "post-condition must require pip-audit"
     assert "sys.exit(0 if ok else 1)" in block
+
+
+def test_the_fatal_text_and_the_success_echo_name_every_floor_the_post_condition_asserts():
+    fatal = re.search(r'PYEOF\' \|\| \{ echo "([^"]*)"', INSTALLER).group(1)
+    ok = re.search(r'^echo "  post-conditions satisfied \(([^)]*)\)"$', INSTALLER, re.M).group(1)
+    for text in (fatal, ok):
+        for floor in ("starlette>=1.3.1", "cryptography>=50.0.1", "pyjwt>=2.15.0", "mem0ai>=2.0.4"):
+            assert floor in text, f"{floor} missing from: {text}"
 
 
 def test_no_dangling_pointers_to_private_ledgers_in_dependency_sources():
@@ -172,7 +180,7 @@ def _run_postcondition(tmp_path, versions, pip_check_rc=0, pip_check_out="", wit
     return subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
 
 
-MET = {"starlette": "1.6.0", "cryptography": "50.0.1", "mem0ai": "2.1.0"}
+MET = {"starlette": "1.6.0", "cryptography": "50.0.1", "pyjwt": "2.15.1", "mem0ai": "2.1.0"}
 
 
 def test_postcondition_passes_when_floors_met_pip_check_clean_and_audit_present(tmp_path):
@@ -185,6 +193,11 @@ def test_postcondition_fails_on_each_broken_leg(tmp_path):
     assert below.returncode == 1 and "cryptography 48.0.1 is below the floor 50.0.1" in below.stderr
     absent = _run_postcondition(tmp_path, {k: v for k, v in MET.items() if k != "mem0ai"})
     assert absent.returncode == 1 and "mem0ai is not installed" in absent.stderr
+    # the pyjwt floor is asserted like the others: the vulnerable 2.14.0, and an absent package
+    old_jwt = _run_postcondition(tmp_path, {**MET, "pyjwt": "2.14.0"})
+    assert old_jwt.returncode == 1 and "pyjwt 2.14.0 is below the floor 2.15.0" in old_jwt.stderr
+    no_jwt = _run_postcondition(tmp_path, {k: v for k, v in MET.items() if k != "pyjwt"})
+    assert no_jwt.returncode == 1 and "pyjwt is not installed (floor 2.15.0)" in no_jwt.stderr
     dirty = _run_postcondition(tmp_path, MET, pip_check_rc=1, pip_check_out="thinc 8.3 has requirement x")
     assert dirty.returncode == 1 and "pip check is not clean" in dirty.stderr
     noaudit = _run_postcondition(tmp_path, MET, with_audit=False)

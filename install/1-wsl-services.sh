@@ -192,13 +192,13 @@ mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
-"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — the lines above name the failing check: a missing package needs network access, a pip check conflict does not (pip install -U the package it names in $MEM0_DIR/.venv), then re-run."; exit 1; }
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, pyjwt>=2.15.0, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — the lines above name the failing check: a missing package needs network access, a pip check conflict does not (pip install -U the package it names in $MEM0_DIR/.venv), then re-run."; exit 1; }
 import os, subprocess, sys
 from importlib.metadata import PackageNotFoundError, version
 from packaging.version import Version as V
 ok = True
 # Floors, not pins: anything at or above these carries the security fixes.
-for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "mem0ai": "2.0.4"}.items():
+for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "pyjwt": "2.15.0", "mem0ai": "2.0.4"}.items():
     try:
         have = version(name)
     except PackageNotFoundError:
@@ -244,7 +244,7 @@ except Exception as e:
     ok = False
 sys.exit(0 if ok else 1)
 PYEOF
-echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, pip check clean, pip-audit present, fastmcp importable, fastembed BM25 encoder loadable)"
+echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=50.0.1, pyjwt>=2.15.0, mem0ai>=2.0.4, pip check clean, pip-audit present, fastmcp importable, fastembed BM25 encoder loadable)"
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the
