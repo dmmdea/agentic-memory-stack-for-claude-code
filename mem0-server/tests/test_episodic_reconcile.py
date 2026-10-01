@@ -1364,3 +1364,14 @@ def test_the_weekly_step_unit_and_the_wsl_timer_keep_their_schedule():
     """The Sunday episodic-reconcile step stays as it is: the daily work is its own step."""
     unit = (REPO_ROOT / "systemd" / "ams-step-episodic-reconcile.service").read_text(encoding="utf-8")
     assert "--guarded --weekly Sun episodic-reconcile" in unit and "--upkeep" not in unit
+
+
+def test_the_backfill_script_dir_is_appended_after_the_server_dir_so_it_never_shadows_a_server_module():
+    """The server dir is inserted first (index 0); the script dir only supplies the ams_env sibling, so it
+    goes AFTER it. No module name is shared today, but ~/apps/mem0-scripts is where a collision would bite."""
+    src = (REPO_ROOT / "scripts" / "wsl" / "episode-embed-backfill.py").read_text(encoding="utf-8")
+    assert "sys.path.insert(0, os.path.dirname" not in src
+    assert src.index("sys.path.insert(0, str(_d))") < src.index("sys.path.append(_HERE)")
+    server = {p.name for p in (REPO_ROOT / "mem0-server").glob("*.py")}
+    scripts = {p.name for p in (REPO_ROOT / "scripts" / "wsl").glob("*.py")}
+    assert not server & scripts, f"a module name exists in both dirs: {sorted(server & scripts)}"

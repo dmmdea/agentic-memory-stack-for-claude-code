@@ -42,7 +42,9 @@ for _d in _SERVER_DIRS:
     if _d.is_dir():
         sys.path.insert(0, str(_d))
         break
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # ams_env, a sibling in both layouts
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.append(_HERE)  # ams_env, a sibling in both layouts; after the server dir, so it can never shadow a server module
 
 MAX_CONSECUTIVE_ERRORS = 5   # a dead embedder must stop the run, not burn the whole cap on failures
 RETRY_BUDGET_S = 120.0       # seconds of cold-start backoff ONE run may spend across all its rows
