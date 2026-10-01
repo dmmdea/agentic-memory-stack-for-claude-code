@@ -99,6 +99,52 @@ def embed_episode_summary(embedder, summary_text: Optional[str]) -> Optional[lis
     return list(vec) if vec is not None else None
 
 
+# 1.32.4: a cold embedder used to drop an episode vector for good. The embedder unloads after 5 idle
+# minutes and a restart or a failed start answers 500 'exited prematurely' / 503 / a refused
+# connection for a while; the shim's own retry covers 429 only (its contract is pinned) and the
+# finalize POST cannot wait (its hook times out at 5 s). The cold retry therefore lives HERE, above
+# the embedder, and both callers share it: the finalize-time background retry in app.py and the
+# episode-embed-backfill script. Waits are seconds-scale (embedder_503.RETRY_AFTER_S is 10), not the
+# shim's sub-second 429 backoff.
+COLD_RETRY_DELAYS_S = (10, 20)
+COLD_RETRY_BUDGET_S = 60.0
+
+
+def is_cold_embed_error(exc: BaseException) -> bool:
+    """True when `exc` means the embedder cannot serve RIGHT NOW (embedder_503.retry_later). What
+    embed_with_cold_retry raises after giving up on a cold embedder is still such an error, so this is how
+    a caller tells 'the seat never came up' from 'the request itself is broken'."""
+    from embedder_503 import retry_later  # lazy: it pulls fastapi, and this module stays import-light
+    return retry_later(exc) is not None
+
+
+def embed_with_cold_retry(embedder, text: Optional[str], *, delays=COLD_RETRY_DELAYS_S,
+                          budget_s: float = COLD_RETRY_BUDGET_S, sleep=time.sleep,
+                          clock=time.monotonic) -> Optional[list]:
+    """embed_episode_summary that rides out a cold or restarting embedder.
+
+    Retries ONLY when embedder_503.retry_later(exc) says the embedder cannot serve right now (refused or
+    timed-out connection, 502/503/504, llama-swap's 500 'exited prematurely'): sleeps max(retry_after,
+    delays[n]) and tries again, at most len(delays) times and never sleeping past `budget_s` since the
+    call began. Any other exception (a context-overflow 500, a 4xx, a coding error) is raised at once,
+    unretried, and so is the last cold one when the retries or the budget run out."""
+    start = clock()
+    attempt = 0
+    while True:
+        try:
+            return embed_episode_summary(embedder, text)
+        except Exception as e:
+            from embedder_503 import retry_later  # lazy, see is_cold_embed_error
+            retry_after = retry_later(e)
+            if retry_after is None or attempt >= len(delays):
+                raise
+            wait = max(retry_after, delays[attempt])
+            if clock() - start + wait > budget_s:
+                raise
+            sleep(wait)
+            attempt += 1
+
+
 def ensure_episode_collection(client, dims: int = EPISODE_DIMS, collection: str = EPISODE_COLLECTION) -> bool:
     """Idempotently ensure the Cosine-distance episode collection exists.
     Returns True if it was created, False if it already existed."""

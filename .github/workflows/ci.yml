@@ -93,6 +93,7 @@ jobs:
             mem0-server/tests/test_contradiction_sweep.py \
             mem0-server/tests/test_dpapi_fetch_key.py \
             mem0-server/tests/test_egemma_rollback_prune.py \
+            mem0-server/tests/test_episode_embed_retry.py \
             mem0-server/tests/test_episodic_reconcile.py \
             mem0-server/tests/test_failure_injection.py \
             mem0-server/tests/test_freshness.py \
