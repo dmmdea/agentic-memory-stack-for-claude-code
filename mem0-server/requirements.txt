@@ -15,6 +15,10 @@
 fastapi>=0.110.0
 starlette>=1.3.1
 cryptography>=50.0.1
+# pyjwt >= 2.15.0 covers CVE-2026-101918 (RecursionError in PyJWKClient, fixed in 2.15.0). It is a
+# transitive dependency (fastmcp -> mcp requires pyjwt[crypto]>=2.10.1) and no repo code imports it;
+# the floor is listed so a reinstall can never keep the vulnerable release (same reasoning as cryptography).
+pyjwt>=2.15.0
 uvicorn>=0.27.0
 httpx>=0.27.0
 # MCP shim runtime (scripts/wsl/mem0-mcp-shim.py runs on THIS venv's python — the

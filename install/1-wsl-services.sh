@@ -136,6 +136,9 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # transitive deps — starlette>=1.3.1 (CVE-2026-54282/54283, FastAPI request path),
     # cryptography>=50.0.1 (GHSA-g6cj-pr64-35w5 fixed in 50.0.0, GHSA-jwv3-5hgf-82ww and
     # GHSA-m2h6-j472-rp4c fixed in 49.0.0). Both deps come in transitively otherwise.
+    # pyjwt>=2.15.0 (CVE-2026-101918, a RecursionError in PyJWKClient, fixed in 2.15.0) is
+    # transitive too (fastmcp -> mcp); no repo code imports it. Quote every spec that
+    # carries a comparison: an unquoted >= is a shell redirect that installs it unpinned.
     # These are FLOORS, never caps or exact pins (house rule: updatable, not pinned into
     # staleness): a cap on cryptography once kept a reinstall from taking a security fix.
     # mem0ai[nlp]>=2.0.4 likewise; mem0-server/requirements.txt documents the same set
@@ -150,7 +153,7 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # — is the defense against a future breaking fastembed release.
     # numpy: scripts/wsl/semantic-dedup.py scores duplicate pairs with blocked matrix products
     # (it arrives transitively with fastembed today; the dedup must not depend on that).
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' pip-audit
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' pip-audit
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -173,7 +176,7 @@ else
     # a live box actually takes on re-run. Adding it only to the fresh-install
     # line would never heal an existing venv (that is exactly how the leg died:
     # a venv rebuild dropped it and nothing re-installed it).
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 
@@ -189,13 +192,13 @@ mkdir -p "$FASTEMBED_CACHE_PATH"
 
 # Post-conditions for BOTH branches (fresh install and refresh): the installer
 # must never report success with a CVE-vulnerable venv OR a dead BM25 leg.
-"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — the lines above name the failing check: a missing package needs network access, a pip check conflict does not (pip install -U the package it names in $MEM0_DIR/.venv), then re-run."; exit 1; }
+"$MEM0_DIR/.venv/bin/python" - <<'PYEOF' || { echo "  FATAL: post-conditions not satisfied (need starlette>=1.3.1, cryptography>=50.0.1, pyjwt>=2.15.0, mem0ai>=2.0.4, a clean pip check, pip-audit installed, an importable fastmcp, and a loadable fastembed BM25 encoder) — the lines above name the failing check: a missing package needs network access, a pip check conflict does not (pip install -U the package it names in $MEM0_DIR/.venv), then re-run."; exit 1; }
 import os, subprocess, sys
 from importlib.metadata import PackageNotFoundError, version
 from packaging.version import Version as V
 ok = True
 # Floors, not pins: anything at or above these carries the security fixes.
-for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "mem0ai": "2.0.4"}.items():
+for name, floor in {"starlette": "1.3.1", "cryptography": "50.0.1", "pyjwt": "2.15.0", "mem0ai": "2.0.4"}.items():
     try:
         have = version(name)
     except PackageNotFoundError:
@@ -241,7 +244,7 @@ except Exception as e:
     ok = False
 sys.exit(0 if ok else 1)
 PYEOF
-echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=50.0.1, mem0ai>=2.0.4, pip check clean, pip-audit present, fastmcp importable, fastembed BM25 encoder loadable)"
+echo "  post-conditions satisfied (starlette>=1.3.1, cryptography>=50.0.1, pyjwt>=2.15.0, mem0ai>=2.0.4, pip check clean, pip-audit present, fastmcp importable, fastembed BM25 encoder loadable)"
 
 # v0.19 Phase H: deploy the DPAPI key-fetch script next to the app modules.
 # mem0.service runs it via ExecStartPre=- (fail-soft). tr strips CRLF since the

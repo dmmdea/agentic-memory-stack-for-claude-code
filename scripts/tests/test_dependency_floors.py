@@ -17,6 +17,7 @@ INSTALLER = (ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
 FLOORS = {
     "cryptography": ">=50.0.1",
     "mem0ai[nlp]": ">=2.0.4",
+    "pyjwt": ">=2.15.0",
     "starlette": ">=1.3.1",
 }
 
@@ -61,6 +62,27 @@ def test_pip_audit_is_installed_on_both_installer_branches_and_listed():
     assert "pip-audit" in _requirement_specs()
 
 
+def _raw_pip_specs(pattern):
+    """The pip arguments of the installer line matching `pattern`, exactly as bash will see them."""
+    hits = [ln for ln in INSTALLER.splitlines() if re.search(pattern, ln)]
+    assert len(hits) == 1, f"expected exactly one installer pip line matching {pattern!r}, got {hits}"
+    return hits[0].split(" install ", 1)[1].split(" || ")[0]
+
+
+def test_every_comparison_spec_on_the_installer_pip_lines_is_quoted_in_the_raw_line():
+    """Unquoted `pkg>=1.2` is a shell redirect: bash installs unpinned `pkg` and writes a file named
+    `=1.2`. The shlex tokenizing above hides that (it never redirects), so look at the RAW text:
+    once the quoted spans are removed, no `<` or `>` may remain in the pip arguments."""
+    for label, pattern in (("fresh", r"pip install --quiet 'mem0ai"), ("refresh", r'\.venv/bin/pip" install --quiet ')):
+        raw = _raw_pip_specs(pattern)
+        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "", raw)
+        assert "<" not in unquoted and ">" not in unquoted, (
+            f"installer {label} pip line has a version comparison outside quotes (a shell redirect, "
+            f"not a floor): {raw}")
+        for floor_name, floor in FLOORS.items():
+            assert f"'{floor_name}{floor}'" in raw, f"installer {label} line: {floor_name}{floor} must be single-quoted"
+
+
 def test_no_cap_or_exact_pin_survives_in_the_dependency_sources():
     for name, text in (("requirements.txt", REQ), ("1-wsl-services.sh", INSTALLER)):
         assert "<49" not in text, f"{name}: the cryptography cap is back"
@@ -74,11 +96,19 @@ def test_installer_post_condition_asserts_the_floors_pip_check_and_pip_audit():
     m = re.search(r"<<'PYEOF'.*?\nPYEOF\n", INSTALLER.split("Post-conditions for BOTH branches", 1)[1], re.S)
     assert m, "post-condition block not found"
     block = m.group(0)
-    for name, floor in (("starlette", "1.3.1"), ("cryptography", "50.0.1"), ("mem0ai", "2.0.4")):
+    for name, floor in (("starlette", "1.3.1"), ("cryptography", "50.0.1"), ("pyjwt", "2.15.0"), ("mem0ai", "2.0.4")):
         assert f'"{name}": "{floor}"' in block, f"post-condition does not assert {name}>={floor}"
     assert '"pip", "check"' in block, "post-condition must run pip check"
     assert "pip-audit" in block, "post-condition must require pip-audit"
     assert "sys.exit(0 if ok else 1)" in block
+
+
+def test_the_fatal_text_and_the_success_echo_name_every_floor_the_post_condition_asserts():
+    fatal = re.search(r'PYEOF\' \|\| \{ echo "([^"]*)"', INSTALLER).group(1)
+    ok = re.search(r'^echo "  post-conditions satisfied \(([^)]*)\)"$', INSTALLER, re.M).group(1)
+    for text in (fatal, ok):
+        for floor in ("starlette>=1.3.1", "cryptography>=50.0.1", "pyjwt>=2.15.0", "mem0ai>=2.0.4"):
+            assert floor in text, f"{floor} missing from: {text}"
 
 
 def test_no_dangling_pointers_to_private_ledgers_in_dependency_sources():
@@ -150,7 +180,7 @@ def _run_postcondition(tmp_path, versions, pip_check_rc=0, pip_check_out="", wit
     return subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
 
 
-MET = {"starlette": "1.6.0", "cryptography": "50.0.1", "mem0ai": "2.1.0"}
+MET = {"starlette": "1.6.0", "cryptography": "50.0.1", "pyjwt": "2.15.1", "mem0ai": "2.1.0"}
 
 
 def test_postcondition_passes_when_floors_met_pip_check_clean_and_audit_present(tmp_path):
@@ -163,6 +193,11 @@ def test_postcondition_fails_on_each_broken_leg(tmp_path):
     assert below.returncode == 1 and "cryptography 48.0.1 is below the floor 50.0.1" in below.stderr
     absent = _run_postcondition(tmp_path, {k: v for k, v in MET.items() if k != "mem0ai"})
     assert absent.returncode == 1 and "mem0ai is not installed" in absent.stderr
+    # the pyjwt floor is asserted like the others: the vulnerable 2.14.0, and an absent package
+    old_jwt = _run_postcondition(tmp_path, {**MET, "pyjwt": "2.14.0"})
+    assert old_jwt.returncode == 1 and "pyjwt 2.14.0 is below the floor 2.15.0" in old_jwt.stderr
+    no_jwt = _run_postcondition(tmp_path, {k: v for k, v in MET.items() if k != "pyjwt"})
+    assert no_jwt.returncode == 1 and "pyjwt is not installed (floor 2.15.0)" in no_jwt.stderr
     dirty = _run_postcondition(tmp_path, MET, pip_check_rc=1, pip_check_out="thinc 8.3 has requirement x")
     assert dirty.returncode == 1 and "pip check is not clean" in dirty.stderr
     noaudit = _run_postcondition(tmp_path, MET, with_audit=False)
@@ -177,3 +212,41 @@ def test_a_conflict_or_missing_scanner_names_its_remedy_not_just_the_network(tmp
     assert "pip install pip-audit" in noaudit.stderr
     fatal = re.search(r'PYEOF\' \|\| \{ echo "([^"]*)"', INSTALLER).group(1)
     assert "pip check" in fatal and "network" in fatal and "conflict" in fatal
+
+
+# ---- the native authority and the Linux replica reuse the fresh pip line ------------------
+
+import os
+import shutil
+
+import pytest
+
+BASH = shutil.which("bash")
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("script", ["linux-authority.sh", "linux-replica.sh"])
+def test_the_authority_and_replica_installers_hand_every_floor_to_pip_intact(tmp_path, script):
+    """Both read PIP_SPECS from the fresh pip line of install/1-wsl-services.sh with grep and sed, then
+    eval it into their own pip call. The quoted floors must survive that round trip as single
+    arguments: lose a quote and `pyjwt>=2.15.0` becomes a redirect (an unpinned install, a stray
+    file named `=2.15.0`). This runs the scripts' own two lines against a stub pip."""
+    lines = (ROOT / "install" / script).read_text(encoding="utf-8").splitlines()
+    assign = [ln for ln in lines if ln.startswith("PIP_SPECS=")]
+    run = [ln for ln in lines if ln.lstrip().startswith("eval ") and "$PIP_SPECS" in ln]
+    assert len(assign) == 1 and len(run) == 1, (assign, run)
+    app = tmp_path / "app"
+    (app / ".venv" / "bin").mkdir(parents=True)
+    pip = app / ".venv" / "bin" / "pip"
+    pip.write_text('#!/bin/sh\nprintf "%s\n" "$@" > "$(dirname "$0")/../argv.txt"\n', encoding="utf-8")
+    pip.chmod(0o755)
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {**os.environ, "WSL_INSTALLER": str(ROOT / "install" / "1-wsl-services.sh"), "MEM0_APP": str(app)}
+    r = subprocess.run([BASH, "-c", assign[0] + "\n" + run[0]], cwd=str(work), env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    argv = (app / ".venv" / "argv.txt").read_text(encoding="utf-8").split()
+    for name, floor in FLOORS.items():
+        assert f"{name}{floor}" in argv, f"{script}: {name}{floor} did not reach pip as one argument: {argv}"
+    assert list(work.iterdir()) == [], f"{script}: the eval wrote a stray file: {list(work.iterdir())}"
