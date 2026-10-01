@@ -51,6 +51,73 @@ def test_none_prompt_is_not_a_machine_turn():
 
 
 # ---------------------------------------------------------------------------
+# Relayed agent messages: a second verdict, ported from the Windows lib's Test-RelayedAgentMessage
+# ---------------------------------------------------------------------------
+
+def test_every_corpus_case_carries_both_verdicts():
+    """The additive relayed_agent_message field is on every case, and both values are represented."""
+    assert all(isinstance(c.get("relayed_agent_message"), bool) for c in CORPUS)
+    assert {c["relayed_agent_message"] for c in CORPUS} == {True, False}
+    names = [c["name"] for c in CORPUS]
+    assert len(names) == len(set(names)), "corpus names must be unique (they are the test ids)"
+
+
+@pytest.mark.parametrize("case", CORPUS, ids=[c["name"] for c in CORPUS])
+def test_relayed_verdict_matches_the_shared_corpus(case):
+    assert hook_contract.is_relayed_agent_message(case["prompt"]) is case["relayed_agent_message"]
+
+
+@pytest.mark.parametrize("case", CORPUS, ids=[c["name"] for c in CORPUS])
+def test_non_human_verdict_is_either_machine_or_relayed(case):
+    want = case["machine_turn"] or case["relayed_agent_message"]
+    assert hook_contract.is_non_human_turn(case["prompt"]) is want
+
+
+def test_a_relayed_message_stays_human_shaped_for_the_memory_block():
+    """C10 keeps a relayed message on the human path (the corpus says machine_turn=false); only the
+    episode summary treats it as non-human. is_machine_turn_prompt must not absorb the relayed verdict."""
+    peers = [c for c in CORPUS if c["relayed_agent_message"]]
+    assert peers
+    for c in peers:
+        assert hook_contract.is_machine_turn_prompt(c["prompt"]) is False
+        assert hook_contract.is_non_human_turn(c["prompt"]) is True
+
+
+@pytest.mark.parametrize("value", [None, "", 0, 7, b"<cross-session-message>", ["<cross-session-message>"], {}])
+def test_relayed_verdict_never_raises_and_reads_non_text_as_human(value):
+    assert hook_contract.is_relayed_agent_message(value) is False
+    assert hook_contract.is_non_human_turn(value) is False
+
+
+def test_relayed_verdict_is_an_exact_port_of_the_powershell_predicate():
+    """Same six leading whitespace characters, case-sensitive, and the wrapper needs a following
+    whitespace-or-'>' character. The edges below were also run through Test-RelayedAgentMessage."""
+    w = '<cross-session-message from="uds:example">hi</cross-session-message>'
+    lead = " \t\r\n\f\v"
+    assert hook_contract.is_relayed_agent_message(lead + w) is True
+    # a character outside the six-char trim set is NOT skipped
+    assert hook_contract.is_relayed_agent_message(" " + w) is False
+    assert hook_contract.is_relayed_agent_message("\x1c" + w) is False
+    # the announcement is matched ordinally, so any case or spacing difference is a miss
+    assert hook_contract.is_relayed_agent_message("another claude session sent a message:\n" + w) is False
+    assert hook_contract.is_relayed_agent_message("Another Claude session sent a message:\n" + w) is True
+    # the wrapper must be followed by whitespace or '>' (a bare end of string is not enough)
+    assert hook_contract.is_relayed_agent_message("<cross-session-message") is False
+    assert hook_contract.is_relayed_agent_message("<cross-session-message>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message\nfrom=x>") is True
+    # .NET's \s covers the Unicode space separators and NEL, but not the C0 separators Python's \s adds
+    assert hook_contract.is_relayed_agent_message("<cross-session-message from=x>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message　from=x>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message\x85from=x>") is True
+    assert hook_contract.is_relayed_agent_message("<cross-session-message\x1cfrom=x>") is False
+    # the announcement alone is not enough; the wrapper may sit anywhere after it
+    assert hook_contract.is_relayed_agent_message("Another Claude session sent a message: hi") is False
+    assert hook_contract.is_relayed_agent_message("Another Claude session sent a message: see " + w) is True
+    # a wrapper that merely appears mid-text of an ordinary prompt is not a relayed message
+    assert hook_contract.is_relayed_agent_message("look: " + w) is False
+
+
+# ---------------------------------------------------------------------------
 # Runtime: app.context_bundle with its collaborators patched
 # ---------------------------------------------------------------------------
 

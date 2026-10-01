@@ -610,3 +610,30 @@ Describe 'learn-rules-drain: a message relayed from another agent session is nev
         }
     }
 }
+
+Describe 'the relayed-agent-message rule over the shared machine-turn corpus' {
+    # 1.32.4: the server's hook_contract.is_relayed_agent_message is a port of this rule and reads the
+    # same relayed_agent_message field of the corpus, so the three copies (lib, drain, server) cannot drift.
+    BeforeAll {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:winDir 'learn-rules-drain.ps1'), [ref]$tokens, [ref]$errs)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-DrainRelayedMessage' }, $true)
+        $fn | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($fn.Extent.Text))
+        . (Join-Path $script:winDir 'user-prompt-lib.ps1')
+    }
+
+    It 'Test-RelayedAgentMessage and its drain copy: <name> -> relayed_agent_message=<relayed>' -ForEach @((Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts | ForEach-Object { @{ name = $_.name; prompt = [string]$_.prompt; relayed = [bool]$_.relayed_agent_message; machine = [bool]$_.machine_turn } }) {
+        (Test-RelayedAgentMessage -Prompt $prompt) | Should -Be $relayed
+        (Test-DrainRelayedMessage $prompt) | Should -Be $relayed
+        # the two verdicts are independent: a relayed message is still human-shaped for the memory block
+        (Test-MachineTurnPrompt -Prompt $prompt) | Should -Be $machine
+    }
+
+    It 'the corpus has relayed and non-relayed cases and every case carries the field' {
+        $corpus = @((Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'fixtures\machine-turn-prompts.json') | ConvertFrom-Json).prompts)
+        @($corpus | Where-Object { $_.PSObject.Properties['relayed_agent_message'] }).Count | Should -Be $corpus.Count
+        @($corpus | Where-Object { $_.relayed_agent_message -eq $true }).Count | Should -BeGreaterThan 2
+        @($corpus | Where-Object { $_.relayed_agent_message -eq $false }).Count | Should -BeGreaterThan 2
+    }
+}
