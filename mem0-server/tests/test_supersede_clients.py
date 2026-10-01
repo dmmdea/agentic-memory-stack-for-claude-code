@@ -317,3 +317,50 @@ def test_replay_a_supersede_missing_its_ids_is_a_deterministic_conflict(ro, monk
     _Replay(ro, monkeypatch)
     stats = ro.replay(_queue(tmp_path, ("supersede", {"memory_id": LOSER})), "http://authority.invalid", "k")
     assert stats["conflicts"] == 1 and stats["kept"] == 0
+
+
+# ---- readers: a superseded fact must not feed MEMORY.md or the nightly dream ------------------------
+#
+# The admission gate hides superseded_by on a search; these two jobs read the store directly, so they
+# apply the same rule themselves. A PARTIAL supersession (partially_superseded_by) never hides: the
+# record still stands apart from the one claim it names. The audits (l10, brand-backfill,
+# brand-scope-audit) deliberately keep seeing everything.
+
+def test_memory_index_build_leaves_superseded_records_out_and_keeps_partial_ones(monkeypatch, tmp_path):
+    m = _load("memory_index_build_ut", SCRIPTS / "memory-index-build.py", monkeypatch, tmp_path)
+    live = {"data": "the live stable fact", "tier": "stable", "source": "src"}
+    points = [
+        {"id": "a" * 8 + "-live", "payload": live},
+        {"id": "b" * 8 + "-gone", "payload": {**live, "data": "the superseded stable fact",
+                                              "superseded_by": WINNER}},
+        {"id": "c" * 8 + "-part", "payload": {**live, "data": "the partially superseded fact",
+                                              "partially_superseded_by": _PARTIAL}},
+        {"id": "d" * 8 + "-temp", "payload": {**live, "data": "the superseded temporal fact",
+                                              "tier": "temporal", "superseded_by": WINNER}},
+    ]
+    out = tmp_path / "MEMORY.md"
+    monkeypatch.setattr(m, "scroll_all", lambda: points)
+    monkeypatch.setattr(m, "OUT", out)
+    m.main()
+    text = out.read_text(encoding="utf-8")
+    assert "the live stable fact" in text
+    assert "the partially superseded fact" in text, "a partial supersession never hides a record"
+    assert "the superseded stable fact" not in text and "the superseded temporal fact" not in text
+
+
+def test_dream_gather_leaves_superseded_records_out_and_keeps_partial_ones(monkeypatch, tmp_path):
+    m = _load("dream_consolidate_ut", SCRIPTS / "dream-consolidate.py", monkeypatch, tmp_path)
+
+    def answer(request):
+        body = {"result": {"points": [
+            {"id": "live", "payload": {"data": "live", "user_id": "u", "created_at": "2026-09-11T06:00:00Z",
+                                       "tier": "evidence"}},
+            {"id": "gone", "payload": {"data": "stale", "user_id": "u", "created_at": "2026-09-11T05:00:00Z",
+                                       "tier": "evidence", "superseded_by": WINNER}},
+            {"id": "part", "payload": {"data": "partly stale", "user_id": "u",
+                                       "created_at": "2026-09-11T04:00:00Z", "tier": "evidence",
+                                       "partially_superseded_by": _PARTIAL}},
+        ], "next_page_offset": None}}
+        return httpx.Response(200, json=body)
+    client = m.Mem0Client("http://x", "k", "u", http=httpx.Client(transport=httpx.MockTransport(answer)))
+    assert [p["id"] for p in client.all_points()] == ["live", "part"]
