@@ -185,7 +185,7 @@ Response 200: {"results": [{"id": "...", "memory": "...", "score": 0.83, "metada
 
 ### `PUT /v1/memories/{id}`
 
-Update a memory's text content. The **full existing payload is carried over** atomically into the rewrite (tier, source, brand, project, provenance stamps — every custom key): mem0 rebuilds the Qdrant payload from scratch on update, so before this carry-over a PUT silently destroyed all custom metadata (only tier was restored). The pre-update payload read is **fail-closed**: if it errors, the PUT is refused with `503` rather than performing a blind update that would wipe metadata. Because a PUT changes the text, the record **re-enters the NLI write-gate**: the carry-over deliberately drops the NLI check-markers (a judgment of the old text must not vouch for the new one) and re-judgment of the new text is queued asynchronously, exactly like an add. Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`); canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order.
+Update a memory's text content. The **full existing payload is carried over** atomically into the rewrite (tier, source, brand, project, provenance stamps — every custom key): mem0 rebuilds the Qdrant payload from scratch on update, so before this carry-over a PUT silently destroyed all custom metadata (only tier was restored). The pre-update payload read is **fail-closed**: if it errors, the PUT is refused with `503` rather than performing a blind update that would wipe metadata. Because a PUT changes the text, the record **re-enters the NLI write-gate**: the carry-over deliberately drops the NLI check-markers (a judgment of the old text must not vouch for the new one) and re-judgment of the new text is queued asynchronously, exactly like an add. Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`); canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order. `PUT` never retires a fact: when the new text carries a hand-written `SUPERSEDED <date> by mem0 <id>` marker and the record is not already superseded, the answer gains `supersede_note` and `supersede_marker` (`{kind, winner_id}`) and the server does nothing else, because the gate reads the `superseded_by` field, never the text.
 
 ```json
 Request: {"text": "new content"}
@@ -222,7 +222,20 @@ Response 503: the tier could not be read (store unreachable) or the audit intent
 
 ### `PATCH /v1/memories/{id}/metadata`
 
-Partial metadata update (shallow merge, not replace). Cannot change `tier` (use `PATCH /tier`). Used by re-extraction (marks originals `retrievable=false`), decay (sets `temporal.expires_at`), and the dream consolidator (stamps `touched_by_dream`). Lifecycle-critical keys that gate retrieval (`retrievable`, `superseded_by`, `contradicts_canonical`, …) are in `FORBIDDEN_KEYS`: only a trusted actor (per-actor `TRUSTED_PATCH_ACTORS` allowlist) or an HMAC user-direct token may write them. Every successful merge is appended to the tier ledger.
+Partial metadata update (shallow merge, not replace). Cannot change `tier` (use `PATCH /tier`). Used by re-extraction (marks originals `retrievable=false`), decay (sets `temporal.expires_at`), and the dream consolidator (stamps `touched_by_dream`). Lifecycle-critical keys that gate retrieval (`retrievable`, `contradicts_canonical`, …) are in `security_invariants.METADATA_FORBIDDEN_KEYS`, and `authorize_metadata_patch` (a pure function, 1.32.4) decides each write: only a trusted actor (per-actor `TRUSTED_PATCH_ACTORS` allowlist) may write them, and a trusted actor writes only its own keys. `superseded_by` and the supersede door's other keys (`superseded_at`, `superseded_via`, `partially_superseded_by`) are in the list with **no** actor allowed: their only writer is `POST /v1/memories/{id}/supersede` (below). A hide key (`superseded_by`, `contradicts_canonical`) is refused on a `canonical` record for every actor, because the trusted-actor path skips the HMAC check and an actor string alone must never hide a canonical. Every successful merge is appended to the tier ledger.
+
+### `POST /v1/memories/{id}/supersede` and `DELETE /v1/memories/{id}/supersede`
+
+The supersede door (1.32.4): the **only writer of `superseded_by`**, and the way a session retires a stale fact. `POST` takes `{winner_id, scope, detail, reason, source}`. `scope: "full"` sets `superseded_by` / `superseded_at` / `superseded_via`, and the admission gate then hides the record outside the `history` class; `scope: "partial"` appends `{winner_id, detail, at}` to `partially_superseded_by` and **never hides** (the gate does not read that key). The server enforces the refusal matrix of [`supersession.py`](../../mem0-server/supersession.py) whoever calls, with the codes listed in [api-contracts.md](../api-contracts.md): a canonical, insight or tier-less record, a retired record or winner, a superseded winner, another user's or another brand's winner and a different existing winner are all refused. Both records are read fail-closed and locked in sorted key order, an intent ledger line (`supersede-intent`) is written before the mutation and a `supersede` line after, the server stamps the actor itself (`supersede-endpoint`), and a repeated call is a no-op. `DELETE ?scope=full|partial|all&reason=` undoes it under the same tier rules (`unsupersede-intent` / `unsupersede` ledger lines).
+
+```
+Response 200 (POST): {"ok": true, "memory_id", "winner_id", "scope", "noop", "hidden"}
+Response 200 (DELETE): {"ok": true, "memory_id", "scope", "noop"}
+Response 400/403/404/409: "<code>: <message>" (bad-id, loser-canonical, winner-superseded, ...), see api-contracts.md
+Response 503: the store could not be read or the intent ledger line could not be written; nothing was changed
+```
+
+The MCP tools are `memory_supersede` / `memory_unsupersede`; the operator modes are `contradiction-sweep.py --resolve-supersede`, `--unsupersede` and `--supersede-markers` ([reconciliation.md](./reconciliation.md)).
 
 ### `DELETE /v1/memories/{id}`
 
@@ -239,7 +252,9 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 - `memory_add(text, user_id, infer, metadata)` — POST /v1/memories
 - `memory_search(query, user_id, limit, threshold)` — POST /v1/memories/search
 - `memory_list(user_id, limit)` — GET /v1/memories (limit hard-clamped at 500 client-side too)
-- `memory_update(memory_id, text)` — PUT /v1/memories/{id}
+- `memory_update(memory_id, text)` — PUT /v1/memories/{id} (text only; never append a `SUPERSEDED` marker, use `memory_supersede`)
+- `memory_supersede(memory_id, superseded_by, scope, detail, reason)` — POST /v1/memories/{id}/supersede (1.32.4)
+- `memory_unsupersede(memory_id, scope, reason)` — DELETE /v1/memories/{id}/supersede (1.32.4)
 - `memory_promote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier
 - `memory_demote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier (same endpoint, different direction)
 - `memory_delete(memory_id)` — DELETE /v1/memories/{id}
@@ -307,6 +322,7 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - [`../../mem0-server/app.py`](../../mem0-server/app.py) — the FastAPI app: all routes, auth, tier gates, hash idempotency, the ledger writer.
 - [`../../mem0-server/config.py`](../../mem0-server/config.py) — mem0 config: embedder, Qdrant collection, ports.
 - [`../../mem0-server/admission_gate.py`](../../mem0-server/admission_gate.py) — the read-side query-class admission policy.
+- [`../../mem0-server/supersession.py`](../../mem0-server/supersession.py) — the supersede door's pure rules: the refusal matrix, the payload builders and the hand-written-marker parser (the routes are in `app.py`; the metadata key policy is `security_invariants.authorize_metadata_patch`).
 - [`../../mem0-server/reranker.py`](../../mem0-server/reranker.py) — the bge-reranker cross-encoder client + skip thresholds.
 - [`../../mem0-server/write_path.py`](../../mem0-server/write_path.py) — the passive write-path tracker and the middleware that feeds it (`/health/maintenance` `write_path`).
 - [`../../scripts/wsl/mem0-mcp-shim.py`](../../scripts/wsl/mem0-mcp-shim.py) — the stdio-MCP → HTTP shim (the MCP tool wrappers).
@@ -332,3 +348,11 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 ## C10 addition (machine turns)
 
 - `POST /v1/context/bundle`: a `prompt` that starts with `<task-notification>` (after leading whitespace; `hook_contract.is_machine_turn_prompt`) is a background task notification, not a human prompt. The episode checkpoint still runs, no search runs, and `memories` / `goals` / `open_questions` come back empty with `machine_turn: true`. The field is additive and absent on every other response.
+
+## 1.32.4 additions (the supersede door)
+
+- `POST` / `DELETE /v1/memories/{id}/supersede`: the only writer of `superseded_by` (and of `superseded_at`, `superseded_via`, `partially_superseded_by`); server-enforced refusal matrix, intent ledger line first, actor stamped by the server, repeat call a no-op.
+- `PATCH /v1/memories/{id}/metadata`: no actor may write `superseded_by` any more (the `supersession-resolve-v030` entry is gone), and no actor may put a hide key on a canonical record; the key policy lives in `security_invariants.authorize_metadata_patch`. `add()` strips the three new keys too.
+- `PUT /v1/memories/{id}`: `supersede_note` / `supersede_marker` when the new text holds a hand-written `SUPERSEDED ... by mem0 <id>` marker.
+- Shim: `memory_supersede` and `memory_unsupersede` (offline-queued like the other writes; a 4xx refusal is never queued), `partial_supersession_note` on `memory_search` and `memory_recall`, `'history'` in the `memory_search` docstring. `replay-ops.py` replays both ops.
+- Ledger events `supersede`, `supersede-intent`, `unsupersede`, `unsupersede-intent` (`scripts/wsl/ledger-audit.py`).

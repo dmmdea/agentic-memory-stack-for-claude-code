@@ -88,7 +88,13 @@ workspace/project enforcement is still deferred.
    `superseded_by:<mid>` in the durable and operational classes, so the newer
    record surfaces instead. Null/absent pointers are falsy → admitted (legacy
    data carries none). Runs right after the tier check; skipped when the
-   policy is `forensic` (history class, below).
+   policy is `forensic` (history class, below). Since 1.32.4 the field has
+   one writer, `POST /v1/memories/{id}/supersede` (a session's
+   `memory_supersede`, the operator's `--resolve-supersede`, the
+   `--supersede-markers` converter): no metadata-PATCH actor can write it and
+   `add()` strips it. A *partial* supersession (`partially_superseded_by`) is
+   **not read by the gate** and never hides a record, and a text marker
+   (`SUPERSEDED ... by mem0 <id>`) is only text: it hides nothing.
 5. **Contradiction filtering (I.3)** — a record stamped
    `metadata.contradicts_canonical=<canonical_mid>` by the offline
    contradiction sweep (below) is rejected with `contradicts_canonical:<mid>`
@@ -249,8 +255,9 @@ previously omitted `schema_version`):
 | brandless scope + brand-tagged record | **fail-closed** — `brand_scope_required` (v0.19 M4) | `allow_cross_brand` is the explicit opt-in |
 | record brand is listed in the brand map's `shared_brands` or `MEM0_SHARED_BRANDS` | **fail-open** — treated as brand-neutral | the operator declared the label visible to every scope (C3) |
 | audit log unwritable | **fail-open for availability** — WARN, search proceeds (v0.19 M6/M11) | audit must never break retrieval |
-| `superseded_by` truthy (durable/operational) | **fail-closed** — `superseded_by:<mid>` (v0.19 I.1) | the newer record should surface instead; `history` class admits |
+| `superseded_by` truthy (durable/operational) | **fail-closed** — `superseded_by:<mid>` (v0.19 I.1) | the newer record should surface instead; `history` class admits. Written only by the supersede endpoint (1.32.4) |
 | `superseded_by` null/absent | **fail-open** — admitted | legacy data carries no supersession pointer |
+| `partially_superseded_by` (any value) | **fail-open** — admitted | a partial supersession annotates one stale claim and never hides; the gate does not read the key (1.32.4) |
 | `contradicts_canonical` truthy, target still `canonical` (durable/operational) | **fail-closed** — `contradicts_canonical:<mid>` (v0.19 I.3) | contradiction of locked ground truth; `history` class admits |
 | `contradicts_canonical` truthy, target demoted / gone / lookup failed | **fail-open** — admitted; counted in `stamps` | a stamp against a non-canonical target is stale (WP-4); an unresolved lookup must not hide a live record |
 | `contradiction_checked_at` alone (sweep NO verdict) | **fail-open** — admitted | idempotency marker, not a verdict |

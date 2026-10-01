@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -388,3 +389,84 @@ def test_protocol_no_longer_claims_there_is_no_supersession_field():
     text = " ".join(_protocol().split())
     assert "`valid_from`/`valid_to`/`supersedes` schema" not in text
     assert "superseded_by" in text and "memory_supersede" in text
+
+
+# ---- the docs agree with the code ---------------------------------------------------------------------
+
+def _doc_text(rel: str) -> str:
+    return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+
+def _refusal_codes() -> set:
+    """Every code supersession.py can refuse with, read from its source so a new code cannot be added
+    without the contract naming it. The two f-string codes expand over the protected tiers."""
+    src = (HERE.parent / "supersession.py").read_text(encoding="utf-8")
+    codes = set()
+    for m in re.finditer(r'Refusal\(\s*\d+,\s*(f?)"([a-z{}\' -]+)"', src):
+        if m.group(1):
+            tiers = re.search(r"PROTECTED_TIERS = frozenset\(\{([^}]*)\}\)", src).group(1)
+            codes |= {f"loser-{t.strip().strip(chr(34))}" for t in tiers.split(",")}
+        else:
+            codes.add(m.group(2))
+    assert len(codes) >= 14, codes     # the parse found the matrix
+    return codes
+
+
+def test_api_contracts_names_every_refusal_code_of_the_door():
+    doc = _doc_text("docs/api-contracts.md")
+    missing = sorted(c for c in _refusal_codes() if f"`{c}`" not in doc)
+    assert not missing, f"docs/api-contracts.md does not document the refusal code(s) {missing}"
+
+
+def test_api_contracts_names_every_forbidden_metadata_key_and_the_hide_key_rule():
+    from security_invariants import METADATA_FORBIDDEN_KEYS, RETRIEVAL_HIDE_KEYS
+    doc = _doc_text("docs/api-contracts.md")
+    start = doc.index("### `PATCH /v1/memories/{mid}/metadata`")
+    section = doc[start:doc.index("### `POST /v1/memories/{mid}/supersede`")]
+    missing = sorted(k for k in METADATA_FORBIDDEN_KEYS if f"`{k}`" not in section)
+    assert not missing, f"the PATCH /metadata contract does not list the forbidden key(s) {missing}"
+    assert "hide key" in section and all(f"`{k}`" in section for k in RETRIEVAL_HIDE_KEYS)
+
+
+def test_api_contracts_documents_both_routes_and_both_tools_and_the_put_note():
+    doc = _doc_text("docs/api-contracts.md")
+    for heading in ("### `POST /v1/memories/{mid}/supersede`", "### `DELETE /v1/memories/{mid}/supersede`",
+                    '### `memory_supersede(memory_id, superseded_by, scope="full", detail=None, reason=None)`',
+                    '### `memory_unsupersede(memory_id, scope="full", reason=None)`'):
+        assert heading in doc, f"docs/api-contracts.md has no section {heading!r}"
+    assert "supersede_note" in doc and "partial_supersession_note" in doc
+    assert "never changes what a search returns" in doc, "memory_update is text only"
+
+
+def test_the_system_docs_describe_the_door_where_they_describe_the_writers():
+    for rel, needles in {
+        "docs/systems/mem0-api.md": ("/supersede", "memory_supersede", "memory_unsupersede", "supersession.py",
+                                     "METADATA_FORBIDDEN_KEYS"),
+        "docs/systems/reconciliation.md": ("--supersede-markers", "--apply-partial", "--only", "--unsupersede",
+                                           "--resolve-supersede", "memory_supersede", "dangling",
+                                           "refused:canonical"),
+        "docs/systems/memory-model.md": ("memory_supersede", "memory_unsupersede"),
+        "docs/systems/admission-gate.md": ("partially_superseded_by", "/supersede"),
+        "docs/operations.md": ("--unsupersede", "--supersede-markers", "--resolve-supersede"),
+        "docs/glossary.md": ("## Supersession",),
+        "ARCHITECTURE.md": ("/supersede", "partially_superseded_by"),
+    }.items():
+        text = _doc_text(rel)
+        missing = [n for n in needles if n not in text]
+        assert not missing, f"{rel} does not mention {missing}"
+
+
+def test_every_new_sweep_flag_is_in_the_reconciliation_runbook():
+    src = (SCRIPTS / "contradiction-sweep.py").read_text(encoding="utf-8")
+    doc = _doc_text("docs/systems/reconciliation.md")
+    for flag in ("--resolve-supersede", "--unsupersede", "--supersede-markers", "--apply-partial", "--only"):
+        assert f'"{flag}"' in src, f"{flag} is no longer a sweep flag: update this pin and the runbook"
+        assert flag in doc, f"{flag} is not in docs/systems/reconciliation.md"
+
+
+def test_operations_no_longer_sends_a_superseded_record_to_unstamp():
+    ops = _doc_text("docs/operations.md")
+    assert "**Superseded / contradicts-canonical** → that's reconciliation; `--unstamp` if wrong" not in ops
+    line = next(ln for ln in ops.splitlines() if ln.startswith("- **Superseded"))
+    assert "--unsupersede" in line and "--unstamp" in line, line
+    assert "`SUPERSEDED" in ops and "--supersede-markers" in ops, "a known-issues row and the runbook line"

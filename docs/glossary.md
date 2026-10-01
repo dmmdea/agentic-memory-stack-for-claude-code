@@ -90,6 +90,10 @@ The 4C contradiction/corroboration gate that scores every autonomous Canonical p
 
 The mode in which memory is asked for — `durable` (default), `operational`, `canonical`, or `history` — each with its own Admission Gate policy governing which tiers are admitted, the recency cap, and whether superseded/contradicted records are hidden. "Durable" is a query class, not a tier. See [memory-model.md](systems/memory-model.md).
 
+## Supersession
+
+Retiring a stale Memory behind a newer one. It has one writer, `POST /v1/memories/{id}/supersede` (the MCP tool `memory_supersede`, the operator's `contradiction-sweep.py --resolve-supersede` and `--supersede-markers`), which enforces the refusal rules on every call and ledgers it. A **full** supersession sets `superseded_by`, and the Admission Gate then withholds the record outside the `history` Query Class; a **partial** one annotates a single stale claim (`partially_superseded_by`) and never hides. It is reversible (`memory_unsupersede`, `--unsupersede`). Appending "SUPERSEDED ..." to a record's text is not a supersession: the gate never reads text. See [reconciliation.md](systems/reconciliation.md).
+
 ## L1a Extractor
 
 The session fact extractor (`scripts/windows/l1a-extract.ps1`): on a Stop/PreCompact hook a Codex subagent reads the last ~24 turns under an inferability-gate + ephemera-gate prompt, keeping only genuinely project-specific facts that outlive the session (max 5/run, one success per 10 min) and posting each to mem0 as `tier=evidence`. See [memory-capture.md](flows/memory-capture.md).
