@@ -1189,8 +1189,11 @@ def _acquire_lock(path, stale_s: int = 3600) -> bool:
 def run_promote(mem0_http: httpx.Client, memory_id: str) -> int:
     """Human-confirmed promote (2026-06-30): enforce (HIDE) memory_id against the canonical recorded
     for it in the review queue. The reviewed-and-approved counterpart to the safe auto-CLEAR loop —
-    the operator looks at REVIEW_QUEUE, decides a candidate is a genuine contradiction, and runs this."""
+    the operator looks at REVIEW_QUEUE, decides a candidate is a genuine contradiction, and runs this.
+    A supersede line (kind "supersede", canonical_id = the winner) is a staleness review of a different
+    kind: it is resolved by --resolve-supersede, so it never supplies the canonical here."""
     canonical_id = None
+    supersede_winner = None
     try:
         with open(REVIEW_QUEUE, encoding="utf-8") as f:
             for line in f:
@@ -1202,9 +1205,18 @@ def run_promote(mem0_http: httpx.Client, memory_id: str) -> int:
                 except ValueError:
                     continue
                 if rec.get("memory_id") == memory_id and rec.get("canonical_id"):
-                    canonical_id = rec.get("canonical_id")  # last entry wins
+                    if rec.get("kind") == SUPERSEDE_KIND:
+                        supersede_winner = rec.get("canonical_id")
+                    else:
+                        canonical_id = rec.get("canonical_id")  # last entry wins
     except OSError:
         pass
+    if not canonical_id and supersede_winner:
+        print(f"contradiction-sweep: --promote {memory_id}: its review line is a SUPERSEDE review (the "
+              "record is stale, it does not contradict a canonical), and --promote would stamp "
+              "contradicts_canonical against a non-canonical winner. Resolve it with: "
+              f"--resolve-supersede {memory_id} --winner {supersede_winner} [--apply]", flush=True)
+        return 1
     if not canonical_id:
         print(f"contradiction-sweep: --promote {memory_id}: not found in review queue "
               f"({REVIEW_QUEUE}) — nothing to promote", flush=True)

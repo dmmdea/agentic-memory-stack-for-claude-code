@@ -211,3 +211,30 @@ def test_parse_created_and_is_older():
     assert sweep.is_older(b_old, {"payload": {}}) is False      # unparseable anchor -> conservative
     assert sweep.parse_created({"payload": {"metadata": {"created_at": "2026-06-01T00:00:00Z"}}}) is not None
     assert sweep.parse_created({"payload": {}}) is None
+
+
+def test_run_promote_refuses_a_supersede_review_line_and_names_the_right_command(tmp_path, monkeypatch, capsys):
+    """A supersede line (kind "supersede", canonical_id = the winner) is a staleness review, not a
+    contradiction against a canonical. The banner advertises --promote for every line, and run_promote
+    ignored the kind, so it would have stamped contradicts_canonical against a NON-canonical winner.
+    The supersede door is --resolve-supersede."""
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    stamped = []
+    monkeypatch.setattr(sweep, "stamp_candidate", lambda *a, **k: stamped.append(a) or True)
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "w1", "kind": "supersede"})
+    assert sweep.run_promote(None, "m1") == 1
+    assert stamped == [], "nothing is stamped from a supersede line"
+    assert "--resolve-supersede m1 --winner w1" in capsys.readouterr().out
+    assert len(_lines(q)) == 1, "the line stays until it is resolved"
+
+
+def test_run_promote_still_promotes_a_contradiction_line_beside_a_supersede_line(tmp_path, monkeypatch):
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    seen = []
+    monkeypatch.setattr(sweep, "stamp_candidate", lambda http, mid, ts, contradicts=None, **k: seen.append(contradicts) or True)
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"})
+    sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "w1", "kind": "supersede"})
+    assert sweep.run_promote(None, "m1") == 0
+    assert seen == ["c1"], "the contradiction line decides, whichever order the lines are in"
