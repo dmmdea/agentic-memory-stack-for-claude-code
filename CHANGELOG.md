@@ -4,6 +4,82 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.5 — a server-side job label needs the authority's service key, and an insight leaves insight only by a signed demote (2026-10-01)
+
+### Security
+- **Any holder of the ordinary API key could claim a server-side job's label.** The server trusted free-text labels
+  in a request body or query string: the sweep's `contradiction-sweep-v019` and the backfill's `stamp-retired-v013`
+  (PATCH /metadata, skipping the canonical and insight HMAC gate), the legacy `backfill-apply-v013`, `decay-scan`
+  and `system`, and the dream's `dream-consolidator` family (insight PUT/DELETE/PATCH without a token, PATCH /tier
+  into insight, and POST /v1/memories tier=insight through `metadata.source`). Every PC and every MCP session
+  holds that key, so any of them could hide a non-canonical record (`contradicts_canonical`, `retrievable=false`),
+  schedule its deletion (`expires_at`), mint, rewrite or delete a high-trust insight, or stamp `retired_at` on a
+  canonical. 1.32.4 closed the canonical hide keys and named this as the open follow-up. Now such a label counts
+  only when the request also carries the authority-only **service key** in `X-AMS-Service-Key`; without it the
+  server answers `403 service-credential-required` and names the label. The check runs in every write handler
+  (POST add, PUT, DELETE, PATCH /tier, PATCH /metadata) before the policy, and the policy functions themselves
+  (`assert_writable`, `validate_insight_actor`, `authorize_metadata_patch`) now take `service_verified` and honour a
+  label only when told it was proven, so a handler that forgets the check is refused rather than trusted.
+- **An insight could be moved out of insight with no token**, after which PUT and DELETE were ungated: the insight
+  gate fell to two plain requests, the hole session 12 closed for canonical. A move out of insight now signs
+  `demote` like a move out of canonical (`mem0-canonize.sh --action demote`), no job label exempts it (nothing in
+  the stack demotes an insight), and PATCH /tier re-reads the tier under the record lock: a record that became
+  canonical or insight while an unsigned change was in flight is a 409.
+- **The codex judge no longer inherits the credential pointers.** It reads memory text any API-key holder can
+  write; `codex_shim_client.judge_env()` drops `CREDENTIALS_DIRECTORY`, `MEM0_API_KEY_FILE`, `MEM0_KEY` and
+  `MEM0_API_KEY` from its environment. That removes the pointer, not the files: the sandbox is the boundary.
+- Boundary, stated plainly: the service key separates the authority's own jobs from every caller that holds only
+  the shared API key (MCP sessions, hooks, PCs, replicas). It does not resist a shell on the authority as the
+  service user. It is one key for every job. No replica or PC holds it, and it is not the canonical key, so a job
+  that holds it still cannot mint a canonical token. Known and unchanged: caller-chosen `source` labels that
+  server-side jobs read (the autopromote corroboration fast-track's `user-decision`, semantic-dedup's
+  `automemory:` protection) need a different design, because their legitimate senders are unprivileged PC hooks.
+
+### Added
+- **`ams-service-key`**, an authority-only, regenerable secret. Native authority: the systemd credential
+  `LoadCredentialEncrypted=ams-service-key:<secrets-dir>/ams-service-key.cred` on mem0.service, the dream and the
+  sweep steps, and the hand-run wrappers; `install/linux-authority.sh` makes it when it is missing or does not
+  decrypt on this host (the old one is set aside, never deleted) and fails the install unless mem0 reports it
+  loaded. WSL authority: `~/.mem0/service-key` (mode 600) from `install/1-wsl-services.sh` and `scripts/wsl/deploy.sh`,
+  which asserts it after its restart. Replicas never hold it and refuse every job label, by design.
+- `/health/deep` `checks.service_key: {present, source}` (informational) and the capability row `service-key`
+  (required on the brain: an absent key there is dead).
+- `scripts/wsl/ams-service-run.sh <script> [args]`: the operator's hand run with the service key on the authority,
+  for `contradiction-sweep.py` (`--unstamp`, `--promote`), `stamp-retired-at.py` and `ship_log_reclassify.py`.
+- `ams_env.service_key()` and `ams_env.mem0_headers()`: the dream, the sweep and the backfill scripts build their
+  mem0 headers in one place and send the key when they hold it.
+
+### Changed
+- The MCP shim downgrades every `memory_add` with tier=insight to evidence (no session can hold the key); before, a
+  consolidator source passed straight through.
+- MCP `memory_demote`/`memory_promote` (actor `claude-autonomous`, no token) can no longer move an insight in
+  either direction: a wrong insight is demoted with the signed `mem0-canonize.sh --action demote` (or a signed delete).
+- PowerShell: a failed insight add from the Windows-hosted dream never enters the shared Outbox (`replay-ops.py`
+  drains it for every session and never sends the service key): a 403 goes to the poison file, a transient failure
+  to the dead-letter file, which re-posts through `Add-Mem0Memory` with the key.
+- `ship_log_reclassify.py` reads the key and URL through `ams_env` and refuses `--live` without the service key
+  (it would otherwise write each episode and then be refused the retire).
+- `app.py` keeps no copy of the insight allowlist; it imports `security_invariants.INSIGHT_ALLOWED_ACTORS`.
+
+### Upgrade notes
+- **Authority first, from a release tree of the tag.** `install/linux-authority.sh --dry-run` then the real run: it
+  generates `ams-service-key.cred`, renders the units with the new credential line, restarts mem0 and checks the key
+  is loaded. Run it after the v1.32.5 release assets exist (its step [4b] fetches the store binary for the tag), or
+  pass `--ams-store-binary/--ams-store-sums`. Once mem0.service carries the line, a missing or undecryptable
+  `ams-service-key.cred` stops it from starting; re-running the installer regenerates the key.
+- **WSL brain:** `scripts/wsl/deploy.sh` makes `~/.mem0/service-key` before its restart and asserts it after; also
+  re-run `install/2-windows-config.ps1` so the Windows dream's `memory-common.ps1`/`dream-consolidate.ps1` send it.
+- **PCs:** nothing is required for the security change (no PC sends a job label). Re-run the installer to get the
+  shim's insight downgrade and the PowerShell Outbox rule; the new MCP behaviour appears after a session restart.
+- **Insight adds queued in the shared Outbox before the upgrade** (a Windows-hosted dream's failed add, or an MCP
+  session that named a consolidator `source`) replay without the key and land once in `mutation-conflicts.jsonl`
+  as `403 service-credential-required`. Drain the Outbox before upgrading, or re-post a genuine one from the
+  authority (the nightly dream also re-derives insights from the same evidence).
+- **Operators:** hand runs that send a job label (`contradiction-sweep.py --unstamp/--promote`, `stamp-retired-at.py`,
+  `ship_log_reclassify.py`) go through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> <args>` on the authority.
+- Live suites that seed insights or send job labels need the key in the run's environment (they run on the
+  authority only); the headless suite does not.
+
 ## 1.32.4 — unfinished sessions read clean and close daily, missed episode vectors come back, and a real supersede door (2026-10-01)
 
 ### Fixed
