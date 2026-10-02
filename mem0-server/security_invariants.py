@@ -315,7 +315,8 @@ def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], 
     require_service_credential is refused rather than trusted.
     """
     keys = set(keys)
-    actor_lower = normalize_label(actor) if service_verified else ""
+    actor_lower = normalize_label(actor) if service_verified else ""   # the allowlist lookups
+    actor_sent = normalize_label(actor)                                    # what the caller sent, for the message
     hide_hit = RETRIEVAL_HIDE_KEYS & keys
     if hide_hit and current_tier == "canonical":
         raise HTTPException(
@@ -332,7 +333,8 @@ def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], 
             raise HTTPException(
                 403,
                 f"forbidden metadata keys {sorted(forbidden_hit - allowed_keys)} "
-                f"require trusted actor; got actor={actor_lower!r}",
+                f"require trusted actor; got actor={actor_sent!r}"
+                + ("" if service_verified or not is_privileged_label(actor) else " (not proven: no service key)"),
             )
     if actor_lower in TRUSTED_PATCH_ACTORS:
         actor_allowed_keys = TRUSTED_PATCH_ACTORS[actor_lower]

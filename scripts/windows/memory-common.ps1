@@ -393,6 +393,10 @@ function Add-Mem0Memory {
     $key = Get-Mem0Key
     $Metadata['source'] = $Source
     if (-not $Metadata.ContainsKey('tier')) { $Metadata['tier'] = 'evidence' }
+    # 1.32.5: what happened to this write, for Drain-Mem0DeadLetter ('ok' | 'poisoned' | 'queued' |
+    # 'dead-lettered' | 'retry'). Inside a drain ($script:Mem0InDeadLetterDrain) this function never
+    # appends to the dead-letter file itself: the drain owns the re-queue, and a poisoned record leaves.
+    $script:Mem0LastPostOutcome = $null
     $headers = @{'X-API-Key' = $key; 'Content-Type' = 'application/json'}
     # 1.32.5: an insight add claims the consolidator's source label, which the server accepts only
     # with the service key. Read it for that case alone so an ordinary add never touches the file.
@@ -423,6 +427,7 @@ function Add-Mem0Memory {
         # record source-IDs (audit finding 2026-06-08: C1 insights had no lineage).
         $newId = $null
         if ($r -and $r.results -and $r.results.Count -gt 0) { $newId = $r.results[0].id }
+        $script:Mem0LastPostOutcome = 'ok'
         if ($newId) { return $newId } else { return $true }
     } catch {
         # v1.23 P2-7 (spec §7 defect 2): a failed write is never dropped and never dead-lettered.
@@ -448,18 +453,23 @@ function Add-Mem0Memory {
             $rec = @{ text = $Text; source = $Source; metadata = $Metadata; status_code = $statusCode
                       error = $errMsg; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
             try { Add-Content -LiteralPath $poisonPath -Value $rec -Encoding UTF8 } catch {}
+            $script:Mem0LastPostOutcome = 'poisoned'
             return $false
         }
         if ($isInsight) {
+            if ($script:Mem0InDeadLetterDrain) { $script:Mem0LastPostOutcome = 'retry'; return $false }
             $dlq = Join-Path $script:StateDir 'mem0-post-failures.jsonl'
             $rec = @{ text = $Text; source = $Source; metadata = $Metadata; attempts = 1; status_code = $statusCode
                       error = "insight add (kept out of the Outbox): $errMsg"; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
             try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
+            $script:Mem0LastPostOutcome = 'dead-lettered'
             return $false
         }
         try {
             Add-Mem0OutboxOp -Op 'add' -Args @{ text = $Text; user_id = '__WSL_USER__'; infer = $false; metadata = $Metadata } | Out-Null
+            $script:Mem0LastPostOutcome = 'queued'
         } catch {
+            if ($script:Mem0InDeadLetterDrain) { $script:Mem0LastPostOutcome = 'retry'; return $false }
             # The Outbox itself is unreachable (WSL asleep, \\wsl.localhost not mounted): a TRANSIENT
             # condition, so the fact goes to the legacy dead-letter file, which Drain-Mem0DeadLetter
             # re-posts through this function on the next run (and then queues it to the Outbox once
@@ -468,6 +478,7 @@ function Add-Mem0Memory {
             $rec = @{ text = $Text; source = $Source; metadata = $Metadata; attempts = 1; status_code = 0
                       error = "outbox-unwritable: $($_.Exception.Message); original: $errMsg"; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
             try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
+            $script:Mem0LastPostOutcome = 'dead-lettered'
         }
         return $false
     }
@@ -499,6 +510,11 @@ function Drain-Mem0DeadLetter {
     $poisoned = 0
     $dropped  = 0
 
+    # 1.32.5: while this drain re-posts, Add-Mem0Memory must not append to this file (the drain
+    # re-queues), and a record its re-post POISONED is already in the poison file, so it leaves the
+    # queue instead of looping (and writing a poison line) on every drain.
+    $script:Mem0InDeadLetterDrain = $true
+    try {
     foreach ($line in $lines) {
         try {
             $rec = $line | ConvertFrom-Json
@@ -569,12 +585,16 @@ function Drain-Mem0DeadLetter {
         }
 
         $r = $false
+        $script:Mem0LastPostOutcome = $null
         try {
             $r = Add-Mem0Memory -Text $textVal -Source $sourceVal -Metadata $metaHt
         } catch {}
 
         if ($r) {
             $drained++
+        } elseif ($script:Mem0LastPostOutcome -eq 'poisoned') {
+            Write-MemoryLog -Component 'l1a' -Message "WARN: DLQ record poisoned on re-post (now in mem0-post-poison.jsonl, dropped from the queue)"
+            $poisoned++
         } else {
             # Re-queue with incremented attempts; preserve all fields.
             # Connection-level failures (status_code 0) do not accrue attempts — see gate above.
@@ -591,6 +611,16 @@ function Drain-Mem0DeadLetter {
             $still += $retryRec
         }
     }
+    } finally {
+        $script:Mem0InDeadLetterDrain = $false
+    }
+
+    # 1.32.5: another process may have APPENDED to the file while this drain ran (a dream's failed
+    # insight add, an outbox-unwritable fallback); the rewrite below must not erase those lines.
+    try {
+        $now = @(Get-Content -LiteralPath $dlq -ErrorAction Stop)
+        if ($now.Count -gt $lines.Count) { $still += $now[$lines.Count..($now.Count - 1)] }
+    } catch {}
 
     if ($still.Count -eq 0) {
         Remove-Item -LiteralPath $dlq -ErrorAction SilentlyContinue

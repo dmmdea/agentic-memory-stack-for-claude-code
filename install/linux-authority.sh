@@ -302,19 +302,24 @@ fi
 # deleted) and replaced.
 SERVICE_CRED="$SECRETS_DIR/ams-service-key.cred"
 svc_cred_decrypts() { systemd-creds --user decrypt --name=ams-service-key "$1" - >/dev/null 2>&1; }
-if [ -s "$SERVICE_CRED" ] && { [ "$DRY_RUN" = 1 ] || svc_cred_decrypts "$SERVICE_CRED"; }; then
+# The decrypt probe is read-only, so the dry run runs it too and reports what it found.
+if [ -s "$SERVICE_CRED" ] && command -v systemd-creds >/dev/null && svc_cred_decrypts "$SERVICE_CRED"; then
     echo "    service key: $SERVICE_CRED present and decrypts on this host (kept)"
-elif plan "generate $SERVICE_CRED (32 random bytes -> systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key)"; then :; else
-    if [ -e "$SERVICE_CRED" ]; then
-        aside="$SERVICE_CRED.undecryptable-$(date -u +%Y%m%dT%H%M%SZ)"
-        mv -f "$SERVICE_CRED" "$aside"
-        echo "    service key: $SERVICE_CRED did not decrypt on this host; set aside as $aside, generating a new one"
-    fi
+elif [ "$DRY_RUN" = 1 ] && [ -s "$SERVICE_CRED" ] && ! command -v systemd-creds >/dev/null; then
+    echo "    [dry-run] service key: $SERVICE_CRED present; no systemd-creds here to probe it"
+elif plan "generate $SERVICE_CRED (32 random bytes -> systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key)$([ -e "$SERVICE_CRED" ] && echo "; the present file does NOT decrypt on this host and would be set aside")"; then :; else
+    # Make and prove the NEW key first; only then move a non-decrypting old one aside. A failure on
+    # the way leaves the old file exactly where it was, so a later mem0 restart is no worse off.
     ( umask 077
       python3 -c 'import secrets; print(secrets.token_hex(32))' \
         | systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key - "$SERVICE_CRED.tmp" ) \
-        || { rm -f "$SERVICE_CRED.tmp"; fail "could not create $SERVICE_CRED: systemd-creds --user encrypt --with-key=host+tpm2 failed (it needs systemd >= 256 and TPM2 access for this user)"; }
-    svc_cred_decrypts "$SERVICE_CRED.tmp" || { rm -f "$SERVICE_CRED.tmp"; fail "systemd-creds wrote $SERVICE_CRED.tmp but it does not decrypt"; }
+        || { rm -f "$SERVICE_CRED.tmp"; fail "could not create $SERVICE_CRED: systemd-creds --user encrypt --with-key=host+tpm2 failed (it needs systemd >= 256 and TPM2 access for this user); the existing file, if any, is untouched"; }
+    svc_cred_decrypts "$SERVICE_CRED.tmp" || { rm -f "$SERVICE_CRED.tmp"; fail "systemd-creds wrote $SERVICE_CRED.tmp but it does not decrypt; the existing file, if any, is untouched"; }
+    if [ -e "$SERVICE_CRED" ]; then
+        aside="$SERVICE_CRED.undecryptable-$(date -u +%Y%m%dT%H%M%SZ)"
+        mv -f "$SERVICE_CRED" "$aside"
+        echo "    service key: $SERVICE_CRED did not decrypt on this host; set aside as $aside"
+    fi
     mv -f "$SERVICE_CRED.tmp" "$SERVICE_CRED"
     echo "    service key: generated $SERVICE_CRED"
 fi

@@ -73,7 +73,13 @@ reports `checks.service_key.present: true`. By hand:
 ```bash
 python3 -c 'import secrets; print(secrets.token_hex(32))' \
   | systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key - <secrets-dir>/ams-service-key.cred
+systemctl --user restart mem0.service   # the server reads the key once, at start
+curl -s "$(head -n1 ~/.mem0/authority-url)/health/deep" | jq '.checks.service_key'   # present: true
 ```
+
+The restart is not optional: the dream and sweep units load the new file on their next run while a
+running `mem0.service` still holds the old key, so every job label would be refused until it restarts.
+The installer re-run does the restart and the check for you, which is why it is the preferred path.
 
 On a WSL authority, `install/1-wsl-services.sh` or `deploy.sh` writes a missing `~/.mem0/service-key`
 (then restart `mem0.service`, which reads it once). The operator's hand runs of the scripts that send
