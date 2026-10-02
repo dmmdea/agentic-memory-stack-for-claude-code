@@ -305,10 +305,13 @@ echo "    fastembed durable cache seeded OK ($FASTEMBED_CACHE)"
 # The server accepts a server-side job label (the dream's, the sweep's) only with this key, and it
 # reads the key once at start, so it must exist BEFORE the restart below. Regenerable: only this
 # box holds it. install/1-wsl-services.sh makes it on a full install; this is the upgrade path.
-if [ "${MEM0_ROLE:-brain}" = "brain" ] && [ ! -s "$HOME/.mem0/service-key" ]; then
-    ( umask 077; python3 -c "import secrets; print(secrets.token_hex(32))" > "$HOME/.mem0/service-key" )
+if [ "${MEM0_ROLE:-brain}" = "brain" ]; then
+    if [ ! -s "$HOME/.mem0/service-key" ]; then
+        ( umask 077; python3 -c "import secrets; print(secrets.token_hex(32))" > "$HOME/.mem0/service-key" )
+        echo "    service-key generated at ~/.mem0/service-key (proves the dream's and the sweep's job labels)"
+    fi
+    # Every deploy, a kept key included: a restored or hand-made file never keeps a broader mode.
     chmod 600 "$HOME/.mem0/service-key"
-    echo "    service-key generated at ~/.mem0/service-key (mode 600; proves the dream's and the sweep's job labels)"
 fi
 
 # --- 5. restart + health gate ---

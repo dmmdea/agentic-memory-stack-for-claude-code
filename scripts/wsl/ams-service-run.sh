@@ -55,6 +55,8 @@ if [[ "$(env_val MEM0_HOST_KIND)" == "native" ]]; then
     -p "LoadCredentialEncrypted=ams-api-key:$sec/ams-api-key.cred" \
     -p "LoadCredentialEncrypted=ams-service-key:$sec/ams-service-key.cred" \
     -p "Environment=MEM0_HOST_KIND=native" \
+    -p "Environment=MEM0_CODEX_TRANSPORT=native" \
+    -p "Environment=CODEX_HOME=$sec/codex" \
     -E "MEM0_URL=http://$bind:18791" \
     /bin/bash -c 'export MEM0_API_KEY_FILE="$CREDENTIALS_DIRECTORY/ams-api-key"; exec "$@"' _ "$PY" "$target" "$@"
 fi

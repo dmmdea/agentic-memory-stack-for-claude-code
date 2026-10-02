@@ -480,6 +480,8 @@ def test_handler_accepts_a_signed_demotion_of_an_insight(signing):
     tok = _sign(signing, ts, nonce, "demote", "mid-1", "wrong insight")
     out = call("evidence", actor="user-direct", reason="wrong insight", token=tok, ts=ts, nonce=nonce)
     assert out["ok"] is True and store.writes[0][0]["tier"] == "evidence"
+    # Ledgered as the signed CLI path, like a canonical demotion (both lines of the pair).
+    assert [r["transport"] for r in ledger] == ["cli-user-direct", "cli-user-direct"]
 
 
 def test_handler_refuses_a_record_that_became_insight_mid_flight_with_409(signing):

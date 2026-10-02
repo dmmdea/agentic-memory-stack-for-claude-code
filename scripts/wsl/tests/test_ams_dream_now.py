@@ -354,6 +354,10 @@ def test_service_run_loads_the_sweep_units_credentials(box):
     unit = SWEEP_UNIT.read_text(encoding="utf-8").replace("__SECRETS_DIR__", str(box.sec))
     assert creds == re.findall(r"^LoadCredentialEncrypted=(.+)$", unit, re.M)
     assert any(c.startswith("ams-service-key:") for c in creds)
+    # The sweep's judging modes (--apply, --rejudge-stamped) call Codex: the hand run must see the
+    # unit's own Codex login and transport, every Environment= line except the %d credential path.
+    envs = [e for e in re.findall(r"^Environment=(.+)$", unit, re.M) if "%d/" not in e]
+    assert envs and all(f"Environment={e}" in _properties(argv) for e in envs), envs
     py = f"{box.home}/apps/mem0-server/.venv/bin/python"
     assert argv[-4:] == [py, f"{box.home}/apps/mem0-scripts/contradiction-sweep.py", "--unstamp", "abc"]
     assert "MEM0_URL=http://192.0.2.10:18791" in argv

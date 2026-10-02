@@ -147,6 +147,58 @@ Describe 'Add-Mem0Memory failure path: Outbox, not DLQ' {
     }
 }
 
+Describe 'Add-Mem0Memory and the 1.32.5 service key' {
+    # An insight add claims the dream's job label, which the server accepts only with the authority's
+    # service key; the Outbox replay never sends that key, so an insight must never be queued there.
+    BeforeEach {
+        $script:savedProfile = $env:USERPROFILE
+        $env:USERPROFILE = Join-Path $TestDrive ('p' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.mem0'), (Join-Path $env:USERPROFILE '.claude\state') | Out-Null
+        $script:StateDir = Join-Path $env:USERPROFILE '.claude\state'
+        $script:OutboxPath = Join-Path $env:USERPROFILE '.mem0\outbox.jsonl'
+        $script:savedKeyPath = $script:Mem0KeyPath
+        $script:Mem0KeyPath = Join-Path $env:USERPROFILE '.mem0\api-key'      # the service key sits beside it
+        Set-Content -Path (Join-Path $env:USERPROFILE '.mem0\service-key') -Value 'svc-key' -Encoding UTF8
+        Mock Get-Mem0Key { 'k' }
+        $script:seenHeaders = $null
+    }
+    AfterEach { $env:USERPROFILE = $script:savedProfile; $script:OutboxPath = $null; $script:Mem0KeyPath = $script:savedKeyPath }
+
+    It 'sends X-AMS-Service-Key on an insight add' {
+        Mock Invoke-RestMethod { $script:seenHeaders = $Headers; [pscustomobject]@{ results = @([pscustomobject]@{ id = 'x' }) } }
+        Add-Mem0Memory -Text 'an insight' -Source 'dream-consolidator' -Metadata @{ tier = 'insight' } | Should -Be 'x'
+        $script:seenHeaders['X-AMS-Service-Key'] | Should -Be 'svc-key'
+        $script:seenHeaders['X-API-Key'] | Should -Be 'k'
+    }
+    It 'never reads or sends the key for an ordinary add' {
+        Mock Get-Mem0ServiceKey { 'must-not-be-read' }
+        Mock Invoke-RestMethod { $script:seenHeaders = $Headers; [pscustomobject]@{ results = @([pscustomobject]@{ id = 'y' }) } }
+        Add-Mem0Memory -Text 'a fact' -Source 'l1a' -Metadata @{ tier = 'evidence' } | Should -Be 'y'
+        $script:seenHeaders.ContainsKey('X-AMS-Service-Key') | Should -Be $false
+        Should -Invoke Get-Mem0ServiceKey -Times 0
+    }
+    It 'keeps a transiently failed insight add out of the Outbox and in the dead-letter file' {
+        Mock Invoke-RestMethod { throw [System.Net.WebException]::new('connect refused') }
+        Add-Mem0Memory -Text 'an insight' -Source 'dream-consolidator' -Metadata @{ tier = 'insight' } | Should -Be $false
+        Test-Path $script:OutboxPath | Should -Be $false
+        $rec = Get-Content (Join-Path $script:StateDir 'mem0-post-failures.jsonl') | ConvertFrom-Json
+        $rec.text | Should -Be 'an insight'
+        $rec.error | Should -Match '^insight add \(kept out of the Outbox\)'
+        $rec | Get-Member -Name 'X-AMS-Service-Key' | Should -BeNullOrEmpty -Because 'the key is never written to disk'
+    }
+    It 'sends a 403 on an insight add to the poison file, never the Outbox' {
+        Mock Invoke-RestMethod { throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('403', [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]403)) }
+        Add-Mem0Memory -Text 'an insight' -Source 'dream-consolidator' -Metadata @{ tier = 'insight' } | Should -Be $false
+        Test-Path $script:OutboxPath | Should -Be $false
+        (Get-Content (Join-Path $script:StateDir 'mem0-post-poison.jsonl') | ConvertFrom-Json).status_code | Should -Be 403
+    }
+    It 'still queues an ordinary 403 to the Outbox (unchanged for non-insight writes)' {
+        Mock Invoke-RestMethod { throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('403', [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]403)) }
+        Add-Mem0Memory -Text 'a fact' -Source 'l1a' -Metadata @{ tier = 'evidence' } | Should -Be $false
+        (Get-Content $script:OutboxPath | ConvertFrom-Json).op | Should -Be 'add'
+    }
+}
+
 Describe 'Regression guards for the authority contract' {
     It 'no Windows hook initialises its URL from $env:MEM0_URL directly' {
         foreach ($f in 'memory-common.ps1', 'user-prompt-extract.ps1', 'mem0-hook-daemon.ps1', 'sessionstart-capture.ps1', 'user-prompt-lib.ps1') {
@@ -219,11 +271,22 @@ Describe 'Regression guards for the authority contract' {
         $gate | Should -BeGreaterThan 0 -Because 'a brain keeps whatever the operator set'
         $code.Substring($gate, $i - $gate) | Should -Match '127\\\.0\\\.0\\\.1\|localhost' -Because 'only a LOOPBACK value is residue; a remote value is a choice'
     }
-    It 'Add-Mem0Memory writes the dead-letter file only on the outbox-unwritable branch' {
+    It 'Add-Mem0Memory writes the dead-letter file only on the outbox-unwritable branch, and for an insight add' {
         $body = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') 'Add-Mem0Memory'
         $body | Should -Not -BeNullOrEmpty
         $body | Should -Match 'Add-Mem0OutboxOp'
-        ([regex]::Matches($body, 'mem0-post-failures')).Count | Should -Be 1
-        $body.IndexOf('mem0-post-failures') | Should -BeGreaterThan $body.IndexOf('Add-Mem0OutboxOp') -Because 'the DLQ is the fallback AFTER the Outbox write fails, never the first choice'
+        $outbox = $body.IndexOf('Add-Mem0OutboxOp')
+        $hits = [regex]::Matches($body, 'mem0-post-failures')
+        $hits.Count | Should -Be 2
+        # For an ordinary write the DLQ is the fallback AFTER the Outbox write fails, never the first choice.
+        $hits[1].Index | Should -BeGreaterThan $outbox -Because 'the DLQ is the fallback AFTER the Outbox write fails'
+        # 1.32.5, the one exception: an insight add carries the service key, which the Outbox replay
+        # (replay-ops.py, drained for every session) deliberately never sends, so a queued insight
+        # could only 403 into the conflicts file. The DLQ drain re-posts through Add-Mem0Memory,
+        # which reads the key again. That branch must sit BEFORE the Outbox call and be insight-only.
+        $hits[0].Index | Should -BeLessThan $outbox
+        $gate = $body.LastIndexOf('if ($isInsight) {', $hits[0].Index)
+        $gate | Should -BeGreaterThan 0 -Because 'only an insight add may skip the Outbox'
+        $body | Should -Match "\`$isInsight = \(\`$Metadata\['tier'\] -eq 'insight'\)"
     }
 }

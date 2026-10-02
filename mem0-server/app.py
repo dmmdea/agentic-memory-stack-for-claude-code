@@ -2336,11 +2336,13 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     # transport field: "autonomous" when actor is from CANONICAL_AUTOPROMOTE_ALLOWED (dream-autopromote),
     # "cli-user-direct" for HMAC-validated user-direct canonical, "rest-api" otherwise.
+    # 1.32.5: a signed demotion out of insight is HMAC-validated too (_signed_demote), so it is
+    # ledgered as the signed CLI path like a canonical demotion, never as a plain rest-api change.
     if b.tier == "canonical" and actor in CANONICAL_AUTOPROMOTE_ALLOWED:
         transport = "autonomous"
     elif b.tier == "canonical" and x_user_direct_token:
         transport = "cli-user-direct"
-    elif current_tier == "canonical" and x_user_direct_token:
+    elif _signed_demote or (current_tier == "canonical" and x_user_direct_token):
         transport = "cli-user-direct"
     else:
         transport = "rest-api"

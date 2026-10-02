@@ -336,7 +336,9 @@ if [ "$MEM0_ROLE" = "brain" ]; then
         chmod 600 "$SERVICE_KEY_FILE"
         echo "  service-key written to $SERVICE_KEY_FILE (mode 600)"
     else
-        echo "==> service-key present — keeping"
+        # A restored or hand-made key keeps its bytes but never a broader mode than its contract.
+        chmod 600 "$SERVICE_KEY_FILE"
+        echo "==> service-key present — keeping (mode 600 enforced)"
     fi
 elif [ "$MEM0_ROLE" = "replica" ] && [ -e "$SERVICE_KEY_FILE" ]; then
     rm -f "$SERVICE_KEY_FILE"
