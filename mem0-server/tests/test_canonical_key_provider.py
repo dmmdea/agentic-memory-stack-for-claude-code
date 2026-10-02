@@ -494,3 +494,61 @@ def test_default_paths_under_a_symlinked_home_dir_are_accepted(tmp_path, monkeyp
         CanonicalKeyProvider(dpapi_path=home / ".mem0" / ".." / ".." / "etc" / "shadow",
                              plaintext_path=home / ".mem0" / "canonical-key",
                              runtime_key_path=home / ".mem0" / "absent-rt")
+
+
+# ---- 1.32.5: the service key provider -------------------------------------------------------------
+
+def test_service_key_provider_names_only_service_key_paths(tmp_path, monkeypatch):
+    """A provider for one key can never fall back to the other key's file: every default path
+    derives from the key name (a None path once meant the CANONICAL default)."""
+    from canonical_key_provider import service_key_provider
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path / "creds"))
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        p = service_key_provider()
+    assert p.name == "service-key"
+    assert p.plaintext_path == tmp_path / ".mem0" / "service-key"
+    assert p.dpapi_path == tmp_path / ".mem0" / "service-key.dpapi"
+    assert p.runtime_key_path == tmp_path / "run" / "mem0" / "service-key"
+    assert p.credential_key_path == tmp_path / "creds" / "ams-service-key"
+    for path in (p.plaintext_path, p.dpapi_path, p.runtime_key_path, p.credential_key_path):
+        assert "canonical" not in str(path)
+
+
+def test_service_key_provider_ignores_a_canonical_key_and_reads_its_own(tmp_path, monkeypatch):
+    from canonical_key_provider import service_key_provider, service_key_health
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    (tmp_path / ".mem0").mkdir()
+    (tmp_path / ".mem0" / "canonical-key").write_text("CANON", encoding="utf-8")
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        p = service_key_provider()
+        assert p.get_key() is None, "the canonical key must never serve as the service key"
+        assert service_key_health(p) == {"present": False, "source": "none"}
+        (tmp_path / ".mem0" / "service-key").write_text("SVC\n", encoding="utf-8")
+        q = service_key_provider()
+        assert q.get_key() == "SVC" and service_key_health(q) == {"present": True, "source": "plaintext"}
+
+
+def test_service_key_credential_wins_and_empty_is_absent(tmp_path, monkeypatch):
+    from canonical_key_provider import service_key_provider
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (tmp_path / ".mem0").mkdir()
+    (tmp_path / ".mem0" / "service-key").write_text("FILE", encoding="utf-8")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        (creds / "ams-service-key").write_text("  \n", encoding="utf-8")
+        assert service_key_provider().get_key() == "FILE", "an empty credential is absent"
+        (creds / "ams-service-key").write_text("CRED\n", encoding="utf-8")
+        p = service_key_provider()
+        assert p.get_key() == "CRED" and p.key_source == "credential"
+
+
+def test_unknown_key_name_is_refused():
+    from canonical_key_provider import CanonicalKeyProvider
+    with pytest.raises(ValueError):
+        CanonicalKeyProvider(name="api-key")

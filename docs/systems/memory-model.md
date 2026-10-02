@@ -54,7 +54,7 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 - **Written by:** direct MCP/API `memory_add` with `tier=temporal`. The L1a extractor never emits it — every auto-extracted fact posts as `evidence`.
 - **`expires_at` CANNOT be set at write time.** It sits in `_ADD_FORBIDDEN_META` (`app.py`), so `add()`
   **silently strips** it and still returns `200` — the caller believes it set an expiry and did not. The only
-  writer is `PATCH /v1/memories/{id}/metadata` by a trusted actor (`decay-scan` or `system`), i.e. after the fact.
+  writer is `PATCH /v1/memories/{id}/metadata` by a server-side job label (`decay-scan` or `system`), i.e. after the fact, and since 1.32.5 the server accepts that label only on a request that carries the authority's service key.
   There is no `valid_until` field at all ([tier policy](./tier-policy.md)).
   Verified live 2026-08-11: an add carrying `expires_at` returned `200` with the key absent from the stored
   payload.
@@ -68,9 +68,9 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 #### `insight` — consolidated knowledge (machine-written, machine-only)
 
 - **Purpose:** higher-order patterns distilled *across* sessions by the nightly dream ("the operator prefers X across all repos", "errors of class Y always trace to Z"). One insight compresses many evidence records.
-- **Written by:** **only** the consolidator actor (`ADD_ALLOWED_TIERS` blocks it for everyone else) — lineage-tracked to its source evidence.
+- **Written by:** **only** the authority's nightly dream, whose consolidator label counts only on a request that carries the authority's service key (1.32.5; `ADD_ALLOWED_TIERS` blocks it for everyone else) — lineage-tracked to its source evidence. **No MCP session can create or move an insight record:** `memory_add` with `tier=insight` is always downgraded to `evidence` (before 1.32.5 a session that typed a consolidator `source` got through), and `memory_promote` / `memory_demote` cannot move an insight in either direction.
 - **Read:** admitted on durable/operational searches, but **filtered out of the per-prompt hot bundle server-side** — insights are for deliberate recall, not ambient injection.
-- **Lifecycle:** no stored decay or expiry (operational reads recency-weight it like everything else); can be promoted to `canonical` like evidence.
+- **Lifecycle:** no stored decay or expiry (operational reads recency-weight it like everything else); can be promoted to `canonical` like evidence. It leaves the tier only on the operator's signed token, like `canonical` (`mem0-canonize.sh --action demote`, or a signed delete); no job label exempts it, because nothing in the stack demotes an insight.
 
 #### `stable` — settled durable facts
 
@@ -150,12 +150,13 @@ flowchart LR
     E -->|"promote (operator or dream, 4C-gated, cap 3/night)"| C[canonical]
     E -->|promote| S[stable]
     I -->|promote| C
+    I -->|"demote (HMAC, operator CLI, ledgered)"| E
     C -->|"demote (HMAC, ledgered)"| S
     E -->|"contradict/supersede verdict (queue-gated, weekly-sweep auto-enforced) or a session's memory_supersede"| H["hidden (forensic history only)"]
     T -->|"expires_at / decay"| G["expired"]
 ```
 
-Demotion exists (`memory_demote`) and is ledgered like promotion. Hiding is human-gated on the evidence-vs-evidence and re-judge paths, and auto-enforced only by the weekly canonical sweep's authoritative Codex verdicts — always reversible (`--unstamp`) and always forensic-visible; see [`reconciliation.md`](./reconciliation.md) for the exact per-path matrix.
+Demotion exists and is ledgered like promotion: `memory_demote` moves evidence, stable and temporal records, while a move out of `canonical` or `insight` needs the operator's signed token (`mem0-canonize.sh --action demote`). Hiding is human-gated on the evidence-vs-evidence and re-judge paths, and auto-enforced only by the weekly canonical sweep's authoritative Codex verdicts — always reversible (`--unstamp`) and always forensic-visible; see [`reconciliation.md`](./reconciliation.md) for the exact per-path matrix.
 
 **Superseding (1.32.4).** A session that learns a fact is stale retires it itself: `memory_supersede(old, new)` records that the newer memory replaces the whole older one (`superseded_by`; the admission gate then withholds the old record outside the `history` class), and `scope="partial"` with a `detail` annotates one stale claim in a record that otherwise stands (`partially_superseded_by`, which never hides). The server enforces the refusals whoever calls: a `canonical`, `insight` or tier-less record is never superseded this way (a canonical leaves default retrieval only through the operator's signed demote), and a retired record or winner, a winner that is itself superseded, a different user's or brand's winner and a second winner are refused. Every supersession is ledgered and reversible (`memory_unsupersede`, `contradiction-sweep.py --unsupersede`). Appending `SUPERSEDED ... by <id>` to a record's text does nothing: the gate reads the field, never the text. See [`reconciliation.md`](./reconciliation.md) and [api-contracts](../api-contracts.md).
 
@@ -164,7 +165,7 @@ Demotion exists (`memory_demote`) and is ledgered like promotion. Hiding is huma
 1. **Born.** You tell the agent the staging DB moved to a new host. Session ends → L1a reads the last 24 turns, redacts secrets, and the inferability gate keeps `"Staging Postgres moved to host X on 2026-07-01"` → `POST /v1/memories`, `tier=evidence`. The episode records *why* it moved; a goal "migrate the staging consumers" is registered.
 2. **Working.** Next session you ask about staging: the fact clears the 0.30 gate, rides the `[MEMORY CONTEXT]` block at the recency peak above your prompt.
 3. **Challenged.** A month later the DB moves again; a new evidence fact lands. An **evidence-vs-evidence sweep** (on-demand — the weekly cron runs the canonical-anchored sweep) finds the old fact as a near-duplicate older neighbor, and the supersession judge answers its acid test — *"would re-reading the older fact mislead about the CURRENT state?"* — **STALE** → queued to the human review file, surfaced in your session banner.
-4. **Hidden — by you.** `--promote` stamps it; the admission gate now drops it from durable/operational reads. It is still fully visible via `query_class="history"` and in the tier ledger. (`--unstamp` reverses in one command.)
+4. **Hidden — by you.** `--promote` stamps it; the admission gate now drops it from durable/operational reads. It is still fully visible via `query_class="history"` and in the tier ledger. (`--unstamp` reverses in one command.) The stamp is a server-side job label the server accepts only with the authority's service key (1.32.5), so on the native authority a hand run goes through `bash ~/apps/mem0-scripts/ams-service-run.sh contradiction-sweep.py --promote <id>` (or `--unstamp <id>`); no session or PC holding only the API key can write it.
 5. **Or elevated.** Had it instead been reinforced and nominated by the dream (confidence-sorted, top-3, deduped, past the 4C gate), it would have been HMAC-promoted to `canonical` — becoming part of the anchor set future facts are judged against.
 
 That loop — *capture with skepticism, trust in graded tiers, decay the perishable, reconcile the contradictory, and never hide anything without a human* — **is** the memory model.
@@ -191,6 +192,7 @@ Changing any tier's semantics, a query class's admitted-tier set, or the decay p
 ## Invariants and assumptions
 
 - `canonical` is the anchor set every other record is judged against; **no plain write can create it** — only the HMAC-signed CLI or the 4C-gated dream autopromotion.
+- `insight` is machine-written: only the authority's dream, proven by the service key, or the operator's signed token writes, rewrites or deletes one, and only the signed token moves one out of the tier. An actor or `source` string is a label, never a credential.
 - Nothing is ever hidden without a forensic escape hatch: the `history` class always sees superseded/contradicted (and, since v0.20, canonical) records; every hide is reversible (`--unstamp`, `--unsupersede`, `memory_unsupersede`) and ledgered.
 - Each semantic record is atomic — one claim per record — so it stands alone when retrieved individually.
 - `temporal` is admitted by no query class today; it is write-side parking, not a retrieval tier.
@@ -201,11 +203,11 @@ Not applicable at the model level — failure modes live in the systems that imp
 
 ## Security and privacy notes
 
-The `canonical` tier is the only cryptographically protected layer: creating it requires the operator's HMAC-signed user-direct token (or the `dream-autopromote` actor, still HMAC-signed). The admission gate is a **retrieval filter, not an authorization layer** — the same API key can read every tier via the right query class; tier is about *trust and staleness*, not access control.
+Two credentials sit above the shared API key every PC and MCP session holds. The `canonical` tier needs the operator's HMAC-signed user-direct token to create, change or leave (the `dream-autopromote` actor still signs it). The server-side job labels (the dream's insight writes, the sweep's hide stamps, `retired_at`, `retrievable`, `expires_at`) count only on a request that carries the authority-only **service key** (1.32.5), so the plain API key cannot use those labels to hide a non-canonical record, schedule its deletion or mint an insight (it can still hide one through `PATCH /tier` to `temporal` or the supersede door, no worse than the `DELETE` it already has on unprotected tiers; see the known gaps); the `insight` tier is gated by that key or the signed token, and leaving it needs the signed token. The service key separates the authority's own jobs from callers holding only the API key; it does not resist a shell on the authority as the service user, an ssh session to the brain, or (WSL brain) a Windows-side process of the same user, and it is one key for every job. [`tier-policy.md`](./tier-policy.md) has the threat model and the known gaps. The admission gate is a **retrieval filter, not an authorization layer** — the same API key can read every tier via the right query class; tier is about *trust and staleness*, not access control.
 
 ## Observability and debugging
 
-The tier ledger (`~/.mem0/tier-ledger-YYYY-MM.jsonl`) is the audit trail for every tier movement; the dream-rebuilt `~/.mem0/MEMORY.md` gives a lean at-a-glance tier census; decay-scan writes a report of what it expired or flagged. `query_class="history"` is the debugging lens for "why is this record no longer retrieved."
+The tier ledger (`~/.mem0/tier-ledger-YYYY-MM.jsonl`) is the audit trail for every tier movement; the dream-rebuilt `~/.mem0/MEMORY.md` gives a lean at-a-glance tier census; decay-scan writes a report of what it expired or flagged. `query_class="history"` is the debugging lens for "why is this record no longer retrieved." When the dream's insight writes or the sweep's stamps are refused, check `/health/deep`: `checks.service_key.present` (the capability `service-key`, required on the brain) says whether the authority loaded the service key, and without it every job label is refused with `403 service-credential-required`.
 
 ## Testing notes
 
@@ -218,13 +220,15 @@ Confusions that have caused real bugs:
 - **"durable" is a query class, not a tier.** It selects *how* you ask, not *what* a record is.
 - **`insight` is a tier *and* a memory type.** The tier controls trust/admission; the type describes what kind of knowledge it is.
 - **The admission gate is a *retrieval filter*, not an authorization layer.** The same API key can read everything via the right class.
+- **An actor or `source` string is a label, not a credential.** Before 1.32.5 the server trusted the consolidator, sweep and job labels typed with the shared API key; now a privileged label counts only with the authority's service key (`403 service-credential-required` otherwise).
 - **`temporal` is invisible to reads.** It is admitted by no query class today — do not use it to store something you expect to retrieve.
 
 ## Source map
 
 - [`../../mem0-server/admission_gate.py`](../../mem0-server/admission_gate.py) — per-query-class tier admission policy.
 - [`../../mem0-server/freshness.py`](../../mem0-server/freshness.py) — the Weibull freshness/decay weight.
-- [`../../mem0-server/app.py`](../../mem0-server/app.py) — tier constants (`ADD_ALLOWED_TIERS`, `INSIGHT_ALLOWED_ACTORS`, `CANONICAL_AUTOPROMOTE_ALLOWED`) and the tier ledger writer.
+- [`../../mem0-server/app.py`](../../mem0-server/app.py) — tier constants (`ADD_ALLOWED_TIERS`, `CANONICAL_AUTOPROMOTE_ALLOWED`) and the tier ledger writer.
+- [`../../mem0-server/security_invariants.py`](../../mem0-server/security_invariants.py) — `INSIGHT_ALLOWED_ACTORS`, the job-label tables, the tier-write policy functions and the service-credential gate (`require_service_credential`).
 - [`../../scripts/wsl/semantic-dedup.py`](../../scripts/wsl/semantic-dedup.py) — tier-sensitive dedup thresholds.
 - [`../../mem0-server/episodic.py`](../../mem0-server/episodic.py) — the episodic/goals/open-questions ledger.
 

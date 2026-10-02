@@ -1490,7 +1490,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
         return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
-    mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    mem0_http = httpx.Client(headers=ams_env.mem0_headers(api_key))
     checked = yes = no = cleared = skipped = queued = 0
     aborted = None
     consec_fail = 0  # 2026-08-24: rejudge previously counted NO judge failure at all —
@@ -1855,7 +1855,7 @@ def run_resolve_supersede(args, dry_run: bool) -> int:
     except OSError as e:
         print(f"contradiction-sweep: resolve-supersede FAIL — api-key unreadable: {e}", flush=True)
         return 1
-    http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    http = httpx.Client(headers=ams_env.mem0_headers(api_key))
     try:
         payloads = {}
         for mid in (loser, winner):
@@ -2160,7 +2160,7 @@ def run_supersede_markers(args, dry_run: bool) -> int:
             _append_summary({**summary, "outcome": "degraded:mem0-unreachable", "skipped": str(e)[:120]})
             return _finish("degraded:mem0-unreachable")
     qdrant_http = httpx.Client()
-    mem0_http = httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    mem0_http = httpx.Client(headers=ams_env.mem0_headers(api_key))
     aborted: Optional[str] = None
     rows: list = []
     canon_rows: list = []
@@ -2255,7 +2255,7 @@ def run_unsupersede(args, dry_run: bool) -> int:
     except OSError as e:
         print(f"contradiction-sweep: --unsupersede needs ~/.mem0/api-key: {e}", flush=True)
         return 1
-    with httpx.Client(headers={"X-API-Key": api_key, "Content-Type": "application/json"}) as http:
+    with httpx.Client(headers=ams_env.mem0_headers(api_key)) as http:
         try:
             r = http.get(f"{MEM0}/v1/memories/{mid}", timeout=10.0)
             r.raise_for_status()
@@ -2767,8 +2767,7 @@ def _main(argv=None) -> int:
             print(f"contradiction-sweep: --unstamp needs ~/.mem0/api-key: {e}",
                   flush=True)
             return 1
-        with httpx.Client(headers={"X-API-Key": api_key,
-                                   "Content-Type": "application/json"}) as mem0_http:
+        with httpx.Client(headers=ams_env.mem0_headers(api_key)) as mem0_http:
             return run_unstamp(mem0_http, args.unstamp)
 
     if args.dismiss:
@@ -2781,8 +2780,7 @@ def _main(argv=None) -> int:
         except OSError as e:
             print(f"contradiction-sweep: --promote needs ~/.mem0/api-key: {e}", flush=True)
             return 1
-        with httpx.Client(headers={"X-API-Key": api_key,
-                                   "Content-Type": "application/json"}) as mem0_http:
+        with httpx.Client(headers=ams_env.mem0_headers(api_key)) as mem0_http:
             return run_promote(mem0_http, args.promote)
 
     now = dt.datetime.now(dt.timezone.utc)
@@ -2846,8 +2844,7 @@ def _main(argv=None) -> int:
 
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
-    mem0_http = httpx.Client(headers={"X-API-Key": api_key or "",
-                                      "Content-Type": "application/json"})
+    mem0_http = httpx.Client(headers=ams_env.mem0_headers(api_key or ""))
 
     pairs_checked = yes_count = no_count = skipped_pairs = stamped_count = 0
     cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt

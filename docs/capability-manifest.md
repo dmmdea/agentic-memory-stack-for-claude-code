@@ -48,6 +48,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `embedder` | dense embedder (768-dim round-trip) | checks.embedder | both | — |
 | `bm25-sparse-leg` | lexical BM25 leg of hybrid retrieval | checks.sparse_leg (deterministic oldest-point canary) | both | — |
 | `canonical-key` | HMAC canonical-key chain (runtime/DPAPI/plaintext provider) | checks.canonical_key | brain | — |
+| `service-key` | authority-only service key that proves a server-side job label (1.32.5) | checks.service_key | brain | — |
 | `put-carryover` | PUT payload carry-over (metadata survives text rewrites) | checks.put_carryover_today (daily activity counters); unknown-on-idle by design (F9) — exerciser: Test-MemoryStack I13 PUT canary | both | F17 |
 | `mojibake-tripwire` | CP437 corpus-encoding tripwire | checks.mojibake (payload scan) | both | F17 |
 | `contradiction-review-queue` | human review queue for contradiction verdicts is watched | checks.pending_contradiction_reviews (queue depth) | brain | F17 |

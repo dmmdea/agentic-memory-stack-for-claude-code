@@ -301,6 +301,19 @@ if ! FASTEMBED_CACHE_PATH="$FASTEMBED_CACHE" "$APP_DIR/.venv/bin/python" -c \
 fi
 echo "    fastembed durable cache seeded OK ($FASTEMBED_CACHE)"
 
+# --- 4c. 1.32.5: the service key (brain only) ---
+# The server accepts a server-side job label (the dream's, the sweep's) only with this key, and it
+# reads the key once at start, so it must exist BEFORE the restart below. Regenerable: only this
+# box holds it. install/1-wsl-services.sh makes it on a full install; this is the upgrade path.
+if [ "${MEM0_ROLE:-brain}" = "brain" ]; then
+    if [ ! -s "$HOME/.mem0/service-key" ]; then
+        ( umask 077; python3 -c "import secrets; print(secrets.token_hex(32))" > "$HOME/.mem0/service-key" )
+        echo "    service-key generated at ~/.mem0/service-key (proves the dream's and the sweep's job labels)"
+    fi
+    # Every deploy, a kept key included: a restored or hand-made file never keeps a broader mode.
+    chmod 600 "$HOME/.mem0/service-key"
+fi
+
 # --- 5. restart + health gate ---
 systemctl --user restart mem0.service
 for i in $(seq 1 30); do
@@ -315,7 +328,7 @@ done
 # endpoint, so a merely-cold box still passes; a wedged one now ABORTS the deploy
 # (curl exits non-zero and `set -o pipefail` propagates it) instead of hanging forever.
 # (It is also why no ACTIVE reranker probe may ever be added to /health/deep.)
-curl -sf --max-time 60 "$MEM0_HEALTH_URL/health/deep" | python3 -c "
+curl -sf --max-time 60 "$MEM0_HEALTH_URL/health/deep" | MEM0_ROLE="${MEM0_ROLE:-brain}" python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert d.get('ok'), f'/health/deep not ok: {d}'
@@ -325,6 +338,13 @@ assert d.get('ok'), f'/health/deep not ok: {d}'
 print('    /health/deep OK — ' + ', '.join(
     k + ':' + str(v.get('ok', v) if isinstance(v, dict) else v)
     for k, v in d.get('checks', {}).items()))
+# 1.32.5: on a brain the service key must be loaded, or every night's insight writes and sweep
+# stamps are refused. It never flips ok (a replica has none by design), so assert it here.
+import os
+if os.environ.get('MEM0_ROLE', 'brain') == 'brain':
+    sk = (d.get('checks') or {}).get('service_key') or {}
+    assert sk.get('present'), f'brain did not load the service key (checks.service_key={sk}); is ~/.mem0/service-key readable?'
+    print('    service key loaded')
 "
 # --- 5b. W5 T4.4 (AMS-24): retrieval families gate — the honor-system era ends ---
 # Runs the PUBLIC families suite only (review F5: the private findability

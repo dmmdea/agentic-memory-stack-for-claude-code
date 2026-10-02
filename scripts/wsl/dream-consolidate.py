@@ -161,7 +161,8 @@ class Mem0Client:
         self.key = key
         self.user_id = user_id
         self.http = http or httpx.Client(timeout=30.0)
-        self.h = {"X-API-Key": key, "Content-Type": "application/json"}
+        # 1.32.5: carries the service key when the unit loaded it (the insight add needs it).
+        self.h = ams_env.mem0_headers(key)
 
     def _get(self, path: str, timeout: float = 5.0):
         r = self.http.get(f"{self.url}{path}", headers=self.h, timeout=timeout)
@@ -1273,7 +1274,13 @@ class Dream:
                 try:
                     ok = self.mem0.add(text, metadata)
                 except Exception as e:  # noqa: BLE001
-                    log(f"  insight post failed (non-fatal; spooled for the next run): {e}")
+                    # 1.32.5: name the one refusal a retry cannot fix, so a backlog is not misread.
+                    _resp = getattr(e, "response", None)
+                    _why = ""
+                    if getattr(_resp, "status_code", 0) == 403 and "service-credential-required" in (getattr(_resp, "text", "") or ""):
+                        _why = (" [the server refused the dream-consolidator label: this process holds no service key "
+                                "(the ams-service-key credential, or ~/.mem0/service-key on a WSL brain)]")
+                    log(f"  insight post failed (non-fatal; spooled for the next run): {e}{_why}")
                     ok = False
                 if not ok:
                     self.spooled += int(self._spool_add(text, metadata, lineage))

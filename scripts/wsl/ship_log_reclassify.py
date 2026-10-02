@@ -31,13 +31,18 @@ from typing import Any
 
 import httpx
 
+# 1.32.5: deployed flat beside ams_env (the API key from the unit credential, the authority URL,
+# the service key this script needs for its backfill-apply-v013 label).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ams_env  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Qdrant scroll — bypasses mem0 GET /v1/memories 500-record cap
 # (same idiom as l10-audit.py scroll_all_qdrant_points)
 # ---------------------------------------------------------------------------
 
 QDRANT = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-MEM0 = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
+MEM0 = ams_env.mem0_url()
 COLLECTION = "memories"
 _SCROLL_PAGE = 256
 _REPORT_JSON_PATH = Path.home() / ".mem0" / "ship-log-reclassify-report.json"
@@ -179,12 +184,15 @@ _CONSERVATIVE_LEN = 800
 
 
 def _api_key() -> str:
-    """Read mem0 API key from ~/.mem0/api-key."""
-    return (Path.home() / ".mem0" / "api-key").read_text(encoding="utf-8").strip()
+    """The mem0 API key: the unit credential ($MEM0_API_KEY_FILE) on the native authority, else
+    ~/.mem0/api-key (ams_env.api_key)."""
+    return ams_env.api_key()
 
 
 def _mem0_headers() -> dict[str, str]:
-    return {"X-API-Key": _api_key(), "Content-Type": "application/json"}
+    # 1.32.5: backfill-apply-v013 is a server-side job label; the server accepts it only with the
+    # authority's service key (run this through ams-service-run.sh on the authority).
+    return ams_env.mem0_headers(_api_key())
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +686,17 @@ def main() -> int:
         ),
     )
     args = ap.parse_args()
+    # 1.32.5: --live posts each episode and THEN soft-retires the record with the
+    # backfill-apply-v013 label. Without the service key every retire is refused after its episode
+    # was already written (an orphan the script warns never to re-run over), so refuse up front.
+    if getattr(args, "live", False) and not ams_env.service_key():
+        print(
+            "ERROR: --live needs the authority's service key (the backfill-apply-v013 label is refused "
+            "without it). Run it on the authority: bash ~/apps/mem0-scripts/ams-service-run.sh "
+            "ship_log_reclassify.py <args>",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.retire_only:
         if not args.dry_run and not args.live:

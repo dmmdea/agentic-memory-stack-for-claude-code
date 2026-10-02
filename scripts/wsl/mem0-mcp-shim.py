@@ -215,9 +215,9 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     metadata dict can include {source, tier, kind, workspace, project, ...}.
 
     v0.16.1 client-side UX guard: tier='canonical' in metadata is auto-downgraded to 'evidence'
-    with a note explaining how to promote via mem0-canonize.sh CLI. tier='insight' from
-    non-consolidator sources is similarly downgraded with a note. The server-side enforcement
-    is unchanged — this is a friendlier client-side default.
+    with a note explaining how to promote via mem0-canonize.sh CLI. tier='insight' is ALWAYS
+    downgraded to 'evidence' with a note (1.32.5): only the nightly dream on the authority, holding
+    the authority's service key, writes insight records, whatever `source` an MCP call names.
     """
     md = dict(metadata or {})
     note = None
@@ -230,16 +230,16 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
             "from a terminal."
         )
     elif md.get("tier") == "insight":
-        INSIGHT_ALLOWED = {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"}
-        src = (md.get("source") or "").lower()
-        if src not in INSIGHT_ALLOWED:
-            md["tier"] = "evidence"
-            md["_insight_intent"] = True
-            note = (
-                "tier auto-downgraded insight→evidence; insight is reserved for c1/dream "
-                "consolidator. Dream will pick this up on its next nightly cycle if it crosses "
-                "the bar."
-            )
+        # 1.32.5: the consolidator's source label counts only with the authority's service key,
+        # which no MCP session holds, so an insight over MCP is ALWAYS downgraded here (before
+        # 1.32.5 a session that typed the consolidator's source passed straight through).
+        md["tier"] = "evidence"
+        md["_insight_intent"] = True
+        note = (
+            "tier auto-downgraded insight→evidence; insight is reserved for the nightly dream "
+            "consolidator on the authority. Dream will pick this up on its next nightly cycle if "
+            "it crosses the bar."
+        )
     # MEM-19: stamped on the add POST too. AddIn doesn't validate the field yet
     # (pydantic ignores extras), so this is forward-stamping: the day the add
     # contract is versioned server-side, the shim is already compliant.
@@ -523,7 +523,8 @@ def memory_promote(memory_id: str, tier: str = "stable", reason: str | None = No
       bash mem0-canonize.sh <memory_id> "<reason>"
 
     actor is always 'claude-autonomous' when called via MCP (server-enforced).
-    'insight' is reserved for c1-consolidator/dream-consolidator (server-enforced; will 403).
+    'insight' is reserved for the dream consolidator on the authority (server-enforced; will 403),
+    and since 1.32.5 an insight record cannot be moved OUT of insight from here either.
 
     reason is recommended for audit clarity and REQUIRED for canonical (n/a here).
 
@@ -546,9 +547,10 @@ def memory_demote(memory_id: str, tier: str = "evidence", reason: str | None = N
     For full removal use memory_delete. Writes a tier-ledger entry.
     actor is always 'claude-autonomous' when called via MCP.
     reason is recommended for audit clarity.
-    A CANONICAL record cannot be demoted from here: the server requires the operator's
-    signed token for any move out of canonical (400 without a reason, else 403). The operator path is
-    `mem0-canonize.sh --action demote <id> "<reason>"` on the authority."""
+    A CANONICAL or (since 1.32.5) INSIGHT record cannot be demoted from here: the server requires the
+    operator's signed token for any move out of either tier (400 without a reason, else 403). The
+    operator path is `mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence|stable|temporal]`
+    (on a PC it forwards to the authority)."""
     payload = {"tier": tier, "actor": "claude-autonomous", "reason": reason}
     try:
         return _authority_only("PATCH", f"/v1/memories/{memory_id}/tier", json=payload)

@@ -297,3 +297,21 @@ def test_canonize_op_refused_by_authority_is_a_conflict(ro, tmp_path, monkeypatc
     stats = ro.replay(ob, "http://authority.invalid", "k")
     assert stats["conflicts"] == 1 and stats["replayed"] == 0
     assert "authority refused rc=4" in (tmp_path / "mutation-conflicts.jsonl").read_text(encoding="utf-8")
+
+
+# ---- 1.32.5: queued writes never carry, and never borrow, the service key -------------------------
+
+def test_replay_never_sends_the_service_key():
+    """replay-ops drains the Outbox for every session on the box. Sending the service key here would
+    vouch for a forged, shim-queued insight add; the legitimate insight writers keep their own
+    spool (Python dream) or the dead-letter file (PowerShell dream), never the Outbox."""
+    src = (Path(__file__).resolve().parents[2] / "scripts" / "wsl" / "replay-ops.py").read_text(encoding="utf-8")
+    assert "X-AMS-Service-Key" not in src and "service_key" not in src
+
+
+def test_powershell_insight_adds_stay_out_of_the_outbox():
+    src = (Path(__file__).resolve().parents[2] / "scripts" / "windows" / "memory-common.ps1").read_text(encoding="utf-8")
+    body = src[src.index("function Add-Mem0Memory"):src.index("function Drain-Mem0DeadLetter")]
+    i_insight, i_outbox = body.index("if ($isInsight) {\n"), body.index("Add-Mem0OutboxOp")
+    assert i_insight < i_outbox, "an insight add must be routed away BEFORE the Outbox call"
+    assert "$poisonCodes += 403" in body

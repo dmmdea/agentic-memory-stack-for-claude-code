@@ -113,7 +113,7 @@ def test_the_runbook_encrypts_each_credential_under_the_id_its_unit_loads_it_by(
     the units cannot open it, on the one day the operator has no time to find out why. The command is the
     installer's own (`install/linux-authority.sh` quotes it), with `--name=`."""
     ids = _credential_ids()
-    assert ids == {"ams-api-key", "ams-canonical-key"}, f"the units load new credentials: {sorted(ids)}"
+    assert ids == {"ams-api-key", "ams-canonical-key", "ams-service-key"}, f"the units load new credentials: {sorted(ids)}"
     installer = (REPO_ROOT / "install" / "linux-authority.sh").read_text(encoding="utf-8")
     quoted = re.search(r"systemd-creds --user encrypt --with-key=host\+tpm2", installer)
     assert quoted, "the installer no longer quotes the encrypt command; re-read it and update the runbook"

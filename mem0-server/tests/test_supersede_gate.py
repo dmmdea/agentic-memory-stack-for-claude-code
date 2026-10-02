@@ -27,10 +27,15 @@ import security_invariants as si  # noqa: E402
 MID = "11111111-2222-4333-8444-555555555555"
 
 
+SVC = "s" * 64
+
+
 @pytest.fixture(autouse=True)
 def _canonical_key(monkeypatch):
-    """A key exists (as on a provisioned box), so a missing token is a 403, not a 503."""
+    """A key exists (as on a provisioned box), so a missing token is a 403, not a 503. 1.32.5: so
+    does the authority's service key, which a server-side job label needs to count."""
     monkeypatch.setattr(si, "_get_canonical_key", lambda: "k" * 43)
+    monkeypatch.setattr(si, "_get_service_key", lambda: SVC)
 
 
 class _Rec:
@@ -48,16 +53,19 @@ class _Client:
         return [_Rec({"tier": self._tier, "data": "x"})]
 
 
-def _patch(tier, actor, keys, token=None):
-    """Run the PATCH /metadata authorisation exactly as the handler does (no token: no HMAC)."""
+def _patch(tier, actor, keys, token=None, service_key=None):
+    """Run the PATCH /metadata authorisation exactly as the handler does (no token: no HMAC):
+    1.32.5 the label gate first, then the tier gate and the key policy with its verdict."""
+    verified = si.require_service_credential(actor, service_key)
     current = si.assert_writable(_Client(tier), "memories", MID, "patch_metadata",
-                                 token, None, actor=actor, reason="r", x_user_direct_nonce=None)
-    si.authorize_metadata_patch(current, actor, keys)
+                                 token, None, actor=actor, reason="r", x_user_direct_nonce=None,
+                                 service_verified=verified)
+    si.authorize_metadata_patch(current, actor, keys, service_verified=verified)
 
 
-def _refused(tier, actor, keys):
+def _refused(tier, actor, keys, service_key=None):
     with pytest.raises(fastapi.HTTPException) as e:
-        _patch(tier, actor, keys)
+        _patch(tier, actor, keys, service_key=service_key)
     return e.value.status_code
 
 
@@ -76,7 +84,8 @@ def _refused(tier, actor, keys):
     ("canonical", "contradiction-sweep-v019", {"contradiction_checked_at"}),
 ])
 def test_allowed_metadata_writes_stay_allowed(tier, actor, keys):
-    _patch(tier, actor, keys)
+    # A server-side job's label is proven by the service key (the unit loads it).
+    _patch(tier, actor, keys, service_key=SVC)
 
 
 @pytest.mark.parametrize("tier,actor,keys", [
@@ -91,6 +100,8 @@ def test_allowed_metadata_writes_stay_allowed(tier, actor, keys):
 ])
 def test_refused_metadata_writes_stay_refused(tier, actor, keys):
     assert _refused(tier, actor, keys) == 403
+    # ...and the service key does not open them either: it proves a label, it is not a pass.
+    assert _refused(tier, actor, keys, service_key=SVC) == 403
 
 
 # ---- F1: the actor string is not a credential for hiding a record ---------------------------------
@@ -132,7 +143,8 @@ def test_the_handler_uses_the_pure_policy():
     src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
     body = src[src.index("def update_metadata("):src.index("# v0.16: Goal endpoints")]
     assert "assert_writable(" in body
-    assert "authorize_metadata_patch(current_tier, b.actor, b.metadata.keys())" in body
+    assert ("authorize_metadata_patch(current_tier, b.actor, b.metadata.keys(), "
+            "service_verified=_service_verified)") in body
     assert "FORBIDDEN_KEYS = {" not in body, "the key policy lives in security_invariants only"
 
 
@@ -254,3 +266,102 @@ def test_supersession_module_is_deployed():
     text = (SERVER_DIR.parent / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
     line = next(ln for ln in text.splitlines() if ln.startswith("MEM0_MODULES="))
     assert " supersession.py" in line
+
+
+# ---- 1.32.5: a server-side job label is a claim the service key must prove --------------------------
+
+PRIVILEGED_WRITES = [
+    ("evidence", "system", {"tier_actor"}),
+    ("evidence", "decay-scan", {"expires_at"}),
+    ("evidence", "backfill-apply-v013", {"retrievable"}),
+    ("evidence", "contradiction-sweep-v019", {"contradicts_canonical", "contradiction_checked_at"}),
+    ("insight", "contradiction-sweep-v019", {"contradicts_canonical"}),
+    ("insight", "dream-consolidator", {"custom_tag"}),
+    ("canonical", "stamp-retired-v013", {"retired_at"}),
+    ("canonical", "contradiction-sweep-v019", {"contradiction_checked_at"}),
+]
+
+
+@pytest.mark.parametrize("tier,actor,keys", PRIVILEGED_WRITES)
+def test_a_job_label_without_the_service_key_is_refused(tier, actor, keys):
+    """THE 1.32.5 hole: any API-key holder could send these labels. Without the key: 403."""
+    with pytest.raises(fastapi.HTTPException) as e:
+        _patch(tier, actor, keys)
+    assert e.value.status_code == 403 and "service-credential-required" in str(e.value.detail)
+
+
+@pytest.mark.parametrize("tier,actor,keys", PRIVILEGED_WRITES)
+def test_the_policy_functions_fail_closed_without_the_proof(tier, actor, keys):
+    """Defence in depth: a handler that FORGETS require_service_credential must still be refused,
+    so the pure policy honours a label only when told it was proven."""
+    with pytest.raises(fastapi.HTTPException) as e:
+        current = si.assert_writable(_Client(tier), "memories", MID, "patch_metadata",
+                                     None, None, actor=actor, reason="r", x_user_direct_nonce=None)
+        si.authorize_metadata_patch(current, actor, keys)
+    assert e.value.status_code == 403
+
+
+@pytest.mark.parametrize("label", [
+    "contradiction-sweep-v019", "  Contradiction-Sweep-V019  ", "DREAM-CONSOLIDATOR",
+    "bac\u212aFill-apply-v013",  # KELVIN SIGN lower()s to "k": still the privileged label
+])
+def test_label_normalisation_cannot_dodge_the_gate(label):
+    assert si.is_privileged_label(label)
+    with pytest.raises(fastapi.HTTPException) as e:
+        si.require_service_credential(label, None)
+    assert e.value.status_code == 403
+
+
+@pytest.mark.parametrize("presented", [None, "", "   ", "s" * 63, "s" * 65, SVC.upper(), "\u00e9" * 64, 42])
+def test_only_the_exact_key_proves_a_label(presented):
+    with pytest.raises(fastapi.HTTPException):
+        si.require_service_credential("dream-consolidator", presented)
+
+
+def test_the_exact_key_proves_a_label_and_surrounding_whitespace_is_tolerated():
+    assert si.require_service_credential("dream-consolidator", SVC) is True
+    assert si.require_service_credential("dream-consolidator", " " + SVC + "\n") is True
+
+
+@pytest.mark.parametrize("label", [None, "", "claude-autonomous", "user-direct", "rest-api", 42])
+def test_an_ordinary_label_needs_no_key(label):
+    assert si.require_service_credential(label, None) is False
+
+
+def test_a_server_without_the_key_accepts_no_job_label_and_says_why(monkeypatch):
+    monkeypatch.setattr(si, "_get_service_key", lambda: None)
+    for presented in (None, "", SVC):
+        with pytest.raises(fastapi.HTTPException) as e:
+            si.require_service_credential("contradiction-sweep-v019", presented)
+        assert e.value.status_code == 403 and "holds no service key" in str(e.value.detail)
+
+
+def test_every_privileged_table_is_covered():
+    labels = set(si.TRUSTED_PATCH_ACTORS) | set(si.LEGACY_PATCH_ACTOR_KEYS) | set(si.INSIGHT_ALLOWED_ACTORS)
+    assert labels and all(si.is_privileged_label(x) for x in labels)
+
+
+HANDLERS = {
+    "add": ("def add(", "require_service_credential(src, x_ams_service_key", None),
+    "update": ("def update(", "require_service_credential(actor, x_ams_service_key)", "assert_writable("),
+    "update_tier": ("def update_tier(", "require_service_credential(actor, x_ams_service_key)", "tier_change_hmac_action("),
+    "update_metadata": ("def update_metadata(", "require_service_credential(b.actor, x_ams_service_key)", "assert_writable("),
+    "delete": ("def delete(", "require_service_credential(actor, x_ams_service_key)", "assert_writable("),
+}
+
+
+@pytest.mark.parametrize("name", sorted(HANDLERS))
+def test_every_write_handler_gates_its_label_before_the_policy(name):
+    """app.py cannot be imported headless: pin that each write handler declares the header and
+    calls the gate BEFORE it hands the label to the policy, and passes the proof on."""
+    src = (SERVER_DIR / "app.py").read_text(encoding="utf-8")
+    start, gate, policy = HANDLERS[name]
+    i = src.index(start)
+    end = src.find("\n@app.", i + 10)
+    body = src[i:end if end != -1 else len(src)]  # delete() is the last route in app.py
+    assert 'alias="X-AMS-Service-Key"' in body, name
+    assert gate in body, name
+    if policy:
+        assert body.index(gate) < body.index(policy), f"{name}: the label gate must run before the policy"
+    if name in ("update", "update_metadata", "delete"):
+        assert "service_verified=_service_verified" in body, name

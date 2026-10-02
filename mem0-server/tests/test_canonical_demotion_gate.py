@@ -46,7 +46,11 @@ fastapi = pytest.importorskip("fastapi")
     ("canonical", "stable", "demote"),
     ("canonical", "temporal", "demote"),
     ("canonical", "insight", "demote"),
-    ("insight", "evidence", None),
+    # 1.32.5: a move OUT of insight signs "demote" too (the insight two-step hole).
+    ("insight", "evidence", "demote"),
+    ("insight", "stable", "demote"),
+    ("insight", "temporal", "demote"),
+    ("insight", "insight", None),
     ("evidence", "stable", None),
     ("stable", "evidence", None),
     (None, "evidence", None),
@@ -78,6 +82,16 @@ def signing(monkeypatch):
     monkeypatch.setattr(si, "_get_canonical_key", lambda: key)
     monkeypatch.setattr(si, "_check_and_record_nonce", _record)
     return key
+
+
+SERVICE_KEY = "s" * 64
+
+
+@pytest.fixture
+def service_key(monkeypatch):
+    """1.32.5: the authority's service key, so a consolidator label is a PROVEN claim."""
+    monkeypatch.setattr(si, "_get_service_key", lambda: SERVICE_KEY)
+    return SERVICE_KEY
 
 
 def _now() -> str:
@@ -281,21 +295,25 @@ def _handler(store: _FakeStore, ledger_fail: bool = False):
         "CANONICAL_REQUIRES_USER_DIRECT": True,
         "CANONICAL_AUTOPROMOTE_ALLOWED": {"dream-autopromote"},
         "INSIGHT_REQUIRES_C1": True,
-        "INSIGHT_ALLOWED_ACTORS": {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"},
+        # 1.32.5: one copy, security_invariants' (app.py imports it).
+        "INSIGHT_ALLOWED_ACTORS": si.INSIGHT_ALLOWED_ACTORS,
         "is_imperative_canonical": lambda text: False,
         "mem": types.SimpleNamespace(vector_store=types.SimpleNamespace(client=store, collection_name="memories")),
         "_append_ledger": append_ledger,
         "_mid_write_lock": lambda mid: threading.Lock(),
         "_upstream_error": lambda e: HTTPException(502, f"upstream: {e}"),
+        # 1.32.4: the into-insight/canonical supersession refusal reads the point; never superseded here.
+        "_supersede_read": lambda mid: {"data": "a fact"},
     }
     # dont_inherit: this test module's `from __future__ import annotations` would otherwise turn
     # TierIn's annotations into strings pydantic cannot resolve outside app.py's namespace.
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py:update_tier", "exec", dont_inherit=True), ns)
     tier_in, fn = ns["TierIn"], ns["update_tier"]
 
-    def call(tier, actor="claude-autonomous", reason="why", token=None, ts=None, nonce=None):
+    def call(tier, actor="claude-autonomous", reason="why", token=None, ts=None, nonce=None, service_key=None):
         return fn("mid-1", tier_in(tier=tier, actor=actor, reason=reason), x_api_key="k",
-                  x_user_direct_token=token, x_user_direct_ts=ts, x_user_direct_nonce=nonce)
+                  x_user_direct_token=token, x_user_direct_ts=ts, x_user_direct_nonce=nonce,
+                  x_ams_service_key=service_key)
 
     return call, ledger
 
@@ -397,10 +415,11 @@ def test_handler_demotion_needs_a_reason(signing):
 
 
 @pytest.mark.parametrize("target", ["stable", "temporal", "insight"])
-def test_handler_every_target_out_of_canonical_needs_the_token(signing, target):
+def test_handler_every_target_out_of_canonical_needs_the_token(signing, service_key, target):
+    # The consolidator label is PROVEN here (service key), so the 403 is the demote gate's own.
     store = _FakeStore(["canonical"])
     call, ledger = _handler(store)
-    assert _status(call, target, actor="c1-consolidator") == 403
+    assert _status(call, target, actor="c1-consolidator", service_key=service_key) == 403
     assert store.writes == [] and ledger == []
 
 
@@ -432,4 +451,66 @@ def test_handler_refuses_a_promote_token_for_a_demotion(signing):
     ts, nonce = _now(), str(uuid.uuid4())
     tok = _sign(signing, ts, nonce, "promote", "mid-1", "stale fact")
     assert _status(call, "evidence", actor="user-direct", reason="stale fact", token=tok, ts=ts, nonce=nonce) == 403
+    assert store.writes == []
+
+
+# ---- 1.32.5: insight is protected like canonical; a job label needs the service key ----------
+
+@pytest.mark.parametrize("target", ["evidence", "stable", "temporal"])
+def test_handler_refuses_an_unsigned_move_out_of_insight(signing, target):
+    """The two-step hole: insight -> evidence used to need nothing, after which PUT/DELETE were ungated."""
+    store = _FakeStore(["insight"])
+    call, ledger = _handler(store)
+    assert _status(call, target) == 403
+    assert store.writes == [] and _intents(ledger) == []
+
+
+def test_a_proven_consolidator_label_does_not_exempt_an_insight_demotion(signing, service_key):
+    """No job label demotes an insight: only the operator's signed demote moves it out."""
+    store = _FakeStore(["insight"])
+    call, ledger = _handler(store)
+    assert _status(call, "evidence", actor="dream-consolidator", service_key=service_key) == 403
+    assert store.writes == []
+
+
+def test_handler_accepts_a_signed_demotion_of_an_insight(signing):
+    store = _FakeStore(["insight"])
+    call, ledger = _handler(store)
+    ts, nonce = _now(), str(uuid.uuid4())
+    tok = _sign(signing, ts, nonce, "demote", "mid-1", "wrong insight")
+    out = call("evidence", actor="user-direct", reason="wrong insight", token=tok, ts=ts, nonce=nonce)
+    assert out["ok"] is True and store.writes[0][0]["tier"] == "evidence"
+    # Ledgered as the signed CLI path, like a canonical demotion (both lines of the pair).
+    assert [r["transport"] for r in ledger] == ["cli-user-direct", "cli-user-direct"]
+
+
+def test_handler_refuses_a_record_that_became_insight_mid_flight_with_409(signing):
+    store = _FakeStore(["evidence", "insight"])
+    call, ledger = _handler(store)
+    with pytest.raises(fastapi.HTTPException) as e:
+        call("stable")
+    assert e.value.status_code == 409 and "became insight" in str(e.value.detail)
+    assert store.writes == [] and _intents(ledger) == []
+
+
+def test_promotion_into_insight_with_an_unproven_consolidator_label_is_refused(signing):
+    store = _FakeStore(["evidence"])
+    call, ledger = _handler(store)
+    with pytest.raises(fastapi.HTTPException) as e:
+        call("insight", actor="dream-consolidator")
+    assert e.value.status_code == 403 and "service-credential-required" in str(e.value.detail)
+    assert store.writes == []
+
+
+def test_promotion_into_insight_with_a_proven_consolidator_label_lands(signing, service_key):
+    store = _FakeStore(["evidence", "evidence"])
+    call, ledger = _handler(store)
+    out = call("insight", actor="dream-consolidator", service_key=service_key)
+    assert out["ok"] is True and store.writes[0][0]["tier"] == "insight"
+
+
+def test_a_wrong_service_key_is_no_proof(signing, service_key):
+    store = _FakeStore(["evidence"])
+    call, ledger = _handler(store)
+    assert _status(call, "insight", actor="dream-consolidator", service_key="s" * 63 + "t") == 403
     assert store.writes == []

@@ -36,11 +36,19 @@ The default tier — every auto-captured fact lands here first. It is deliberate
 
 ## Insight
 
-The consolidated-knowledge tier: higher-order patterns distilled *across* sessions by the nightly Dream and written only by the consolidator actor. `insight` is both a trust tier and a memory type; it is admitted on durable/operational reads but filtered out of the per-prompt hot bundle. See [memory-model.md](systems/memory-model.md).
+The consolidated-knowledge tier: higher-order patterns distilled *across* sessions by the nightly Dream and written only under the Dream's Server-Side Job Label, which the server accepts only with the Service Key. A record leaves the tier only through the operator's signed `demote` (since 1.32.5; no job label exempts it). `insight` is both a trust tier and a memory type; it is admitted on durable/operational reads but filtered out of the per-prompt hot bundle. See [memory-model.md](systems/memory-model.md).
 
 ## Temporal
 
 The explicitly-perishable tier for facts with a shelf life. In the current admission policies it is write-side parking — stored and ledgered but admitted by no Query Class — and it is deleted by the weekly decay-scan once its expiry passes. See [memory-model.md](systems/memory-model.md).
+
+## Server-Side Job Label
+
+A privileged `actor` (request body or query string) or `metadata.source` string that names one of the stack's own jobs: the Dream's and the consolidators' insight labels (`dream-consolidator`, `c1-consolidator`, `c1-dream-consolidator`), the contradiction sweep's and the retire stamper's metadata labels (`contradiction-sweep-v019`, `stamp-retired-v013`), and the backfill and decay labels (`backfill-apply-v013`, `decay-scan`, `system`). Each unlocks a write an ordinary API-key holder cannot make, such as an insight write or a `retired_at`, `contradicts_canonical` or `expires_at` stamp. The label is plain text and every PC and MCP session holds the API key that carries it, so since 1.32.5 the server counts one only when the request also carries the Service Key; otherwise it answers 403 `service-credential-required`. An ordinary write needs no label: omit it, or use your own (for example `claude-autonomous`). See [tier-policy.md](systems/tier-policy.md).
+
+## Service Key
+
+The authority-only secret (`ams-service-key`) that proves a Server-Side Job Label, sent in the `X-AMS-Service-Key` header. On the native authority it is a systemd credential loaded by the server and by the Dream, the contradiction sweep and the operator's hand-run wrapper (`scripts/wsl/ams-service-run.sh`); on a WSL-hosted brain it is `~/.mem0/service-key` (mode 600). No replica, PC or MCP session holds it, and the installer regenerates it when missing, so it needs no backup. It is a separate secret from the Canonical signing key: a job holding it cannot sign a canonical token. It separates the authority's jobs from callers that hold only the shared API key; it does not resist a shell on the authority as the service user. `/health/deep` reports it as `checks.service_key`. See [key-custody.md](systems/key-custody.md).
 
 ## Receipt
 

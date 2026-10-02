@@ -39,7 +39,7 @@ def _home_env(home, **extra):
 
 
 class Box:
-    """A sandboxed authority: HOME with a stack.env receipt, the two .cred files, the deployed
+    """A sandboxed authority: HOME with a stack.env receipt, the three .cred files, the deployed
     scripts, and a fake systemd-run first on PATH."""
 
     def __init__(self, tmp: Path, *, stack_env="default", role_file="brain"):
@@ -50,7 +50,7 @@ class Box:
         for d in (self.home / ".mem0", self.sec, self.bin, self.home / "apps" / "mem0-scripts",
                   self.home / "apps" / "mem0-server" / ".venv" / "bin"):
             d.mkdir(parents=True)
-        for c in ("ams-api-key", "ams-canonical-key"):
+        for c in ("ams-api-key", "ams-canonical-key", "ams-service-key"):
             (self.sec / f"{c}.cred").write_text("not a real credential\n", encoding="utf-8")
         for f in ("ams-step.sh", "dream-consolidate.py", "codex-usage-report.py"):
             (self.home / "apps" / "mem0-scripts" / f).write_text("", encoding="utf-8")
@@ -107,6 +107,7 @@ def test_the_exact_systemd_run_call(box):
     assert argv[4:] == [
         "-p", f"LoadCredentialEncrypted=ams-api-key:{sec}/ams-api-key.cred",
         "-p", f"LoadCredentialEncrypted=ams-canonical-key:{sec}/ams-canonical-key.cred",
+        "-p", f"LoadCredentialEncrypted=ams-service-key:{sec}/ams-service-key.cred",
         "-p", "Environment=MEM0_HOST_KIND=native",
         "-p", "Environment=MEM0_CODEX_TRANSPORT=native",
         "-p", f"Environment=CODEX_HOME={sec}/codex",
@@ -133,7 +134,7 @@ def test_the_call_is_the_units_own_credentials_environment_and_command(box):
         return s
 
     creds = [render(m) for m in re.findall(r"^LoadCredentialEncrypted=(.+)$", unit, re.M)]
-    assert len(creds) == 2
+    assert len(creds) == 3  # api, canonical, and (1.32.5) the service key
     assert [p.split("=", 1)[1] for p in props if p.startswith("LoadCredentialEncrypted=")] == creds
 
     wrapper = argv[argv.index("-c") + 1]
@@ -265,7 +266,7 @@ def test_an_authority_without_a_recorded_secrets_dir_says_how_to_record_it(tmp_p
     assert "MEM0_SECRETS_DIR" in r.stderr and "linux-authority.sh" in r.stderr
 
 
-@pytest.mark.parametrize("missing", ["ams-api-key.cred", "ams-canonical-key.cred"])
+@pytest.mark.parametrize("missing", ["ams-api-key.cred", "ams-canonical-key.cred", "ams-service-key.cred"])
 def test_a_missing_credential_file_stops_before_the_unit_starts(box, missing):
     (box.sec / missing).unlink()
     r = box.run()
@@ -326,3 +327,55 @@ def test_the_helper_is_deployed_with_the_chain_scripts():
     inst = (REPO_ROOT / "install" / "linux-authority.sh").read_text(encoding="utf-8")
     assert '"$REPO_ROOT"/scripts/wsl/*.sh' in inst and '"$SCRIPTS_DIR"' in inst
     assert HELPER.name in (REPO_ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+
+
+# ---- 1.32.5: ams-service-run.sh, the operator's hand run with the service key --------------------
+# Same sandbox: the fake systemd-run records the call, nothing needs systemd or a credential.
+
+SERVICE_RUN = SCRIPTS / "ams-service-run.sh"
+SWEEP_UNIT = REPO_ROOT / "systemd" / "ams-step-contradiction-sweep.service"
+
+
+def _svc(box, *args):
+    (box.home / "apps" / "mem0-scripts" / "contradiction-sweep.py").write_text("", encoding="utf-8")
+    env = _home_env(box.home, PATH=f"{box.bin}:{os.environ['PATH']}", FAKE_ARGV=str(box.argv_file), FAKE_RC="0")
+    for k in [k for k in env if k.startswith("MEM0_")] + ["XDG_RUNTIME_DIR"]:
+        env.pop(k, None)
+    return subprocess.run([BASH, str(SERVICE_RUN), *args], capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_service_run_loads_the_sweep_units_credentials(box):
+    """The hand run must carry the credentials the nightly sweep unit loads, or --unstamp/--promote
+    send the sweep's label without the key and are refused."""
+    r = _svc(box, "contradiction-sweep.py", "--unstamp", "abc")
+    assert r.returncode == 0, r.stderr
+    argv = box.argv()
+    creds = [p.split("=", 1)[1] for p in _properties(argv) if p.startswith("LoadCredentialEncrypted=")]
+    unit = SWEEP_UNIT.read_text(encoding="utf-8").replace("__SECRETS_DIR__", str(box.sec))
+    assert creds == re.findall(r"^LoadCredentialEncrypted=(.+)$", unit, re.M)
+    assert any(c.startswith("ams-service-key:") for c in creds)
+    # The sweep's judging modes (--apply, --rejudge-stamped) call Codex: the hand run must see the
+    # unit's own Codex login and transport, every Environment= line except the %d credential path.
+    envs = [e for e in re.findall(r"^Environment=(.+)$", unit, re.M) if "%d/" not in e]
+    assert envs and all(f"Environment={e}" in _properties(argv) for e in envs), envs
+    py = f"{box.home}/apps/mem0-server/.venv/bin/python"
+    assert argv[-4:] == [py, f"{box.home}/apps/mem0-scripts/contradiction-sweep.py", "--unstamp", "abc"]
+    assert "MEM0_URL=http://192.0.2.10:18791" in argv
+
+
+@pytest.mark.parametrize("name", ["dream-consolidate.py", "deploy.sh", "../contradiction-sweep.py", "x.py"])
+def test_service_run_refuses_a_script_outside_its_list(box, name):
+    r = _svc(box, name)
+    assert r.returncode == 2 and box.argv() is None
+
+
+def test_service_run_refuses_off_the_authority(tmp_path):
+    b = Box(tmp_path, stack_env="MEM0_HOST_KIND=native\nMEM0_ROLE=replica\n", role_file="replica")
+    r = _svc(b, "contradiction-sweep.py")
+    assert r.returncode == 3 and b.argv() is None and "not the authority" in r.stderr
+
+
+def test_service_run_stops_before_the_unit_when_the_service_key_is_missing(box):
+    (box.sec / "ams-service-key.cred").unlink()
+    r = _svc(box, "contradiction-sweep.py", "--promote", "abc")
+    assert r.returncode == 2 and box.argv() is None and "ams-service-key.cred" in r.stderr

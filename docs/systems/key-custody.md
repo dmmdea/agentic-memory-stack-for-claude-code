@@ -3,7 +3,8 @@
 ## Purpose
 
 Every credential this stack depends on, where each copy lives, and the restore path. The
-operating rule is simple and absolute: **no key is ever recoverable from only one place.**
+operating rule is simple and absolute: **no key is ever recoverable from only one place.** (The
+one deliberate exception is the regenerable service key, below: it is re-made, not recovered.)
 
 ## Questions this doc answers
 
@@ -11,10 +12,12 @@ operating rule is simple and absolute: **no key is ever recoverable from only on
 - Which are irreplaceable and which can just be re-issued?
 - Why is the DPAPI blob *not* a backup?
 - If this machine died right now, what would it take to be running again?
+- What is the service key, who may hold it, and why is it the one secret with no backup?
 
 ## Scope
 
-`scripts/wsl/key-backup.sh`, the key material it protects, and the restore procedure.
+`scripts/wsl/key-backup.sh`, the key material it protects, and the restore procedure; and the
+authority-only service key (1.32.5), which `key-backup.sh` deliberately does not collect.
 
 ## Non-scope
 
@@ -28,6 +31,7 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 |---|---|---|
 | **canonical HMAC signing key** | `~/.mem0/canonical-key`, its DPAPI blob, tmpfs at runtime | **irreplaceable** |
 | mem0 API key | `~/.mem0/api-key` | re-issuable, but everything is wired to it |
+| **service key** (`ams-service-key`, 1.32.5) | native authority: `<secrets-dir>/ams-service-key.cred` (systemd credential); WSL authority: `~/.mem0/service-key` (mode 600) | **regenerable, authority-only** — never on a replica or a PC; restore = regenerate |
 | authority URL | `~/.mem0/authority-url` | config, trivially rebuilt |
 | NVIDIA API key | `~/.claude.json` (`local-offload` env, plaintext) | re-issuable from the vendor |
 | GitHub tokens | OS keyring | re-issuable — `gh auth login` |
@@ -37,6 +41,59 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 block future canonical promotions: existing canonical records were signed under that key, so
 the audit chain that makes the canonical tier trustworthy cannot be re-established. It cannot
 be regenerated, only restored.
+
+## The service key
+
+The authority's own jobs write under labels: the dream's insight `source` and `actor`, and the
+`actor` of the contradiction sweep, the retired-at stamper and the ship-log reclassifier. Before
+1.32.5 those labels were free text, so any holder of the shared API key (every PC and every MCP
+session) could type one and write what the job writes. Since 1.32.5 a label counts only when the
+request also carries the **service key** in the `X-AMS-Service-Key` header; without it the server
+answers `403 service-credential-required`. Nothing else about the API key changed.
+
+| | |
+|---|---|
+| class | **regenerable, authority-only** |
+| native authority | systemd credential `ams-service-key`, file `<secrets-dir>/ams-service-key.cred` (`--with-key=host+tpm2`). Loaded by `mem0.service`, the dream and contradiction-sweep step units, and the transient units of `ams-dream-now.sh` and `ams-service-run.sh` |
+| WSL authority | `~/.mem0/service-key`, mode 600. Made by `install/1-wsl-services.sh` on a `brain` and by `scripts/wsl/deploy.sh` before its restart; there is no DPAPI blob |
+| replica, PC, thin client | never. `1-wsl-services.sh` removes the file on a box that becomes a replica; a replica's server, dormant or live, refuses every job label by design |
+| backup | none; `key-backup.sh` does not collect it |
+| restore | regenerate |
+
+It is the one secret deliberately kept in a single place. The rule above is about keys that
+cannot be re-made; this one can, because only the authority's server and units hold it and no
+stored record depends on its value. A lost key costs no data: until a new one is loaded, the
+server refuses the dream's insight writes and the sweep's stamps, and on the native authority a
+missing or undecryptable `.cred` stops `mem0.service` from starting (its drop-in loads the
+credential). To regenerate it, re-run `install/linux-authority.sh`, which makes a missing key and
+replaces one that does not decrypt on this host (the old file is kept as
+`ams-service-key.cred.undecryptable-<UTC stamp>`), and fails the install unless `/health/deep`
+reports `checks.service_key.present: true`. By hand:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_hex(32))' \
+  | systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key - <secrets-dir>/ams-service-key.cred
+systemctl --user restart mem0.service   # the server reads the key once, at start
+curl -s "$(head -n1 ~/.mem0/authority-url)/health/deep" | jq '.checks.service_key'   # present: true
+```
+
+The restart is not optional: the dream and sweep units load the new file on their next run while a
+running `mem0.service` still holds the old key, so every job label would be refused until it restarts.
+The installer re-run does the restart and the check for you, which is why it is the preferred path.
+
+On a WSL authority, `install/1-wsl-services.sh` or `deploy.sh` writes a missing `~/.mem0/service-key`
+(then restart `mem0.service`, which reads it once). The operator's hand runs of the scripts that send
+a job label go through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> [args]`, which loads
+the key for the run ([operations](../operations.md#a-hand-run-is-refused-with-service-credential-required)).
+
+**What it is not.** It separates the authority's own jobs from every caller that holds only the
+shared API key: MCP shim sessions, hooks, PCs and replicas. It does not resist a shell on the
+authority as the service user, an ssh session to the brain, or (WSL brain) a Windows-side process of
+the same user. It is one key for every job, not per-job least privilege. It is separate from the
+canonical key, so a job that holds it cannot mint canonical tokens. The Codex judge, which reads
+memory text any API-key holder can write, runs without the environment variables that carry or point at
+the credentials (the credential directory, the API key file, the API key); that removes the pointer, not
+the files, and the sandbox is the real boundary.
 
 ## Why the DPAPI blob is not a backup
 
@@ -56,7 +113,8 @@ verifies them against the manifest**, and **fails with a non-zero exit if fewer 
 destinations verify**. One copy is not durability, so the script refuses to call it success.
 
 Re-issuable credentials (GitHub, Codex) are deliberately excluded: backing them up widens the
-blast radius for no recovery benefit.
+blast radius for no recovery benefit. The service key is excluded for the same reason, and a
+second one: a copy anywhere but the authority defeats what the key is for.
 
 ```bash
 # from the Windows-side shell, which is the only runtime that sees both destinations
@@ -86,7 +144,12 @@ curl -s localhost:18791/health/deep | python3 -c \
   "import json,sys;print(json.load(sys.stdin)['checks']['canonical_key'])"
 ```
 
-Expect `ok: True, present: True`. On a rebuilt machine you will also want to re-create the
+Expect `ok: True, present: True`. The bundle does not carry the service key and nothing here
+restores it: it is regenerated (see [The service key](#the-service-key)). On a WSL brain,
+`scripts/wsl/deploy.sh` writes a missing `~/.mem0/service-key` before its restart (a re-run of
+`install/1-wsl-services.sh` does too; restart `mem0.service` after it). Expect
+`checks.service_key.present: true` from `/health/deep` as well: without it the restored server
+starts and then refuses every job label. On the native authority, re-run `install/linux-authority.sh`. On a rebuilt machine you will also want to re-create the
 DPAPI blob (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)) — the restored plaintext
 is what that blob gets built *from*, which is the whole reason it must survive.
 
@@ -94,6 +157,9 @@ is what that blob gets built *from*, which is the whole reason it must survive.
 
 - **Treating the DPAPI blob as the second copy.** It is machine-bound. See above.
 - **Backing up to one place and calling it durable.** The script exits non-zero on purpose.
+- **Copying the service key to a replica, a PC or a backup bundle.** It exists to be held by the
+  authority alone; a copy next to the API key removes the separation it provides. Regenerate it
+  on the authority instead.
 - **Assuming a green run means the bundle is complete.** An interpreter or mount failure can
   silently drop an artifact; the run prints the artifact count, and the manifest is what a
   restore must be checked against.

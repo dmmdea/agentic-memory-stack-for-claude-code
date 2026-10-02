@@ -9,6 +9,10 @@ The policy matrix (current_tier × action):
                                            gated only promotions, so an API-key holder could demote a
                                            canonical record and then PUT/DELETE it with no token.
 - insight   × PUT/DELETE/PATCH-metadata  → require actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct
+                                           (1.32.5: the actor counts only when proven by the service key)
+- insight   × PATCH-tier-demote          → require HMAC user-direct "demote" (1.32.5; no job exemption)
+- any tier  × a server-side job label    → refused (403 service-credential-required) unless the request
+                                           carries the authority's service key (1.32.5)
 - stable / evidence / temporal × any     → no extra gate (existing flow unchanged)
 - canonical × PATCH-metadata with a hide key (RETRIEVAL_HIDE_KEYS: superseded_by, contradicts_canonical)
                                          → refused (403) for EVERY actor, trusted ones included
@@ -150,10 +154,17 @@ def tier_change_hmac_action(current_tier: Optional[str], target_tier: str) -> Op
     Any move INTO canonical signs "promote" (unchanged since v0.19 Phase G). Any move OUT of
     canonical signs "demote". current_tier is the record's tier now (None when the record is
     unknown, which never requires "demote").
+
+    1.32.5: a move OUT of insight signs "demote" too. Before it, insight -> evidence needed no
+    token, after which PUT and DELETE were ungated: the insight gate fell to two plain requests,
+    the same two-step hole session 12 closed for canonical. No job label exempts it (nothing in
+    the stack demotes an insight): the operator's signed demote is the only way out.
     """
     if target_tier == "canonical":
         return "promote"
     if current_tier == "canonical":
+        return "demote"
+    if current_tier == "insight" and target_tier != "insight":
         return "demote"
     return None
 
@@ -186,12 +197,10 @@ TRUSTED_PATCH_ACTORS: dict[str, frozenset[str]] = {
 # (admission_gate.AdmissionPolicy.evaluate, steps 1b and 1c). No metadata PATCH may put one on a
 # canonical record, whatever its actor string: a canonical leaves default retrieval only through
 # the operator's signed path (demote first: mem0-canonize.sh --action demote).
-# Scope, stated plainly: this closes the hole for CANONICAL records only. The trusted and legacy actor
-# strings themselves are still unauthenticated, so an API-key holder that sends one can still stamp
-# that actor's keys on a non-canonical record (the sweep's contradicts_canonical on an insight or
-# evidence record, backfill-apply-v013's retrievable=false, system's expires_at). The sweep stamps
-# insight candidates by design, so insight is not added here; closing the rest needs a credential for
-# server-side actors, not a string (register follow-up).
+# The sweep stamps insight candidates by design, so insight is not added here. The rest of what 1.32.4
+# named as open (an API-key holder sending the sweep's, the backfill's or the decay labels to stamp
+# their keys on a non-canonical record) closed in 1.32.5: every such label needs the authority's
+# service key (require_service_credential below), and the policy honours it only when proven.
 RETRIEVAL_HIDE_KEYS = frozenset({"superseded_by", "contradicts_canonical"})
 
 # PATCH /v1/memories/{id}/metadata key policy. It lived inline in the app.py handler; 1.32.4 moved
@@ -218,7 +227,81 @@ LEGACY_PATCH_ACTOR_KEYS: dict[str, frozenset[str]] = {
 }
 
 
-def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], keys) -> None:
+# ---------- 1.32.5: the service credential behind privileged labels ----------
+#
+# Every label above (TRUSTED_PATCH_ACTORS, LEGACY_PATCH_ACTOR_KEYS, INSIGHT_ALLOWED_ACTORS) is
+# free text in a request body or query string, and the ordinary API key is held by every PC and
+# every MCP shim session. So a label grants nothing unless the request also carries the
+# authority-only service key (canonical_key_provider.service_key_provider: systemd credential
+# `ams-service-key` on the native authority, ~/.mem0/service-key on a WSL authority, absent on
+# replicas and PCs). Each write handler calls require_service_credential on the label it is
+# about to hand to the policy functions, BEFORE it calls them, so the pure policy below keeps
+# reading a plain string and only ever sees a privileged one that was proven.
+
+from canonical_key_provider import service_key_provider as _service_key_provider
+
+_SERVICE_KEY_PROVIDER = _service_key_provider()
+
+SERVICE_KEY_HEADER = "X-AMS-Service-Key"
+
+
+def _get_service_key() -> Optional[str]:
+    """Indirection so tests can swap the key (reset _SERVICE_KEY_PROVIDER._cache_loaded)."""
+    return _SERVICE_KEY_PROVIDER.get_key()
+
+
+def normalize_label(label: Optional[str]) -> str:
+    """The one normalisation every label comparison in this module uses. A non-string (a missing
+    query param's FieldInfo default when a handler is called outside FastAPI) is no label."""
+    return label.strip().lower() if isinstance(label, str) else ""
+
+
+def is_privileged_label(label: Optional[str]) -> bool:
+    """True when the label is one a server-side job uses to claim a privilege. Read live from the
+    three tables, so a label added to any of them is covered without a second edit."""
+    n = normalize_label(label)
+    return bool(n) and (n in TRUSTED_PATCH_ACTORS or n in LEGACY_PATCH_ACTOR_KEYS
+                        or n in INSIGHT_ALLOWED_ACTORS)
+
+
+def service_credential_ok(presented: Optional[str]) -> bool:
+    """Constant-time check of the X-AMS-Service-Key header against the loaded service key. False
+    when either side is missing or empty: a server without the key accepts no privileged label."""
+    key = _get_service_key()
+    p = presented.strip() if isinstance(presented, str) else ""
+    if not key or not p:
+        return False
+    return hmac.compare_digest(p.encode("utf-8"), key.encode("utf-8"))
+
+
+def require_service_credential(label: Optional[str], presented: Optional[str],
+                               field: str = "actor") -> bool:
+    """Gate a privileged label on the service credential.
+
+    Returns False for a label that is not privileged (nothing to prove; the caller's request
+    proceeds under the ordinary rules), True for a privileged label whose request carries the
+    service key, and raises 403 `service-credential-required` for a privileged label without it.
+    `field` names where the label came from (actor, metadata.source) for the error text.
+    """
+    if not is_privileged_label(label):
+        return False
+    if service_credential_ok(presented):
+        return True
+    if not _get_service_key():
+        why = ("this server holds no service key, so it accepts no server-side job label "
+               "(a replica or a PC never does; on the authority, re-run the installer)")
+    else:
+        why = f"the request did not carry the authority's service key in {SERVICE_KEY_HEADER}"
+    raise HTTPException(
+        403,
+        f"service-credential-required: {field}={normalize_label(label)!r} is a server-side job "
+        f"label and {why}. Ordinary writes need no label: omit it, or use your own (for example "
+        "'claude-autonomous').",
+    )
+
+
+def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], keys,
+                             service_verified: bool = False) -> None:
     """Key-level authorisation for PATCH /metadata. Runs after assert_writable.
 
     Every forbidden key in the request must be individually allowed for the actor (legacy
@@ -226,9 +309,14 @@ def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], 
     write ONLY its own keys. A hide key (RETRIEVAL_HIDE_KEYS) is refused on a canonical record for
     every actor: the trusted-actor early return in assert_writable skips the HMAC check, so the
     actor string alone must never be enough to hide a canonical. Raises HTTPException(403).
+
+    1.32.5: service_verified says the handler proved the actor with the service key. An unproven
+    label gets no key allowance at all (it reads as no label), so a handler that forgot
+    require_service_credential is refused rather than trusted.
     """
     keys = set(keys)
-    actor_lower = (actor or "").strip().lower()
+    actor_lower = normalize_label(actor) if service_verified else ""   # the allowlist lookups
+    actor_sent = normalize_label(actor)                                    # what the caller sent, for the message
     hide_hit = RETRIEVAL_HIDE_KEYS & keys
     if hide_hit and current_tier == "canonical":
         raise HTTPException(
@@ -245,7 +333,8 @@ def authorize_metadata_patch(current_tier: Optional[str], actor: Optional[str], 
             raise HTTPException(
                 403,
                 f"forbidden metadata keys {sorted(forbidden_hit - allowed_keys)} "
-                f"require trusted actor; got actor={actor_lower!r}",
+                f"require trusted actor; got actor={actor_sent!r}"
+                + ("" if service_verified or not is_privileged_label(actor) else " (not proven: no service key)"),
             )
     if actor_lower in TRUSTED_PATCH_ACTORS:
         actor_allowed_keys = TRUSTED_PATCH_ACTORS[actor_lower]
@@ -535,16 +624,19 @@ def validate_insight_actor(
     action: str,
     reason: str,
     x_user_direct_nonce: Optional[str] = None,
+    service_verified: bool = False,
 ) -> None:
-    """Insight-tier write: actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct.
+    """Insight-tier write: a PROVEN actor in INSIGHT_ALLOWED_ACTORS OR valid HMAC user-direct.
 
     The OR gives the operator a direct-override route: even if he is not a consolidator
     actor, he can provide a signed HMAC token to mutate an insight record.
     x_user_direct_nonce is forwarded to validate_hmac_user_direct (v0.17 F.1).
+    1.32.5: service_verified says the handler proved the label with the service key
+    (require_service_credential). Without it the label is just text and the HMAC applies, so a
+    caller that forgets the handler-level gate is denied, never let through.
     """
-    actor_lower = (actor or "").strip().lower()
-    if actor_lower in INSIGHT_ALLOWED_ACTORS:
-        return  # consolidator path — accept without HMAC
+    if service_verified and normalize_label(actor) in INSIGHT_ALLOWED_ACTORS:
+        return  # proven consolidator — accept without HMAC
     # HMAC required as the fallback gate
     validate_hmac_user_direct(
         memory_id, action, reason,
@@ -565,6 +657,7 @@ def assert_writable(
     actor: str,
     reason: str,
     x_user_direct_nonce: Optional[str] = None,
+    service_verified: bool = False,
 ) -> Optional[str]:
     """Fetch current tier and enforce the policy matrix for mutation actions.
 
@@ -578,6 +671,10 @@ def assert_writable(
 
     x_user_direct_nonce (v0.17 F.1): forwarded to validate_hmac_user_direct for
     replay protection. v0.18 MED-7: required — absent nonce → 403 on the HMAC path.
+
+    service_verified (1.32.5): True only when the handler proved the actor label with the service
+    key (require_service_credential). Every label privilege below (the trusted-actor bypass, the
+    consolidator's insight path) needs it; without it a privileged label is ordinary text.
 
     Returns current_tier str (or None if memory not found) so callers can include
     it in ledger entries. Raises HTTPException on policy violation.
@@ -604,8 +701,9 @@ def assert_writable(
     # H8: TRUSTED_PATCH_ACTORS bypass for patch_metadata only.
     # stamp-retired-v013 may PATCH retired_at on canonical/insight records without HMAC.
     # The app.py PATCH /metadata handler additionally enforces the allowed-keys constraint.
-    _actor_lower = (actor or "").strip().lower()
-    if intended_action == "patch_metadata" and _actor_lower in TRUSTED_PATCH_ACTORS:
+    # 1.32.5: only a label the handler PROVED with the service key gets the bypass.
+    if (intended_action == "patch_metadata" and service_verified
+            and normalize_label(actor) in TRUSTED_PATCH_ACTORS):
         return current_tier  # trusted-actor bypass; app.py enforces allowed-keys
 
     if current_tier == "canonical":
@@ -619,6 +717,7 @@ def assert_writable(
             actor, x_user_direct_token, x_user_direct_ts,
             memory_id, intended_action, reason,
             x_user_direct_nonce=x_user_direct_nonce,
+            service_verified=service_verified,
         )
     # stable / evidence / temporal — no extra gate; fall through
 

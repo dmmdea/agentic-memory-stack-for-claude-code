@@ -8,7 +8,7 @@ in it, and where things live.
 
 A persistent, multi-tier, measurably-faithful **memory backend for Claude Code**: one always-on
 Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it (topology:
-`ARCHITECTURE.md`). Five components (4 runtime processes + 1 credential file):
+`ARCHITECTURE.md`). Six components (4 runtime processes + 2 credentials):
 
 1. **mem0-server** (`mem0-server/app.py`) — FastAPI wrapper around mem0 on
    `:18791` (the authority binds its tailnet address; a dormant replica's copy is loopback).
@@ -22,7 +22,16 @@ Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it 
 5. **canonical key** (`~/.mem0/canonical-key`, mode 600; a systemd credential on the native
    authority) — HMAC signing key for
    `tier=canonical` promotions via `scripts/wsl/mem0-canonize.sh` (user-direct CLI
-   only; agents cannot canonize through the API/MCP).
+   only; agents cannot canonize through the API/MCP). The same CLI's signed `demote`
+   moves a record out of canonical or, since 1.32.5, out of insight.
+6. **service key** (`ams-service-key`: a systemd credential on the native authority,
+   `~/.mem0/service-key` mode 600 on a WSL-hosted brain) — proves a server-side job label
+   (the dream's, the sweep's) in the `X-AMS-Service-Key` header; without it the server
+   answers 403 `service-credential-required`. Authority only: no replica, PC or MCP session
+   holds it. Regenerable (the installer makes it; nothing to back up), and kept apart from
+   the canonical key. `/health/deep` reports it as `checks.service_key`. Hand runs of the
+   jobs that send a label go through `scripts/wsl/ams-service-run.sh`; a new Python job that
+   claims a privileged label sends `ams_env.mem0_headers()`, and its unit loads the credential.
 
 ## Install / verify / upgrade
 
@@ -88,7 +97,10 @@ look and how to work; `docs/` explains how the application works.
 ## Trust tiers (the core protocol)
 
 `evidence` → `insight` → `canonical`. Writes land as evidence/temporal; `canonical`
-is ground truth and can only be set via the HMAC-signed CLI path. When two memories
+is ground truth and can only be set via the HMAC-signed CLI path. `insight` is written
+only by the nightly dream on the authority (service key) and leaves the tier only through
+the same signed path: the MCP `memory_add` downgrades an insight to evidence, and
+`memory_demote` cannot move one. When two memories
 disagree, higher tier wins; same tier → newer wins. The admission gate fail-closes on
 brand scope: pass `brand=` when your context has one.
 

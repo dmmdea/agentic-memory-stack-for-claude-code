@@ -5,7 +5,7 @@
 # (a replica's own dream-consolidate.ps1 exits on its role, -Force included, so it never consolidates).
 #
 # The nightly dream is ams-step-dream.service, one step of the chain. Started from a shell it would
-# fail to authenticate: the unit supplies two systemd credentials and three Environment= lines. And
+# fail to authenticate: the unit supplies three systemd credentials and three Environment= lines. And
 # its `--guarded` turns it into a receipted no-op once tonight's chain has succeeded. So this starts
 # a transient user unit that carries the same LoadCredentialEncrypted= / Environment= / ExecStartPre=
 # and runs the unit's own command without --guarded. It goes through ams-step.sh, so the run is
@@ -68,8 +68,8 @@ if [ "$kind" != native ]; then
     refuse "MEM0_HOST_KIND=${kind:-unset} in ~/.mem0/stack.env: only the native Linux authority runs the dream as a systemd chain step. A WSL brain's dream is the Windows scheduled task; force it there with dream-consolidate.ps1 -Force."
 fi
 sec="$(env_val MEM0_SECRETS_DIR)"
-[ -n "$sec" ] || fail '~/.mem0/stack.env has no MEM0_SECRETS_DIR (the directory holding the two .cred files); re-run install/linux-authority.sh, which records it'
-for c in ams-api-key ams-canonical-key; do
+[ -n "$sec" ] || fail '~/.mem0/stack.env has no MEM0_SECRETS_DIR (the directory holding the .cred files); re-run install/linux-authority.sh, which records it'
+for c in ams-api-key ams-canonical-key ams-service-key; do
     [ -r "$sec/$c.cred" ] || fail "missing $sec/$c.cred (the credential ams-step-dream.service loads)"
 done
 PY="$HOME/apps/mem0-server/.venv/bin/python"
@@ -91,6 +91,7 @@ rc=0
 systemd-run --user --wait --collect --unit="$unit" \
     -p "LoadCredentialEncrypted=ams-api-key:$sec/ams-api-key.cred" \
     -p "LoadCredentialEncrypted=ams-canonical-key:$sec/ams-canonical-key.cred" \
+    -p "LoadCredentialEncrypted=ams-service-key:$sec/ams-service-key.cred" \
     -p "Environment=MEM0_HOST_KIND=native" \
     -p "Environment=MEM0_CODEX_TRANSPORT=native" \
     -p "Environment=CODEX_HOME=$sec/codex" \

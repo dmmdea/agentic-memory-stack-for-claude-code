@@ -45,6 +45,8 @@ GREEN_CHECKS = {
     # verdict that reads the real keys.
     "canonical_key": {"ok": True, "present": True, "source": "runtime",
                       "dpapi_blob": True},
+    # 1.32.5: canonical_key_provider.service_key_health's shape.
+    "service_key": {"present": True, "source": "credential"},
     "put_carryover_today": {"date": "2026-08-07", "puts": 3,
                             "keys_restored": 0, "keys_lost": 0},
     "mojibake": {"ok": True, "scanned": 100, "hits": 0, "sample_ids": [],
@@ -87,7 +89,7 @@ GREEN_CHECKS = {
 
 PROBE_BACKED = [
     "mem0-api", "qdrant-store", "embedder", "bm25-sparse-leg", "canonical-key",
-    "put-carryover", "mojibake-tripwire", "contradiction-review-queue",
+    "service-key", "put-carryover", "mojibake-tripwire", "contradiction-review-queue",
     "dream-cycle", "drift-guard", "backup-pipeline", "dedup-job",
     "memory-index", "sweep-job", "codex-auth",
 ]
@@ -761,3 +763,29 @@ def test_promotion_gate_row_warns_on_a_brain_that_only_shadows():
 
 def test_promotion_gate_row_is_documented():
     assert "promotion-gate" in _doc_table_ids()
+
+
+# ======================================================================
+# 1.32.5 -- the service key
+# ======================================================================
+
+def test_service_key_absent_is_dead_and_required_on_the_brain():
+    """Without the service key the authority refuses its own dream's insight writes and the sweep's
+    stamps, so an absent key on the brain is dead and a required capability, never silence."""
+    out = _ev(_checks(service_key={"present": False, "source": "none"}))
+    assert out["states"]["service-key"] == "dead"
+    assert "service-key" in out["dead_required"]
+
+
+def test_service_key_absent_on_a_replica_is_not_required():
+    """No replica holds the service key by design; its absence must never convict a replica."""
+    out = _ev(_checks(service_key={"present": False, "source": "none"}), role="replica")
+    assert out["states"]["service-key"] == "dead"
+    assert "service-key" not in out["dead_required"]
+
+
+def test_service_key_present_is_alive_and_missing_check_is_unknown():
+    assert _ev(GREEN_CHECKS)["states"]["service-key"] == "alive"
+    checks = dict(GREEN_CHECKS)
+    del checks["service_key"]
+    assert _ev(checks)["states"]["service-key"] == "unknown"

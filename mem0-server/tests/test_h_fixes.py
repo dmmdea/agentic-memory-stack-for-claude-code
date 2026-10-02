@@ -33,6 +33,16 @@ import pytest
 URL = os.environ.get("MEM0_URL", "http://127.0.0.1:18791")
 KEY = os.environ.get("MEM0_KEY") or (Path.home() / ".mem0" / "api-key").read_text().strip()
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
+# 1.32.5: these live cases send server-side job labels (or seed insights), which the server accepts
+# only with the authority's service key. Read it the way the server does; absent (a replica, a PC),
+# those cases fail with 403 service-credential-required, which is the correct answer there.
+try:
+    from canonical_key_provider import service_key_provider as _service_key_provider
+    _SERVICE_KEY = _service_key_provider().get_key()
+except Exception:  # noqa: BLE001
+    _SERVICE_KEY = None
+if _SERVICE_KEY:
+    H["X-AMS-Service-Key"] = _SERVICE_KEY
 
 # v0.19 Phase H: key via provider (runtime tmpfs > dpapi-on-win > plaintext) —
 # conftest.py inserts mem0-server/ into sys.path before this module loads.
