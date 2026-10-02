@@ -70,7 +70,7 @@ def test_wsl_installer_health_probe_follows_mem0_bind():
 def test_stamp_retired_at_resolves_through_ams_env():
     code = _code(REPO_ROOT / "scripts" / "wsl" / "stamp-retired-at.py")
     assert LOOPBACK not in code
-    assert "from ams_env import api_key, mem0_url" in code
+    assert "from ams_env import api_key, mem0_headers, mem0_url" in code
 
 
 def test_windows_dream_probes_the_resolved_authority():

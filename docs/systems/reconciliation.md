@@ -10,7 +10,7 @@ Deep-dive on layer 5 of [`ARCHITECTURE.md`](../../ARCHITECTURE.md): the machiner
 | Evidence-vs-evidence supersession sweep | "should the OLDER of two near-duplicates be hidden as stale?" | most-recent non-canonical facts | on-demand (`--evidence-sweep`) |
 | NLI write-gate (opt-in, async) | "does this brand-new record contradict canonical truth?" | each incoming write | at write time, post-response |
 
-All three route judgment to **Codex through the Windows HTTP shim (:18792)** — clean JSON over loopback TCP, API-key-authed, prompts treating memory text as untrusted data inside delimiter blocks with closing-tag neutralization.
+All three route judgment to **Codex through the Windows HTTP shim (:18792)** — clean JSON over loopback TCP, API-key-authed, prompts treating memory text as untrusted data inside delimiter blocks with closing-tag neutralization. On the native transport the `codex exec` child is started without `CREDENTIALS_DIRECTORY` and the API-key pointers (`MEM0_API_KEY_FILE`, `MEM0_KEY`, `MEM0_API_KEY`), because a judge reads memory text any key holder can write (1.32.5); that removes the pointer, not the files, so the sandbox stays the real boundary.
 
 ### Why local models never judge (measured, twice)
 
@@ -32,7 +32,7 @@ Measured on the 30 labeled pairs: precision **35 % → 67 % at 100 % genuine rec
 | `contradicts_canonical_pending` | an **advisory** (historically local-judge) YES | **No — deliberately ignored.** A weak verdict must never hide a live record |
 | `contradicts_canonical` | the **authoritative** stamp | Yes — hidden from durable/operational reads (forensic `history` still sees it) |
 
-Every contradiction stamp travels through the trusted-actor mem0 PATCH path (key-allowlisted actor), never direct store writes — so the ledger and gate see every change. A *supersession* is the one lifecycle write with its own door instead (below): it is not a stamp any PATCH actor can write.
+Every contradiction stamp travels through the trusted-actor mem0 PATCH path (key-allowlisted actor), never direct store writes — so the ledger and gate see every change. Since 1.32.5 that actor label (`contradiction-sweep-v019`) is a claim the server checks, not a string it believes: it honours the label only on a request carrying the authority's service key (`X-AMS-Service-Key`), which the Sunday sweep unit loads as the `ams-service-key` credential and no replica, PC or MCP session holds. Any other sender of the label gets `403 service-credential-required` ([admission-gate](./admission-gate.md#offline-contradiction-sweep-v019-i3-runbook)). A *supersession* is the one lifecycle write with its own door instead (below): it is not a stamp any PATCH actor can write.
 
 ## The resolution policy: auto-clear always; hides are queue-gated on two of three paths
 
@@ -51,7 +51,7 @@ The load-bearing asymmetry: **clearing a flag is safe and automated; hiding is d
 - *Direction.* A YES whose candidate is **newer than the canonical** may be the correction, with the canonical the stale one. It is routed to the review queue as `kind: canonical-possibly-stale` (with `stale_canonical_id`, deliberately not `canonical_id`, so `--promote` cannot act on it) and the candidate gets only the `contradiction_checked_at` marker; nothing is hidden. The operator resolves it by refreshing or demoting the canonical, then `--dismiss <memory_id>` (which drops every queue line for that memory); the weekly sweep also drops the line by itself once its `stale_canonical_id` is no longer a live canonical (`stale_review_pruned` in the summary), and the queue's idempotency is per `(memory_id, kind, stale canonical)`, so a candidate already queued for `--promote` still gets its stale record. `--promote` leaves the stale line in place. A YES on an *older* candidate is stamped as before.
 - *Stamps are re-judged on the brain.* The Sunday unit runs `--then-rejudge-stamped` (the sweep, then `--rejudge-stamped` with the same `--judge codex --apply`, under one chain step and one receipt). The re-judge clears NO-verdict stamps, dangling stamps, and stamps whose target was **demoted or retired** (no judge call: nothing is left to contradict), as `cleared_ids[].reason` `dangling-canonical` / `target-demoted:<tier>` / `target-retired`.
 
-So the honest statement is: *new evidence-vs-evidence hides and pending-flag promotions are always human-gated; the weekly canonical-anchored sweep auto-enforces authoritative Codex verdicts.* Recovery is uniform regardless of path: `--unstamp <id>` un-hides in one command (`--unsupersede <id>` for a supersession), the forensic `history` class always sees hidden records, and the next re-judge auto-clears anything Codex no longer stands behind. The SessionStart banner surfaces the queue depth.
+So the honest statement is: *new evidence-vs-evidence hides and pending-flag promotions are always human-gated; the weekly canonical-anchored sweep auto-enforces authoritative Codex verdicts.* Recovery is uniform regardless of path: `--unstamp <id>` un-hides in one command (on the authority, through `ams-service-run.sh`, see below; `--unsupersede <id>` for a supersession), the forensic `history` class always sees hidden records, and the next re-judge auto-clears anything Codex no longer stands behind. The SessionStart banner surfaces the queue depth.
 
 **The incident behind the queue:** an early auto-enforce pass over *pending* flags hid **3 out of 4 perfectly consistent facts** on single Codex YES verdicts (2026-06-30). The queue has gated that path — and all evidence-vs-evidence hides — since. Note the historical wrinkle: the weekly unit judged locally (advisory-only) until the C5 hardening switched it to Codex for verdict quality, which made the Sunday pass enforcement-capable again; if a Sunday stamp ever looks wrong, `--unstamp` + the re-judge are the designed recovery.
 
@@ -72,6 +72,17 @@ flowchart LR
 ```
 
 Queue writes are idempotent by memory id; sweeps and re-judges hold single-runner locks (atomic mkdir, stale-reclaim) so concurrent runs can't double-process.
+
+### Operator hand runs need the service key (1.32.5)
+
+`--promote` and `--unstamp`, and a hand `--apply` of the sweep or of `--rejudge-stamped`, write stamps under the sweep's actor label, which the server accepts only with the service key. Run them on the authority through the wrapper, which hands the script the credentials the Sunday unit has:
+
+```bash
+bash ~/apps/mem0-scripts/ams-service-run.sh contradiction-sweep.py --unstamp <id>
+bash ~/apps/mem0-scripts/ams-service-run.sh contradiction-sweep.py --promote <id>
+```
+
+The wrapper runs only `contradiction-sweep.py`, `stamp-retired-at.py` and `ship_log_reclassify.py`, and refuses on any role but the brain (a replica or PC holds no service key). On a native authority it starts a transient user unit loading `ams-api-key` and `ams-service-key`, with its output piped to the terminal: a dropped ssh session stops the unit at its next write, so run a long scroll in `tmux` or `screen`. On a WSL brain it runs the script directly, which reads `~/.mem0/service-key`. `--dismiss` (queue file only) and the supersede door's modes (`--resolve-supersede`, `--unsupersede`, `--supersede-markers`) send no job label and run as before. Without the key a stamp write is refused `403 service-credential-required`; there is no hand-typed `curl` equivalent.
 
 ## The supersede door (1.32.4)
 
@@ -102,7 +113,7 @@ Env-gated (`MEM0_NLI_GATE_ENABLED`, default off) and **async** — it runs as a 
 
 ## Operating it
 
-Day-2 commands, banners, and the shim's availability model are in [`operations.md`](../operations.md#the-session-banner-says-contradictions-await-review). The short version: when the banner shows queued verdicts, read the queue, `--promote` the genuinely stale, ignore or clear the rest — queued items are never enforced without you (weekly-sweep stamps are the exception, and `--unstamp` reverses any of it in one command). A `kind: supersede` line is resolved with `--resolve-supersede <id> --winner <id>`, not `--promote`, and `--unsupersede` reverses that.
+Day-2 commands, banners, and the shim's availability model are in [`operations.md`](../operations.md#the-session-banner-says-contradictions-await-review). The short version: when the banner shows queued verdicts, read the queue, `--promote` the genuinely stale, ignore or clear the rest — queued items are never enforced without you (weekly-sweep stamps are the exception, and `--unstamp` reverses any of it in one command). On the authority `--promote` and `--unstamp` run through `ams-service-run.sh` ([above](#operator-hand-runs-need-the-service-key-1325)). A `kind: supersede` line is resolved with `--resolve-supersede <id> --winner <id>`, not `--promote`, and `--unsupersede` reverses that.
 
 ## Design principles of the layer (summary)
 
@@ -117,6 +128,7 @@ Day-2 commands, banners, and the shim's availability model are in [`operations.m
 - [`../../scripts/wsl/contradiction-sweep.py`](../../scripts/wsl/contradiction-sweep.py) — every mode above: the sweep, `--rejudge-stamped`, `--evidence-sweep`, `--retrieval-pairs`, `--promote` / `--dismiss` / `--unstamp`, and the supersede door's operator modes (`--resolve-supersede`, `--unsupersede`, `--supersede-markers`).
 - [`../../mem0-server/supersession.py`](../../mem0-server/supersession.py) — the refusal matrix and the hand-written-marker parser the endpoint and the sweep share.
 - [`../../mem0-server/app.py`](../../mem0-server/app.py) — `POST` / `DELETE /v1/memories/{id}/supersede` and the PATCH `/metadata` handler.
-- [`../../mem0-server/security_invariants.py`](../../mem0-server/security_invariants.py) — `authorize_metadata_patch` and `TRUSTED_PATCH_ACTORS`.
+- [`../../mem0-server/security_invariants.py`](../../mem0-server/security_invariants.py) — `authorize_metadata_patch`, `TRUSTED_PATCH_ACTORS` and `require_service_credential` (the service-key check that makes the actor label a claim).
+- [`../../scripts/wsl/ams-service-run.sh`](../../scripts/wsl/ams-service-run.sh) — the wrapper for operator hand runs that write stamps on the authority.
 - [`../../scripts/wsl/mem0-mcp-shim.py`](../../scripts/wsl/mem0-mcp-shim.py) — `memory_supersede` / `memory_unsupersede`; [`../../scripts/wsl/replay-ops.py`](../../scripts/wsl/replay-ops.py) replays them from the outbox.
 - [`../../mem0-server/tests/test_contradiction_sweep.py`](../../mem0-server/tests/test_contradiction_sweep.py), [`test_supersession.py`](../../mem0-server/tests/test_supersession.py), [`test_supersede_clients.py`](../../mem0-server/tests/test_supersede_clients.py) — the pins.

@@ -206,3 +206,26 @@ def test_native_a_missed_footer_is_null_never_zero():
     out = csc.judge("p", _run=lambda cmd, **kw: _cp(0, out="just the answer\n", err="some warning\n"))
     assert out["ok"] is True
     assert out["tokens_used"] is None and out["model_resolved"] is None and out["effort_resolved"] is None
+
+
+def test_the_judge_child_inherits_no_credential_pointer(monkeypatch):
+    """1.32.5: the judge reads memory text any API-key holder writes; its codex child must not
+    be handed the units' credential directory or a key."""
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", "/run/user/1000/credentials/x.service")
+    monkeypatch.setenv("MEM0_API_KEY_FILE", "/run/user/1000/credentials/x.service/ams-api-key")
+    monkeypatch.setenv("MEM0_API_KEY", "k2")
+    monkeypatch.setenv("CODEX_HOME", "/secrets/codex")
+    seen = {}
+
+    def run(cmd, **kw):
+        seen["env"] = kw.get("env")
+        with open(cmd[cmd.index("--output-last-message") + 1], "w", encoding="utf-8") as f:
+            f.write("ok\n")
+        return _cp(0, out="ok\n")
+
+    assert csc.judge("p", effort="low", timeout_s=30, model="m", _run=run)["ok"] is True
+    env = seen["env"]
+    assert env is not None, "the judge must pass an explicit, scrubbed environment"
+    for k in ("CREDENTIALS_DIRECTORY", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY"):
+        assert k not in env, k
+    assert env.get("CODEX_HOME") == "/secrets/codex", "codex still finds its own login"

@@ -219,3 +219,41 @@ def test_ams_env_stays_stdlib_only_at_import():
     top = {a.name.split(".")[0] for n in tree.body if isinstance(n, ast.Import) for a in n.names}
     top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom) and n.module}
     assert "httpx" not in top
+
+
+# ---- 1.32.5: the service key a server-side job sends ----------------------------------------------
+
+def test_service_key_precedence_and_headers(home, monkeypatch):
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    m = _load()
+    assert m.service_key() == ""
+    h = m.mem0_headers("k")
+    assert h == {"X-API-Key": "k", "Content-Type": "application/json"}, "no key held: no header at all"
+    (home / ".mem0" / "service-key").write_text("file-svc\n", encoding="utf-8")
+    assert m.service_key() == "file-svc"
+    creds = home / "creds"
+    creds.mkdir()
+    (creds / "ams-service-key").write_text("cred-svc", encoding="utf-8")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    assert m.service_key() == "cred-svc"
+    assert m.mem0_headers("k")["X-AMS-Service-Key"] == "cred-svc"
+    (creds / "ams-service-key").write_text("   ", encoding="utf-8")
+    assert m.service_key() == "file-svc", "an empty credential falls through to the file"
+
+
+def test_service_key_is_never_read_from_an_environment_value(home, monkeypatch):
+    """An env var leaks into every child, the codex judge included: the key is read from files only."""
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    for v in ("AMS_SERVICE_KEY", "MEM0_SERVICE_KEY", "SERVICE_KEY"):
+        monkeypatch.setenv(v, "env-svc")
+    assert _load().service_key() == ""
+
+
+@pytest.mark.parametrize("name", ["dream-consolidate.py", "contradiction-sweep.py", "stamp-retired-at.py",
+                                  "ship_log_reclassify.py"])
+def test_label_senders_build_their_headers_through_ams_env(name):
+    """Every script that sends a server-side job label must carry the service key, so none of them
+    may build an X-API-Key header by hand."""
+    src = (SCRIPTS / name).read_text(encoding="utf-8")
+    assert '{"X-API-Key"' not in src, f"{name} builds mem0 headers by hand"
+    assert "mem0_headers(" in src

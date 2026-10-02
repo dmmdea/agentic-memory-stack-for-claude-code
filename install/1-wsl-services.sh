@@ -323,6 +323,26 @@ else
     echo "==> canonical-key present (plaintext or DPAPI blob) — keeping"
 fi
 
+# 1.32.5: the service key proves a server-side job label (the dream's, the sweep's) to this
+# server. Only a BRAIN runs those jobs, so only a brain holds it; a replica must not, and a box
+# that turns from brain into replica drops it (it would let that box's sessions claim the labels
+# against the authority, which holds a different key anyway). Regenerable: nothing outside this
+# box uses it, so a missing one is simply made.
+SERVICE_KEY_FILE="$USER_HOME/.mem0/service-key"
+if [ "$MEM0_ROLE" = "brain" ]; then
+    if [ ! -s "$SERVICE_KEY_FILE" ]; then
+        echo "==> Generating service-key (proves the dream's and the sweep's job labels)"
+        ( umask 077; python3 -c "import secrets; print(secrets.token_hex(32))" > "$SERVICE_KEY_FILE" )
+        chmod 600 "$SERVICE_KEY_FILE"
+        echo "  service-key written to $SERVICE_KEY_FILE (mode 600)"
+    else
+        echo "==> service-key present — keeping"
+    fi
+elif [ "$MEM0_ROLE" = "replica" ] && [ -e "$SERVICE_KEY_FILE" ]; then
+    rm -f "$SERVICE_KEY_FILE"
+    echo "==> role=replica: removed $SERVICE_KEY_FILE (only the brain holds the service key)"
+fi
+
 # ----------------------------------------------------------------------
 # 3. Embedder model — EmbeddingGemma-300m on llama-swap :11436
 # ----------------------------------------------------------------------

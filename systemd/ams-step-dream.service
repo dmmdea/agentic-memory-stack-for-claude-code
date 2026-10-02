@@ -10,6 +10,8 @@ Environment=MEM0_API_KEY_FILE=%d/ams-api-key
 Environment=MEM0_HOST_KIND=native
 Environment=MEM0_CODEX_TRANSPORT=native
 LoadCredentialEncrypted=ams-canonical-key:__SECRETS_DIR__/ams-canonical-key.cred
+# 1.32.5: proves the dream-consolidator label on its insight adds and touched_by_dream stamps.
+LoadCredentialEncrypted=ams-service-key:__SECRETS_DIR__/ams-service-key.cred
 Environment=CODEX_HOME=__SECRETS_DIR__/codex
 ExecStartPre=-%h/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/codex-usage-report.py --probe
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded dream %h/apps/mem0-server/.venv/bin/python %h/apps/mem0-scripts/dream-consolidate.py

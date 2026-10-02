@@ -300,3 +300,27 @@ def test_memory_diagnose_posts_diagnose_contract(shim, monkeypatch):
     assert payload["target_id"] == "mid-123"
     assert payload["threshold"] == 0.55 and payload["limit"] == 5
     assert payload["rerank"] is False
+
+
+
+@pytest.mark.parametrize("source", ["c1-consolidator", "dream-consolidator", "c1-dream-consolidator",
+                                    "DREAM-CONSOLIDATOR", "claude", None])
+def test_memory_add_downgrades_every_insight_over_mcp(shim, monkeypatch, source):
+    """1.32.5: no MCP session can hold the service key, so the shim downgrades tier=insight
+    whatever source it names (before, a consolidator source passed straight through to a 403)."""
+    posts = []
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None):
+        posts.append((url, json, headers or {}))
+        return _FakeResp({"results": [{"id": "x"}]})
+
+    monkeypatch.setattr(shim.httpx, "request", fake_request)
+    md = {"tier": "insight"}
+    if source is not None:
+        md["source"] = source
+    out = _tool_fn(shim.memory_add)("an insight-shaped fact", infer=False, metadata=md)
+    url, payload, headers = posts[0]
+    assert payload["metadata"]["tier"] == "evidence", source
+    assert payload["metadata"].get("_insight_intent") is True
+    assert "X-AMS-Service-Key" not in headers, "the shim never holds or sends the service key"
+    assert "downgraded" in str(out)

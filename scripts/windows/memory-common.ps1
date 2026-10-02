@@ -372,6 +372,18 @@ function Add-Mem0OutboxOp {
     return $key
 }
 
+function Get-Mem0ServiceKey {
+    # 1.32.5: the authority-only service key, beside the api-key in the WSL ~/.mem0 of a Windows-
+    # hosted brain (install/1-wsl-services.sh writes it there; replicas and PCs never have one).
+    # It proves a server-side job label (the dream's 'dream-consolidator'); without it the server
+    # refuses that label. Returns '' when absent. Not cached: only the nightly dream asks.
+    try {
+        $p = Join-Path (Split-Path -Parent $script:Mem0KeyPath) 'service-key'
+        if (Test-Path -LiteralPath $p) { return (Get-Content -LiteralPath $p -Raw -ErrorAction Stop).Trim() }
+    } catch {}
+    return ''
+}
+
 function Add-Mem0Memory {
     param(
         [string]$Text,
@@ -381,6 +393,13 @@ function Add-Mem0Memory {
     $key = Get-Mem0Key
     $Metadata['source'] = $Source
     if (-not $Metadata.ContainsKey('tier')) { $Metadata['tier'] = 'evidence' }
+    $headers = @{'X-API-Key' = $key; 'Content-Type' = 'application/json'}
+    # 1.32.5: an insight add claims the consolidator's source label, which the server accepts only
+    # with the service key. Read it for that case alone so an ordinary add never touches the file.
+    if ($Metadata['tier'] -eq 'insight') {
+        $svc = Get-Mem0ServiceKey
+        if ($svc) { $headers['X-AMS-Service-Key'] = $svc }
+    }
     $body = @{
         messages = $Text
         user_id = '__WSL_USER__'
@@ -397,7 +416,7 @@ function Add-Mem0Memory {
         # file as ANSI, and an em-dash's 0x94 byte is a smart quote to the tokenizer.)
         $r = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/memories" `
             -Method Post `
-            -Headers @{'X-API-Key' = $key; 'Content-Type' = 'application/json'} `
+            -Headers $headers `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
             -TimeoutSec 15
         # Return the new memory id (or $true if mem0 didn't return one) so callers can
@@ -417,11 +436,25 @@ function Add-Mem0Memory {
         } catch {}
         # (PowerShell variable names are case-insensitive: never pair $POISON with $poison.)
         $poisonCodes = @(400, 401, 413, 422)
+        # 1.32.5: an insight add carries the service key, which the Outbox never stores and
+        # replay-ops.py never sends (it drains for every session, so sending it would vouch for a
+        # forged queued insight). A 403 on it (service-credential-required) is therefore final and
+        # goes to the poison file for a human, and a transient failure goes to the dead-letter file,
+        # whose drain re-posts through THIS function, which reads the key again.
+        $isInsight = ($Metadata['tier'] -eq 'insight')
+        if ($isInsight) { $poisonCodes += 403 }
         $poisonPath = Join-Path $script:StateDir 'mem0-post-poison.jsonl'
         if ($poisonCodes -contains $statusCode) {
             $rec = @{ text = $Text; source = $Source; metadata = $Metadata; status_code = $statusCode
                       error = $errMsg; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
             try { Add-Content -LiteralPath $poisonPath -Value $rec -Encoding UTF8 } catch {}
+            return $false
+        }
+        if ($isInsight) {
+            $dlq = Join-Path $script:StateDir 'mem0-post-failures.jsonl'
+            $rec = @{ text = $Text; source = $Source; metadata = $Metadata; attempts = 1; status_code = $statusCode
+                      error = "insight add (kept out of the Outbox): $errMsg"; timestamp = (Get-Date).ToString('o') } | ConvertTo-Json -Depth 5 -Compress
+            try { Add-Content -LiteralPath $dlq -Value $rec -Encoding UTF8 } catch {}
             return $false
         }
         try {

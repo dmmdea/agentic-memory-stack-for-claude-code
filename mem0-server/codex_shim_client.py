@@ -99,6 +99,23 @@ def judge_transport() -> str:
     return "native" if shutil.which("codex") is not None else "none"
 
 
+# 1.32.5: what the judge's codex child must NOT inherit. The judge reads memory text any API-key
+# holder can write, so it runs as a prompt-injectable reader; the units that call it (mem0 for the
+# NLI gate, the dream, the sweep) hold the API, canonical and service keys under
+# $CREDENTIALS_DIRECTORY. Codex needs CODEX_HOME, HOME and PATH, none of these. Dropping the
+# variables removes the pointer, not the files (the same user can still list its runtime dir), so
+# this narrows the easy path; the sandbox is the real boundary.
+_JUDGE_ENV_DROP = ("CREDENTIALS_DIRECTORY", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY")
+
+
+def judge_env(base: Optional[dict] = None) -> dict:
+    """The environment for a `codex exec` judge call: the caller's, minus the credential pointers."""
+    env = dict(os.environ if base is None else base)
+    for k in _JUDGE_ENV_DROP:
+        env.pop(k, None)
+    return env
+
+
 def _judge_once_native(prompt: str, effort: str, timeout_s: int, model: str, _run=subprocess.run) -> dict:
     """One `codex exec` call. Fail-soft dict, never raises. Single-flight through a file lock:
     a held lock is `lock_contended`, which judge() waits out exactly like a shim 503."""
@@ -120,7 +137,7 @@ def _judge_once_native(prompt: str, effort: str, timeout_s: int, model: str, _ru
                    "-c", f'model_reasoning_effort="{effort}"', "--output-last-message", last, "--", prompt]
             t0 = time.monotonic()
             try:
-                cp = _run(cmd, capture_output=True, text=True, timeout=int(timeout_s), cwd=td, env=dict(os.environ))
+                cp = _run(cmd, capture_output=True, text=True, timeout=int(timeout_s), cwd=td, env=judge_env())
             except subprocess.TimeoutExpired:
                 return {"ok": False, "error_type": "client_timeout", "error": f"codex exec exceeded {timeout_s}s", "transport": "native"}
             except Exception as e:  # noqa: BLE001 — fail-soft by contract

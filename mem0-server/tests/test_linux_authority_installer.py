@@ -92,7 +92,7 @@ def test_render_only_unit_set_is_native(tmp_path):
     conf = files["mem0.service.d/native.conf"]
     assert "ExecStartPre=\n" in conf, "the drop-in must CLEAR the WSL ExecStartPre before adding its own"
     assert "wait-for-bind.sh 192.0.2.9" in conf
-    assert conf.count("LoadCredentialEncrypted=") == 2, "both keys come through systemd-creds"
+    assert conf.count("LoadCredentialEncrypted=") == 3, "all three keys (api, canonical, 1.32.5 service) come through systemd-creds"
     assert "ams-canonical-key.cred" in conf and "ams-api-key.cred" in conf
     assert "Environment=MEM0_API_KEY_FILE=%d/ams-api-key" in conf
     assert "Environment=MEM0_HOST_KIND=native" in conf

@@ -2,7 +2,7 @@
 # install/linux-authority.sh — the native Linux AUTHORITY install (spec §4; no WSL anywhere).
 #
 # What it does, in order:
-#   [0] prerequisites: not root; tools; the two systemd-creds files; bind address is a real
+#   [0] prerequisites: not root; tools; the two operator systemd-creds files (the service key is made here when missing); bind address is a real
 #       non-wildcard IPv4 (the tailscale0 address); the Phase 0 symlink set resolves off the
 #       root disk; the local embedder answers on :11436
 #   [1] ~/.mem0/role=brain, stack.env (MEM0_HOST_KIND=native, MEM0_BIND, MEM0_ROLE=brain,
@@ -291,6 +291,34 @@ if [ "$DRY_RUN" = 0 ]; then
     curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (--embed-model)"
 fi
 
+# 1.32.5: the SERVICE key (ams-service-key) proves a server-side job label (the dream's and the
+# sweep's) to the server; without it every such label is refused. Unlike the two keys above it is
+# regenerable — only this box's units and the server hold it, nothing outside needs a copy — so
+# the installer makes it when it is missing. The plaintext only crosses a pipe into systemd-creds,
+# bound to this host's TPM like the others; it never lands on disk. A present key is kept.
+# Once mem0.service carries LoadCredentialEncrypted=ams-service-key, a .cred that is missing OR does
+# not decrypt on this host (one restored from another box's backup) stops the unit from starting
+# at all, so the test is a real decrypt, not a file check; a key that fails it is set aside (never
+# deleted) and replaced.
+SERVICE_CRED="$SECRETS_DIR/ams-service-key.cred"
+svc_cred_decrypts() { systemd-creds --user decrypt --name=ams-service-key "$1" - >/dev/null 2>&1; }
+if [ -s "$SERVICE_CRED" ] && { [ "$DRY_RUN" = 1 ] || svc_cred_decrypts "$SERVICE_CRED"; }; then
+    echo "    service key: $SERVICE_CRED present and decrypts on this host (kept)"
+elif plan "generate $SERVICE_CRED (32 random bytes -> systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key)"; then :; else
+    if [ -e "$SERVICE_CRED" ]; then
+        aside="$SERVICE_CRED.undecryptable-$(date -u +%Y%m%dT%H%M%SZ)"
+        mv -f "$SERVICE_CRED" "$aside"
+        echo "    service key: $SERVICE_CRED did not decrypt on this host; set aside as $aside, generating a new one"
+    fi
+    ( umask 077
+      python3 -c 'import secrets; print(secrets.token_hex(32))' \
+        | systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key - "$SERVICE_CRED.tmp" ) \
+        || { rm -f "$SERVICE_CRED.tmp"; fail "could not create $SERVICE_CRED: systemd-creds --user encrypt --with-key=host+tpm2 failed (it needs systemd >= 256 and TPM2 access for this user)"; }
+    svc_cred_decrypts "$SERVICE_CRED.tmp" || { rm -f "$SERVICE_CRED.tmp"; fail "systemd-creds wrote $SERVICE_CRED.tmp but it does not decrypt"; }
+    mv -f "$SERVICE_CRED.tmp" "$SERVICE_CRED"
+    echo "    service key: generated $SERVICE_CRED"
+fi
+
 # ---------------------------------------------------------------- 1. role + receipts
 say "[1] role=brain, stack.env (MEM0_HOST_KIND=native), authority-url"
 if plan "write $MEM0_DIR/role=brain, stack.env, authority-url=http://$BIND_IP:18791"; then :; else
@@ -512,7 +540,13 @@ for u in "$SYSTEMD_USER_DIR"/ams-step-*.service; do [ -f "$u" ] && systemctl --u
 echo "    chain steps enabled: $(ls "$SYSTEMD_USER_DIR"/ams-nightly.target.wants/ 2>/dev/null | tr "\n" " ")"
 for i in $(seq 1 60); do curl -sf -m 2 "http://$BIND_IP:18791/health" >/dev/null && break; sleep 2; done
 curl -sf -m 5 "http://$BIND_IP:18791/health" | jq -c . || fail "mem0 did not answer on http://$BIND_IP:18791/health (journalctl --user -u mem0)"
-curl -sf -m 60 "http://$BIND_IP:18791/health/deep" | jq -c '{ok, stack, canonical_key: .checks.canonical_key, embedder: .checks.embedder, judge_transport: .checks.judge_transport}' \
+deep_json="$(curl -sf -m 60 "http://$BIND_IP:18791/health/deep" || true)"
+printf '%s' "$deep_json" | jq -c '{ok, stack, canonical_key: .checks.canonical_key, service_key: .checks.service_key, embedder: .checks.embedder, judge_transport: .checks.judge_transport}' 2>/dev/null \
     || echo "    WARN: /health/deep not ok yet (an empty store is expected before the staging restore)"
+# 1.32.5 post-condition: a server that did not load the service key refuses the dream's insight
+# writes and the sweep's stamps, quietly, every night. Fail the install instead.
+svc_present="$(printf '%s' "$deep_json" | jq -r '.checks.service_key.present // false' 2>/dev/null || echo false)"
+[ "$svc_present" = true ] || fail "mem0 did not load the service key (checks.service_key.present=${svc_present:-false}): is LoadCredentialEncrypted=ams-service-key in ~/.config/systemd/user/mem0.service.d/native.conf and $SECRETS_DIR/ams-service-key.cred readable? (journalctl --user -u mem0)"
+echo "    service key loaded by mem0"
 echo
 echo "Native authority installed. Bind $BIND_IP:18791; secrets via systemd-creds; timers: systemctl --user list-timers ams-nightly.timer l10-audit.timer"

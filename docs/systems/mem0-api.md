@@ -26,6 +26,7 @@ The HTTP REST surface (health, memories CRUD + search, tier/metadata mutation), 
 ## Key concepts
 
 - **`X-API-Key`** — the single shared auth header every REST call must carry.
+- **`X-AMS-Service-Key`** (1.32.5) — an optional second header on the write routes, carrying the authority-only service key. It is what makes a server-side job label (`actor` / `metadata.source` strings such as `contradiction-sweep-v019` or `dream-consolidator`) count: those labels are free text, and the shared API key is held by every PC and MCP session, so a label alone grants nothing.
 - **Tier gate on write** — the server, not the caller, decides which tier a write may land in; `canonical` is never writable via `add`.
 - **`infer`** — `false` stores the payload as-is (all automated paths); `true` runs mem0's LLM extraction.
 - **Query class** — a search-time mode (`durable`/`operational`/`canonical`/`history`) that selects the admitted tiers and recency policy.
@@ -38,9 +39,21 @@ Every REST request requires `X-API-Key: <key>` as a header. The key is stored in
 
 Missing or incorrect key → `401 {"detail": "missing or invalid X-API-Key"}`.
 
+#### The service key (1.32.5)
+
+The shared API key proves "some stack caller", never "the authority's own job". Three families of free-text label used to act as credentials on top of it, so any API-key holder could send one:
+
+- the stamp jobs `stamp-retired-v013` (`retired_at`) and `contradiction-sweep-v019` (`contradicts_canonical`, `contradiction_checked_at`, `contradicts_canonical_pending`), which skip the canonical/insight HMAC gate on `PATCH /metadata`;
+- the legacy lifecycle writers `backfill-apply-v013` (`retrievable`), `decay-scan` (`expires_at`) and `system` (`expires_at`, `tier_actor`);
+- the insight consolidators `c1-consolidator`, `dream-consolidator`, `c1-dream-consolidator`, which wrote insight with no HMAC through `POST`, `PUT`, `DELETE` and the tier `PATCH`.
+
+The result was that any holder could hide non-canonical records (`contradicts_canonical`, `retrievable=false`), schedule deletion (`expires_at`), stamp `retired_at` on a canonical, and mint, rewrite or delete insight records. Now each write route (`POST /v1/memories` on an insight add, `PUT`, `DELETE`, `PATCH /tier`, `PATCH /metadata`) calls `security_invariants.require_service_credential` first. For a label in any of the three tables it compares `X-AMS-Service-Key` with the loaded key in constant time and answers `403 service-credential-required: <field>=<label> is a server-side job label and ...` when the header is missing or wrong, **whatever the tier of the target record**. The tail of the message tells the two causes apart: "this server holds no service key" (a replica or PC, or an authority whose key is missing: re-run the installer) or "the request did not carry the authority's service key". A request with no job label is untouched and needs no header. The policy functions (`assert_writable`, `validate_insight_actor`, `authorize_metadata_patch`) take `service_verified`, default `False`, and read an unproven label as plain text, so a handler that forgot the gate denies rather than allows.
+
+Where the key lives: the native authority loads it as the systemd credential `ams-service-key` (`LoadCredentialEncrypted=` from `<secrets-dir>/ams-service-key.cred`) into `mem0.service`, the dream and contradiction-sweep step units, and the transient units of `ams-dream-now.sh` and `ams-service-run.sh`; a WSL authority keeps it in `~/.mem0/service-key` (mode 600). Replicas and PCs never hold it, so a replica's dormant server refuses every job label. It is a separate secret from the canonical HMAC key (a job holding it cannot mint a canonical token) and is regenerable: nothing outside the authority needs a copy. Once `mem0.service` carries the credential line, a missing or undecryptable `.cred` stops the service from starting, and re-running the installer regenerates it. Callers: the dream and the sweep send the header from `ams_env.mem0_headers()` when they hold the key; an operator's hand run on the native authority goes through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> [args]` (`contradiction-sweep.py`, `stamp-retired-at.py`, `ship_log_reclassify.py`); the MCP shim and the offline outbox replay never send it.
+
 ### The write path
 
-`POST /v1/memories` runs a fixed, order-dependent pipeline before it stores anything: (1) size cap (`MAX_MEMORY_CHARS`, default 4000) → `413`; (2) empty-string guard → `400`; (3) the tier gate (below); (4) a strip of caller-supplied retrieval-gating metadata keys the caller must not be able to forge (`contradicts_canonical`, `superseded_by`, `retrievable`, …); (5) hash idempotency — on `infer=false`, an exact-hash duplicate in the same `(user_id, workspace, project)` scope returns the existing id and writes nothing. The tier gate and metadata strip run **before** dedup by design, so a rejected write is rejected whether or not its text already existed.
+`POST /v1/memories` runs a fixed, order-dependent pipeline before it stores anything: (1) size cap (`MAX_MEMORY_CHARS`, default 4000) → `413`; (2) empty-string guard → `400`; (3) the tier gate (below; an insight add starts with the service-credential check on `metadata.source`); (4) a strip of caller-supplied retrieval-gating metadata keys the caller must not be able to forge (`contradicts_canonical`, `superseded_by`, `retrievable`, …); (5) hash idempotency — on `infer=false`, an exact-hash duplicate in the same `(user_id, workspace, project)` scope returns the existing id and writes nothing. The tier gate and metadata strip run **before** dedup by design, so a rejected write is rejected whether or not its text already existed.
 
 ### The read path
 
@@ -55,7 +68,7 @@ The end-to-end capture and retrieval paths that drive this API are documented as
 - **Vector store:** Qdrant collection `mem0_egemma_768` (768-dim EmbeddingGemma vectors) on `:6333`; tier and metadata live in each point's payload.
 - **History:** mem0's `~/.mem0/history.db` (SQLite).
 - **Tier ledger:** append-only `~/.mem0/tier-ledger-YYYY-MM.jsonl` (monthly segments; the legacy `tier-ledger.jsonl` is a frozen archive) — every tier change, metadata merge, and decay-delete lands here.
-- **API key:** `~/.mem0/api-key` (mode 600). **Canonical HMAC key:** resolved via the DPAPI provider (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)).
+- **API key:** `~/.mem0/api-key` (mode 600). **Canonical HMAC key:** resolved via the DPAPI provider (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)). **Service key** (1.32.5): the systemd credential `ams-service-key` on the native authority, `~/.mem0/service-key` (mode 600) on a WSL authority, absent everywhere else; it is read by the same provider class as the canonical key (`service_key_provider()`), under its own file names, so neither key can fall back to the other's file. Nothing to back up: the installer regenerates it.
 
 ## Interfaces and entry points
 
@@ -73,7 +86,7 @@ Use for liveness checks (hooks, Test-MemoryStack). Do **not** use for "write pat
 
 ### `GET /health/deep`
 
-Checks Qdrant collection status, EmbeddingGemma embedder dimension (via llama-swap), and mem0 collection point count. Also surfaces the canonical-key health, admission-rejection counters, pending contradiction-review depth, nightly-job + session receipt ages, drift-guard state, the passive reranker counters, the admission self-probe, and the capability manifest. Slow (~1-3s). Use for diagnostics, not polling. **No check here may perform a slow ACTIVE model call** — `scripts/wsl/deploy.sh` gates on this endpoint seconds after a restart (with `--max-time 60`), so a cold model behind a probe here blocks deploys regardless of device; that is why the reranker is surfaced passively.
+Checks Qdrant collection status, EmbeddingGemma embedder dimension (via llama-swap), and mem0 collection point count. Also surfaces the canonical-key health, the service-key presence, admission-rejection counters, pending contradiction-review depth, nightly-job + session receipt ages, drift-guard state, the passive reranker counters, the admission self-probe, and the capability manifest. Slow (~1-3s). Use for diagnostics, not polling. **No check here may perform a slow ACTIVE model call** — `scripts/wsl/deploy.sh` gates on this endpoint seconds after a restart (with `--max-time 60`), so a cold model behind a probe here blocks deploys regardless of device; that is why the reranker is surfaced passively.
 
 ```
 Response 200: {"ok": true, "checks": {"qdrant": {"ok": true, "points": N, "status": "green"}, "embedder": {"ok": true, "dim": 768}}}
@@ -95,6 +108,10 @@ Five more added by W3 and W4 (the alarm-mouth + revive-or-bury tracks — all in
 - **`admission_probe` — informational** (never flips `ok`): the admission gate's in-process self-probe. Shape: `{"ok": bool, "tier_rejected": bool|null, "brand_rejected": bool|null, "neutral_admitted": bool|null, "query_class": "durable", "error"?: "..."}`. Three synthetic records go through `AdmissionPolicy.evaluate()` **directly** — never `apply_admission`, which would bump the daily rejection counters this same response reports and append to `~/.mem0/admission-rejected.jsonl` on every health read. Zero I/O, zero side effects; it also runs on an empty store.
 - **`retrieval_drift`**: passthrough of the retrieval-drift guard's state sidecar (`~/.mem0/retrieval-drift-state.json`; the guard itself lives in a private evaluation repo). Shape: `{"state_present": bool, "last_compare_ts": ts|null, "age_hours": h|null, "before_retrievable": N|null, "n_total": N|null, "hwm": N|null, "hwm_seeded": bool|null, "consecutive_below_hwm": N|null, "consecutive_snapshot_failures": N|null, "alarm": bool|null, "missing": [...]|null, "compat_fallback": bool|null, "error"?: "..."}`. An absent file is `state_present: false` with everything null and **no** error (a not-yet-deployed guard is a fact, not a fault); a present-but-malformed file is `state_present: true` plus an `error` note.
 - **`capabilities`**: the capability-manifest verdict — a pure fold of the checks above against the `CAPABILITIES` literal. Shape: `{"role": "brain"|"replica"|null, "states": {"<id>": "alive"|"degraded"|"dead"|"unknown"|"retired"}, "dead_required": ["<id>", ...], "unknown": ["<id>", ...], "evaluated_at": "<iso>"}`. `dead_required` lists dead rows required for this box's role (unknown role never convicts role-scoped rows; zero-signal activity counters are `unknown`, never `alive`). Row table and verdict rules: [../capability-manifest.md](../capability-manifest.md). The verifier FAILs on a non-empty `dead_required`.
+
+One more, added in 1.32.5:
+
+- **`service_key` — informational** (never flips `ok`): whether this server loaded the service key that proves a server-side job label (see Auth). Shape: `{"present": bool, "source": "credential"|"runtime"|"plaintext"|"none"}`. A box without it is healthy and refuses every job label, which is correct on a replica or PC. On the brain the capability row `service-key` (required for role `brain`) reads `dead` when `present` is false, because the dream's insight writes and the sweep's stamps would all get `403 service-credential-required`; the installer (`install/linux-authority.sh`) fails the install unless `/health/deep` reports `checks.service_key.present: true`, and `scripts/wsl/deploy.sh` asserts it after a WSL restart.
 
 ### `GET /health/maintenance`
 
@@ -135,7 +152,7 @@ Request: {
 - `infer=false` stores as-is (used by all automated paths). `infer=true` runs mem0's LLM extraction pipeline.
 - **Tier restrictions on add (server-enforced):**
   - `tier=canonical` → `403` always. Add as `evidence`, promote via the HMAC-signed `PATCH /tier` (`mem0-canonize.sh`).
-  - `tier=insight` → `403` unless `metadata.source` is one of the exact consolidator allowlist actors (`c1-consolidator`, `dream-consolidator`, `c1-dream-consolidator`). The old substring check (`"c1" in source`) was trivially bypassable and was replaced by the exact allowlist `INSIGHT_ALLOWED_ACTORS`.
+  - `tier=insight` → `403` unless `metadata.source` is one of the exact consolidator allowlist actors (`c1-consolidator`, `dream-consolidator`, `c1-dream-consolidator`) **and** the request carries the service key in `X-AMS-Service-Key` (1.32.5). A job-label `source` without the key is `403 service-credential-required: metadata.source=<label> is a server-side job label and ...`; a `source` that is neither on the allowlist nor a job label is the plain "reserved for the C1/dream consolidator" `403`. The header is read only on an insight add. The old substring check (`"c1" in source`) was trivially bypassable and was replaced by the exact allowlist `INSIGHT_ALLOWED_ACTORS` (one copy, in `security_invariants`); the allowlist alone then proved nothing, since the label was free text any API-key holder could type, which is what the service key closes. Over MCP an insight add never gets here: the shim downgrades it to `evidence`.
   - `tier=evidence` or `tier=temporal` → allowed.
   - No metadata.tier → defaults to no tier label (retrieved as untiered evidence).
 - **Size limit:** `MAX_MEMORY_CHARS = 4000` (env-overridable via `MEM0_MAX_MEMORY_CHARS`). Payload above this → `413`. Break into atomic facts.
@@ -144,7 +161,7 @@ Request: {
 ```
 Response 200: {"results": [{"id": "<uuid>", "memory": "...", ...}]}
 Response 400: empty memory
-Response 403: tier enforcement or insight-source missing
+Response 403: tier enforcement, insight-source missing, or an insight source that is a job label sent without the service key (service-credential-required)
 Response 413: payload exceeds MAX_MEMORY_CHARS
 Response 500: Qdrant/llama-swap unreachable
 ```
@@ -185,12 +202,13 @@ Response 200: {"results": [{"id": "...", "memory": "...", "score": 0.83, "metada
 
 ### `PUT /v1/memories/{id}`
 
-Update a memory's text content. The **full existing payload is carried over** atomically into the rewrite (tier, source, brand, project, provenance stamps — every custom key): mem0 rebuilds the Qdrant payload from scratch on update, so before this carry-over a PUT silently destroyed all custom metadata (only tier was restored). The pre-update payload read is **fail-closed**: if it errors, the PUT is refused with `503` rather than performing a blind update that would wipe metadata. Because a PUT changes the text, the record **re-enters the NLI write-gate**: the carry-over deliberately drops the NLI check-markers (a judgment of the old text must not vouch for the new one) and re-judgment of the new text is queued asynchronously, exactly like an add. Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`); canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order. `PUT` never retires a fact: when the new text carries a hand-written `SUPERSEDED <date> by mem0 <id>` marker and the record is not already superseded, the answer gains `supersede_note` and `supersede_marker` (`{kind, winner_id}`) and the server does nothing else, because the gate reads the `superseded_by` field, never the text.
+Update a memory's text content. The **full existing payload is carried over** atomically into the rewrite (tier, source, brand, project, provenance stamps — every custom key): mem0 rebuilds the Qdrant payload from scratch on update, so before this carry-over a PUT silently destroyed all custom metadata (only tier was restored). The pre-update payload read is **fail-closed**: if it errors, the PUT is refused with `503` rather than performing a blind update that would wipe metadata. Because a PUT changes the text, the record **re-enters the NLI write-gate**: the carry-over deliberately drops the NLI check-markers (a judgment of the old text must not vouch for the new one) and re-judgment of the new text is queued asynchronously, exactly like an add. Canonical/insight records require a valid HMAC user-direct token (`mem0-canonize.sh --action put`), with one exemption: the consolidator's `actor` label (query param) passes an **insight** record without it, and since 1.32.5 only when the request carries `X-AMS-Service-Key`. A job label in `actor` without that header is `403 service-credential-required` on a record of any tier, before the tier gate, the size cap or the payload read; canonical text is additionally run through the imperative-canary and rejected `422` if it reads as a standing order. `PUT` never retires a fact: when the new text carries a hand-written `SUPERSEDED <date> by mem0 <id>` marker and the record is not already superseded, the answer gains `supersede_note` and `supersede_marker` (`{kind, winner_id}`) and the server does nothing else, because the gate reads the `superseded_by` field, never the text.
 
 ```json
 Request: {"text": "new content"}
 Response 200: mem0 update result
 Response 400: pre-update read rejected by the store (malformed memory id — permanent fault, never queued)
+Response 403: canonical/insight target without a valid HMAC token (an insight target also passes with a consolidator actor plus the service key), or a job-label actor sent without the service key (service-credential-required)
 Response 413: text exceeds MAX_MEMORY_CHARS
 Response 500: carry-over restore exhausted for a canonical/insight record (inconsistent state — manual verification)
 Response 503: pre-update payload read failed (refused fail-closed rather than wiping custom metadata; MCP shim queues 503s to the outbox and replays)
@@ -206,23 +224,24 @@ Request: {"tier": "canonical", "actor": "user-direct", "reason": "the operator s
 
 - `actor` is required (a free-text label; the enforced rules are tier-specific below). `tier` must be in `PROMOTE_ALLOWED_TIERS` (`evidence`, `stable`, `canonical`, `insight`, `temporal`).
 - `tier=canonical` requires `actor=user-direct` **or** `actor=dream-autopromote` (the nightly autopromotion), a non-empty `reason`, **and** a valid HMAC user-direct token — headers `X-User-Direct-Token` / `-Ts` / `-Nonce`, signing format-2 `<ts>|<nonce>|promote|<mid>|<reason>` (produced by `mem0-canonize.sh`; the nonce-less format-1 was removed in v0.20). A canonical promote from any other actor, or without the nonce, → `403`. The canonical text is run through the imperative-canary → `422` if it reads as a standing order rather than a declarative fact.
-- `tier=insight` requires `actor` in the exact allowlist `{c1-consolidator, dream-consolidator, c1-dream-consolidator}`. Any other actor → `403`.
-- `tier in {evidence, stable, temporal}` accepts `claude-autonomous` — autonomous Claude can only ever set these, and only on a record that is not canonical.
-- **Moving a record out of `canonical`** (to any other tier) needs the same kind of token signed for the action word `demote` (`<ts>|<nonce>|demote|<mid>|<reason>`, produced by `mem0-canonize.sh --action demote [--tier evidence|stable|temporal]`) and a non-empty `reason`. Without it → `403`; a promote token cannot be replayed as a demotion. A record with no `tier` field reads as canonical (fail-closed), so an unsigned change to it is also `403`. The tier is re-read under the record's write lock: if the record became canonical while an unsigned change was in flight → `409` (retry, or sign it). A move to a non-canonical tier on a record that does not exist (or was deleted mid-flight) → `404`. The per-record write lock keys on the canonical UUID spelling, so every spelling of one id serializes on the same lock.
+- The route reads `X-AMS-Service-Key` first (1.32.5): an `actor` that is a job label (the three consolidators, the stamp labels and the legacy labels listed under Auth) without a matching key is `403 service-credential-required: actor=<label> is a server-side job label and ...`, whatever the tier asked for. An ordinary actor (`claude-autonomous`, `user-direct`) ignores the header.
+- `tier=insight` requires `actor` in the exact allowlist `{c1-consolidator, dream-consolidator, c1-dream-consolidator}` **and** the service key (the label is checked first, so an allowlisted label without the key is the service-credential `403`). Any other actor → `403`.
+- `tier in {evidence, stable, temporal}` accepts `claude-autonomous` — autonomous Claude can only ever set these, and only on a record that is neither canonical nor insight.
+- **Moving a record out of `canonical`, or since 1.32.5 out of `insight`** (to any other tier) needs the same kind of token signed for the action word `demote` (`<ts>|<nonce>|demote|<mid>|<reason>`, produced by `mem0-canonize.sh --action demote [--tier evidence|stable|temporal]`) and a non-empty `reason`. Without it → `403`; a promote token cannot be replayed as a demotion. **No job label exempts an insight demotion, the consolidator with the service key included**: nothing in the stack demotes an insight, so it leaves the tier only through the operator's signed path. Before 1.32.5 `insight → evidence` needed no token, after which `PUT` and `DELETE` were ungated (their gate reads the tier the record has at that moment): the insight gate fell to two plain requests, the same two-step hole the canonical demote token already closed. A record with no `tier` field reads as canonical (fail-closed), so an unsigned change to it is also `403`. The tier is re-read under the record's write lock: if the record became canonical **or insight** while an unsigned change was in flight → `409` (`the record became <tier> while this tier change was in flight; retry. Moving it out of <tier> needs the signed 'demote' token`, naming whichever tier it is; retry, or sign it). A move to a non-canonical tier on a record that does not exist (or was deleted mid-flight) → `404`. The per-record write lock keys on the canonical UUID spelling, so every spelling of one id serializes on the same lock.
 
 ```
 Response 200: {"ok": true, "memory_id": "...", "tier": "canonical", "actor": "user-direct", "ts": "2026-..."}
-Response 400: missing actor, missing reason for a canonical promotion or a demotion, invalid tier
-Response 403: actor/tier enforcement rejected, canonical promote without nonce, or a move out of canonical without the signed demote token
+Response 400: missing actor, missing reason for a canonical promotion or a demotion (out of canonical or insight), invalid tier
+Response 403: actor/tier enforcement rejected, a job-label actor without the service key (service-credential-required), canonical promote without nonce, or a move out of canonical or insight without the signed demote token
 Response 404: a move to a non-canonical tier on a record that does not exist (or was deleted mid-flight)
-Response 409: the record became canonical while an unsigned tier change was in flight
+Response 409: the record became canonical or insight while an unsigned tier change was in flight
 Response 422: imperative text rejected from canonical
 Response 503: the tier could not be read (store unreachable) or the audit intent line could not be written
 ```
 
 ### `PATCH /v1/memories/{id}/metadata`
 
-Partial metadata update (shallow merge, not replace). Cannot change `tier` (use `PATCH /tier`). Used by re-extraction (marks originals `retrievable=false`), decay (sets `temporal.expires_at`), and the dream consolidator (stamps `touched_by_dream`). Lifecycle-critical keys that gate retrieval (`retrievable`, `contradicts_canonical`, …) are in `security_invariants.METADATA_FORBIDDEN_KEYS`, and `authorize_metadata_patch` (a pure function, 1.32.4) decides each write: only a trusted actor (per-actor `TRUSTED_PATCH_ACTORS` allowlist) may write them, and a trusted actor writes only its own keys. `superseded_by` and the supersede door's other keys (`superseded_at`, `superseded_via`, `partially_superseded_by`) are in the list with **no** actor allowed: their only writer is `POST /v1/memories/{id}/supersede` (below). A hide key (`superseded_by`, `contradicts_canonical`) is refused on a `canonical` record for every actor, because the trusted-actor path skips the HMAC check and an actor string alone must never hide a canonical. Every successful merge is appended to the tier ledger.
+Partial metadata update (shallow merge, not replace). Cannot change `tier` (use `PATCH /tier`). Used by re-extraction (marks originals `retrievable=false`), decay (sets `temporal.expires_at`), and the dream consolidator (stamps `touched_by_dream`). Lifecycle-critical keys that gate retrieval (`retrievable`, `contradicts_canonical`, …) are in `security_invariants.METADATA_FORBIDDEN_KEYS`, and `authorize_metadata_patch` (a pure function, 1.32.4) decides each write: only a trusted actor (per-actor `TRUSTED_PATCH_ACTORS` allowlist, plus the legacy lifecycle labels in `LEGACY_PATCH_ACTOR_KEYS`) may write them, and a trusted actor writes only its own keys. Since 1.32.5 an actor counts as trusted only when the request carries `X-AMS-Service-Key`: the handler checks it before anything else (`403 service-credential-required` for a job label without it, whatever the target's tier) and hands the policy functions `service_verified`, so an unproven label gets no key allowance and no HMAC bypass. The stamp jobs' bypass of the canonical/insight HMAC gate (`stamp-retired-v013` for `retired_at`, `contradiction-sweep-v019` for its three stamp keys) is the same: it holds only with the key. `superseded_by` and the supersede door's other keys (`superseded_at`, `superseded_via`, `partially_superseded_by`) are in the list with **no** actor allowed: their only writer is `POST /v1/memories/{id}/supersede` (below). A hide key (`superseded_by`, `contradicts_canonical`) is refused on a `canonical` record for every actor, because the trusted-actor path skips the HMAC check and an actor string alone must never hide a canonical. Every successful merge is appended to the tier ledger.
 
 ### `POST /v1/memories/{id}/supersede` and `DELETE /v1/memories/{id}/supersede`
 
@@ -239,7 +258,7 @@ The MCP tools are `memory_supersede` / `memory_unsupersede`; the operator modes 
 
 ### `DELETE /v1/memories/{id}`
 
-Delete a memory by ID. Canonical/insight deletes require an HMAC user-direct token (`mem0-canonize.sh --action delete`). The weekly decay-scan writes a ledger line with `event=decay-delete` when it removes an expired `temporal` record (`scripts/wsl/decay-scan.py`).
+Delete a memory by ID. Canonical/insight deletes require an HMAC user-direct token (`mem0-canonize.sh --action delete`); the consolidator's `actor` label (query param) passes an insight record without one only with `X-AMS-Service-Key` (1.32.5), and a job label in `actor` without the header is `403 service-credential-required` on a record of any tier. The weekly decay-scan writes a ledger line with `event=decay-delete` when it removes an expired `temporal` record (`scripts/wsl/decay-scan.py`).
 
 ```
 Response 200: mem0 delete result
@@ -249,14 +268,14 @@ Response 200: mem0 delete result
 
 The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 
-- `memory_add(text, user_id, infer, metadata)` — POST /v1/memories
+- `memory_add(text, user_id, infer, metadata)` — POST /v1/memories (an `insight` tier request is always downgraded to `evidence` with a note since 1.32.5: no MCP session holds the service key)
 - `memory_search(query, user_id, limit, threshold)` — POST /v1/memories/search
 - `memory_list(user_id, limit)` — GET /v1/memories (limit hard-clamped at 500 client-side too)
 - `memory_update(memory_id, text)` — PUT /v1/memories/{id} (text only; never append a `SUPERSEDED` marker, use `memory_supersede`)
 - `memory_supersede(memory_id, superseded_by, scope, detail, reason)` — POST /v1/memories/{id}/supersede (1.32.4)
 - `memory_unsupersede(memory_id, scope, reason)` — DELETE /v1/memories/{id}/supersede (1.32.4)
-- `memory_promote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier
-- `memory_demote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier (same endpoint, different direction)
+- `memory_promote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier (the shim always sends `actor="claude-autonomous"`: it cannot move a record into `canonical` or `insight`, nor out of either)
+- `memory_demote(memory_id, tier, actor, reason)` — PATCH /v1/memories/{id}/tier (same endpoint, different direction; refused `400` without a reason, otherwise `403`, on a `canonical` or, since 1.32.5, an `insight` record: those leave their tier only through the signed `mem0-canonize.sh --action demote`, and a wrong insight is demoted that way or deleted with a signed `--action delete`, never with this tool)
 - `memory_delete(memory_id)` — DELETE /v1/memories/{id}
 - `memory_health()` — GET /health/deep (switched 2026-07-26: shallow /health green-lit broken write paths)
 
@@ -269,12 +288,14 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 
 ## Downstream effects
 
-Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hook clients that POST to `/v1/context/bundle` and `/v1/memories/search`, the dream consolidator (which posts insights and calls the tier PATCH via `mem0-canonize.sh`), and the canonize CLI. The `hook_contract_version` field lets the server WARN on hook/server wire drift without rejecting.
+Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hook clients that POST to `/v1/context/bundle` and `/v1/memories/search`, the dream consolidator (which posts insights, sending the service key, and calls the tier PATCH via `mem0-canonize.sh`), the nightly sweep and stamp jobs (which send it on their job-label writes), and the canonize CLI (`--action demote` now also moves a record out of insight). The `hook_contract_version` field lets the server WARN on hook/server wire drift without rejecting.
 
 ## Invariants and assumptions
 
 - The server binds loopback-only (`127.0.0.1`); it is never exposed on `0.0.0.0`.
 - The tier gates are server-side; a caller cannot self-elevate to `canonical`/`insight` regardless of the metadata it sends.
+- An `actor` or `metadata.source` label is never a credential: the labels of the server's own jobs count only on a request that carries `X-AMS-Service-Key`, and a server without the key (every replica and PC) refuses all of them.
+- A record leaves `canonical` or `insight` only through the operator's signed `demote` token; no job label, and no key the stack's jobs hold, exempts it.
 - `infer=false` writes are hash-idempotent within a scope, so hooks re-firing on every Stop cannot re-insert duplicates.
 - `limit` is clamped to 500 on both list and search.
 - Callers cannot forge retrieval-gating metadata keys via `add` or the generic metadata PATCH.
@@ -285,7 +306,8 @@ Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hoo
 |---|---|
 | `400` | empty memory; missing actor; missing reason for canonical; `tier` in metadata PATCH |
 | `401` | missing/invalid `X-API-Key` |
-| `403` | tier gate (canonical via add, insight source, canonical promote without user-direct/nonce) |
+| `403` | tier gate (canonical via add, insight source, canonical promote without user-direct/nonce, a move out of canonical or insight without the signed `demote` token); `service-credential-required` (a server-side job label in `actor` / `metadata.source` without `X-AMS-Service-Key`, on any write route and any tier) |
+| `409` | `PATCH /tier`: the record became `canonical` or `insight` while an unsigned tier change was in flight (retry, or sign it); the supersede door has its own 409 codes (see [api-contracts.md](../api-contracts.md)) |
 | `413` | payload exceeds `MAX_MEMORY_CHARS` |
 | `422` | imperative text rejected from the canonical tier (imperative-canary) |
 | `500` | Qdrant / llama-swap / mem0 backend error |
@@ -294,8 +316,10 @@ Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hoo
 ## Security and privacy notes
 
 - **Auth:** single `X-API-Key` (mode-600 file), constant-time compared; loopback bind is the network boundary.
+- **Service credential (1.32.5):** the shared API key is held by every PC and MCP session, so a free-text label can no longer vouch for a server-side job; the `ams-service-key` header does (see Auth). What it separates: the authority's own jobs from every caller holding only the shared key (MCP shim sessions, hooks, PCs, replicas). What it does **not** resist: a shell on the authority as the service user, an ssh session to the brain, or (a WSL brain) Windows-side processes of the same user, any of which can read the key. It is one key for every job, not per-job least privilege; its separation from the canonical key means a job holding it cannot mint canonical tokens, and no replica or PC holds it. The codex judge child (`codex_shim_client.judge_env()`) has `CREDENTIALS_DIRECTORY` and the API-key pointers removed from its environment because it reads attacker-writable memory text; that drops the pointer, not the files, and the sandbox is the real boundary.
+- **Known gaps (not closed by the service key, stated so nobody assumes they are):** writes that need no forged label and are no worse than the `DELETE` every key holder already has on `evidence`/`stable`/`temporal` records: `PATCH /tier` to `temporal` (hides a record from every query class), `_canonical_intent`, the supersede door on unprotected tiers, `retired_at` on non-canonical records. Caller-chosen `source` labels read by server-side jobs: autopromote's `user-decision` / `operator-decision` corroboration fast-track (its legitimate sender is an unprivileged PC hook, so no server credential can tell it from a forger) and semantic-dedup's `automemory:` protection; these need a different design. The ledger `transport` field is self-declared from which headers were present.
 - **Canonical writes:** gated by an HMAC user-direct token (format-2, replay-protected via a burned nonce in `~/.mem0/canonical-replay.jsonl`); the signing key rests as a DPAPI blob where the per-box cutover has been run, else mode-600 plaintext — /health/deep reports which (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)).
-- **Metadata forgery:** retrieval-gating keys are stripped on `add` and forbidden on the generic metadata PATCH so an API-key holder cannot silently bury records.
+- **Metadata forgery:** retrieval-gating keys are stripped on `add` and forbidden on the generic metadata PATCH so an API-key holder cannot silently bury records; since 1.32.5 the per-actor exceptions (the sweep's and the lifecycle writers' keys) hold only for a request that proves the label with the service key.
 - **Secret redaction:** stored prompt text is scrubbed server-side (`redact.py`).
 
 ## Observability and debugging
@@ -316,6 +340,8 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - **`infer=true` for hook-extracted facts** → incorrect behavior: mem0's LLM extraction re-processes the already-extracted fact, possibly splitting or altering it. Always use `infer=false` from automated paths.
 - **Calling `/health` to verify write path** → misleading green. `/health/maintenance` `write_path` reports the outcome of the last real writes (passive, safe to poll); `/health/deep` or a test round-trip checks the path on demand, and loads the embedder to do it.
 - **Expecting a substring match for the insight source** → the allowlist is exact (`c1-consolidator`, `dream-consolidator`, `c1-dream-consolidator`); `actor="not-c1"` no longer slips through.
+- **Typing a job label to get a privilege** (`actor="contradiction-sweep-v019"`, `source="dream-consolidator"`, `actor="system"`) → `403 service-credential-required` since 1.32.5. The label is not the credential; the service key is, and only the authority's jobs hold it. Use your own label (`claude-autonomous`); a hand run of a sweep or stamp script on the native authority goes through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> [args]`, not a hand-built request.
+- **Walking a bad insight back with `memory_demote`** → `403` (`400` with no reason) since 1.32.5; an insight leaves its tier only with the operator's signed token: `bash mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence|stable|temporal]`, or a signed `--action delete`.
 
 ## Source map
 
@@ -325,6 +351,9 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - [`../../mem0-server/supersession.py`](../../mem0-server/supersession.py) — the supersede door's pure rules: the refusal matrix, the payload builders and the hand-written-marker parser (the routes are in `app.py`; the metadata key policy is `security_invariants.authorize_metadata_patch`).
 - [`../../mem0-server/reranker.py`](../../mem0-server/reranker.py) — the bge-reranker cross-encoder client + skip thresholds.
 - [`../../mem0-server/write_path.py`](../../mem0-server/write_path.py) — the passive write-path tracker and the middleware that feeds it (`/health/maintenance` `write_path`).
+- [`../../mem0-server/security_invariants.py`](../../mem0-server/security_invariants.py) — the write-gate policy: the job-label tables, `require_service_credential` (the `X-AMS-Service-Key` check), `assert_writable`, `validate_insight_actor`, `authorize_metadata_patch`, `tier_change_hmac_action`.
+- [`../../mem0-server/canonical_key_provider.py`](../../mem0-server/canonical_key_provider.py) — the key provider for the canonical key and (`service_key_provider()`, `service_key_health()`) the service key.
+- [`../../scripts/wsl/ams-service-run.sh`](../../scripts/wsl/ams-service-run.sh) — the operator's wrapper for hand runs of the sweep / stamp / reclassify scripts with the service key on the authority.
 - [`../../scripts/wsl/mem0-mcp-shim.py`](../../scripts/wsl/mem0-mcp-shim.py) — the stdio-MCP → HTTP shim (the MCP tool wrappers).
 - [`../../scripts/wsl/mem0-canonize.sh`](../../scripts/wsl/mem0-canonize.sh) — the HMAC user-direct CLI for canonical promote / put / delete / metadata.
 
@@ -356,3 +385,10 @@ Server behavior is covered by the `mem0-server/tests` suite (tier enforcement, b
 - `PUT /v1/memories/{id}`: `supersede_note` / `supersede_marker` when the new text holds a hand-written `SUPERSEDED ... by mem0 <id>` marker.
 - Shim: `memory_supersede` and `memory_unsupersede` (offline-queued like the other writes; a 4xx refusal is never queued), `partial_supersession_note` on `memory_search` and `memory_recall`, `'history'` in the `memory_search` docstring. `replay-ops.py` replays both ops.
 - Ledger events `supersede`, `supersede-intent`, `unsupersede`, `unsupersede-intent` (`scripts/wsl/ledger-audit.py`).
+
+## 1.32.5 additions (the service credential)
+
+- New request header `X-AMS-Service-Key` on `POST /v1/memories` (insight adds), `PUT`, `DELETE`, `PATCH /tier` and `PATCH /metadata`. A server-side job label (the stamp, legacy-lifecycle and consolidator labels) counts only with it; otherwise `403 service-credential-required: <field>=<label> is a server-side job label and ...`, before the tier gates and the signed-token check, and on a target of any tier.
+- `PATCH /tier`: moving a record out of `insight` now needs the signed `demote` token, like canonical, with no job-label exemption (`mem0-canonize.sh --action demote`). The 409 for a change that raced a protected tier names `canonical` or `insight`.
+- `/health/deep`: `checks.service_key` (`{present, source}`, informational) and the capability row `service-key` (required on the brain).
+- Shim: `memory_add` always downgrades `tier=insight` to `evidence`; `memory_promote` / `memory_demote` can no longer move an insight in either direction.

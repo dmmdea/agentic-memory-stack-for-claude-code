@@ -463,7 +463,10 @@ CANONICAL_REQUIRES_USER_DIRECT = True   # actor must be "user-direct" OR in CANO
 INSIGHT_REQUIRES_C1 = True              # actor must be in INSIGHT_ALLOWED_ACTORS for insight writes
 # v0.14 C: exact allowlist replaces substring check ("c1" in actor) which was trivially bypassable
 # (e.g. actor="not-c1" passed the old check). Only these known consolidator identities may write insight tier.
-INSIGHT_ALLOWED_ACTORS = {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"}
+# 1.32.5: ONE copy, security_invariants' (this module kept its own, which could drift from the one the
+# insight PUT/DELETE gate reads), and a label in it counts only with the service key
+# (security_invariants.require_service_credential).
+from security_invariants import INSIGHT_ALLOWED_ACTORS
 # Phase 2 autonomous promotion: the nightly dream consolidator may autonomously promote
 # to canonical under the STRICT bar (Codex-judged, cap<=3/night, canary unchanged).
 # The actor label is distinct from "user-direct" so ledger entries are auditable by source.
@@ -1109,6 +1112,10 @@ def health_deep() -> dict:
     # endpoint exists to prevent). Key is cached after first read — zero I/O
     # beyond one dpapi_path.exists(). ok=False ONLY when the blob exists but no
     # key loaded; a dev box with no key configured at all stays green.
+    # 1.32.5: informational; the brain's capability row 'service-key' turns an absent key dead.
+    from security_invariants import _SERVICE_KEY_PROVIDER as _svc_provider
+    from canonical_key_provider import service_key_health as _service_key_health
+    out["checks"]["service_key"] = _service_key_health(_svc_provider)
     out["checks"]["canonical_key"] = _canonical_key_health(_APP_KEY_PROVIDER)
     if not out["checks"]["canonical_key"]["ok"]:
         out["ok"] = False
@@ -1199,7 +1206,8 @@ def health_deep() -> dict:
     return out
 
 @app.post("/v1/memories")
-def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key: Optional[str] = Header(None)):
+def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key: Optional[str] = Header(None),
+        x_ams_service_key: Optional[str] = Header(None, alias="X-AMS-Service-Key")):
     auth(x_api_key)
     # Storage cap enforcement (audit finding 2026-06-08: 341/384 backfilled points
     # exceeded the previously-documented 600-char cap which was never enforced).
@@ -1238,6 +1246,9 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
         if t == "insight":
             src = (b.metadata.get("source") or "").lower()
             actor = (b.metadata.get("actor") or "").lower()
+            # 1.32.5: the consolidator's source label is a claim; only the service key proves it.
+            from security_invariants import require_service_credential
+            require_service_credential(src, x_ams_service_key, field="metadata.source")
             if src not in INSIGHT_ALLOWED_ACTORS:
                 raise HTTPException(
                     403,
@@ -2005,6 +2016,7 @@ def update(
     x_user_direct_token: Optional[str] = Header(None, alias="X-User-Direct-Token"),
     x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
     x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce"),
+    x_ams_service_key: Optional[str] = Header(None, alias="X-AMS-Service-Key"),
     actor: Optional[str] = Query(None),
     reason: Optional[str] = Query(None),
 ):
@@ -2012,8 +2024,11 @@ def update(
     v0.17 Phase F.1: X-User-Direct-Nonce header accepted for replay protection.
     AMS-01 (P0, 2026-08-07): the full existing payload is carried over INTO the
     update (mem0 rebuilds the payload from scratch — every custom key used to be
-    destroyed on every PUT; only tier was restored). See payload_carryover."""
+    destroyed on every PUT; only tier was restored). See payload_carryover.
+    1.32.5: a privileged actor label needs the service key (require_service_credential)."""
     auth(x_api_key)
+    from security_invariants import require_service_credential
+    _service_verified = require_service_credential(actor, x_ams_service_key)
     if len(b.text) > MAX_MEMORY_CHARS:
         raise HTTPException(413, f"update: text exceeds {MAX_MEMORY_CHARS}-char cap (got {len(b.text)})")
     # v0.17 Phase A: canonical/insight tier write-path gate
@@ -2024,6 +2039,7 @@ def update(
         "put", x_user_direct_token, x_user_direct_ts,
         actor=(actor or ""), reason=(reason or ""),
         x_user_direct_nonce=x_user_direct_nonce,
+        service_verified=_service_verified,
     )
     # v0.28 Phase 2a: promote-canary on PUT — after HMAC enforcement, before the write.
     # When the target record is canonical, reject imperative text (declarative facts only).
@@ -2209,7 +2225,8 @@ def update(
 def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 x_user_direct_token: Optional[str] = Header(None, alias="X-User-Direct-Token"),
                 x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
-                x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce")):
+                x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce"),
+                x_ams_service_key: Optional[str] = Header(None, alias="X-AMS-Service-Key")):
     """Update a memory's tier. Server-enforced actor requirements per tier.
     Canonical promotions additionally require a valid HMAC X-User-Direct-Token header (v0.14 B),
     and so does a move OUT of canonical (session 12: signed action "demote"; see the gate below).
@@ -2229,12 +2246,17 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     reason = (b.reason or "").strip()
     if not actor:
         raise HTTPException(400, "actor is required (e.g., 'user-direct', 'c1-consolidator', 'claude-autonomous')")
-    # Canonical DEMOTION gate: a move OUT of canonical signs its own "demote" action. Without
-    # it an API-key holder could demote a canonical record and then PUT or DELETE it with no
-    # token, because assert_writable gates those only while the record is still canonical.
-    # fetch_current_tier fails closed: a store error is a 503, and a point with no tier field
-    # reads as canonical. A point that does not exist is a 404 (nothing to change).
+    # 1.32.5: a privileged actor label (the consolidator's) counts only with the service key.
+    from security_invariants import require_service_credential
+    require_service_credential(actor, x_ams_service_key)
+    # DEMOTION gate: a move OUT of canonical, and since 1.32.5 out of insight, signs its own
+    # "demote" action. Without it an API-key holder could demote the record and then PUT or DELETE
+    # it with no token, because assert_writable gates those only while the record keeps its tier.
+    # No job label exempts an insight: nothing in the stack demotes one, so it leaves insight only
+    # through the operator's signed path, like canonical. fetch_current_tier fails closed: a store
+    # error is a 503, and a point with no tier field reads as canonical. A missing point is a 404.
     current_tier = None
+    _signed_demote = False
     if b.tier != "canonical":
         from security_invariants import fetch_current_tier, tier_change_hmac_action, _NOT_FOUND
         _ct = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
@@ -2243,13 +2265,14 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         current_tier = _ct
         if tier_change_hmac_action(current_tier, b.tier) == "demote":
             if not reason:
-                raise HTTPException(400, "demoting a canonical record requires non-empty 'reason' (audit-trail policy)")
+                raise HTTPException(400, f"demoting a {current_tier} record requires non-empty 'reason' (audit-trail policy)")
             from security_invariants import validate_hmac_user_direct
             validate_hmac_user_direct(
                 mid, "demote", reason,
                 x_user_direct_token, x_user_direct_ts,
                 x_user_direct_nonce=x_user_direct_nonce,
             )
+            _signed_demote = True
     if b.tier == "canonical":
         if CANONICAL_REQUIRES_USER_DIRECT and actor != "user-direct" and actor not in CANONICAL_AUTOPROMOTE_ALLOWED:
             raise HTTPException(403,
@@ -2322,7 +2345,7 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
     else:
         transport = "rest-api"
     class _TierRaced(Exception):
-        """The record became canonical between the gate's read and this write."""
+        """The record entered a protected tier between the gate's read and this write."""
 
     try:
         # AMS-01/F4: serialize against a concurrent PUT's read-modify-write —
@@ -2330,8 +2353,9 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
         # demoted by the PUT's stale-tier upsert (store and ledger disagreed).
         with _mid_write_lock(mid):
             # TOCTOU: the demotion gate read the tier BEFORE this lock. A promotion that landed in
-            # between would let this unsigned change move a record that is canonical NOW, so a
-            # move that saw a non-canonical record re-reads the tier under the lock and refuses.
+            # between would let this unsigned change move a record that is canonical (or, since
+            # 1.32.5, insight) NOW, so every change that was not signed for "demote" re-reads the
+            # tier under the lock and refuses when the record now needs that signature.
             # 1.32.4: a superseded record never enters a protected tier (it would be a hidden
             # canonical, and its supersession link would expose it to an unsigned cascade delete).
             if b.tier in ("canonical", "insight"):
@@ -2339,13 +2363,13 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 _refusal = _ss.promotion_refusal(_supersede_read(mid), b.tier)
                 if _refusal:
                     raise HTTPException(_refusal.status, f"{_refusal.code}: {_refusal.message}")
-            if b.tier != "canonical" and current_tier != "canonical":
+            if b.tier != "canonical" and not _signed_demote:
                 _tier_now = fetch_current_tier(mem.vector_store.client, mem.vector_store.collection_name, mid)
                 if _tier_now == _NOT_FOUND:
                     # Deleted while this change was in flight: nothing to change, and no ledger line.
                     raise HTTPException(404, f"memory {mid} not found")
-                if _tier_now == "canonical":
-                    raise _TierRaced()
+                if tier_change_hmac_action(_tier_now, b.tier) == "demote":
+                    raise _TierRaced(_tier_now)
             # AMS-22: write-ahead intent — appended BEFORE the mutation so an authority
             # change can never complete without an audit trace. If this append fails the
             # mutation is REFUSED (503, retryable); a loud failure AFTER the mutation
@@ -2371,10 +2395,11 @@ def update_tier(mid: str, b: TierIn, x_api_key: Optional[str] = Header(None),
                 payload={"tier": b.tier, "updated_at": now, "tier_actor": actor},
                 points=[mid],
             )
-    except _TierRaced:
+    except _TierRaced as _raced:
+        _rt = _raced.args[0] if _raced.args else "canonical"
         raise HTTPException(409, (
-            "the record became canonical while this tier change was in flight; retry. "
-            "Moving it out of canonical needs the signed 'demote' token "
+            f"the record became {_rt} while this tier change was in flight; retry. "
+            f"Moving it out of {_rt} needs the signed 'demote' token "
             "(mem0-canonize.sh --action demote)."
         ))
     except HTTPException:
@@ -2403,6 +2428,7 @@ def update_metadata(
     x_user_direct_token: Optional[str] = Header(None, alias="X-User-Direct-Token"),
     x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
     x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce"),
+    x_ams_service_key: Optional[str] = Header(None, alias="X-AMS-Service-Key"),
 ):
     """Shallow-merge new metadata fields into the existing Qdrant payload.
     Cannot change `tier` (use PATCH /tier for that). Used by re-extraction
@@ -2414,8 +2440,14 @@ def update_metadata(
 
     EVERY successful merge is appended to the tier-ledger so all post-hoc
     mutations are audit-covered (lens S1: shallow-merge could otherwise be
-    used to undo retirement silently)."""
+    used to undo retirement silently).
+
+    1.32.5: a privileged actor label (TRUSTED_PATCH_ACTORS, LEGACY_PATCH_ACTOR_KEYS, the insight
+    consolidators) counts only with the service key, checked BEFORE assert_writable, whose
+    trusted-actor early return skips the HMAC gate."""
     auth(x_api_key)
+    from security_invariants import require_service_credential
+    _service_verified = require_service_credential(b.actor, x_ams_service_key)
     if "tier" in b.metadata:
         raise HTTPException(400, "use PATCH /v1/memories/{id}/tier to change tier")
     if not b.metadata:
@@ -2430,12 +2462,13 @@ def update_metadata(
         "patch_metadata", x_user_direct_token, x_user_direct_ts,
         actor=(b.actor or ""), reason=(b.reason or ""),
         x_user_direct_nonce=x_user_direct_nonce,
+        service_verified=_service_verified,
     )
     # Key-level policy (forbidden retrieval-gating keys, legacy server-flow actors, per-actor
     # TRUSTED_PATCH_ACTORS allowlists): security_invariants.authorize_metadata_patch, a pure
     # function since 1.32.4 so the whole decision is testable headless.
     from security_invariants import authorize_metadata_patch
-    authorize_metadata_patch(current_tier, b.actor, b.metadata.keys())
+    authorize_metadata_patch(current_tier, b.actor, b.metadata.keys(), service_verified=_service_verified)
     # Bump updated_at so lead-7 sort by recency in memory-index-build.py is correct
     merged = dict(b.metadata)
     merged["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -3642,6 +3675,7 @@ def delete(
     x_user_direct_token: Optional[str] = Header(None, alias="X-User-Direct-Token"),
     x_user_direct_ts: Optional[str] = Header(None, alias="X-User-Direct-Ts"),
     x_user_direct_nonce: Optional[str] = Header(None, alias="X-User-Direct-Nonce"),
+    x_ams_service_key: Optional[str] = Header(None, alias="X-AMS-Service-Key"),
     actor: Optional[str] = Query(None),
     reason: Optional[str] = Query(None),
     cascade: bool = Query(False),
@@ -3652,8 +3686,11 @@ def delete(
     completion-append failure stays fail-soft (the deletion already happened —
     the intent line is the audit floor).
     v0.17 Phase A: canonical/insight tier gate applied BEFORE deletion.
-    v0.17 Phase F.1: X-User-Direct-Nonce for replay protection; cascade=true for delete_linked."""
+    v0.17 Phase F.1: X-User-Direct-Nonce for replay protection; cascade=true for delete_linked.
+    1.32.5: a privileged actor label needs the service key (require_service_credential)."""
     auth(x_api_key)
+    from security_invariants import require_service_credential
+    _service_verified = require_service_credential(actor, x_ams_service_key)
     # v0.17 Phase A: canonical/insight tier write-path gate (runs BEFORE the Qdrant retrieve below
     # so the 403 fires fast without fetching the payload a second time — assert_writable fetches
     # the tier internally; we accept the cost of one extra Qdrant retrieve for the prior_payload
@@ -3665,6 +3702,7 @@ def delete(
         "delete", x_user_direct_token, x_user_direct_ts,
         actor=(actor or ""), reason=(reason or ""),
         x_user_direct_nonce=x_user_direct_nonce,
+        service_verified=_service_verified,
     )
     # Fetch payload for restore-info BEFORE deletion (separate from assert_writable's fetch)
     prior_payload = None

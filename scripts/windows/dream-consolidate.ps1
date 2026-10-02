@@ -601,6 +601,10 @@ if ($insights.Count -gt 0 -and -not $DryRun) {
         # v0.13.1: stamp source evidence with touched_by_dream so decay-scan's protection isn't dead code
         if ($ok -and $lineage.Count -gt 0) {
             $patchKey = (Get-Content "$DcHomeUnc\.mem0\api-key" -Raw -ErrorAction SilentlyContinue).Trim()
+            # 1.32.5: 'dream-consolidator' is a server-side job label; it counts only with the service key.
+            $patchHeaders = @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'}
+            $patchSvc = Get-Mem0ServiceKey
+            if ($patchSvc) { $patchHeaders['X-AMS-Service-Key'] = $patchSvc }
             if ($patchKey) {
                 foreach ($sourceMid in $lineage) {
                     try {
@@ -610,7 +614,7 @@ if ($insights.Count -gt 0 -and -not $DryRun) {
                             reason = "cited as source_memory_id by insight"
                         } | ConvertTo-Json -Depth 4
                         # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
-                        Invoke-RestMethod -Method Patch -Uri "$($script:Mem0Url)/v1/memories/$sourceMid/metadata" -Headers @{'X-API-Key'=$patchKey; 'Content-Type'='application/json'} -Body ([System.Text.Encoding]::UTF8.GetBytes($patchBody)) -TimeoutSec 5 | Out-Null
+                        Invoke-RestMethod -Method Patch -Uri "$($script:Mem0Url)/v1/memories/$sourceMid/metadata" -Headers $patchHeaders -Body ([System.Text.Encoding]::UTF8.GetBytes($patchBody)) -TimeoutSec 5 | Out-Null
                     } catch {
                         # Best-effort - don't abort the cycle if a single PATCH fails
                         Write-MemoryLog -Component 'dream' -Message "  PATCH touched_by_dream failed for ${sourceMid}: $_"

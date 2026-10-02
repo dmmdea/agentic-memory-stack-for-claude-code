@@ -105,7 +105,13 @@ class CanonicalKeyProvider:
     2. ~/.mem0/canonical-key.dpapi (DPAPI-encrypted blob, Windows only)
     3. ~/.mem0/canonical-key (plaintext, mode 600 — dev/recovery fallback)
 
-    None if none present. Key cached after first read."""
+    None if none present. Key cached after first read.
+
+    1.32.5: `name` selects WHICH key every default path names: "canonical-key" (the default) or
+    "service-key" (the authority-only service credential, see service_key_provider()). Every
+    default is derived from it — ~/.mem0/<name>, ~/.mem0/<name>.dpapi, $XDG_RUNTIME_DIR/mem0/<name>,
+    $CREDENTIALS_DIRECTORY/ams-<name> — so a provider for one key can never fall back to the
+    other key's file. Passing None for a path means "the default for this name", never "off"."""
 
     def __init__(
         self,
@@ -113,24 +119,28 @@ class CanonicalKeyProvider:
         plaintext_path: Optional[Path] = None,
         runtime_key_path: Optional[Path] = None,
         credential_key_path: Optional[Path] = None,
+        name: str = "canonical-key",
     ):
+        if name not in ("canonical-key", "service-key"):
+            raise ValueError(f"unknown key name {name!r}")
+        self.name = name
         default_dir = Path.home() / ".mem0"
-        self.dpapi_path = dpapi_path if dpapi_path is not None else default_dir / "canonical-key.dpapi"
-        self.plaintext_path = plaintext_path if plaintext_path is not None else default_dir / "canonical-key"
+        self.dpapi_path = dpapi_path if dpapi_path is not None else default_dir / f"{name}.dpapi"
+        self.plaintext_path = plaintext_path if plaintext_path is not None else default_dir / name
         if runtime_key_path is not None:
             self.runtime_key_path: Optional[Path] = runtime_key_path
         else:
             xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
             # systemd sets XDG_RUNTIME_DIR for user services; without it (plain
             # Windows process, bare cron) the runtime branch is simply disabled.
-            self.runtime_key_path = Path(xdg) / "mem0" / "canonical-key" if xdg else None
+            self.runtime_key_path = Path(xdg) / "mem0" / name if xdg else None
         # Spec §4 (native authority): systemd LoadCredentialEncrypted delivers the key under
         # $CREDENTIALS_DIRECTORY (tmpfs, 0700, removed on stop). Explicit path wins; else the env.
         if credential_key_path is not None:
             self.credential_key_path: Optional[Path] = credential_key_path
         else:
             _cd = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
-            self.credential_key_path = Path(_cd) / "ams-canonical-key" if _cd else None
+            self.credential_key_path = Path(_cd) / f"ams-{name}" if _cd else None
         # Path-traversal guard: paths must resolve under user home OR be under tmp (for tests)
         guarded = [self.dpapi_path, self.plaintext_path]
         if self.runtime_key_path is not None:
@@ -193,7 +203,7 @@ class CanonicalKeyProvider:
                 under_home_lexical = False
             under_tmp = any(str(resolved).startswith(str(t)) for t in tmp_prefixes)
             if not (under_home or under_home_lexical or under_tmp):
-                raise ValueError(f"canonical-key path {resolved} outside user home, tmp, or runtime dir")
+                raise ValueError(f"{name} path {resolved} outside user home, tmp, or runtime dir")
         self._cached_key: Optional[str] = None
         self._cache_loaded = False
         # v0.20 Phase D (M6): which source served the cached key —
@@ -225,13 +235,13 @@ class CanonicalKeyProvider:
                     return self._cached_key
                 import logging
                 logging.getLogger(__name__).warning(
-                    f"credential canonical-key at {self.credential_key_path} is empty/whitespace, "
+                    f"credential {self.name} at {self.credential_key_path} is empty/whitespace, "
                     "falling back to runtime/dpapi/plaintext"
                 )
             except OSError as e:
                 import logging
                 logging.getLogger(__name__).warning(
-                    f"credential canonical-key at {self.credential_key_path} unreadable, "
+                    f"credential {self.name} at {self.credential_key_path} unreadable, "
                     f"falling back to runtime/dpapi/plaintext: {e}"
                 )
         # v0.19 Phase H: runtime-injected key (tmpfs, ExecStartPre DPAPI fetch)
@@ -250,13 +260,13 @@ class CanonicalKeyProvider:
                     return self._cached_key
                 import logging
                 logging.getLogger(__name__).warning(
-                    f"runtime canonical-key at {self.runtime_key_path} is empty/whitespace, "
+                    f"runtime {self.name} at {self.runtime_key_path} is empty/whitespace, "
                     "falling back to dpapi/plaintext"
                 )
             except OSError as e:
                 import logging
                 logging.getLogger(__name__).warning(
-                    f"runtime canonical-key at {self.runtime_key_path} unreadable, "
+                    f"runtime {self.name} at {self.runtime_key_path} unreadable, "
                     f"falling back to dpapi/plaintext: {e}"
                 )
         # Prefer DPAPI on Windows
@@ -280,7 +290,7 @@ class CanonicalKeyProvider:
         if not _is_windows() and self.dpapi_path.exists() and not self.plaintext_path.exists():
             import logging
             logging.getLogger(__name__).error(
-                "canonical-key.dpapi present but DPAPI is unavailable on this platform, "
+                f"{self.name}.dpapi present but DPAPI is unavailable on this platform, "
                 f"no runtime-injected key at {self.runtime_key_path} (dpapi-fetch-key.sh "
                 "ExecStartPre failed? check `journalctl --user -u mem0`), and no "
                 "plaintext key exists; recover by restarting mem0 (re-runs the fetch) "
@@ -297,7 +307,7 @@ class CanonicalKeyProvider:
                 return self._cached_key
             import logging
             logging.getLogger(__name__).warning(
-                f"plaintext canonical-key at {self.plaintext_path} is empty/whitespace, "
+                f"plaintext {self.name} at {self.plaintext_path} is empty/whitespace, "
                 "treating as absent"
             )
         self._cached_key = None
@@ -323,3 +333,26 @@ def canonical_key_health(provider: "CanonicalKeyProvider") -> dict:
         "source": provider.key_source,
         "dpapi_blob": blob_present,
     }
+
+
+def service_key_provider() -> "CanonicalKeyProvider":
+    """1.32.5: the provider for the authority-only SERVICE key (`ams-service-key`).
+
+    The key is what turns a privileged actor or source label (the sweep's and the dream's
+    server-side job labels: security_invariants.PRIVILEGED_LABELS) from a string any API-key holder
+    can type into a claim the server can check. It is separate from the canonical key on purpose:
+    it lets a job write insight records and sweep stamps, never promote to canonical, and replicas
+    hold their own throwaway canonical key while no replica or PC holds the service key at all.
+
+    Sources, by the same precedence as the canonical key: $CREDENTIALS_DIRECTORY/ams-service-key
+    (systemd LoadCredentialEncrypted on the native authority), $XDG_RUNTIME_DIR/mem0/service-key,
+    ~/.mem0/service-key (mode 600; the WSL authority). There is no DPAPI blob for it."""
+    return CanonicalKeyProvider(name="service-key")
+
+
+def service_key_health(provider: "CanonicalKeyProvider") -> dict:
+    """1.32.5: the service_key fragment for /health/deep. Informational, never flips `ok`: a box
+    without the key refuses every privileged label (fail closed), which on a replica is correct and
+    on the authority shows up as the capability `service-key` dead (capabilities.py)."""
+    key = provider.get_key()
+    return {"present": bool(key), "source": provider.key_source}

@@ -230,16 +230,16 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
             "from a terminal."
         )
     elif md.get("tier") == "insight":
-        INSIGHT_ALLOWED = {"c1-consolidator", "dream-consolidator", "c1-dream-consolidator"}
-        src = (md.get("source") or "").lower()
-        if src not in INSIGHT_ALLOWED:
-            md["tier"] = "evidence"
-            md["_insight_intent"] = True
-            note = (
-                "tier auto-downgraded insight→evidence; insight is reserved for c1/dream "
-                "consolidator. Dream will pick this up on its next nightly cycle if it crosses "
-                "the bar."
-            )
+        # 1.32.5: the consolidator's source label counts only with the authority's service key,
+        # which no MCP session holds, so an insight over MCP is ALWAYS downgraded here (before
+        # 1.32.5 a session that typed the consolidator's source passed straight through).
+        md["tier"] = "evidence"
+        md["_insight_intent"] = True
+        note = (
+            "tier auto-downgraded insight→evidence; insight is reserved for the nightly dream "
+            "consolidator on the authority. Dream will pick this up on its next nightly cycle if "
+            "it crosses the bar."
+        )
     # MEM-19: stamped on the add POST too. AddIn doesn't validate the field yet
     # (pydantic ignores extras), so this is forward-stamping: the day the add
     # contract is versioned server-side, the shim is already compliant.

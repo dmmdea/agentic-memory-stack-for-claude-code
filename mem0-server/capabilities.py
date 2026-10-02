@@ -117,6 +117,10 @@ CAPABILITIES = [
      "what": "HMAC canonical-key chain (runtime/DPAPI/plaintext provider)",
      "probe": "checks.canonical_key",
      "required": "brain", "escalation_documented": False},
+    {"id": "service-key",
+     "what": "authority-only service key that proves a server-side job label (1.32.5)",
+     "probe": "checks.service_key",
+     "required": "brain", "escalation_documented": False},
     {"id": "put-carryover",
      "what": "PUT payload carry-over (metadata survives text rewrites)",
      "probe": ("checks.put_carryover_today (daily activity counters); "
@@ -340,6 +344,14 @@ def _sparse_leg_state(check):
     if isinstance(cov, (int, float)) and cov < SPARSE_COVERAGE_FLOOR:
         return "degraded"
     return "alive"
+
+
+def _service_key_state(check):
+    """1.32.5: without the service key the authority refuses its own dream's insight writes and the
+    sweep's stamps (every privileged label needs it), so on the brain an absent key is dead."""
+    if not isinstance(check, dict):
+        return "unknown"
+    return "alive" if check.get("present") else "dead"
 
 
 def _canonical_key_state(check):
@@ -618,6 +630,8 @@ def _state_for(row, checks, stack_version=None, now_s=None):
         return _sparse_leg_state(checks.get("sparse_leg"))
     if cid == "canonical-key":
         return _canonical_key_state(checks.get("canonical_key"))
+    if cid == "service-key":
+        return _service_key_state(checks.get("service_key"))
     if cid == "put-carryover":
         return _put_carryover_state(checks.get("put_carryover_today"))
     if cid == "mojibake-tripwire":

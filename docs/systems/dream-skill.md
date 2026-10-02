@@ -103,6 +103,8 @@ Output: `{"insights":["...", "..."]}`. Each insight posted to mem0 as:
 
 The native (Python) dream also stamps `brand` when more than half of the cited memories carry the same non-shared brand, and none otherwise ([`brands.md`](./brands.md)). The brand is part of the metadata that is posted and, when the POST fails, spooled, so a spooled insight replays with it.
 
+**The `dream-consolidator` label is a claim the server checks (1.32.5).** `source: "dream-consolidator"` is free text, and every PC and MCP session holds the API key, so the server accepts an insight add under that source only when the request also carries the authority's service key in `X-AMS-Service-Key` (`403 service-credential-required` otherwise). The dream sends it on every insight add and on its `touched_by_dream` stamp, the PATCH on each cited source evidence record (actor `dream-consolidator`) that gives decay-scan's protection something to read. The Python dream reads the key through `ams_env.service_key()` and sends it with `ams_env.mem0_headers()`. The Windows-brain dream reads `service-key` beside the WSL API key (`Get-Mem0ServiceKey`), and only for an insight add or that PATCH, so an ordinary add never touches the file.
+
 ### Phase 3.5 — Autonomous canonical promotion
 
 After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second Codex call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task/imperative text) → sort by confidence → **cap at 3** → dedup against the existing canonical set.
@@ -171,7 +173,9 @@ promotions, the drift canary before/after, the morning summary and the usage led
 - **An honest night.** Phase 3 embeds (the drift snapshot, the insight POSTs), so it first polls
   `GET /health/embedder` (21 probes, 30 s apart) and then proceeds either way. An insight whose POST
   fails is appended to `~/.mem0/maintenance/dream/insight-spool.jsonl` (deduplicated by content hash)
-  and replayed before anything else on the next run; a replayed line leaves the spool. The run then
+  and replayed before anything else on the next run; a replayed line leaves the spool. A POST the server
+  refused for a missing service key (`403 service-credential-required`) is spooled all the same, and the log
+  line names that cause, because replaying cannot cure it. The run then
   writes its step outcome (`AMS_OUTCOME_FILE`, see the chain description in
   [installer-and-deploy.md](./installer-and-deploy.md)): `ok`, or `degraded:` with `posted-<p>-of-<c>`,
   `replay-failed-<n>` (queued insights the replay could not post), `spool-backlog-<n>` (queued insights
@@ -183,9 +187,13 @@ promotions, the drift canary before/after, the morning summary and the usage led
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
   throttle stamp is `~/.mem0/maintenance/last-dream`, written by Python only.
-- **Secrets.** The API key arrives as `MEM0_API_KEY_FILE` and the canonical key under
-  `$CREDENTIALS_DIRECTORY` (both `LoadCredentialEncrypted=` lines of the step unit);
-  `mem0-canonize.sh --actor dream-autopromote` reads the credential first.
+- **Secrets.** The step unit loads three credentials (`LoadCredentialEncrypted=` lines): the API key
+  (`ams-api-key`, reached through `MEM0_API_KEY_FILE`), the canonical key (`ams-canonical-key`) and, since
+  1.32.5, the service key (`ams-service-key`), all under `$CREDENTIALS_DIRECTORY`. The service key is what
+  proves the `dream-consolidator` label on the insight adds and the `touched_by_dream` stamps; it is a
+  separate secret from the canonical key, and the service key alone cannot sign a promotion.
+  `mem0-canonize.sh --actor dream-autopromote` reads the canonical credential first. On a WSL brain the
+  service key is `~/.mem0/service-key` (mode 600), made by the installer and by `scripts/wsl/deploy.sh`.
 - **No catch-up script.** `ams-nightly.timer` is `Persistent=` and the chain carries a boot guard;
   a missed night runs at the next boot and a completed one is not re-run.
 - **Index refresh** is its own chain step (`memory-index-refresh.py`, 6 h throttle, mkdir mutex);
@@ -206,14 +214,15 @@ promotions, the drift canary before/after, the morning summary and the usage led
 
 - **Trigger:** Windows Task Scheduler entry `ClaudeCode-DreamConsolidator-3am`, daily at 03:00, `-WakeToRun`, action = `dream-consolidate.ps1`.
 - **Catch-up:** `dream-catchup.ps1`, spawned detached from a SessionStart hook, nudges the consolidator when debt has accumulated. **Brain only (1.28.4):** on any other role (`~/.mem0/role`) the catch-up, the index refresh and the consolidator itself log the role and exit, because the nightly chain runs on the brain and a replica's `last-dream` marker never advances again.
-- **Flags:** `-DryRun` makes zero promotions and zero file writes (nominees logged only); `-Force` bypasses **only** the 24h throttle, and only where the role is `brain` (a replica exits on its role first, `-Force` included). On the native authority the dream is the Python port `dream-consolidate.py` (`--force` bypasses the same throttle, and a completed forced run marks it, so one that finishes after 04:00 makes the next 03:00 dream skip), and the hand entry point is `scripts/wsl/ams-dream-now.sh`, which runs it under the chain step's credentials without the chain guard ([operations](../operations.md#the-nightly-dream-didnt-run)).
-- **Backend calls:** mem0 REST (`GET`/search for evidence and canonical, `POST` insights) and `mem0-canonize.sh --actor dream-autopromote` for canonical promotion.
+- **Flags:** `-DryRun` makes zero promotions and zero file writes (nominees logged only); `-Force` bypasses **only** the 24h throttle, and only where the role is `brain` (a replica exits on its role first, `-Force` included). On the native authority the dream is the Python port `dream-consolidate.py` (`--force` bypasses the same throttle, and a completed forced run marks it, so one that finishes after 04:00 makes the next 03:00 dream skip), and the hand entry point is `scripts/wsl/ams-dream-now.sh`, which runs it under the chain step's three credentials (API, canonical and service keys; it refuses when one of the `.cred` files is missing) without the chain guard ([operations](../operations.md#the-nightly-dream-didnt-run)).
+- **Backend calls:** mem0 REST (`GET`/search for evidence and canonical, `POST` insights and the `touched_by_dream` `PATCH`, both carrying the service key) and `mem0-canonize.sh --actor dream-autopromote` for canonical promotion.
 
 ## Dependencies
 
 - **Codex CLI** (`gpt-6-astra` at medium effort, ChatGPT-subscription OAuth) for the consolidation and autopromote-nomination calls; gather runs on `gpt-5.6-terra`.
 - **The shared Codex mutex** (`memory-common.ps1`) — see [`codex-hooks.md`](./codex-hooks.md).
 - **mem0 REST** on `:18791` and **`mem0-canonize.sh`** for the HMAC-signed promotion.
+- **The service key** (`ams-service-key`, 1.32.5) on the brain: without it the server refuses the dream's insight adds and `touched_by_dream` stamps with `403 service-credential-required`, and on a native authority `mem0.service` itself will not start once its unit names a `.cred` that is missing or does not decrypt (re-run `install/linux-authority.sh`, which regenerates it).
 - **EmbeddingGemma + Qdrant** (via mem0) for the Phase 5 drift canary; the optional **`eval/` harness** for the drift script.
 
 ## Downstream effects
@@ -225,16 +234,19 @@ Consolidation writes new `insight`-tier records and (rarely, ≤3/night) new `ca
 - At most one consolidation per 24h (the throttle is marked only after a phase succeeds).
 - The dream never invokes Codex concurrently with L1a — the shared mutex guarantees it.
 - At most **3** canonical autopromotions per night, each HMAC-signed and gate-checked.
+- An insight record is created only by a request that carries the service key (the dream holds it; no MCP session, replica or PC does), and rewriting or deleting one needs that key or the operator's signed token.
 - `-DryRun` writes nothing (no promotions, no file writes).
 - A missing or failed drift snapshot never produces a false alarm — the compare is simply skipped.
 
 ## Error handling
 
-Every phase is best-effort and fail-open: the 4C gate is wrapped so it can never crash the consolidator (a gate error becomes a fail-safe BLOCK in `enforce` only); a malformed Codex JSON skips the throttle mark so the next run retries; a `422` canary rejection on a promotion is non-fatal; the Codex mutex is released in a `finally` block; a canonical fetch or canonize failure is logged non-fatally. The 24h throttle is written only when a phase completes without error.
+Every phase is best-effort and fail-open: the 4C gate is wrapped so it can never crash the consolidator (a gate error becomes a fail-safe BLOCK in `enforce` only); a malformed Codex JSON skips the throttle mark so the next run retries; a `422` canary rejection on a promotion is non-fatal; the Codex mutex is released in a `finally` block; a canonical fetch or canonize failure is logged non-fatally. The 24h throttle is written only when a phase completes without error. On the PowerShell path a failed insight add never goes to the shared Outbox: `replay-ops.py` drains that for every session and deliberately never sends the service key (sending it would vouch for a forged queued insight). A `403` goes to the poison file (`mem0-post-poison.jsonl`), and a transient failure to the dead-letter file (`mem0-post-failures.jsonl`), which re-posts through `Add-Mem0Memory`, which reads the key again.
 
 ## Security and privacy notes
 
 Autonomous canonical promotion does **not** bypass the canonical write gate: it still signs the same format-2 HMAC token via `mem0-canonize.sh` (actor `dream-autopromote`), so an attacker who could only run the consolidator still cannot forge canonical without the HMAC signing key. The imperative-canary independently blocks standing-order text from the canonical tier. Logs carry counts, ids, and reasons — not raw memory text where avoidable.
+
+The dream's insight writes are authorised by the service key, not by the `dream-consolidator` label (1.32.5): a label is free text and every PC and MCP session holds the API key, so before the key any of them could mint, rewrite or delete an insight by typing the label. The key lives only on the authority (a systemd credential, or `~/.mem0/service-key` on a WSL brain) and is regenerable, since nothing outside the authority's units needs a copy. It separates the authority's own jobs from every caller that holds only the API key; it does **not** resist a shell on the authority as the service user, an ssh session to the brain, or (WSL brain) a Windows-side process of the same user, and it is one key for every job, not per-job least privilege. The Codex judge child the dream starts gets no `CREDENTIALS_DIRECTORY` or API-key pointers (the judge reads memory text any key holder can write); that removes the pointer, not the files, so the sandbox stays the real boundary. Insight leaves its tier only through the operator's signed demote, which no job label exempts, and the nightly dream never demotes one.
 
 ## Observability and debugging
 
@@ -250,15 +262,17 @@ The pure decision logic in `autopromote-lib.ps1` (`Invoke-PromotionGate`, `Resol
 - **Assuming autopromotion skips the HMAC** — it does not; it signs via `mem0-canonize.sh` exactly like an operator promotion.
 - **Confusing `-Force` with skipping the gate** — `-Force` bypasses only the 24h throttle, nothing else.
 - **Expecting drift alarms without the eval checkout** — with no `EvalRootWsl`, Phase 5 no-ops silently.
+- **Running the dream, or typing its label, from a process with no service key** — the server answers `403 service-credential-required`. From a shell on the native authority use `ams-dream-now.sh`, which loads the credentials the unit has. `memory_add(tier="insight")` over MCP is always downgraded to `evidence` (no MCP session can hold the key), and the nightly dream picks the fact up if it crosses the bar.
+- **Demoting a bad insight with `memory_demote`** — that tool (actor `claude-autonomous`, no token) and `memory_promote` can no longer move an insight in either direction. Use the signed path, `mem0-canonize.sh --action demote <id> "<reason>" [--tier evidence|stable|temporal]` (on a PC it forwards to the authority), or a signed delete.
 
 ## Source map
 
 - [`../../scripts/windows/dream-consolidate.ps1`](../../scripts/windows/dream-consolidate.ps1) — the nightly orchestrator (all phases, drift canary, EvalRootWsl resolution).
 - [`../../scripts/windows/autopromote-lib.ps1`](../../scripts/windows/autopromote-lib.ps1) — the pure 4C-gate + nomination decision logic.
 - [`../../scripts/windows/dream-catchup.ps1`](../../scripts/windows/dream-catchup.ps1) — the debt-based missed-run catch-up.
-- [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the shared Codex lock and throttle helpers.
+- [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the shared Codex lock and throttle helpers, and `Add-Mem0Memory` / `Get-Mem0ServiceKey` (the insight add and the service-key read).
 - [`../../scripts/wsl/mem0-canonize.sh`](../../scripts/wsl/mem0-canonize.sh) — the HMAC-signed canonical promotion the dream calls.
-- [`../../scripts/wsl/dream-consolidate.py`](../../scripts/wsl/dream-consolidate.py), [`autopromote_lib.py`](../../scripts/wsl/autopromote_lib.py), [`memory-index-refresh.py`](../../scripts/wsl/memory-index-refresh.py), [`codex_usage.py`](../../scripts/wsl/codex_usage.py) — the Python ports that run on a native Linux authority (v1.22).
+- [`../../scripts/wsl/dream-consolidate.py`](../../scripts/wsl/dream-consolidate.py), [`autopromote_lib.py`](../../scripts/wsl/autopromote_lib.py), [`memory-index-refresh.py`](../../scripts/wsl/memory-index-refresh.py), [`codex_usage.py`](../../scripts/wsl/codex_usage.py) — the Python ports that run on a native Linux authority (v1.22). [`ams_env.py`](../../scripts/wsl/ams_env.py) holds `service_key()` and `mem0_headers()`, which the Python dream sends its service key with (1.32.5).
 
 ## Related docs
 

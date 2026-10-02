@@ -308,7 +308,48 @@ Closed by Phase-2 (v0.19 Phase I):
   weekly contradiction sweep stamps candidates that a local LLM judged to
   contradict canonical ground truth, and the gate suppresses them.
 
+Closed by 1.32.5 (the service credential):
+- **Forged server-side job labels.** The keys that take a record out of
+  retrieval or schedule its removal (`contradicts_canonical`,
+  `contradiction_checked_at`, `contradicts_canonical_pending`, `retired_at`,
+  `retrievable`, `expires_at`) and the insight tier's write path were guarded
+  only by actor strings (`contradiction-sweep-v019`, `stamp-retired-v013`,
+  `backfill-apply-v013`, `decay-scan`, `system`, and the insight
+  consolidators). A string is not a credential, and every PC and every MCP
+  session holds the API key, so any of them could hide a non-canonical record,
+  schedule its deletion, stamp `retired_at` on a canonical, or mint, rewrite or
+  delete a high-trust insight record. A privileged label now counts only on a
+  request that carries the authority's service key; otherwise the server
+  answers `403 service-credential-required`. The policy functions
+  (`assert_writable`, `validate_insight_actor`, `authorize_metadata_patch`)
+  take a `service_verified` flag that defaults to False, so a handler that
+  forgets the check denies instead of trusting the label.
+- **The two-step insight hole.** `PATCH /tier` insight → evidence needed no
+  token, after which PUT and DELETE were ungated. A move out of insight now
+  signs `demote` like a move out of canonical (`mem0-canonize.sh --action
+  demote`), no job label exempts it, and the handler re-reads the tier under
+  the record lock: a record that became canonical or insight while an unsigned
+  change was in flight is a `409` (retry).
+
 Still NOT closed:
+- The service key's boundary. It separates the authority's own jobs from every
+  caller that holds only the API key (MCP sessions, hooks, PCs, replicas). It
+  does not resist a shell on the authority as the service user, an ssh session
+  to the brain, or (WSL brain) a Windows-side process of the same user. It is
+  one key for every job, not per-job least privilege; because it is a
+  different secret from the canonical key, a job holding it cannot mint
+  canonical tokens.
+- Hides that need no forged label, and are no worse than the DELETE every key
+  holder already has on evidence, stable and temporal records: `PATCH /tier`
+  to `temporal` (outside every class's allowlist, `history` included),
+  `_canonical_intent` (hidden from default search), the supersede door on a
+  record in an unprotected tier, and `retired_at` on a non-canonical record.
+- Caller-chosen `source` labels that server-side jobs read: the autopromote
+  corroboration fast-track for `user-decision` / `operator-decision` (its
+  legitimate sender is an unprivileged PC hook, so no server credential can
+  tell it from a forger) and semantic-dedup's `automemory:` protection. They
+  need a different design.
+- The ledger's `transport` field is self-declared from header presence.
 - Rich rejected-candidate provenance (full scope snapshot, query hash link
   to `retrieval-log.jsonl`).
 - workspace/project scope enforcement (brand only today).
@@ -378,9 +419,24 @@ candidate contradicts the canonical statement.
   `--recheck-days`, default 7, are skipped — idempotent). Stamps go through
   the mem0 API trusted-actor PATCH path: actor `contradiction-sweep-v019` is
   key-allowlisted in `security_invariants.TRUSTED_PATCH_ACTORS` to write
-  EXACTLY those two keys (per-actor mapping since v0.19 I.3 — mirrors
-  `stamp-retired-v013`; it cannot write `retired_at` and vice versa). NEVER
-  direct Qdrant `set_payload` (H8 lesson: bypasses gate + ledger).
+  EXACTLY the sweep's own keys (`contradicts_canonical`,
+  `contradiction_checked_at`, and the advisory `contradicts_canonical_pending`
+  described in [reconciliation.md](./reconciliation.md); per-actor mapping
+  since v0.19 I.3 — mirrors `stamp-retired-v013`; it cannot write `retired_at`
+  and vice versa). NEVER direct Qdrant `set_payload` (H8 lesson: bypasses gate
+  + ledger).
+  **The label is a credential-backed claim since 1.32.5.** An actor string is
+  free text and the ordinary API key is held by every PC and every MCP session,
+  so the server honours `contradiction-sweep-v019` only on a request that also
+  carries the authority's service key in `X-AMS-Service-Key`
+  (`security_invariants.require_service_credential`, checked before the
+  allowlist and before the canonical HMAC check that a trusted actor skips).
+  Without it the PATCH is a `403 service-credential-required`. The nightly
+  unit (`ams-step-contradiction-sweep.service`) loads `ams-service-key` as a
+  systemd credential, every sweep client sends it through
+  `ams_env.mem0_headers()`, and a WSL brain keeps it in `~/.mem0/service-key`.
+  A replica or PC never holds it, so its dormant server refuses every such
+  label.
 - **Self-healing YES stamps (v0.19 fix-pass):** a YES verdict is no longer
   permanent. Stamped candidates whose `contradiction_checked_at` is older
   than `--recheck-stamped-days` (default 30; `0` = always) are RE-JUDGED;
@@ -396,11 +452,10 @@ candidate contradicts the canonical statement.
   ids — every retrieval suppression gets a human review within a week.
 - **Unstamp (false-positive recovery — one command since v0.20 Phase C, M8
   residual):** when the Test-MemoryStack WARN row lists a wrongly-stamped id,
-  clear it immediately (don't wait for the recheck window):
+  clear it immediately (don't wait for the recheck window), on the authority:
 
   ```bash
-  /home/youruser/apps/mem0-server/.venv/bin/python \
-    /path/to/agentic-memory-stack-for-claude-code/scripts/wsl/contradiction-sweep.py --unstamp <MEMORY_ID>
+  bash ~/apps/mem0-scripts/ams-service-run.sh contradiction-sweep.py --unstamp <MEMORY_ID>
   ```
 
   This prints the BEFORE/AFTER metadata and clears `contradicts_canonical`
@@ -408,14 +463,23 @@ candidate contradicts the canonical statement.
   `contradiction-sweep-v019`; null shallow-merge makes the gate's `meta.get()`
   falsy → the record is admitted again). It runs no sweep and appends nothing
   to the JSONL run log. Exit 0 = cleared (or nothing to clear); nonzero =
-  read/PATCH failure. Equivalent raw PATCH (fallback if the script is
-  unavailable):
+  read/PATCH failure.
 
-  ```bash
-  curl -s -X PATCH http://127.0.0.1:18791/v1/memories/<MEMORY_ID>/metadata \
-    -H "X-API-Key: $(cat ~/.mem0/api-key)" -H "Content-Type: application/json" \
-    -d '{"metadata": {"contradicts_canonical": null, "contradiction_checked_at": "'"$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"'"}, "actor": "contradiction-sweep-v019", "reason": "manual unstamp - false-positive YES verdict"}'
-  ```
+  **Why the wrapper (1.32.5).** The PATCH names the actor
+  `contradiction-sweep-v019`, a label the server accepts only with the service
+  key, and that key exists only on the authority. `ams-service-run.sh` gives a
+  hand run the credentials the nightly unit has. On a native authority it
+  starts a transient user unit that loads `ams-api-key` and `ams-service-key`
+  and points `MEM0_URL` at the authority's bind address; on a WSL brain it runs
+  the script directly, which reads `~/.mem0/service-key`. It refuses on any
+  other role (exit 3: no replica or PC holds the key) and runs only
+  `contradiction-sweep.py`, `stamp-retired-at.py` and
+  `ship_log_reclassify.py`. Output is piped to the terminal, and a dropped ssh
+  session stops the unit at its next write, so run a long scroll in `tmux` or
+  `screen` (a single `--unstamp` needs neither). There is no hand-typed `curl`
+  fallback any more: a PATCH that names that actor without the service key is
+  refused `403 service-credential-required`, and no copy of the key exists
+  outside the authority's units for a typed request to use.
 
   The fresh `contradiction_checked_at` defers re-judging by `--recheck-days`
   (7d). If the temperature-0 judge still answers YES on the re-judge it will
@@ -474,12 +538,24 @@ candidate contradicts the canonical statement.
   systemctl --user list-timers | grep contradiction          # verify
   ```
 
+  On the native authority the sweep is the chain step
+  `ams-step-contradiction-sweep.service`, which loads `ams-service-key` beside
+  `ams-api-key`; a WSL brain's sweep needs no unit change, because the script
+  reads `~/.mem0/service-key` itself. A sweep that holds no service key can
+  still judge, but every stamp PATCH it sends is refused
+  `403 service-credential-required`.
+
 - **Manual runs:**
 
   ```bash
   /home/youruser/apps/mem0-server/.venv/bin/python \
     /path/to/agentic-memory-stack-for-claude-code/scripts/wsl/contradiction-sweep.py --limit 3 --top-k 4 --dry-run
   ```
+
+  A dry run writes nothing and needs no service key. A hand run that writes a
+  stamp (`--apply`, `--rejudge-stamped --apply`, `--promote`, `--unstamp`)
+  goes through `ams-service-run.sh` as above; `--dismiss` only edits the local
+  review queue and needs neither.
 
 - **Unit tests:** `mem0-server/tests/test_contradiction_sweep.py` (mocked-LLM
   verdict parsing, stamping payloads, eligibility/brand scoping, per-actor key

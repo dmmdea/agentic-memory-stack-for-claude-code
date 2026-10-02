@@ -11,8 +11,8 @@
 #   bash mem0-canonize.sh --action delete         <memory_id> "<reason>" --cascade
 #   bash mem0-canonize.sh --action patch_metadata <memory_id> "<reason>" --metadata-json '<json>'
 #   bash mem0-canonize.sh --action demote         <memory_id> "<reason>" [--tier evidence|stable|temporal]
-#     (moves a record OUT of canonical; default target tier evidence. The server refuses any
-#      unsigned demotion of a canonical record, so this is the only way to do it.)
+#     (moves a record OUT of canonical, or since 1.32.5 out of insight; default target tier
+#      evidence. The server refuses any unsigned demotion of either, so this is the only way.)
 #
 # Requires:
 #   ~/.mem0/api-key — regular mem0 API key
@@ -351,7 +351,7 @@ print(json.dumps({'metadata': metadata, 'actor': 'user-direct', 'reason': reason
     -d "$BODY" | python3 -m json.tool
 
 elif [[ "$ACTION" == "demote" ]]; then
-  # ── PATCH /tier OUT of canonical: signs action="demote" ─────────────────
+  # ── PATCH /tier OUT of canonical or insight: signs action="demote" ──────
   BODY="$(python3 -c "
 import json, sys
 print(json.dumps({'tier': sys.argv[1], 'actor': 'user-direct', 'reason': sys.argv[2]}))

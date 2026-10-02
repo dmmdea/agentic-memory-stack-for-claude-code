@@ -77,6 +77,41 @@ def api_key() -> str:
         return ""
 
 
+SERVICE_KEY_HEADER = "X-AMS-Service-Key"
+
+
+def service_key() -> str:
+    """1.32.5: the authority-only service key, '' when this process has none.
+
+    $CREDENTIALS_DIRECTORY/ams-service-key (the systemd credential the dream and sweep units load,
+    and scripts/wsl/ams-service-run.sh for a hand run) > ~/.mem0/service-key (a WSL authority).
+    Only a server-side job needs it: it is what lets the server accept the job's actor or source
+    label (security_invariants.require_service_credential). Never read from the environment as a
+    value: an env var leaks into every child process, including the codex judge."""
+    cd = (os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
+    candidates = [Path(cd) / "ams-service-key"] if cd else []
+    candidates.append(_mem0_dir() / "service-key")
+    for p in candidates:
+        try:
+            v = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if v:
+            return v
+    return ""
+
+
+def mem0_headers(key: str | None = None) -> dict[str, str]:
+    """The headers a job sends to mem0: the API key, JSON, and the service key when this process
+    holds one. Sending it on every request is harmless (the server reads it only where a
+    privileged label is claimed) and means no call site has to know which requests need it."""
+    h = {"X-API-Key": api_key() if key is None else key, "Content-Type": "application/json"}
+    sk = service_key()
+    if sk:
+        h[SERVICE_KEY_HEADER] = sk
+    return h
+
+
 def codex_home() -> str:
     """CODEX_HOME env > <MEM0_SECRETS_DIR>/codex when it holds auth.json > ~/.codex."""
     env = (os.environ.get("CODEX_HOME") or "").strip()
