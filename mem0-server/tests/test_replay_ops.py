@@ -15,8 +15,8 @@ def ro():
     try:
         spec = importlib.util.spec_from_file_location("replay_ops_ut", MOD_PATH)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    except Exception as e:
-        pytest.skip(f"import needs httpx: {e}")
+    except (Exception, SystemExit) as e:   # 1.32.6: a missing key is a SystemExit, not an OSError
+        pytest.skip(f"import needs httpx and an api key: {e}")
     return mod
 
 def test_adds_replay_before_mutations_and_ledger_dedups(ro, tmp_path, monkeypatch):
