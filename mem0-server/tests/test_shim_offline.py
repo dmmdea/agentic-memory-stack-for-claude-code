@@ -299,7 +299,7 @@ def test_shim_import_succeeds_with_only_the_credential_file(nhome, monkeypatch, 
     assert _load_native()._headers()["X-API-Key"] == "credential-key"
 
 
-@pytest.mark.parametrize("bad", ["empty", "blank", "missing", "unreadable-dir"])
+@pytest.mark.parametrize("bad", ["empty", "blank", "missing", "unreadable-dir", "not-utf8"])
 def test_shim_unusable_credential_file_falls_back_to_the_home_key(bad, nhome, monkeypatch, tmp_path):
     (nhome / ".mem0" / "api-key").write_text("home-key\n", encoding="utf-8")
     p = tmp_path / "creds" / "ams-api-key"
@@ -310,6 +310,8 @@ def test_shim_unusable_credential_file_falls_back_to_the_home_key(bad, nhome, mo
         p.write_text("  \n", encoding="utf-8")
     elif bad == "unreadable-dir":
         p.mkdir()                      # reading a directory raises OSError on every platform
+    elif bad == "not-utf8":
+        p.write_bytes(bytes([0xFF, 0xFE, 0x80]) + b" not text")
     monkeypatch.setenv("MEM0_API_KEY_FILE", str(p))
     assert _load_native()._headers()["X-API-Key"] == "home-key"
 

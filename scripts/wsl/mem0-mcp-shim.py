@@ -43,7 +43,7 @@ def _read_api_key() -> str:
     if env_path:
         try:
             val = Path(env_path).read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, ValueError):   # unreadable, or not text: fall through to the home key
             val = ""
         if val:
             return val
