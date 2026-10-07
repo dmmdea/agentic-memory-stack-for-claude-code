@@ -248,3 +248,214 @@ def test_authority_file_ignores_comments_blanks_and_trailing_slash(tmp_path, mon
     mod = _load_shim(tmp_path, monkeypatch, env_url=None,
                      file_url="# written by the installer\n\nhttp://brain-host:18791/\n")
     assert mod.AUTHORITY_URL == "http://brain-host:18791"
+
+
+# ---------------------------------------------------------------------------------------------
+# 1.32.6: the shim on a native Linux authority. The API key is a systemd credential (a file named
+# by MEM0_API_KEY_FILE, no ~/.mem0/api-key) and install/linux-authority.sh copies the script raw, so
+# the tenant placeholder that the other installers substitute stays in the signature defaults.
+# The replay script's twin of these tests lives in test_replay_ops.py.
+# ---------------------------------------------------------------------------------------------
+
+_SENTINEL = "__WSL_USER__"   # tests are never deployed, so the literal may appear here
+_TOKENS = ("__WSL_USER__", "__WIN_USER__", "__WSL_DISTRO__")
+
+
+def _load_native(name="shim_native_ut", path=SHIM_PATH):
+    pytest.importorskip("fastmcp")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def nhome(monkeypatch, tmp_path):
+    """A redirected home with an empty ~/.mem0 and none of the resolver's env inputs set."""
+    monkeypatch.setenv("MEM0_URL", "http://authority.invalid:18791")
+    for var in ("MEM0_API_KEY_FILE", "MEM0_DEFAULT_USER_ID", "MEM0_KEY", "MEM0_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    h = apply_home(monkeypatch, tmp_path / "home")
+    (h / ".mem0").mkdir(parents=True)
+    return h
+
+
+def _credential(tmp_path, text="credential-key"):
+    p = tmp_path / "creds" / "ams-api-key"
+    p.parent.mkdir(exist_ok=True)
+    p.write_text(text + "\n", encoding="utf-8")
+    return p
+
+
+def test_shim_credential_file_beats_the_home_key(nhome, monkeypatch, tmp_path):
+    (nhome / ".mem0" / "api-key").write_text("home-key", encoding="utf-8")
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path)))
+    assert _load_native()._headers()["X-API-Key"] == "credential-key"
+
+
+def test_shim_import_succeeds_with_only_the_credential_file(nhome, monkeypatch, tmp_path):
+    assert not (nhome / ".mem0" / "api-key").exists()
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path)))
+    assert _load_native()._headers()["X-API-Key"] == "credential-key"
+
+
+@pytest.mark.parametrize("bad", ["empty", "blank", "missing", "unreadable-dir"])
+def test_shim_unusable_credential_file_falls_back_to_the_home_key(bad, nhome, monkeypatch, tmp_path):
+    (nhome / ".mem0" / "api-key").write_text("home-key\n", encoding="utf-8")
+    p = tmp_path / "creds" / "ams-api-key"
+    p.parent.mkdir()
+    if bad == "empty":
+        p.write_text("", encoding="utf-8")
+    elif bad == "blank":
+        p.write_text("  \n", encoding="utf-8")
+    elif bad == "unreadable-dir":
+        p.mkdir()                      # reading a directory raises OSError on every platform
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(p))
+    assert _load_native()._headers()["X-API-Key"] == "home-key"
+
+
+def test_shim_no_key_anywhere_is_a_fail_exit(nhome):
+    with pytest.raises(SystemExit) as ei:
+        _load_native()
+    assert "mem0 API key not found" in str(ei.value)
+
+
+def test_shim_empty_credential_and_no_home_key_is_a_fail_exit(nhome, monkeypatch, tmp_path):
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path, text="")))
+    with pytest.raises(SystemExit):
+        _load_native()
+
+
+def test_shim_never_reads_the_key_from_a_plaintext_env_var(nhome, monkeypatch):
+    monkeypatch.setenv("MEM0_KEY", "env-key")
+    monkeypatch.setenv("MEM0_API_KEY", "env-key")
+    with pytest.raises(SystemExit):
+        _load_native()
+
+
+def _stack_env(home, text):
+    (home / ".mem0" / "stack.env").write_text(text, encoding="utf-8")
+
+
+def _user_ids(obj):
+    """Every user_id value anywhere in a captured call (json body, params, nested filters)."""
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "user_id":
+                found.append(v)
+            found.extend(_user_ids(v))
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            found.extend(_user_ids(v))
+    return found
+
+
+@pytest.fixture()
+def nshim(nhome):
+    (nhome / ".mem0" / "api-key").write_text("home-key", encoding="utf-8")
+    return _load_native()
+
+
+@pytest.fixture()
+def ncaptured(nshim, monkeypatch):
+    calls = []
+
+    def fake_request(method, path, **kw):
+        calls.append({"path": path, **kw})
+        return {"results": [], "memories": []}, "authority"
+
+    def fake_authority_only(method, path, **kw):
+        calls.append({"path": path, **kw})
+        return {"results": []}
+
+    monkeypatch.setattr(nshim, "_request", fake_request)
+    monkeypatch.setattr(nshim, "_authority_only", fake_authority_only)
+    return calls
+
+
+_TENANT_TOOLS = {
+    "memory_add": lambda s, **kw: s.memory_add(text="a fact", **kw),
+    "memory_search": lambda s, **kw: s.memory_search(query="q", **kw),
+    "memory_recall": lambda s, **kw: s.memory_recall(query="q", **kw),
+    "memory_list": lambda s, **kw: s.memory_list(**kw),
+    "memory_diagnose": lambda s, **kw: s.memory_diagnose(query="q", target_id="t", **kw),
+}
+
+
+def test_shim_tenant_tools_are_exactly_the_five_with_the_placeholder_default():
+    src = SHIM_PATH.read_text(encoding="utf-8")
+    owners = set(re.findall(r"def (\w+)\([^)]*user_id: str = \"" + _SENTINEL + r"\"", src, flags=re.S))
+    assert owners == set(_TENANT_TOOLS)
+
+
+@pytest.mark.parametrize("tool", sorted(_TENANT_TOOLS))
+def test_shim_stack_env_tenant_is_used_for_the_default_placeholder(tool, nshim, ncaptured, nhome):
+    _stack_env(nhome, "# written by the installer\nMEM0_HOST_KIND=native\nMEM0_WSL_USER = 'tenant-a'\nOTHER=x\n")
+    _TENANT_TOOLS[tool](nshim)                  # the default: the placeholder, exactly as installed
+    ids = _user_ids(ncaptured)
+    assert ids and set(ids) == {"tenant-a"}, ncaptured
+
+
+@pytest.mark.parametrize("tool", sorted(_TENANT_TOOLS))
+def test_shim_env_tenant_beats_stack_env(tool, nshim, ncaptured, nhome, monkeypatch):
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    monkeypatch.setenv("MEM0_DEFAULT_USER_ID", "tenant-env")
+    _TENANT_TOOLS[tool](nshim)
+    assert set(_user_ids(ncaptured)) == {"tenant-env"}
+
+
+@pytest.mark.parametrize("tool", sorted(_TENANT_TOOLS))
+def test_shim_explicit_user_id_is_untouched(tool, nshim, ncaptured, nhome, monkeypatch):
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    monkeypatch.setenv("MEM0_DEFAULT_USER_ID", "tenant-env")
+    _TENANT_TOOLS[tool](nshim, user_id="explicit-tenant")
+    assert set(_user_ids(ncaptured)) == {"explicit-tenant"}
+
+
+@pytest.mark.parametrize("tool", sorted(_TENANT_TOOLS))
+@pytest.mark.parametrize("stack_env", [None, "# nothing useful\nMEM0_HOST_KIND=native\nMEM0_WSL_USER=\n"])
+def test_shim_unresolvable_placeholder_passes_through(tool, stack_env, nshim, ncaptured, nhome):
+    if stack_env is not None:
+        _stack_env(nhome, stack_env)
+    _TENANT_TOOLS[tool](nshim)
+    assert set(_user_ids(ncaptured)) == {_SENTINEL}
+
+
+def test_shim_tenant_resolver_only_acts_on_the_placeholder_shape(nshim, nhome):
+    _stack_env(nhome, 'MEM0_WSL_USER="tenant-a"\n')
+    assert nshim._resolve_tenant(_SENTINEL) == "tenant-a"
+    assert nshim._resolve_tenant("__WIN_USER__") == "tenant-a"           # the shape, not three names
+    for untouched in ("tenant-b", "", "__lower__", "_X_", "x__ABC__", "__ABC__x", "__", "____"):
+        assert nshim._resolve_tenant(untouched) == untouched
+    assert nshim._resolve_tenant(None) is None
+
+
+def test_shim_keeps_the_placeholder_literal_in_the_five_signature_defaults():
+    """install/linux-client.sh and the Windows installer substitute it (test_linux_client_installer pins
+    that they do); resolving at runtime must not remove what they substitute."""
+    text = SHIM_PATH.read_text(encoding="utf-8")
+    assert text.count(_SENTINEL) == 5
+    assert text.count("__WIN_USER__") == 0 and text.count("__WSL_DISTRO__") == 0
+
+
+def test_the_linux_client_substitution_leaves_no_sentinel_in_the_shim():
+    """install/linux-client.sh runs sed "s|__WSL_USER__|$USER_ID|g" and hard-fails when any of the three
+    tokens is still present, so no new code, docstring or comment may carry one."""
+    deployed = SHIM_PATH.read_text(encoding="utf-8").replace(_SENTINEL, "someuser")
+    assert not any(tok in deployed for tok in _TOKENS)
+
+
+def test_a_substituted_shim_resolves_nothing_and_keeps_its_tenant(nhome, monkeypatch, tmp_path):
+    """The sed-installed copy (a Windows or thin-client host) behaves as before: its default is a real
+    tenant, so stack.env and the env are never consulted."""
+    (nhome / ".mem0" / "api-key").write_text("home-key", encoding="utf-8")
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    monkeypatch.setenv("MEM0_DEFAULT_USER_ID", "tenant-env")
+    deployed = tmp_path / "mem0-mcp-shim-deployed.py"
+    deployed.write_text(SHIM_PATH.read_text(encoding="utf-8").replace(_SENTINEL, "someuser"), encoding="utf-8")
+    mod = _load_native("shim_substituted_ut", deployed)
+    calls = []
+    monkeypatch.setattr(mod, "_request", lambda m, p, **kw: (calls.append(kw) or {"results": []}, "authority"))
+    mod.memory_list()
+    assert set(_user_ids(calls)) == {"someuser"}

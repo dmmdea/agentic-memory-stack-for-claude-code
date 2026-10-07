@@ -8,6 +8,7 @@ import datetime as _dt
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -34,7 +35,52 @@ def _default_authority() -> str:
     return "http://127.0.0.1:18791"
 
 AUTHORITY = _default_authority()
-KEY = (Path.home() / ".mem0" / "api-key").read_text(encoding="utf-8").strip()
+KEY_FILE = Path.home() / ".mem0" / "api-key"
+
+def _read_api_key() -> str:
+    """$MEM0_API_KEY_FILE (a systemd credential on the native authority; non-empty) > ~/.mem0/api-key.
+    Inlined, not imported from ams_env: that module is not deployed in every client layout."""
+    env_path = (os.environ.get("MEM0_API_KEY_FILE") or "").strip()
+    if env_path:
+        try:
+            val = Path(env_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            val = ""
+        if val:
+            return val
+    if not KEY_FILE.exists():
+        raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE} (and no readable MEM0_API_KEY_FILE)")
+    return KEY_FILE.read_text(encoding="utf-8").strip()
+
+KEY = _read_api_key()
+
+# The signature defaults of the shim and the fallback below carry an operator placeholder that the
+# installers substitute; a native authority copies the scripts raw, so a value that still has the
+# placeholder SHAPE (double-underscore, upper-case, double-underscore) is resolved at call time.
+_UNRESOLVED_TENANT = re.compile(r"__[A-Z0-9_]+__")
+
+def _resolve_tenant(user_id):
+    """An unresolved placeholder -> MEM0_DEFAULT_USER_ID env > ~/.mem0/stack.env MEM0_WSL_USER > as given.
+    Any other user_id is returned untouched."""
+    if not _UNRESOLVED_TENANT.fullmatch(user_id or ""):
+        return user_id
+    env = (os.environ.get("MEM0_DEFAULT_USER_ID") or "").strip()
+    if env:
+        return env
+    try:
+        lines = (Path.home() / ".mem0" / "stack.env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return user_id
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "MEM0_WSL_USER":
+            val = val.strip().strip("\"'").strip()
+            if val:
+                return val
+    return user_id
 _MUTATION_ORDER = 1  # adds sort before everything else
 _ADD_ORDER = 0
 
@@ -101,7 +147,7 @@ def dispatch(op: str, args: dict) -> httpx.Response:
     t = httpx.Timeout(connect=1.5, read=30.0, write=30.0, pool=1.5)
     h = _headers()
     if op == "add":
-        body = {"messages": args["text"], "user_id": args.get("user_id", "__WSL_USER__"),
+        body = {"messages": args["text"], "user_id": _resolve_tenant(args.get("user_id", "__WSL_USER__")),
                 "infer": args.get("infer", False), "metadata": args.get("metadata") or {}}
         r = httpx.post(f"{AUTHORITY}/v1/memories", json=body, headers=h, timeout=t)
     elif op == "update":

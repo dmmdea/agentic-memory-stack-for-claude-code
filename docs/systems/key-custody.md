@@ -30,12 +30,14 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 | secret | where it lives | class |
 |---|---|---|
 | **canonical HMAC signing key** | `~/.mem0/canonical-key`, its DPAPI blob, tmpfs at runtime | **irreplaceable** |
-| mem0 API key | `~/.mem0/api-key` | re-issuable, but everything is wired to it |
+| mem0 API key | `~/.mem0/api-key`; native authority: `<secrets-dir>/ams-api-key.cred` (systemd credential), exposed to a unit as the file named by `MEM0_API_KEY_FILE` | re-issuable, but everything is wired to it |
 | **service key** (`ams-service-key`, 1.32.5) | native authority: `<secrets-dir>/ams-service-key.cred` (systemd credential); WSL authority: `~/.mem0/service-key` (mode 600) | **regenerable, authority-only** — never on a replica or a PC; restore = regenerate |
 | authority URL | `~/.mem0/authority-url` | config, trivially rebuilt |
 | NVIDIA API key | `~/.claude.json` (`local-offload` env, plaintext) | re-issuable from the vendor |
 | GitHub tokens | OS keyring | re-issuable — `gh auth login` |
 | Codex / ChatGPT OAuth | `~/.codex/auth.json` | re-issuable — re-authenticate |
+
+**Where a process finds the API key.** The shim (`mem0-mcp-shim.py`) and the replay script (`replay-ops.py`) read, in order, the file named by `MEM0_API_KEY_FILE` (when it reads non-empty) and then `~/.mem0/api-key`; neither has a plaintext environment fallback, and a native authority holds no `~/.mem0/api-key`. A process there that is not a unit must decrypt the credential itself and point `MEM0_API_KEY_FILE` at the file it wrote (see [operations](../operations.md#mcp-tools-not-appearing-in-claude-code)), and remove that file when it is done.
 
 **Only the first is irreplaceable**, and it deserves the emphasis. Losing it does not merely
 block future canonical promotions: existing canonical records were signed under that key, so

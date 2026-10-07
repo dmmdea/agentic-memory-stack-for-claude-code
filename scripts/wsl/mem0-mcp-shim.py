@@ -4,6 +4,7 @@ Stdio transport (what Claude Code expects for stdio-type MCP entries).
 """
 from __future__ import annotations
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -34,9 +35,51 @@ def _resolve_authority() -> str:
     return "http://127.0.0.1:18791"
 
 MEM0_URL = _resolve_authority()
-if not KEY_FILE.exists():
-    raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE}")
-MEM0_KEY = KEY_FILE.read_text(encoding="utf-8").strip()
+
+def _read_api_key() -> str:
+    """$MEM0_API_KEY_FILE (a systemd credential on the native authority; non-empty) > ~/.mem0/api-key.
+    Inlined, not imported from ams_env: that module is not deployed in every client layout."""
+    env_path = (os.environ.get("MEM0_API_KEY_FILE") or "").strip()
+    if env_path:
+        try:
+            val = Path(env_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            val = ""
+        if val:
+            return val
+    if not KEY_FILE.exists():
+        raise SystemExit(f"FAIL: mem0 API key not found at {KEY_FILE} (and no readable MEM0_API_KEY_FILE)")
+    return KEY_FILE.read_text(encoding="utf-8").strip()
+
+MEM0_KEY = _read_api_key()
+
+# Tenant. The installers that substitute the operator's tenant into the signature defaults below do
+# not run on a native authority (its scripts are copied raw), so a default that still has the
+# placeholder SHAPE (double-underscore, upper-case, double-underscore) is resolved here at call time.
+_UNRESOLVED_TENANT = re.compile(r"__[A-Z0-9_]+__")
+
+def _resolve_tenant(user_id):
+    """An unresolved placeholder -> MEM0_DEFAULT_USER_ID env > ~/.mem0/stack.env MEM0_WSL_USER > as given.
+    Any other user_id (an explicit tenant, or one an installer already substituted) is returned untouched."""
+    if not _UNRESOLVED_TENANT.fullmatch(user_id or ""):
+        return user_id
+    env = (os.environ.get("MEM0_DEFAULT_USER_ID") or "").strip()
+    if env:
+        return env
+    try:
+        lines = (Path.home() / ".mem0" / "stack.env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return user_id
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "MEM0_WSL_USER":
+            val = val.strip().strip("\"'").strip()
+            if val:
+                return val
+    return user_id
 
 import json as _json
 import uuid as _uuid
@@ -219,6 +262,7 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     downgraded to 'evidence' with a note (1.32.5): only the nightly dream on the authority, holding
     the authority's service key, writes insight records, whatever `source` an MCP call names.
     """
+    user_id = _resolve_tenant(user_id)
     md = dict(metadata or {})
     note = None
     if md.get("tier") == "canonical":
@@ -279,6 +323,7 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     search WITHOUT brand returns only brand-neutral (null-brand) records.
     allow_cross_brand: explicit opt-in for a brandless search to also return
     brand-scoped records from every brand (audited; use deliberately)."""
+    user_id = _resolve_tenant(user_id)
     filters: dict = {"user_id": user_id}
     if brand:
         filters["brand"] = brand
@@ -353,6 +398,7 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
     neutral set. Brandless returns the brand-neutral set only. Either is safe (no cross-brand leak).
     initiative/project scope the goals/questions to a repo leaf. For a DELIBERATE free-text search
     instead of this curated bundle, use memory_search."""
+    user_id = _resolve_tenant(user_id)
     out: dict = {"ok": True}
     # 1) the per-prompt bundle (durable memories + open goals + open questions), checkpoint
     #    suppressed so a manual pull writes no episode. Reuses the EXACT _search_core gate path.
@@ -436,6 +482,7 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
 def memory_list(user_id: str = "__WSL_USER__", limit: int = 50) -> dict:
     """List recent memories for user_id. Hard-capped server-side at 500.
     Prefer memory_search for content discovery; this is for inventory."""
+    user_id = _resolve_tenant(user_id)
     if limit > 500:
         limit = 500
     data, source = _request("GET", "/v1/memories", params={"user_id": user_id, "limit": limit})
@@ -843,6 +890,7 @@ def memory_diagnose(query: str, target_id: str, user_id: str = "__WSL_USER__",
     the defaults mirror the server search defaults, not your caller's (a
     threshold-0.55 hook query diagnosed at 0.1 names the wrong stage).
     Read-only; safe to run against production."""
+    user_id = _resolve_tenant(user_id)
     body: dict = {"query": query, "target_id": target_id, "user_id": user_id,
                   "query_class": query_class, "threshold": threshold,
                   "limit": limit, "rerank": rerank}
@@ -1021,7 +1069,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.32.5"
+SHIM_STACK_VERSION = "1.32.6"
 
 
 def _write_start_receipt() -> None:

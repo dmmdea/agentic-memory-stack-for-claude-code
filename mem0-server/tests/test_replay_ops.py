@@ -315,3 +315,158 @@ def test_powershell_insight_adds_stay_out_of_the_outbox():
     i_insight, i_outbox = body.index("if ($isInsight) {\n"), body.index("Add-Mem0OutboxOp")
     assert i_insight < i_outbox, "an insight add must be routed away BEFORE the Outbox call"
     assert "$poisonCodes += 403" in body
+
+
+# ---------------------------------------------------------------------------------------------
+# 1.32.6: the replay script on a native Linux authority (key = a systemd credential named by
+# MEM0_API_KEY_FILE; the scripts are copied raw, so the tenant placeholder default is resolved at
+# call time). The shim's twin of these tests lives in test_shim_offline.py.
+# ---------------------------------------------------------------------------------------------
+
+import sys, types  # noqa: E402
+
+_SENTINEL = "__WSL_USER__"   # tests are never deployed, so the literal may appear here
+_TOKENS = ("__WSL_USER__", "__WIN_USER__", "__WSL_DISTRO__")
+
+
+@pytest.fixture()
+def nhome(monkeypatch, tmp_path):
+    """A redirected home with an empty ~/.mem0 and none of the resolver's env inputs set."""
+    for var in ("MEM0_API_KEY_FILE", "MEM0_DEFAULT_USER_ID", "MEM0_KEY", "MEM0_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:   # the script imports it at module scope; only its lock helpers use it
+        monkeypatch.setitem(sys.modules, "fcntl", types.ModuleType("fcntl"))
+    h = apply_home(monkeypatch, tmp_path / "home")
+    (h / ".mem0").mkdir(parents=True)
+    return h
+
+
+def _load_native():
+    pytest.importorskip("httpx")
+    spec = importlib.util.spec_from_file_location("replay_native_ut", MOD_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _credential(tmp_path, text="credential-key"):
+    p = tmp_path / "creds" / "ams-api-key"
+    p.parent.mkdir(exist_ok=True)
+    p.write_text(text + "\n", encoding="utf-8")
+    return p
+
+
+def test_replay_credential_file_beats_the_home_key(nhome, monkeypatch, tmp_path):
+    (nhome / ".mem0" / "api-key").write_text("home-key", encoding="utf-8")
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path)))
+    assert _load_native()._headers()["X-API-Key"] == "credential-key"
+
+
+def test_replay_import_succeeds_with_only_the_credential_file(nhome, monkeypatch, tmp_path):
+    assert not (nhome / ".mem0" / "api-key").exists()
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path)))
+    assert _load_native()._headers()["X-API-Key"] == "credential-key"
+
+
+@pytest.mark.parametrize("bad", ["empty", "blank", "missing", "unreadable-dir"])
+def test_replay_unusable_credential_file_falls_back_to_the_home_key(bad, nhome, monkeypatch, tmp_path):
+    (nhome / ".mem0" / "api-key").write_text("home-key\n", encoding="utf-8")
+    p = tmp_path / "creds" / "ams-api-key"
+    p.parent.mkdir()
+    if bad == "empty":
+        p.write_text("", encoding="utf-8")
+    elif bad == "blank":
+        p.write_text("  \n", encoding="utf-8")
+    elif bad == "unreadable-dir":
+        p.mkdir()                      # reading a directory raises OSError on every platform
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(p))
+    assert _load_native()._headers()["X-API-Key"] == "home-key"
+
+
+def test_replay_no_key_anywhere_is_a_fail_exit(nhome):
+    with pytest.raises(SystemExit) as ei:
+        _load_native()
+    assert "mem0 API key not found" in str(ei.value)
+
+
+def test_replay_empty_credential_and_no_home_key_is_a_fail_exit(nhome, monkeypatch, tmp_path):
+    monkeypatch.setenv("MEM0_API_KEY_FILE", str(_credential(tmp_path, text="")))
+    with pytest.raises(SystemExit):
+        _load_native()
+
+
+def test_replay_never_reads_the_key_from_a_plaintext_env_var(nhome, monkeypatch):
+    monkeypatch.setenv("MEM0_KEY", "env-key")
+    monkeypatch.setenv("MEM0_API_KEY", "env-key")
+    with pytest.raises(SystemExit):
+        _load_native()
+
+
+class _Resp:
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+
+@pytest.fixture()
+def nreplay(nhome):
+    (nhome / ".mem0" / "api-key").write_text("home-key", encoding="utf-8")
+    return _load_native()
+
+
+@pytest.fixture()
+def nposted(nreplay, monkeypatch):
+    bodies = []
+    monkeypatch.setattr(nreplay.httpx, "post", lambda url, json=None, **kw: (bodies.append(json) or _Resp()))
+    return bodies
+
+
+def _stack_env(home, text):
+    (home / ".mem0" / "stack.env").write_text(text, encoding="utf-8")
+
+
+def test_replay_add_without_a_user_id_uses_the_stack_env_tenant(nreplay, nposted, nhome):
+    _stack_env(nhome, "# installer\nMEM0_WSL_USER = 'tenant-a'\n")
+    nreplay.dispatch("add", {"text": "x"})
+    assert [b["user_id"] for b in nposted] == ["tenant-a"]
+
+
+def test_replay_env_tenant_beats_stack_env(nreplay, nposted, nhome, monkeypatch):
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    monkeypatch.setenv("MEM0_DEFAULT_USER_ID", "tenant-env")
+    nreplay.dispatch("add", {"text": "x"})
+    assert [b["user_id"] for b in nposted] == ["tenant-env"]
+
+
+def test_replay_resolves_a_placeholder_user_id_that_an_unresolved_shim_queued(nreplay, nposted, nhome):
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    nreplay.dispatch("add", {"text": "x", "user_id": _SENTINEL})
+    assert [b["user_id"] for b in nposted] == ["tenant-a"]
+
+
+def test_replay_explicit_user_id_is_untouched(nreplay, nposted, nhome, monkeypatch):
+    _stack_env(nhome, "MEM0_WSL_USER=tenant-a\n")
+    monkeypatch.setenv("MEM0_DEFAULT_USER_ID", "tenant-env")
+    nreplay.dispatch("add", {"text": "x", "user_id": "explicit-tenant"})
+    assert [b["user_id"] for b in nposted] == ["explicit-tenant"]
+
+
+def test_replay_unresolvable_placeholder_passes_through(nreplay, nposted):
+    nreplay.dispatch("add", {"text": "x"})
+    assert [b["user_id"] for b in nposted] == [_SENTINEL]
+
+
+def test_replay_keeps_the_placeholder_literal_once_and_no_other_token():
+    """install/linux-client.sh substitutes it (test_linux_client_installer pins that); runtime
+    resolution must not remove what the installers substitute."""
+    text = MOD_PATH.read_text(encoding="utf-8")
+    assert text.count(_SENTINEL) == 1
+    assert text.count("__WIN_USER__") == 0 and text.count("__WSL_DISTRO__") == 0
+
+
+def test_the_linux_client_substitution_leaves_no_sentinel_in_replay_ops():
+    deployed = MOD_PATH.read_text(encoding="utf-8").replace(_SENTINEL, "someuser")
+    assert not any(tok in deployed for tok in _TOKENS)
