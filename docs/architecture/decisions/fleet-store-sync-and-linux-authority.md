@@ -248,6 +248,16 @@ validates the plan before writing and writes nothing when validation fails, beca
 plan makes the applier refuse the whole file and take every store's decisions down with it, while
 a missing one costs exactly one night of judgement.
 
+## Amendment 2026-10-07: the shim and the replay script resolve the key and the tenant at runtime
+
+The native authority copies `scripts/wsl/*` raw, while the WSL and thin-client installers substitute the
+operator's tenant into them, and the key it holds is a systemd credential, not `~/.mem0/api-key`. A local MCP
+client on that box therefore could not start, and would have written under the placeholder tenant had it started.
+The consequence is that the two scripts a client runs carry their own small resolvers (key file from
+`MEM0_API_KEY_FILE`, then `~/.mem0/api-key`; a placeholder-shaped tenant from `MEM0_DEFAULT_USER_ID`, then
+`stack.env`) instead of importing `ams_env`, which is not deployed in every client layout, and the installer
+substitution stays the primary path everywhere it runs. No plaintext environment fallback was added for the key.
+
 ## Alternatives considered
 
 - **Keep the authority on the workstation and only run the nightly on the server.** Rejected:

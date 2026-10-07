@@ -272,6 +272,17 @@ wsl -e bash -lc "~/apps/mem0-server/.venv/bin/python $shim < /dev/null"
 - **mem0 down** → all tools fail: `systemctl --user start mem0.service`.
 - **Server config changed** → MCP servers spawn at session start; restart VS Code.
 - **Banner corruption** (fastmcp ANSI banner on stdout) → `mcp.run(show_banner=False)` must be set (it is, in the shipped shim).
+- **A local client on the native Linux authority** (1.32.6). That box has no `~/.mem0/api-key`: the key exists only as the encrypted credential `<secrets-dir>/ams-api-key.cred`, so a shim started outside a unit exits with `FAIL: mem0 API key not found`. Decrypt the credential to a private file and name it in `MEM0_API_KEY_FILE` for the shim's launch. The tenant needs nothing: a placeholder tenant is read from `MEM0_DEFAULT_USER_ID`, else from `MEM0_WSL_USER` in `~/.mem0/stack.env`.
+
+  ```bash
+  umask 077
+  systemd-creds --user decrypt --name=ams-api-key "<secrets-dir>/ams-api-key.cred" "$XDG_RUNTIME_DIR/ams-api-key"
+  export MEM0_API_KEY_FILE="$XDG_RUNTIME_DIR/ams-api-key"   # a runtime-dir file, gone at logout
+  # start (or register) the shim with MEM0_API_KEY_FILE in its environment; when the session is over:
+  rm -f "$XDG_RUNTIME_DIR/ams-api-key"
+  ```
+
+  A shim that starts but writes under a tenant you do not recognise: check `MEM0_DEFAULT_USER_ID` and the `MEM0_WSL_USER` line in `~/.mem0/stack.env`.
 
 ---
 

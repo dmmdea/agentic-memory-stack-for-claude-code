@@ -4,6 +4,28 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.32.6 — the MCP shim and the replay script run on the native authority: the key and the tenant resolve at runtime (2026-10-07)
+
+### Fixed
+- **`mem0-mcp-shim.py` and `replay-ops.py` could not start on a native Linux authority.** Both read the API key
+  only from `~/.mem0/api-key`, and the shim exited at import when that file was missing. On the native authority the
+  key exists only as a systemd encrypted credential, which a unit sees as a file whose path is in `MEM0_API_KEY_FILE`.
+  Both now resolve the key as `MEM0_API_KEY_FILE` (when the file reads non-empty), then `~/.mem0/api-key`, then
+  the same `FAIL: mem0 API key not found` exit as before. The resolver is inlined in each file, because
+  `ams_env.py` is not deployed in the Windows and Linux-client layouts, and it adds no plaintext environment
+  fallback: a process that wants the credential loads it and names the file, nothing else.
+- **A local MCP client on the native authority wrote and searched under a placeholder tenant.** The five shim tools
+  (`memory_add`, `memory_search`, `memory_recall`, `memory_list`, `memory_diagnose`) and the `add` replay in
+  `replay-ops.py` default `user_id` to an operator placeholder that the Windows installer and
+  `install/linux-client.sh` substitute at deploy time. `install/linux-authority.sh` copies the scripts raw, so on
+  the authority the placeholder reached the server as a literal tenant (the failure class of the unresolved-sentinel
+  entries further down). A `user_id` with the placeholder shape (double underscore, upper case, double
+  underscore) is now resolved at call time: `MEM0_DEFAULT_USER_ID`, then `MEM0_WSL_USER` in `~/.mem0/stack.env`,
+  else left as given. An explicit tenant is never touched, and the signature defaults are unchanged, so the
+  installers' substitution and their unresolved-sentinel check behave exactly as before.
+- **The plugin manifests carried 1.28.5.** `.claude-plugin/plugin.json` and `marketplace.json` are back in step
+  with `VERSION`.
+
 ## 1.32.5 — a server-side job label needs the authority's service key, and an insight leaves insight only by a signed demote (2026-10-01)
 
 ### Security
