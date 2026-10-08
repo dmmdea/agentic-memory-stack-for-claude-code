@@ -35,17 +35,17 @@ def test_brand_coherence_floor_disabled_by_default_admits_low_score():
     """Default (None): a same-brand match is admitted regardless of score — no
     behavior change vs pre-R5."""
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None)
-    r = _result(brand="ai-ecosystem"); r["score"] = 0.05
+    r = _result(brand="ai-ecosystem"); r["cosine"] = 0.05
     d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
     assert d.admit is True
 
 
 def test_brand_coherence_floor_rejects_weak_same_brand_match():
-    """Floor enabled: a branded result whose score is below the floor is cut as a
+    """Floor enabled: a branded result whose raw cosine is below the floor is cut as a
     near-but-wrong-domain match."""
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
                              brand_coherence_floor=0.20)
-    r = _result(brand="ai-ecosystem"); r["score"] = 0.08
+    r = _result(brand="ai-ecosystem"); r["cosine"] = 0.08
     d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
     assert d.admit is False
     assert d.reason.startswith("brand_coherence")
@@ -54,18 +54,30 @@ def test_brand_coherence_floor_rejects_weak_same_brand_match():
 def test_brand_coherence_floor_admits_strong_same_brand_match():
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
                              brand_coherence_floor=0.20)
-    r = _result(brand="ai-ecosystem"); r["score"] = 0.51
+    r = _result(brand="ai-ecosystem"); r["cosine"] = 0.51
     d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
     assert d.admit is True
 
 
 def test_brand_coherence_floor_fails_open_without_score():
-    """No score on the result -> fail-open (admitted), like the relevance floor."""
+    """No cosine on the result (a lexical-only rescue) -> fail-open (admitted), like the relevance floor."""
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
                              brand_coherence_floor=0.20)
-    r = _result(brand="ai-ecosystem")  # no 'score' key
+    r = _result(brand="ai-ecosystem"); r["score"] = 0.01  # a fused score, but no 'cosine' key
     d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
     assert d.admit is True
+
+
+def test_brand_coherence_floor_reads_the_raw_cosine_never_the_fused_score():
+    """1.34.0: `score` is the rank-fusion score (fusion.py), on another scale than the floor. A low
+    fused score with a strong cosine is admitted; a high fused score with a weak cosine is cut."""
+    policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
+                             brand_coherence_floor=0.20)
+    r = _result(brand="ai-ecosystem"); r["score"] = 0.12; r["cosine"] = 0.48
+    assert policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable").admit is True
+    r = _result(brand="ai-ecosystem"); r["score"] = 0.95; r["cosine"] = 0.11
+    d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
+    assert d.admit is False and d.reason == "brand_coherence:0.11_below_0.2"
 
 
 def test_brand_coherence_floor_ignores_null_brand_records():
@@ -73,7 +85,7 @@ def test_brand_coherence_floor_ignores_null_brand_records():
     not subject to it (it carries no domain to be incoherent with)."""
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
                              brand_coherence_floor=0.20)
-    r = _result(brand=None); r["score"] = 0.01
+    r = _result(brand=None); r["cosine"] = 0.01
     d = policy.evaluate(r, scope={"brand": "ai-ecosystem"}, query_class="durable")
     assert d.admit is True
 
@@ -684,7 +696,7 @@ def test_stats_out_counts_every_family(tmp_path, monkeypatch):
     con = _result(mid="f-con")
     con["metadata"]["contradicts_canonical"] = "m-canon"
     weak_brand = _result(mid="f-coh", brand="ai-ecosystem")
-    weak_brand["score"] = 0.10                      # below coherence floor
+    weak_brand["cosine"] = 0.10                     # below coherence floor (it reads the raw cosine)
     weak_rel = _result(mid="f-rel")
     weak_rel["rerank_score"] = 0.10                 # below relevance floor
 
@@ -849,7 +861,7 @@ def test_shared_brand_skips_the_brand_coherence_floor(tmp_path, monkeypatch):
     _shared_home(tmp_path, monkeypatch)
     policy = AdmissionPolicy(allowed_tiers=("stable", "evidence"), max_age_days=None,
                              brand_coherence_floor=0.20, shared_brands=("shared-a",))
-    r = _result(brand="shared-a"); r["score"] = 0.01
+    r = _result(brand="shared-a"); r["cosine"] = 0.01
     assert policy.evaluate(r, scope={"brand": "brand-b"}, query_class="durable").admit is True
 
 

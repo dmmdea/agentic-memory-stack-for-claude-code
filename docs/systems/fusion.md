@@ -39,7 +39,8 @@ deliberate searches and is unchanged.
   `[1/(k + r_dense) + w_bm25/(k + r_bm25) + w_entity/(k + r_entity)] / [(1 + w_bm25 + w_entity)/(k + 1)]`
   with k = 2, w_bm25 = 0.4, w_entity = 0.25. It lies in (0, 1], is 1.0 only for a candidate ranked first
   by every leg, and orders the results. It is not a cosine.
-- **Raw cosine** — still what every relevance threshold compares (the gate runs before fusion).
+- **Raw cosine** — still what every relevance threshold compares (the gate runs before fusion); each
+  search result carries it as `cosine`.
 
 ## How the system works
 
@@ -49,7 +50,8 @@ looked up by name in both the sync and the async search. At start the server ass
 `fusion.ams_score_and_rank` to that global (`fusion.install`). The replacement drops candidates whose
 raw cosine is below the caller's threshold, ranks the rest by weighted reciprocal rank fusion over the
 legs, and returns the top `top_k` as `{id, score, payload}`; mem0 formats them as before. Each call also
-records every candidate's legs (raw cosine, ranks, BM25 value, entity boost) for that request.
+records every candidate's legs (raw cosine, ranks, BM25 value, entity boost) for that request, and the
+server's search copies each result's raw cosine onto it as `cosine` (`fusion.end_search`).
 
 ### Why mem0's own formula ranked badly
 
@@ -97,9 +99,10 @@ formula).
 
 How the constants were chosen: a grid over k (1-60) and the keyword weight (0.1-0.8) traces a frontier
 from paraphrase recall to identifier recall. The shipped point is the one that loses nothing to dense
-search on paraphrases and then gains most on identifiers; k = 2 is also Qdrant's own RRF default, and the
-surface is flat between k = 1 and 3. The entity weight made no measurable difference on either set
-and stays at 0.25, as mem0 designed the leg.
+search on paraphrases and then gains most on identifiers, and the surface is flat between k = 1 and 3.
+Ranks count from 1 here; Qdrant's RRF counts them from 0, so its default k = 2 is k = 1 in this formula.
+The entity weight made no measurable difference on either set and stays at 0.25, as mem0 designed the
+leg.
 
 ### The embedding-model question
 
@@ -109,38 +112,54 @@ of nine). The memories stay on EmbeddingGemma-300m ([embedder profiles](embedder
 
 ## Important flows
 
-- **Rollback**: `MEM0_FUSION=mem0` in the server's environment (unit drop-in or stack.env) and a restart:
-  the binding stays, the ranking is mem0's own formula again (measured identical to stock mem0).
-- **After a mem0 upgrade**: `/health/deep` `checks.fusion.bound` must be true. It is false when mem0
-  stops calling the module global (`Memory._search_vector_store` no longer names `score_and_rank`), and
-  that flips `ok`, so the installers' post-condition fails instead of the stack silently ranking the old
-  way.
+- **Rollback**: `MEM0_FUSION=mem0` in the server's process environment and a restart: the binding stays,
+  the ranking is mem0's own formula again (measured identical to stock mem0). The server unit has no
+  `EnvironmentFile=`, so a line in `stack.env` does nothing; use a drop-in of your own, which no
+  installer rewrites (the native authority's writes only `native.conf`): `systemctl --user edit mem0`, add
+  `[Service]` and `Environment=MEM0_FUSION=mem0`, then `systemctl --user restart mem0`. `/health/deep`
+  `checks.fusion.mode` reads `mem0` while it is on; delete the drop-in and restart to undo it.
+- **After a mem0 upgrade**: `/health/deep` `checks.fusion.ok` must be true. It is false when mem0 no
+  longer loads the module global at call time (`Memory._search_vector_store` has no `LOAD_GLOBAL` of
+  `score_and_rank` in `mem0.memory.main`'s namespace), when mem0's `score_and_rank` takes a parameter
+  the fusion does not (the fusion then stays unbound and mem0's formula ranks), and when a search
+  returned results without reaching the fusion (`searches.bypassed`). That flips `ok`, so the native
+  authority installer's post-condition, `deploy.sh`'s post-restart gate and Test-MemoryStack's L2 row
+  fail instead of the stack silently ranking the old way. To run such a mem0 anyway, set the mem0 mode
+  (Rollback, above): it needs no binding, so `ok` stays true.
 - **Re-measuring**: the private operator repo's `eval/embedder-ab/scripts` (`capture_mem0.py`,
   `offline_fusion.py`, `analyze_fusion.py`) re-run the whole matrix in minutes from one capture pass.
 
 ## Interfaces and entry points
 
-`fusion.install()` (server start), `fusion.ams_score_and_rank` (mem0's hook), `fusion.last_legs()` (the
-current request's legs), `GET /health/deep` `checks.fusion` (`{ok, mode, bound, callers_bound}`),
-`MEM0_FUSION` (`rrf` default, `mem0`). `POST /v1/memories/search` with `explain` passes `score_details`
-(ranks and raw values per leg) through mem0 2.1.0.
+`fusion.install()` (server start), `fusion.ams_score_and_rank` (mem0's hook), `fusion.begin_search()` /
+`fusion.end_search()` (around the server's `mem.search`: the request's legs start empty, then each
+result gets its `cosine` and the search is counted), `fusion.last_legs()` (the current request's legs),
+`fusion.health()` (`GET /health/deep` `checks.fusion`: `{ok, mode, bound, callers_bound, searches:
+{reached, bypassed}[, error]}`), `MEM0_FUSION` (`rrf` default, `mem0`). A search with `explain` adds a
+`fusion` stage to the `_explain` trace: the mode and the legs (raw cosine, ranks, BM25 value, entity
+boost, fused score) of the first 20 results.
 
 ## Invariants and assumptions
 
 - The caller's threshold is compared to the raw cosine, before fusion, exactly as mem0 does.
 - Candidates are the dense pool only; a keyword-only memory is not a candidate here (the deliberate
   search's union leg in `app.py` is the one place that adds those, and only the reranker can keep them).
-- `score` is in (0, 1] and monotone with the order; equal scores keep the dense order.
-- Nothing may threshold on `score` as if it were a cosine.
+- `score` is in (0, 1]; the fusion returns its results in descending `score`, and equal scores keep
+  the dense order. Later stages re-order without rewriting it (durable freshness sorts by
+  `durable_freshness_score`, the reranker by `rerank_score`), so a response is not always in `score`
+  order.
+- Nothing may threshold on `score` as if it were a cosine; compare `cosine`.
 
 ## Error handling
 
 `fusion.install` never raises: an unexpected mem0 shape is reported in `checks.fusion.error` and
-`bound` reads false. An unknown `MEM0_FUSION` value falls back to `rrf`.
+`bound` reads false. An unknown `MEM0_FUSION` value falls back to `rrf`. A result without a `cosine`
+(a lexical-only rescue) passes the brand-coherence floor (fail-open).
 
 ## Observability and debugging
 
-`/health/deep` `checks.fusion`; the `explain` trace on a search; `POST /v1/memories/diagnose` reports
+`/health/deep` `checks.fusion` (with `searches.reached` / `bypassed` since start); each result's
+`cosine`; the `fusion` stage of a search's `explain` trace; `POST /v1/memories/diagnose` reports
 the target's fused `score` and its raw `cosine`, and its threshold verdict compares the cosine (the live
 gate's footing).
 
@@ -148,14 +167,18 @@ gate's footing).
 
 `mem0-server/tests/test_fusion.py` (pure, CI-gated): the raw-cosine gate, the formula, rank-only
 behaviour (a compressed space gives identical scores), the spacing against a 0.8 freshness weight, a
-keyword match lifting a near-top candidate without burying the dense leader, the rollback mode, the
-binding self-check (bound and unbound) and the server wiring.
+keyword match lifting a near-top candidate without burying the dense leader, the rollback mode (which
+keeps the raw cosine), the binding self-check (a global load, an attribute load, another module's
+method, a signature mismatch), the bypass count and `health()`, and the server wiring.
+`mem0-server/tests/test_fusion_mem0.py` (local; skips without mem0) binds into the installed mem0
+and runs its real sync and async search over a stub store: the results are the fusion's, and the
+mem0 mode reproduces stock mem0.
 
 ## Common pitfalls
 
 - The fused score is not a cosine: the reranker's skip cut is 1.0 (every leg ranks the head first) in
-  every space, and the admission gate's optional brand-coherence floor (off everywhere) would need a value
-  on this scale if it is ever enabled.
+  every space, and anything that compares a cosine reads the result's `cosine` (the admission gate's
+  optional brand-coherence floor, off everywhere) or the request's `threshold`, never `score`.
 - A change to freshness, the pool size or the legs moves the ranking: re-run the lab matrix.
 
 ## Source map

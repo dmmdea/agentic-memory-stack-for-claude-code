@@ -31,10 +31,12 @@ EmbeddingGemma-2, whose cosine scale is more compressed, lost even more (audit E
   and freshness becomes the mild recency preference it was meant to be.
 - The fusion is scale-free: a future embedding space needs no new fusion constants (its cosine
   thresholds still need calibrating).
-- The server depends on a private mem0 binding; the health check turns a mem0 refactor into a failed
-  deploy instead of a silent regression.
-- Search results' `score` changes meaning (rank fusion, not a cosine-like sum); nothing in the stack
-  thresholds on it as a cosine.
+- The server depends on a private mem0 binding; the health check (the code mem0 runs, its signature,
+  and a count of searches that bypassed the fusion) turns a mem0 refactor into a failed deploy instead
+  of a silent regression, and `MEM0_FUSION=mem0` runs such a mem0 on purpose.
+- Search results' `score` changes meaning (rank fusion, not a cosine-like sum). Each result now also
+  carries its raw `cosine`, and the one reader that compared `score` with a cosine-scale value (the
+  admission gate's optional brand-coherence floor, off everywhere) reads `cosine` instead.
 
 ## Alternatives considered
 

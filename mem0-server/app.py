@@ -518,10 +518,10 @@ NLI_GATE_ENABLED = _env_flag("MEM0_NLI_GATE_ENABLED")  # opt-in; default OFF
 NLI_GATE_COSINE_FLOOR = _embedder_profile.threshold("nli_floor", EMBED_PROFILE)  # SEMANTIC scale (raw cosine), NOT the hybrid score; per embedding space (env MEM0_NLI_GATE_COSINE_FLOOR wins)
 NLI_GATE_TOPK = _env_int("MEM0_NLI_GATE_TOPK", 3)
 NLI_GATE_TIMEOUT_S = _env_int("MEM0_NLI_GATE_TIMEOUT_S", 45)  # Codex low-effort NLI runs ~20-30s
-# Over-fetch window for the canonical pre-filter: mem.search returns the top-N by COMBINED
-# score above the SEMANTIC floor, and _search_core then post-filters that window to canonical/
-# stable. A small top_k could truncate a canonical neighbor sitting below several evidence
-# neighbors on the combined scale (audit MED), so fetch wide then let the tier filter narrow.
+# Over-fetch window for the canonical pre-filter: mem.search returns the top-N by the FUSED
+# score (fusion.py) above the raw-cosine floor, and _search_core then post-filters that window to
+# canonical/stable. A small top_k could truncate a canonical neighbor ranked below several evidence
+# neighbors (audit MED), so fetch wide then let the tier filter narrow.
 # Cheap — the gate runs ASYNC, off the hot path.
 NLI_GATE_FETCH = _env_int("MEM0_NLI_GATE_FETCH", 25)
 # Retrieval-gating metadata keys a caller must NOT be able to set via add() (mirrors the PATCH
@@ -1140,10 +1140,11 @@ def health_deep() -> dict:
     except Exception as e:
         out["ok"] = False
         out["checks"]["embedder"] = {"ok": False, "error": str(e)[:120]}
-    # Hybrid fusion binding (fusion.install at start): bound=False means mem0 ranks with its own
-    # additive formula again (a mem0 release moved the scoring), which flips ok so the deploy gate fails.
-    out["checks"]["fusion"] = {"ok": bool(FUSION_STATUS.get("bound")), **FUSION_STATUS}
-    if not FUSION_STATUS.get("bound"):
+    # Hybrid fusion (fusion.install at start, fusion.end_search per search): not bound, or a search that
+    # returned results without reaching it, means mem0 ranks with its own additive formula again (a mem0
+    # release moved the scoring). That flips ok, so the deploy gates fail; MEM0_FUSION=mem0 is exempt.
+    out["checks"]["fusion"] = fusion_check = _fusion.health(FUSION_STATUS)
+    if not fusion_check["ok"]:
         out["ok"] = False
     # v0.19 M10: hook-contract drift counters (in-process, zero I/O). missing =
     # field-less callers (documented-legitimate, logged INFO); unknown = real
@@ -1505,15 +1506,23 @@ def _search_core(b: SearchIn, _route: str = "search"):
             "capped_limit": capped_limit, "buffer": _buf,
             "overfetch_limit": overfetch_limit,
             "collapsed": bool(capped_limit > 0 and overfetch_limit == capped_limit)}})
+    # mem0 ranks the dense pool through fusion.py (rank fusion): each result's `score` is the fused
+    # score, and end_search adds its raw `cosine`, the value b.threshold compared.
+    _fusion.begin_search()
     results = mem.search(
         query=b.query,
         filters=search_filters,
         top_k=overfetch_limit,
         threshold=b.threshold,
     )
+    _fusion.end_search(results)
     if _explain_on:
         _n = len(results.get("results") or []) if isinstance(results, dict) else 0
         _trace.append({"stage": "dense_fetch", "out": _n})
+        _legs = _fusion.last_legs() or {}
+        _trace.append({"stage": "fusion", "detail": {"mode": _fusion.mode(), "legs": {
+            str(r.get("id")): _legs.get(str(r.get("id")))
+            for r in ((results.get("results") or []) if isinstance(results, dict) else [])[:20]}}})
     # ------------------------------------------------------------------
     # W5 T5 (AMS-56): keyword-recall union leg — DELIBERATE PATH ONLY.
     # mem0's fusion builds candidates exclusively from the dense window, so a
@@ -1952,8 +1961,10 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
         if b.rerank:
             _buf = min(_buf, 10)
         overfetch_limit = 0 if capped_limit == 0 else min(capped_limit + _buf, 500)
+        _fusion.begin_search()
         probe = mem.search(query=b.query, filters={"user_id": user_id},
                            top_k=500, threshold=0.0)
+        _fusion.end_search(probe)
         probe_items = (probe.get("results") or []) if isinstance(probe, dict) else []
         dense_rank = None
         dense_score = None
@@ -1963,9 +1974,9 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                 dense_score = _r.get("score")
                 break
         # The live gate compares the RAW cosine (the fusion keeps the threshold on it), so the
-        # threshold verdict must too; the fused score is on another footing. The fusion records each
-        # candidate's legs for this request; under MEM0_FUSION=mem0 there are none and the fused
-        # score stands in, as before.
+        # threshold verdict must too; the fused score is on another footing. The fusion records every
+        # pool candidate's raw cosine for this request in either mode; the fused score stands in only
+        # when the search never reached the fusion (checks.fusion reports that as a bypass).
         dense_cosine = ((_fusion.last_legs() or {}).get(b.target_id) or {}).get("cosine")
         gate_score = dense_cosine if dense_cosine is not None else dense_score
         # -- probe 2: flags off the payload --
@@ -1974,7 +1985,7 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
         # -- probe 3: pure admission verdict (query_class normalized — the
         # v0.19 L4/L8 class: 'Operational' must not skip the recency branch) --
         adm_record = {"id": b.target_id, "memory": payload.get("data"),
-                      "metadata": target_meta, "score": dense_score,
+                      "metadata": target_meta, "score": dense_score, "cosine": dense_cosine,
                       "created_at": payload.get("created_at")}
         scope = {"user_id": user_id, "brand": b.brand,
                  "allow_cross_brand": b.allow_cross_brand}

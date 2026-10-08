@@ -165,9 +165,9 @@ class AdmissionPolicy:
     # cross-brand admission "beyond cosine" (MemGate 2606.06054 motivates learned
     # admissibility; this is the score-floor approximation). For a BRANDED result
     # (res_brand truthy) admitted under a brand-scoped request, reject it when its
-    # retrieval score is below this floor — catches a near-but-wrong-domain
+    # raw cosine (`cosine`) is below this floor — catches a near-but-wrong-domain
     # branded match that the flat cosine boundary would have surfaced. None =
-    # disabled (default); fail-open when the result carries no score. The
+    # disabled (default); fail-open when the result carries no cosine. The
     # fail-CLOSED brand-mismatch / brandless rules below are unchanged — this only
     # ADDS a within-brand weak-match cut. Populated from MEM0_BRAND_COHERENCE_THRESHOLD.
     brand_coherence_floor: Optional[float] = None
@@ -244,12 +244,15 @@ class AdmissionPolicy:
             # fail-open (brandless searches returned every brand's records).
             return AdmissionDecision(False, f"brand_scope_required:{res_brand}")
         # 2b. v1.0 R5: brand-coherence floor — a BRANDED result that survived the
-        # fail-closed match above is still cut if its retrieval score is below the
+        # fail-closed match above is still cut if its raw cosine is below the
         # configured floor (a weak near-but-wrong-domain branded match). Disabled by
-        # default (None); fail-open when the result has no score. Never relaxes the
-        # fail-closed rules above; only tightens within-brand admission.
+        # default (None); fail-open when the result has no cosine. Never relaxes the
+        # fail-closed rules above; only tightens within-brand admission. The cosine
+        # (`cosine`, stamped by the search from the fusion's legs), never `score`: since
+        # 1.34.0 `score` is the rank-fusion score (fusion.py), which is not on the cosine
+        # scale the floor is set on.
         if self.brand_coherence_floor is not None and res_brand:
-            cscore = result.get("score")
+            cscore = result.get("cosine")
             if cscore is not None:
                 try:
                     if float(cscore) < self.brand_coherence_floor:
@@ -327,7 +330,8 @@ def _brand_coherence_floor_from_env() -> Optional[float]:
     """v1.0 R5: parse MEM0_BRAND_COHERENCE_THRESHOLD (the within-brand weak-match
     cut). Disabled-by-default: absent / empty / '0' / unparseable / non-finite ->
     None (no floor). Mirrors _relevance_floor_from_env's safety so a bad value can
-    never cause surprise rejections. Operates on the result's retrieval `score`."""
+    never cause surprise rejections. Operates on the result's raw cosine (`cosine`,
+    stamped by the search), never the rank-fusion `score`."""
     raw = os.environ.get("MEM0_BRAND_COHERENCE_THRESHOLD", "").strip()
     if not raw:
         return None

@@ -166,6 +166,8 @@ try {
         # AMS-09 (W2): a dead BM25 sparse leg also flips ok=false — name it here
         # so the L2 FAIL row is never an empty error list.
         if ($hd.checks.sparse_leg -and -not $hd.checks.sparse_leg.ok) { $errs += "sparse_leg: $(if ($hd.checks.sparse_leg.error) { $hd.checks.sparse_leg.error } else { 'BM25 leg dead (fastembed/slot/canary)' })" }
+        # 1.34.0: search not bound to the rank fusion (mem0 ranks with its own formula) flips ok=false too.
+        if ($hd.checks.fusion -and -not $hd.checks.fusion.ok) { $errs += "fusion: not bound (mode=$($hd.checks.fusion.mode), bypassed=$($hd.checks.fusion.searches.bypassed)$(if ($hd.checks.fusion.error) { ", $($hd.checks.fusion.error)" }); docs/systems/fusion.md)" }
         Add-Check 'LIVENESS' 'mem0 /health/deep' 'FAIL' ($errs -join '; ')
     }
 } catch { Add-Check 'LIVENESS' 'mem0 /health/deep' 'FAIL' $_.Exception.Message }

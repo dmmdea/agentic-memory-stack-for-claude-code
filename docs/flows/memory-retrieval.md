@@ -37,9 +37,9 @@ The BM25 leg is not free-standing: mem0 encodes sparse vectors with **fastembed*
 
 The subtlety that has caused real miscalibration:
 
-> **The relevance gate applies to the raw SEMANTIC cosine; the score the API returns is the COMBINED (semantic+bm25+entity)/max value — a different, higher scale.**
+> **The relevance gate applies to the raw SEMANTIC cosine; the `score` the API returns is the rank-fusion score ([fusion](../systems/fusion.md), 1.34.0; before it, mem0's COMBINED (semantic+bm25+entity)/max value) — not a cosine at all.** Each result also carries its raw `cosine`, the value the gate compared.
 
-Calibrate thresholds against the *semantic* scale (binary-search the highest threshold at which a query still returns), never against the returned score. A first calibration pass measured the returned score, chose 0.50, and the live bundle abstained on *everything* — a relevant prompt whose combined score was 0.71 had semantic ≈ 0.42.
+Calibrate thresholds against the *semantic* scale (binary-search the highest threshold at which a query still returns, or read `cosine`), never against the returned score. A first calibration pass measured the returned score, chose 0.50, and the live bundle abstained on *everything* — a relevant prompt whose combined score was 0.71 had semantic ≈ 0.42.
 
 **The calibration record** (eval harness, private repo): on EmbeddingGemma's compressed cosine scale, off-domain prompts top out ≈ 0.12; genuinely relevant ones run 0.25–0.57 (median ≈ 0.33). The production gate is **0.30**: it rejects everything clearly-irrelevant with margin, while 0.35 was measured to crater recall to ≈ 0.47 and 0.50 to zero. That is why the gate must not be "tightened" as a precision lever — precision comes from admission, tiers, and abstention downstream.
 
@@ -126,7 +126,7 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 
 ## Invariants and assumptions
 
-- **Calibrate on the semantic scale, never the returned combined score** — the trap above; the gate applies to the raw semantic cosine.
+- **Calibrate on the semantic scale, never the returned `score`** — the trap above; the gate applies to the raw semantic cosine (a result's `cosine`), and `score` is the rank-fusion score.
 - **Abstention-first** — no memory clears the gate → no block renders; goals/questions alone never inject.
 - **The 0.30 gate is an admission floor, not a precision lever** — precision comes from admission, tiers, and abstention, not from tightening the gate.
 - **Rerank never runs on the hot path** — only on deliberate `memory_search` at `limit ≥ 5`.
@@ -184,4 +184,4 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 
 ## W5 (AMS-56): the keyword-recall union leg
 
-mem0's internal hybrid re-scores ONLY candidates from the dense window, so an exact-token target (a port, id, or slug) whose dense rank sits past the window is structurally unreachable no matter how strong its BM25 score. On the DELIBERATE path only (`rerank: true` — the per-prompt bundle and the NLI gate hardcode `rerank: false` and are structurally excluded), the server unions `keyword_search` hits absent from the dense pool into the candidate list BEFORE the retired/intent filters, rerank, and admission, hydrated to the standard result shape with `lexical_only: true` and NO score key (a BM25 magnitude on the cosine-calibrated scale would poison the brand-coherence floor). The rerank is FORCED when lexical candidates are present, and the fail-closed rule is binding: a `lexical_only` item either carries a real `rerank_score` or is dropped. The leg stands down at `limit > 50` (latency guardrail) and never breaks dense search (whole-leg try/except). Receipts: `lexical_candidates` / `lexical_added` / `lexical_kept` in the retrieval log, plus the `route` field discriminating search/bundle/nli callers.
+mem0's internal hybrid re-scores ONLY candidates from the dense window, so an exact-token target (a port, id, or slug) whose dense rank sits past the window is structurally unreachable no matter how strong its BM25 score. On the DELIBERATE path only (`rerank: true` — the per-prompt bundle and the NLI gate hardcode `rerank: false` and are structurally excluded), the server unions `keyword_search` hits absent from the dense pool into the candidate list BEFORE the retired/intent filters, rerank, and admission, hydrated to the standard result shape with `lexical_only: true` and NO score or cosine key (a BM25 magnitude in either would poison the ordering and the brand-coherence floor, which reads `cosine` and fails open without one). The rerank is FORCED when lexical candidates are present, and the fail-closed rule is binding: a `lexical_only` item either carries a real `rerank_score` or is dropped. The leg stands down at `limit > 50` (latency guardrail) and never breaks dense search (whole-leg try/except). Receipts: `lexical_candidates` / `lexical_added` / `lexical_kept` in the retrieval log, plus the `route` field discriminating search/bundle/nli callers.

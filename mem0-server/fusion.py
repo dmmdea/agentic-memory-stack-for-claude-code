@@ -20,7 +20,8 @@ keyword match / an entity boost (a candidate without one gets no term for that l
 care how compressed a model's cosine scale is, and the score keeps the top ranks well apart (with
 k=2 the dense leg alone gives rank 1 / 2 / 3 the values 0.61 / 0.45 / 0.36), so a freshness weight
 of 0.8 moves a memory a rank or two instead of to the bottom. The constants were chosen on the
-2026-10-08 lab (docs/systems/fusion.md): k is Qdrant's own RRF default.
+2026-10-08 lab (docs/systems/fusion.md). Ranks count from 1 (Qdrant's RRF counts from 0, so its
+default k = 2 is k = 1 here).
 
 Contract callers depend on (pinned in tests/test_fusion.py):
 * the caller's threshold gates the RAW cosine before any fusion (the context-bundle relevance gate,
@@ -30,17 +31,21 @@ Contract callers depend on (pinned in tests/test_fusion.py):
 * it returns [{id, score, payload[, score_details]}] sorted by score descending, at most top_k long,
   with score in (0, 1] and monotone with the order;
 * each call records the per-id legs (the raw cosine among them) for the request, for the diagnose
-  verdict and observability (last_legs).
+  verdict, the admission gate's cosine floors and observability (last_legs, stamp_cosine). The mem0
+  mode records the raw cosine too, so those readers compare a cosine whichever formula ranks.
 
-Modes (MEM0_FUSION): "rrf" (the default) and "mem0" (mem0's own additive formula, the rollback).
+Modes (MEM0_FUSION, read from the process environment): "rrf" (the default) and "mem0" (mem0's own
+additive formula: the rollback, and the way to run a mem0 the fusion cannot bind to; see health()).
 """
 from __future__ import annotations
 
 import contextvars
+import dis
+import inspect
 import os
 from typing import Any, Dict, List, Optional
 
-RRF_K = 2.0            # Qdrant's RRF default; the lab's surface is flat between 1 and 3
+RRF_K = 2.0            # on 1-based ranks; the lab's surface is flat between 1 and 3
 RRF_W_BM25 = 0.4       # the keyword leg's weight relative to the dense leg (1.0)
 RRF_W_ENTITY = 0.25    # the entity leg's weight (neutral on the lab sets, kept for entity-led queries)
 MODES = ("rrf", "mem0")
@@ -118,20 +123,51 @@ def ams_score_and_rank(semantic_results, bm25_scores, entity_boosts, threshold, 
     bm25_scores = bm25_scores or {}
     entity_boosts = entity_boosts or {}
     if mode() == "mem0" and _MEM0_ORIGINAL is not None:
-        LAST_LEGS.set(None)
+        LAST_LEGS.set({str(r["id"]): {"cosine": float(r.get("score") or 0.0)}
+                       for r in semantic_results if r.get("id") is not None})
         kw = {"explain": explain} if explain else {}
         return _MEM0_ORIGINAL(semantic_results=semantic_results, bm25_scores=bm25_scores,
                               entity_boosts=entity_boosts, threshold=threshold, top_k=top_k, **kw)
     return rrf(semantic_results, bm25_scores, entity_boosts, threshold, top_k, explain=explain)
 
 
+# The parameters ams_score_and_rank takes. mem0's own score_and_rank must take no other, or its search
+# could pass one the fusion would not honour (2.1.0 added `explain`; the next one would be a TypeError on
+# every search).
+_HANDLED_PARAMS = frozenset({"semantic_results", "bm25_scores", "entity_boosts", "threshold", "top_k",
+                             "explain"})
+
+
+def _unhandled_params(fn) -> List[str]:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return []
+    return [p.name for p in params
+            if p.name not in _HANDLED_PARAMS and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
+
+
+def _calls_the_global(fn, module) -> bool:
+    """True when fn loads score_and_rank as a global OF `module` at call time: its globals are that
+    module's namespace and its code has a LOAD_GLOBAL of the name. An attribute call
+    (scoring.score_and_rank, self._scorer.score_and_rank) or a method defined in another module and
+    re-exported reads False; so does a call moved into a nested helper (loud, never silent)."""
+    code = getattr(fn, "__code__", None)
+    if code is None or getattr(fn, "__globals__", None) is not vars(module):
+        return False
+    return any(ins.opname == "LOAD_GLOBAL" and ins.argval == "score_and_rank"
+               for ins in dis.get_instructions(code))
+
+
 def install(main_module=None) -> Dict[str, Any]:
     """Bind ams_score_and_rank as mem0's fusion. Returns the binding status for /health/deep.
 
-    bound is True only when mem0's search still looks score_and_rank up as a module global (the code
-    object of Memory._search_vector_store names it) AND that global is now this function: a mem0
-    release that moves the scoring elsewhere reads bound=False instead of silently falling back to
-    the additive formula."""
+    bound is True only when Memory._search_vector_store (the search the server calls) looks
+    score_and_rank up as a global of mem0.memory.main at call time AND that global is now this
+    function; callers_bound reports the sync and the async search (the server uses the sync one). A
+    mem0 whose score_and_rank takes a parameter this function does not is left unbound, with mem0's
+    own formula in place. Either way a mem0 release that moves the scoring reads bound=False instead
+    of silently falling back to the additive formula."""
     global _MEM0_ORIGINAL
     status: Dict[str, Any] = {"mode": mode(), "bound": False}
     try:
@@ -141,15 +177,18 @@ def install(main_module=None) -> Dict[str, Any]:
         if not callable(current):
             status["error"] = "mem0.memory.main has no score_and_rank"
             return status
-        if current is not ams_score_and_rank:
-            _MEM0_ORIGINAL = current
+        original = _MEM0_ORIGINAL if current is ams_score_and_rank else current
+        extra = _unhandled_params(original) if original is not None else []
+        if extra:
+            status["error"] = f"mem0's score_and_rank takes parameters the fusion does not handle: {extra}"
+            return status
+        _MEM0_ORIGINAL = original
         main_module.score_and_rank = ams_score_and_rank
         callers = []
         for cls_name in ("Memory", "AsyncMemory"):
             cls = getattr(main_module, cls_name, None)
             fn = getattr(cls, "_search_vector_store", None) if cls is not None else None
-            code = getattr(fn, "__code__", None)
-            callers.append(bool(code is not None and "score_and_rank" in code.co_names))
+            callers.append(fn is not None and _calls_the_global(fn, main_module))
         status["callers_bound"] = callers
         status["bound"] = bool(callers and callers[0]) and main_module.score_and_rank is ams_score_and_rank
     except Exception as e:  # never break the server start: report it, health reads it
@@ -157,6 +196,51 @@ def install(main_module=None) -> Dict[str, Any]:
     return status
 
 
+# Searches since start that returned results through the fusion (reached) and without it (bypassed):
+# the observed half of the binding check. One bypassed search means mem0 ranked without calling the
+# global, whatever install() read from its code.
+SEARCHES = {"reached": 0, "bypassed": 0}
+
+
+def health(status: Dict[str, Any]) -> Dict[str, Any]:
+    """checks.fusion for /health/deep: install()'s status, the search counts and ok. ok is false when
+    the fusion is not bound or a search bypassed it, which fails /health/deep and every gate that reads
+    it, unless the operator runs mem0's own formula on purpose (MEM0_FUSION=mem0): that mode needs no
+    binding, so it is also how a mem0 the fusion cannot bind to is run without failing every deploy."""
+    out: Dict[str, Any] = {"ok": (bool(status.get("bound")) and SEARCHES["bypassed"] == 0)
+                                 or mode() == "mem0"}
+    out.update(status)
+    out["mode"] = mode()
+    out["searches"] = dict(SEARCHES)
+    return out
+
+
 def last_legs() -> Optional[Dict[str, Dict[str, Any]]]:
-    """The per-id legs of the last rrf fusion in this context, or None."""
+    """The per-id legs of the last fusion call in this context (the mem0 mode records only the raw
+    cosine), or None."""
     return LAST_LEGS.get()
+
+
+def begin_search() -> None:
+    """Call right before mem.search: this request's legs start empty, so what end_search and
+    last_legs read afterwards can only come from that search."""
+    LAST_LEGS.set(None)
+
+
+def end_search(results: Any) -> None:
+    """Call right after mem.search. Copies each result's raw cosine from the legs onto it as `cosine`
+    (the value the threshold compared, and the one the admission gate's cosine floor reads), and counts
+    the search as reached or bypassed. A result that did not come through the dense pool (a
+    lexical-only rescue, added later) gets no cosine."""
+    items = results.get("results") if isinstance(results, dict) else None
+    if not isinstance(items, list) or not items:
+        return
+    legs = LAST_LEGS.get()
+    if legs is None:
+        SEARCHES["bypassed"] += 1
+        return
+    SEARCHES["reached"] += 1
+    for r in items:
+        leg = legs.get(str(r.get("id"))) if isinstance(r, dict) else None
+        if leg is not None and leg.get("cosine") is not None:
+            r["cosine"] = leg["cosine"]

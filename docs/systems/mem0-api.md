@@ -196,7 +196,7 @@ Request: {
 }
 ```
 
-- `score` is the [hybrid fusion](fusion.md) score: reciprocal rank fusion of the dense, keyword and entity legs, in (0, 1] and monotone with the order; it is not a cosine, so never threshold on it as one (`threshold` in the request is compared to the raw cosine, before fusion).
+- `score` is the [hybrid fusion](fusion.md) score: reciprocal rank fusion of the dense, keyword and entity legs, in (0, 1]; the fusion ranks by it, and later stages re-order without rewriting it (durable freshness by `durable_freshness_score`, the reranker by `rerank_score`). It is not a cosine, so never threshold on it as one: `threshold` in the request is compared to the raw cosine, before fusion, and each result carries that raw cosine as `cosine` (absent on a `lexical_only` rescue).
 - `rerank=true` triggers `bge-reranker-v2-m3` post-processing (`reranker.py`), applied only when there are ≥ 3 results **and** the head is not unanimous (fused score < `RERANK_SKIP_IF_TOP_SCORE`, 1.0; `RERANK_MIN_N`). The reranker is a cross-encoder served on llama-swap `:11436` (GPU since 2026-08-13; raw-logit score scale is device-independent); any reranker failure returns the dense-only order unchanged and logs a WARN (fail-soft).
 - `query_class` (default `durable`) selects the admitted-tier set and recency policy: `operational` applies a 30-day Weibull recency weight; `canonical` filters to `{canonical, stable}`; `history` disables supersession/contradiction hiding (forensic).
 - `limit` clamped at 500 server-side.

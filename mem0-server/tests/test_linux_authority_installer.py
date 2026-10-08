@@ -896,3 +896,13 @@ def test_the_authority_installer_proves_the_server_came_up_in_the_resolved_space
     assert ".embed_profile.profile" in tail and "is bound to embedding profile" in tail
     assert 'ep.collection("memories", ep.get(sys.argv[1]))' in tail and "is bound to collection" in tail
     assert sh.index('service key loaded by mem0') < i, "after the service-key post-condition"
+
+
+def test_the_authority_installer_fails_when_the_search_is_not_bound_to_the_fusion():
+    """1.34.0: a mem0 the rank fusion cannot bind to ranks with its own formula while every other check is
+    green, so the install fails on checks.fusion.ok (which MEM0_FUSION=mem0 passes on purpose)."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    i = sh.index('fusion_ok="$(')
+    assert ".checks.fusion.ok // false" in sh[i:i + 120]
+    assert '[ "$fusion_ok" = true ] || fail "mem0\'s search is not bound to the rank fusion' in sh[i:]
+    assert sh.index("bound_profile=") < i, "after the embedding-space post-condition"
