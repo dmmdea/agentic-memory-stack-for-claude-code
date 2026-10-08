@@ -225,8 +225,8 @@ The MCP tool `memory_supersede` wraps this route (below).
 | `PATCH /v1/goals/{goal_id}/abandon` | mark abandoned (actor + reason) |
 | `PATCH /v1/goals/{goal_id}/complete` | mark completed (actor + reason) |
 | `PATCH /v1/goals/{goal_id}/priority` | set priority |
-| `POST /v1/goals/{goal_id}/link_episode` | link an episode (link_type) |
-| `POST /v1/goals/{source_goal_id}/merge` | merge a duplicate goal into a target |
+| `POST /v1/goals/{goal_id}/link_episode` | link an episode (link_type); at most one link per (episode, link_type, goal): a repeat returns the existing link's id |
+| `POST /v1/goals/{source_goal_id}/merge` | merge a duplicate goal into a target: `{ok, source_goal_id, target_goal_id, relinked_episodes, dropped_duplicates}` (a source link the target already has is dropped, not moved) |
 | `POST /v1/open_questions` | record a frontier question |
 | `GET /v1/open_questions` | list open questions (`status`/`brand`/`limit`) |
 | `POST /v1/open_questions/search` | FTS5 search across questions |

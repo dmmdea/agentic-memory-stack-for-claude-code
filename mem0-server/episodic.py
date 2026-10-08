@@ -329,6 +329,23 @@ def init_schema(conn: sqlite3.Connection) -> None:
             "WHERE state='in_progress' GROUP BY session_id HAVING COUNT(*) > 1"
         )
         raise
+    # DC-03: one goal link per (episode, link type, goal). CREATE UNIQUE INDEX raises on existing violations, and the
+    # live table already holds some (the nightly promoter re-inserted them), so dedupe first - keep the EARLIEST row
+    # (MIN(id)), which keeps the original created_at - then enforce. Idempotent: a clean table deletes nothing.
+    deduped = conn.execute(
+        """DELETE FROM episode_links
+           WHERE target_kind = 'goal'
+             AND id NOT IN (SELECT MIN(id) FROM episode_links WHERE target_kind = 'goal'
+                            GROUP BY episode_id, link_type, target_id)"""
+    ).rowcount
+    if deduped:
+        # Once per store (the first start of 1.34.0). The goals those duplicates kept looking fresh age from their
+        # first link from now on, so goals-stale-sweep may report some stale on its next Sunday.
+        log.warning("DC-03: removed %d duplicate goal link(s) from episode_links before enforcing uniqueness", deduped)
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_links_goal
+           ON episode_links(episode_id, link_type, target_id) WHERE target_kind = 'goal'"""
+    )
     conn.commit()
 
 
@@ -441,7 +458,11 @@ def add_link(
     target_kind: str = "mem0",
     commit: bool = True,
 ) -> int:
-    """Insert an episode_link row; returns the new link id."""
+    """Insert an episode_link row; returns the new link id. A goal link goes through link_episode_to_goal
+    (at most one per (episode, link_type, goal), DC-03), so a repeat returns the existing id instead of
+    raising IntegrityError on uq_episode_links_goal."""
+    if target_kind == "goal":
+        return link_episode_to_goal(conn, episode_id, int(target_id), link_type=link_type, commit=commit)
     cur = conn.execute(
         """
         INSERT INTO episode_links (episode_id, link_type, target_kind, target_id)
@@ -1096,7 +1117,10 @@ def link_episode_to_goal(
     delta_text: str | None = None,  # noqa: ARG001 — reserved for Phase B
     commit: bool = True,
 ) -> int:
-    """Insert into episode_links with target_kind='goal'.
+    """Link an episode to a goal (episode_links, target_kind='goal'), at most once: -> the link's id, the
+    existing one when the (episode, link_type, goal) link is already there (DC-03, uq_episode_links_goal).
+    Use this, never add_link, for goal links: add_link is a plain INSERT, which the unique index refuses with
+    IntegrityError for a repeat.
 
     link_type must be one of: advanced_goal, blocked_goal, completed_goal, cited_goal.
     delta_text is accepted for API symmetry but stored externally (Phase B populates
@@ -1104,13 +1128,45 @@ def link_episode_to_goal(
     """
     if link_type not in {"advanced_goal", "blocked_goal", "completed_goal", "cited_goal"}:
         raise ValueError(f"invalid link_type {link_type!r}")
+    # DC-03: ensure-exists. The nightly recurrence promoter re-presents the same episodes for 14 days and used to
+    # insert their links again every run (404 duplicate rows live by 2026-10-08), which inflated linked counts and
+    # refreshed MAX(created_at), so those goals never went stale and led the bundle's recency ranking.
+    # One statement, so the existence check and the insert share the write lock.
     cur = conn.execute(
-        "INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) VALUES (?, ?, 'goal', ?)",
-        (episode_id, link_type, str(goal_id)),
+        "INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) "
+        "SELECT ?, ?, 'goal', ? WHERE NOT EXISTS (SELECT 1 FROM episode_links "
+        "WHERE episode_id = ? AND link_type = ? AND target_kind = 'goal' AND target_id = ?)",
+        (episode_id, link_type, str(goal_id), episode_id, link_type, str(goal_id)),
     )
+    if cur.rowcount == 0:
+        # Already linked: the existing row is the answer (cur.lastrowid would be the connection's PREVIOUS insert).
+        link_id = conn.execute(
+            "SELECT MIN(id) FROM episode_links WHERE episode_id = ? AND link_type = ? "
+            "AND target_kind = 'goal' AND target_id = ?",
+            (episode_id, link_type, str(goal_id)),
+        ).fetchone()[0]
+    else:
+        link_id = cur.lastrowid
     if commit:
         conn.commit()
-    return cur.lastrowid  # type: ignore[return-value]
+    return link_id  # type: ignore[return-value]
+
+
+def retarget_goal_links(conn: sqlite3.Connection, source_goal_id: int, target_goal_id: int) -> tuple[int, int]:
+    """Move every goal link from source to target (a goal merge) -> (moved, dropped). Does not commit.
+
+    A source link whose (episode, link_type) the target already has would collide with uq_episode_links_goal
+    (DC-03), so it is not moved: it is redundant, and it is deleted with whatever else is left on the source.
+    Order matters: the UPDATE first, then the DELETE of the leftovers (the reverse would drop every link)."""
+    moved = conn.execute(
+        "UPDATE OR IGNORE episode_links SET target_id = ? WHERE target_kind = 'goal' AND target_id = ?",
+        (str(target_goal_id), str(source_goal_id)),
+    ).rowcount
+    dropped = conn.execute(
+        "DELETE FROM episode_links WHERE target_kind = 'goal' AND target_id = ?",
+        (str(source_goal_id),),
+    ).rowcount
+    return moved, dropped
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 # Exports:
 #   Test-CanonicalDuplicate   — dedup check (moved from dream-consolidate.ps1)
 #   Test-ImperativeOrTask     — structural filter: rejects task/imperative text (FIX 4)
+#   Test-ImperativeCanonical  — the server's promote-canary, the 4th check of Test-ImperativeOrTask (WG-01)
 #   Invoke-AutopromoteDecision — complete nomination pipeline (parse → structural-filter
 #                                → sort-by-confidence → cap-at-3 → dedup)
 #   Get-AmEmbedProfile         — the embedding space the store is bound to: collection + sibling cosine
@@ -112,6 +113,23 @@ function Test-CanonicalDuplicate {
 }
 
 # ── Structural filter: reject task/imperative text ────────────────────────────
+# The server's promote-canary (mem0-server/imperative_canary.py::is_imperative_canonical): the rule PATCH /tier
+# applies to every promotion and answers a standing order with HTTP 422. Per sentence (split on . ! ? and newlines),
+# case-insensitive: a sentence that OPENS with MUST / NEVER / ALWAYS / SHALL / DO NOT / DON'T / RULE:, or says
+# "you must" anywhere. Inlined rather than calling Test-AmImperative (memory-store-lib.ps1, the same rule): the dream
+# dot-sources only this file and memory-common.ps1. DreamAutopromote.Tests.ps1 parses imperative_canary.py and
+# fails when this copy drifts from it.
+$script:AmCanaryRegex = [regex]"(?ix)(?:^\s*(?:MUST|NEVER|ALWAYS|SHALL)\b|^\s*(?:DO\s+NOT|DON'T)\b|^\s*RULE\s*:|\byou\s+must\b)"
+$script:AmCanarySplit = '[.!?\n]+'
+function Test-ImperativeCanonical {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    foreach ($s in ($Text -split $script:AmCanarySplit)) {
+        if ($s.Trim() -and $script:AmCanaryRegex.IsMatch($s)) { return $true }
+    }
+    return $false
+}
+
 # Returns $true if the memory text should be REJECTED (i.e. it is a task or imperative).
 function Test-ImperativeOrTask {
     param([string]$Text)
@@ -122,6 +140,10 @@ function Test-ImperativeOrTask {
     if ($Text -imatch '\b(TODO|WIP|in progress|shipped|next:)\b') { return $true }
     # Leading verb-imperative (heuristic, case-sensitive, sentence start)
     if ($Text -cmatch '^(Use|Run|Check|Ensure|Verify|Update|Install|Add|Enable|Disable|Set|Create|Delete|Remove|Stop|Start)\b') { return $true }
+    # WG-01: whatever the server's canary would refuse. The three checks above look only at the start of the whole
+    # text and are case-sensitive, so "... retired. Do not audit them" passed them, spent a gate call and was
+    # refused with 422 by the server (the same night-after-night reject the Python dream's filter now avoids).
+    if (Test-ImperativeCanonical -Text $Text) { return $true }
     return $false
 }
 
@@ -374,10 +396,13 @@ function Invoke-AutopromoteDecision {
             # Extract first [...] array from the response (Codex may add prose)
             if ($cleaned -match '(\[[\s\S]*\])') { $cleaned = $Matches[1] }
             if (-not [string]::IsNullOrWhiteSpace($cleaned)) {
-                # @() forces a single PSCustomObject into an array so Where-Object iterates
-                # elements rather than properties (ConvertFrom-Json returns PSCustomObject
-                # for single-element arrays on some PS versions).
-                $nominees = @($cleaned | ConvertFrom-Json | Where-Object { $_.memory_id -and $_.reason })
+                # Assign, then filter. Windows PowerShell 5.1 (the engine the nightly dream runs under) emits the array
+                # ConvertFrom-Json parses as ONE pipeline object, where pwsh 7 enumerates it, so piping straight into
+                # Where-Object handed it the whole array as a single nominee: the structural filter below found no
+                # evidence for it and skipped every nominee whenever Codex named two or more.
+                # @() keeps a lone nominee (pwsh 7 returns it unwrapped) an array so Where-Object iterates elements.
+                $parsedNominees = $cleaned | ConvertFrom-Json
+                $nominees = @($parsedNominees | Where-Object { $_.memory_id -and $_.reason })
             }
         } catch {
             $preview = ([string]$CodexJson)

@@ -356,6 +356,21 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
             Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
     }
 
+    It 'the canonical fetch sends a non-empty query with threshold 0 (mem0 2.1.0 rejects an empty one)' {
+        # An empty query raises in mem0 2.1.0 (HTTP 500, caught as non-fatal: the canonical-dedup guard then ran with
+        # no canonicals); the request default threshold 0.1 could also drop canonicals by their cosine to the query.
+        $m = [regex]::Match($script:dreamCode, '@\{ query = ''([^'']*)''; filters = @\{ tier = ''canonical''')
+        $m.Success | Should -BeTrue -Because 'the canonical fetch body must exist'
+        $m.Groups[1].Value.Trim() | Should -Not -BeNullOrEmpty -Because 'mem0 2.1.0 rejects an empty query'
+        $script:dreamCode | Should -Match 'user_id = \$DcWslUser \}; limit = 500; threshold = 0\.0 \}' -Because 'no canonical may be dropped by its cosine, and 500 is the server cap on one search'
+        $script:dreamCode | Should -Match 'canonicalFacts\.Count -ge 500' -Because 'a full page may hide canonicals and is logged'
+    }
+
+    It 'F-03: the heartbeat names the missing canary and the nights below the high-water mark' {
+        # twin of dream-consolidate.py: nine mornings read "(before=6/7, hwm=7)" and nothing said which canary
+        $script:dreamCode | Should -Match ([regex]::Escape('missing=$gone, nights-below-hwm=$($rd.consecutive_below_hwm))'))
+    }
+
     It 'AMS-06: the dedup-mutex skip does NOT mark the throttle' {
         # The wake-collision burned TWO nights per occurrence because this branch
         # stamped last-dream on a skip; dream-catchup then read "fresh". Extract

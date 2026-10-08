@@ -4,7 +4,7 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## 1.34.0 — rank fusion for every search, capture liveness and urgent chain pages (2026-10-08)
+## 1.34.0 — rank fusion for every search, capture liveness, urgent chain pages and maintenance observability (2026-10-08)
 
 ### Changed
 - **Every memory search ranks by rank fusion** (`mem0-server/fusion.py`, [docs/systems/fusion.md](docs/systems/fusion.md),
@@ -50,6 +50,37 @@ in the first entries below — full pre-inversion history lives in the maintaine
   monitor can page urgently on it, through quiet hours, while `failed_steps` keeps paging normally.
 
 ### Fixed
+- **Boot-guard and weekly no-op receipts no longer overwrite a step's real run** on `/health/maintenance`
+  (audit CDD-02): after a reboot every step read "ran at boot in 0 ms". `steps.<name>` headline fields and
+  `last_success` come from the latest real run; the latest no-op rides in `last_noop`. A guard no-op no longer
+  keeps a failing daily step out of `stale_steps`, nor one whose real runs a day-long reboot loop pushed out of
+  the 2,000-receipt window.
+- **The drift alarm names its canary** (audit F-03): `drift` gains `missing` and `below_hwm_nights`, and the
+  dream heartbeat (Python and Windows) says which canary stands the alarm and for how many nights.
+- **The morning summary's health line is tonight's** (audit CM-01): `health-stamp` now runs before
+  `morning-summary`, which quotes it (`ams-step-*.service` `After=` order); a failure in `morning-summary` or
+  `rtcwake` now reaches `/health/maintenance` the next night.
+- **A refused autopromotion is visible** (audit WG-01): the dream receipt counts `nominated`,
+  `structural_rejected`, `promoted`, `promote_failed`, `gate_blocked`; a refused promotion reads
+  `degraded:autopromote-failed-<n>`, the failure log keeps the cause, and the dream's nominee filter rejects
+  what the server's imperative canary would refuse (Python and the Windows twin, whose multi-nominee case
+  rejected nothing under PowerShell 5.1), so a canary-bound memory is never gated or sent again.
+- **Goal links are unique per (episode, link type, goal)** (audit DC-03): linking is ensure-exists (a repeat
+  returns the existing id, through `add_link` too); the first start logs and removes the duplicates the nightly
+  promoter wrote (404 on the authority on 2026-10-08, keeping each first link's time) and adds the unique index
+  `uq_episode_links_goal`; a goal merge moves each link once and reports the ones the target already had as
+  `dropped_duplicates` (response and ledger). Goals those duplicates kept looking fresh can read stale on the next
+  Sunday's sweep. To roll back past 1.34.0, drop the index first
+  (`sqlite3 ~/.mem0/episodic.db 'DROP INDEX IF EXISTS uq_episode_links_goal'`): an older build inserts plainly.
+- **A short memory id is a 404, not a 500**, on `GET /v1/memories/{id}` and `POST /v1/memories/diagnose` (seven
+  such GETs answered 500 on the authority from 2026-09-19 to 10-08), and every UUID spelling reaches Qdrant in its
+  canonical form (a padded or `uuid:`-prefixed one answered 400 there).
+- **The dream's canonical fetch works on mem0 2.1.0 and says when it is cut**: it sent an empty query, which
+  mem0 2.1.0 rejects (HTTP 500, read as "no canonicals", so the canonical-dedup guard ran empty), and the request
+  default threshold 0.1 could drop canonicals by their cosine to that query. It now sends a fixed query with
+  threshold 0 and asks for the server's cap of 500; a full page reads `degraded:canonical-fetch-truncated`
+  (37 canonicals today). Python and PowerShell.
+- CI gates `test_autopromote_lib.py` and `test_ams_chain.py`, which it never collected.
 - `restore-replica.sh` step 4 gates on the top-level `ok` of `/health/deep`: it grepped for any `"ok": true`,
   which every healthy sub-check also matched, so a red endpoint restored green.
 

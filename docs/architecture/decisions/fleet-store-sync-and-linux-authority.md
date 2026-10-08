@@ -41,7 +41,8 @@ in below.
    the Windows shim exposed; the shim is not installed on the authority.
 2. **One nightly chain, not independent timers.** A single persistent timer with a boot guard
    starts an ordered target (consolidate → dedup → store judge → backup → off-box copy → morning
-   summary → health stamp). Steps hang off the target with `Wants=`/`After=`, so a failed step
+   summary → health stamp; since 1.34.0 the health stamp runs before the morning summary, which
+   quotes it). Steps hang off the target with `Wants=`/`After=`, so a failed step
    never blocks the backup. A run missed while the box was off fires at the next boot.
 3. **The harness stores replicate through a git hub on the brain box.** One bare repository on
    the server, owned by a `git-shell` user with per-machine keys and non-fast-forward and delete

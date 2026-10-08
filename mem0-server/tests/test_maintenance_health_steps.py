@@ -129,6 +129,30 @@ def test_daily_step_keeps_the_48h_rule(tmp_path):
     assert out["stale_steps"] == []
 
 
+
+def test_a_reboot_loop_that_scrolls_the_real_runs_out_cannot_read_fresh(tmp_path, monkeypatch):
+    """A day-long reboot loop writes a guard no-op per step per boot. Once those push the step's real runs out of the
+    window, the no-ops prove nothing: the step must read stale, not "fresh at boot"."""
+    monkeypatch.setattr(mh, "MAX_RECEIPT_LINES", 20)
+    rows = [_r("2026-09-10T03:00:00Z", "dream", ok=False, status="failed")]             # the last real run, cut off
+    rows += [_r(f"2026-09-11T{i // 4:02d}:{(i % 4) * 15:02d}:00Z", "dream", note="guard: chain succeeded; no-op")
+             for i in range(25)]
+    out = _build(tmp_path, rows)
+    assert "dream" in out["stale_steps"] and out["ok"] is False
+
+
+def test_a_step_added_inside_a_cut_off_window_keeps_its_no_op_reference(tmp_path, monkeypatch):
+    """A step that first appears well after the window starts has no older history to lose: a new weekly step
+    before its first Sunday is not stale, cut-off window or not."""
+    monkeypatch.setattr(mh, "MAX_RECEIPT_LINES", 20)
+    start = dt.datetime(2026, 8, 20, 3, 0, tzinfo=dt.timezone.utc)
+    rows = [_r((start + dt.timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ"), "dream") for d in range(23)]
+    rows += [_r(f"2026-09-{d:02d}T03:30:00Z", "goals-new-weekly", note="weekly: not Sun; no-op") for d in (8, 9, 10, 11)]
+    rows.sort(key=lambda r: r["ts"])
+    out = _build(tmp_path, rows)
+    assert len(rows) > mh.MAX_RECEIPT_LINES
+    assert out["stale_steps"] == [] and out["ok"] is True
+
 # ---- (e)/(f) pool health -----------------------------------------------------------------
 def test_pool_health_degraded_flips_ok(tmp_path):
     out = _build(tmp_path, [], pool_health_reader=lambda: "DEGRADED")
@@ -447,10 +471,21 @@ def test_the_pc_dependent_steps_include_wiki_index_and_are_real_chain_steps():
 # ---- the rest of C2: drift and wiki are reported, never folded into ok ----------------------
 def test_drift_is_reported_but_not_folded(tmp_path):
     out = _build(tmp_path, [], drift_reader=lambda: {"alarm": True, "before_retrievable": 6, "n_total": 7, "hwm": 7})
-    assert out["drift"] == {"alarm": True, "before": 6, "n_total": 7} and out["ok"] is True
+    assert out["drift"] == {"alarm": True, "before": 6, "n_total": 7, "missing": None, "below_hwm_nights": None} and out["ok"] is True
     out = _build(tmp_path, [], drift_reader=lambda: (_ for _ in ()).throw(RuntimeError("x")))
-    assert out["drift"] == {"alarm": None, "before": None, "n_total": None}
-    assert _build(tmp_path, [])["drift"] == {"alarm": None, "before": None, "n_total": None}
+    assert out["drift"] == {"alarm": None, "before": None, "n_total": None, "missing": None, "below_hwm_nights": None}
+    assert _build(tmp_path, [])["drift"] == {"alarm": None, "before": None, "n_total": None, "missing": None, "below_hwm_nights": None}
+
+
+def test_a_standing_drift_alarm_names_the_canary_and_the_nights(tmp_path):
+    """F-03: `alarm: true, before: 6, n_total: 7` stood eight nights and said nothing about WHICH canary. The state
+    file already carries it (`missing`, `consecutive_below_hwm`); the endpoint dropped both."""
+    state = {"alarm": True, "before_retrievable": 6, "n_total": 7, "hwm": 7,
+             "missing": ["relevance-threshold"], "consecutive_below_hwm": 8}
+    out = _build(tmp_path, [], drift_reader=lambda: state)
+    assert out["drift"] == {"alarm": True, "before": 6, "n_total": 7,
+                            "missing": ["relevance-threshold"], "below_hwm_nights": 8}
+    assert out["ok"] is True, "drift is still reported, never folded into ok"
 
 
 def test_wiki_freshness_reads_the_newer_of_pull_and_build(tmp_path):
@@ -468,3 +503,59 @@ def test_wiki_freshness_reads_the_newer_of_pull_and_build(tmp_path):
     (d / "last-pull").write_text("garbage")
     assert _build(tmp_path, [], wiki_stamp_dir=d)["wiki"] == {"last_pull_age_h": None, "last_build_age_h": None, "fresh_age_h": None}
     assert _build(tmp_path, [])["wiki"] == {"last_pull_age_h": None, "last_build_age_h": None, "fresh_age_h": None}
+
+
+# ---- CDD-02: a weekly off-day / boot-guard no-op is a receipt, not a run -----------------------------------
+GUARD = "guard: chain succeeded since the last 03:00 boundary (43372s ago); no-op"
+
+
+def test_boot_guard_noop_does_not_overwrite_the_real_run(tmp_path):
+    """After any reboot every step "ran" at boot in 0 ms: the ok:true guard row overwrote last_run, status,
+    duration_ms and receipt_id of the night's real run (audit CDD-02 / CM-05 / DC-07 / SEC-05 / WG-12)."""
+    rows = [_r("2026-09-10T08:03:17Z", "dream", duration_ms=182241, work={"posted": 3}),
+            _r("2026-09-10T20:05:58Z", "dream", note=GUARD, duration_ms=0)]
+    s = _build(tmp_path, rows)["steps"]["dream"]
+    assert (s["last_run"], s["duration_ms"], s["receipt_id"]) == ("2026-09-10T08:03:17Z", 182241, "dream-2026-09-10T08:03:17Z")
+    assert s["last_success"] == "2026-09-10T08:03:17Z" and s["ok"] is True and s["status"] == "ok"
+    assert s["last_noop"] == {"ts": "2026-09-10T20:05:58Z", "note": GUARD, "receipt_id": "dream-2026-09-10T20:05:58Z"}
+
+
+def test_weekly_off_day_noop_is_not_shown_as_the_sunday_run(tmp_path):
+    """Live 2026-10-08: decay-scan last_success read Thursday 08:03:39 in 0 ms for a step that last ran Sunday 10-04."""
+    rows = [_r("2026-09-06T03:00:30Z", "decay-scan", duration_ms=4000),
+            _r("2026-09-10T03:00:40Z", "decay-scan", note="weekly: not Sun; no-op", duration_ms=0)]
+    s = _build(tmp_path, rows)["steps"]["decay-scan"]
+    assert (s["last_run"], s["last_success"], s["duration_ms"]) == ("2026-09-06T03:00:30Z", "2026-09-06T03:00:30Z", 4000)
+    assert s["last_noop"]["note"] == "weekly: not Sun; no-op"
+
+
+def test_a_step_with_a_real_failure_keeps_the_failure_as_its_headline_under_a_later_noop(tmp_path):
+    rows = [_r("2026-09-10T03:00:00Z", "stack-backup", ok=False, status="failed", note="rsync 23"),
+            _r("2026-09-10T20:00:00Z", "stack-backup", note=GUARD, duration_ms=0)]
+    s = _build(tmp_path, rows)["steps"]["stack-backup"]
+    assert s["ok"] is False and s["status"] == "failed" and s["last_run"] == "2026-09-10T03:00:00Z"
+    assert s["last_success"] is None, "a no-op is not a success"
+
+
+def test_a_step_that_only_ever_noopped_keeps_the_noop_as_its_headline(tmp_path):
+    out = _build(tmp_path, [_r("2026-09-10T03:00:00Z", "decay-scan", note="weekly: not Sun; no-op", duration_ms=0)])
+    s = out["steps"]["decay-scan"]
+    assert s["last_run"] == "2026-09-10T03:00:00Z" and s["ok"] is True and s["status"] == "ok" and s["last_success"] is None
+    assert s["last_noop"]["ts"] == "2026-09-10T03:00:00Z"
+    assert out["stale_steps"] == [], "not stale before its first Sunday (unchanged)"
+
+
+def test_a_step_without_noops_has_a_null_last_noop(tmp_path):
+    assert _build(tmp_path, [_r("2026-09-10T03:00:00Z", "dream")])["steps"]["dream"]["last_noop"] is None
+
+
+def test_a_guard_noop_does_not_keep_a_failing_daily_step_out_of_stale(tmp_path):
+    """Daily staleness read `last_success`, which an ok:true guard no-op bumped, so a step failing every night
+    under a reboot read fresh. The weekly path already judged on real runs; the daily path now does too."""
+    rows = [_r("2026-09-08T03:00:00Z", "dream"),
+            _r("2026-09-09T03:00:00Z", "dream", ok=False, status="failed", note="boom"),
+            _r("2026-09-10T03:00:00Z", "dream", ok=False, status="failed", note="boom"),
+            _r("2026-09-10T12:00:00Z", "dream", note=GUARD, duration_ms=0)]
+    out = _build(tmp_path, rows)   # judged Friday 2026-09-11 08:00: last real success is 77 h old
+    assert out["stale_steps"] == ["dream"]
+    assert [f["step"] for f in out["failed_steps"]] == ["dream"]

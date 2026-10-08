@@ -167,7 +167,7 @@ SCHEMA: dict[str, dict] = {
     },
     "goal-merged": {
         "required": ["ts", "event", "source_goal_id", "target_goal_id", "actor", "reason"],
-        "optional": ["relinked_episodes", "schema_version"],
+        "optional": ["relinked_episodes", "dropped_duplicates", "schema_version"],
     },
     "open-question-resolved": {
         "required": ["ts", "event", "open_question_id", "actor", "session_id"],

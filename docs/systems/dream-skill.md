@@ -107,7 +107,7 @@ The native (Python) dream also stamps `brand` when more than half of the cited m
 
 ### Phase 3.5 — Autonomous canonical promotion
 
-After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second Codex call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task/imperative text) → sort by confidence → **cap at 3** → dedup against the existing canonical set.
+After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second Codex call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task text, leading imperatives and any text the server's imperative canary would refuse) → sort by confidence → **cap at 3** → dedup against the existing canonical set.
 
 Each surviving nominee passes through the **4C promotion gate** (`Invoke-PromotionGate`):
 1. **Contradiction gate (all sources):** any contradiction against an existing canonical fact — judged by an *independent, adversarial* Codex pass, never the proposing pass — → BLOCK.
@@ -115,7 +115,7 @@ Each surviving nominee passes through the **4C promotion gate** (`Invoke-Promoti
 
 The gate is **shadow-first**: `MEM0_PROMOTION_GATE_MODE` ∈ `{off, shadow, enforce}` (default `shadow`; also settable persistently via the receipt's `PromotionGateMode`). `shadow` computes and logs the verdict but does not change the promotion decision (calibration); `enforce` makes a BLOCK verdict — or a gate *error* (fail-safe) — skip the promotion; `off` is the kill switch. The single decision point is the unit-tested `Resolve-GateBlocked`.
 
-Promotion itself calls `mem0-canonize.sh --actor dream-autopromote` — so a dream promotion is still HMAC-signed with the canonical key (the actor label only distinguishes it from `user-direct` in the ledger; `transport=autonomous`). A `422` from the server means the imperative-canary rejected the text (expected for edge cases, non-fatal). Nominees and outcomes are appended to a morning summary.
+Promotion itself calls `mem0-canonize.sh --actor dream-autopromote` — so a dream promotion is still HMAC-signed with the canonical key (the actor label only distinguishes it from `user-direct` in the ledger; `transport=autonomous`). The nominee filter applies the server's own imperative-canary (`imperative_canary.is_imperative_canonical`, per sentence and case-insensitive) as a structural reject, so a text the server would refuse with `422` is never gated or sent; on the native (Python) dream a promotion that still fails counts in `promote_failed` and reads `degraded:autopromote-failed-<n>`. Nominees and outcomes are appended to a morning summary.
 
 ### Phase 4 — Prune
 
@@ -180,9 +180,9 @@ promotions, the drift canary before/after, the morning summary and the usage led
   [installer-and-deploy.md](./installer-and-deploy.md)): `ok`, or `degraded:` with `posted-<p>-of-<c>`,
   `replay-failed-<n>` (queued insights the replay could not post), `spool-backlog-<n>` (queued insights
   a night that never reached phase 3 left untouched), `drift-snapshot-failed` and/or
-  `canonical-fetch-failed` (comma-joined) and the counts
-  `{signals, consolidated, posted, spooled, replayed, replay_failed, spool_depth}` (`spool_depth` is the
-  post-run line count), so a night that posted 0 of 3, or that could not empty last night's queue,
+  `canonical-fetch-failed`, `canonical-fetch-truncated` (the canonical fetch came back full: one search returns at most 500, so canonicals past that would be invisible to the dedup guard; 37 exist on 2026-10-08) and/or `autopromote-failed-<n>` (a promotion the server refused or could not complete; comma-joined) and the counts
+  `{signals, consolidated, posted, spooled, replayed, replay_failed, spool_depth, nominated, structural_rejected, promoted, promote_failed, gate_blocked}` (`spool_depth` is the
+  post-run line count; a gate BLOCK is counted in `gate_blocked` and is not a degraded night), so a night that posted 0 of 3, or that could not empty last night's queue,
   no longer reads as a green receipt. The dream's canonical search carries `hook_contract_version` 17.0.
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
@@ -240,7 +240,7 @@ Consolidation writes new `insight`-tier records and (rarely, ≤3/night) new `ca
 
 ## Error handling
 
-Every phase is best-effort and fail-open: the 4C gate is wrapped so it can never crash the consolidator (a gate error becomes a fail-safe BLOCK in `enforce` only); a malformed Codex JSON skips the throttle mark so the next run retries; a `422` canary rejection on a promotion is non-fatal; the Codex mutex is released in a `finally` block; a canonical fetch or canonize failure is logged non-fatally. The 24h throttle is written only when a phase completes without error. On the PowerShell path a failed insight add never goes to the shared Outbox: `replay-ops.py` drains that for every session and deliberately never sends the service key (sending it would vouch for a forged queued insight). A `403` goes to the poison file (`mem0-post-poison.jsonl`), and a transient failure to the dead-letter file (`mem0-post-failures.jsonl`), which re-posts through `Add-Mem0Memory`, which reads the key again.
+Every phase is best-effort and fail-open: the 4C gate is wrapped so it can never crash the consolidator (a gate error becomes a fail-safe BLOCK in `enforce` only); a malformed Codex JSON skips the throttle mark so the next run retries; a `422` canary rejection on a promotion is non-fatal, and on the native dream it is counted (`promote_failed`, receipt `degraded:autopromote-failed-<n>`); the Codex mutex is released in a `finally` block; a canonical fetch or canonize failure is logged non-fatally. The 24h throttle is written only when a phase completes without error. On the PowerShell path a failed insight add never goes to the shared Outbox: `replay-ops.py` drains that for every session and deliberately never sends the service key (sending it would vouch for a forged queued insight). A `403` goes to the poison file (`mem0-post-poison.jsonl`), and a transient failure to the dead-letter file (`mem0-post-failures.jsonl`), which re-posts through `Add-Mem0Memory`, which reads the key again.
 
 ## Security and privacy notes
 
@@ -254,7 +254,7 @@ Per-run logging goes to the dream component log; the GATE log records each nomin
 
 ## Testing notes
 
-The pure decision logic in `autopromote-lib.ps1` (`Invoke-PromotionGate`, `Resolve-GateBlocked`, `Get-SourceClass`, `Get-CorroborationCount`, `Test-CanonicalDuplicate`, `Test-ImperativeOrTask`) is unit-tested without the live stack (`DreamAutopromote.Tests.ps1`, `DreamGateVerdict.Tests.ps1`). Validate an end-to-end change with `-DryRun`, which exercises the full pipeline (including shadow-mode gate verdicts) while writing nothing.
+The pure decision logic in `autopromote-lib.ps1` (`Invoke-PromotionGate`, `Resolve-GateBlocked`, `Get-SourceClass`, `Get-CorroborationCount`, `Test-CanonicalDuplicate`, `Test-ImperativeOrTask`, `Test-ImperativeCanonical`) is unit-tested without the live stack (`DreamAutopromote.Tests.ps1`, `DreamGateVerdict.Tests.ps1`). `Test-ImperativeCanonical` is a copy of the server's `imperative_canary.py` rule (the Python dream imports that module instead), so `DreamAutopromote.Tests.ps1` parses the module and fails when the copy drifts. The same file runs the multi-nominee decision in a child Windows PowerShell 5.1, the engine the nightly dream runs under, because 5.1 emits a parsed JSON array as one pipeline object where pwsh 7 enumerates it: piped straight into the nominee filter, that skipped the structural filter whenever Codex named two or more memories, and a suite run only under pwsh 7 could not see it. Validate an end-to-end change with `-DryRun`, which exercises the full pipeline (including shadow-mode gate verdicts) while writing nothing.
 
 ## Common pitfalls
 

@@ -11,6 +11,8 @@
 #   (c) --actor flag  -> survivingNominees are present; logs include actor annotation
 #   (d) Bad Codex JSON -> zero surviving nominees, no crash
 #   (e) Structural filter (FIX 4) -> task/imperative text rejected before cap/dedup
+#   (f) WG-01 -> whatever the server's imperative canary refuses is rejected up front, and the lib's
+#       copy of that rule is pinned to mem0-server/imperative_canary.py
 
 BeforeAll {
     # ── Dot-source the production helper ────────────────────────────────────
@@ -330,5 +332,91 @@ Describe 'Structural filter (FIX 4) -- task/imperative text rejected before cap/
         $r.structuralRejects.Count | Should -BeGreaterThan 0 -Because 'WIP marker must be structurally rejected'
         $survivors = @($r.survivingNominees | Where-Object { $_.memory_id -eq 'imp-wip' })
         $survivors.Count | Should -Be 0 -Because 'WIP text must not survive'
+    }
+
+    # WG-01: the server's promote-canary refuses a standing order with HTTP 422, per sentence and case-insensitively.
+    # The checks above look only at the start of the whole text, case-sensitively, so these cleared the filter, spent a
+    # gate call and were refused by the server. Twins of the rows added to test_autopromote_lib.py::test_structural_filter.
+    It 'rejects a nominee the server canary would refuse: <Why>' -ForEach @(
+        @{ Why = 'Do not opens a later sentence';       Text = 'The old exporter is retired. Do not audit it.' }
+        @{ Why = 'a capitalised Always';                Text = 'Always bind the tailnet address' }
+        @{ Why = 'Never opens a line after a newline';  Text = "Ollama is decommissioned.`nNever re-register it." }
+        @{ Why = 'you must anywhere in the text';       Text = 'The stack binds port 18791. You must not expose it.' }
+        @{ Why = 'a RULE: label';                       Text = 'RULE: keep the port closed' }
+    ) {
+        $ev = @([pscustomobject]@{ id = 'canary-1'; memory = $Text; metadata = [pscustomobject]@{ tier = 'evidence' } })
+        $json = '[{"memory_id":"canary-1","reason":"standing order","confidence":0.95}]'
+
+        $r = Invoke-AutopromoteDecision -CodexJson $json -EvidenceMemories $ev
+
+        $r.structuralRejects.Count | Should -Be 1 -Because "the server refuses this text, so it must never be gated or sent ($Why)"
+        $r.survivingNominees.Count | Should -Be 0
+    }
+
+    It 'still nominates a fact the server canary lets through: <Why>' -ForEach @(
+        @{ Why = 'do not sits mid-sentence';    Text = 'Port 80 is reserved for HTTP; do not bind it without approval.' }
+        @{ Why = 'must has no you before it';   Text = 'The operator must provide a reason when promoting a record' }
+    ) {
+        $ev = @([pscustomobject]@{ id = 'canary-2'; memory = $Text; metadata = [pscustomobject]@{ tier = 'evidence' } })
+        $json = '[{"memory_id":"canary-2","reason":"declarative fact","confidence":0.95}]'
+
+        $r = Invoke-AutopromoteDecision -CodexJson $json -EvidenceMemories $ev
+
+        $r.structuralRejects.Count | Should -Be 0 -Because "the server accepts this text ($Why)"
+        $r.survivingNominees.Count | Should -Be 1 -Because 'a declarative fact must stay nominatable'
+    }
+
+    # The nightly dream runs under Windows PowerShell 5.1, where ConvertFrom-Json emits a JSON array as ONE pipeline
+    # object (pwsh 7 enumerates it). A nominee list piped straight from it reached the filter as a single array-valued
+    # nominee, so with two or more nominees no structural check ran, and this suite, run under pwsh 7, stayed green.
+    # This runs the decision in a child powershell.exe, the way PS51Compat.Tests.ps1 reaches the real 5.1 parser.
+    It 'applies the structural filter to a multi-nominee list under Windows PowerShell 5.1' -Skip:($PSVersionTable.Platform -eq 'Unix') {
+        $child = Join-Path $TestDrive 'multi-nominee-5.1.ps1'
+        Set-Content -LiteralPath $child -Encoding UTF8 -Value @(
+            'param([string]$Lib)'
+            '. $Lib'
+            '$ev = @('
+            "    [pscustomobject]@{ id = 'imp-a'; memory = 'NEVER re-register Ollama after decommissioning'; metadata = [pscustomobject]@{ tier = 'evidence' } }"
+            "    [pscustomobject]@{ id = 'imp-b'; memory = 'ALWAYS use dream-autopromote for nightly promotions'; metadata = [pscustomobject]@{ tier = 'evidence' } }"
+            ')'
+            '$json = ''[{"memory_id":"imp-a","reason":"r","confidence":0.9},{"memory_id":"imp-b","reason":"r","confidence":0.8}]'''
+            '$r = Invoke-AutopromoteDecision -CodexJson $json -EvidenceMemories $ev'
+            '"rejects=$(@($r.structuralRejects).Count) survivors=$(@($r.survivingNominees).Count)"'
+        )
+        $lib = Join-Path (Split-Path -Parent $PSScriptRoot) 'autopromote-lib.ps1'
+
+        $out = (& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $child -Lib $lib 2>&1 | Out-String).Trim()
+
+        $out | Should -BeExactly 'rejects=2 survivors=0' -Because 'Windows PowerShell 5.1 must reject both imperative nominees, as pwsh 7 does'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# (f) WG-01: Test-ImperativeCanonical is the server's rule, not a lookalike
+# ---------------------------------------------------------------------------
+# mem0-server/imperative_canary.py is the one definition. A PowerShell lib cannot import it, so autopromote-lib.ps1
+# carries a copy of the pattern and of the sentence splitter. This parses the Python file (the approach of
+# EmbedderProfile.Tests.ps1) and fails when the copy drifts, instead of the two rules agreeing only on the rows above.
+Describe 'Test-ImperativeCanonical mirrors imperative_canary.py (WG-01)' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+        $script:pyCanary = Get-Content -LiteralPath (Join-Path (Join-Path $repoRoot 'mem0-server') 'imperative_canary.py') -Raw -Encoding UTF8
+        # the verbose pattern minus its comment lines and whitespace is the compact pattern the lib carries
+        $m = [regex]::Match($script:pyCanary, '_IMPERATIVE_RE\s*=\s*re\.compile\(\s*r"""(?<p>.*?)""",', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        $script:pyPattern = (($m.Groups['p'].Value -split "`r?`n" | Where-Object { $_.TrimStart() -notmatch '^#' }) -join '') -replace '\s+', ''
+        $script:pySplit = [regex]::Match($script:pyCanary, '_SENTENCE_SPLIT_RE\s*=\s*re\.compile\(r"(?<s>[^"]+)"\)').Groups['s'].Value
+    }
+
+    It 'finds both definitions in the server module' {
+        $script:pyPattern | Should -Not -BeNullOrEmpty -Because 'imperative_canary.py must define _IMPERATIVE_RE'
+        $script:pySplit | Should -Not -BeNullOrEmpty -Because 'imperative_canary.py must define _SENTENCE_SPLIT_RE'
+    }
+    It 'carries the server pattern verbatim, case-insensitive like the server' {
+        ($script:AmCanaryRegex.ToString() -replace '^\(\?[a-z]+\)', '') | Should -BeExactly $script:pyPattern
+        $script:AmCanaryRegex.ToString() | Should -Match '^\(\?[a-z]*i[a-z]*\)' -Because 'the server compiles it re.IGNORECASE'
+        $script:pyCanary | Should -Match 're\.IGNORECASE' -Because 'this pin assumes the server pattern is case-insensitive'
+    }
+    It 'splits sentences on the same characters' {
+        $script:AmCanarySplit | Should -BeExactly $script:pySplit
     }
 }

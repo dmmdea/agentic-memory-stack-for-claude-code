@@ -89,7 +89,7 @@ def test_failed_insight_post_is_spooled_and_reads_degraded(home, m):
     head, work = _outcome(home)
     assert head == "degraded:posted-0-of-3"
     assert work == {"signals": 1, "consolidated": 3, "posted": 0, "spooled": 3, "replayed": 0,
-                    "replay_failed": 0, "spool_depth": 3}
+                    "replay_failed": 0, "spool_depth": 3, "nominated": 0, "structural_rejected": 0, "promoted": 0, "promote_failed": 0, "gate_blocked": 0}
     assert out["outcome"] == "degraded:posted-0-of-3" and out["work"] == work
 
 
@@ -113,7 +113,7 @@ def test_spooled_insight_is_replayed_first_on_the_next_run(home, m):
     assert _spool(home) == [], "a replayed line leaves the spool"
     head, work = _outcome(home)
     assert head == "ok" and work == {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 3,
-                                                   "replay_failed": 0, "spool_depth": 0}
+                                                   "replay_failed": 0, "spool_depth": 0, "nominated": 0, "structural_rejected": 0, "promoted": 0, "promote_failed": 0, "gate_blocked": 0}
     assert out["posted"] == 1
 
 
@@ -176,7 +176,7 @@ def test_a_drained_backlog_reads_ok_again(home, m):
     _run(m, [], mem0=Mem0(EV, fail_adds=99), judge=_judge(SIG, INS, PROMO))
     _run(m, ["--force"], mem0=Mem0(EV), judge=_judge(SIG, NONE, PROMO))
     assert _outcome(home) == ("ok", {"signals": 1, "consolidated": 0, "posted": 0, "spooled": 0, "replayed": 1,
-                                     "replay_failed": 0, "spool_depth": 0})
+                                     "replay_failed": 0, "spool_depth": 0, "nominated": 0, "structural_rejected": 0, "promoted": 0, "promote_failed": 0, "gate_blocked": 0})
 
 
 def test_dry_run_with_a_standing_spool_does_not_read_as_a_backlog(home, m):
@@ -271,6 +271,21 @@ def test_canonical_fetch_failure_reads_degraded(home, m):
     assert _outcome(home)[0] == "degraded:canonical-fetch-failed"
 
 
+def test_a_full_canonical_page_reads_degraded(home, m):
+    """The server caps one search at 500: a full page may hide canonicals from the dedup guard, so it is not ok."""
+    fm = Mem0(EV)
+    fm.search_canonical = lambda: [{"id": f"c{i}", "memory": f"canonical {i}"} for i in range(m.CANONICAL_FETCH_LIMIT)]
+    _run(m, [], mem0=fm, judge=_judge(SIG, INS, PROMO))
+    assert _outcome(home)[0] == "degraded:canonical-fetch-truncated"
+
+
+def test_a_canonical_page_short_of_the_cap_is_ok(home, m):
+    fm = Mem0(EV)
+    fm.search_canonical = lambda: [{"id": f"c{i}", "memory": f"canonical {i}"} for i in range(m.CANONICAL_FETCH_LIMIT - 1)]
+    _run(m, [], mem0=fm, judge=_judge(SIG, INS, PROMO))
+    assert _outcome(home)[0] == "ok"
+
+
 def test_the_whole_09_24_night_names_every_loss(home, m, monkeypatch):
     ev = _drift_env(home, monkeypatch, snapshot_rc=1)
     fm = Mem0(EV, fail_adds=99)
@@ -285,13 +300,13 @@ def test_the_whole_09_24_night_names_every_loss(home, m, monkeypatch):
 def test_a_clean_night_writes_ok_with_counts(home, m):
     _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, PROMO))
     assert _outcome(home) == ("ok", {"signals": 1, "consolidated": 1, "posted": 1, "spooled": 0, "replayed": 0,
-                                     "replay_failed": 0, "spool_depth": 0})
+                                     "replay_failed": 0, "spool_depth": 0, "nominated": 0, "structural_rejected": 0, "promoted": 0, "promote_failed": 0, "gate_blocked": 0})
 
 
 def test_a_no_signal_night_is_ok_and_carries_its_counts(home, m):
     _run(m, [], mem0=Mem0(EV), judge=_judge('{"signals":[]}'))
     assert _outcome(home) == ("ok", {"signals": 0, "consolidated": 0, "posted": 0, "spooled": 0, "replayed": 0,
-                                     "replay_failed": 0, "spool_depth": 0})
+                                     "replay_failed": 0, "spool_depth": 0, "nominated": 0, "structural_rejected": 0, "promoted": 0, "promote_failed": 0, "gate_blocked": 0})
 
 
 def test_a_failed_phase_writes_failed_and_a_skipped_night_writes_nothing(home, m):
@@ -364,3 +379,67 @@ def test_ledger_row_keeps_measured_usage_and_null_for_a_miss(home, m):
     assert rows["dream-gather"]["model_resolved"] == "gpt-6-astra" and rows["dream-gather"]["effort_resolved"] == "high"
     assert rows["dream-consolidate"]["tokens_used"] is None, "unmeasured is null in the ledger"
     assert rows["dream-consolidate"]["model_resolved"] is None
+
+
+# ---- WG-01 / CM-04: the autopromote phase is part of the receipt ---------------------------------------------------
+# 2026-10-07: the dream nominated a memory, the 4C gate said PROMOTE, PATCH /tier answered 422 (the server's imperative
+# canary read "... Do not audit, fix or document them" as a standing order) and the receipt was `ok` with no counters.
+NOM = '[{"memory_id":"e1","reason":"evergreen invariant","confidence":0.9}]'
+BANNER = ("Promoting memory e1e1e1e1-aaaa-bbbb-cccc-dddddddddddd to canonical (action=promote)...\n"
+          "  ts=2026-10-07T08:01:18Z\n  nonce=11111111-2222-3333-4444-555555555555\n  token=AbCdEfGhIjKlMnOpQrSt...\n")
+REFUSED = BANNER + "curl: (22) The requested URL returned error: 422\nExpecting value: line 1 column 1 (char 0)"
+
+
+def test_a_refused_promotion_reads_degraded_and_is_counted(home, m, monkeypatch):
+    monkeypatch.setenv("MEM0_PROMOTION_GATE_MODE", "off")
+    monkeypatch.setattr(m, "_canonize", lambda mid, reason: (1, REFUSED))
+    out = _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, NOM))
+    head, work = _outcome(home)
+    assert head == "degraded:autopromote-failed-1"
+    assert (work["nominated"], work["promoted"], work["promote_failed"], work["gate_blocked"]) == (1, 0, 1, 0)
+    assert out["outcome"] == head and out["promoted"] == 0
+
+
+def test_the_promotion_failure_log_keeps_the_cause_not_the_banner(home, m, monkeypatch, capsys):
+    """The banner mem0-canonize.sh prints is ~190 characters; the log kept the first 200, so the cause was clipped
+    to `curl: (22`. The refusal is at the END of the output."""
+    monkeypatch.setenv("MEM0_PROMOTION_GATE_MODE", "off")
+    monkeypatch.setattr(m, "_canonize", lambda mid, reason: (1, REFUSED))
+    _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, NOM))
+    assert "returned error: 422" in capsys.readouterr().out
+
+
+def test_a_good_promotion_is_counted_and_stays_ok(home, m, monkeypatch):
+    monkeypatch.setenv("MEM0_PROMOTION_GATE_MODE", "off")
+    monkeypatch.setattr(m, "_canonize", lambda mid, reason: (0, '{"ok": true, "tier": "canonical"}'))
+    _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, NOM))
+    head, work = _outcome(home)
+    assert head == "ok" and (work["nominated"], work["promoted"], work["promote_failed"]) == (1, 1, 0)
+
+
+def test_a_gate_block_is_counted_but_is_not_a_degraded_night(home, m, monkeypatch):
+    monkeypatch.setenv("MEM0_PROMOTION_GATE_MODE", "enforce")
+    monkeypatch.setattr(m.ap, "promotion_gate_verdict", lambda mid, text, rec, **kw: {
+        "memoryId": mid, "candidatePreview": text[:140], "source": "l1a", "sourceClass": "untrusted", "siblingCount": 0,
+        "siblingThreshold": 0.6, "wasReObserved": False, "corroborationCount": 1, "nearCanonicalCount": 0,
+        "contradicts": False, "contradictionParsed": True, "contradictionCanonical": None, "codexMs": None,
+        "codexTokens": 0, "gate": {"promote": False, "reason": "insufficient corroboration", "gate_class": "uncorroborated"}})
+    monkeypatch.setattr(m, "_canonize", lambda mid, reason: (_ for _ in ()).throw(AssertionError("a blocked nominee is never sent")))
+    _run(m, [], mem0=Mem0(EV), judge=_judge(SIG, INS, NOM))
+    head, work = _outcome(home)
+    assert head == "ok" and (work["nominated"], work["promoted"], work["promote_failed"], work["gate_blocked"]) == (1, 0, 0, 1)
+
+
+def test_a_nominee_the_server_canary_would_refuse_is_never_gated_or_sent(home, m, monkeypatch):
+    """The 10-07 shape: the second sentence opens with `Do not`. The dream's own filter looked only at the start of the
+    whole text, case-sensitively; the server's canary is per sentence. Now the nominee is a structural reject, so it
+    spends no gate call, makes no PATCH, and tomorrow's run meets the same verdict instead of the same 422."""
+    calls = []
+    monkeypatch.setattr(m, "_canonize", lambda mid, reason: (calls.append(("canonize", mid)), (1, REFUSED))[1])
+    monkeypatch.setattr(m.ap, "promotion_gate_verdict", lambda *a, **k: (calls.append(("gate",)), (_ for _ in ()).throw(RuntimeError("gated")))[1])
+    ev = [dict(EV[0], memory="The old exporter and the Alpha Drive project are RETIRED. Do not audit, fix or document them; treat any reference to them as stale.")]
+    _run(m, [], mem0=Mem0(ev), judge=_judge(SIG, INS, NOM))
+    assert calls == []
+    head, work = _outcome(home)
+    assert head == "ok" and (work["nominated"], work["promote_failed"]) == (0, 0)
+    assert work["structural_rejected"] == 1, "the drop is no longer silent: it is a count in the receipt"

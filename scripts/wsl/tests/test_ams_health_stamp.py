@@ -7,6 +7,7 @@ counts a step reported. Both name a failing write path on their health line and 
 healthy one."""
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -319,3 +320,39 @@ def test_summary_names_a_stalled_capture_and_only_then(tmp_path):
     (tmp_path / "second").mkdir()
     t2 = _summary(tmp_path / "second", [_row("dream")], health=dict(BASE, capture={"state": "quiet", "stalled": False}))
     assert "pool-health ONLINE\n" in t2 and "capture" not in t2, "a quiet capture is not a fault"
+
+
+# ---- CM-01: the summary quotes the stamp, so the stamp runs first -------------------------------------------------
+UNITS = SCRIPTS.parents[1] / "systemd"
+
+
+def _after_graph():
+    g = {}
+    for p in UNITS.glob("ams-step-*.service"):
+        step = p.name[len("ams-step-"):-len(".service")]
+        m = re.search(r"^After=(.*)$", p.read_text(encoding="utf-8"), re.M)
+        g[step] = {u[len("ams-step-"):-len(".service")] for u in (m.group(1).split() if m else []) if u.startswith("ams-step-")}
+    return g
+
+
+def _runs_after(g, a, b):
+    seen, todo = set(), [a]
+    while todo:
+        for dep in g.get(todo.pop(), ()):
+            if dep == b:
+                return True
+            if dep not in seen:
+                seen.add(dep)
+                todo.append(dep)
+    return False
+
+
+def test_the_morning_summary_runs_after_the_health_stamp_it_quotes():
+    """The summary reads health-maintenance.json, which only the stamp writes. Live 2026-10-08: the summary line (03:04:50.33)
+    came from the stamp BEFORE tonight's (03:04:50.65), so a night that recovered still read `ok=False degraded=wiki-index`,
+    and a bad night reads green until the next one."""
+    g = _after_graph()
+    assert _runs_after(g, "morning-summary", "health-stamp")
+    assert not _runs_after(g, "health-stamp", "morning-summary")
+    assert _runs_after(g, "health-stamp", "pcloud-copy"), "the stamp still follows the last real step"
+    assert _runs_after(g, "rtcwake", "morning-summary") and _runs_after(g, "rtcwake", "health-stamp"), "rtcwake stays last"
