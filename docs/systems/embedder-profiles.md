@@ -77,7 +77,7 @@ tiers and the reranker skip. Three keep an operator knob (`MEM0_RELEVANCE_THRESH
 | evidence-sweep floor | 0.45 | 0.77 | same map |
 | autopromote sibling | 0.6 | 0.825 | same map |
 | semantic-dedup tiers | .97/.95/.94/.94/.95 | .993/.99/.988/.988/.99 | full-corpus tail: at ≥ 0.988 no pair EmbeddingGemma-300m kept is deleted |
-| reranker skip (combined score) | 0.92 | 0.89 | the cut that skips the same 0.4% of searches |
+| reranker skip (fused score) | 1.0 | 1.0 | not a cosine: rank fusion is the same in every space, 1.0 = every leg ranks the head first ([hybrid fusion](fusion.md)) |
 
 ## The EmbeddingGemma-2 evaluation (2026-10-08) and the decision it made
 
@@ -94,11 +94,19 @@ and a question about a detail past character 1,500 of the body. MRR@10, paired b
   lost 66 queries and won 1. mem0 fuses `(cosine + bm25 + entity) / max` additively, and a compressed, high
   cosine scale hands the ranking to the keyword and entity terms.
 - **Memories, hybrid + rerank:** a tie (0.643 vs 0.645 EN).
+- **Memories, revisited with the fusion fixed** (1.34.0, rank fusion, [hybrid fusion](fusion.md)), same lab,
+  freshness on, 160 answerable paraphrase targets and 200 identifier targets: the per-prompt path gives
+  EmbeddingGemma-2 0.944 EN / 0.951 ES on paraphrases (was 0.542 / 0.575) and EmbeddingGemma-300m 0.972 /
+  0.959; EmbeddingGemma-2 still trails in every cell, by 0.01-0.04 (significantly in four of nine). The
+  mixing was the cause of the large gap, not the model; the remaining gap keeps the memories where they are.
 - **Wiki, deep-detail questions:** EmbeddingGemma-2 on whole pages 0.788 (4K alias) / 0.811 (8K alias) vs
   EmbeddingGemma-300m's best recipe 0.687 (+0.10, CI [+0.016, +0.194]); head questions a tie. Giving
   EmbeddingGemma-300m more of the page did not help it (+0.006).
 - **VRAM:** EmbeddingGemma-2 at ctx 4096 costs what EmbeddingGemma-300m costs at 2048 (+735 vs +742 MiB);
-  ctx 8192 adds about 600 MiB and bought no significant retrieval, so no long alias by default.
+  ctx 8192 adds about 600 MiB and bought no significant retrieval, so no long alias by default. Per model,
+  not in total: a box that keeps the memories on EmbeddingGemma-300m and serves the wiki on
+  EmbeddingGemma-2 holds both, so a small card that already runs a heavy model beside the memory stack
+  needs those ~735 MiB free.
 
 Decision: **the memories stay on EmbeddingGemma-300m; the wiki index moves to EmbeddingGemma-2**
 (`MEM0_WIKI_EMBED_PROFILE=egemma2`). The wiki's search cut-off moves with it: about 0.22 separates

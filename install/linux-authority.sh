@@ -647,5 +647,11 @@ want_collection="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))'
 [ "$bound_profile" = "$EMBED_PROFILE" ] || fail "mem0 is bound to embedding profile '${bound_profile:-none reported}', not '$EMBED_PROFILE': is Environment=MEM0_EMBED_PROFILE in ~/.config/systemd/user/mem0.service.d/native.conf, and did the server restart? (journalctl --user -u mem0)"
 [ -z "$want_collection" ] || [ "$bound_collection" = "$want_collection" ] || fail "mem0 is bound to collection '${bound_collection:-none reported}', not '$want_collection' (profile $EMBED_PROFILE)"
 echo "    embedding profile $EMBED_PROFILE bound (collection ${bound_collection:-?}, alias $EMBED_MODEL)"
+# 1.34.0 post-condition: every search ranks by rank fusion (docs/systems/fusion.md). A mem0 the fusion
+# cannot bind to ranks with its own formula while every other check is green; MEM0_FUSION=mem0 in a
+# mem0.service drop-in of your own runs that formula on purpose and passes.
+fusion_ok="$(printf '%s' "$deep_json" | jq -r '.checks.fusion.ok // false' 2>/dev/null || echo false)"
+[ "$fusion_ok" = true ] || fail "mem0's search is not bound to the rank fusion: $(printf '%s' "$deep_json" | jq -c '.checks.fusion' 2>/dev/null) (docs/systems/fusion.md; journalctl --user -u mem0)"
+echo "    search fusion: $(printf '%s' "$deep_json" | jq -r '.checks.fusion.mode // "?"' 2>/dev/null)"
 echo
 echo "Native authority installed. Bind $BIND_IP:18791; secrets via systemd-creds; timers: systemctl --user list-timers ams-nightly.timer l10-audit.timer"

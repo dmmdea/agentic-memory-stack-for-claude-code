@@ -47,6 +47,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `qdrant-store` | vector store holding the memory corpus | checks.qdrant (collection status + point count) | both | — |
 | `embedder` | dense embedder (768-dim round-trip) | checks.embedder | both | — |
 | `bm25-sparse-leg` | lexical BM25 leg of hybrid retrieval | checks.sparse_leg (deterministic oldest-point canary) | both | — |
+| `search-fusion` | rank fusion ranks every memory search (1.34.0) | checks.fusion (binding + searches that bypassed it) | both | — |
 | `canonical-key` | HMAC canonical-key chain (runtime/DPAPI/plaintext provider) | checks.canonical_key | brain | — |
 | `service-key` | authority-only service key that proves a server-side job label (1.32.5) | checks.service_key | brain | — |
 | `put-carryover` | PUT payload carry-over (metadata survives text rewrites) | checks.put_carryover_today (daily activity counters); unknown-on-idle by design (F9) — exerciser: Test-MemoryStack I13 PUT canary | both | F17 |
@@ -88,6 +89,8 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
   `dead`; no signal → `unknown`.
 - **`bm25-sparse-leg`**: `sparse_leg.ok: false` → `dead`; alive but coverage < 0.95 → `degraded`
   (a half-backfilled corpus is degraded, not dead).
+- **`search-fusion`**: `fusion.ok: false` (not bound, or a search bypassed it) → `dead`; `mode: mem0` → `degraded`
+  (the operator's rollback to mem0's own formula: off on purpose, never dead; [fusion](systems/fusion.md)).
 - **`drift-guard`**: `state_present: false` → `unknown` (the guard may simply not be deployed);
   ≥ 2 consecutive snapshot failures or a > 96h-stale compare → `dead`; a standing alarm or
   compat-fallback → `degraded`.

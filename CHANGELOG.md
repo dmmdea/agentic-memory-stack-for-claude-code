@@ -4,9 +4,39 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
-## 1.34.0 — capture liveness and urgent chain pages (2026-10-08)
+## 1.34.0 — rank fusion for every search, capture liveness and urgent chain pages (2026-10-08)
+
+### Changed
+- **Every memory search ranks by rank fusion** (`mem0-server/fusion.py`, [docs/systems/fusion.md](docs/systems/fusion.md),
+  Proposed ADR `hybrid-fusion-rank.md`; audit EVAL-01). mem0 added the raw cosine, a sigmoid BM25 score and an
+  entity boost, so on candidates whose cosines sit within 0.1-0.2 of each other the keyword and entity terms
+  outvoted the meaning of the query, and durable freshness (0.77-0.90 for evidence-tier memories) then
+  outvoted relevance too. The server now replaces mem0's `score_and_rank` (the module global its search calls)
+  with weighted reciprocal rank fusion over the dense pool (k 2, keyword 0.4, entity 0.25), keeping the
+  raw-cosine gate and the candidate pool. Measured on a restored copy of the store through the authority's
+  mem0 2.0.4, EmbeddingGemma-300m, freshness on: paraphrased questions 0.758 -> 0.972 MRR (EN), identifier
+  questions 0.490 -> 0.652, what the per-prompt hook injects 0.622 -> 0.838; a tie with dense search on
+  paraphrases and +0.04-0.08 on identifiers. A lab server built from this change returned exactly the
+  replayed top 10 for all 1,080 queries.
+- Search results' `score` is now the fused score: in (0, 1], not a cosine. `threshold` still compares the
+  raw cosine, which each result now carries as `cosine`; the admission gate's optional brand-coherence
+  floor (off everywhere) reads `cosine` instead of `score`.
+- The reranker's skip cut (`rerank_skip`) is 1.0 in every space: the head is ranked first by every leg
+  (0.0-0.1% of the lab's searches, as inert as the old 0.92 / 0.89 on mem0's scale).
+- `POST /v1/memories/diagnose` reports the target's raw `cosine` beside its fused `score`, and its threshold
+  verdict compares the cosine (it compared the fused score with a cosine threshold).
 
 ### Added
+- `GET /health/deep` `checks.fusion` (`{ok, mode, bound, callers_bound, searches: {reached, bypassed}}`):
+  `ok` is false when mem0's search no longer loads the module global, when mem0's `score_and_rank` takes a
+  parameter the fusion does not, or when a search returned results without reaching the fusion. That fails
+  the native authority installer's new post-condition, `deploy.sh`'s gate and Test-MemoryStack's L2 row
+  (which now names it) instead of the stack silently ranking the old way. `MEM0_FUSION=mem0` restores
+  mem0's own formula (the rollback, and how to run a mem0 the fusion cannot bind to), set in a
+  `mem0.service` drop-in of your own: the unit does not read `stack.env`
+  ([docs/systems/fusion.md](docs/systems/fusion.md)). A search with `explain` gains a `fusion` trace stage.
+- Capability manifest row `search-fusion` (`checks.fusion`): `dead` when unbound or bypassed, `degraded` in the
+  deliberate mem0 mode.
 - **`capture` on `GET /health/maintenance`** (audit CRIT-01): is the PC-side L1a extractor still finishing
   runs? Read per request from `episodic.db` (index reads over a read-only connection): `activity_at` (the newest
   episode touched, which every prompt does) and `success_at` (the newest complete episode: L1a's finished runs).
@@ -18,6 +48,15 @@ in the first entries below — full pre-inversion history lives in the maintaine
 - **`critical_failed_steps` on `GET /health/maintenance`** (audit CRIT-02): `failed_steps` minus the steps whose
   failure is not actionable at night because they depend on a PC being on (today `wiki-index`). An external
   monitor can page urgently on it, through quiet hours, while `failed_steps` keeps paging normally.
+
+### Fixed
+- `restore-replica.sh` step 4 gates on the top-level `ok` of `/health/deep`: it grepped for any `"ok": true`,
+  which every healthy sub-check also matched, so a red endpoint restored green.
+
+### Measured (no change)
+- Revisited the EmbeddingGemma-2 question with the fusion fixed: EmbeddingGemma-2 recovers most of what
+  mem0's formula cost it (paraphrase 0.944 EN, was 0.542) but still trails EmbeddingGemma-300m in every cell
+  by 0.01-0.04 (four of nine significant). The memories stay on EmbeddingGemma-300m.
 
 ## 1.33.0 — embedder profiles: one definition per embedding space, a measured migration path, the wiki in its own space (2026-10-08)
 

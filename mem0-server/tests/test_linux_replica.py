@@ -446,3 +446,23 @@ def test_installer_ams_hub_reaches_the_client_from_the_receipt_and_clears_when_t
     assert "--ams-hub cleared (explicit empty value; not inherited)" in r.stdout
     assert "WARN: no --ams-hub" in r.stdout
     assert "--ams-hub inherited" not in r.stdout
+
+
+def test_restore_gates_on_the_top_level_ok_of_deep_health():
+    """A grep for any `"ok": true` also matched every healthy sub-check, so a red /health/deep (an unbound fusion,
+    a dead sparse leg) passed the restore's step 4. The gate reads the top-level field."""
+    import shutil
+    sh = RESTORE.read_text(encoding="utf-8")
+    line = next(ln for ln in sh.splitlines() if 'replica /health/deep not ok' in ln)
+    assert "jq -e '.ok == true'" in line
+    if shutil.which("jq") is None or shutil.which("bash") is None:
+        pytest.skip("jq/bash not on PATH")
+    red = '{"ok": false, "checks": {"qdrant": {"ok": true}, "fusion": {"ok": false}}}'
+    green = '{"ok": true, "checks": {"qdrant": {"ok": true}}}'
+    gate = line.replace('fail "replica /health/deep not ok: ${deep:0:300}"', "exit 3")
+    for deep, rc in ((red, 3), (green, 0)):
+        r = subprocess.run(["bash", "-c", f"deep='{deep}'; {gate}"], capture_output=True, text=True, timeout=30)
+        assert r.returncode == rc, (deep, r.returncode, r.stderr)
+    old = subprocess.run(["bash", "-c", f"deep='{red}'; printf '%s' \"$deep\" | grep -q '\"ok\"[[:space:]]*:[[:space:]]*true'"],
+                         capture_output=True, text=True, timeout=30)
+    assert old.returncode == 0, "the old grep passed the red response: the reason for this test"

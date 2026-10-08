@@ -6,7 +6,13 @@ def test_should_rerank_skips_small():
     assert should_rerank([{"score": 0.5}, {"score": 0.4}]) is False  # N=2 < 3
 
 def test_should_rerank_skips_high_confidence():
-    assert should_rerank([{"score": 0.95}, {"score": 0.5}, {"score": 0.4}]) is False
+    # the fused score (reciprocal rank fusion) is 1.0 only when every leg ranks the head first
+    assert should_rerank([{"score": 1.0}, {"score": 0.5}, {"score": 0.4}]) is False
+
+
+def test_should_rerank_runs_below_a_unanimous_head():
+    # 0.95 was "confident" on mem0's additive scale; on the rank-fusion scale it is not unanimous
+    assert should_rerank([{"score": 0.95}, {"score": 0.5}, {"score": 0.4}]) is True
 
 def test_should_rerank_runs_when_unsure():
     assert should_rerank([{"score": 0.5}, {"score": 0.45}, {"score": 0.4}, {"score": 0.35}]) is True
@@ -47,7 +53,8 @@ def test_rerank_passes_through_on_failure(monkeypatch):
 
 def test_skip_reason_distinguishes_the_two_skips():
     assert skip_reason([{"score": 0.5}, {"score": 0.4}]) == "small_n"
-    assert skip_reason([{"score": 0.95}, {"score": 0.5}, {"score": 0.4}]) == "confident"
+    assert skip_reason([{"score": 1.0}, {"score": 0.5}, {"score": 0.4}]) == "confident"
+    assert skip_reason([{"score": 0.95}, {"score": 0.5}, {"score": 0.4}]) is None   # not unanimous
     assert skip_reason([{"score": 0.5}, {"score": 0.45}, {"score": 0.4}]) is None
 
 
@@ -60,7 +67,7 @@ def test_status_out_reports_skips_without_transport(monkeypatch):
     rr.rerank("q", [{"memory": "a"}, {"memory": "b"}], status_out=st)
     assert st["status"] == "skipped_small_n"
     st = {}
-    rr.rerank("q", [{"score": 0.99, "memory": "a"}, {"memory": "b"},
+    rr.rerank("q", [{"score": 1.0, "memory": "a"}, {"memory": "b"},
                     {"memory": "c"}], status_out=st)
     assert st["status"] == "skipped_confident"
 
@@ -101,6 +108,6 @@ def test_force_bypasses_both_skips(monkeypatch):
     assert out[0]["memory"] == "b" and out[0]["rerank_score"] == 0.9
     # confident head — force must still rerank
     st = {}
-    rr.rerank("q", [{"score": 0.99, "memory": "a"}, {"memory": "b"}],
+    rr.rerank("q", [{"score": 1.0, "memory": "a"}, {"memory": "b"}],
               force=True, status_out=st)
     assert calls["n"] == 2 and st["status"] == "ran"

@@ -50,8 +50,9 @@ Retrieval, admission and recency policy around the rerank ([memory-retrieval flo
 
 `_search_core` calls `reranker.rerank(query, results, text_key, force=..., status_out=...)`
 when the request asked for a rerank and there are results. Skip rules (`skip_reason`): fewer
-than `RERANK_MIN_N = 3` results (`small_n`) or a top dense score at or above
-`RERANK_SKIP_IF_TOP_SCORE = 0.92` (`confident`). `force=True` bypasses both (see W5). Each
+than `RERANK_MIN_N = 3` results (`small_n`) or a head whose fused score is at or above
+`RERANK_SKIP_IF_TOP_SCORE` (`confident`; the profile's `rerank_skip`, 1.0 in every space: the head is
+ranked first by every leg of the [hybrid fusion](fusion.md)). `force=True` bypasses both (see W5). Each
 document is cut to `RERANK_DOC_MAX_CHARS = 6000` characters before it is sent.
 
 **Timeouts and the cold-start retry.** The first attempt uses `RERANK_TIMEOUT_S = 8.0`. If it
@@ -105,7 +106,7 @@ session finds both support models warm. Without `?warm=` the endpoint behaves as
 
 - `reranker.rerank(query, results, text_key, *, force=False, status_out=None)` — the list-return signature is pinned; the two additions are keyword-only. `status_out["status"]` reports the values in the table above (the skip reasons were previously collapsed inside `should_rerank`).
 - `force=True` bypasses BOTH skip heuristics. The search path passes it whenever keyword-union candidates joined the pool: a silent skip would delete every lexical rescue via the fail-closed drop (`lexical_only` items without a `rerank_score` never reach the caller).
-- The 0.92 confidence skip is measured-inert on the live combined-score scale (max observed 0.737 pre-W5); `rerank_status` now measures `skipped_confident` occurrences so the constant's behavior is observable rather than assumed (AMS-43).
+- The confidence skip was measured-inert on mem0's additive score scale (0.92 cut, max observed 0.737 pre-W5). Since the rank fusion (1.34.0) the cut is 1.0, a unanimous head, which the 2026-10-08 lab hit on 0.0-0.1% of searches: still effectively inert. `rerank_status` measures `skipped_confident` occurrences so the constant's behavior is observable rather than assumed (AMS-43).
 - Passive liveness counters (W4) are unchanged: skips still bump nothing; `failed_fallback_dense` corresponds to a real transport failure.
 
 ## Data and state

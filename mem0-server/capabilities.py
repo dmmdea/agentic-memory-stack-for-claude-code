@@ -113,6 +113,10 @@ CAPABILITIES = [
      "what": "lexical BM25 leg of hybrid retrieval",
      "probe": "checks.sparse_leg (deterministic oldest-point canary)",
      "required": "both", "escalation_documented": False},
+    {"id": "search-fusion",
+     "what": "rank fusion ranks every memory search (1.34.0)",
+     "probe": "checks.fusion (binding + searches that bypassed it)",
+     "required": "both", "escalation_documented": False},
     {"id": "canonical-key",
      "what": "HMAC canonical-key chain (runtime/DPAPI/plaintext provider)",
      "probe": "checks.canonical_key",
@@ -344,6 +348,16 @@ def _sparse_leg_state(check):
     if isinstance(cov, (int, float)) and cov < SPARSE_COVERAGE_FLOOR:
         return "degraded"
     return "alive"
+
+
+def _fusion_state(check):
+    """1.34.0 (fusion.py): ok false (not bound, or a search bypassed it) -> dead; the mem0 mode is the operator's
+    deliberate rollback to mem0's own formula -> degraded (the capability is off on purpose, never dead)."""
+    if not isinstance(check, dict):
+        return "unknown"
+    if not check.get("ok"):
+        return "dead"
+    return "degraded" if check.get("mode") == "mem0" else "alive"
 
 
 def _service_key_state(check):
@@ -628,6 +642,8 @@ def _state_for(row, checks, stack_version=None, now_s=None):
         return _ok_state(checks.get("embedder"))
     if cid == "bm25-sparse-leg":
         return _sparse_leg_state(checks.get("sparse_leg"))
+    if cid == "search-fusion":
+        return _fusion_state(checks.get("fusion"))
     if cid == "canonical-key":
         return _canonical_key_state(checks.get("canonical_key"))
     if cid == "service-key":

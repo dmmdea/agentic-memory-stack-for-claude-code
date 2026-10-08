@@ -189,7 +189,8 @@ systemctl --user start mem0.service
 health=""
 for i in $(seq 1 45); do health="$(curl -sf -m 10 http://127.0.0.1:18791/health 2>/dev/null || true)"; printf '%s' "$health" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' && break; sleep 2; [ "$i" = 45 ] && fail "replica mem0 did not come up healthy: ${health:-<no answer>} (systemctl --user status mem0.service)"; done
 deep="$(curl -sf -m 120 http://127.0.0.1:18791/health/deep 2>/dev/null || true)"
-printf '%s' "$deep" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || fail "replica /health/deep not ok: ${deep:0:300}"
+# the TOP-LEVEL ok: a grep for any "ok": true also matched every healthy sub-check, so a red /health/deep passed
+printf '%s' "$deep" | jq -e '.ok == true' >/dev/null 2>&1 || fail "replica /health/deep not ok: ${deep:0:300}"
 # ...and bound to the space and collection that were just restored (a server reports both; one that
 # predates the profile report says nothing and is not second-guessed)
 bound_profile="$(printf '%s' "$deep" | jq -r '.embed_profile.profile // empty' 2>/dev/null || true)"
