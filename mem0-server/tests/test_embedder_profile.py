@@ -149,7 +149,13 @@ def test_thresholds_default_profile_unchanged(clean):
     t = ep.get("egemma-300m").thresholds
     assert (t.relevance_gate, t.episode_floor, t.nli_floor, t.evidence_sim_floor, t.sibling) == (0.30, 0.20, 0.5, 0.45, 0.6)
     assert t.dedup_for("canonical") == 0.97 and t.dedup_for("evidence") == 0.94 and t.dedup_for("unknown") == 0.92
-    assert ep.threshold("relevance_gate") == 0.30 and ep.threshold("rerank_skip") == 0.92
+    assert ep.threshold("relevance_gate") == 0.30 and ep.threshold("rerank_skip") == 1.0
+
+
+def test_the_rerank_skip_is_the_same_in_every_space(clean):
+    # it reads the fused score, which is reciprocal rank fusion (fusion.py): rank-based, so no model's
+    # cosine scale moves it; 1.0 = every leg ranks the head first
+    assert {p.thresholds.rerank_skip for p in ep.PROFILES.values()} == {1.0}
 
 
 def test_thresholds_follow_the_profile_and_env_knobs(clean, monkeypatch):

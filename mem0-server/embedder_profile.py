@@ -47,7 +47,7 @@ class Thresholds:
     sibling: float            # autopromote corroboration: a sibling counts at cosine >= this
     dedup: tuple              # semantic-dedup per tier: ((tier, cosine), ...) — it DELETES
     dedup_fallback: float     # semantic-dedup, a tier the table does not name
-    rerank_skip: float        # skip the cross-encoder when the head's COMBINED hybrid score >= this
+    rerank_skip: float        # skip the cross-encoder when the head's FUSED score (fusion.py) >= this
 
     def dedup_for(self, tier: str) -> float:
         return dict(self.dedup).get(tier, self.dedup_fallback)
@@ -95,12 +95,14 @@ PROFILES = {
         memories="mem0_egemma_768", episodes="episodes_egemma_768", wiki="wiki_pages_egemma_768",
         # The values the stack was calibrated with on this space (calibrate_relevance.py 2026-06-15,
         # calibrate_episode_floor.py, corroboration_threshold_calibration.py; dedup by operator
-        # direction 2026-06-10). Unchanged by the profile refactor.
+        # direction 2026-06-10). Unchanged by the profile refactor. rerank_skip is not a cosine: the
+        # fused score is reciprocal rank fusion (fusion.py), the same in every space, and 1.0 means
+        # every leg ranks the head first (0.0-0.1% of the lab's searches; docs/systems/fusion.md).
         thresholds=Thresholds(
             relevance_gate=0.30, episode_floor=0.20, nli_floor=0.5, evidence_sim_floor=0.45, sibling=0.6,
             dedup=(("canonical", 0.97), ("stable", 0.95), ("evidence", 0.94), ("temporal", 0.94),
                    ("insight", 0.95)),
-            dedup_fallback=0.92, rerank_skip=0.92),
+            dedup_fallback=0.92, rerank_skip=1.0),
     ),
     # google/embeddinggemma-2: Gemma 4 backbone, 270M text-only parameters, 768-d output (Matryoshka
     # 512/256/128 unused here), mean pooling, trained at 8,192 tokens. Its GGUF header advertises the
@@ -126,13 +128,14 @@ PROFILES = {
         # 0.108). Episode floor 0.68: middle of the clean band [0.65, 0.71]. The neighbour thresholds
         # match quantiles of nearest-neighbour cosine across the two spaces (2,000 memories, rank
         # corr 0.88). Dedup tiers from the full-corpus tail: at >= 0.988 no pair EmbeddingGemma-300m
-        # kept would be deleted. rerank_skip 0.89 skips the same 0.4% of searches as 0.92 did.
+        # kept would be deleted. rerank_skip is the fused (rank-fusion) score, which does not depend on
+        # the space: 1.0 as on EmbeddingGemma-300m.
         thresholds=Thresholds(
             relevance_gate=0.70, episode_floor=0.68, nli_floor=0.79, evidence_sim_floor=0.77,
             sibling=0.825,
             dedup=(("canonical", 0.993), ("stable", 0.99), ("evidence", 0.988), ("temporal", 0.988),
                    ("insight", 0.99)),
-            dedup_fallback=0.988, rerank_skip=0.89),
+            dedup_fallback=0.988, rerank_skip=1.0),
     ),
 }
 

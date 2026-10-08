@@ -54,7 +54,8 @@ RERANK_RETRY_MIN_S = 1.0
 RAN_STATUSES = ("ran", "ok-after-cold-retry")
 # Don't bother reranking trivially small or very confident result sets.
 RERANK_MIN_N = 3
-# Per embedding space: the head's COMBINED hybrid score rises with the dense model's cosine scale.
+# The head's FUSED score (fusion.py, reciprocal rank fusion) is 1.0 only when every leg ranks it first;
+# the cut is per profile but the same in every space, because rank fusion ignores the cosine scale.
 import embedder_profile as _embedder_profile
 RERANK_SKIP_IF_TOP_SCORE = _embedder_profile.threshold("rerank_skip")
 # v2-m3 has 8192-token ctx; 6000 chars gives safe headroom for query + special tokens.

@@ -185,6 +185,13 @@ from config import build_embedder
 mem.embedding_model = build_embedder()
 log.info("mem0 initialized (embedder: %s prefix-shim, model: %s, collection: %s)",
          EMBED_PROFILE.label, EMBEDDER_CONFIG["model"], mem.vector_store.collection_name)
+# Hybrid fusion (docs/systems/fusion.md): mem0 ranks its dense pool by (cosine + bm25 + entity) / max,
+# which hands the order to the keyword and entity terms; fusion.install binds a ranking that stays on
+# the cosine scale in its place. /health/deep reports the binding, so a mem0 release that moves the
+# scoring fails the deploy gate instead of silently ranking the old way.
+import fusion as _fusion  # noqa: E402
+FUSION_STATUS = _fusion.install()
+log.info("fusion: %s", FUSION_STATUS)
 
 def _stamp_tier_fetch(ids):
     """One batched retrieve of the CURRENT tier of each contradicts_canonical target (payload-only,
@@ -1133,6 +1140,11 @@ def health_deep() -> dict:
     except Exception as e:
         out["ok"] = False
         out["checks"]["embedder"] = {"ok": False, "error": str(e)[:120]}
+    # Hybrid fusion binding (fusion.install at start): bound=False means mem0 ranks with its own
+    # additive formula again (a mem0 release moved the scoring), which flips ok so the deploy gate fails.
+    out["checks"]["fusion"] = {"ok": bool(FUSION_STATUS.get("bound")), **FUSION_STATUS}
+    if not FUSION_STATUS.get("bound"):
+        out["ok"] = False
     # v0.19 M10: hook-contract drift counters (in-process, zero I/O). missing =
     # field-less callers (documented-legitimate, logged INFO); unknown = real
     # drift candidates (logged WARN). Informational — never flips ok=False.
@@ -1610,7 +1622,7 @@ def _search_core(b: SearchIn, _route: str = "search"):
     _rr_status: dict = {}
     if b.rerank and isinstance(items, list) and items:
         # W5 T5.3: FORCE the rerank whenever lexical candidates joined the
-        # pool — a silent should_rerank skip (small-N or 0.92-confident head)
+        # pool — a silent should_rerank skip (small-N or a unanimous head)
         # would delete every lexical rescue via the fail-closed drop below,
         # exactly the confidently-wrong-dense shape AMS-56 exists to fix.
         reranked_items = bge_rerank(b.query, items, text_key="memory",
@@ -1950,6 +1962,12 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                 dense_rank = _i + 1
                 dense_score = _r.get("score")
                 break
+        # The live gate compares the RAW cosine (the fusion keeps the threshold on it), so the
+        # threshold verdict must too; the fused score is on another footing. The fusion records each
+        # candidate's legs for this request; under MEM0_FUSION=mem0 there are none and the fused
+        # score stands in, as before.
+        dense_cosine = ((_fusion.last_legs() or {}).get(b.target_id) or {}).get("cosine")
+        gate_score = dense_cosine if dense_cosine is not None else dense_score
         # -- probe 2: flags off the payload --
         retired = payload.get("retrievable") is False
         canonical_intent = bool(payload.get("_canonical_intent"))
@@ -2016,8 +2034,8 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
         # -- verdict: first eating stage, in live pipeline order --
         if dense_rank is None:
             verdict = "dense_retrieval:below_500_horizon"
-        elif dense_score is not None and b.threshold and float(dense_score) < float(b.threshold):
-            verdict = f"threshold:{dense_score}_below_{b.threshold}"
+        elif gate_score is not None and b.threshold and float(gate_score) < float(b.threshold):
+            verdict = f"threshold:{gate_score}_below_{b.threshold}"
         elif dense_rank > overfetch_limit:
             verdict = f"overfetch_pool:rank_{dense_rank}_exceeds_{overfetch_limit}"
         elif retired:
@@ -2036,7 +2054,7 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
         return {
             "target_id": b.target_id,
             "verdict": verdict,
-            "dense": {"rank_at_500": dense_rank, "score": dense_score,
+            "dense": {"rank_at_500": dense_rank, "score": dense_score, "cosine": dense_cosine,
                       "overfetch_limit": overfetch_limit,
                       "within_overfetch": (dense_rank is not None
                                            and dense_rank <= overfetch_limit)},
