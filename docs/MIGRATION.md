@@ -140,3 +140,57 @@ Keep the old `~/.mem0/backups` for a few weeks as the rollback anchor, then reti
 | `mem0.service` up but canonical promotion 503s | the key chain isn't provisioned — Phase 2 step 1; check the tmpfs key per the DPAPI doc's Recovery section |
 | Old memories don't retrieve but health is green | you restored into the alternate collection — check `curl :6333/collections` for `*-restore` names and redo with `--target-collection mem0_egemma_768` |
 | Hooks never fire in Claude Code | restart VS Code after the installer (hooks + MCP load at session start) |
+
+---
+
+# Moving to another embedding space
+
+A different embedding model is a different vector space even at the same width, so a model change
+re-embeds every point into new collections and re-calibrates every cosine threshold
+([embedder profiles](systems/embedder-profiles.md)). The stack does both through a **profile**: the
+collections are named by model and the thresholds are calibrated per profile. The old collections are
+never written, so they stay the rollback anchor.
+
+**Measure first.** A newer model is not automatically better here: on 2026-10-08 EmbeddingGemma-2 lost
+about a quarter of the per-prompt path's MRR on this store and won only on whole wiki pages. Run the
+house evals (`eval/embedder-ab/` in the operator repo) against a shadow server before moving the memories.
+
+## The wiki (a rebuild)
+
+The wiki index is derived from the vault and rebuilt in seconds, so it moves without a migration:
+
+```bash
+# 1. serve the profile's alias on the authority AND on every PC that refreshes the wiki
+#    (EmbeddingGemma-2: llama.cpp >= b11452; see install/llama-swap-setup.md)
+# 2. choose the wiki's space
+echo 'MEM0_WIKI_EMBED_PROFILE=egemma2' >> ~/.mem0/stack.env
+# 3. rebuild into the new collection (the old one is kept; it is 4 MB)
+~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/wiki-index-build.py
+```
+
+Re-calibrate any consumer-side wiki score cut-off for the new space.
+
+## The memories, entities and episodes (a migration)
+
+```bash
+P=~/apps/mem0-server/.venv/bin/python; T=~/apps/mem0-scripts/embedder-migrate.py
+# 1. serve the target profile's alias on llama-swap (and add it to the harness's memory_stack)
+# 2. build the target collections beside the live ones (minutes; reads the source, never writes it)
+$P $T --to egemma2 --dry-run
+$P $T --to egemma2
+$P $T --to egemma2 --verify          # counts match; a sampled re-embed reproduces every stored vector
+# 3. switch: catch up, flip the profile, restart, catch up the writes that landed during the restart
+$P $T --to egemma2 --catch-up
+sed -i '/^MEM0_EMBED_PROFILE=/d' ~/.mem0/stack.env && echo 'MEM0_EMBED_PROFILE=egemma2' >> ~/.mem0/stack.env
+install/linux-authority.sh --embed-profile egemma2      # re-renders the unit; the native authority's deploy path
+$P $T --from egemma2 --to egemma-300m --catch-up         # keeps the OLD space current = the rollback anchor
+curl -s http://<authority>:18791/health/deep | jq .embed_profile
+```
+
+Writes made while the server restarts queue in the PCs' outboxes and replay. Re-anchor the retrieval-drift
+canaries whose stored text names the old embedder or collection.
+
+**Rollback:** set `MEM0_EMBED_PROFILE` back, run `embedder-migrate.py --from <new> --to <old> --catch-up` to
+bring the old collections up to date, re-render and restart. **Prune** the old space only after the new one
+has served real traffic for a while: `scripts/wsl/egemma-rollback-prune.sh` deletes the previous space's
+collections only while the server reports the new profile and collection; it is never armed by an installer.

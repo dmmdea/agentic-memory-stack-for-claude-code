@@ -9,13 +9,23 @@ control again.
 """
 from __future__ import annotations
 
+import datetime
+import os
 import re
+import shutil
+import stat
+import subprocess
 from pathlib import Path
+
+import pytest
+
+import embedder_profile as EP
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UNIT = REPO_ROOT / "systemd" / "mem0.service"
 INSTALLER = REPO_ROOT / "install" / "1-wsl-services.sh"
 APP = REPO_ROOT / "mem0-server" / "app.py"
+BASH = shutil.which("bash")
 
 
 def test_mem0_unit_carries_phase_h_key_chain():
@@ -289,3 +299,188 @@ def test_deploy_skips_the_native_chain_units_on_a_wsl_host():
     text = (REPO_ROOT / "scripts" / "wsl" / "deploy.sh").read_text(encoding="utf-8")
     assert 'case "$unit" in ams-*) continue ;; esac' in text
     assert text.index('MEM0_HOST_KIND:-}') < text.index('for src in "$REPO_ROOT"/systemd/*.service')
+
+
+# --- the embedding space (mem0-server/embedder_profile.py) in the units and the installer ---
+
+NATIVE_CONF = REPO_ROOT / "systemd" / "mem0-native.conf"
+EMBED_LIB = REPO_ROOT / "scripts" / "wsl" / "embed-profile.sh"
+
+
+def test_native_drop_in_takes_the_profile_and_its_alias_variable_from_the_installer():
+    """The drop-in names no profile, alias or collection: the installer renders all three, and the
+    alias goes under the variable embedder_profile reads for the profile (a literal MEM0_EMBED_MODEL=
+    would be ignored for any profile but the default space)."""
+    text = NATIVE_CONF.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.startswith("Environment=")]
+    assert "Environment=MEM0_EMBED_PROFILE=__EMBED_PROFILE__" in lines
+    assert "Environment=__EMBED_MODEL_VAR__=__EMBED_MODEL__" in lines
+    assert not [ln for ln in lines if ln.startswith("Environment=MEM0_EMBED_MODEL")], lines
+    for p in EP.PROFILES.values():
+        assert p.model not in text and p.memories not in text, p.name
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("name", sorted(EP.PROFILES))
+def test_the_shell_names_the_scoped_alias_variable_as_embedder_profile_reads_it(name, tmp_path, monkeypatch):
+    """embed-profile.sh's ep_env_key and the installer's drop-in rest on the shell and the module
+    agreeing on one variable name; ask the module whether a variable of that name selects the alias."""
+    r = subprocess.run([BASH, "-c", f'. "{EMBED_LIB.as_posix()}"; ep_env_key "{name}"'], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    key = r.stdout
+    assert key == EP._model_key(EP.PROFILES[name]), (key, EP._model_key(EP.PROFILES[name]))
+    from _home_isolation import apply_home
+    with monkeypatch.context() as m:
+        apply_home(m, tmp_path / "empty")
+        for k in [k for k in os.environ if k.startswith("MEM0_EMBED")]:
+            m.delenv(k)
+        m.setenv(key, "served-as-this")
+        assert EP.embed_model(EP.PROFILES[name]) == "served-as-this"
+
+
+def test_the_legacy_alias_variable_is_the_default_profiles_alone():
+    """linux-authority.sh writes the unscoped MEM0_EMBED_MODEL for the default profile and the scoped
+    variable for every other: that is embedder_profile.embed_model's own rule, asked rather than assumed."""
+    import tempfile
+    for name, p in EP.PROFILES.items():
+        with tempfile.TemporaryDirectory() as home:
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith("MEM0_")}, "HOME": home, "USERPROFILE": home,
+                   "MEM0_EMBED_MODEL": "legacy-alias"}
+            out = subprocess.run(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import embedder_profile as ep; "
+                                  "print(ep.embed_model(ep.get(sys.argv[2])))", str(REPO_ROOT / "mem0-server"), name],
+                                 capture_output=True, text=True, env=env, timeout=30)
+        assert (out.stdout.strip() == "legacy-alias") == (name == EP.DEFAULT_PROFILE), (name, out.stdout, out.stderr)
+
+
+def test_rollback_prune_timer_ships_unarmed_and_the_authority_installer_turns_it_off():
+    """Un-armed is a property of the shipped file, not of nobody having enabled it: with Persistent=true a
+    PAST OnCalendar fires the destructive prune at once as a missed run, so the shipped date is a placeholder
+    in the far future. The operator sets the real one when arming. The native installer also disables it."""
+    timer = PRUNE_TIMER.read_text(encoding="utf-8")
+    m = re.search(r"^OnCalendar=(\d{4})-", timer, re.M)
+    assert m, "the timer needs an OnCalendar for the parity audit"
+    assert int(m.group(1)) >= datetime.date.today().year + 50, "the shipped date must be a far-future placeholder"
+    authority = (REPO_ROOT / "install" / "linux-authority.sh").read_text(encoding="utf-8")
+    assert "egemma-rollback-prune" in authority.split("disable --now", 1)[0].rsplit("for t in", 1)[1]
+    for installer in (INSTALLER, REPO_ROOT / "install" / "linux-authority.sh", REPO_ROOT / "install" / "linux-replica.sh"):
+        code = installer.read_text(encoding="utf-8")
+        assert not re.search(r"(enable|start)[^\n]*egemma-rollback-prune", code), installer.name
+
+
+def test_rollback_prune_units_describe_a_profile_gated_cleanup_not_the_v022_one_shot():
+    svc = PRUNE_SERVICE.read_text(encoding="utf-8")
+    assert "embed_profile.profile" in svc and "NEW profile" in svc
+    assert "nomic" not in svc and "2026-06-21" not in PRUNE_TIMER.read_text(encoding="utf-8")
+
+
+# The WSL installer stages two GGUFs and prints the llama-swap entries. Neither can run as a whole here
+# (it installs Qdrant and a venv), so its functions are lifted out of the file and run for real.
+
+def _installer_function(name: str) -> str:
+    text = INSTALLER.read_text(encoding="utf-8")
+    start = text.index(f"{name}() {{")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+def _fake_tools(tmp_path: Path, payload: bytes) -> Path:
+    """A PATH dir with a curl that writes `payload` to its -o target and no huggingface-cli."""
+    b = tmp_path / "bin"
+    b.mkdir(exist_ok=True)
+    payload_file = tmp_path / "payload.bin"
+    payload_file.write_bytes(payload)
+    curl = b / "curl"
+    curl.write_text(
+        '#!/usr/bin/env bash\nout=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done\n'
+        f'echo called >> "{tmp_path / "curl.calls"}"\ncp "{payload_file}" "$out"\n', encoding="utf-8")
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+    return b
+
+
+def _stage(tmp_path: Path, payload: bytes, want: str, existing: bytes | None = None):
+    home = tmp_path / "home"
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    dest = home / "models" / "x.gguf"
+    if existing is not None:
+        dest.write_bytes(existing)
+    b = _fake_tools(tmp_path, payload)
+    script = f'USER_HOME="{home.as_posix()}"\nset -eo pipefail\n{_installer_function("stage_gguf")}\n' \
+             f'stage_gguf "{dest.as_posix()}" some/repo x.gguf "Test model" "{want}" "1MB"\n'
+    env = {**os.environ, "PATH": f"{b}{os.pathsep}/usr/bin{os.pathsep}/bin"}
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+    return r, dest
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_staged_gguf_is_checksum_verified_and_a_mismatch_is_removed(tmp_path):
+    import hashlib
+    good = b"the real gguf"
+    r, dest = _stage(tmp_path, good, hashlib.sha256(good).hexdigest())
+    assert r.returncode == 0, r.stderr
+    assert dest.read_bytes() == good and "sha256 verified" in r.stdout
+    # a download that does not hash to the expected digest is removed, so a re-run fetches it again
+    r, dest = _stage(tmp_path / "bad", b"corrupt bytes", hashlib.sha256(good).hexdigest())
+    assert r.returncode == 0, r.stderr
+    assert not dest.exists(), "a wrong-checksum file must not stay behind to be served"
+    assert "has sha256" in r.stdout and "removed" in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_present_gguf_is_not_fetched_again_and_a_foreign_one_is_reported_not_deleted(tmp_path):
+    import hashlib
+    good = b"the real gguf"
+    r, dest = _stage(tmp_path, b"never fetched", hashlib.sha256(good).hexdigest(), existing=good)
+    assert r.returncode == 0, r.stderr
+    assert "already present" in r.stdout and not (tmp_path / "curl.calls").exists()
+    r, dest = _stage(tmp_path / "other", b"never fetched", hashlib.sha256(good).hexdigest(), existing=b"an operator's own file")
+    assert dest.read_bytes() == b"an operator's own file", "an operator-supplied file is never deleted"
+    assert "WARN" in r.stdout and "not the expected" in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_failed_download_warns_and_leaves_no_file(tmp_path):
+    b = tmp_path / "bin"
+    b.mkdir()
+    curl = b / "curl"
+    curl.write_text("#!/usr/bin/env bash\nexit 22\n", encoding="utf-8")
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+    home = tmp_path / "home"
+    (home / "models").mkdir(parents=True)
+    dest = home / "models" / "x.gguf"
+    script = f'USER_HOME="{home.as_posix()}"\nset -eo pipefail\n{_installer_function("stage_gguf")}\nstage_gguf "{dest.as_posix()}" r/r x.gguf L "" ""\n'
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env={**os.environ, "PATH": f"{b}{os.pathsep}/usr/bin{os.pathsep}/bin"}, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert "could not fetch" in r.stdout and not dest.exists()
+
+
+def test_the_wsl_installer_stages_embeddinggemma2_beside_the_300m_file():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert 'EG2_HF_REPO="ggml-org/embeddinggemma-2-GGUF"' in text
+    assert 'EG2_HF_FILE="embeddinggemma-2-Q8_0.gguf"' in text
+    assert 'EG2_SHA256="2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"' in text
+    assert 'EG2_GGUF="$USER_HOME/models/embeddinggemma-2-Q8_0.gguf"' in text
+    # the 300m fetch stays: a rollback box and the migration both need the old space served
+    assert 'EGEMMA_HF_REPO="ggml-org/embeddinggemma-300M-GGUF"' in text
+    assert text.index("stage_gguf \"$EGEMMA_GGUF\"") < text.index("stage_gguf \"$EG2_GGUF\"")
+    assert "embedder_profile.py" in re.search(r'^MEM0_MODULES="([^"]*)"', text, re.M).group(1).split()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_printed_llama_swap_entries_serve_the_trained_windows_and_name_the_llama_cpp_floor():
+    """The stanza is what an operator pastes into llama-swap: two EmbeddingGemma-2 entries (hot at
+    4096, long at 8192, both mean-pooled with flash attention, batch = ubatch = ctx so a full-window
+    input fits one ubatch), and the llama.cpp build that has the gemma-embedding2 architecture."""
+    fn = _installer_function("print_stanza_eg2") + "\n" + _installer_function("print_stanza_300m")
+    r = subprocess.run([BASH, "-c", f'EG2_GGUF=/m/eg2.gguf; EGEMMA_GGUF=/m/300m.gguf\n{fn}\nprint_stanza_eg2; echo ----; print_stanza_300m'],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    eg2, old = r.stdout.split("----")
+    assert "b11452" in eg2 and "embeddinggemma2:" in eg2 and "embeddinggemma2-long:" in eg2
+    hot, long_ = eg2.split("embeddinggemma2-long:")
+    p = EP.PROFILES["egemma2"]
+    for block, ctx in ((hot, p.ctx_tokens), (long_, p.long_ctx_tokens)):
+        for flag in (f"--ctx-size {ctx}", f"--batch-size {ctx}", f"--ubatch-size {ctx}", "--pooling mean", "--embeddings",
+                     "-ngl 99", "--flash-attn on", "--model /m/eg2.gguf", "ttl: 300"):
+            assert flag in block, (flag, block)
+    assert "--ctx-size 2048" in old and "--model /m/300m.gguf" in old, "the 300m entry is unchanged"
+    assert "262144" in eg2, "the stanza warns off the GGUF header's window"

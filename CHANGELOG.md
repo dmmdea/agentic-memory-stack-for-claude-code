@@ -4,6 +4,64 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.33.0 — embedder profiles: one definition per embedding space, a measured migration path, the wiki in its own space (2026-10-08)
+
+### Added
+- **Embedder profiles** (`mem0-server/embedder_profile.py`, [docs/systems/embedder-profiles.md](docs/systems/embedder-profiles.md)).
+  A profile names one embedding space: the llama-swap alias, the served context and token budget, the task
+  prefixes and a template version, the collections built in it (named by model, never reused across spaces)
+  and every cosine threshold calibrated on it. Every embedder, collection name and threshold in the server,
+  the chain steps, the installers, backup/restore and the Windows scripts now resolves through it. Shipped:
+  `egemma-300m` (EmbeddingGemma-300m, the default and the space every existing store is in) and `egemma2`
+  (EmbeddingGemma-2: 768-d, Gemma 4 backbone, needs llama.cpp b11452+). `MEM0_EMBED_PROFILE` selects the
+  memories' space; `MEM0_WIKI_EMBED_PROFILE` gives the LLM Wiki index its own. With nothing set, behaviour is
+  unchanged (the wiki index re-embeds its pages once, to record the new per-point recipe).
+- **`scripts/wsl/embedder-migrate.py`**: builds a space's memories, entities and episodes collections beside
+  the live ones (ids, payloads and the BM25 sparse vectors copied, only the dense vector re-embedded with the
+  shim's own prefix and truncation), `--verify` (counts, and a sampled re-embed must reproduce each stored
+  vector), `--catch-up` (edits and deletions since the build; run in reverse it is the rollback), and an
+  embed-identity record (`~/.mem0/embed-identity.json`). Exercised end to end on a restored copy of the store
+  (16,946 memories), UUID and integer ids.
+- `install/linux-authority.sh` / `linux-replica.sh --embed-profile` (recorded in stack.env and the unit; an
+  existing store is refused a profile change until the new space is built); `MEM0_WIKI_EMBED_PROFILE` is an
+  operator-owned stack.env key carried across re-runs.
+- `/health` reports `embed_profile`; `/health/deep` reports `embed_profile` (profile, model, template version,
+  collections, the wiki's space) and the embedder probe's model, not only its width.
+- `wiki-index.sh build|search` follow the AUTHORITY's wiki space: a replica that does not serve that space's
+  model streams the snapshot (`build-here`) or the query (`search-here`) to the brain, so a PC can never
+  write the wiki in another space.
+
+### Changed
+- The thresholds that compare cosines (context-bundle gate, raw-trace episode floor, NLI pre-filter,
+  evidence-sweep floor, autopromote sibling, semantic-dedup tiers, reranker skip) come from the active
+  profile. The EmbeddingGemma-300m values are unchanged; EmbeddingGemma-2's were calibrated on a restored
+  copy of the store (its cosine scale sits far higher: off-topic top-1 0.61-0.69 vs 0.17-0.29).
+- The prefix shim reads its prefixes and its token budget from the profile (EmbeddingGemma-2: 3,900 tokens
+  at ctx 4096, twice the old window at the old VRAM).
+- `stack-backup.sh` snapshots the active space's collections and, while they exist, the other generation's
+  (the rollback anchor); the manifest records the profile, model, template version and which collection each
+  file holds. Restores refuse a set from another space than the box serves.
+- The rollback prune (`egemma-rollback-prune.sh`) is now a profile-gated prune of the previous space; it is
+  never armed by an installer.
+
+### Fixed
+- **Chain steps could embed with the wrong GGUF** (audit F-01): `MEM0_EMBED_MODEL` reached only the server unit,
+  so `episode-upkeep`'s backfill fell back to the stock `embeddinggemma` alias, a different conversion than the
+  store's file. Every embedder now resolves the alias from the same profile, reading stack.env.
+- **Health checks verified only `dim == 768`** (F-02), which cannot tell two 768-d models apart.
+- **Hard-coded collection names in the weekly jobs** (WG-05), and `ledger-audit.py`, `ship_log_reclassify.py`
+  and `stamp-retired-at.py` still pointed at the dead pre-EmbeddingGemma `memories` collection.
+- `cp437-repair.py` re-embedded repaired text with a private copy of the prefix and the 2,048-token budget; it
+  now takes both from the profile.
+- The backup manifest's fixed per-kind keys went to whichever collection sorted first.
+
+### Measured, not migrated
+EmbeddingGemma-2 was evaluated on a restored copy of the store before anything moved (240 memories × EN/ES
+questions, 45 wiki pages, house probe sets; details in the system doc). On short memory facts it was slightly
+worse dense-only (MRR 0.931 vs 0.953) and much worse through the per-prompt hybrid path (0.369 vs 0.504 EN),
+so the memories stay on EmbeddingGemma-300m; on whole wiki pages it answered detail questions better
+(+0.10 MRR), so the wiki index can move to it (`MEM0_WIKI_EMBED_PROFILE=egemma2`).
+
 ## 1.32.6 — the MCP shim and the replay script run on the native authority: the key and the tenant resolve at runtime (2026-10-07)
 
 ### Fixed

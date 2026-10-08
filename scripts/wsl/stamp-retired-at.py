@@ -29,7 +29,16 @@ from pathlib import Path
 import httpx
 
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "memories"
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as _ep  # noqa: E402  (the collection of the active embedding space)
+COLLECTION = _ep.collection("memories")  # was the dead pre-EmbeddingGemma "memories" collection (404 since its prune)
 # v1.23.4: the authority may bind its tailnet address (native box) — resolve like every chain job.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ams_env import api_key, mem0_headers, mem0_url  # noqa: E402  (deployed flat beside this script)

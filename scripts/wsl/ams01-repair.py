@@ -82,7 +82,16 @@ import httpx
 # ---------------------------------------------------------------------------
 
 QDRANT = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.environ.get("MEM0_COLLECTION", "mem0_egemma_768")
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as _ep  # noqa: E402  (the collection of the active embedding space)
+COLLECTION = _ep.collection("memories")  # MEM0_QDRANT_COLLECTION / MEM0_COLLECTION override; default the active space's
 HISTORY_DB = Path(os.environ.get("MEM0_HISTORY_DB", str(Path.home() / ".mem0" / "history.db")))
 SNAPSHOT_DIR = Path(os.environ.get(
     "MEM0_QDRANT_SNAPSHOT_DIR",

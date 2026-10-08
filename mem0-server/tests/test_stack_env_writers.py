@@ -52,7 +52,7 @@ def _run(args, tmp_path, stack_env=None):
     sec.mkdir(exist_ok=True)
     (sec / "ams-api-key.cred").write_bytes(b"x" * 64)
     (sec / "ams-canonical-key.cred").write_bytes(b"y" * 64)
-    env = home_env(home)
+    env = {k: v for k, v in home_env(home).items() if not k.startswith("MEM0_EMBED")}  # the operator's embedding settings must not reach the installer
     r = subprocess.run([BASH, str(SCRIPT), *args, "--secrets-dir", str(sec)],
                        capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     return r, home
@@ -295,6 +295,49 @@ def test_stack_env_carry_prints_only_recorded_operator_keys(tmp_path):
     assert none.returncode == 0 and none.stdout == ""
 
 
+def _carry(tmp_path, body, *skips):
+    f = tmp_path / "stack.env"
+    f.write_bytes(body)
+    return subprocess.run([BASH, "-c", f'. "{LIB.as_posix()}"; stack_env_carry "{f.as_posix()}" ' + " ".join(skips)],
+                          capture_output=True, text=True, timeout=30)
+
+
+def test_the_embedding_space_keys_are_carried_by_pattern(tmp_path):
+    """MEM0_EMBED_PROFILE and the alias overrides embedder_profile reads from stack.env survive every
+    writer's rewrite. Without them a re-run of the WSL or replica installer rebinds the server to the
+    default space's collections while the store sits in another: searches score noise, /health/deep
+    stays green. They are carried by pattern, so a profile added later needs no list edit."""
+    body = (b"MEM0_ROLE=replica\r\nMEM0_EMBED_PROFILE=egemma2\r\nMEM0_EMBED_MODEL=embeddinggemma-ams\r\n"
+            b"MEM0_EMBED_MODEL_EGEMMA2=embeddinggemma2-ams\r\nMEM0_EMBED_LONG_MODEL_EGEMMA2=embeddinggemma2-ams-long\r\n"
+            b"MEM0_EMBED_BASE_URL=http://box:11436/v1\r\nMEM0_EMBED_MODEL_FUTURE_2=x\r\nMEM0_EMBED_FOO=not-ours\r\n"
+            b"MEM0_EMBED_PROFILE=second-occurrence\r\n")
+    out = _carry(tmp_path, body)
+    assert out.returncode == 0, out.stderr
+    # the first occurrence wins (every sed reader takes it), a CR from a hand edit is dropped, and an
+    # unrelated MEM0_EMBED_* name is not ours to carry
+    assert out.stdout.splitlines() == [
+        "MEM0_EMBED_PROFILE=egemma2", "MEM0_EMBED_MODEL=embeddinggemma-ams",
+        "MEM0_EMBED_MODEL_EGEMMA2=embeddinggemma2-ams", "MEM0_EMBED_LONG_MODEL_EGEMMA2=embeddinggemma2-ams-long",
+        "MEM0_EMBED_BASE_URL=http://box:11436/v1", "MEM0_EMBED_MODEL_FUTURE_2=x"], out.stdout
+
+
+def test_a_writer_that_sets_an_embedding_key_itself_skips_it_in_the_carry(tmp_path):
+    out = _carry(tmp_path, b"MEM0_EMBED_PROFILE=egemma2\nMEM0_EMBED_MODEL_EGEMMA2=a\nMEM0_EMBED_MODEL=b\n",
+                 "MEM0_EMBED_PROFILE", "MEM0_EMBED_MODEL_EGEMMA2")
+    assert out.stdout.splitlines() == ["MEM0_EMBED_MODEL=b"]
+
+
+def test_the_replica_and_wsl_writers_keep_the_profile_through_a_rewrite():
+    """Neither installer can run hermetically here; both write stack.env from a fixed list plus the
+    carry, and the carry now holds the embedding keys, so the pin is the pattern in the lib plus the
+    call that hands the carried keys to the write."""
+    for writer in ("install/1-wsl-services.sh", "install/linux-replica.sh"):
+        code = "\n".join(ln for ln in (REPO_ROOT / writer).read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+        assert '"${STACK_ENV_CARRY[@]}"' in code, writer
+    lib = LIB.read_text(encoding="utf-8")
+    assert "STACK_ENV_EMBED_KEY_RE=" in lib and "MEM0_EMBED_(PROFILE|MODEL|MODEL_[A-Z0-9_]+|LONG_MODEL_[A-Z0-9_]+|BASE_URL)" in lib
+
+
 @pytest.mark.parametrize("writer", ["install/1-wsl-services.sh", "install/linux-authority.sh", "install/linux-replica.sh"])
 def test_every_writer_carries_the_operator_keys_into_its_write(writer):
     """1-wsl-services.sh and linux-replica.sh cannot run hermetically here, so their wiring is
@@ -405,6 +448,7 @@ KEY_READERS = {   # key -> [(file, the text of its stack.env read)]
                        ("scripts/wsl/ams-store-judge-apply.sh", "s/^MEM0_BRAND_MAP=//p")],
     "MEM0_POOL_HEALTH_ACK": [("mem0-server/maintenance_health.py", "read_stack_env().get(POOL_ACK_KEY)")],
     "MEM0_BRAIN_SSH": [("scripts/wsl/wiki-index.sh", "s/^MEM0_BRAIN_SSH=//p")],
+    "MEM0_WIKI_EMBED_PROFILE": [("mem0-server/embedder_profile.py", '_setting("MEM0_WIKI_EMBED_PROFILE")')],
 }
 
 

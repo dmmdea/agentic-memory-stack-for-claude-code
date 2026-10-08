@@ -132,6 +132,14 @@ if [ -z "${MEM0_USER_ID:-}" ] && [ -s "$HOME/.mem0/stack.env" ]; then
     [ -n "$MEM0_USER_ID" ] || MEM0_USER_ID="$(sed -n 's/^MEM0_WSL_USER=//p' "$HOME/.mem0/stack.env" | head -n1)"
     [ -n "$MEM0_USER_ID" ] && export MEM0_USER_ID
 fi
+# The embedding space travels with the stack too (mem0-server/embedder_profile.py): a chain step runs
+# from a unit that sets none of it, and a python job that fell back to the default profile would read
+# and write another space's collections than the server is bound to. stack.env first-wins by sed, the
+# environment outranks it, and a box without the key exports nothing (the default space, as before).
+if [ -z "${MEM0_EMBED_PROFILE:-}" ] && [ -s "$HOME/.mem0/stack.env" ]; then
+    MEM0_EMBED_PROFILE="$(sed -n 's/^MEM0_EMBED_PROFILE=//p' "$HOME/.mem0/stack.env" | head -n1 | tr -d '\r')"
+    if [ -n "$MEM0_EMBED_PROFILE" ]; then export MEM0_EMBED_PROFILE; else unset MEM0_EMBED_PROFILE; fi
+fi
 # $EPOCHREALTIME (bash >= 5) in microseconds: `date +%s%3N` is GNU-only; the uutils coreutils
 # shipped on Ubuntu 26.04 ignores the width and prints nanoseconds (first live chain run
 # receipted 1,834,879,975 ms for a 2 s step).

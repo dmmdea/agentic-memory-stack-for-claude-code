@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build/refresh the wiki_pages_egemma_768 Qdrant collection from the operator's LLM Wiki.
+"""Build/refresh the wiki index (the wiki profile's collection, e.g. wiki_pages_eg2_768) from the operator's LLM Wiki.
 
 Embeds every page under a snapshot of the wiki's curated `wiki/` tree (entities, concepts,
 sources, syntheses) with the SAME EmbeddingGemma prefix-shim embedder mem0 uses (document
@@ -16,7 +16,8 @@ Inputs (docs/systems/wiki-index.md):
                      brain box does not mount)
   WIKI_QDRANT_HOST / WIKI_QDRANT_PORT   the Qdrant to build into (default localhost:6333 —
                      the brain box's own; a replica box reaches it through wiki-index.sh's tunnel)
-  MEM0_EMBED_MODEL   the llama-swap model name (config.py; the store's exact GGUF)
+  MEM0_WIKI_EMBED_PROFILE   the wiki's embedding space (embedder_profile.wiki_profile; default the
+                     memories' space). Its collection, model alias and token budget follow from it.
 
 Run with the deployed server venv (same as memory-index-build.py):
     ~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/wiki-index-build.py
@@ -30,14 +31,30 @@ import uuid
 from pathlib import Path
 
 WIKI_ROOT = Path(os.environ.get("WIKI_ROOT") or (Path.home() / "wiki-index" / "wiki"))
-COLLECTION = "wiki_pages_egemma_768"
-DIMS = 768
-EMBED_BODY_CHARS = 1200  # title + summary + this much body — one vector per page
 SUMMARY_CAP = 300
 QDRANT_HOST = os.environ.get("WIKI_QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.environ.get("WIKI_QDRANT_PORT", "6333"))
 
-sys.path.insert(0, str(Path.home() / "apps" / "mem0-server"))
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as _ep  # noqa: E402
+
+WIKI_PROFILE = _ep.wiki_profile()
+COLLECTION = _ep.collection("wiki", WIKI_PROFILE)
+DIMS = WIKI_PROFILE.dims
+# One vector per page: title + first line + body. EmbeddingGemma-300m's 2,048-token window takes the
+# first 1,200 characters of the body (the recipe its index was built and measured with); a space with
+# a larger window takes the whole body and the shim cuts it at the profile's token budget (2026-10-08:
+# whole pages on EmbeddingGemma-2 answered detail questions about the late parts of a page far better).
+EMBED_BODY_CHARS = 1200 if WIKI_PROFILE.ctx_tokens <= 2048 else None
+# Recorded on every point: a recipe change re-embeds a page even when its text hash is unchanged.
+EMBED_RECIPE = f"{WIKI_PROFILE.name}/{WIKI_PROFILE.template_version}/body:{EMBED_BODY_CHARS or 'full'}"
 
 
 DIR_TYPE = {"entities": "entity", "concepts": "concept", "sources": "source", "syntheses": "synthesis"}
@@ -87,22 +104,23 @@ def page_point(path: Path):
         "updated": fm.get("updated", ""),
         "summary": summary,
         "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "embed_recipe": EMBED_RECIPE,
     }
     return pid, embed_text, payload
 
 
 def existing_points(client) -> dict:
-    """id -> (hash, path) for every point already in the collection."""
+    """id -> (hash, path, embed_recipe) for every point already in the collection."""
     out = {}
     offset = None
     while True:
         points, offset = client.scroll(
             collection_name=COLLECTION, limit=256, offset=offset,
-            with_payload=["hash", "path"], with_vectors=False,
+            with_payload=["hash", "path", "embed_recipe"], with_vectors=False,
         )
         for p in points:
             pl = p.payload or {}
-            out[str(p.id)] = (pl.get("hash", ""), pl.get("path", ""))
+            out[str(p.id)] = (pl.get("hash", ""), pl.get("path", ""), pl.get("embed_recipe", ""))
         if offset is None:
             break
     return out
@@ -127,7 +145,8 @@ def main() -> int:
         )
         print(f"created collection {COLLECTION} on {QDRANT_HOST}:{QDRANT_PORT}")
 
-    emb = build_embedder()
+    # the wiki's space, long shape (its long alias when the box serves one, else the hot alias)
+    emb = build_embedder(long=True, profile=WIKI_PROFILE)
     existing = existing_points(client)
 
     seen_ids, upserted, skipped, errors = set(), 0, 0, 0
@@ -137,7 +156,7 @@ def main() -> int:
             continue
         pid, embed_text, payload = built
         seen_ids.add(pid)
-        if pid in existing and existing[pid][0] == payload["hash"]:
+        if pid in existing and existing[pid][0] == payload["hash"] and existing[pid][2] == EMBED_RECIPE:
             skipped += 1
             continue
         try:

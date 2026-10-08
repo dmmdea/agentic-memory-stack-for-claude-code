@@ -18,7 +18,8 @@ from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks, Requ
 from pydantic import BaseModel, Field
 from mem0 import Memory
 
-from config import build_config, EMBEDDER_CONFIG
+from config import build_config, EMBEDDER_CONFIG, EMBED_PROFILE
+import embedder_profile as _embedder_profile
 from reranker import rerank as bge_rerank
 # W4 (F11): PASSIVE rerank counters. There is deliberately NO active rerank
 # probe on /health/deep — deploy.sh gates on this endpoint right after a
@@ -180,7 +181,8 @@ mem = Memory.from_config(build_config())
 # (mem0 2.0.4's EmbedderConfig pydantic allowlist rejects a custom provider name).
 from config import build_embedder
 mem.embedding_model = build_embedder()
-log.info("mem0 initialized (embedder: EmbeddingGemma-300m prefix-shim, collection: mem0_egemma_768)")
+log.info("mem0 initialized (embedder: %s prefix-shim, model: %s, collection: %s)",
+         EMBED_PROFILE.label, EMBEDDER_CONFIG["model"], mem.vector_store.collection_name)
 
 def _stamp_tier_fetch(ids):
     """One batched retrieve of the CURRENT tier of each contradicts_canonical target (payload-only,
@@ -504,7 +506,7 @@ def _env_int(name, default):
     except (TypeError, ValueError):
         return int(default)
 NLI_GATE_ENABLED = _env_flag("MEM0_NLI_GATE_ENABLED")  # opt-in; default OFF
-NLI_GATE_COSINE_FLOOR = _env_float("MEM0_NLI_GATE_COSINE_FLOOR", 0.5)  # SEMANTIC scale (raw cosine), NOT the hybrid score
+NLI_GATE_COSINE_FLOOR = _embedder_profile.threshold("nli_floor", EMBED_PROFILE)  # SEMANTIC scale (raw cosine), NOT the hybrid score; per embedding space (env MEM0_NLI_GATE_COSINE_FLOOR wins)
 NLI_GATE_TOPK = _env_int("MEM0_NLI_GATE_TOPK", 3)
 NLI_GATE_TIMEOUT_S = _env_int("MEM0_NLI_GATE_TIMEOUT_S", 45)  # Codex low-effort NLI runs ~20-30s
 # Over-fetch window for the canonical pre-filter: mem.search returns the top-N by COMBINED
@@ -647,7 +649,7 @@ RAW_FALLBACK_ENABLED = _env_flag("MEM0_RAW_FALLBACK_ENABLED")
 # (~0.058 above off-domain max, ~0.067 below relevant min) — rejects every
 # off-domain probe (R2 abstention preserved) while admitting every relevant probe.
 # (Script's ceiling-0.05 rec was 0.215; 0.20 is the round value just below it.)
-RAW_FALLBACK_COSINE_FLOOR = _env_float("MEM0_RAW_FALLBACK_COSINE_FLOOR", 0.20)
+RAW_FALLBACK_COSINE_FLOOR = _embedder_profile.threshold("episode_floor", EMBED_PROFILE)  # per embedding space; env MEM0_RAW_FALLBACK_COSINE_FLOOR wins
 RAW_FALLBACK_TOPK = _env_int("MEM0_RAW_FALLBACK_TOPK", 10)
 RAW_FALLBACK_SNIPPET_CHARS = _env_int("MEM0_RAW_FALLBACK_SNIPPET_CHARS", 300)
 
@@ -783,6 +785,14 @@ TIER_BUNDLE_POLICY: dict[str, dict[str, Any]] = {
     "frontier": {"memory_cap": 2, "goal_cap": 5, "oq_cap": 3, "relevance_threshold": 0.30},
     "small":    {"memory_cap": 1, "goal_cap": 3, "oq_cap": 2, "relevance_threshold": 0.30},
 }
+# The literal above is the EmbeddingGemma-300m calibration (kept in parity with
+# claude-config/model-tiers.json by tests/test_tier_parity.py). The gate the server applies is the
+# ACTIVE embedding space's (embedder_profile): cosine scales are not portable between models, and
+# EmbeddingGemma-2 scores off-topic questions where EmbeddingGemma-300m scores relevant ones. Env
+# MEM0_RELEVANCE_THRESHOLD overrides it for calibration runs.
+RELEVANCE_GATE = _embedder_profile.threshold("relevance_gate", EMBED_PROFILE)
+for _tier_policy in TIER_BUNDLE_POLICY.values():
+    _tier_policy["relevance_threshold"] = RELEVANCE_GATE
 
 
 def resolve_tier_policy(tier: Optional[str]) -> dict[str, Any]:
@@ -949,8 +959,10 @@ def _append_ledger(record: dict) -> None:
 def health() -> dict:
     # MEM-17: "version" stays the historical mem0-lib+phase tag (dashboards may
     # pattern-match it); "stack" is the actual stack release (repo VERSION).
+    # "embedder" names the active embedding space's model (embeddinggemma-300m before profiles,
+    # unchanged for that profile); "embed_profile" is the profile a reader matches it against.
     return {"ok": True, "version": "2.0.4-v012", "stack": STACK_VERSION,
-            "store": "qdrant", "embedder": "embeddinggemma-300m"}
+            "store": "qdrant", "embedder": EMBED_PROFILE.label.lower(), "embed_profile": EMBED_PROFILE.name}
 
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
@@ -996,7 +1008,19 @@ def health_morning_summary() -> dict:
 
 def _embed_model() -> str:
     """The llama-swap model name the store is bound to (config.EMBEDDER_CONFIG["model"])."""
-    return str(EMBEDDER_CONFIG.get("model") or "embeddinggemma")
+    return str(EMBEDDER_CONFIG.get("model") or EMBED_PROFILE.model)
+
+
+def _embed_base() -> str:
+    """The OpenAI-compatible base URL the embedder is served from (embedder_profile.base_url)."""
+    return str(EMBEDDER_CONFIG.get("openai_base_url") or _embedder_profile.DEFAULT_BASE_URL).rstrip("/")
+
+
+def _qdrant_base() -> str:
+    """The Qdrant the Memory instance is bound to (config vector_store host/port)."""
+    vs = build_config()["vector_store"]["config"]
+    host = vs.get("host") or "localhost"
+    return f"http://{'127.0.0.1' if host == 'localhost' else host}:{vs.get('port') or 6333}"
 
 
 @app.get("/health/embedder")
@@ -1019,7 +1043,7 @@ def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     import time as _time
     loaded = None
     try:
-        r = _httpx.get("http://127.0.0.1:11436/v1/models", timeout=3.0)
+        r = _httpx.get(f"{_embed_base()}/models", timeout=3.0)
         r.raise_for_status()
         for entry in (r.json().get("data") or []):
             if str(entry.get("id", "")) != _embed_model():
@@ -1029,7 +1053,7 @@ def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     except Exception:
         loaded = None
     t0 = _time.perf_counter()
-    r = _httpx.post("http://127.0.0.1:11436/v1/embeddings",
+    r = _httpx.post(f"{_embed_base()}/embeddings",
                     json={"model": _embed_model(), "input": "warm"},
                     timeout=10.0)
     r.raise_for_status()
@@ -1060,25 +1084,28 @@ def health_deep() -> dict:
         out["collection"] = mem.vector_store.collection_name
     except Exception:
         out["collection"] = None
-    # Qdrant (v0.22: live collection is mem0_egemma_768 after the EmbeddingGemma re-embed)
+    # The embedding space this server is bound to: profile, model alias, template version and the
+    # collections that space owns. A reader compares it with the store's embed-identity record.
+    out["embed_profile"] = _embedder_profile.describe(EMBED_PROFILE)
+    # Qdrant: the collection the Memory instance is bound to (never a literal: a space change moves it).
     try:
-        r = _httpx.get("http://127.0.0.1:6333/collections/mem0_egemma_768", timeout=3.0)
+        r = _httpx.get(f"{_qdrant_base()}/collections/{out['collection'] or EMBED_PROFILE.memories}", timeout=3.0)
         r.raise_for_status()
         d = r.json().get("result", {})
         out["checks"]["qdrant"] = {"ok": True, "points": d.get("points_count"), "status": d.get("status")}
     except Exception as e:
         out["ok"] = False
         out["checks"]["qdrant"] = {"ok": False, "error": str(e)[:120]}
-    # Embedder (v0.22: EmbeddingGemma-300m on llama.cpp/llama-swap :11436, OpenAI-compatible.
-    # Replaced the nomic-via-Ollama :11435 probe when Ollama was decommissioned.)
+    # Embedder: the active profile's model on llama-swap (OpenAI-compatible), document prefix.
+    # Replaced the nomic-via-Ollama :11435 probe when Ollama was decommissioned.
     try:
-        r = _httpx.post("http://127.0.0.1:11436/v1/embeddings",
-                       json={"model": _embed_model(), "input": "title: none | text: health"},
+        r = _httpx.post(f"{_embed_base()}/embeddings",
+                       json={"model": _embed_model(), "input": EMBED_PROFILE.doc_prefix + "health"},
                        timeout=10.0)
         r.raise_for_status()
         dim = len(r.json().get("data", [{}])[0].get("embedding", []))
-        out["checks"]["embedder"] = {"ok": dim == 768, "dim": dim}
-        if dim != 768:
+        out["checks"]["embedder"] = {"ok": dim == EMBED_PROFILE.dims, "dim": dim, "model": _embed_model()}
+        if dim != EMBED_PROFILE.dims:
             out["ok"] = False
     except Exception as e:
         out["ok"] = False

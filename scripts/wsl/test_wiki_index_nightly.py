@@ -37,7 +37,9 @@ def _fake_bin(tmp_path: Path, ssh_body: str) -> Path:
     ssh.write_text("#!/usr/bin/env bash\n" + ssh_body, encoding="utf-8")
     ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC)
     py = b / "fakepy"
-    py.write_text('#!/usr/bin/env bash\necho "builder root=$WIKI_ROOT embed=${MEM0_EMBED_MODEL:-unset} args=$*" >> "$FAKE_LOG"\n',
+    py.write_text('#!/usr/bin/env bash\necho "builder root=$WIKI_ROOT embed=${MEM0_EMBED_MODEL:-unset} profile=${MEM0_EMBED_PROFILE:-unset}'
+                  ' scoped=${MEM0_EMBED_MODEL_EGEMMA2:-unset} long=${MEM0_EMBED_LONG_MODEL_EGEMMA2:-unset}'
+                  ' base=${MEM0_EMBED_BASE_URL:-unset} args=$*" >> "$FAKE_LOG"\n',
                   encoding="utf-8")
     py.chmod(py.stat().st_mode | stat.S_IEXEC)
     return b
@@ -50,7 +52,7 @@ def _run(tmp_path: Path, sources: str, ssh_body: str, extra_env=None, stack_env:
         (home / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
     b = _fake_bin(tmp_path, ssh_body)
     log = tmp_path / "builder.log"
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEM0_EMBED")}  # the operator's embedding settings must not leak in
     drive, tail = os.path.splitdrive(str(home))
     # HOME plus the Windows variables, so no platform resolves ~ to the real profile.
     env.update({"HOME": str(home), "USERPROFILE": str(home), "HOMEDRIVE": drive, "HOMEPATH": tail,
@@ -82,6 +84,35 @@ def test_embed_model_comes_from_stack_env(tmp_path):
     r, _, log = _run(tmp_path, "op@up", f'cat "{tar}"\n', stack_env="MEM0_EMBED_MODEL=embeddinggemma-custom\n")
     assert r.returncode == 0, r.stderr
     assert "embed=embeddinggemma-custom" in log
+
+
+def test_embedding_profile_and_its_scoped_aliases_come_from_stack_env(tmp_path):
+    """The store lives in one embedding space (mem0-server/embedder_profile.py); the chain's environment
+    carries none of it, so the nightly passes the profile, the alias overrides scoped to that profile and
+    the base URL on from stack.env, like the alias before it."""
+    tar = _wiki_tar(tmp_path, 1)
+    se = ("MEM0_EMBED_PROFILE=egemma2\nMEM0_EMBED_MODEL=embeddinggemma-ams\nMEM0_EMBED_MODEL_EGEMMA2=embeddinggemma2-ams\n"
+          "MEM0_EMBED_LONG_MODEL_EGEMMA2=embeddinggemma2-ams-long\nMEM0_EMBED_BASE_URL=http://box:11436/v1\n")
+    r, _, log = _run(tmp_path, "op@up", f'cat "{tar}"\n', stack_env=se)
+    assert r.returncode == 0, r.stderr
+    assert "profile=egemma2" in log and "scoped=embeddinggemma2-ams" in log and "long=embeddinggemma2-ams-long" in log, log
+    assert "base=http://box:11436/v1" in log and "embed=embeddinggemma-ams" in log, log
+
+
+def test_the_environment_outranks_stack_env_for_the_embedding_profile(tmp_path):
+    tar = _wiki_tar(tmp_path, 1)
+    r, _, log = _run(tmp_path, "op@up", f'cat "{tar}"\n', stack_env="MEM0_EMBED_PROFILE=egemma2\n",
+                     extra_env={"MEM0_EMBED_PROFILE": "egemma-300m"})
+    assert r.returncode == 0, r.stderr
+    assert "profile=egemma-300m" in log, log
+
+
+def test_a_box_without_a_recorded_profile_exports_none(tmp_path):
+    """Nothing is invented: no key in stack.env means the default space, as before profiles existed."""
+    tar = _wiki_tar(tmp_path, 1)
+    r, _, log = _run(tmp_path, "op@up", f'cat "{tar}"\n', stack_env="MEM0_WSL_USER=tenant\n")
+    assert r.returncode == 0, r.stderr
+    assert "profile=unset" in log and "scoped=unset" in log and "embed=unset" in log, log
 
 
 def test_sources_come_from_stack_env_when_no_env_override(tmp_path):

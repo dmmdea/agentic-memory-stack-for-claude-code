@@ -129,6 +129,9 @@ try:
     import supersession as _supersession
 except Exception:  # noqa: BLE001
     _supersession = None
+# The collection and the evidence-sweep cosine floor belong to one embedding space, so both come
+# from embedder_profile (same bridge). No guard: without them the sweep has no collection to read.
+import embedder_profile as _ep  # noqa: E402
 
 
 def _install_is_provisioned() -> bool:
@@ -148,8 +151,9 @@ def _install_is_provisioned() -> bool:
 QDRANT = "http://127.0.0.1:6333"
 # v0.27.3 FIX: was the stale pre-egemma "memories" collection (pruned post-migration) — candidate
 # DISCOVERY (scroll_canonicals + query_similar) ran on dead vectors while stamps wrote to the live
-# collection via the mem0 API. mem0_egemma_768 is the live collection (config.py collection_name).
-COLLECTION = "mem0_egemma_768"
+# collection via the mem0 API. The live collection is the one the server is bound to
+# (config.py collection_name = embedder_profile.collection("memories")).
+COLLECTION = _ep.collection("memories")
 MEM0 = ams_env.mem0_url()
 
 
@@ -2629,9 +2633,10 @@ def _main(argv=None) -> int:
                         help="evidence-sweep: how many most-recent non-canonical facts to anchor on "
                              "(default 40; pass a large value for a full-store backlog pass — the "
                              "sim-floor keeps judge calls bounded to near-duplicate pairs)")
-    parser.add_argument("--evidence-sim-floor", type=float, default=0.45,
+    parser.add_argument("--evidence-sim-floor", type=float, default=_ep.threshold("evidence_sim_floor"),
                         help="evidence-sweep: only judge an older neighbor whose cosine similarity to "
-                             "the anchor is >= this (default 0.45) — bounds judging to near-duplicates")
+                             "the anchor is >= this (default %(default)s, the active embedding space's "
+                             "calibrated value) — bounds judging to near-duplicates")
     parser.add_argument("--retrieval-pairs", action="store_true",
                         help="W5 ADOPT-4 DRY-RUN ONLY: count co-retrieval pairs from the retrieval "
                              "log (route='search' rows), rank by co-occurrence, apply eligibility, "

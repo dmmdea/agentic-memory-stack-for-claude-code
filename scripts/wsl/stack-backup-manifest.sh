@@ -11,8 +11,6 @@ set -euo pipefail
 TS="${1:?ts arg required}"
 BACKUP_DIR="$HOME/.mem0/backups"
 MANIFEST="$BACKUP_DIR/manifest-$TS.json"
-# DR fix (2026-06-20): count the LIVE collection, not the frozen pre-egemma "memories".
-QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
 QDRANT_URL="${MEM0_QDRANT_URL:-http://127.0.0.1:6333}"
 
 # stack.env is read BY KEY, never sourced: it is operator-edited, and an unquoted value with a
@@ -24,11 +22,35 @@ stack_env_get() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. The embedding space the set was made in (mem0-server/embedder_profile.py, through embed-profile.sh)
+# ---------------------------------------------------------------------------
+# A vector snapshot is only meaningful with the model and prompt template that made it, so the manifest
+# says which: embed_profile, embed_model, template_version and the collection each Qdrant file holds.
+# stack-backup.sh resolves the same profile in the same run, so the names agree with the files it wrote.
+# DR fix (2026-06-20): count the LIVE collection, not a frozen older one - the name is the active
+# space's memories collection, never a literal.
+EP_LIB="$(dirname "$0")/embed-profile.sh"
+EP_READY=0
+if [ -f "$EP_LIB" ]; then
+    # shellcheck disable=SC1090
+    . "$EP_LIB"
+    if ep_load; then EP_READY=1; else echo "WARN: the embedding profile did not resolve (a configuration error: see above); the manifest will say embed_profile unknown" >&2; fi
+else
+    echo "WARN: $EP_LIB is missing; the manifest will say embed_profile unknown (redeploy scripts/wsl/)" >&2
+fi
+if [ "$EP_READY" != 1 ]; then
+    EP_PROFILE=unknown; EP_MODEL=""; EP_TEMPLATE=""
+    EP_MEM="${MEM0_QDRANT_COLLECTION:-}"; EP_ENT=""; EP_EPI=""; EP_WIKI=""
+fi
+QDRANT_COLLECTION="$EP_MEM"
+
+# ---------------------------------------------------------------------------
 # 1. Qdrant points count from live state at backup time
 # ---------------------------------------------------------------------------
 
 QDRANT_POINTS=0
-qdrant_raw=$(curl -fsS "$QDRANT_URL/collections/$QDRANT_COLLECTION" 2>/dev/null || true)
+qdrant_raw=""
+[ -z "$QDRANT_COLLECTION" ] || qdrant_raw=$(curl -fsS "$QDRANT_URL/collections/$QDRANT_COLLECTION" 2>/dev/null || true)
 if [ -n "$qdrant_raw" ]; then
     QDRANT_POINTS=$(echo "$qdrant_raw" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('points_count',0))" \
@@ -183,11 +205,34 @@ cat > "$MANIFEST.tmp" <<EOF
 EOF
 # Per-file size + sha256 (bit-rot is otherwise detectable only by sqlite/tar checks). Kept in a
 # separate `checksums` map keyed by file name so `files` stays name-only for stack-restore.
-python3 - "$BACKUP_DIR" "$MANIFEST.tmp" <<'PYSUMS'
+python3 - "$BACKUP_DIR" "$MANIFEST.tmp" "$TS" "$EP_PROFILE" "$EP_MODEL" "$EP_TEMPLATE" "$EP_MEM" "$EP_ENT" "$EP_EPI" "$EP_WIKI" <<'PYSUMS'
 import hashlib, json, os, sys
-backup_dir, path = sys.argv[1], sys.argv[2]
+backup_dir, path, ts, ep_profile, ep_model, ep_template, c_mem, c_ent, c_epi, c_wiki = sys.argv[1:11]
 with open(path) as fh:
     m = json.load(fh)
+# The embedding space, right after the identity fields. "collections" are the ACTIVE space's names (the
+# ones the fixed file keys hold); "qdrant_collections" maps EVERY Qdrant snapshot in this set to the
+# collection it holds, extras included (qcol-<kind>+<collection>-<TS>.snapshot carries its own name).
+# A restore reads the profile and the collection from here instead of assuming the default space.
+active = {"memories": c_mem, "entities": c_ent, "episodes": c_epi, "wiki": c_wiki}
+files = m["files"]
+held = {}
+for key, kind in (("qdrant_snapshot", "memories"), ("qdrant_episodes", "episodes"),
+                  ("qdrant_entities", "entities"), ("qdrant_wiki", "wiki")):
+    if isinstance(files.get(key), str) and active.get(kind):
+        held[files[key]] = active[kind]
+for name in m.get("qdrant_extra_collections", []):
+    if isinstance(name, str) and "+" in name and name.endswith("-" + ts + ".snapshot"):
+        held[name] = name[name.index("+") + 1:-len("-" + ts + ".snapshot")]
+head_keys = ("ts", "backup_ts_raw", "app_version", "schema_version", "git_sha")
+ordered = {k: m.pop(k) for k in head_keys if k in m}
+ordered["embed_profile"] = ep_profile
+ordered["embed_model"] = ep_model
+ordered["template_version"] = ep_template
+ordered["collections"] = {k: v for k, v in active.items() if v}
+ordered["qdrant_collections"] = held
+ordered.update(m)
+m = ordered
 sums = {}
 names = [v for v in m["files"].values() if isinstance(v, str)]
 names += [n for n in m.get("qdrant_extra_collections", []) if isinstance(n, str)]

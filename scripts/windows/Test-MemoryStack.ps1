@@ -154,7 +154,9 @@ try {
     $hdTried = $true
     $hd = Invoke-RestMethod -Uri "$TmsAuthorityUrl/health/deep" -TimeoutSec 30
     if ($hd.ok) {
-        Add-Check 'LIVENESS' 'mem0 /health/deep' 'OK' "qdrant_points=$($hd.checks.qdrant.points) embed_dim=$($hd.checks.embedder.dim)"
+        # The embedding space the authority is bound to (embed_profile), when its server reports one.
+        $hdSpace = if ($hd.embed_profile) { " profile=$($hd.embed_profile.profile) model=$($hd.embed_profile.model) template=$($hd.embed_profile.template_version) collection=$($hd.collection)" } else { '' }
+        Add-Check 'LIVENESS' 'mem0 /health/deep' 'OK' "qdrant_points=$($hd.checks.qdrant.points) embed_dim=$($hd.checks.embedder.dim)$hdSpace"
     } else {
         $errs = @()
         if (-not $hd.checks.qdrant.ok)   { $errs += "qdrant:$($hd.checks.qdrant.error)" }
@@ -198,9 +200,10 @@ try {
 # ([System.Text.Encoding]::UTF8.GetBytes($x)); GETs are untouched. Same fix as
 # pre-tool-check.ps1 (719 silent 400s, 06-10..07-03).
 
-# L4: EmbeddingGemma-300m embedder on llama-swap :11436 (v0.22 migration: replaced the
+# L4: the EmbeddingGemma embedder on llama-swap :11436 (v0.22 migration: replaced the
 # Ollama :11435 nomic-embed-text backend; Ollama fully decommissioned 2026-06-13).
-# Must return a 768-dim vector via the OpenAI-compatible /v1/embeddings endpoint.
+# Must return a vector of the authority's width via the OpenAI-compatible /v1/embeddings endpoint,
+# under the alias of the embedding space the authority is bound to (see Get-TmsEmbedderExpectation).
 # 2026-07-22: these two probes hit llama.cpp upstreams that were CPU-only at the time, which were
 # slow for two legitimate reasons: a lazy first load after any llama-swap restart (measured
 # ~7.4s) and box-wide CPU contention (embeddings latency has been observed spiking from a
@@ -224,16 +227,102 @@ function Get-ProbeFailure {
     return [pscustomobject]@{ IsTimeout = $isTimeout; Message = $msg }
 }
 
+# The embedding space the memory authority is bound to (mem0-server/embedder_profile.py is the one
+# definition of it). Vectors from different models are different spaces even at the same 768
+# width, so "an embedder answered with 768 numbers" does not say WHICH model answered. The
+# identity that counts is the profile plus the llama-swap alias the vectors come from; the
+# authority reports both on /health/deep (embed_profile: profile, model, template_version,
+# collections) and this verifier reads them there instead of carrying names of its own.
+#
+# A replica embeds with ITS OWN llama-swap (wiki builds, the offline replica), so for a replica
+# the authority's profile must be served locally under the alias this box's stack.env resolves
+# for that profile. The authority's own alias cannot stand in for it: the native authority
+# serves a private copy of the GGUF under a name of its own (embeddinggemma-ams).
+#
+# $TmsProfileStockModel is the last resort for that alias, used only when this box has no
+# embedder_profile module to ask. It mirrors embedder_profile.py's `model=` per profile;
+# EmbedderProfile.Tests.ps1 parses that file and fails when the two drift.
+$TmsProfileStockModel = @{ 'egemma-300m' = 'embeddinggemma'; 'egemma2' = 'embeddinggemma2' }
+
+function Get-TmsEmbedProfilePy {
+    # Ask this box's deployed server venv (embedder_profile, the one definition) for a binding:
+    # profile, llama-swap alias and memories collection, under this box's own env and stack.env.
+    # -Profile asks for THAT profile's alias/collection (a replica asking about the authority's);
+    # without it the answer is this box's active profile. $null when the venv or the module is
+    # absent (a pre-profile deploy), the profile is unknown to it, or WSL does not answer.
+    param([string]$Profile = '')
+    if ($Profile -and $Profile -notmatch '^[a-z0-9][a-z0-9-]*$') { return $null }   # interpolated into a shell line
+    $srv = "/home/$TmsWslUser/apps/mem0-server"
+    $pre = if ($Profile) { "MEM0_EMBED_PROFILE=$Profile " } else { '' }
+    $code = "import embedder_profile as ep; p = ep.active(); print('TMS-EMBED|%s|%s|%s' % (p.name, ep.embed_model(p), ep.collection('memories', p)))"
+    try { $out = wsl.exe -d $TmsDistro -e bash -lc "cd $srv && $pre$srv/.venv/bin/python -c ""$code"" 2>/dev/null" } catch { return $null }
+    foreach ($l in @($out)) {
+        if ("$l" -match '^TMS-EMBED\|([a-z0-9-]+)\|([A-Za-z0-9._-]+)\|([A-Za-z0-9._-]+)\s*$') {
+            return [pscustomobject]@{ Profile = $Matches[1]; Model = $Matches[2]; Collection = $Matches[3] }
+        }
+    }
+    return $null
+}
+
+function Get-TmsEmbedderExpectation {
+    # What the local :11436 embedder must be. $Hd is the authority's /health/deep (or $null);
+    # $Remote is true when the authority is another box (a replica). Returns Profile, Model (the
+    # alias to probe locally), Dim, Template, Collection, Source and Notes (WARN texts).
+    param($Hd, [bool]$Remote = $false)
+    # Source 'pre-profile literal': neither /health/deep nor the venv could name the space, so the
+    # request is the one this verifier sent before profiles existed (EmbeddingGemma-300m, 768).
+    $x = [pscustomobject]@{ Profile = $null; Model = 'embeddinggemma'; Dim = 768; Template = ''; Collection = ''; Source = 'pre-profile literal'; Notes = @() }
+    $ap = if ($Hd) { $Hd.embed_profile } else { $null }
+    if ($ap -and $ap.profile -and $ap.model) {
+        $x.Profile  = [string]$ap.profile
+        $x.Model    = [string]$ap.model
+        $x.Template = [string]$ap.template_version
+        $x.Source   = 'authority /health/deep'
+        $x.Collection = [string]$(if ($Hd.collection) { $Hd.collection } else { $ap.collections.memories })
+        if ($Hd.checks.embedder.ok -and $Hd.checks.embedder.dim) { $x.Dim = [int]$Hd.checks.embedder.dim }
+        if ($Hd.checks.embedder.model -and [string]$Hd.checks.embedder.model -ne $x.Model) {
+            $x.Notes += "authority probed its embedder as '$($Hd.checks.embedder.model)' but its profile names '$($x.Model)'"
+        }
+        if ($Hd.collection -and $ap.collections.memories -and [string]$Hd.collection -ne [string]$ap.collections.memories) {
+            $x.Notes += "authority is bound to collection '$($Hd.collection)' but its profile '$($x.Profile)' names '$($ap.collections.memories)' (an env override, or a store from another space)"
+        }
+        if ($Remote) {
+            $mine = Get-TmsEmbedProfilePy -Profile $x.Profile
+            if ($mine) { $x.Model = $mine.Model }
+            elseif ($TmsProfileStockModel.ContainsKey($x.Profile)) { $x.Model = $TmsProfileStockModel[$x.Profile] }
+            $x.Source = 'authority /health/deep, alias resolved on this box'
+            $own = Get-TmsEmbedProfilePy
+            if ($own -and $own.Profile -ne $x.Profile) {
+                $x.Notes += "this box's own embedder profile is '$($own.Profile)' but the authority is bound to '$($x.Profile)' (wiki builds and the offline replica would embed in another space)"
+            }
+        }
+        return $x
+    }
+    $own = Get-TmsEmbedProfilePy
+    if ($own) {
+        $x.Profile = $own.Profile; $x.Model = $own.Model; $x.Collection = $own.Collection
+        $x.Source = 'this box server venv (authority reported no embed_profile)'
+    }
+    return $x
+}
+
+$embExp = Get-TmsEmbedderExpectation -Hd $hd -Remote ($TmsIsReplica -or -not $TmsAuthorityIsLoopback)
+if ($embExp.Notes.Count -gt 0) { Add-Check 'LIVENESS' 'embedder identity' 'WARN' ($embExp.Notes -join '; ') }
 try {
-    $embBody = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json
+    # 'title: none | text: ' is the document prefix both EmbeddingGemma generations use
+    # (embedder_profile._EG_DOC; EmbedderProfile.Tests.ps1 pins it).
+    $embBody = @{model=$embExp.Model; input='title: none | text: ping'} | ConvertTo-Json
     $e = Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($embBody)) -ContentType 'application/json' -TimeoutSec $probeTimeoutSec
     $dim = @($e.data[0].embedding).Count
-    if ($dim -eq 768) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "embeddinggemma live, dim=$dim" }
-    else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "responded but dim=$dim (expected 768)" }
+    $embId = if ($embExp.Profile) { "$($embExp.Profile)/$($embExp.Model)" } else { $embExp.Model }
+    $embWhy = if ($embExp.Profile) { " [profile+alias from $($embExp.Source)$(if ($embExp.Template) { ", template $($embExp.Template)" })]" } else { '' }
+    if ($dim -eq $embExp.Dim) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'OK'   "$embId live, dim=$dim$embWhy" }
+    else                      { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "$embId responded but dim=$dim (expected $($embExp.Dim))$embWhy" }
 } catch {
     $f = Get-ProbeFailure $_
     if ($f.IsTimeout) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'WARN' "no response in ${probeTimeoutSec}s (model cold or contended, not necessarily down)" }
-    else              { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $f.Message }
+    elseif ($embExp.Profile) { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' "probe as alias '$($embExp.Model)' failed - this box's llama-swap must serve it for profile $($embExp.Profile): $($f.Message)" }
+    else                     { Add-Check 'LIVENESS' 'EmbeddingGemma :11436' 'FAIL' $f.Message }
 }
 
 # L5: bge-reranker-v2-m3 on llama-swap :11436.
@@ -684,6 +773,12 @@ if ($key -and -not $TmsIsReplica) {
 if ($key -and -not $TmsIsReplica) {
     $psMid = $null
     try {
+        # The collection the live server is bound to: its own /health/deep says so; failing that, the
+        # server venv's embedder_profile does. Resolved before the probe writes anything.
+        $psColl = if ($hd -and $hd.collection) { $hd.collection }
+                  elseif ($hd -and $hd.embed_profile.collections.memories) { $hd.embed_profile.collections.memories }
+                  else { (Get-TmsEmbedProfilePy).Collection }
+        if (-not $psColl) { throw 'probe skipped: the bound collection could not be resolved (no /health/deep binding, no server venv embedder_profile)' }
         $psText1 = "put-survival-probe-$(Get-Random) alpha"
         $psText2 = "put-survival-probe-$(Get-Random) survived-zzqx"
         $psAddBody = @{
@@ -703,7 +798,6 @@ if ($key -and -not $TmsIsReplica) {
                 -Headers @{'X-API-Key'=$key} -TimeoutSec 15 | Out-Null
             # Read the raw Qdrant payload (the API's GET shape does not expose
             # every payload key; the payload IS the thing AMS-01 destroyed).
-            $psColl = if ($hd -and $hd.collection) { $hd.collection } else { 'mem0_egemma_768' }
             $psQBody = @{ids=@($psMid); with_payload=$true} | ConvertTo-Json
             $psPts = Invoke-RestMethod -Uri "http://127.0.0.1:6333/collections/$psColl/points" -Method Post `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($psQBody)) -ContentType 'application/json' -TimeoutSec 10

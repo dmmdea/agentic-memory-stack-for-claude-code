@@ -95,14 +95,45 @@ Check "curl in WSL" { wsl.exe -d $Distro -e which curl 2>&1 | Out-Null; $LASTEXI
 # but the dependency belongs here where a fresh install learns about it.
 Check "jq in WSL" { wsl.exe -d $Distro -e which jq 2>&1 | Out-Null; $LASTEXITCODE -eq 0 } "wsl: sudo apt install -y jq"
 # v0.22: Ollama is decommissioned from mem0's path (the embedder is EmbeddingGemma on
-# llama-swap :11436). llama-swap (+ its llama.cpp build >= b6384 for gemma-embedding)
-# is the single local inference stack. We check llama-swap is reachable rather than
-# requiring Ollama. WARN-level: the installer stages the egemma GGUF and prints the
-# llama-swap model entry to add if it isn't serving yet.
+# llama-swap :11436). llama-swap (+ a llama.cpp build new enough for the embedder's
+# architecture, see $llamaFloor below) is the single local inference stack. We check
+# llama-swap is reachable rather than requiring Ollama. WARN-level: the installer stages
+# the egemma GGUF and prints the llama-swap model entry to add if it isn't serving yet.
+#
+# The llama.cpp floor depends on WHICH embedding space this install serves
+# (mem0-server/embedder_profile.py is the one definition of the space). The floors are
+# properties of llama.cpp releases, not of that table, so they live here:
+#   egemma-300m  gemma-embedding   b6384
+#   egemma2      gemma-embedding2  b11452  (llama.cpp PR #30054, first contained in release b11452)
+# The profile is read the way embedder_profile.py reads it: MEM0_EMBED_PROFILE, then
+# ~/.mem0/stack.env inside WSL (an existing install records it there), then EmbeddingGemma-300m.
+# A profile this table does not list gets the newest floor (Known = false). EmbedderProfile.Tests.ps1
+# fails when a profile exists in embedder_profile.py but not here. PowerShell 5.1 syntax: phase 0
+# runs before pwsh is guaranteed.
+function Get-LlamaBuildRequirement {
+    param([string]$Profile = '')
+    $floors = @{
+        'egemma-300m' = @{ Floor = 'b6384';  Arch = 'gemma-embedding' }
+        'egemma2'     = @{ Floor = 'b11452'; Arch = 'gemma-embedding2' }
+    }
+    if (-not $Profile) { $Profile = 'egemma-300m' }
+    if ($floors.ContainsKey($Profile)) {
+        return [pscustomobject]@{ Profile = $Profile; Floor = $floors[$Profile].Floor; Arch = $floors[$Profile].Arch; Known = $true }
+    }
+    return [pscustomobject]@{ Profile = $Profile; Floor = 'b11452'; Arch = 'the embedder architecture'; Known = $false }
+}
+$embedProfile = ([string]$env:MEM0_EMBED_PROFILE).Trim()
+if (-not $embedProfile) {
+    try { $embedProfile = ([string](wsl.exe -d $Distro -e bash -lc "sed -n 's/^MEM0_EMBED_PROFILE=//p' ~/.mem0/stack.env 2>/dev/null | head -1")).Trim() } catch { $embedProfile = '' }
+}
+if ($embedProfile -notmatch '^[a-z0-9][a-z0-9-]*$') { $embedProfile = '' }
+$llamaReq = Get-LlamaBuildRequirement -Profile $embedProfile
+# EmbeddingGemma-300m keeps its original wording; any other profile names its architecture too.
+$llamaFloor = if ($embedProfile -and $embedProfile -ne 'egemma-300m') { "$($llamaReq.Floor) ($($llamaReq.Arch))" } else { $llamaReq.Floor }
 Check "llama-swap :11436 reachable in WSL" {
     wsl.exe -d $Distro -e bash -lc "curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null" 2>&1 | Out-Null
     $LASTEXITCODE -eq 0
-} "Start llama-swap (single local inference stack on :11436) serving the EmbeddingGemma embedder + bge-reranker. Full step-by-step guide: install/llama-swap-setup.md (build llama.cpp >= b6384, download the two GGUFs, config + systemd unit + verify)."
+} "Start llama-swap (single local inference stack on :11436) serving the EmbeddingGemma embedder + bge-reranker. Full step-by-step guide: install/llama-swap-setup.md (build llama.cpp >= $llamaFloor, download the two GGUFs, config + systemd unit + verify)."
 Check "Node 22+ in WSL" {
     $v = wsl.exe -d $Distro -e bash -lc "node --version 2>/dev/null"
     if (-not $v) { return $false }

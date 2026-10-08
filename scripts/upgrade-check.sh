@@ -160,7 +160,35 @@ else
 fi
 
 echo ""
-echo "## Models  (EmbeddingGemma-300m, bge-reranker-v2-m3)"
+# The embedder generation is the active embedding profile's: mem0-server/embedder_profile.py is the one
+# definition of it (env MEM0_EMBED_PROFILE > ~/.mem0/stack.env > default). python3 imports it (no
+# third-party imports) from the repo-relative mem0-server, then the deployed ~/apps/mem0-server.
+# A deploy that predates the module can only be on EmbeddingGemma-300m, the one embedder before
+# profiles existed, so that is the only literal left; a profile the module rejects is reported, not guessed.
+EMB_LABEL="EmbeddingGemma-300m"; EMB_PROFILE=""; EMB_ALIAS=""; EMB_DEFAULT=1; EMB_ERR=""
+EMB_OUT=$(python3 -c '
+import os, sys
+for d in sys.argv[1:]:
+    if os.path.isfile(os.path.join(d, "embedder_profile.py")):
+        sys.path.insert(0, d)
+        break
+else:
+    print("no-module"); sys.exit(0)
+import embedder_profile as ep
+try:
+    p = ep.active()
+except SystemExit as e:
+    print("unresolved|" + str(e).replace("|", "/")); sys.exit(0)
+print("ok|%s|%s|%s|%d" % (p.label, p.name, ep.embed_model(p), p.name == ep.DEFAULT_PROFILE))
+' "$(dirname "${BASH_SOURCE[0]}")/../mem0-server" "$HOME/apps/mem0-server" 2>/dev/null) || EMB_OUT="unresolved|python3 could not import embedder_profile"
+case "$EMB_OUT" in
+  ok\|*) IFS='|' read -r _ EMB_LABEL EMB_PROFILE EMB_ALIAS EMB_DEFAULT <<< "$EMB_OUT" ;;
+  unresolved\|*) EMB_LABEL="embedding profile unresolved"; EMB_ERR="${EMB_OUT#unresolved|}" ;;
+  *) ;;                                  # no-module: a pre-profile deploy, EmbeddingGemma-300m
+esac
+echo "## Models  (${EMB_LABEL}, bge-reranker-v2-m3)"
+[ -n "$EMB_ERR" ] && echo "  ! $EMB_ERR"
+[ "$EMB_DEFAULT" != "1" ] && echo "  embedding profile: $EMB_PROFILE (llama-swap alias $EMB_ALIAS) - its vectors live in their own collections"
 echo "  fixed GGUF artifacts - a model change is a DELIBERATE swap (re-embed + re-eval), NOT an auto-upgrade."
 echo ""
 echo "Next: /upgrade-memory-stack applies the SAFE set with snapshot -> full-suite gate -> rollback."

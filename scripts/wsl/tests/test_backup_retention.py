@@ -899,3 +899,499 @@ def test_the_real_step_receipts_a_copy_size_mismatch_as_failed_with_the_file(hom
     assert r.returncode == 6, r.stderr
     assert (rec["ok"], rec["status"], rec["exit"]) == (False, "failed", 6), rec
     assert rec["work"] == {"file": f"history-{_ts(2)}.db"}, rec
+
+
+# ------------------------------------------------------------------------------------------------
+# The embedding space (mem0-server/embedder_profile.py): two spaces side by side, the manifest that
+# says which one a set is in, and the restores that refuse the wrong one
+# ------------------------------------------------------------------------------------------------
+
+import sys  # noqa: E402
+
+sys.path.insert(0, str(WSL_DIR.parents[1] / "mem0-server"))
+import embedder_profile as EP  # noqa: E402
+
+REPO = WSL_DIR.parents[1]
+P300 = EP.PROFILES["egemma-300m"]
+P2 = EP.PROFILES["egemma2"]
+
+
+def _space(p):
+    return [p.memories, p.entities, p.episodes, p.wiki]
+
+
+def _holds(path: Path, coll: str) -> bool:
+    """FakeQdrant writes `snapshot-of-<collection>-<name>` repeated: which collection a copied file holds."""
+    return path.read_bytes().startswith(f"snapshot-of-{coll}-".encode())
+
+
+def _one(b: Path, pattern: str) -> Path:
+    found = sorted(b.glob(pattern))
+    assert len(found) == 1, (pattern, [f.name for f in found])
+    return found[0]
+
+
+def _manifest(b: Path) -> dict:
+    return json.loads(_one(b, "manifest-*.json").read_text())
+
+
+def _both_spaces(home):
+    return FakeQdrant(home / "qdrant-server" / "snapshots", [*_space(P300), *_space(P2)])
+
+
+def test_the_new_spaces_collections_sort_before_the_old_ones():
+    """The bug this section pins: the fixed manifest slot used to go to the first collection of a kind in
+    NAME order, and EmbeddingGemma-2's names sort before EmbeddingGemma-300m's ('2' < 'e')."""
+    assert P2.episodes < P300.episodes and P2.wiki < P300.wiki and P2.entities < P300.entities
+
+
+@pytest.mark.parametrize("active,other", [(P300, P2), (P2, P300)], ids=["default-space", "new-space"])
+def test_the_active_space_owns_the_fixed_names_when_two_spaces_sit_side_by_side(home, active, other):
+    """With both spaces in Qdrant, the ACTIVE space's collection of each kind is the fixed slot
+    (qdrant-<TS>, qcol-<kind>-<TS>: what the manifest's fixed keys name), whatever the sort order;
+    the other space is backed up too, every collection as a "+" extra, its memories as qcol-memories+."""
+    fake = _both_spaces(home)
+    try:
+        extra = {} if active is P300 else {"MEM0_EMBED_PROFILE": active.name}
+        r = _run(BACKUP, home, fake, **extra)
+        assert r.returncode == 0, r.stderr
+        b = home / ".mem0" / "backups"
+        assert _holds(_one(b, "qdrant-*.snapshot"), active.memories)
+        for kind in ("episodes", "entities", "wiki"):
+            assert _holds(_one(b, f"qcol-{kind}-[0-9]*.snapshot"), getattr(active, kind)), kind
+            assert _holds(_one(b, f"qcol-{kind}+*.snapshot"), getattr(other, kind)), kind
+        assert _holds(_one(b, "qcol-memories+*.snapshot"), other.memories)
+        assert sorted(c for c, _ in fake.created) == sorted([*_space(active), *_space(other)]), "every collection is snapshotted once"
+        m = _manifest(b)
+        assert m["embed_profile"] == active.name
+        assert m["files"]["qdrant_snapshot"] and m["files"]["qdrant_episodes"]
+        # the other space rides as extras, listed and checksummed
+        assert len(m["qdrant_extra_collections"]) == 4
+        for name in m["qdrant_extra_collections"]:
+            assert m["checksums"][name]["sha256"] == hashlib.sha256((b / name).read_bytes()).hexdigest()
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("active", [P300, P2], ids=["default-space", "new-space"])
+def test_the_manifest_records_the_space_and_which_collection_each_file_holds(home, active):
+    fake = _both_spaces(home)
+    try:
+        (home / ".mem0" / "stack.env").write_text(f"MEM0_EMBED_PROFILE={active.name}\n")   # the receipt, not the env
+        r = _run(BACKUP, home, fake)
+        assert r.returncode == 0, r.stderr
+        b = home / ".mem0" / "backups"
+        m = _manifest(b)
+        assert (m["embed_profile"], m["embed_model"], m["template_version"]) == (active.name, active.model, active.template_version)
+        assert m["collections"] == {"memories": active.memories, "entities": active.entities,
+                                    "episodes": active.episodes, "wiki": active.wiki}
+        held = m["qdrant_collections"]
+        assert held[m["files"]["qdrant_snapshot"]] == active.memories
+        assert held[m["files"]["qdrant_episodes"]] == active.episodes
+        assert held[m["files"]["qdrant_entities"]] == active.entities
+        assert held[m["files"]["qdrant_wiki"]] == active.wiki
+        other = P2 if active is P300 else P300
+        assert sorted(held[n] for n in m["qdrant_extra_collections"]) == sorted(_space(other))
+        # every file the map names is one the manifest lists, and every Qdrant file it lists is in the map
+        listed = {v for k, v in m["files"].items() if k.startswith("qdrant") and isinstance(v, str)} | set(m["qdrant_extra_collections"])
+        assert set(held) == listed
+        # the identity fields come right after the release stamp, before the file lists
+        keys = list(m)
+        assert keys.index("git_sha") < keys.index("embed_profile") < keys.index("files")
+    finally:
+        fake.close()
+
+
+def test_without_a_profile_the_default_space_is_backed_up_exactly_as_before(home, qdrant):
+    """No MEM0_EMBED_PROFILE anywhere: the names, the slots and the manifest's fixed keys are the ones
+    every earlier set had (the other tests in this file pin them); the set only gains its identity."""
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    b = home / ".mem0" / "backups"
+    m = _manifest(b)
+    assert (m["embed_profile"], m["embed_model"]) == (P300.name, P300.model)
+    assert (b / f"qcol-episodes-{m['backup_ts_raw']}.snapshot").exists()
+    assert not list(b.glob("qcol-*+*.snapshot")), "no other space in Qdrant, no extras"
+    assert m["qdrant_extra_collections"] == []
+
+
+def test_an_operator_override_of_the_memories_collection_still_names_the_active_space(home):
+    """MEM0_QDRANT_COLLECTION renames the bound memories collection (and the <name>_entities mem0 derives
+    from it); the backup follows, as it did when the name was a literal default."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", ["custom_mem", "custom_mem_entities", P300.episodes, P300.wiki])
+    try:
+        r = _run(BACKUP, home, fake, MEM0_QDRANT_COLLECTION="custom_mem")
+        assert r.returncode == 0, r.stderr
+        b = home / ".mem0" / "backups"
+        assert _holds(_one(b, "qdrant-*.snapshot"), "custom_mem")
+        assert _holds(_one(b, "qcol-entities-[0-9]*.snapshot"), "custom_mem_entities")
+        m = _manifest(b)
+        assert m["collections"]["memories"] == "custom_mem" and m["collections"]["entities"] == "custom_mem_entities"
+    finally:
+        fake.close()
+
+
+def test_the_other_spaces_memories_snapshots_keep_their_own_window(home):
+    fake = _both_spaces(home)
+    try:
+        b = home / ".mem0" / "backups"
+        for d in range(1, 11):
+            _touch(b / f"qcol-memories+{P2.memories}-{_ts(d)}.snapshot", b"anchor")
+        r = _run(BACKUP, home, fake)
+        assert r.returncode == 0, r.stderr
+        assert len(list(b.glob(f"qcol-memories+{P2.memories}-[0-9]*.snapshot"))) == 8
+        assert len(list(b.glob("qdrant-[0-9]*.snapshot"))) == 1, "the primary kind is a different window"
+    finally:
+        fake.close()
+
+
+def test_a_failed_snapshot_of_the_other_space_reads_degraded(home, tmp_path):
+    """The rollback anchor is exactly what the operator reaches for when a migration goes wrong: its
+    silent absence from the set is a degradation, not a clean night."""
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [*_space(P300), *_space(P2)], fail_create={P2.memories})
+    try:
+        out = _outcome(tmp_path)
+        r = _run(BACKUP, home, fake, AMS_OUTCOME_FILE=str(out))
+        assert r.returncode == 0, r.stderr
+        status, reason, counts = _outcome_line(out)
+        assert status == "degraded" and "secondary-snapshot-failed" in reason and counts["secondary_snapshot_failed"] == 1
+    finally:
+        fake.close()
+
+
+def test_an_unknown_profile_is_a_loud_failure_that_snapshots_nothing(home, qdrant):
+    """A hand-edited MEM0_EMBED_PROFILE must not fall back to some other space's names: the primary set is
+    missing (rc 1, the night is red), the local files are still backed up, and the manifest says unknown."""
+    r = _run(BACKUP, home, qdrant, MEM0_EMBED_PROFILE="no-such-space")
+    assert r.returncode != 0
+    assert "no-such-space" in r.stderr and "NOT be backed up" in r.stderr, r.stderr
+    assert qdrant.created == []
+    assert _manifest(home / ".mem0" / "backups")["embed_profile"] == "unknown"
+
+
+def test_a_checkout_without_the_profile_module_falls_back_to_the_pre_profile_names_and_says_so(home, tmp_path):
+    """The one literal that stays: if embedder_profile.py cannot be found (a scripts dir deployed away from
+    the server), a nightly that dies is worse than one that backs up the names every store was built on."""
+    deployed = tmp_path / "isolated" / "scripts"
+    deployed.mkdir(parents=True)
+    for name in ("stack-backup.sh", "stack-backup-manifest.sh", "embed-profile.sh"):
+        shutil.copy(WSL_DIR / name, deployed / name)
+    fake = FakeQdrant(home / "qdrant-server" / "snapshots", [*_space(P300)])
+    try:
+        r = subprocess.run(["bash", str(deployed / "stack-backup.sh")], env=_env(home, fake), capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stderr
+        assert "embedder_profile.py not found" in r.stderr
+        b = home / ".mem0" / "backups"
+        assert _holds(_one(b, "qdrant-*.snapshot"), P300.memories)
+        assert _manifest(b)["embed_profile"] == "unknown"
+    finally:
+        fake.close()
+
+
+def test_every_script_that_names_a_collection_asks_embedder_profile():
+    """No collection literal in the backup path: a name that is not asked of the module is a name that
+    survives the next migration unchanged."""
+    for rel in ("stack-backup.sh", "stack-backup-manifest.sh", "stack-restore.sh", "egemma-rollback-prune.sh"):
+        code = "\n".join(ln for ln in (WSL_DIR / rel).read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+        for p in (P300, P2):
+            for n in _space(p):
+                assert n not in code, (rel, n)
+    lib = (WSL_DIR / "embed-profile.sh").read_text(encoding="utf-8")
+    assert lib.count("mem0_egemma_768") == 1 and "pre-profile" in lib, "the single documented fallback literal"
+
+
+# --------------------------------------------------------------------------- ams-step: the profile
+
+
+def _step_echo(tmp_path: Path, stack_env: str | None, **extra):
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True, exist_ok=True)
+    if stack_env is not None:
+        (home / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
+    r = subprocess.run(["bash", str(STEP), "demo", "bash", "-c", "echo profile=[$MEM0_EMBED_PROFILE]"],
+                       env=_env(home, **extra), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_a_chain_step_sees_the_embedding_profile_from_stack_env(tmp_path):
+    """The step units set none of it; a python job that fell back to the default profile would read and
+    write another space's collections than the server is bound to."""
+    assert "profile=[egemma2]" in _step_echo(tmp_path, "MEM0_WSL_USER=t\nMEM0_EMBED_PROFILE=egemma2\n")
+    assert "profile=[egemma2]" in _step_echo(tmp_path / "crlf", "MEM0_EMBED_PROFILE=egemma2\r\n")
+
+
+def test_the_environment_outranks_stack_env_for_a_chain_step(tmp_path):
+    assert "profile=[egemma-300m]" in _step_echo(tmp_path, "MEM0_EMBED_PROFILE=egemma2\n", MEM0_EMBED_PROFILE="egemma-300m")
+
+
+def test_a_chain_step_on_a_box_without_a_recorded_profile_gets_none(tmp_path):
+    assert "profile=[]" in _step_echo(tmp_path, "MEM0_WSL_USER=t\n")
+    assert "profile=[]" in _step_echo(tmp_path / "bare", None)
+
+
+# --------------------------------------------------------------------------- wiki-index.sh (replica wrapper)
+
+
+def test_the_replica_wrapper_passes_the_embedding_profile_on_to_the_builder(tmp_path):
+    """wiki-index.sh embeds with THIS box's profile into the brain's collection of that space: the profile and
+    the scoped alias overrides come from the replica's stack.env, the environment wins."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_EMBED_PROFILE=egemma2\nMEM0_EMBED_MODEL_EGEMMA2=eg2-local\n", encoding="utf-8")
+    b = tmp_path / "bin"
+    b.mkdir()
+    ssh = b / "ssh"
+    ssh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    py = b / "fakepy"
+    py.write_text('#!/usr/bin/env bash\necho "profile=${MEM0_EMBED_PROFILE:-unset} alias=${MEM0_EMBED_MODEL_EGEMMA2:-unset}" >> "$FAKE_LOG"\n', encoding="utf-8")
+    for f in (ssh, py):
+        f.chmod(f.stat().st_mode | stat.S_IEXEC)
+    log = tmp_path / "log"
+
+    def run(**extra):
+        return subprocess.run(["bash", str(WSL_DIR / "wiki-index.sh"), "search", "q"],
+                              env=_env(home, PATH=f"{b}{os.pathsep}{os.environ['PATH']}", WIKI_PY=str(py), WIKI_BRAIN_SSH="brain",
+                                       FAKE_LOG=str(log), WIKI_TUNNEL_PORT="16999", **extra),
+                              capture_output=True, text=True, timeout=60)
+
+    r = run()
+    assert r.returncode == 0, r.stderr
+    assert log.read_text().strip() == "profile=egemma2 alias=eg2-local"
+    log.unlink()
+    r = run(MEM0_EMBED_PROFILE="egemma-300m")
+    assert r.returncode == 0, r.stderr
+    assert log.read_text().startswith("profile=egemma-300m"), "the environment outranks the receipt"
+
+
+# --------------------------------------------------------------------------- stack-restore.sh
+
+
+RESTORE = WSL_DIR / "stack-restore.sh"
+
+
+def _restorable_set(home, qdrant, **extra):
+    """A complete set + its manifest, written by the real manifest writer."""
+    b = home / ".mem0" / "backups"
+    ts = "20261007-033000"
+    _seed_set(b, ts)
+    r = _run(MANIFEST, home, qdrant, args=[ts], **extra)
+    assert r.returncode == 0, r.stderr
+    return ts
+
+
+def _restore_dry_run(home, ts, tmp_path, **extra):
+    return subprocess.run(["bash", str(RESTORE), "--snapshot", ts, "--dry-run"],
+                          env=_env(home, DRILL_LOG=str(tmp_path / "drill.jsonl"), **extra),
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_stack_restore_shows_which_space_the_set_is_in(home, qdrant, tmp_path):
+    ts = _restorable_set(home, qdrant)
+    r = _restore_dry_run(home, ts, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"embed_profile  : {P300.name} (model alias {P300.model}, template {P300.template_version})" in r.stdout, r.stdout
+    assert f"qdrant_collection: {P300.memories} (what qdrant_snapshot holds)" in r.stdout
+    assert "WARN" not in r.stderr
+
+
+def test_stack_restore_warns_but_does_not_refuse_when_the_box_is_in_another_space(home, qdrant, tmp_path):
+    """The staging restore only uploads a snapshot into a side collection, in any space (a rollback drill
+    restores the OLD space on purpose); the refusal belongs to the replica restores."""
+    ts = _restorable_set(home, qdrant)
+    r = _restore_dry_run(home, ts, tmp_path, MEM0_EMBED_PROFILE=P2.name)
+    assert r.returncode == 0, r.stderr
+    assert f"made in embedding profile '{P300.name}' but this box is configured for '{P2.name}'" in r.stderr, r.stderr
+    assert f"--embed-profile {P300.name}" in r.stderr, "the warning says how to switch the box"
+
+
+def test_stack_restore_reads_a_set_from_before_profiles_as_the_default_space(home, qdrant, tmp_path):
+    ts = _restorable_set(home, qdrant)
+    mp = home / ".mem0" / "backups" / f"manifest-{ts}.json"
+    m = json.loads(mp.read_text())
+    for k in ("embed_profile", "embed_model", "template_version", "collections", "qdrant_collections"):
+        m.pop(k)
+    mp.write_text(json.dumps(m))
+    r = _restore_dry_run(home, ts, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "none recorded (a set from before embedding profiles: the default space)" in r.stdout, r.stdout
+    assert f"qdrant_collection: {EP.PROFILES[EP.DEFAULT_PROFILE].memories}" in r.stdout
+
+
+# --------------------------------------------------------------------------- restore-replica.sh
+
+
+REPLICA_RESTORE = WSL_DIR.parents[1] / "scripts" / "travel" / "restore-replica.sh"
+
+
+class FakeLlamaSwap:
+    """GET /v1/models listing the given aliases, the way llama-swap does."""
+
+    def __init__(self, aliases):
+        fake = self
+        self.aliases = list(aliases)
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"object": "list", "data": [{"id": a, "object": "model"} for a in fake.aliases]}).encode()
+                self.send_response(200 if self.path.rstrip("/").endswith("/models") else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _replica_box(tmp_path, manifest: dict | None, stack_env: str = "", aliases=()):
+    """A replica home, a fake brain (a local backup dir reached through a stub ssh) and a fake llama-swap."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    (home / ".mem0" / "role").write_text("replica\n")
+    (home / ".mem0" / "authority-url").write_text("http://brain.example.test:18791\n")
+    brain = tmp_path / "brain-backups"
+    brain.mkdir()
+    (home / ".mem0" / "replica.env").write_text(f"BRAIN_SSH='brain'\nBRAIN_BACKUP_DIR='{brain}'\nBRAIN_WSL=''\n")
+    if stack_env:
+        (home / ".mem0" / "stack.env").write_text(stack_env)
+    ts = "20261007-033000"
+    if manifest is not None:
+        base = {"ts": "2026-10-07T03:30:00Z", "backup_ts_raw": ts,
+                "files": {"qdrant_snapshot": f"qdrant-{ts}.snapshot", "episodic_db": f"episodic-{ts}.db", "history_db": f"history-{ts}.db"},
+                "counts": {"qdrant_points": 42}}
+        base.update(manifest)
+        (brain / f"manifest-{ts}.json").write_text(json.dumps(base))
+        for f in base["files"].values():
+            (brain / f).write_bytes(b"x")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    ssh = bin_ / "ssh"   # run the remote command line locally: skip the option pairs and the host
+    ssh.write_text('#!/usr/bin/env bash\nwhile [ $# -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nexec bash -c "$*"\n')
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC)
+    for name in ("systemctl", "loginctl"):   # the script's EXIT trap stops the user units: never the real ones
+        stub = bin_ / name
+        stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    swap = FakeLlamaSwap(aliases)
+    return home, swap, bin_
+
+
+def _replica_restore(home, swap, bin_, *args, **extra):
+    return subprocess.run(["bash", str(REPLICA_RESTORE), "--dry-run", *args],
+                          env=_env(home, PATH=f"{bin_}{os.pathsep}{os.environ['PATH']}", MEM0_EMBED_BASE_URL=swap.url, **extra),
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_the_replica_restore_takes_profile_and_collection_from_the_manifest(tmp_path):
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": P2.name, "collections": {"memories": P2.memories}},
+                                    stack_env=f"MEM0_EMBED_PROFILE={P2.name}\n", aliases=[P2.model])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode == 0, r.stderr
+        assert f"embedding profile {P2.name}: alias '{P2.model}' served locally; restoring into collection '{P2.memories}'" in r.stdout, r.stdout
+        assert "[dry-run]" in r.stdout
+    finally:
+        swap.close()
+
+
+def test_a_set_from_before_profiles_restores_into_the_default_space(tmp_path):
+    home, swap, bin_ = _replica_box(tmp_path, {}, aliases=[P300.model])   # no embed_profile, no collections
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode == 0, r.stderr
+        assert f"records no embedding profile (made before profiles): the default space, {P300.name}" in r.stdout
+        assert f"restoring into collection '{P300.memories}'" in r.stdout
+    finally:
+        swap.close()
+
+
+def test_the_replica_restore_refuses_a_set_in_another_space_than_the_replicas(tmp_path):
+    """The failure this guards: the upload would restore healthy-looking vectors that the replica's own
+    server (bound to another space) never reads, or worse reads with the wrong model."""
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": P2.name, "collections": {"memories": P2.memories}},
+                                    aliases=[P2.model, P300.model])   # the replica is on the default space
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode != 0
+        assert f"set 20261007-033000 is in embedding profile '{P2.name}' but this replica is configured for '{P300.name}'" in r.stderr, r.stderr
+        assert f"install/linux-replica.sh --embed-profile {P2.name}" in r.stderr, "the refusal names the fix"
+    finally:
+        swap.close()
+    # and the other way: a legacy set on a replica that has moved to the new space
+    home, swap, bin_ = _replica_box(tmp_path / "other", {}, stack_env=f"MEM0_EMBED_PROFILE={P2.name}\n", aliases=[P2.model])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode != 0 and f"in embedding profile '{P300.name}' but this replica is configured for '{P2.name}'" in r.stderr, r.stderr
+    finally:
+        swap.close()
+
+
+def test_the_replica_restore_refuses_when_the_local_embedder_does_not_serve_the_profiles_alias(tmp_path):
+    """Serving SOME embedder is not enough: the alias of the set's profile is what the replica's mem0 asks for."""
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": P2.name, "collections": {"memories": P2.memories}},
+                                    stack_env=f"MEM0_EMBED_PROFILE={P2.name}\n", aliases=[P300.model])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode != 0
+        assert f"does not serve '{P2.model}'" in r.stderr and "b11452" in r.stderr, r.stderr
+    finally:
+        swap.close()
+
+
+def test_the_replicas_own_scoped_alias_is_what_has_to_be_served(tmp_path):
+    """The replica may serve the GGUF under its own name (embedder_profile: MEM0_EMBED_MODEL_<PROFILE>)."""
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": P2.name, "collections": {"memories": P2.memories}},
+                                    stack_env=f"MEM0_EMBED_PROFILE={P2.name}\nMEM0_EMBED_MODEL_EGEMMA2=eg2-on-this-box\n",
+                                    aliases=["eg2-on-this-box"])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode == 0, r.stderr
+        assert "alias 'eg2-on-this-box' served locally" in r.stdout
+    finally:
+        swap.close()
+
+
+def test_the_replica_restore_refuses_a_collection_its_server_would_not_bind(tmp_path):
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": P2.name, "collections": {"memories": "custom_name"}},
+                                    stack_env=f"MEM0_EMBED_PROFILE={P2.name}\n", aliases=[P2.model])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode != 0
+        assert f"holds collection 'custom_name' but this replica's server binds '{P2.memories}'" in r.stderr, r.stderr
+        # --collection is the explicit override: the operator binds the name himself
+        r = _replica_restore(home, swap, bin_, "--collection", "custom_name")
+        assert r.returncode == 0, r.stderr
+        assert "restoring into collection 'custom_name'" in r.stdout
+    finally:
+        swap.close()
+
+
+def test_the_replica_restore_refuses_a_set_without_a_resolvable_profile(tmp_path):
+    home, swap, bin_ = _replica_box(tmp_path, {"embed_profile": "unknown"}, aliases=[P300.model])
+    try:
+        r = _replica_restore(home, swap, bin_)
+        assert r.returncode != 0 and "without a resolvable embedding profile" in r.stderr, r.stderr
+    finally:
+        swap.close()
+
+
+def test_the_replica_restore_checks_the_restored_server_is_bound_to_the_restored_space():
+    """The live half (upload, start mem0, /health/deep) needs systemd and a Qdrant, so it is pinned by text:
+    the restored server must report the set's profile and collection, not merely `ok`."""
+    sh = REPLICA_RESTORE.read_text(encoding="utf-8")
+    assert ".embed_profile.profile" in sh and "is bound to embedding profile" in sh
+    assert "is bound to collection" in sh
+    assert sh.index('bound_profile="$(printf') > sh.index('printf \'%s\' "$deep" | grep -q \'"ok"')
+    code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
+    for p in (P300, P2):
+        for n in _space(p):
+            assert n not in code, n
+    assert 'COLLECTION=""' in code, "the default collection is no longer a literal"

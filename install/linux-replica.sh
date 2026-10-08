@@ -14,13 +14,19 @@
 # It ends with a FIRST RESTORE: the newest set is pulled and restored, /health/deep must answer
 # through the local embedder, then the services are stopped again (dormant while online).
 #
-# Requires a local EmbeddingGemma@768 on :11436 (llama-swap), the same model the Brain
-# embeds with — a replica with a different embedder answers nonsense.
+# Requires a local embedder on :11436 (llama-swap) serving the SAME embedding space the Brain's store
+# lives in (mem0-server/embedder_profile.py: egemma-300m or egemma2) under that profile's alias — a
+# replica in another space answers nonsense. The installer checks the alias is listed; the restore
+# refuses a snapshot set whose manifest names another profile.
 #
 # Usage:
 #   bash install/linux-replica.sh --authority http://<brain-host>:18791 --brain-ssh <ssh-alias> \
-#        [--brain-wsl <distro>:<user>] [--brain-backup-dir <remote dir>] \
-#        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run] \n#        [--ams-hub <user@host:repo.git>] [--ams-store-binary <file>] [--ams-store-sums <file>]
+#        [--brain-wsl <distro>:<user>] [--brain-backup-dir <remote dir>] [--embed-profile <profile>] \
+#        [--api-key-file <file>] [--user-id <tenant>] [--qdrant-storage-gb <n>] [--dry-run] \
+#        [--ams-hub <user@host:repo.git>] [--ams-store-binary <file>] [--ams-store-sums <file>]
+#   --embed-profile: the Brain's embedding space. Taken from the authority's /health/deep when omitted
+#                and nothing is recorded in stack.env (a re-run keeps the recorded value; "" clears it);
+#                the default space when the authority does not say. Recorded as MEM0_EMBED_PROFILE.
 #   --ams-hub and its two companions are forwarded verbatim to install/linux-client.sh, which
 #                is where the fleet store is installed; a replica joins the store as a client. An
 #                omitted --ams-hub inherits the recorded hub (client-receipt.json); "" clears it.
@@ -39,8 +45,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/stack-env.sh"
 # the release sha stamp (DEPLOYED_SHA) beside VERSION; see deploy-stamp.sh.
 . "$SCRIPT_DIR/deploy-stamp.sh"
+# Shell access to the embedding-space definition (embedder_profile.py): no collection or alias is
+# named here, the module is asked.
+. "$REPO_ROOT/scripts/wsl/embed-profile.sh"
 AUTHORITY=""; BRAIN_SSH=""; BRAIN_WSL=""; BRAIN_BACKUP_DIR=""; SET_BRAIN_WSL=0; SET_BRAIN_BACKUP_DIR=0
 API_KEY_FILE=""; USER_ID=""; DRY_RUN=0; QDRANT_STORAGE_GB=8
+EMBED_PROFILE=""; SET_EMBED_PROFILE=0
 # Fleet-store flags: a replica is a client plus a dormant brain, so these belong to the
 # client install and are forwarded to it verbatim. Without the forward the client would
 # skip its store block and the replica would silently never join the fleet.
@@ -54,13 +64,14 @@ QDRANT_DIR="$HOME/qdrant-server"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
         --brain-ssh) BRAIN_SSH="${2:-}"; shift 2 ;;
         --brain-wsl) BRAIN_WSL="${2:-}"; SET_BRAIN_WSL=1; shift 2 ;;
         --brain-backup-dir) BRAIN_BACKUP_DIR="${2:-}"; SET_BRAIN_BACKUP_DIR=1; shift 2 ;;
+        --embed-profile) EMBED_PROFILE="${2:-}"; SET_EMBED_PROFILE=1; shift 2 ;;
         --api-key-file) API_KEY_FILE="${2:-}"; shift 2 ;;
         --user-id) USER_ID="${2:-}"; shift 2 ;;
         --qdrant-storage-gb) QDRANT_STORAGE_GB="${2:-}"; shift 2 ;;
@@ -151,8 +162,32 @@ PIP_SPECS="$(grep -E "pip install --quiet 'mem0ai" "$WSL_INSTALLER" | head -1 | 
 STACK_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 echo "    stack $STACK_VERSION; authority $AUTHORITY; brain via ssh '$BRAIN_SSH'${BRAIN_WSL:+ (WSL $BRAIN_WSL)}; tenant $USER_ID"
 echo "    server: qdrant $QDRANT_VERSION ($QDRANT_ASSET, ${PAGE_SIZE}-byte pages), $(echo "$MEM0_MODULES" | wc -w) modules, specs: $PIP_SPECS"
+# The embedding space: flag > stack.env (the recorded value) > the authority's own answer > the default
+# space. An explicit empty value clears the recorded one, like the other inherited settings.
+if [ "$SET_EMBED_PROFILE" = 1 ]; then
+    [ -n "$EMBED_PROFILE" ] || echo "    --embed-profile cleared (explicit empty value; not inherited)"
+elif [ -f "$MEM0_DIR/stack.env" ]; then
+    EMBED_PROFILE="$(sed -n 's/^MEM0_EMBED_PROFILE=//p' "$MEM0_DIR/stack.env" | head -n1 | tr -d '\r')"
+    [ -z "$EMBED_PROFILE" ] || echo "    --embed-profile inherited from ~/.mem0/stack.env: $EMBED_PROFILE"
+fi
+AUTH_PROFILE=""
+if [ "$DRY_RUN" = 0 ]; then   # a dry run touches nothing, and asks nobody
+    AUTH_PROFILE="$(curl -sf -m 15 "$AUTHORITY/health/deep" 2>/dev/null | jq -r '.embed_profile.profile // empty' 2>/dev/null || true)"
+fi
+if [ -n "$AUTH_PROFILE" ] && [ -n "$EMBED_PROFILE" ] && [ "$AUTH_PROFILE" != "$EMBED_PROFILE" ]; then
+    fail "the authority serves embedding profile '$AUTH_PROFILE' but this replica is set to '$EMBED_PROFILE': a replica in another space answers nonsense. Re-run with --embed-profile $AUTH_PROFILE"
+fi
+[ -n "$EMBED_PROFILE" ] || EMBED_PROFILE="$AUTH_PROFILE"
+if [ -z "$EMBED_PROFILE" ]; then
+    EMBED_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile from mem0-server/embedder_profile.py"
+    echo "    embed profile: $EMBED_PROFILE (the default space; the authority did not say)"
+fi
+ep_field "$EMBED_PROFILE" name >/dev/null || fail "--embed-profile '$EMBED_PROFILE' is not a known embedding profile (see mem0-server/embedder_profile.py)"
+# The alias THIS box serves the profile under: its own scoped override in stack.env, else the profile's.
+EMBED_ALIAS="$(ep_alias "$EMBED_PROFILE")" || fail "cannot read the llama-swap alias of profile $EMBED_PROFILE"
+echo "    embed profile: $EMBED_PROFILE; local llama-swap alias: $EMBED_ALIAS"
 if [ "$DRY_RUN" = 0 ]; then
-    curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null || fail "no local embedder on :11436 — serve EmbeddingGemma@768 through llama-swap first (see install/llama-swap-setup.md)"
+    curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q "\"$EMBED_ALIAS\"" || fail "the local embedder on :11436 does not serve '$EMBED_ALIAS' (embedding profile $EMBED_PROFILE) — serve it through llama-swap first (see install/llama-swap-setup.md; EmbeddingGemma-2 needs llama.cpp b11452 or later)"
     ssh -o BatchMode=yes -o ConnectTimeout=15 "$BRAIN_SSH" exit 0 >/dev/null 2>&1 || fail "ssh '$BRAIN_SSH' does not accept key auth from this box"
 fi
 
@@ -170,7 +205,7 @@ bash "$SCRIPT_DIR/linux-client.sh" "${CLIENT_ARGS[@]}"
 
 # ---------------------------------------------------------------- 2. role + receipts
 say "[2] role=replica, replica.env, stack.env"
-if plan "write $MEM0_DIR/role=replica, replica.env (BRAIN_SSH/BRAIN_BACKUP_DIR/BRAIN_WSL), stack.env (MEM0_ROLE=replica, MEM0_BIND=127.0.0.1)"; then :; else
+if plan "write $MEM0_DIR/role=replica, replica.env (BRAIN_SSH/BRAIN_BACKUP_DIR/BRAIN_WSL), stack.env (MEM0_ROLE=replica, MEM0_BIND=127.0.0.1, MEM0_EMBED_PROFILE=$EMBED_PROFILE)"; then :; else
     umask 077
     printf 'replica\n' > "$MEM0_DIR/role"
     cat > "$MEM0_DIR/replica.env" <<ENV
@@ -184,10 +219,12 @@ REPLICA_CACHE='$MEM0_DIR/replica-snapshots'
 ENV
     # 1.31.3: operator-owned keys (install/stack-env.sh) are carried over, or this rewrite deletes
     # them: MEM0_BRAIN_SSH is the brain alias this replica's wiki-index.sh tunnels through.
-    mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$MEM0_DIR/stack.env")
+    # ...and so are the embedding-space keys (the alias overrides, the base URL); the profile itself is
+    # written from the value resolved above, so it is skipped in the carry and appears once.
+    mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$MEM0_DIR/stack.env" MEM0_EMBED_PROFILE)
     for kv in "${STACK_ENV_CARRY[@]}"; do echo "    ${kv%%=*} carried over from $MEM0_DIR/stack.env: ${kv#*=}"; done
     stack_env_write "$MEM0_DIR/stack.env" MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native \
-        MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND=127.0.0.1 MEM0_ROLE=replica "${STACK_ENV_CARRY[@]}" \
+        MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND=127.0.0.1 MEM0_ROLE=replica MEM0_EMBED_PROFILE="$EMBED_PROFILE" "${STACK_ENV_CARRY[@]}" \
         || fail "refusing to write $MEM0_DIR/stack.env (a value is not a plain token; see above)"
     umask 022
     echo "    role=replica; replica.env + stack.env written"

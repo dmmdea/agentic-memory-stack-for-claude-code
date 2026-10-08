@@ -17,17 +17,26 @@
 #   --leave-running   keep qdrant + mem0 up after the restore (the watcher's go_offline path);
 #                     default stops them again so the replica stays dormant while online.
 #   --dry-run         resolve config, list the newest remote set, touch nothing.
+#   --collection      restore into this collection instead of the set's own (the manifest's
+#                     collections.memories; a set from before embedding profiles is the default
+#                     space's). The set's profile is checked either way.
 #
 # One-Brain Rule guard: refuses unless ~/.mem0/role is `replica` AND the authority is remote —
 # on the Brain this would overwrite the live store with a day-old snapshot.
+#
+# Embedding-space guard: a snapshot's vectors only mean something to the model and prompt template
+# that made them. The set's manifest names its profile (embed_profile); the restore refuses unless
+# this replica is configured for the same profile (~/.mem0/stack.env, install/linux-replica.sh
+# --embed-profile) AND the local llama-swap serves that profile's alias — otherwise the replica would
+# restore healthy-looking vectors it embeds every query against in another space.
 set -euo pipefail
-LEAVE_RUNNING=0; DRY_RUN=0; COLLECTION="mem0_egemma_768"
+LEAVE_RUNNING=0; DRY_RUN=0; COLLECTION=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --leave-running) LEAVE_RUNNING=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --collection) COLLECTION="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -46,6 +55,20 @@ is_local_url() {
     [ -z "$host" ] && return 0
     case "$host" in 127.*|localhost|*.localhost|0.0.0.0|::1|::) return 0 ;; esac
     return 1
+}
+
+# embedder_profile.py (mem0-server) is the one definition of the embedding space: found repo-relative
+# first (the tests, a checkout), then where the replica installer deploys the server modules. This script
+# is deployed alone, so it carries its own small resolver instead of sourcing a library.
+ep_py() {  # <python> [args...]: runs with `ep` imported; rc 2 when the module cannot be found
+    local d
+    for d in "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)/mem0-server" "$HOME/apps/mem0-server"; do
+        [ -f "$d/embedder_profile.py" ] || continue
+        python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import embedder_profile as ep; del sys.argv[1]
+'"$1" "$d" "${@:2}"
+        return $?
+    done
+    return 2
 }
 
 # ---------------------------------------------------------------- guards
@@ -91,6 +114,39 @@ print(f.get("qdrant_snapshot") or "", f.get("episodic_db") or "", f.get("history
 [ -n "$QDRANT_FILE" ] && [ -n "$EPI_FILE" ] && [ -n "$HIST_FILE" ] || fail "manifest $TS is not a complete set (qdrant/episodic/history all required)"
 [ "${PTS:-0}" -gt 0 ] || fail "manifest $TS reports 0 Qdrant points — refusing to restore an empty brain"
 echo "    set $TS: $PTS points ($QDRANT_FILE, $EPI_FILE, $HIST_FILE)"
+
+# ---------------------------------------------------------------- 1b. the set's embedding space
+# "-" stands for an empty field (read would collapse a leading empty one): a set from before profiles
+# names none, which means the default space.
+read -r MP_PROFILE MP_COLLECTION < <(printf '%s' "$MANIFEST_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d.get("embed_profile") or "-", (d.get("collections") or {}).get("memories") or "-")')
+[ "$MP_PROFILE" != "-" ] || MP_PROFILE=""
+[ "$MP_COLLECTION" != "-" ] || MP_COLLECTION=""
+if [ -z "$MP_PROFILE" ]; then
+    MP_PROFILE="$(ep_py 'print(ep.DEFAULT_PROFILE)')" || fail "embedder_profile.py not found beside the repo or in ~/apps/mem0-server: the replica cannot tell which embedding space set $TS is in"
+    echo "    set $TS records no embedding profile (made before profiles): the default space, $MP_PROFILE"
+fi
+[ "$MP_PROFILE" != "unknown" ] || fail "set $TS was written without a resolvable embedding profile (embed_profile: unknown); fix the Brain's backup first (is embedder_profile.py deployed beside its scripts?)"
+LOCAL_PROFILE="$(ep_py 'print(ep.active().name)')" || fail "this replica's embedding profile does not resolve (embedder_profile.py missing, or MEM0_EMBED_PROFILE names an unknown profile)"
+if [ "$MP_PROFILE" != "$LOCAL_PROFILE" ]; then
+    fail "set $TS is in embedding profile '$MP_PROFILE' but this replica is configured for '$LOCAL_PROFILE' (~/.mem0/stack.env MEM0_EMBED_PROFILE). Restoring would load vectors this replica embeds every query against in another space. Serve '$MP_PROFILE' on llama-swap :11436, then re-run: bash install/linux-replica.sh --embed-profile $MP_PROFILE"
+fi
+LOCAL_ALIAS="$(ep_py 'print(ep.embed_model(ep.get(sys.argv[1])))' "$MP_PROFILE")" || fail "cannot resolve the llama-swap alias of profile '$MP_PROFILE'"
+EMBED_BASE="$(ep_py 'print(ep.base_url())')" || fail "cannot resolve the embedder base URL"
+BOUND_COLLECTION="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$MP_PROFILE")" || fail "cannot resolve the memories collection of profile '$MP_PROFILE'"
+# the local embedder must serve this profile's alias, not merely answer: any other model is another space
+curl -sf -m 5 "$EMBED_BASE/models" | grep -q "\"$LOCAL_ALIAS\"" || fail "the local embedder ($EMBED_BASE) does not serve '$LOCAL_ALIAS', the alias of embedding profile '$MP_PROFILE' — the replica could answer nothing (EmbeddingGemma-2 needs llama.cpp b11452 or later; llama-swap entries: install/1-wsl-services.sh prints them)"
+# the collection: --collection, else the set's own. The replica's server binds BOUND_COLLECTION, so a set
+# that holds another one would restore fine and be invisible to the server.
+if [ -z "$COLLECTION" ]; then
+    COLLECTION="${MP_COLLECTION:-$BOUND_COLLECTION}"
+    if [ "$COLLECTION" != "$BOUND_COLLECTION" ]; then
+        fail "set $TS holds collection '$COLLECTION' but this replica's server binds '$BOUND_COLLECTION' for profile '$MP_PROFILE' (MEM0_QDRANT_COLLECTION in ~/.mem0/stack.env). Align the two, or pass --collection to restore under a name you will bind yourself"
+    fi
+fi
+echo "    embedding profile $MP_PROFILE: alias '$LOCAL_ALIAS' served locally; restoring into collection '$COLLECTION'"
 if [ "$DRY_RUN" = 1 ]; then echo "    [dry-run] would fetch into $REPLICA_CACHE/$TS, restore into collection '$COLLECTION', then $([ $LEAVE_RUNNING = 1 ] && echo 'leave services running' || echo 'stop services'); nothing touched"; exit 0; fi
 
 # ---------------------------------------------------------------- 2. fetch (size-verified, cached)
@@ -111,7 +167,7 @@ find "$REPLICA_CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "$TS" -exec rm -rf
 
 # ---------------------------------------------------------------- 3. restore into the dormant local store
 say "[3] restore: stop mem0, start qdrant, upload snapshot, copy ledgers"
-curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null || fail "the local embedder (llama-swap :11436) is not serving — the replica could answer nothing"
+curl -sf -m 5 "$EMBED_BASE/models" | grep -q "\"$LOCAL_ALIAS\"" || fail "the local embedder ($EMBED_BASE) is not serving '$LOCAL_ALIAS' — the replica could answer nothing"
 systemctl --user stop mem0.service 2>/dev/null || true
 systemctl --user start qdrant.service
 for i in $(seq 1 60); do curl -sf -m 3 http://127.0.0.1:6333/healthz >/dev/null && break; sleep 2; [ "$i" = 60 ] && fail "local qdrant did not come up within 2 minutes (systemctl --user status qdrant.service)"; done
@@ -134,6 +190,12 @@ health=""
 for i in $(seq 1 45); do health="$(curl -sf -m 10 http://127.0.0.1:18791/health 2>/dev/null || true)"; printf '%s' "$health" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' && break; sleep 2; [ "$i" = 45 ] && fail "replica mem0 did not come up healthy: ${health:-<no answer>} (systemctl --user status mem0.service)"; done
 deep="$(curl -sf -m 120 http://127.0.0.1:18791/health/deep 2>/dev/null || true)"
 printf '%s' "$deep" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || fail "replica /health/deep not ok: ${deep:0:300}"
+# ...and bound to the space and collection that were just restored (a server reports both; one that
+# predates the profile report says nothing and is not second-guessed)
+bound_profile="$(printf '%s' "$deep" | jq -r '.embed_profile.profile // empty' 2>/dev/null || true)"
+bound_collection="$(printf '%s' "$deep" | jq -r '.collection // empty' 2>/dev/null || true)"
+[ -z "$bound_profile" ] || [ "$bound_profile" = "$MP_PROFILE" ] || fail "replica mem0 is bound to embedding profile '$bound_profile', but the restored set is '$MP_PROFILE'"
+[ -z "$bound_collection" ] || [ "$bound_collection" = "$COLLECTION" ] || fail "replica mem0 is bound to collection '$bound_collection', but the set was restored into '$COLLECTION'"
 echo "    replica live: $restored memories, /health/deep ok"
 printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TS" "$restored" > "$STAMP_FILE"
 log_line ok "restored $restored points from $TS"

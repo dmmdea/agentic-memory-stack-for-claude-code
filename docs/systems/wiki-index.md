@@ -19,11 +19,17 @@ paths that back each other up (and a PC-side catch-up that runs the fast one whe
 
 ## Scope
 
-One collection, `wiki_pages_egemma_768`, in the brain box's Qdrant: one point per page under
-the vault's `wiki/` tree (`entities/`, `concepts/`, `sources/`, `syntheses/`), embedded with the
-same EmbeddingGemma prefix shim as `mem0` (`MEM0_EMBED_MODEL`, the store's exact GGUF), payload
-`{path, title, type, tags, updated, summary, hash}`. Builds are idempotent and incremental on
-the content hash; deleted pages are removed.
+One collection in the brain box's Qdrant, in the **wiki's own embedding space**
+(`MEM0_WIKI_EMBED_PROFILE`, default the memories' space; see [embedder profiles](embedder-profiles.md)):
+`wiki_pages_egemma_768` on EmbeddingGemma-300m, `wiki_pages_eg2_768` on EmbeddingGemma-2. One point per
+page under the vault's `wiki/` tree (`entities/`, `concepts/`, `sources/`, `syntheses/`), embedded
+through the prefix shim with that profile's model, payload `{path, title, type, tags, updated, summary,
+hash}`. On EmbeddingGemma-300m a page is embedded as its title, first line and the first 1,200
+characters of the body; a profile with a larger window embeds the whole body up to its token budget
+(EmbeddingGemma-2: 3,900 tokens — measured 2026-10-08 to answer detail questions about the late parts
+of a page far better, deep-detail MRR 0.788 vs 0.687). Builds are idempotent and incremental on the
+content hash; deleted pages are removed. A space change is a rebuild into the other collection; the old
+one is kept.
 
 ## Non-scope
 

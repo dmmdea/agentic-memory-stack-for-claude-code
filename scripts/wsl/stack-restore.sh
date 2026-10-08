@@ -121,6 +121,41 @@ echo "Target Qdrant collection : $TARGET_COLLECTION"
 echo "Target episodic.db       : $TARGET_EPISODIC"
 echo ""
 
+# The embedding space the set was made in (mem0-server/embedder_profile.py through embed-profile.sh).
+# A manifest written before profiles records none: it is the default space, the one every store was
+# built in until then. The staging restore below is safe in ANY space (it only uploads a snapshot), so a
+# mismatch with this box's own profile is a WARN here; the replica restores refuse (restore-replica.sh).
+EP_LIB="$(dirname "$0")/embed-profile.sh"
+LOCAL_PROFILE=""
+if [ -f "$EP_LIB" ]; then
+    # shellcheck disable=SC1090
+    . "$EP_LIB"
+    if ep_load 2>/dev/null && [ "$EP_STATUS" = ok ]; then LOCAL_PROFILE="$EP_PROFILE"; fi
+fi
+mkey() {  # <key> [<subkey>]: a manifest string ('' for a null, an absent key or a manifest older than the key)
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = d.get(sys.argv[2])
+if len(sys.argv) > 3 and isinstance(v, dict):
+    v = v.get(sys.argv[3])
+print(v if isinstance(v, str) else '')" "$MANIFEST" "$@" 2>/dev/null || echo ""
+}
+MANIFEST_EMBED_PROFILE=$(mkey embed_profile)
+MANIFEST_EMBED_MODEL=$(mkey embed_model)
+MANIFEST_TEMPLATE=$(mkey template_version)
+MANIFEST_COLLECTION=$(mkey collections memories)
+if [ -z "$MANIFEST_EMBED_PROFILE" ]; then
+    MANIFEST_EMBED_NOTE="none recorded (a set from before embedding profiles: the default space)"
+    if declare -F ep_default_profile >/dev/null 2>&1; then
+        MANIFEST_EMBED_PROFILE_EFFECTIVE=$(ep_default_profile 2>/dev/null || echo "")
+        [ -z "$MANIFEST_COLLECTION" ] && [ -n "$MANIFEST_EMBED_PROFILE_EFFECTIVE" ] && MANIFEST_COLLECTION=$(ep_field "$MANIFEST_EMBED_PROFILE_EFFECTIVE" memories 2>/dev/null || echo "")
+    fi
+else
+    MANIFEST_EMBED_NOTE="$MANIFEST_EMBED_PROFILE"
+    MANIFEST_EMBED_PROFILE_EFFECTIVE="$MANIFEST_EMBED_PROFILE"
+fi
+
 # Parse manifest fields with python3
 MANIFEST_APP_VERSION=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['app_version'])"           2>/dev/null || echo "unknown")
 MANIFEST_SCHEMA_VER=$(python3  -c "import json; print(json.load(open('$MANIFEST'))['schema_version'])"        2>/dev/null || echo "unknown")
@@ -156,6 +191,11 @@ echo "  schema_version : $MANIFEST_SCHEMA_VER"
 echo "  git_sha        : $MANIFEST_GIT_SHA"
 echo "  qdrant_points  : $MANIFEST_QDRANT_PTS"
 echo "  episodic: sessions=$MANIFEST_EP_SESSIONS episodes=$MANIFEST_EP_EPISODES goals=$MANIFEST_EP_GOALS"
+echo "  embed_profile  : $MANIFEST_EMBED_NOTE${MANIFEST_EMBED_MODEL:+ (model alias $MANIFEST_EMBED_MODEL${MANIFEST_TEMPLATE:+, template $MANIFEST_TEMPLATE})}"
+echo "  qdrant_collection: ${MANIFEST_COLLECTION:-unknown} (what qdrant_snapshot holds)"
+if [ -n "$LOCAL_PROFILE" ] && [ -n "${MANIFEST_EMBED_PROFILE_EFFECTIVE:-}" ] && [ "$MANIFEST_EMBED_PROFILE_EFFECTIVE" != "$LOCAL_PROFILE" ]; then
+    echo "WARN: this snapshot was made in embedding profile '$MANIFEST_EMBED_PROFILE_EFFECTIVE' but this box is configured for '$LOCAL_PROFILE'. The staging restore below is safe, but a server bound to '$LOCAL_PROFILE' cannot serve these vectors: before promoting, switch the box (install/linux-authority.sh --embed-profile $MANIFEST_EMBED_PROFILE_EFFECTIVE, or MEM0_EMBED_PROFILE in ~/.mem0/stack.env) and serve that profile's model on llama-swap." >&2
+fi
 echo ""
 
 # Verify all REQUIRED files exist — and a null/empty manifest entry for a required
@@ -542,7 +582,8 @@ echo "  use stack-promote.sh which stops services, backs up the live DB, runs in
 echo "  promotes atomically, restarts services, and logs to the ledger."
 echo ""
 echo "  - To promote Qdrant: data is already in collection '$TARGET_COLLECTION'."
-echo "    Swap alias or rename collection after validation."
+echo "    It holds the set's ${MANIFEST_COLLECTION:-memories} collection (embedding profile ${MANIFEST_EMBED_PROFILE_EFFECTIVE:-unknown}):"
+echo "    swap alias or rename it to that name after validation, with the server bound to that profile."
 echo "  - Cleanup drill artifacts:"
 echo "    curl -X DELETE $QDRANT_BASE/collections/$TARGET_COLLECTION"
 echo "    rm $TARGET_EPISODIC $HOME/.mem0/history-restore.db $HOME/.mem0/tier-ledger-restore.jsonl"
