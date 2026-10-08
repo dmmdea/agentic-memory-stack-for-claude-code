@@ -39,6 +39,9 @@ GREEN_CHECKS = {
     "embedder": {"ok": True, "dim": 768},
     "sparse_leg": {"ok": True, "points": 100, "with_bm25": 100, "coverage": 1.0,
                    "canary": {"ran": True, "hit": True, "token": "qdrant"}},
+    # fusion.health(): the real /health/deep shape
+    "fusion": {"ok": True, "mode": "rrf", "bound": True, "callers_bound": [True, True],
+               "searches": {"reached": 3, "bypassed": 0}},
     # Real /health/deep shape (canonical_key_health): ok/present/source/dpapi_blob.
     # The fixture previously carried a "provider" key that production never
     # emits — a fixture that does not mirror the real shape cannot catch a
@@ -88,7 +91,7 @@ GREEN_CHECKS = {
 }
 
 PROBE_BACKED = [
-    "mem0-api", "qdrant-store", "embedder", "bm25-sparse-leg", "canonical-key",
+    "mem0-api", "qdrant-store", "embedder", "bm25-sparse-leg", "search-fusion", "canonical-key",
     "service-key", "put-carryover", "mojibake-tripwire", "contradiction-review-queue",
     "dream-cycle", "drift-guard", "backup-pipeline", "dedup-job",
     "memory-index", "sweep-job", "codex-auth",
@@ -140,6 +143,15 @@ def test_sparse_leg_dead_gates_dead_required():
     out = _ev(checks)
     assert out["states"]["bm25-sparse-leg"] == "dead"
     assert "bm25-sparse-leg" in out["dead_required"]
+
+
+def test_search_fusion_dead_when_unbound_or_bypassed_degraded_when_rolled_back():
+    for fusion in ({"ok": False, "mode": "rrf", "bound": False, "error": "moved"},
+                   {"ok": False, "mode": "rrf", "bound": True, "searches": {"reached": 9, "bypassed": 1}}):
+        out = _ev(_checks(fusion=fusion))
+        assert out["states"]["search-fusion"] == "dead" and "search-fusion" in out["dead_required"]
+    out = _ev(_checks(fusion={"ok": True, "mode": "mem0", "bound": False}))
+    assert out["states"]["search-fusion"] == "degraded" and "search-fusion" not in out["dead_required"]
 
 
 def test_sparse_leg_low_coverage_degraded_not_dead():

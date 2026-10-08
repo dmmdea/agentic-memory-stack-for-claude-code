@@ -35,6 +35,8 @@ in the first entries below — full pre-inversion history lives in the maintaine
   mem0's own formula (the rollback, and how to run a mem0 the fusion cannot bind to), set in a
   `mem0.service` drop-in of your own: the unit does not read `stack.env`
   ([docs/systems/fusion.md](docs/systems/fusion.md)). A search with `explain` gains a `fusion` trace stage.
+- Capability manifest row `search-fusion` (`checks.fusion`): `dead` when unbound or bypassed, `degraded` in the
+  deliberate mem0 mode.
 - **`capture` on `GET /health/maintenance`** (audit CRIT-01): is the PC-side L1a extractor still finishing
   runs? Read per request from `episodic.db` (index reads over a read-only connection): `activity_at` (the newest
   episode touched, which every prompt does) and `success_at` (the newest complete episode: L1a's finished runs).
@@ -46,6 +48,10 @@ in the first entries below — full pre-inversion history lives in the maintaine
 - **`critical_failed_steps` on `GET /health/maintenance`** (audit CRIT-02): `failed_steps` minus the steps whose
   failure is not actionable at night because they depend on a PC being on (today `wiki-index`). An external
   monitor can page urgently on it, through quiet hours, while `failed_steps` keeps paging normally.
+
+### Fixed
+- `restore-replica.sh` step 4 gates on the top-level `ok` of `/health/deep`: it grepped for any `"ok": true`,
+  which every healthy sub-check also matched, so a red endpoint restored green.
 
 ### Measured (no change)
 - Revisited the EmbeddingGemma-2 question with the fusion fixed: EmbeddingGemma-2 recovers most of what
