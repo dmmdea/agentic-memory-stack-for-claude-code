@@ -198,3 +198,12 @@ def test_build_embedder_in_the_wiki_space(clean, monkeypatch):
     assert emb._budget == 3900 - 16
     hot = config.build_embedder()
     assert hot.profile.name == "egemma-300m" and hot.config.model == "embeddinggemma"
+
+
+def test_threshold_overrides_are_reported_with_the_value_they_replace(clean, monkeypatch):
+    assert ep.threshold_overrides() == {}
+    monkeypatch.setenv("MEM0_EMBED_PROFILE", "egemma2")
+    monkeypatch.setenv("MEM0_RAW_FALLBACK_COSINE_FLOOR", "0.25")      # a 300m-era value left behind
+    ov = ep.threshold_overrides()
+    assert ov == {"episode_floor": {"env": "MEM0_RAW_FALLBACK_COSINE_FLOOR", "value": "0.25", "profile_value": 0.68}}
+    assert ep.describe()["threshold_overrides"] == ov

@@ -160,8 +160,9 @@ house evals (`eval/embedder-ab/` in the operator repo) against a shadow server b
 The wiki index is derived from the vault and rebuilt in seconds, so it moves without a migration:
 
 ```bash
-# 1. serve the profile's alias on the authority AND on every PC that refreshes the wiki
-#    (EmbeddingGemma-2: llama.cpp >= b11452; see install/llama-swap-setup.md)
+# 1. serve the profile's alias on the authority (EmbeddingGemma-2: llama.cpp >= b11452; see
+#    install/llama-swap-setup.md). A PC that refreshes the wiki without serving it sends its builds and
+#    searches to the brain; serving it there too keeps them local.
 # 2. choose the wiki's space
 echo 'MEM0_WIKI_EMBED_PROFILE=egemma2' >> ~/.mem0/stack.env
 # 3. rebuild into the new collection (the old one is kept; it is 4 MB)
@@ -174,23 +175,32 @@ Re-calibrate any consumer-side wiki score cut-off for the new space.
 
 ```bash
 P=~/apps/mem0-server/.venv/bin/python; T=~/apps/mem0-scripts/embedder-migrate.py
-# 1. serve the target profile's alias on llama-swap (and add it to the harness's memory_stack)
-# 2. build the target collections beside the live ones (minutes; reads the source, never writes it)
+# 1. serve the target profile's alias on llama-swap, in the group that never evicts the memory stack
+#    (and add it to the harness's memory_stack)
+# 2. build the target collections beside the live ones while mem0 runs (reads the source, never writes it)
 $P $T --to egemma2 --dry-run
 $P $T --to egemma2
 $P $T --to egemma2 --verify          # counts match; a sampled re-embed reproduces every stored vector
-# 3. switch: catch up, flip the profile, restart, catch up the writes that landed during the restart
-$P $T --to egemma2 --catch-up
-sed -i '/^MEM0_EMBED_PROFILE=/d' ~/.mem0/stack.env && echo 'MEM0_EMBED_PROFILE=egemma2' >> ~/.mem0/stack.env
-install/linux-authority.sh --embed-profile egemma2      # re-renders the unit; the native authority's deploy path
-$P $T --from egemma2 --to egemma-300m --catch-up         # keeps the OLD space current = the rollback anchor
-curl -s http://<authority>:18791/health/deep | jq .embed_profile
+# 3. switch with WRITES STOPPED: a write accepted after the last catch-up would land only in the old
+#    collection. The PCs queue writes in their outboxes while mem0 is down and replay them after.
+systemctl --user stop mem0
+$P $T --to egemma2 --catch-up --dry-run    # read to_delete / to_delete_ids before anything is deleted
+$P $T --to egemma2 --catch-up              # refuses more than --max-delete deletions (default 200)
+install/linux-authority.sh --embed-profile egemma2   # records the profile, re-renders the unit, starts mem0
+curl -s http://<authority>:18791/health/deep | jq '.collection, .embed_profile'
 ```
 
-Writes made while the server restarts queue in the PCs' outboxes and replay. Re-anchor the retrieval-drift
-canaries whose stored text names the old embedder or collection.
+Do not edit `MEM0_EMBED_PROFILE` in stack.env by hand before the installer: the installer compares the
+recorded profile with the new one to decide whether a store is being rebound, and refuses a rebind to a
+space with no points. Re-anchor the retrieval-drift canaries whose stored text names the old embedder or
+collection.
 
-**Rollback:** set `MEM0_EMBED_PROFILE` back, run `embedder-migrate.py --from <new> --to <old> --catch-up` to
-bring the old collections up to date, re-render and restart. **Prune** the old space only after the new one
-has served real traffic for a while: `scripts/wsl/egemma-rollback-prune.sh` deletes the previous space's
-collections only while the server reports the new profile and collection; it is never armed by an installer.
+**Rollback** (same shape, reverse direction): stop mem0, `embedder-migrate.py --from <new> --to <old>
+--catch-up --dry-run`, then without `--dry-run` (it brings the old collections up to date with the writes
+made since the switch), then `install/linux-authority.sh --embed-profile <old>`. The tool refuses to write
+any collection the stack is using (the server's bound collections, or the active profile's while mem0 is
+stopped), so a catch-up run one step early or in the wrong direction stops instead of mirroring the live
+space. **Prune** the old space only after the new one has served real traffic for a while:
+`scripts/wsl/egemma-rollback-prune.sh` deletes the previous space's collections only while the server
+reports the new profile and collection, and never the live wiki collection; it is never armed by an
+installer.

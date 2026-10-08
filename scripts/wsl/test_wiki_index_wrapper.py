@@ -117,7 +117,11 @@ def test_search_passes_the_query_and_k_and_closes_the_tunnel(tmp_path):
 
 
 def test_alias_resolves_from_stack_env_then_ssh_config_then_the_host(tmp_path):
-    env, home, log = _env(tmp_path)
+    # an authority that answers without a wiki space (older than profiles): the local tunnel path
+    env, home, log = _env(tmp_path, {"FAKE_DEEP": "{}"})
+    curl = tmp_path / "bin" / "curl"
+    curl.write_text(FAKE_CURL, encoding="utf-8")
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
     _snapshot(home)
     (home / ".mem0" / "authority-url").write_text("http://brain-box:18791\n")
     # 1. ssh config Host whose HostName is the authority host
@@ -199,7 +203,7 @@ FAKE_CURL = r"""#!/usr/bin/env bash
 echo "curl $*" >> "$FAKE_LOG"
 for a in "$@"; do
   case "$a" in
-    */health/deep) printf '%s' "${FAKE_DEEP:-{\}}"; exit 0 ;;
+    */health/deep) [ -n "${FAKE_DEEP_FAIL:-}" ] && exit 28; printf '%s' "${FAKE_DEEP:-{\}}"; exit 0 ;;
     */models) printf '{"data":[{"id":"%s"}]}' "${FAKE_SERVED:-}"; exit 0 ;;
   esac
 done
@@ -216,7 +220,7 @@ echo "py root=${WIKI_ROOT:-} host=${WIKI_QDRANT_HOST:-} port=${WIKI_QDRANT_PORT:
 """
 SINK_SSH = """#!/usr/bin/env bash
 echo "ssh $*" >> "$FAKE_LOG"
-case "$*" in *build-here*) cat >/dev/null ;; esac
+case "$*" in *build-here*) cat >/dev/null ;; *search-here*) cat > "$FAKE_LOG.stdin" ;; esac
 exit 0
 """
 
@@ -256,13 +260,35 @@ def test_build_runs_here_in_the_authority_space_when_this_box_serves_it(tmp_path
     assert "wiki_profile=egemma2" in calls               # pinned to the authority's wiki space
 
 
-def test_search_goes_to_the_brain_with_the_query_quoted(tmp_path):
+def test_search_goes_to_the_brain_with_the_arguments_on_stdin(tmp_path):
     env, _, log = _space_env(tmp_path, served="")
-    r = _run(env, "search", "where's the wiki; really?", "--k", "3")
+    q = "where's the wiki; really? ¿dónde está?"
+    r = _run(env, "search", q, "--k", "3")
     calls = log.read_text(encoding="utf-8")
     assert r.returncode == 0, r.stderr
     line = [l for l in calls.splitlines() if "search-here" in l][0]
-    assert r"where\'s\ the\ wiki\;\ really\?" in line and "--k 3" in line
+    assert "--args-on-stdin" in line and "where" not in line   # no query text through the remote shell
+    sent = (tmp_path / "calls.log.stdin").read_bytes().split(b"\0")
+    assert sent[:3] == [q.encode("utf-8"), b"--k", b"3"]
+
+
+def test_an_unreadable_authority_sends_the_work_to_the_brain_never_builds_here(tmp_path):
+    env, home, log = _space_env(tmp_path, served="embeddinggemma2")
+    env["FAKE_DEEP_FAIL"] = "1"            # /health/deep timed out (a cold embedder)
+    _snapshot(home)
+    r = _run(env, "build")
+    calls = log.read_text(encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    assert "build-here" in calls and "-f -N -M" not in calls and "py root=" not in calls
+    assert "could not read the authority's wiki space" in r.stderr
+
+
+def test_search_here_reads_its_arguments_from_stdin(tmp_path):
+    env, _, log = _env(tmp_path)
+    r = subprocess.run([BASH, str(SCRIPT), "search-here", "--args-on-stdin"], capture_output=True, env=env,
+                       input="a b; c\0--k\0002\0".encode("utf-8"), timeout=60, check=False)
+    assert r.returncode == 0, r.stderr
+    assert log.read_text(encoding="utf-8").rstrip().endswith("wiki-search.py a b; c --k 2")
 
 
 def test_build_here_builds_into_the_local_qdrant_and_stamps(tmp_path):

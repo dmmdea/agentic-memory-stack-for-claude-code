@@ -72,7 +72,7 @@ tiers and the reranker skip. Three keep an operator knob (`MEM0_RELEVANCE_THRESH
 | threshold | egemma-300m | egemma2 | how egemma2 was set |
 |---|---|---|---|
 | relevance gate | 0.30 | 0.70 | clean-separation point of `relevance_probes.jsonl` (band 0.694–0.720, 0.026 wide vs 0.108) |
-| episode floor | 0.20 | 0.68 | middle of the clean band [0.65, 0.71] of `episode_probes.jsonl` |
+| episode floor | 0.20 | 0.68 | middle of the clean band [0.65, 0.71] of `episode_probes.jsonl` (the lab's episode vectors were built from the 800-character payload; re-check after a real migration, which embeds the full summary) |
 | NLI floor | 0.5 | 0.79 | nearest-neighbour quantile map (2,000 memories, rank corr 0.88) |
 | evidence-sweep floor | 0.45 | 0.77 | same map |
 | autopromote sibling | 0.6 | 0.825 | same map |
@@ -81,7 +81,7 @@ tiers and the reranker skip. Three keep an operator knob (`MEM0_RELEVANCE_THRESH
 
 ## The EmbeddingGemma-2 evaluation (2026-10-08) and the decision it made
 
-Lab on the Qube: Qdrant 1.19.1 with the authority's 2026-10-07 backup restored (16,946 memories, 2,110
+Lab on a separate GPU workstation: Qdrant 1.19.1 with the authority's 2026-10-07 backup restored (16,946 memories, 2,110
 entities, 3,896 episodes, 45 wiki pages), two lab mem0 servers from this branch on the same data and the
 same reranker, llama.cpp b11490. The lab's EmbeddingGemma-300m reproduced prod's stored vectors (mean cosine
 0.998); EmbeddingGemma-2 Q8_0 matched BF16 (cosine ≥ 0.9996). Query sets: 240 sampled memories with one
@@ -108,11 +108,14 @@ on-topic from off-topic on EmbeddingGemma-300m, about 0.62 on EmbeddingGemma-2.
 
 - **Moving the memories to another space** (not done; the procedure is ready): see
   [MIGRATION.md](../MIGRATION.md#moving-to-another-embedding-space). In short: serve the new alias,
-  `embedder-migrate.py --to <profile>` builds the new collections beside the old ones, `--verify`,
-  `--catch-up` right before the switch, set `MEM0_EMBED_PROFILE`, restart, `--catch-up` again. Rollback is
-  the same tool in reverse plus the old profile.
+  `embedder-migrate.py --to <profile>` builds the new collections beside the old ones, `--verify`; then,
+  with mem0 stopped, `--catch-up` (a `--dry-run` first) and the switch through
+  `install/linux-authority.sh --embed-profile <profile>`, which records the profile and starts mem0. The
+  tool refuses to write a collection the stack is using, so no catch-up runs into the new space after the
+  switch. Rollback is the same tool in reverse (with mem0 stopped) plus the old profile.
 - **Moving the wiki** is a rebuild, not a migration: set `MEM0_WIKI_EMBED_PROFILE`, serve its alias on
-  the authority and on every PC that refreshes the wiki, run `wiki-index-build.py`. The old wiki collection
+  the authority, run `wiki-index-build.py`. A PC that refreshes the wiki without serving the alias sends
+  its builds and searches to the brain (`wiki-index.sh`). The old wiki collection
   is kept (4 MB, rebuildable from the vault in seconds).
 
 ## Data and state

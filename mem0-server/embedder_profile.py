@@ -109,7 +109,8 @@ PROFILES = {
     # BF16 on house text (2026-10-08), so Q8_0 is the served file.
     # Served at ctx 4096 (measured 2026-10-08, b11490, flash attention on): the same VRAM as
     # EmbeddingGemma-300m at 2048 (+735 vs +742 MiB); ctx 8192 costs about 600 MiB more and bought no
-    # significant retrieval on the house wiki (whole pages at 3,900 vs 7,900 tokens: deep-detail MRR
+    # significant retrieval on the house wiki (budgets 3,900 vs 7,900 tokens; the shim's conservative
+    # estimator keeps ~4,300 vs ~8,800 characters of English prose at those budgets: deep-detail MRR
     # 0.788 vs 0.811, 95% CI of the difference [-0.022, +0.075]). So no long alias by default; a box
     # can still declare one (MEM0_EMBED_LONG_MODEL_EGEMMA2 + a ctx-8192 llama-swap entry).
     "egemma2": EmbedProfile(
@@ -265,6 +266,19 @@ def threshold(name: str, profile: EmbedProfile | None = None) -> float:
     return float(getattr(p.thresholds, name))
 
 
+def threshold_overrides(profile: EmbedProfile | None = None) -> dict:
+    """The threshold knobs set right now and the profile value each one replaces. A knob is not scoped
+    to a space: one fitted on EmbeddingGemma-300m and left behind applies verbatim after a switch, so
+    the server reports them on /health/deep and warns at start when the space is not the default."""
+    p = profile or active()
+    out = {}
+    for name, key in _THRESHOLD_ENV.items():
+        raw = _setting(key)
+        if raw:
+            out[name] = {"env": key, "value": raw, "profile_value": getattr(p.thresholds, name)}
+    return out
+
+
 def describe(profile: EmbedProfile | None = None) -> dict:
     """What /health/deep and the receipts report: the binding a reader can check."""
     p = profile or active()
@@ -280,4 +294,5 @@ def describe(profile: EmbedProfile | None = None) -> dict:
         "template_version": p.template_version,
         "collections": {k: collection(k, p) for k in ("memories", "entities", "episodes")},
         "wiki": {"profile": w.name, "model": embed_model(w), "collection": collection("wiki", w)},
+        "threshold_overrides": threshold_overrides(p),
     }

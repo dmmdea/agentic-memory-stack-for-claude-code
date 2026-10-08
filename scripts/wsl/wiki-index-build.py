@@ -55,6 +55,9 @@ DIMS = WIKI_PROFILE.dims
 EMBED_BODY_CHARS = 1200 if WIKI_PROFILE.ctx_tokens <= 2048 else None
 # Recorded on every point: a recipe change re-embeds a page even when its text hash is unchanged.
 EMBED_RECIPE = f"{WIKI_PROFILE.name}/{WIKI_PROFILE.template_version}/body:{EMBED_BODY_CHARS or 'full'}"
+# A point written before recipes were recorded was built with EmbeddingGemma-300m's recipe (it lives
+# in that space's collection), so an upgrade does not re-embed an unchanged index.
+LEGACY_RECIPE = "egemma-300m/eg-search-v1/body:1200"
 
 
 DIR_TYPE = {"entities": "entity", "concepts": "concept", "sources": "source", "syntheses": "synthesis"}
@@ -126,6 +129,12 @@ def existing_points(client) -> dict:
     return out
 
 
+def unchanged(prev, page_hash: str, recipe: str = EMBED_RECIPE) -> bool:
+    """True when a page's stored point can stay: same text hash AND same embed recipe. A point with no
+    recorded recipe counts as LEGACY_RECIPE."""
+    return prev is not None and prev[0] == page_hash and (prev[2] or LEGACY_RECIPE) == recipe
+
+
 def main() -> int:
     from config import build_embedder
     from qdrant_client import QdrantClient
@@ -156,7 +165,7 @@ def main() -> int:
             continue
         pid, embed_text, payload = built
         seen_ids.add(pid)
-        if pid in existing and existing[pid][0] == payload["hash"] and existing[pid][2] == EMBED_RECIPE:
+        if unchanged(existing.get(pid), payload["hash"]):
             skipped += 1
             continue
         try:

@@ -423,6 +423,23 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
         _append_summary(f"no-op:backend-unreachable:{type(e).__name__}", dry_run=dry_run)
         _write_outcome("degraded:backend-unreachable", {})
         return 0
+    if not dry_run:
+        # It deletes through the server (DELETE /v1/memories/{id}), which acts on the collection the
+        # server is BOUND to, and it judges with the thresholds of the space COLLECTION is in. Both are
+        # only right when the scanned collection IS the bound one; anything else (an override naming a
+        # restore copy, the other generation's collection) would delete by verdicts made on other vectors.
+        try:
+            with httpx.Client(timeout=30.0) as probe:
+                bound = (probe.get(f"{MEM0}/health/deep").json() or {}).get("collection")
+        except (httpx.HTTPError, ValueError, OSError):
+            bound = None
+        if bound != COLLECTION:
+            reason = f"collection mismatch: scanning {COLLECTION}, server bound to {bound or 'unknown'}"
+            _append_ledger({"event": "dedup-scan-skip", "actor": "semantic-dedup", "reason": reason})
+            print(f"semantic-dedup: SKIP - {reason} (a dry run still works)", flush=True)
+            _append_summary("no-op:collection-mismatch", dry_run=dry_run)
+            _write_outcome("degraded:collection-mismatch", {})
+            return 0
     stats: dict = {}
     try:
         pts = scroll_all_with_vectors()

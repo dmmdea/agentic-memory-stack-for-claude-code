@@ -428,7 +428,12 @@ stage_gguf() {
     return 0
 }
 stage_gguf "$EGEMMA_GGUF" "$EGEMMA_HF_REPO" "$EGEMMA_HF_FILE" "EmbeddingGemma-300m" "" "~334MB"
-stage_gguf "$EG2_GGUF" "$EG2_HF_REPO" "$EG2_HF_FILE" "EmbeddingGemma-2" "$EG2_SHA256"
+# EmbeddingGemma-2 only when a space uses it — the memories' profile, the wiki's (MEM0_WIKI_EMBED_PROFILE)
+# — or MEM0_STAGE_EG2=1 ahead of a migration: a default install fetches nothing it does not serve.
+EG2_WANTED="$( export HOME="$USER_HOME"; ep_py 'print("1" if "egemma2" in (ep.active().name, ep.wiki_profile().name) else "")' 2>/dev/null || true )"
+if [ -n "$EG2_WANTED" ] || [ "${MEM0_STAGE_EG2:-}" = 1 ]; then
+    stage_gguf "$EG2_GGUF" "$EG2_HF_REPO" "$EG2_HF_FILE" "EmbeddingGemma-2" "$EG2_SHA256"
+fi
 
 # The llama-swap entries, printed for the operator to add (see install/llama-swap-setup.md).
 print_stanza_300m() {
@@ -446,20 +451,17 @@ print_stanza_300m() {
 }
 print_stanza_eg2() {
     echo "        EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture)."
-    echo "        Serve it at the trained window (4096 hot, 8192 long), never the 262144 its GGUF header"
-    echo "        advertises; the long alias loads only for the wiki build and unloads at its ttl:"
+    echo "        Serve it at ctx 4096 (the same VRAM as EmbeddingGemma-300m at 2048), never the 262144 its GGUF"
+    echo "        header advertises, in the group that never evicts the memory stack:"
     echo "          groups:"
-    echo "            support: {swap: false, exclusive: false, members: [embeddinggemma2, embeddinggemma2-long]}"
+    echo "            support: {swap: false, exclusive: false, members: [embeddinggemma2]}"
     echo "          embeddinggemma2:"
     echo "            cmd: <llama.cpp>/llama-server --model $EG2_GGUF \\"
     echo "                 --embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 4096 \\"
     echo "                 -ngl 99 --flash-attn on --port \${PORT} --host 127.0.0.1"
     echo "            ttl: 300"
-    echo "          embeddinggemma2-long:"
-    echo "            cmd: <llama.cpp>/llama-server --model $EG2_GGUF \\"
-    echo "                 --embeddings --pooling mean --ctx-size 8192 --batch-size 8192 --ubatch-size 8192 \\"
-    echo "                 -ngl 99 --flash-attn on --port \${PORT} --host 127.0.0.1"
-    echo "            ttl: 300"
+    echo "        (an optional ctx-8192 entry for whole long pages costs ~600 MiB more and measured no"
+    echo "        significant gain: declare it as MEM0_EMBED_LONG_MODEL_EGEMMA2 if you add one)"
 }
 
 # Verify the embedder endpoint is actually serving the ACTIVE profile's alias (the llama-swap model

@@ -18,11 +18,17 @@ wiki-index-build.py, which reads the active profile.
 Modes:
   (default)    build: create the targets and embed every point missing from them
   --catch-up   also re-embed points whose payload changed in the source and delete target points
-               the source no longer has (run it right before a cutover, and after one in reverse
-               to bring the old space up to date for a rollback)
+               the source no longer has, at most --max-delete (default 200). Run it with mem0
+               STOPPED, right before the profile switch (docs/MIGRATION.md); in reverse it brings
+               the old space up to date for a rollback.
   --verify     no writes: compare counts, and re-embed a sample to prove each stored target vector
                is the target model's vector for that point's text (cosine >= --min-cos)
-  --dry-run    count what would be embedded and stop
+  --dry-run    with any mode: count what would be embedded (and, with --catch-up, list what would
+               be deleted), then stop
+Safety: no mode writes a collection the stack is using — the server's bound collections
+(/health/deep) or the active profile's (stack.env, which still answers while mem0 is stopped) —
+unless --force. Episodes are embedded from episodic.db's full summary_text (the payload holds only
+its first 800 characters), as the live path and episode-embed-backfill.py do.
 
 On success it records the target's identity in ~/.mem0/embed-identity.json (profile, model,
 template version, counts, source collection, time, and --gguf-sha256 when given): the record a
@@ -213,8 +219,67 @@ def _sparse_names(info: dict) -> list[str]:
     return list((info["config"]["params"].get("sparse_vectors") or {}).keys())
 
 
+class _EpisodeText:
+    """The text the server embedded for an episode: the FULL summary. The Qdrant payload carries only
+    its first 800 characters (app.py `_ep_payload`), so a re-embed from the payload would give long
+    episodes a vector the live path never writes; read episodic.db, as episode-embed-backfill.py does."""
+
+    def __init__(self):
+        self.by_id: dict | None = None
+        self.source = "not loaded"
+
+    def load(self, path: Path) -> None:
+        import sqlite3
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                rows = con.execute("SELECT id, summary_text FROM episodes WHERE summary_text IS NOT NULL").fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            self.by_id, self.source = None, f"payload (episodic.db unreadable: {e}; summaries cut at 800 chars)"
+            return
+        self.by_id = {str(i): t for i, t in rows}
+        self.source = f"episodic.db ({len(self.by_id)} summaries)"
+
+    def get(self, pid, payload: dict):
+        if self.by_id is not None and str(pid) in self.by_id:
+            return self.by_id[str(pid)]
+        return payload.get("summary")
+
+
+EPISODE_TEXT = _EpisodeText()
+
+
+def text_of(kind: str, pid, payload: dict):
+    """The text the live path embedded for this point."""
+    if kind == "episodes":
+        return EPISODE_TEXT.get(pid, payload)
+    return payload.get(KINDS[kind])
+
+
+def live_collections(mem0_url: str) -> tuple[set, str]:
+    """Every collection the stack is using right now: the server's bound memories collection and the
+    space it reports (/health/deep), plus the active profile's collections from this box's stack.env,
+    which still answers while mem0 is stopped for a switch. Returns (names, note)."""
+    names: set = set()
+    act = embedder_profile.active()
+    names.update(embedder_profile.collection(k, act) for k in ("memories", "entities", "episodes"))
+    note = f"active profile {act.name}"
+    try:
+        r = httpx.get(f"{mem0_url.rstrip('/')}/health/deep", timeout=20.0)
+        d = r.json()
+        bound = d.get("collection")
+        if bound:
+            names.update({bound, bound + "_entities"})
+        names.update(((d.get("embed_profile") or {}).get("collections") or {}).values())
+        note += f"; server bound to {bound}"
+    except (httpx.HTTPError, ValueError) as e:
+        note += f"; server not reachable ({type(e).__name__}): judged from stack.env alone"
+    return names, note
+
+
 def migrate_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, report: dict) -> None:
-    field = KINDS[kind]
     rec = report.setdefault(kind, {"source": src, "target": dst})
     sinfo = q.info(src)
     if sinfo is None:
@@ -244,7 +309,7 @@ def migrate_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, 
         if pid in target_payload and (not args.catch_up or target_payload[pid] == payload):
             unchanged += 1
             continue
-        text = payload.get(field)
+        text = text_of(kind, p["id"], payload)
         if not isinstance(text, str) or not text.strip():
             empty += 1          # nothing to embed: the server never indexed such a point either
             continue
@@ -253,9 +318,19 @@ def migrate_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, 
         todo.append((p["id"], payload, text, sparse_vals))
     stale = [target_raw[k] for k in sorted(set(target_payload) - source_ids)] if args.catch_up else []
     rec.update(source_points=len(source_ids), to_embed=len(todo), unchanged=unchanged,
-               skipped_empty_text=empty, to_delete=len(stale))
+               skipped_empty_text=empty, to_delete=len(stale),
+               to_delete_ids=[str(x) for x in stale[:50]])
+    if kind == "episodes":
+        rec["text_source"] = EPISODE_TEXT.source
+    over_cap = len(stale) > args.max_delete
     if args.dry_run:
+        rec["over_delete_cap"] = over_cap
         return
+    if over_cap:
+        # A catch-up deletes target points the source no longer has. Many at once means the source and
+        # the target are not what the operator thinks (a half-built space, the wrong direction).
+        raise RuntimeError(f"{kind}: catch-up would delete {len(stale)} points from {dst} "
+                           f"(--max-delete {args.max_delete}); see to_delete_ids with --dry-run")
     t0 = time.time()
     done = 0
     for i in range(0, len(todo), args.batch):
@@ -278,7 +353,6 @@ def migrate_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, 
 
 
 def verify_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, report: dict) -> bool:
-    field = KINDS[kind]
     rec = report.setdefault(kind, {"source": src, "target": dst})
     if q.info(src) is None or q.info(dst) is None:
         rec.update(ok=False, error="source or target collection missing")
@@ -295,14 +369,14 @@ def verify_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, r
     if missing:
         rows = q.retrieve(src, [src_raw[k] for k in missing[:2000]], with_vector=False)
         missing = [str(r["id"]) for r in rows
-                   if isinstance((r.get("payload") or {}).get(field), str) and r["payload"][field].strip()]
+                   if (text_of(kind, r["id"], r.get("payload") or {}) or "").strip()]
     rng = random.Random(args.seed)
     sample = [dst_raw[k] for k in rng.sample(dst_ids, min(args.sample, len(dst_ids)))] if dst_ids else []
     worst = 1.0
     low = []
     if sample:
         rows = q.retrieve(dst, sample, with_vector=True)
-        texts = [(r.get("payload") or {}).get(field) or "" for r in rows]
+        texts = [text_of(kind, r["id"], r.get("payload") or {}) or "" for r in rows]
         fresh = []
         for i in range(0, len(texts), args.batch):
             fresh.extend(emb.embed_docs(texts[i:i + args.batch]))
@@ -316,6 +390,19 @@ def verify_kind(kind: str, src: str, dst: str, q: Qdrant, emb: Embedder, args, r
                missing_ids=missing[:20], extra=len(extra), extra_ids=extra[:20],
                sampled=len(sample), worst_cos=round(worst, 5), below_min_cos=low[:20])
     return ok
+
+
+def _default_mem0_url() -> str:
+    env = (os.environ.get("MEM0_URL") or "").strip()
+    if env:
+        return env
+    try:
+        for line in (Path.home() / ".mem0" / "authority-url").read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                return line.strip()
+    except OSError:
+        pass
+    return "http://127.0.0.1:18791"
 
 
 def write_identity(profile: embedder_profile.EmbedProfile, model: str, report: dict, args) -> None:
@@ -351,7 +438,17 @@ def main(argv=None) -> int:
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--catch-up", action="store_true")
     mode.add_argument("--verify", action="store_true")
-    mode.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="count (and with --catch-up, list) what would be embedded and deleted, then stop")
+    ap.add_argument("--max-delete", type=int, default=200,
+                    help="--catch-up refuses to delete more target points than this (default 200)")
+    ap.add_argument("--mem0-url", default=None,
+                    help="the server whose bound collections are never written (default: MEM0_URL, "
+                         "~/.mem0/authority-url, then http://127.0.0.1:18791)")
+    ap.add_argument("--force", action="store_true",
+                    help="write even into a collection the stack is using (never needed by the runbook)")
+    ap.add_argument("--episodic-db", default=os.environ.get("MEM0_EPISODIC_DB", str(Path.home() / ".mem0" / "episodic.db")),
+                    help="where the episodes' full summaries are read from")
     ap.add_argument("--sample", type=int, default=64, help="--verify: points re-embedded per kind")
     ap.add_argument("--min-cos", type=float, default=0.995, help="--verify: lowest acceptable cosine")
     ap.add_argument("--seed", type=int, default=20261008)
@@ -377,8 +474,21 @@ def main(argv=None) -> int:
     emb = Embedder(args.embed_url or embedder_profile.base_url(), model, target)
     q = Qdrant(args.qdrant)
     report: dict = {"ts": _now(), "from": source.name, "to": target.name, "model": model,
-                    "mode": "verify" if args.verify else "catch-up" if args.catch_up else
-                    "dry-run" if args.dry_run else "build"}
+                    "mode": ("verify" if args.verify else "catch-up" if args.catch_up else "build")
+                            + (" (dry-run)" if args.dry_run else "")}
+    if "episodes" in kinds:
+        EPISODE_TEXT.load(Path(args.episodic_db))
+    # Never write into a collection the stack is using: a catch-up mirrors (it deletes target points
+    # the source lacks), so pointed at the live space one step early it would delete live memories.
+    if not args.verify and not args.dry_run:
+        live, note = live_collections(args.mem0_url or _default_mem0_url())
+        hit = sorted(dst for _, dst in pairs.values() if dst in live)
+        report["live_check"] = note
+        if hit and not args.force:
+            print(f"FAIL: {', '.join(hit)} is in use ({note}); writing it would rebuild or mirror the live "
+                  f"space. Stop mem0 and switch the profile first (docs/MIGRATION.md), or pass --force.",
+                  file=sys.stderr)
+            return 1
     rc = 0
     try:
         for k, (src, dst) in pairs.items():

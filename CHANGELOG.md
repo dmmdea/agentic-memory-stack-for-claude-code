@@ -15,13 +15,17 @@ in the first entries below — full pre-inversion history lives in the maintaine
   `egemma-300m` (EmbeddingGemma-300m, the default and the space every existing store is in) and `egemma2`
   (EmbeddingGemma-2: 768-d, Gemma 4 backbone, needs llama.cpp b11452+). `MEM0_EMBED_PROFILE` selects the
   memories' space; `MEM0_WIKI_EMBED_PROFILE` gives the LLM Wiki index its own. With nothing set, behaviour is
-  unchanged (the wiki index re-embeds its pages once, to record the new per-point recipe).
+  unchanged: the wiki index records each point's embed recipe from now on, and a point written before that
+  counts as EmbeddingGemma-300m's recipe, so an upgrade re-embeds nothing.
 - **`scripts/wsl/embedder-migrate.py`**: builds a space's memories, entities and episodes collections beside
   the live ones (ids, payloads and the BM25 sparse vectors copied, only the dense vector re-embedded with the
   shim's own prefix and truncation), `--verify` (counts, and a sampled re-embed must reproduce each stored
   vector), `--catch-up` (edits and deletions since the build; run in reverse it is the rollback), and an
-  embed-identity record (`~/.mem0/embed-identity.json`). Exercised end to end on a restored copy of the store
-  (16,946 memories), UUID and integer ids.
+  embed-identity record (`~/.mem0/embed-identity.json`). It never writes a collection the stack is using (the
+  server's bound collections, or the active profile's while mem0 is stopped) unless `--force`; a catch-up
+  deletes at most `--max-delete` (200) points and `--catch-up --dry-run` lists them first; episodes are
+  embedded from `episodic.db`'s full summary (the payload holds only 800 characters). Exercised end to end on
+  a restored copy of the store (16,946 memories), UUID and integer ids, and by offline tests.
 - `install/linux-authority.sh` / `linux-replica.sh --embed-profile` (recorded in stack.env and the unit; an
   existing store is refused a profile change until the new space is built); `MEM0_WIKI_EMBED_PROFILE` is an
   operator-owned stack.env key carried across re-runs.
@@ -36,13 +40,25 @@ in the first entries below — full pre-inversion history lives in the maintaine
   evidence-sweep floor, autopromote sibling, semantic-dedup tiers, reranker skip) come from the active
   profile. The EmbeddingGemma-300m values are unchanged; EmbeddingGemma-2's were calibrated on a restored
   copy of the store (its cosine scale sits far higher: off-topic top-1 0.61-0.69 vs 0.17-0.29).
-- The prefix shim reads its prefixes and its token budget from the profile (EmbeddingGemma-2: 3,900 tokens
+- The prefix shim reads its prefixes and its token budget from the profile (EmbeddingGemma-2: a 3,900-token budget, ~4,300 characters of English prose by the shim's conservative estimate;
   at ctx 4096, twice the old window at the old VRAM).
 - `stack-backup.sh` snapshots the active space's collections and, while they exist, the other generation's
   (the rollback anchor); the manifest records the profile, model, template version and which collection each
   file holds. Restores refuse a set from another space than the box serves.
-- The rollback prune (`egemma-rollback-prune.sh`) is now a profile-gated prune of the previous space; it is
-  never armed by an installer.
+- The rollback prune (`egemma-rollback-prune.sh`) is now a profile-gated prune of the previous space; it never
+  deletes a collection the server reports in use (the live wiki may sit in the "old" space) and is never armed
+  by an installer.
+- `semantic-dedup.py` deletes only when the collection it scanned is the one the server is bound to (it deletes
+  through the server); otherwise it skips with `degraded:collection-mismatch`. A dry run still plans.
+- `wiki-index.sh`: an authority whose wiki space cannot be read (a timed-out probe) sends the work to the
+  brain instead of building in this box's space; a remote search sends its arguments on stdin, not through
+  the brain's login shell.
+- `install/1-wsl-services.sh` stages the EmbeddingGemma-2 GGUF only when a space uses it (or
+  `MEM0_STAGE_EG2=1`). The collection overrides and the three threshold knobs are carried across installer
+  re-runs like the other operator keys; the server now reads `MEM0_QDRANT_COLLECTION` / `MEM0_COLLECTION`
+  from stack.env too (it used to ignore them), and reports any active threshold knob on `/health/deep`
+  (warning at start when the space is not the default).
+- The installer refuses to bind an existing store to an empty space whatever stack.env records.
 
 ### Fixed
 - **Chain steps could embed with the wrong GGUF** (audit F-01): `MEM0_EMBED_MODEL` reached only the server unit,
@@ -50,7 +66,9 @@ in the first entries below — full pre-inversion history lives in the maintaine
   store's file. Every embedder now resolves the alias from the same profile, reading stack.env.
 - **Health checks verified only `dim == 768`** (F-02), which cannot tell two 768-d models apart.
 - **Hard-coded collection names in the weekly jobs** (WG-05), and `ledger-audit.py`, `ship_log_reclassify.py`
-  and `stamp-retired-at.py` still pointed at the dead pre-EmbeddingGemma `memories` collection.
+  and `stamp-retired-at.py` still pointed at the dead pre-EmbeddingGemma `memories` collection. Behaviour
+  change: `ledger-audit.py`'s orphan scan now runs against the live store (its findings and baseline change),
+  and the `--live` paths of the other two now act on the live store where they used to fail with a 404.
 - `cp437-repair.py` re-embedded repaired text with a private copy of the prefix and the 2,048-token budget; it
   now takes both from the profile.
 - The backup manifest's fixed per-kind keys went to whichever collection sorted first.

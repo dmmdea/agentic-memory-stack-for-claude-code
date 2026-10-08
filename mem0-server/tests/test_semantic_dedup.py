@@ -173,6 +173,7 @@ def test_outcome_says_degraded_when_it_compared_nothing_or_skipped_too_much():
 # ---------------------------------------------------------------------------
 
 _FAILING: set = set()   # ids the fake mem0 refuses to delete (500), set per test
+_BOUND: dict = {}       # what the fake mem0's /health/deep reports as its bound collection
 
 
 @pytest.fixture()
@@ -185,8 +186,11 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setenv("AMS_OUTCOME_FILE", str(outcome))
     deleted: list = []
     _FAILING.clear()
+    _BOUND.clear()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/health/deep":
+            return httpx.Response(200, json={"collection": _BOUND.get("collection", sd.COLLECTION)})
         if request.method == "DELETE":
             rid = request.url.path.rsplit("/", 1)[-1]
             if rid in _FAILING:
@@ -313,3 +317,23 @@ def test_dry_run_never_reads_as_refused(rig, monkeypatch):
     _FAILING.update({"e1-new", "e2-new"})           # irrelevant: a dry run issues no DELETE
     sd._run(dry_run=True, max_deletions=50)
     assert outcome.read_text(encoding="utf-8").startswith("ok ")
+
+
+def test_a_live_run_on_a_collection_the_server_is_not_bound_to_deletes_nothing(rig, monkeypatch):
+    """It deletes through the server, which acts on its BOUND collection; scanning another one (an
+    override naming a restore copy or the other embedding space) must not delete by those verdicts."""
+    tmp, outcome, deleted = rig
+    monkeypatch.setattr(sd, "scroll_all_with_vectors", _twin_corpus)
+    _BOUND["collection"] = "some_other_collection"
+    assert sd._run(dry_run=False, max_deletions=50) == 0
+    assert deleted == []
+    assert outcome.read_text(encoding="utf-8").startswith("degraded:collection-mismatch")
+    # a dry run is a read: it still plans
+    assert sd._run(dry_run=True, max_deletions=50) == 0
+    assert deleted == []
+
+
+def test_each_generation_collection_is_judged_with_its_own_space():
+    import embedder_profile as ep
+    assert sd._space_of(ep.get("egemma2").memories).name == "egemma2"
+    assert sd._space_of(ep.get("egemma-300m").memories).name == "egemma-300m"

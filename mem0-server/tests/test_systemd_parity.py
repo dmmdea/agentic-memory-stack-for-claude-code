@@ -467,20 +467,23 @@ def test_the_wsl_installer_stages_embeddinggemma2_beside_the_300m_file():
 
 @pytest.mark.skipif(BASH is None, reason="bash not available")
 def test_the_printed_llama_swap_entries_serve_the_trained_windows_and_name_the_llama_cpp_floor():
-    """The stanza is what an operator pastes into llama-swap: two EmbeddingGemma-2 entries (hot at
-    4096, long at 8192, both mean-pooled with flash attention, batch = ubatch = ctx so a full-window
-    input fits one ubatch), and the llama.cpp build that has the gemma-embedding2 architecture."""
+    """The stanza is what an operator pastes into llama-swap: one EmbeddingGemma-2 entry at the
+    profile's served window (mean-pooled with flash attention, batch = ubatch = ctx so a full-window
+    input fits one ubatch), in the group that never evicts the memory stack, and the llama.cpp build
+    that has the gemma-embedding2 architecture. No long entry by default (measured: ctx 8192 bought
+    no significant retrieval for ~600 MiB)."""
     fn = _installer_function("print_stanza_eg2") + "\n" + _installer_function("print_stanza_300m")
     r = subprocess.run([BASH, "-c", f'EG2_GGUF=/m/eg2.gguf; EGEMMA_GGUF=/m/300m.gguf\n{fn}\nprint_stanza_eg2; echo ----; print_stanza_300m'],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     eg2, old = r.stdout.split("----")
-    assert "b11452" in eg2 and "embeddinggemma2:" in eg2 and "embeddinggemma2-long:" in eg2
-    hot, long_ = eg2.split("embeddinggemma2-long:")
+    assert "b11452" in eg2 and "embeddinggemma2:" in eg2 and "embeddinggemma2-long:" not in eg2
+    assert "members: [embeddinggemma2]" in eg2 and "swap: false" in eg2
     p = EP.PROFILES["egemma2"]
-    for block, ctx in ((hot, p.ctx_tokens), (long_, p.long_ctx_tokens)):
-        for flag in (f"--ctx-size {ctx}", f"--batch-size {ctx}", f"--ubatch-size {ctx}", "--pooling mean", "--embeddings",
-                     "-ngl 99", "--flash-attn on", "--model /m/eg2.gguf", "ttl: 300"):
-            assert flag in block, (flag, block)
+    ctx = p.ctx_tokens
+    for flag in (f"--ctx-size {ctx}", f"--batch-size {ctx}", f"--ubatch-size {ctx}", "--pooling mean", "--embeddings",
+                 "-ngl 99", "--flash-attn on", "--model /m/eg2.gguf", "ttl: 300"):
+        assert flag in eg2, (flag, eg2)
+    assert "MEM0_EMBED_LONG_MODEL_EGEMMA2" in eg2, "the optional long entry names the knob that declares it"
     assert "--ctx-size 2048" in old and "--model /m/300m.gguf" in old, "the 300m entry is unchanged"
     assert "262144" in eg2, "the stanza warns off the GGUF header's window"

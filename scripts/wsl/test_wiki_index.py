@@ -56,3 +56,26 @@ def test_first_body_line_caps_length():
 def test_dir_type_mapping():
     assert wib.DIR_TYPE["entities"] == "entity"
     assert wib.DIR_TYPE["syntheses"] == "synthesis"
+
+
+# The skip rule decides what a build re-embeds. Points written before recipes were recorded carry none
+# and were built with EmbeddingGemma-300m's recipe, so an upgrade must not re-embed them in that space,
+# while a recipe change (another space, another window) must.
+EG300M = "egemma-300m/eg-search-v1/body:1200"
+EG2 = "egemma2/eg-search-v1/body:full"
+
+
+def test_unchanged_keeps_a_legacy_point_in_its_own_space():
+    assert wib.LEGACY_RECIPE == EG300M
+    assert wib.unchanged(("h1", "p.md", ""), "h1", recipe=EG300M)
+
+
+def test_unchanged_re_embeds_a_legacy_point_under_another_recipe():
+    assert not wib.unchanged(("h1", "p.md", ""), "h1", recipe=EG2)
+
+
+def test_unchanged_needs_both_hash_and_recipe():
+    assert wib.unchanged(("h1", "p.md", EG2), "h1", recipe=EG2)
+    assert not wib.unchanged(("h1", "p.md", EG2), "h2", recipe=EG2)
+    assert not wib.unchanged(("h1", "p.md", EG300M), "h1", recipe=EG2)
+    assert not wib.unchanged(None, "h1", recipe=EG2)

@@ -45,8 +45,9 @@ ep_table() {
     ep_py '
 act = ep.active()
 def row(p, is_active):
-    if is_active:   # the active space honours the operator overrides (MEM0_QDRANT_COLLECTION ...)
-        c = [ep.collection(k, p) for k in ("memories", "entities", "episodes", "wiki")]
+    if is_active:   # the active space honours the operator overrides (MEM0_QDRANT_COLLECTION ...);
+                    # the wiki column is the LIVE wiki, which lives in its own space (wiki_profile)
+        c = [ep.collection(k, p) for k in ("memories", "entities", "episodes")] + [ep.collection("wiki")]
     else:           # a space that is not bound keeps its own names: the overrides name the bound one
         c = [p.memories, p.entities, p.episodes, p.wiki]
     print("\t".join([p.name, "1" if is_active else "0", ep.embed_model(p), p.template_version, *c]))

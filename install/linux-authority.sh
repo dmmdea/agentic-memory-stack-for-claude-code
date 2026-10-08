@@ -347,7 +347,9 @@ if [ "$DRY_RUN" = 0 ]; then
         [ -L "$p" ] || fail "$p is not a symlink into the AMS dataset (Phase 0 P0-2 symlink set; spec §4: nothing on the root disk)"
     done
     ip -4 -o addr show | grep -q " inet ${BIND_IP}/" || fail "$BIND_IP is not present on any interface (is tailscaled up?)"
-    curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model). EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture) and the entries install/1-wsl-services.sh prints"
+    # the body first, then the match: `curl | grep -q` under pipefail can read a served alias as missing
+    models_json="$(curl -sf -m 5 http://127.0.0.1:11436/v1/models || true)"
+    printf '%s' "$models_json" | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model). EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture) and the entries install/1-wsl-services.sh prints"
     # Rebinding an existing store to another space: mem0 CREATES an absent collection empty and then
     # writes into it, so the new space must already hold the store (scripts/wsl/embedder-migrate.py).
     PREV_PROFILE="$RECORDED_PROFILE"
@@ -357,6 +359,20 @@ if [ "$DRY_RUN" = 0 ]; then
         new_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$new_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
         [ "${new_pts:-0}" -gt 0 ] || fail "profile change $PREV_PROFILE -> $EMBED_PROFILE: collection '$new_mem' holds no points (or Qdrant is down). Build the new space first with scripts/wsl/embedder-migrate.py; binding mem0 to an empty collection starts a second, empty store"
         echo "    profile change $PREV_PROFILE -> $EMBED_PROFILE: '$new_mem' holds $new_pts points"
+    fi
+    # The same rule judged from the store itself, whatever stack.env records (a hand edit can make the
+    # recorded profile equal the new one): never bind an existing store to an empty space while another
+    # space's memories collection holds its points.
+    if store_exists; then
+        eff_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        eff_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$eff_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
+        if [ "${eff_pts:-0}" -eq 0 ]; then
+            for other in $(ep_py 'print(" ".join(n for n in ep.PROFILES if n != sys.argv[1]))' "$EMBED_PROFILE"); do
+                o_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$other")" || continue
+                o_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$o_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
+                [ "${o_pts:-0}" -gt 0 ] && fail "profile $EMBED_PROFILE binds mem0 to '$eff_mem', which holds no points, while '$o_mem' (profile $other) holds $o_pts: build the space first (scripts/wsl/embedder-migrate.py) or keep --embed-profile $other"
+            done
+        fi
     fi
 fi
 

@@ -89,6 +89,9 @@ def _dedup(scenario: str) -> int:
     def handler(request):
         if request.method == "DELETE" and refuse:
             return httpx.Response(500, json={})
+        if request.url.path == "/health/deep":
+            # the server is bound to the collection the job scans (the binding guard's happy path)
+            return httpx.Response(200, json={"collection": sd.COLLECTION})
         return httpx.Response(200, json={})
 
     real_client = httpx.Client

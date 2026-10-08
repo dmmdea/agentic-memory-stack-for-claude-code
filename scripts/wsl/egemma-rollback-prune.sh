@@ -128,6 +128,15 @@ NEWSTATUS=$(echo "$NEW" | awk '{print $2}')
 # rolled-back stack now writing to them. Binding is the truth.
 BOUND=$(echo "$DEEP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("collection") or "")' 2>/dev/null)
 BOUND_PROFILE=$(echo "$DEEP" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("embed_profile") or {}).get("profile") or "")' 2>/dev/null)
+# Every collection the server reports in use: its space's collections and the LIVE wiki, which has its
+# own space (MEM0_WIKI_EMBED_PROFILE) and may be the "old" space's wiki name. None of them is ever deleted.
+IN_USE=$(echo "$DEEP" | python3 -c '
+import sys, json
+d = json.load(sys.stdin); ep = d.get("embed_profile") or {}
+names = set((ep.get("collections") or {}).values())
+names.add((ep.get("wiki") or {}).get("collection") or "")
+names.add(d.get("collection") or "")
+print("\n".join(sorted(n for n in names if n)))' 2>/dev/null)
 echo "[$(ts)] bound collection=$BOUND profile=$BOUND_PROFILE (expected $EXPECTED_COLLECTION / $NEW_PROFILE)" >> "$LOG"
 
 # HEALTH GATE: mem0 embedder ok at the new width AND mem0 is STILL BOUND to the new profile and its
@@ -152,6 +161,9 @@ for pair in $PAIRS; do
   case "$old" in ""|*[!A-Za-z0-9._-]*) KEPT="$KEPT $old(bad-name)"; continue ;; esac
   if [ "$old" = "$BOUND" ] || [ "$old" = "$EXPECTED_COLLECTION" ] || printf '%s\n' "$PROFILE_TABLE" | awk -F'\t' '$1 ~ /^new_/ {print $2}' | grep -qxF "$old"; then
     KEPT="$KEPT $old(is-a-new-space-name)"; echo "[$(ts)] KEEP $old — it is the bound or a new-space collection" >> "$LOG"; continue
+  fi
+  if printf '%s\n' "$IN_USE" | grep -qxF "$old"; then
+    KEPT="$KEPT $old(in-use)"; echo "[$(ts)] KEEP $old — the server reports it in use (e.g. the live wiki)" >> "$LOG"; continue
   fi
   oldstat=$(qpoints "$old")
   [ -n "$oldstat" ] || { echo "[$(ts)] $old already gone" >> "$LOG"; continue; }

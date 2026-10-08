@@ -73,19 +73,23 @@ brain_alias() {
     printf '%s' "$a"
 }
 
-# The authority's wiki space, from its /health/deep ('' when it does not report one: an older
-# authority, or unreachable — the caller then keeps the old behaviour).
+# The authority's wiki space, from its /health/deep: the profile name; '' when the authority answers
+# but reports none (an authority older than profiles: the caller keeps the old behaviour); '?' when
+# it could not be read (unreachable, timed out — /health/deep embeds, so a cold embedder is slow —
+# or not JSON). '?' must never mean "build here in this box's space": the caller sends the work to
+# the brain, which embeds with its own model and so is always in the right space.
 authority_wiki_profile() {
-    local url=""
+    local url="" body=""
     [ -s "$HOME/.mem0/authority-url" ] && url="$(head -n1 "$HOME/.mem0/authority-url" | tr -d '\r')"
     [ -n "$url" ] || return 0
-    curl -s -m 10 "${url%/}/health/deep" 2>/dev/null | "$PY" -c '
+    body="$(curl -s -m 30 "${url%/}/health/deep" 2>/dev/null)" || { echo "?"; return 0; }
+    printf '%s' "$body" | "$PY" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except ValueError:
-    sys.exit(0)
-print(((d.get("embed_profile") or {}).get("wiki") or {}).get("profile") or "")' 2>/dev/null || true
+    print("?"); sys.exit(0)
+print(((d.get("embed_profile") or {}).get("wiki") or {}).get("profile") or "")' 2>/dev/null || echo "?"
 }
 
 # 0 when THIS box's llama-swap lists the model it would use for profile $1 (its own alias for that
@@ -99,7 +103,10 @@ import embedder_profile as ep
 print(ep.embed_model(ep.get(sys.argv[1])))' "$1" "$HOME/apps/mem0-server" 2>/dev/null)" || return 1
     [ -n "$alias" ] || return 1
     base="${MEM0_EMBED_BASE_URL:-http://localhost:11436/v1}"
-    curl -s -m 10 "${base%/}/models" 2>/dev/null | grep -q "\"$alias\""
+    # the body first, then the match: `curl | grep -q` under pipefail can read a served alias as missing
+    local models=""
+    models="$(curl -s -m 10 "${base%/}/models" 2>/dev/null)" || return 1
+    printf '%s' "$models" | grep -q "\"$alias\""
 }
 
 # Prints local | remote: where this run embeds. A local run in the authority's space exports
@@ -109,6 +116,10 @@ wiki_mode() {
     local p
     p="$(authority_wiki_profile)"
     if [ -z "$p" ]; then WIKI_MODE=local; return 0; fi
+    if [ "$p" = "?" ]; then
+        echo "wiki-index: could not read the authority's wiki space; the brain embeds (always its own space)" >&2
+        WIKI_MODE=remote; return 0
+    fi
     if serves_profile "$p"; then
         export MEM0_WIKI_EMBED_PROFILE="$p"
         WIKI_MODE=local
@@ -184,9 +195,10 @@ case "${1:-}" in
         wiki_mode
         if [ "$WIKI_MODE" = remote ]; then
             BRAIN="$(brain_alias)"
-            # %q: the query reaches the brain's shell as one literal argument per word given here
-            ssh -o BatchMode=yes -o ConnectTimeout=10 "$BRAIN" \
-                "\"\$HOME\"/apps/mem0-scripts/wiki-index.sh search-here $(printf '%q ' "$@")"
+            # The arguments travel as NUL-separated stdin, not as words for the brain's login shell:
+            # no quoting layer, whatever that shell is and whatever bytes the query holds.
+            printf '%s\0' "$@" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$BRAIN" \
+                '"$HOME"/apps/mem0-scripts/wiki-index.sh search-here --args-on-stdin'
             exit $?
         fi
         tunnel_open
@@ -214,6 +226,10 @@ case "${1:-}" in
         ;;
     search-here)
         shift
+        if [ "${1:-}" = "--args-on-stdin" ]; then
+            mapfile -d '' -t args
+            set -- ${args[@]+"${args[@]}"}
+        fi
         [ $# -ge 1 ] || { echo "usage: wiki-index.sh search-here \"query\" [--k N]" >&2; exit 2; }
         "$PY" "$DIR/wiki-search.py" "$@"
         ;;

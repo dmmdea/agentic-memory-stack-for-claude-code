@@ -793,6 +793,12 @@ TIER_BUNDLE_POLICY: dict[str, dict[str, Any]] = {
 RELEVANCE_GATE = _embedder_profile.threshold("relevance_gate", EMBED_PROFILE)
 for _tier_policy in TIER_BUNDLE_POLICY.values():
     _tier_policy["relevance_threshold"] = RELEVANCE_GATE
+# A threshold knob is not scoped to a space: one fitted on another model's scores and left set is noise
+# here. Say so loudly where it matters most, on a space other than the default.
+for _name, _ov in _embedder_profile.threshold_overrides(EMBED_PROFILE).items():
+    if EMBED_PROFILE.name != _embedder_profile.DEFAULT_PROFILE:
+        log.warning("threshold override %s=%s replaces %s's calibrated %s=%s — verify it was fitted on this "
+                    "embedding space", _ov["env"], _ov["value"], EMBED_PROFILE.name, _name, _ov["profile_value"])
 
 
 def resolve_tier_policy(tier: Optional[str]) -> dict[str, Any]:

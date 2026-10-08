@@ -31,8 +31,8 @@ EmbeddingGemma-300m's best recipe on detail questions (+0.10, CI [+0.016, +0.194
 3. **The wiki index has its own space**, `MEM0_WIKI_EMBED_PROFILE`; the operator's authority sets it to
    `egemma2` and embeds whole pages through the 4K alias.
 4. Moving the memories to another space is done only with `scripts/wsl/embedder-migrate.py` (new
-   collections beside the old ones, verify, catch-up, switch, catch-up), after the house evals show the
-   new space is at least as good through the per-prompt path.
+   collections beside the old ones, verify, then a catch-up with writes stopped and the switch through the
+   installer), after the house evals show the new space is at least as good through the per-prompt path.
 
 ## Consequences
 
@@ -41,7 +41,7 @@ EmbeddingGemma-300m's best recipe on detail questions (+0.10, CI [+0.016, +0.194
 - A future embedder is one profile entry plus a measured migration; the thresholds for it must be
   calibrated (the egemma2 set shows how: probe sets, a nearest-neighbour quantile map, the dedup tail).
 - The wiki needs an EmbeddingGemma-2-capable llama.cpp (b11452+) and the `embeddinggemma2` alias on the
-  authority and on every PC that refreshes the wiki.
+  authority; a PC that refreshes the wiki without serving it sends its builds and searches to the brain.
 - Two embedders can be resident on the authority's card during a wiki build (about 0.7 GiB each).
 
 ## Alternatives considered

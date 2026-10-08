@@ -449,6 +449,13 @@ KEY_READERS = {   # key -> [(file, the text of its stack.env read)]
     "MEM0_POOL_HEALTH_ACK": [("mem0-server/maintenance_health.py", "read_stack_env().get(POOL_ACK_KEY)")],
     "MEM0_BRAIN_SSH": [("scripts/wsl/wiki-index.sh", "s/^MEM0_BRAIN_SSH=//p")],
     "MEM0_WIKI_EMBED_PROFILE": [("mem0-server/embedder_profile.py", '_setting("MEM0_WIKI_EMBED_PROFILE")')],
+    "MEM0_QDRANT_COLLECTION": [("mem0-server/embedder_profile.py", '_setting("MEM0_QDRANT_COLLECTION")')],
+    "MEM0_COLLECTION": [("mem0-server/embedder_profile.py", '_setting("MEM0_COLLECTION")')],
+    "MEM0_EPISODES_COLLECTION": [("mem0-server/embedder_profile.py", '_setting("MEM0_EPISODES_COLLECTION")')],
+    "MEM0_WIKI_COLLECTION": [("mem0-server/embedder_profile.py", '_setting("MEM0_WIKI_COLLECTION")')],
+    "MEM0_RELEVANCE_THRESHOLD": [("mem0-server/embedder_profile.py", '"relevance_gate": "MEM0_RELEVANCE_THRESHOLD"')],
+    "MEM0_RAW_FALLBACK_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"episode_floor": "MEM0_RAW_FALLBACK_COSINE_FLOOR"')],
+    "MEM0_NLI_GATE_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"nli_floor": "MEM0_NLI_GATE_COSINE_FLOOR"')],
 }
 
 

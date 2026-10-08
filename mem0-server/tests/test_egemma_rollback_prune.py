@@ -82,6 +82,8 @@ def _make_handler(state: dict):
                         "checks": {"embedder": {"ok": state["dim"] == NEW.dims, "dim": state["dim"]}}}
                 if state["profile"] is not None:   # a server that predates the profile report says nothing
                     deep["embed_profile"] = {"profile": state["profile"]}
+                    if state.get("wiki"):            # the live wiki, in its own space
+                        deep["embed_profile"]["wiki"] = {"collection": state["wiki"]}
                 self._send(deep)
             elif self.path.startswith("/collections/"):
                 name = self.path[len("/collections/"):]
@@ -108,11 +110,11 @@ def _make_handler(state: dict):
 
 
 def _state(bound=NEW.memories, profile=NEW.name, dim=NEW.dims, new_points=2279, new_status="green",
-           old_points=16946, deep_down=False):
+           old_points=16946, deep_down=False, wiki=None):
     collections = {n: (old_points, "green") for n in OLD_COLLECTIONS}
     collections.update({n: (new_points, new_status) for n in NEW_COLLECTIONS})
     return {"bound": bound, "profile": profile, "dim": dim, "collections": collections, "deleted": [],
-            "deep_down": deep_down}
+            "deep_down": deep_down, "wiki": wiki}
 
 
 def _run_gate(tmp_path, state, dry_run=True, extra_env=None, with_systemctl=False):
@@ -162,6 +164,17 @@ def test_gate_prunes_the_previous_space_when_bound_to_the_new_one(tmp_path):
     would = r.stdout.split("would delete:")[1].split("+ their snapshots")[0].split()
     assert sorted(would) == sorted(OLD_COLLECTIONS), would
     assert not set(would) & set(NEW_COLLECTIONS), "a new-space collection must never be on the list"
+
+
+def test_the_live_wiki_is_kept_when_it_lives_in_the_old_space(tmp_path):
+    """The memories moved to the new space but the wiki index lives in the old one
+    (MEM0_WIKI_EMBED_PROFILE): the server reports it in use, so the prune keeps it and takes the rest."""
+    r, _ = _run_gate(tmp_path, _state(wiki=OLD.wiki))
+    assert r.returncode == 0, r.stderr
+    assert "DECISION: PRUNE" in r.stdout, r.stdout
+    would = r.stdout.split("would delete:")[1].split("+ their snapshots")[0].split()
+    assert OLD.wiki not in would and sorted(would) == sorted([OLD.memories, OLD.entities, OLD.episodes])
+    assert f"KEEP {OLD.wiki}" in (tmp_path / "prune.log").read_text(encoding="utf-8")
 
 
 def test_gate_skips_on_rollback_to_the_old_space(tmp_path):
