@@ -116,7 +116,11 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
   `last-l1a-attempt` **unconditionally at entry**, before every early return. Verdict: success
   inside 48h → `alive`; attempts fresh **and** success stale by more than **96h** → `degraded`
   (**never `dead`** — the cap is deliberate); anything else, including "never succeeded here" and
-  "attempts stopped too", → `unknown`. An idle box can therefore never be convicted.
+  "attempts stopped too", → `unknown`. An idle box can therefore never be convicted. The stamps are
+  read from a Windows profile only, so on a native Linux authority (`MEM0_HOST_KIND=native`) neither
+  age is filled and the row reads `unknown`; the authority's own reading of the same question is the
+  `capture` block of `GET /health/maintenance`, taken from the episodic store
+  ([systems/mem0-api.md](systems/mem0-api.md#get-healthmaintenance)).
 - **`sessionstart-banner`** — same two-signal shape. `claude-config/storage-cap-check.sh` writes
   `~/.mem0/last-sessionstart-banner` on its **first line**, above the cold-server gate, so the
   stamp proves the hook fired even on a morning when every server-dependent section was skipped.

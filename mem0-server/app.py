@@ -81,6 +81,8 @@ from episodic import (
     count_open_questions as _episodic_count_open_questions,
     # v0.17 Phase 0 — within-session checkpoint
     upsert_in_progress_episode as _episodic_upsert_checkpoint,
+    capture_signals as _episodic_capture_signals,   # CRIT-01: authority-side capture liveness
+    connect_readonly as _episodic_connect_readonly,
     finalize_episode as _episodic_finalize_episode,
     # v0.17 Phase D — open questions
     create_open_question as _episodic_create_open_question,
@@ -970,12 +972,25 @@ def health() -> dict:
     return {"ok": True, "version": "2.0.4-v012", "stack": STACK_VERSION,
             "store": "qdrant", "embedder": EMBED_PROFILE.label.lower(), "embed_profile": EMBED_PROFILE.name}
 
+def _capture_signals() -> dict:
+    """CRIT-01: the episodic store's capture facts for /health/maintenance (indexed reads, about a millisecond; no
+    Qdrant, no model, no cache needed), over a read-only connection that gives up on a lock after 1 s. Raises on a store
+    failure: maintenance_health.build reads that as `unknown`."""
+    conn = _episodic_connect_readonly()
+    try:
+        return _episodic_capture_signals(conn)
+    finally:
+        conn.close()
+
+
 @app.get("/health/maintenance")
 def health_maintenance() -> dict:
     """Spec §9 (P1-5): the nightly chain's last successes, the steps whose latest run failed or
-    degraded, the judge transport, pool usage (alarm at 85 %) and pool health, the box's boot ids
-    for 7 days, and the write path. `ok` folds the failed/degraded steps, the pool and the write
-    path in. Gatus probes it; the session-start line reads it with a 1.5 s budget and falls back to
+    degraded (`critical_failed_steps`: the failed ones minus the PC-dependent steps), the judge
+    transport, pool usage (alarm at 85 %) and pool health, the box's boot ids for 7 days, the write
+    path, and the capture liveness of the PC-side L1a extractor. `ok` folds the failed/degraded
+    steps, the pool and the write path in; `capture` and `critical_failed_steps` never change it.
+    Gatus probes it; the session-start line reads it with a 1.5 s budget and falls back to
     local numbers. `write_path` is the PASSIVE record of real POST/PUT /v1/memories outcomes
     (write_path.py): reading it never touches the embedder, so polling it cannot keep a model
     resident. Never raises on a reader: an unreadable pool/journal reads as unknown, not as an
@@ -995,7 +1010,9 @@ def health_maintenance() -> dict:
                      wiki_stamp_dir=Path.home() / "wiki-index",
                      drift_reader=drift_state_health,
                      # The write path, learned from real writes (in-process, zero I/O, no model load).
-                     write_path_reader=_write_path.snapshot)
+                     write_path_reader=_write_path.snapshot,
+                     # CRIT-01: is a PC's L1a still finishing runs while PC sessions go on? (informational)
+                     capture_reader=_capture_signals)
 
 
 @app.get("/health/morning-summary")

@@ -2,10 +2,12 @@
 
 Each chain step's last success, last run, duration and receipt id (from the receipts
 ams-step.sh appends to ~/.mem0/maintenance/receipts.jsonl); the steps whose LATEST run failed or
-degraded (the receipt's `status`, outcome contract C1); the judge transport; pool usage with the
+degraded (the receipt's `status`, outcome contract C1), and `critical_failed_steps`, the failed ones
+minus the PC-dependent steps (PC_DEPENDENT_STEPS); the judge transport; pool usage with the
 85 % alarm and the pool's HEALTH; the retrieval-drift and wiki-freshness readings; the box's boot
-ids for the last 7 days; and the write path (write_path.py), whose latest failed write turns
-`ok` false. Pure functions with injected
+ids for the last 7 days; the write path (write_path.py), whose latest failed write turns
+`ok` false; and the capture liveness of the PC-side L1a extractor (`capture`, informational: it
+never turns `ok` false). Pure functions with injected
 readers so the endpoint is testable without a chain, a pool or a journal; the route wires the
 real readers. A health endpoint never raises on a reader: a failed reader reads as unknown."""
 from __future__ import annotations
@@ -29,7 +31,25 @@ NO_OP_NOTE_PREFIXES = ("weekly:", "guard:")
 # The step that PRINTS this verdict exits non-zero on a bad one. The endpoint reads the previous
 # night's receipt before tonight's stamp runs, so folding it back in (failed OR stale) would keep a night red.
 VERDICT_STEPS = frozenset({"health-stamp"})
+# Steps whose failure is not actionable at night, because they depend on a PC being switched on. `critical_failed_steps`
+# is `failed_steps` minus this set: an external monitor pages on it urgently, even through quiet hours, while
+# `failed_steps` keeps paging at the normal level. Today that is `wiki-index` alone: its nightly pull needs a PC that
+# mounts the vault, so with every PC off it fails by design once the index is more than 72 h old
+# (scripts/wsl/wiki-index-nightly.sh, docs/systems/wiki-index.md). The unit is the step: its other failure (a pull whose
+# build failed) is real, and still reaches the normal page through `failed_steps`.
+PC_DEPENDENT_STEPS = frozenset({"wiki-index"})
 MAX_RECEIPT_LINES = 2000
+# Capture liveness (audit CRIT-01). The two thresholds are capabilities.py's own FRESH_H and L1A_CONVICT_H, so the
+# authority and the capability manifest mean the same by "quiet" and "convict".
+CAPTURE_QUIET_H = 48.0
+CAPTURE_STALLED_H = 96.0
+# How long the sessions since the last success must have been going before a stale success convicts: L1a runs at most
+# every 10 minutes (its throttle), so an hour of sessions without a finished run is past its first chance. Without it,
+# the first prompt after a trip of more than 96 h would read `stalled` until L1a's first run.
+CAPTURE_GRACE_H = 1.0
+# A stamp further ahead of this server's clock than this is a PC clock error, not a reading: it would otherwise hold
+# the verdict at `ok` until real time caught up.
+CAPTURE_CLOCK_AHEAD_H = 1.0
 
 
 def _parse_ts(s: str) -> Optional[dt.datetime]:
@@ -257,6 +277,74 @@ def _write_path(reader: Optional[Callable[[], dict]]) -> Optional[dict]:
         return {"ok": None, "note": "write-path reader failed"}
 
 
+def capture_state(success_age_h: Optional[float], activity_age_h: Optional[float],
+                  first_activity_age_h: Optional[float] = None) -> str:
+    """ok | quiet | stalled | unknown. Pure. The authority-side twin of capabilities._l1a_state (review F12).
+
+    `success` = a PC's L1a finished a run (a complete episode); `activity` = a PC session is happening (any episode
+    touched, which every UserPromptSubmit does whether or not L1a ever runs); `first_activity` = when the sessions
+    since the last success began. One stale stamp must not convict: a long weekend, a trip or both PCs switched off
+    look exactly like a dead extractor from the success side alone.
+
+      ok        a run finished within CAPTURE_QUIET_H
+      stalled   no run for more than CAPTURE_STALLED_H while a session was active within CAPTURE_QUIET_H, and those
+                sessions have been going for at least CAPTURE_GRACE_H (L1a has had its chances)
+      quiet     stale, but the PCs were quiet too, or the sessions only just began, or the silence is still inside the
+                grace window: cannot convict
+      unknown   no run on record, so a broken extractor cannot be told from a new install (F12)
+    first_activity_age_h None (a reader without it) skips the grace check.
+    """
+    if success_age_h is None:
+        return "unknown"
+    if success_age_h <= CAPTURE_QUIET_H:
+        return "ok"
+    if (activity_age_h is not None and activity_age_h <= CAPTURE_QUIET_H and success_age_h > CAPTURE_STALLED_H
+            and (first_activity_age_h is None or first_activity_age_h >= CAPTURE_GRACE_H)):
+        return "stalled"
+    return "quiet"
+
+
+def _capture(reader: Optional[Callable[[], dict]], now: dt.datetime) -> Optional[dict]:
+    """The `capture` block, or None when no reader is wired (the payload then has no `capture` key).
+
+    `reader()` returns {"success_at": iso|None, "activity_at": iso|None[, "first_activity_at": iso|None]}
+    (episodic.capture_signals). A reader that raises, or answers with something else, reads as `unknown` and never as
+    `stalled`: fail-open on the reader, loud in the value (the write-path rule). A stamp more than
+    CAPTURE_CLOCK_AHEAD_H ahead of this server is ignored (a PC clock error) and named in `note`. `stalled` is always a
+    boolean so a Gatus condition can read it."""
+    if reader is None:
+        return None
+    out: dict = {"state": "unknown", "stalled": False, "success_at": None, "success_age_h": None,
+                 "activity_at": None, "activity_age_h": None,
+                 "quiet_after_h": CAPTURE_QUIET_H, "stalled_after_h": CAPTURE_STALLED_H}
+    try:
+        sig = reader()
+        if not isinstance(sig, dict):
+            raise TypeError("a capture reader returns a dict")
+        ages: dict = {}
+        ahead: list = []
+        for key in ("success", "activity", "first_activity"):
+            ts = _parse_ts(sig.get(f"{key}_at") or "")
+            if ts is None:
+                continue
+            age = (now - ts).total_seconds() / 3600.0
+            if -age > CAPTURE_CLOCK_AHEAD_H:
+                ahead.append(f"{key}_at")
+                continue
+            ages[key] = max(0.0, age)      # a small skew never makes a negative age
+            if key == "first_activity":
+                continue                   # used for the grace check only: the payload keeps its documented keys
+            out[f"{key}_at"] = ts.astimezone(dt.timezone.utc).isoformat()
+            out[f"{key}_age_h"] = round(ages[key], 1)
+        out["state"] = capture_state(ages.get("success"), ages.get("activity"), ages.get("first_activity"))
+        out["stalled"] = out["state"] == "stalled"
+        if ahead:
+            out["note"] = "ignored a stamp from the future (a PC clock ahead): " + ", ".join(ahead)
+    except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
+        out["state"], out["stalled"], out["note"] = "unknown", False, "capture reader failed"
+    return out
+
+
 def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple],
           boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
           usage_reader: Optional[Callable[[], dict]] = None,
@@ -264,7 +352,8 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
           pool_ack_reader: Optional[Callable[[], Optional[str]]] = None,
           wiki_stamp_dir: Optional[Path] = None,
           drift_reader: Optional[Callable[[], dict]] = None,
-          write_path_reader: Optional[Callable[[], dict]] = None) -> dict:
+          write_path_reader: Optional[Callable[[], dict]] = None,
+          capture_reader: Optional[Callable[[], dict]] = None) -> dict:
     by_step: dict[str, list[dict]] = {}
     for r in read_receipts(Path(receipts_path)):
         by_step.setdefault(r["step"], []).append(r)
@@ -315,6 +404,9 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
     stale.sort()
     failed_steps.sort(key=lambda e: e["step"])
     degraded_steps.sort(key=lambda e: e["step"])
+    # The urgent subset, derived from the list above (same shape, same order). `ok` and `failed_steps` are
+    # computed from the whole list and never read this one.
+    critical_failed_steps = [dict(e) for e in failed_steps if e["step"] not in PC_DEPENDENT_STEPS]
     dataset: Optional[dict] = None
     try:
         used, avail, *ds = pool_reader()   # 2-tuple (disk usage) or 4-tuple (pool + dataset)
@@ -371,7 +463,9 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
     write_path = _write_path(write_path_reader)
     if write_path is not None and write_path.get("ok") is False:
         ok = False
+    capture = _capture(capture_reader, now)   # informational: never folded into ok / failed_steps / stale_steps
     out = {"ok": ok, "steps": steps, "stale_steps": stale, "failed_steps": failed_steps,
+           "critical_failed_steps": critical_failed_steps,
            "degraded_steps": degraded_steps, "judge_transport": jt, "pool": pool,
            "drift": _drift(drift_reader), "wiki": _wiki(wiki_stamp_dir, now),
            "usage": usage, "boots_7d": boots, "generated": now.isoformat()}
@@ -379,4 +473,6 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
         out["dataset"] = dataset
     if write_path is not None:
         out["write_path"] = write_path
+    if capture is not None:
+        out["capture"] = capture
     return out
