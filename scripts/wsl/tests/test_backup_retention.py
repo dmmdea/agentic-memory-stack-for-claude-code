@@ -1389,7 +1389,7 @@ def test_the_replica_restore_checks_the_restored_server_is_bound_to_the_restored
     sh = REPLICA_RESTORE.read_text(encoding="utf-8")
     assert ".embed_profile.profile" in sh and "is bound to embedding profile" in sh
     assert "is bound to collection" in sh
-    assert sh.index('bound_profile="$(printf') > sh.index('printf \'%s\' "$deep" | grep -q \'"ok"')
+    assert sh.index('bound_profile="$(printf') > sh.index('printf \'%s\' "$deep" | jq -e \'.ok == true\'')
     code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
     for p in (P300, P2):
         for n in _space(p):
