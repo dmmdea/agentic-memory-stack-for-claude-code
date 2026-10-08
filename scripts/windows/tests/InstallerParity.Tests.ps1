@@ -263,16 +263,20 @@ Describe 'WSL installer provisions EmbeddingGemma, not Ollama+nomic (v0.22 H3)' 
         $src | Should -Not -Match '"model":"embeddinggemma"' -Because 'the alias is profile-derived, not a literal'
     }
 
-    It 'WSL installer stages the EmbeddingGemma-2 GGUF beside the 300m one, checksum-verified, and prints both llama-swap entries' {
+    It 'WSL installer stages the EmbeddingGemma-2 GGUF only when a space uses it, checksum-verified, and prints one ctx-4096 llama-swap entry' {
         $src = Get-Content $wslInstaller -Raw
         $src | Should -Match 'embeddinggemma-2-Q8_0\.gguf'
         $src | Should -Match 'ggml-org/embeddinggemma-2-GGUF'
         $src | Should -Match '2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135' -Because 'the Q8_0 file the stack was measured with (cosine >= 0.9996 against BF16)'
         $src | Should -Match 'embeddinggemma-300M-Q8_0\.gguf' -Because 'the old space stays installable for the migration window and a rollback'
-        # both entries, at the trained windows, with the llama.cpp floor of the gemma-embedding2 architecture
-        $src | Should -Match 'embeddinggemma2-long:'
+        $src | Should -Match 'if \[ -n "\$EG2_WANTED" \] \|\| \[ "\$\{MEM0_STAGE_EG2:-\}" = 1 \]' -Because 'a default install fetches nothing it does not serve'
+        # one entry at ctx 4096 (the same VRAM as the 300m entry at 2048), with the llama.cpp floor of the
+        # gemma-embedding2 architecture; ctx 8192 measured no significant gain, so no long alias by default
+        $src | Should -Match 'members: \[embeddinggemma2\]'
         $src | Should -Match '--ctx-size 4096 --batch-size 4096 --ubatch-size 4096'
-        $src | Should -Match '--ctx-size 8192 --batch-size 8192 --ubatch-size 8192'
+        $src | Should -Not -Match 'embeddinggemma2-long:'
+        $src | Should -Not -Match '--ctx-size 8192'
+        $src | Should -Match 'MEM0_EMBED_LONG_MODEL_EGEMMA2' -Because 'an operator who adds a long entry is told how to declare it'
         $src | Should -Match 'b11452'
     }
 
