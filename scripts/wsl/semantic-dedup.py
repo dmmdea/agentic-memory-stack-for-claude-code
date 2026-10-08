@@ -8,8 +8,15 @@ threshold by trust: high-trust tiers require more semantic identity before mergi
 
   - canonical: 0.97  (almost identical; safer)
   - stable:    0.95  (still cautious)
-  - evidence:  0.92  (default; can afford more dedup)
-  - temporal:  0.92  (decay scanner deletes these by expiry; dedup is fallback)
+  - evidence:  0.94  (can afford more dedup; was 0.92 before 2026-06-10)
+  - temporal:  0.94  (decay scanner deletes these by expiry; dedup is fallback)
+  - insight:   0.95
+
+Those are the EmbeddingGemma-300m values. Cosine scales are not portable between embedding
+spaces, so the table is not a constant here: it is the `dedup` table of the embedder_profile of the
+space COLLECTION lives in (EmbeddingGemma-2 reads far higher, and its table sits at 0.988-0.993).
+The collection decides the space, not the active profile alone: pointing this job at the other
+generation's collection scores it with that generation's table, because this job deletes records.
 
 For each pair (A, B) above the tier threshold AND same tier, keep the older
 (established truth), demote-and-delete the newer. Skips tier=canonical entirely
@@ -52,8 +59,31 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as ep  # noqa: E402  (collection + cosine cut-offs of the embedding space)
+
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
+COLLECTION = ep.collection("memories")  # env-overridable (MEM0_QDRANT_COLLECTION / MEM0_COLLECTION); default is the active space's collection
+
+
+def _space_of(collection: str) -> "ep.EmbedProfile":
+    """The embedding space `collection` was built in. A collection named by a profile is that
+    profile's space even when another one is active; any other name (a custom or restore copy)
+    belongs to the active profile. Its cut-offs are only meaningful on its own vectors."""
+    active = ep.active()
+    if active.memories == collection:
+        return active
+    return next((p for p in ep.PROFILES.values() if p.memories == collection), active)
+
+
+SPACE = _space_of(COLLECTION)
 MEM0 = ams_env.mem0_url()
 try:
     KEY = ams_env.api_key() or os.environ.get("MEM0_API_KEY", "")
@@ -64,8 +94,10 @@ except OSError:
     # still fails loudly at the first authenticated call.
     KEY = os.environ.get("MEM0_API_KEY", "")
 H = {"X-API-Key": KEY, "Content-Type": "application/json"}
-TIER_THRESHOLDS = {"canonical": 0.97, "stable": 0.95, "evidence": 0.94, "temporal": 0.94, "insight": 0.95}
-# 2026-06-10: evidence/temporal bumped 0.92 -> 0.94 per the operator's direction.
+TIER_THRESHOLDS = dict(SPACE.thresholds.dedup)
+DEDUP_FALLBACK = SPACE.thresholds.dedup_fallback   # a tier the table does not name
+# EmbeddingGemma-300m table (embedder_profile): 2026-06-10 evidence/temporal bumped 0.92 -> 0.94 per
+# the operator's direction.
 # Rationale: port directory entries (P:\Port Directory\) and similar IP/port/SHA-change facts
 # read as semantically near-identical (~0.92-0.93 cosine) but are factually distinct. Earlier
 # 0.92 threshold deleted 27 atomic facts on the v0.13 inaugural run, some of which may have
@@ -268,7 +300,7 @@ def _candidate_pairs(pts):
         n = len(members)
         if n < 2:
             continue
-        threshold = TIER_THRESHOLDS.get(tier, 0.92)
+        threshold = TIER_THRESHOLDS.get(tier, DEDUP_FALLBACK)
         mat = np.asarray([dense[i] for i in members], dtype=np.float32)
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         mat = mat / np.maximum(norms, 1e-9)
@@ -314,7 +346,7 @@ def plan_dedup(pts, max_deletions=DEFAULT_MAX_DELETIONS):
         decisions.append({
             "deleted_id": str(newer["id"]), "kept_id": str(older["id"]),
             "cosine": round(sim, 4), "tier": pa.get("tier"),
-            "threshold": TIER_THRESHOLDS.get(pa.get("tier"), 0.92),
+            "threshold": TIER_THRESHOLDS.get(pa.get("tier"), DEDUP_FALLBACK),
             "deleted_full_payload": dict(p_newer),
             "kept_text": (p_older.get("data") or "")[:120],
             "within_cap": max_deletions <= 0 or len(decisions) < max_deletions,
@@ -391,6 +423,23 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
         _append_summary(f"no-op:backend-unreachable:{type(e).__name__}", dry_run=dry_run)
         _write_outcome("degraded:backend-unreachable", {})
         return 0
+    if not dry_run:
+        # It deletes through the server (DELETE /v1/memories/{id}), which acts on the collection the
+        # server is BOUND to, and it judges with the thresholds of the space COLLECTION is in. Both are
+        # only right when the scanned collection IS the bound one; anything else (an override naming a
+        # restore copy, the other generation's collection) would delete by verdicts made on other vectors.
+        try:
+            with httpx.Client(timeout=30.0) as probe:
+                bound = (probe.get(f"{MEM0}/health/deep").json() or {}).get("collection")
+        except (httpx.HTTPError, ValueError, OSError):
+            bound = None
+        if bound != COLLECTION:
+            reason = f"collection mismatch: scanning {COLLECTION}, server bound to {bound or 'unknown'}"
+            _append_ledger({"event": "dedup-scan-skip", "actor": "semantic-dedup", "reason": reason})
+            print(f"semantic-dedup: SKIP - {reason} (a dry run still works)", flush=True)
+            _append_summary("no-op:collection-mismatch", dry_run=dry_run)
+            _write_outcome("degraded:collection-mismatch", {})
+            return 0
     stats: dict = {}
     try:
         pts = scroll_all_with_vectors()
@@ -442,7 +491,8 @@ def _run(dry_run=False, max_deletions=DEFAULT_MAX_DELETIONS):
     stats["delete_failed"] = failures
     outcome = run_outcome(stats)
     label = "DRY-RUN would_delete" if dry_run else "deletions"
-    print(f"semantic-dedup: {label}={deletions}, outcome={outcome}, tier_thresholds={TIER_THRESHOLDS}, report={report_path}")
+    print(f"semantic-dedup: {label}={deletions}, outcome={outcome}, space={SPACE.name}, "
+          f"tier_thresholds={TIER_THRESHOLDS}, report={report_path}")
     _append_summary(outcome, deletions=deletions, dry_run=dry_run, counts=stats)
     _write_outcome(outcome, stats)
     return 0

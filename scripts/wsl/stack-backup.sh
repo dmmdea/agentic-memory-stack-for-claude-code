@@ -20,12 +20,22 @@ rc=0
 DEG_SECONDARY=0   # secondary-collection snapshots that were not taken
 DEG_PRUNE=0       # server-side snapshot list/DELETE/sweep failures (unbounded growth if nightly)
 
-# DR fix (2026-06-20): the LIVE mem0 vector collection is mem0_egemma_768 (config.py).
-# It was "memories" before the EmbeddingGemma migration; the old collection still exists
-# frozen (~2165 pts) while the live store grew in mem0_egemma_768 (3028+). Snapshotting the
-# stale name silently backed up the WRONG vectors. Single source of truth here so it can't
-# drift again. Override via env if the collection is ever renamed.
-QDRANT_COLLECTION="${MEM0_QDRANT_COLLECTION:-mem0_egemma_768}"
+# DR fix (2026-06-20): snapshotting a stale collection name silently backed up the WRONG vectors
+# (the pre-EmbeddingGemma "memories" collection sat frozen while the live store grew elsewhere).
+# So no name is written here: the collections come from the embedding profile
+# (mem0-server/embedder_profile.py, through embed-profile.sh), the same definition the server binds.
+# The ACTIVE space's memories collection is the primary set; while another space's memories collection
+# still exists (the rollback anchor of a migration) it is backed up too, as qcol-memories+<collection>.
+EP_LIB="$(dirname "$0")/embed-profile.sh"
+EP_READY=0
+if [ -f "$EP_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$EP_LIB"
+  if ep_load; then EP_READY=1; else echo "WARN: the embedding profile did not resolve (a configuration error: see above) - the Qdrant collections will NOT be backed up" >&2; fi
+else
+  echo "WARN: $EP_LIB is missing - the Qdrant collections will NOT be backed up (redeploy scripts/wsl/)" >&2
+fi
+QDRANT_COLLECTION="$EP_MEM"
 # Qdrant REST base; overridable so the suite can drive the script against a fake server.
 QDRANT_URL="${MEM0_QDRANT_URL:-http://127.0.0.1:6333}"
 
@@ -37,6 +47,7 @@ stack_env_get() {
 }
 
 echo "stack-backup: starting TS=$TS BACKUP_DIR=$BACKUP_DIR"
+[ "$EP_READY" = 1 ] && echo "stack-backup: embedding profile $EP_PROFILE ($EP_STATUS), primary collection $QDRANT_COLLECTION"
 
 # ── 1. Local file backups (always run; Qdrant outage must not skip these) ─────
 
@@ -287,16 +298,22 @@ snapshot_collection() {  # <collection> <dst>
 if ! command -v jq >/dev/null 2>&1; then
   echo "WARN: jq not installed — cannot parse the Qdrant snapshot name; vector collection NOT backed up (sudo apt install -y jq)" >&2
   rc=1
+elif [ "$EP_READY" != 1 ]; then
+  echo "WARN: no embedding profile - vector collection NOT backed up" >&2
+  rc=1
 else
   snapshot_collection "$QDRANT_COLLECTION" "$BACKUP_DIR/qdrant-$TS.snapshot" || rc=1
   # The small secondary collections ride in the same set (episodes_*, *_entities, wiki_pages_*),
   # under a distinct qcol-<kind> prefix so the qdrant-* prune glob stays disjoint. EVERY collection
-  # matching a kind is snapshotted: the first (in name order) is qcol-<kind>-<TS>.snapshot, which the
-  # manifest's fixed keys name; each further one is qcol-<kind>+<collection>-<TS>.snapshot (the "+"
-  # keeps its prune glob disjoint from the first's and gives it its own newest-8 window).
+  # matching a kind is snapshotted. The fixed name qcol-<kind>-<TS>.snapshot (the manifest's fixed
+  # key) belongs to the ACTIVE space's collection of that kind, by name, never to "the first in name
+  # order": with two spaces side by side (a migration) the new space's episodes_eg2_* sorts before
+  # episodes_egemma_* and used to take the slot, so a manifest of the old space named the new space's
+  # vectors. Every other collection - the other space's, or one nobody named - is
+  # qcol-<kind>+<collection>-<TS>.snapshot (the "+" keeps its prune glob disjoint from the fixed one's
+  # and gives it its own newest-8 window). The other space's MEMORIES collection is a "memories" kind.
   # A failure WARNs and reads `degraded` but does not fail the night: episodes and
   # wiki are rebuildable, while the entities snapshot is the ONLY copy of that collection.
-  seen=""
   colls=""
   # Each stage is its own status: piped into `sort`, jq's failure (a 200 whose body is not a
   # collection list) would be masked by sort's exit 0 and the night would read clean with no
@@ -310,16 +327,17 @@ else
   for coll in $colls; do
     case "$coll" in *[!A-Za-z0-9._-]*) continue ;; esac
     [ "$coll" = "$QDRANT_COLLECTION" ] && continue
+    fixed=0
     case "$coll" in
+      "$EP_ENT") kind=entities; fixed=1 ;;
+      "$EP_EPI") kind=episodes; fixed=1 ;;
+      "$EP_WIKI") kind=wiki; fixed=1 ;;
       episodes_*) kind=episodes ;;
       *_entities) kind=entities ;;
       wiki_pages_*) kind=wiki ;;
-      *) continue ;;
+      *) case " $EP_OTHER_MEMS " in *" $coll "*) kind=memories ;; *) continue ;; esac ;;
     esac
-    case " $seen " in
-      *" $kind "*) qname="qcol-$kind+$coll-$TS.snapshot" ;;
-      *) qname="qcol-$kind-$TS.snapshot"; seen="$seen $kind" ;;
-    esac
+    if [ "$fixed" = 1 ]; then qname="qcol-$kind-$TS.snapshot"; else qname="qcol-$kind+$coll-$TS.snapshot"; fi
     snapshot_collection "$coll" "$BACKUP_DIR/$qname" \
       || { echo "WARN: $coll snapshot failed (the set is missing this collection)" >&2; DEG_SECONDARY=$((DEG_SECONDARY + 1)); }
   done

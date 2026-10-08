@@ -1,8 +1,9 @@
 """episode_embeddings.py — v0.29 R4 semantic raw-trace gate.
 
-Episode SUMMARIES are embedded with the SAME EmbeddingGemma-300m embedder mem0
-uses (asymmetric prefix-shim) and stored in a dedicated Qdrant collection
-``episodes_egemma_768`` keyed by episode id. The context_bundle low-confidence
+Episode SUMMARIES are embedded with the SAME embedder mem0 uses (the active
+embedder_profile's model behind the asymmetric prefix-shim) and stored in that
+space's dedicated Qdrant collection (``episodes_egemma_768`` for
+EmbeddingGemma-300m, ``episodes_eg2_768`` for EmbeddingGemma-2) keyed by episode id. The context_bundle low-confidence
 fallback embeds the live prompt and does a semantic search over this collection,
 then applies a fail-closed brand gate + a calibrated cosine floor.
 
@@ -22,10 +23,13 @@ import threading
 import time
 from typing import Optional
 
+import embedder_profile as _embedder_profile
+
 log = logging.getLogger("mem0-server")   # the server's own logger: the greppable lines below land in its journal
 
-EPISODE_COLLECTION = "episodes_egemma_768"
-EPISODE_DIMS = 768
+# The active embedding space's episode collection (embedder_profile; MEM0_EPISODES_COLLECTION overrides).
+EPISODE_COLLECTION = _embedder_profile.collection("episodes")
+EPISODE_DIMS = _embedder_profile.active().dims
 # Minimum summary length to index. A live check showed degenerate-short summaries
 # (e.g. ~39-char test-fixture artifacts like "Session created for resolve smoke
 # test.") get inflated cosine to unrelated queries and surface as junk fallbacks;

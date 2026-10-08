@@ -1,11 +1,14 @@
 [Unit]
-Description=v0.22 EmbeddingGemma rollback-window cleanup (one-shot, health-gated)
-# Deletes the OLD nomic `memories` Qdrant collection + snapshots (the v0.22 rollback
-# anchor) ONLY when the migration is confirmed durable: mem0 deep-health embedder ok
-# (dim 768) AND mem0 is STILL BOUND to mem0_egemma_768 (the binding-based rollback
-# guard, v0.22 H2) AND the new collection is green with >=1000 points. After a
-# rollback it SKIPs and logs a ROLLBACK DETECTED flag. Disable the timer as STEP 1
-# of any rollback (see ARCHITECTURE.md).
+Description=Embedding-space rollback-window cleanup (operator-armed, profile- and health-gated)
+# Deletes the PREVIOUS embedding space's Qdrant collections + their snapshots (the rollback anchor a
+# migration leaves beside the new space, scripts/wsl/embedder-migrate.py) ONLY when the migration is
+# confirmed durable: mem0 /health/deep reports embed_profile.profile == the NEW profile AND is STILL
+# BOUND to the new memories collection (the binding-based rollback guard, v0.22 H2), the embedder
+# probe is ok, and the new collection is green with enough points. Each old collection also needs
+# its own counterpart in the new space to be green and non-empty. After a rollback it SKIPs and logs
+# a ROLLBACK DETECTED flag. Which profiles: EGEMMA_PRUNE_NEW_PROFILE / EGEMMA_PRUNE_OLD_PROFILE (a
+# drop-in Environment=; defaults egemma2 / egemma-300m). Disable the timer as STEP 1 of any rollback
+# (see ARCHITECTURE.md). No installer enables the timer.
 
 [Service]
 Type=oneshot

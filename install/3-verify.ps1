@@ -106,10 +106,58 @@ if ($stackRole -eq 'replica') {
         $authorityUrl -notmatch '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)'
     } "This replica points at itself ($authorityUrl). Queued writes would replay into its disposable local store and be lost. Re-run 2-windows-config.ps1 -Role replica -AuthorityUrl http://<brain-host>:18791"
 }
-# v0.22 EmbeddingGemma migration: mem0's embedder is EmbeddingGemma-300m on llama-swap
-# :11436 (single-stack llama.cpp). Ollama fully decommissioned 2026-06-13 — no longer
-# a stack dependency. This verifies the embedder returns a 768-dim vector.
-Check "EmbeddingGemma :11436" { try { $b = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json; (@((Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body $b -ContentType 'application/json' -TimeoutSec 20).data[0].embedding).Count -eq 768) } catch { $false } } "wsl: systemctl --user status llama-swap.service"
+# v0.22 EmbeddingGemma migration: mem0's embedder is EmbeddingGemma on llama-swap :11436
+# (single-stack llama.cpp). Ollama fully decommissioned 2026-06-13 — no longer a stack
+# dependency. This verifies the embedder answers with a vector of the authority's width under the
+# alias of the embedding space the authority is bound to.
+#
+# Which space that is lives in mem0-server/embedder_profile.py (EmbeddingGemma-300m or
+# EmbeddingGemma-2: both 768-d, different vector spaces), so no model name or width is written
+# here. The authority reports its binding on /health/deep (embed_profile: profile, model alias);
+# the server venv's embedder_profile module supplies what /health/deep does not: the profile's
+# width, and, on a replica, the alias THIS box's llama-swap serves for the authority's profile
+# (a replica embeds with its own llama-swap, under its own alias). When neither names the space
+# the check fails instead of guessing an alias.
+function Get-VerifyEmbedProfilePy {
+    # This box's server venv (embedder_profile, the one definition) answers: profile, llama-swap alias
+    # and vector width. -Profile asks about THAT profile under this box's overrides; without it, the
+    # profile this box has active. $null when the venv/module is absent or the profile is unknown.
+    param([string]$Distro, [string]$WslUser, [string]$Profile = '')
+    if ($Profile -and $Profile -notmatch '^[a-z0-9][a-z0-9-]*$') { return $null }   # interpolated into a shell line
+    $srv = "/home/$WslUser/apps/mem0-server"
+    $pre = if ($Profile) { "MEM0_EMBED_PROFILE=$Profile " } else { '' }
+    $code = "import embedder_profile as ep; p = ep.active(); print('VERIFY-EMBED|%s|%s|%d' % (p.name, ep.embed_model(p), p.dims))"
+    try { $out = wsl.exe -d $Distro -e bash -lc "cd $srv && $pre$srv/.venv/bin/python -c ""$code"" 2>/dev/null" } catch { return $null }
+    foreach ($l in @($out)) {
+        if ("$l" -match '^VERIFY-EMBED\|([a-z0-9-]+)\|([A-Za-z0-9._-]+)\|(\d+)\s*$') {
+            return [pscustomobject]@{ Profile = $Matches[1]; Alias = $Matches[2]; Dim = [int]$Matches[3] }
+        }
+    }
+    return $null
+}
+function Get-VerifyEmbedder {
+    param([string]$AuthorityUrl, [string]$Role, [string]$Distro, [string]$WslUser)
+    $hd = Probe-Url "$AuthorityUrl/health/deep" -TimeoutSec 30
+    $ap = if ($hd) { $hd.embed_profile } else { $null }
+    if ($ap -and $ap.profile -and $ap.model) {
+        $py = Get-VerifyEmbedProfilePy -Distro $Distro -WslUser $WslUser -Profile ([string]$ap.profile)
+        # The brain's local llama-swap serves the very alias its server embeds with; a replica's serves
+        # whatever its own stack.env resolves for the authority's profile.
+        $alias = if ($Role -eq 'brain') { [string]$ap.model } elseif ($py) { $py.Alias } else { $null }
+        $dim = if ($hd.checks.embedder.ok -and $hd.checks.embedder.dim) { [int]$hd.checks.embedder.dim } elseif ($py) { $py.Dim } else { $null }
+        if ($alias -and $dim) { return [pscustomobject]@{ Profile = [string]$ap.profile; Alias = $alias; Dim = $dim } }
+        return $null
+    }
+    # The authority did not report a binding (unreachable, or a server that predates profiles): this
+    # box's own venv names the space.
+    return Get-VerifyEmbedProfilePy -Distro $Distro -WslUser $WslUser
+}
+$embedBind = Get-VerifyEmbedder -AuthorityUrl $authorityUrl -Role $stackRole -Distro $Distro -WslUser $WslUser
+$embedWho = if ($embedBind) { "$($embedBind.Profile) / alias $($embedBind.Alias)" } else { 'profile unresolved' }
+Check "EmbeddingGemma :11436 ($embedWho)" {
+    if (-not $embedBind) { return $false }
+    try { $b = @{model=$embedBind.Alias; input='title: none | text: ping'} | ConvertTo-Json; (@((Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body $b -ContentType 'application/json' -TimeoutSec 20).data[0].embedding).Count -eq $embedBind.Dim) } catch { $false }
+} "wsl: systemctl --user status llama-swap.service. The alias above is the one llama-swap must serve for the authority's embedding profile (install/llama-swap-setup.md); 'profile unresolved' means neither the authority's /health/deep embed_profile nor the server venv's embedder_profile module answered"
 
 Write-Host ""
 Write-Host "Windows-side files + config:"

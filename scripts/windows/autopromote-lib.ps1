@@ -7,6 +7,91 @@
 #   Test-ImperativeOrTask     — structural filter: rejects task/imperative text (FIX 4)
 #   Invoke-AutopromoteDecision — complete nomination pipeline (parse → structural-filter
 #                                → sort-by-confidence → cap-at-3 → dedup)
+#   Get-AmEmbedProfile         — the embedding space the store is bound to: collection + sibling cosine
+#
+# PowerShell 5.1 syntax only: the nightly dream dot-sources this under powershell.exe (PS51Compat.Tests).
+
+# ── Embedding space: collection and sibling cosine ────────────────────────────
+# Which collection the promotion gate reads, and the cosine at which a sibling counts as an
+# independent observation, belong to the EMBEDDING SPACE, not to this script: vectors from different
+# models are different spaces even at the same width, and cosine scales are not portable between them
+# (the same off-topic question scores 0.17-0.29 top-1 on EmbeddingGemma-300m and 0.61-0.69 on
+# EmbeddingGemma-2). mem0-server/embedder_profile.py is the one definition. A PowerShell lib cannot
+# import it, so this table mirrors the two fields it needs, and EmbedderProfile.Tests.ps1 parses
+# that file and fails when the two drift. The profile NAME is read the way embedder_profile.py reads it:
+# MEM0_EMBED_PROFILE in the environment, then ~/.mem0/stack.env (inside WSL), then the default. An
+# unknown name throws (a configuration error, as embedder_profile.active() raises): quietly using the
+# default would query a space the store was not built in. Get-PromotionGateVerdict's caller already
+# treats a throw as a gate error (fail-safe BLOCK in enforce mode).
+$script:AmEmbedProfiles = @{
+    'egemma-300m' = @{ Collection = 'mem0_egemma_768'; SiblingThreshold = 0.6 }
+    'egemma2'     = @{ Collection = 'mem0_eg2_768';    SiblingThreshold = 0.825 }
+}
+$script:AmDefaultEmbedProfile = 'egemma-300m'
+
+# ~/.mem0/stack.env as a hashtable (KEY=VALUE lines, '#' comments, the FIRST occurrence of a key wins,
+# like embedder_profile._stack_env). An unreadable or absent file is an empty table, never an error.
+# On Windows the file lives inside WSL, so it is read over the UNC share with the distro and user the
+# install receipt records (the same receipt the dream reads); -Path overrides it for tests.
+function Read-AmStackEnv {
+    param([string]$Path = '')
+    $table = @{}
+    try {
+        if (-not $Path) {
+            if ($PSVersionTable.Platform -eq 'Unix') {
+                $Path = Join-Path $HOME (Join-Path '.mem0' 'stack.env')
+            } else {
+                $distro = $env:MEM0_WSL_DISTRO; $wslUser = ''
+                $rcpt = Join-Path $PSScriptRoot 'mem0-stack.config.psd1'
+                if (Test-Path -LiteralPath $rcpt) {
+                    $c = Import-PowerShellDataFile $rcpt
+                    if (-not $distro) { $distro = [string]$c.Distro }
+                    $wslUser = [string]$c.WslUser
+                }
+                if ($distro -and $wslUser) { $Path = "\\wsl.localhost\$distro\home\$wslUser\.mem0\stack.env" }
+            }
+        }
+        if ($Path) {
+            foreach ($line in @([System.IO.File]::ReadAllLines($Path))) {
+                $t = "$line".Trim()
+                if (-not $t -or $t.StartsWith('#') -or $t.IndexOf('=') -lt 0) { continue }
+                $i = $t.IndexOf('=')
+                $k = $t.Substring(0, $i).Trim()
+                if ($k -and -not $table.ContainsKey($k)) { $table[$k] = $t.Substring($i + 1).Trim() }
+            }
+        }
+    } catch { }
+    return $table
+}
+
+# The profile in force: Name, Collection (memories) and SiblingThreshold. Collection honours the same
+# overrides as embedder_profile.collection(): MEM0_QDRANT_COLLECTION, then the legacy MEM0_COLLECTION,
+# each from the environment before stack.env.
+function Get-AmEmbedProfile {
+    param([string]$StackEnvPath = '')
+    $stack = Read-AmStackEnv -Path $StackEnvPath
+    $setting = {
+        param([string]$Key)
+        $v = ([string][System.Environment]::GetEnvironmentVariable($Key)).Trim()
+        if (-not $v -and $stack.ContainsKey($Key)) { $v = [string]$stack[$Key] }
+        $v
+    }
+    $name = & $setting 'MEM0_EMBED_PROFILE'
+    if (-not $name) { $name = $script:AmDefaultEmbedProfile }
+    $key = @($script:AmEmbedProfiles.Keys | Where-Object { $_ -ceq $name })
+    if ($key.Count -ne 1) {
+        throw "MEM0_EMBED_PROFILE='$name' is not a known embedding profile ($((@($script:AmEmbedProfiles.Keys) | Sort-Object) -join ', '))"
+    }
+    $cfg = $script:AmEmbedProfiles[$key[0]]
+    $collection = & $setting 'MEM0_QDRANT_COLLECTION'
+    if (-not $collection) { $collection = & $setting 'MEM0_COLLECTION' }
+    if (-not $collection) { $collection = [string]$cfg.Collection }
+    return [pscustomobject]@{
+        Name             = [string]$key[0]
+        Collection       = $collection
+        SiblingThreshold = [double]$cfg.SiblingThreshold
+    }
+}
 
 # ── Dedup helper ──────────────────────────────────────────────────────────────
 function Test-CanonicalDuplicate {
@@ -137,7 +222,7 @@ function Get-SourceClass {
 function Get-CorroborationCount {
     param(
         [double[]]$SiblingScores = @(),
-        [double]$Threshold       = 0.6,
+        [double]$Threshold       = (Get-AmEmbedProfile).SiblingThreshold,   # per embedding space; the gate passes its own
         [bool]$WasReObserved     = $false
     )
     $siblings = @($SiblingScores | Where-Object { $_ -ge $Threshold }).Count
@@ -376,12 +461,21 @@ function Get-PromotionGateVerdict {
         [string]$MemoryId,
         [string]$CandidateText,
         [object]$EvidenceRecord,
-        [double]$SiblingThreshold = 0.6,
+        [double]$SiblingThreshold,   # default: the embedding space's (Get-AmEmbedProfile)
         [int]$MinCorroboration    = 2,
         [int]$NearCanonicalK      = 5,
-        [string]$Collection       = 'mem0_egemma_768',
+        [string]$Collection,         # default: the embedding space's memories collection
         [string]$QdrantUrl        = 'http://127.0.0.1:6333'
     )
+    # The sibling cosine and the collection are properties of the embedding space the store is bound
+    # to; an explicit argument still wins. Resolved only when one is missing, so a caller that passes
+    # both never depends on the profile.
+    $embedProfile = $null
+    if (-not $PSBoundParameters.ContainsKey('SiblingThreshold') -or -not $PSBoundParameters.ContainsKey('Collection')) {
+        $embedProfile = Get-AmEmbedProfile
+        if (-not $PSBoundParameters.ContainsKey('SiblingThreshold')) { $SiblingThreshold = $embedProfile.SiblingThreshold }
+        if (-not $PSBoundParameters.ContainsKey('Collection'))       { $Collection = $embedProfile.Collection }
+    }
     $qcol = "$QdrantUrl/collections/$Collection"
 
     # 1. candidate payload — user_id (scoping) + re-observation signal (dedup fold)
@@ -501,6 +595,8 @@ function Get-PromotionGateVerdict {
         sourceClass            = $sourceClass
         siblingCount           = $siblingCount
         siblingThreshold       = $SiblingThreshold
+        collection             = $Collection
+        embedProfile           = $(if ($embedProfile) { $embedProfile.Name } else { $null })
         wasReObserved          = $wasReObserved
         corroborationCount     = $corroboration
         nearCanonicalCount     = $nearCanonTexts.Count

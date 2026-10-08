@@ -29,9 +29,23 @@
 #                  canary); written to stack.env as MEM0_EVAL_ROOT. Omit -> the canary no-ops.
 #   --pcloud-dir:  where the chain's pcloud-copy step mirrors the newest backup set
 #                  (stack.env MEM0_PCLOUD_DIR; default ~/pCloudDrive/memory-backups/<hostname>).
-#   --embed-model: the llama-swap model name whose GGUF the store was embedded with (default
-#                  embeddinggemma). A different conversion of the same model is a different vector
-#                  space: the restore looked healthy while every search scored noise.
+#   --embed-profile: the embedding space the store lives in (mem0-server/embedder_profile.py:
+#                  egemma-300m or egemma2). A space is a model AND a prompt template; two spaces never
+#                  share a collection, and a query embedded in the wrong one scores noise with no error.
+#                  Taken from stack.env on a re-run. With no recorded profile, a box that already holds
+#                  a store (a stack.env, or Qdrant collections on disk) is egemma-300m, the space stores
+#                  were built in before profiles existed; a fresh install starts on egemma-300m too
+#                  (measured 2026-10-08: EmbeddingGemma-2 lost about a quarter of the per-prompt
+#                  path's MRR on short facts; docs/systems/embedder-profiles.md). Changing
+#                  the profile of an existing store needs the new space built first (scripts/wsl/
+#                  embedder-migrate.py): mem0 creates an absent collection EMPTY, so the installer
+#                  refuses to rebind a store to a collection that holds no points. Recorded in
+#                  stack.env as MEM0_EMBED_PROFILE and rendered into the drop-in.
+#   --embed-model: the llama-swap model name whose GGUF the store was embedded with (default: the
+#                  profile's own alias, embeddinggemma / embeddinggemma2). A different conversion of
+#                  the same model is a different vector space: the restore looked healthy while every
+#                  search scored noise. Recorded as MEM0_EMBED_MODEL (egemma-300m) or
+#                  MEM0_EMBED_MODEL_<PROFILE> (the other profiles) and checked against /v1/models.
 #   --ams-checkout: where this box keeps its own checkout of the store hub (<dir>/projects is
 #                  the work tree, <dir>/state the state root). With --ams-hub it enables the
 #                  nightly store-judge step; omit BOTH on a box that is not the store hub.
@@ -55,8 +69,8 @@
 #                  calibrates first. An explicit empty value drops the line (back to shadow).
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
-#   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-model, --eval-root,
-#                  --pcloud-dir, --zfs-dataset) keeps the value already in ~/.mem0/stack.env;
+#   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-profile, --embed-model,
+#                  --eval-root, --pcloud-dir, --zfs-dataset) keeps the value already in ~/.mem0/stack.env;
 #                  only a first install with no stack.env applies the defaults above. An EXPLICIT
 #                  empty value (--eval-root "") clears the inherited value.
 set -euo pipefail
@@ -67,13 +81,21 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/stack-env.sh"
 # The release sha stamp (DEPLOYED_SHA) the backup manifest reads; the deployed tree has no .git.
 . "$SCRIPT_DIR/deploy-stamp.sh"
-BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""
+# Shell access to the embedding-space definition (embedder_profile.py): this installer names no
+# collection or model alias of its own, it asks the module.
+. "$REPO_ROOT/scripts/wsl/embed-profile.sh"
+BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""; EMBED_PROFILE=""
 # P4-1b: the store hub's own checkout and the binary that judges it.
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
 WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
 PROMOTION_GATE_MODE=""; SET_PROMOTION_GATE_MODE=0
 AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
-SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0
+SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0; SET_EMBED_PROFILE=0
+# The space a FRESH install (no store on the box) starts in. An existing store never takes this:
+# it keeps its recorded profile, or the profile stores were built in before profiles existed.
+# EmbeddingGemma-300m: on short memory facts it measured better than EmbeddingGemma-2 through the
+# per-prompt path (2026-10-08). The wiki's space is separate (MEM0_WIKI_EMBED_PROFILE).
+FRESH_INSTALL_PROFILE="egemma-300m"
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
@@ -89,6 +111,7 @@ while [ $# -gt 0 ]; do
         --eval-root) EVAL_ROOT="${2:-}"; SET_EVAL_ROOT=1; shift 2 ;;
         --pcloud-dir) PCLOUD_DIR="${2:-}"; SET_PCLOUD_DIR=1; shift 2 ;;
         --embed-model) EMBED_MODEL="${2:-}"; SET_EMBED_MODEL=1; shift 2 ;;
+        --embed-profile) EMBED_PROFILE="${2:-}"; SET_EMBED_PROFILE=1; shift 2 ;;
         --ams-checkout) AMS_CHECKOUT="${2:-}"; SET_AMS_CHECKOUT=1; shift 2 ;;
         --ams-hub) AMS_HUB="${2:-}"; SET_AMS_HUB=1; shift 2 ;;
         --ams-store-binary) AMS_BINARY="${2:-}"; shift 2 ;;
@@ -147,7 +170,35 @@ inherit_from_stack_env() {  # $1 = variable, $2 = stack.env key, $3 = flag (for 
     printf -v "$1" '%s' "$prev"
     echo "    $3 inherited from ~/.mem0/stack.env: $prev"
 }
-inherit_from_stack_env EMBED_MODEL MEM0_EMBED_MODEL --embed-model
+# The embedding space comes BEFORE the alias: the key the alias is recorded under depends on it.
+# One stack.env value ('' when absent), read the way the inherit reads it.
+stack_env_value() { [ -f "$HOME/.mem0/stack.env" ] && sed -n "s/^$1=//p" "$HOME/.mem0/stack.env" | head -n1 | tr -d '\r'; return 0; }
+# A store already on the box: a receipt from an earlier install, or Qdrant collections on disk (a
+# restored data dir with no stack.env yet). "Fresh" means neither.
+store_exists() {
+    [ -f "$HOME/.mem0/stack.env" ] && return 0
+    [ -n "$(ls -A "$QDRANT_DIR/storage/collections" 2>/dev/null)" ]
+}
+RECORDED_PROFILE="$(stack_env_value MEM0_EMBED_PROFILE)"
+inherit_from_stack_env EMBED_PROFILE MEM0_EMBED_PROFILE --embed-profile
+PROFILE_BASIS="flag or receipt"
+if [ -z "$EMBED_PROFILE" ]; then
+    if store_exists; then
+        EMBED_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile from mem0-server/embedder_profile.py"
+        PROFILE_BASIS="existing store, no recorded profile"
+    else
+        EMBED_PROFILE="$FRESH_INSTALL_PROFILE"
+        PROFILE_BASIS="fresh install"
+    fi
+fi
+# An unknown name is refused here (embedder_profile.get exits with the list of known ones).
+ep_field "$EMBED_PROFILE" name >/dev/null || fail "--embed-profile '$EMBED_PROFILE' is not a known embedding profile (see mem0-server/embedder_profile.py)"
+LEGACY_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile"
+# The alias is recorded under the variable embedder_profile reads for the profile: the unscoped
+# MEM0_EMBED_MODEL predates profiles and counts for the default space only (embedder_profile.embed_model),
+# every other profile has its own MEM0_EMBED_MODEL_<PROFILE>.
+if [ "$EMBED_PROFILE" = "$LEGACY_PROFILE" ]; then EMBED_MODEL_KEY=MEM0_EMBED_MODEL; else EMBED_MODEL_KEY="$(ep_env_key "$EMBED_PROFILE")"; fi
+inherit_from_stack_env EMBED_MODEL "$EMBED_MODEL_KEY" --embed-model
 inherit_from_stack_env EVAL_ROOT   MEM0_EVAL_ROOT   --eval-root
 inherit_from_stack_env PCLOUD_DIR  MEM0_PCLOUD_DIR  --pcloud-dir
 inherit_from_stack_env ZFS_DATASET MEM0_ZFS_DATASET --zfs-dataset
@@ -160,7 +211,12 @@ if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_D
     ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
     [ -z "$ZFS_DATASET" ] || echo "    --zfs-dataset inherited from the installed drop-in: $ZFS_DATASET"
 fi
-[ -n "$EMBED_MODEL" ] || EMBED_MODEL="embeddinggemma"
+[ -n "$EMBED_MODEL" ] || EMBED_MODEL="$(ep_field "$EMBED_PROFILE" model)" || fail "cannot read the model alias of profile $EMBED_PROFILE"
+# What the drop-in sets must select exactly this alias through embedder_profile (a scoped key already
+# in stack.env, say, would outrank the variable we write and bind the server to another file).
+bound_alias="$( export MEM0_EMBED_PROFILE="$EMBED_PROFILE"; export "$EMBED_MODEL_KEY=$EMBED_MODEL"; ep_alias "$EMBED_PROFILE" )" || bound_alias=""
+[ "$bound_alias" = "$EMBED_MODEL" ] || fail "embedder_profile resolves profile $EMBED_PROFILE to '${bound_alias:-nothing}', not '$EMBED_MODEL' ($EMBED_MODEL_KEY): another alias override outranks it; remove it from ~/.mem0/stack.env"
+echo "    embed profile: $EMBED_PROFILE ($PROFILE_BASIS); llama-swap alias: $EMBED_MODEL"
 # 1.31.1: the wiki list is stored comma-separated whatever the flag or an older receipt used
 # (a space-separated receipt line is exactly what broke `. stack.env`), so re-runs converge.
 [ -z "$WIKI_SOURCES" ] || WIKI_SOURCES="$(stack_env_list "$WIKI_SOURCES")"
@@ -171,7 +227,7 @@ fi
 # at least one class of stack.env reader, so the install refuses instead (install/stack-env.sh).
 STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_HOST_KIND=native
                 MEM0_REPO_ROOT_WSL="$REPO_ROOT" MEM0_BIND="$BIND_IP" MEM0_ROLE=brain
-                MEM0_SECRETS_DIR="$SECRETS_DIR" MEM0_EMBED_MODEL="$EMBED_MODEL")
+                MEM0_SECRETS_DIR="$SECRETS_DIR" MEM0_EMBED_PROFILE="$EMBED_PROFILE" "$EMBED_MODEL_KEY=$EMBED_MODEL")
 [ -z "$EVAL_ROOT" ] || STACK_ENV_ARGS+=(MEM0_EVAL_ROOT="$EVAL_ROOT")
 [ -z "$PCLOUD_DIR" ] || STACK_ENV_ARGS+=(MEM0_PCLOUD_DIR="$PCLOUD_DIR")
 # v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
@@ -193,7 +249,9 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 # drop a line the operator wrote.
 # --promotion-gate-mode is the one operator key with a flag: given (even empty, which drops the
 # line), it replaces the recorded value, so the carry skips that key and it is written once.
-CARRY_SKIP=()
+# The profile and the active alias are written from the values above; the carry keeps every OTHER
+# embedding-space key (the alias of the space this store is not in is what a rollback needs).
+CARRY_SKIP=(MEM0_EMBED_PROFILE "$EMBED_MODEL_KEY")
 if [ "$SET_PROMOTION_GATE_MODE" = 1 ]; then
     CARRY_SKIP+=(MEM0_PROMOTION_GATE_MODE)
     case "$PROMOTION_GATE_MODE" in
@@ -261,6 +319,7 @@ render_units() {  # $1 = destination dir
         grep -q "__[A-Z_]*__" "$dst/$unit" && fail "unresolved sentinel in $unit"
     done
     sed -e "s|__MEM0_BIND__|$BIND_IP|g" -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" -e "s|__ZFS_DATASET__|$ZFS_DATASET|g" -e "s|__EMBED_MODEL__|$EMBED_MODEL|g" \
+        -e "s|__EMBED_PROFILE__|$EMBED_PROFILE|g" -e "s|__EMBED_MODEL_VAR__|$EMBED_MODEL_KEY|g" \
         "$REPO_ROOT/systemd/mem0-native.conf" > "$dst/mem0.service.d/native.conf"
     # no dataset given: the endpoint falls back to the disk usage of the home filesystem
     [ -n "$ZFS_DATASET" ] || sed -i '/^Environment=MEM0_ZFS_DATASET=$/d' "$dst/mem0.service.d/native.conf"
@@ -288,7 +347,33 @@ if [ "$DRY_RUN" = 0 ]; then
         [ -L "$p" ] || fail "$p is not a symlink into the AMS dataset (Phase 0 P0-2 symlink set; spec §4: nothing on the root disk)"
     done
     ip -4 -o addr show | grep -q " inet ${BIND_IP}/" || fail "$BIND_IP is not present on any interface (is tailscaled up?)"
-    curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (--embed-model)"
+    # the body first, then the match: `curl | grep -q` under pipefail can read a served alias as missing
+    models_json="$(curl -sf -m 5 http://127.0.0.1:11436/v1/models || true)"
+    printf '%s' "$models_json" | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model). EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture) and the entries install/1-wsl-services.sh prints"
+    # Rebinding an existing store to another space: mem0 CREATES an absent collection empty and then
+    # writes into it, so the new space must already hold the store (scripts/wsl/embedder-migrate.py).
+    PREV_PROFILE="$RECORDED_PROFILE"
+    if [ -z "$PREV_PROFILE" ] && store_exists; then PREV_PROFILE="$LEGACY_PROFILE"; fi
+    if [ -n "$PREV_PROFILE" ] && [ "$PREV_PROFILE" != "$EMBED_PROFILE" ]; then
+        new_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        new_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$new_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
+        [ "${new_pts:-0}" -gt 0 ] || fail "profile change $PREV_PROFILE -> $EMBED_PROFILE: collection '$new_mem' holds no points (or Qdrant is down). Build the new space first with scripts/wsl/embedder-migrate.py; binding mem0 to an empty collection starts a second, empty store"
+        echo "    profile change $PREV_PROFILE -> $EMBED_PROFILE: '$new_mem' holds $new_pts points"
+    fi
+    # The same rule judged from the store itself, whatever stack.env records (a hand edit can make the
+    # recorded profile equal the new one): never bind an existing store to an empty space while another
+    # space's memories collection holds its points.
+    if store_exists; then
+        eff_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        eff_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$eff_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
+        if [ "${eff_pts:-0}" -eq 0 ]; then
+            for other in $(ep_py 'print(" ".join(n for n in ep.PROFILES if n != sys.argv[1]))' "$EMBED_PROFILE"); do
+                o_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$other")" || continue
+                o_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$o_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
+                [ "${o_pts:-0}" -gt 0 ] && fail "profile $EMBED_PROFILE binds mem0 to '$eff_mem', which holds no points, while '$o_mem' (profile $other) holds $o_pts: build the space first (scripts/wsl/embedder-migrate.py) or keep --embed-profile $other"
+            done
+        fi
+    fi
 fi
 
 # 1.32.5: the SERVICE key (ams-service-key) proves a server-side job label (the dream's and the
@@ -553,5 +638,14 @@ printf '%s' "$deep_json" | jq -c '{ok, stack, canonical_key: .checks.canonical_k
 svc_present="$(printf '%s' "$deep_json" | jq -r '.checks.service_key.present // false' 2>/dev/null || echo false)"
 [ "$svc_present" = true ] || fail "mem0 did not load the service key (checks.service_key.present=${svc_present:-false}): is LoadCredentialEncrypted=ams-service-key in ~/.config/systemd/user/mem0.service.d/native.conf and $SECRETS_DIR/ams-service-key.cred readable? (journalctl --user -u mem0)"
 echo "    service key loaded by mem0"
+# The same kind of post-condition for the embedding space: the drop-in rendered above must have bound
+# the server to the profile resolved here, and to that profile's memories collection. A server that came
+# up on another space answers from the wrong collections with /health/deep otherwise green.
+bound_profile="$(printf '%s' "$deep_json" | jq -r '.embed_profile.profile // empty' 2>/dev/null || true)"
+bound_collection="$(printf '%s' "$deep_json" | jq -r '.collection // empty' 2>/dev/null || true)"
+want_collection="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || want_collection=""
+[ "$bound_profile" = "$EMBED_PROFILE" ] || fail "mem0 is bound to embedding profile '${bound_profile:-none reported}', not '$EMBED_PROFILE': is Environment=MEM0_EMBED_PROFILE in ~/.config/systemd/user/mem0.service.d/native.conf, and did the server restart? (journalctl --user -u mem0)"
+[ -z "$want_collection" ] || [ "$bound_collection" = "$want_collection" ] || fail "mem0 is bound to collection '${bound_collection:-none reported}', not '$want_collection' (profile $EMBED_PROFILE)"
+echo "    embedding profile $EMBED_PROFILE bound (collection ${bound_collection:-?}, alias $EMBED_MODEL)"
 echo
 echo "Native authority installed. Bind $BIND_IP:18791; secrets via systemd-creds; timers: systemctl --user list-timers ams-nightly.timer l10-audit.timer"

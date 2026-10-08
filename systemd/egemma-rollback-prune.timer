@@ -1,8 +1,13 @@
 [Unit]
-Description=Fire EmbeddingGemma rollback prune once on 2026-06-21 (one-shot, self-disables after a successful prune)
+Description=Fire the embedding-space rollback prune once the operator has set a date (self-disables after a prune that leaves nothing behind)
+# UN-ARMED ON PURPOSE. The OnCalendar below is a placeholder in the far future so that even a mistaken
+# `enable` cannot fire the destructive prune (with Persistent=true a PAST date would run it at once as
+# a missed run). Arm it after the rollback window: `systemctl --user edit egemma-rollback-prune.timer`,
+# set OnCalendar= (empty line first to clear this one) to the date, then `enable --now`. Installers
+# deploy this unit but never enable it (tests/test_systemd_parity.py pins that).
 
 [Timer]
-OnCalendar=2026-06-21 14:00:00
+OnCalendar=2099-01-01 00:00:00
 Persistent=true
 
 [Install]

@@ -54,7 +54,9 @@ RERANK_RETRY_MIN_S = 1.0
 RAN_STATUSES = ("ran", "ok-after-cold-retry")
 # Don't bother reranking trivially small or very confident result sets.
 RERANK_MIN_N = 3
-RERANK_SKIP_IF_TOP_SCORE = 0.92
+# Per embedding space: the head's COMBINED hybrid score rises with the dense model's cosine scale.
+import embedder_profile as _embedder_profile
+RERANK_SKIP_IF_TOP_SCORE = _embedder_profile.threshold("rerank_skip")
 # v2-m3 has 8192-token ctx; 6000 chars gives safe headroom for query + special tokens.
 # (was 380 chars for bge-reranker-base which had 512-token ctx)
 RERANK_DOC_MAX_CHARS = 6000  # v2-m3 ctx=8192; 6000 chars is safe room for query + special tokens

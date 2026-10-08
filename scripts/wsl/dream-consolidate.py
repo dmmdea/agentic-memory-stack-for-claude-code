@@ -60,6 +60,7 @@ for _cand in (Path(__file__).resolve().parents[2] / "mem0-server", Path.home() /
     if _cand.is_dir():
         sys.path.insert(0, str(_cand))
         break
+import embedder_profile as ep  # noqa: E402  (the memories collection of the active embedding space)
 try:
     import codex_shim_client as _csc
 except Exception:  # noqa: BLE001 — the dream must still import for a dry run without the server package
@@ -198,7 +199,7 @@ class Mem0Client:
         mem0 get_all — an unordered top_k over a 13k-point store — so "the last 36 h" cannot be
         read from it (the first live run saw no recent evidence in a store that had plenty).
         The nightly index build scrolls the same way; the tenant filter is applied here."""
-        col = collection or os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
+        col = collection or ep.collection("memories")
         pts, off = [], None
         while True:
             body = {"limit": 256, "with_payload": True, "with_vector": False,

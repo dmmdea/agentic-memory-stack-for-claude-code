@@ -9,6 +9,13 @@
   Qdrant is restored via the SNAPSHOT UPLOAD API, not by copying the storage directory. A raw
   directory copy is version-coupled and silently corrupts across Qdrant versions; the upload API
   is the supported path.
+
+  Embedding space: a snapshot's vectors only mean something to the model and prompt template that made
+  them. The set's manifest names its profile (embed_profile; a set from before profiles has none, which
+  is the default space) and the collection it holds. The restore refuses unless the WSL distro is
+  configured for that profile (~/.mem0/stack.env MEM0_EMBED_PROFILE, install/linux-replica.sh
+  --embed-profile) AND the local llama-swap serves the profile's alias. Both come from
+  mem0-server/embedder_profile.py as deployed in the distro; nothing here names a collection or model.
 #>
 param(
     # No default ON PURPOSE: the old 'P:\memory-backups\your-machine' default pointed at pCloud's STREAMING
@@ -17,7 +24,8 @@ param(
     [Parameter(Mandatory)][string]$BackupDir,
     [Parameter(Mandatory)][string]$Stamp,
     [string]$Distro = $(if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else { 'Ubuntu' }),
-    [string]$Collection = 'mem0_egemma_768'
+    # '' = the set's own collection (manifest collections.memories), else the profile's
+    [string]$Collection = ''
 )
 $ErrorActionPreference = 'Stop'
 function Wsl([string]$cmd) { wsl.exe -d $Distro -e bash -lc $cmd }
@@ -30,9 +38,44 @@ foreach ($f in @($epi, $hist, $snap)) { if (-not (Test-Path $f)) { throw "missin
 # Preconditions the hard way: jq is required by the snapshot chain (AMS issue #17), and a
 # missing embedder means the replica can answer nothing.
 if (-not (Wsl "command -v jq >/dev/null && echo ok")) { throw "jq is not installed in WSL ($Distro). Run: sudo apt-get install -y jq" }
-if (-not (Wsl "curl -sf -m 5 http://127.0.0.1:11436/v1/models >/dev/null && echo ok")) {
-    throw "The local embedder (llama-swap :11436) is not serving. The replica needs EmbeddingGemma@768 locally or recall returns nothing."
+
+# --- the set's embedding space, resolved by the profile module inside the distro ---
+$manifestFile = "$BackupDir\manifest-$Stamp.json"
+$mProfile = ''; $mCollection = ''
+if (Test-Path $manifestFile) {
+    try {
+        $mj = Get-Content -Raw $manifestFile | ConvertFrom-Json
+        if ($mj.embed_profile) { $mProfile = "$($mj.embed_profile)".Trim() }
+        if ($mj.collections -and $mj.collections.memories) { $mCollection = "$($mj.collections.memories)".Trim() }
+    } catch { Write-Warning "manifest $manifestFile did not parse ($_); treating the set as made before embedding profiles" }
 }
+if ($mProfile -eq 'unknown') { throw "set $Stamp was written without a resolvable embedding profile (embed_profile: unknown); fix the Brain's backup first" }
+$epScript = @'
+import json, os, sys
+sys.path.insert(0, os.path.expanduser("~/apps/mem0-server"))
+import embedder_profile as ep
+p = ep.get(ep.DEFAULT_PROFILE if sys.argv[1] == "-" else sys.argv[1])
+print(json.dumps({"profile": p.name, "local": ep.active().name, "alias": ep.embed_model(p),
+                  "collection": ep.collection("memories", p), "base_url": ep.base_url()}))
+'@
+$epJson = $epScript | wsl.exe -d $Distro -e python3 - $(if ($mProfile) { $mProfile } else { '-' })
+if ($LASTEXITCODE -ne 0 -or -not $epJson) {
+    throw "embedder_profile.py could not be read in WSL ($Distro) (is the server deployed to ~/apps/mem0-server, and does MEM0_EMBED_PROFILE name a known profile?): $epJson"
+}
+$space = "$epJson" | ConvertFrom-Json
+if ($space.profile -ne $space.local) {
+    throw "set $Stamp is in embedding profile '$($space.profile)' but WSL ($Distro) is configured for '$($space.local)' (~/.mem0/stack.env MEM0_EMBED_PROFILE). Restoring would load vectors this replica embeds every query against in another space. Serve '$($space.profile)' on llama-swap :11436, then re-run install/linux-replica.sh --embed-profile $($space.profile)."
+}
+if (-not (Wsl "curl -sf -m 5 '$($space.base_url)/models' | grep -q '`"$($space.alias)`"' && echo ok")) {
+    throw "The local embedder ($($space.base_url)) does not serve '$($space.alias)', the alias of embedding profile '$($space.profile)'. The replica needs it locally or recall returns nothing (EmbeddingGemma-2 needs llama.cpp b11452 or later)."
+}
+if (-not $Collection) {
+    $Collection = if ($mCollection) { $mCollection } else { "$($space.collection)" }
+    if ($Collection -ne "$($space.collection)") {
+        throw "set $Stamp holds collection '$Collection' but this replica's server binds '$($space.collection)' for profile '$($space.profile)' (MEM0_QDRANT_COLLECTION in ~/.mem0/stack.env). Align the two, or pass -Collection to restore under a name you will bind yourself."
+    }
+}
+Write-Host "    embedding profile $($space.profile): alias '$($space.alias)' served locally; restoring into collection '$Collection'"
 
 Write-Host "    stopping local mem0; starting qdrant (needed for the snapshot upload)"
 Wsl "systemctl --user stop mem0.service 2>/dev/null; systemctl --user start qdrant.service 2>/dev/null; true" | Out-Null

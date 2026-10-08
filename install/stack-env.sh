@@ -56,6 +56,16 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 #     environment and brands.json, not from here.
 #   MEM0_POOL_HEALTH_ACK: the operator's dated pool-health acknowledgment, `<STATE>:<YYYY-MM-DD>`
 #     (docs/systems/mem0-api.md, /health/maintenance), read by that endpoint on every call.
+#   MEM0_WIKI_EMBED_PROFILE: the LLM Wiki index's embedding space when it differs from the memories'
+#     (docs/systems/embedder-profiles.md): read, after the process environment, by
+#     mem0-server/embedder_profile.py (wiki_profile), so by the server's /health/deep, the wiki builder
+#     and wiki search. A rewrite that dropped it would move the wiki back to the memories' space.
+#   MEM0_QDRANT_COLLECTION / MEM0_COLLECTION (legacy name) / MEM0_EPISODES_COLLECTION /
+#     MEM0_WIKI_COLLECTION (a collection other than the profile's, e.g. a restore copy) and the
+#     threshold knobs MEM0_RELEVANCE_THRESHOLD / MEM0_RAW_FALLBACK_COSINE_FLOOR /
+#     MEM0_NLI_GATE_COSINE_FLOOR: read, after the process environment, by mem0-server/embedder_profile.py
+#     (collection, threshold), so by the server and every job. A rewrite that dropped a collection
+#     override would silently rebind the server to the profile's own collection.
 #   MEM0_NLI_GATE_ENABLED (the NLI write gate): NOT read from here. mem0-server/app.py reads it once,
 #     at import, from the process environment only, so a value here is recorded and carried but does
 #     not turn the gate on. To turn it on, set Environment=MEM0_NLI_GATE_ENABLED=1 in a mem0.service
@@ -65,13 +75,28 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 # sets a key here passes its name as a skip argument to stack_env_carry so the line is written
 # exactly once.
 # A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK"
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK MEM0_WIKI_EMBED_PROFILE MEM0_QDRANT_COLLECTION MEM0_COLLECTION MEM0_EPISODES_COLLECTION MEM0_WIKI_COLLECTION MEM0_RELEVANCE_THRESHOLD MEM0_RAW_FALLBACK_COSINE_FLOOR MEM0_NLI_GATE_COSINE_FLOOR"
+# The embedding-space keys (mem0-server/embedder_profile.py reads them from this file when the process
+# environment has none) are carried by PATTERN, not by name, so a profile added later is covered:
+# MEM0_EMBED_PROFILE, the alias overrides MEM0_EMBED_MODEL (EmbeddingGemma-300m only) and
+# MEM0_EMBED_MODEL_<PROFILE> / MEM0_EMBED_LONG_MODEL_<PROFILE>, and MEM0_EMBED_BASE_URL. A rewrite that
+# dropped MEM0_EMBED_PROFILE would rebind the server to the default space's collections while the store
+# sits in another (searches score noise, /health/deep stays green); one that dropped an alias would
+# send the queries to a different conversion of the model. linux-authority.sh and linux-replica.sh
+# write the profile (and the authority the active alias) themselves and pass those names as skips.
+STACK_ENV_EMBED_KEY_RE='^MEM0_EMBED_(PROFILE|MODEL|MODEL_[A-Z0-9_]+|LONG_MODEL_[A-Z0-9_]+|BASE_URL)$'
 
-stack_env_carry() {  # $1 = the existing stack.env, $2.. = keys to skip (set by a flag) -> "KEY=VALUE" lines for the operator-owned keys it records
+stack_env_carry() {  # $1 = the existing stack.env, $2.. = keys to skip (set by a flag) -> "KEY=VALUE" lines for the operator-owned and embedding-space keys it records
     local k v file="$1" s skip
     shift
     [ -f "$file" ] || return 0
-    for k in $STACK_ENV_OPERATOR_KEYS; do
+    local -a keys
+    read -r -a keys <<< "$STACK_ENV_OPERATOR_KEYS"
+    # the embedding-space keys the file records, in file order, each once
+    while IFS= read -r k; do
+        [[ "$k" =~ $STACK_ENV_EMBED_KEY_RE ]] && keys+=("$k")
+    done < <(sed -n 's/^\(MEM0_EMBED_[A-Z0-9_]*\)=.*$/\1/p' "$file" | tr -d '\r' | awk '!seen[$0]++')
+    for k in "${keys[@]}"; do
         skip=0
         for s in "$@"; do [ "$s" != "$k" ] || skip=1; done
         [ "$skip" = 0 ] || continue

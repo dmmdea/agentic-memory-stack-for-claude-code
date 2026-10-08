@@ -22,6 +22,17 @@ WSL_ONLY = re.compile(r"/mnt/c|cmd\.exe|powershell\.exe|dpapi-fetch-key\.sh|/run
 
 
 from _home_isolation import home_env  # noqa: E402
+import embedder_profile as EP  # noqa: E402  (mem0-server is on sys.path: tests/ is a package)
+
+LEGACY = EP.DEFAULT_PROFILE                       # the space stores were built in before profiles
+FRESH = "egemma-300m"                             # the installer's policy: what a box with no store starts in
+OTHER = "egemma2"                                 # a non-default space, for the scoped-alias paths
+assert FRESH == LEGACY and OTHER in EP.PROFILES and OTHER != LEGACY
+
+
+def EP_KEY(profile):
+    """The scoped alias variable, restated here on purpose: the test below asks embedder_profile whether it reads it."""
+    return "MEM0_EMBED_MODEL_" + profile.upper().replace("-", "_")
 
 
 def _run(args, tmp_path, secrets=True):
@@ -32,7 +43,7 @@ def _run(args, tmp_path, secrets=True):
     if secrets:
         (sec / "ams-api-key.cred").write_bytes(b"x" * 64)
         (sec / "ams-canonical-key.cred").write_bytes(b"y" * 64)
-    env = home_env(home)
+    env = {k: v for k, v in home_env(home).items() if not k.startswith("MEM0_EMBED")}  # the operator's embedding settings must not reach the installer
     r = subprocess.run([BASH, str(SCRIPT), *args, "--secrets-dir", str(sec)],
                        capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
     return r, home
@@ -221,17 +232,38 @@ def test_l10_audit_gets_its_own_credential_dropin(tmp_path):
     assert "Environment=MEM0_API_KEY_FILE=%d/ams-api-key" in conf and "__SECRETS_DIR__" not in conf
 
 
+
+def _conf(out):
+    return (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+
+
 def test_embed_model_is_rendered_into_the_drop_in(tmp_path):
     """The store is bound to the exact GGUF it was embedded with; the authority names the llama-swap
-    model that serves that file (a stock 'embeddinggemma' of another conversion scored noise)."""
+    model that serves that file (a stock 'embeddinggemma' of another conversion scored noise). The
+    variable it is rendered under follows the profile: the unscoped MEM0_EMBED_MODEL names an
+    EmbeddingGemma-300m file, so it is written for that profile only."""
+    # an existing store (a receipt with no profile) is EmbeddingGemma-300m: the line is exactly what it was
+    home = tmp_path / "home"
+    _stack_env(home)
     out = tmp_path / "render"
     r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
     assert r.returncode == 0, r.stderr
-    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma\n" in (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    conf = _conf(out)
+    assert f"Environment=MEM0_EMBED_PROFILE={LEGACY}\n" in conf
+    assert f"Environment=MEM0_EMBED_MODEL={EP.get(LEGACY).model}\n" in conf
     out2 = tmp_path / "render2"
     r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-model", "embeddinggemma-ams", "--render-only", str(out2)], tmp_path)
     assert r.returncode == 0, r.stderr
-    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-ams\n" in (out2 / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-ams\n" in _conf(out2)
+    # the other profile: the alias travels under its own scoped variable, never the unscoped one
+    out3 = tmp_path / "render3"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", OTHER, "--embed-model", "embeddinggemma2-ams",
+                 "--render-only", str(out3)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    conf3 = _conf(out3)
+    assert f"Environment=MEM0_EMBED_PROFILE={OTHER}\n" in conf3
+    assert f"Environment={EP_KEY(OTHER)}=embeddinggemma2-ams\n" in conf3
+    assert "Environment=MEM0_EMBED_MODEL=" not in conf3, "the unscoped variable would leak a 300m alias into a rollback"
 
 
 def test_tenant_inherits_from_the_existing_receipt_on_a_rerun(tmp_path):
@@ -342,13 +374,182 @@ def test_zfs_dataset_inherits_from_a_pre_v1232_drop_in(tmp_path):
 
 
 def test_first_install_applies_the_defaults(tmp_path):
+    """A box with no store starts in the default space (EmbeddingGemma-300m: on short facts it measured
+    better than EmbeddingGemma-2 through the per-prompt path, 2026-10-08), under its alias."""
     out = tmp_path / "render"
     r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
     assert r.returncode == 0, r.stderr
-    conf = (out / "mem0.service.d" / "native.conf").read_text(encoding="utf-8")
-    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma\n" in conf
+    conf = _conf(out)
+    assert f"Environment=MEM0_EMBED_PROFILE={FRESH}\n" in conf
+    assert f"Environment=MEM0_EMBED_MODEL={EP.get(FRESH).model}\n" in conf
     assert "MEM0_ZFS_DATASET" not in conf
     assert "inherited" not in r.stdout
+    assert f"embed profile: {FRESH} (fresh install)" in r.stdout
+
+
+# ---- the embedding space (embedder_profile): --embed-profile, its defaults and its receipt ------
+
+
+def _se_lines(out):
+    return [ln for ln in (out / "stack.env").read_text(encoding="utf-8").splitlines() if ln]
+
+
+def test_a_fresh_install_records_its_profile_and_a_rerun_keeps_it(tmp_path):
+    """No stack.env and no Qdrant data = fresh = the default space. The receipt records it, so the next
+    run is a fixed point and a later default change cannot move the store."""
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    se = _se_lines(out)
+    assert f"MEM0_EMBED_PROFILE={FRESH}" in se and f"MEM0_EMBED_MODEL={EP.get(FRESH).model}" in se
+    (tmp_path / "home" / ".mem0").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "home" / ".mem0" / "stack.env").write_text((out / "stack.env").read_text(encoding="utf-8"), encoding="utf-8")
+    out2 = tmp_path / "render2"
+    r2, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out2)], tmp_path)
+    assert r2.returncode == 0, r2.stderr
+    assert f"--embed-profile inherited from ~/.mem0/stack.env: {FRESH}" in r2.stdout
+    assert _se_lines(out2) == se, "a re-run from its own receipt is a fixed point"
+    assert _conf(out2) == _conf(out)
+
+
+def test_an_existing_store_without_a_recorded_profile_stays_in_the_old_space(tmp_path):
+    """A receipt from before profiles (the authority already in service) must not move to the newest
+    space by itself: searches would score noise against the old vectors with /health/deep green."""
+    home = tmp_path / "home"
+    _stack_env(home, "MEM0_EMBED_MODEL=embeddinggemma-ams\n")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"embed profile: {LEGACY} (existing store, no recorded profile)" in r.stdout
+    se = _se_lines(out)
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in se and "MEM0_EMBED_MODEL=embeddinggemma-ams" in se
+    conf = _conf(out)
+    assert f"Environment=MEM0_EMBED_PROFILE={LEGACY}\n" in conf
+    assert "Environment=MEM0_EMBED_MODEL=embeddinggemma-ams\n" in conf
+
+
+def test_qdrant_collections_on_disk_make_an_existing_store(tmp_path):
+    """A restored data dir with no stack.env yet is a store, not a fresh install."""
+    home = tmp_path / "home"
+    (home / "qdrant-server" / "storage" / "collections" / EP.get(LEGACY).memories).mkdir(parents=True)
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in _se_lines(out)
+    # an empty storage dir is still a fresh install
+    out2 = tmp_path / "render2"
+    (home / "qdrant-server" / "storage" / "collections" / EP.get(LEGACY).memories).rmdir()
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"MEM0_EMBED_PROFILE={FRESH}" in _se_lines(out2)
+    assert "(fresh install)" in r.stdout
+
+
+def test_a_recorded_profile_outranks_the_default_and_the_flag_outranks_both(tmp_path):
+    home = tmp_path / "home"
+    _stack_env(home, f"MEM0_EMBED_PROFILE={OTHER}\n")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"--embed-profile inherited from ~/.mem0/stack.env: {OTHER}" in r.stdout
+    assert f"MEM0_EMBED_PROFILE={OTHER}" in _se_lines(out)
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", LEGACY, "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in _se_lines(out2) and "--embed-profile inherited" not in r.stdout
+    # an explicit empty value clears the recorded one, and the default rule applies (a receipt exists: 300m)
+    out3 = tmp_path / "render3"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", "", "--render-only", str(out3)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "--embed-profile cleared (explicit empty value; not inherited)" in r.stdout
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in _se_lines(out3)
+
+
+def test_an_unknown_profile_is_refused_before_anything_is_written(tmp_path):
+    r, home = _run(["--bind-ip", "192.0.2.9", "--embed-profile", "no-such-space", "--dry-run"], tmp_path)
+    assert r.returncode != 0
+    assert "not a known embedding profile" in r.stderr and "no-such-space" in r.stderr
+    assert not (home / ".mem0").exists()
+    # a recorded unknown profile is refused the same way (a hand edit must not bind the server nowhere)
+    home = tmp_path / "home2"
+    _stack_env(home, "MEM0_EMBED_PROFILE=no-such-space\n")
+    r = subprocess.run([BASH, str(SCRIPT), "--bind-ip", "192.0.2.9", "--render-only", str(tmp_path / "r"),
+                        "--secrets-dir", str(tmp_path / "secrets")], capture_output=True, text=True,
+                       env=home_env(home), cwd=str(REPO_ROOT), timeout=120)
+    assert r.returncode != 0 and "not a known embedding profile" in r.stderr
+
+
+def test_switching_profiles_keeps_the_other_spaces_alias_for_a_rollback(tmp_path):
+    """The alias of the space the store is NOT in stays in stack.env: it is what a rollback needs, and
+    the installer's own rewrite of the file must not be what drops it."""
+    home = tmp_path / "home"
+    _stack_env(home, "MEM0_EMBED_MODEL=embeddinggemma-ams\n")
+    out = tmp_path / "render"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", OTHER, "--render-only", str(out)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    se = _se_lines(out)
+    assert f"MEM0_EMBED_PROFILE={OTHER}" in se and f"{EP_KEY(OTHER)}={EP.get(OTHER).model}" in se
+    assert "MEM0_EMBED_MODEL=embeddinggemma-ams" in se, "the legacy alias is carried, not rewritten"
+    assert "MEM0_EMBED_MODEL carried over from ~/.mem0/stack.env: embeddinggemma-ams" in r.stdout
+    conf = _conf(out)
+    assert "Environment=MEM0_EMBED_MODEL=" not in conf, "the drop-in sets the active profile's alias only"
+    # and back: the scoped alias recorded for the other space is carried the same way
+    (home / ".mem0" / "stack.env").write_text((out / "stack.env").read_text(encoding="utf-8"), encoding="utf-8")
+    out2 = tmp_path / "render2"
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", LEGACY, "--render-only", str(out2)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    se2 = _se_lines(out2)
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in se2 and "MEM0_EMBED_MODEL=embeddinggemma-ams" in se2
+    assert f"{EP_KEY(OTHER)}={EP.get(OTHER).model}" in se2
+    assert se2.count(f"MEM0_EMBED_PROFILE={LEGACY}") == 1
+
+
+def test_the_rendered_drop_in_selects_the_alias_through_embedder_profile(tmp_path, monkeypatch):
+    """The point of rendering the alias under a profile-specific variable is that embedder_profile
+    reads exactly that variable. Feed the drop-in's Environment= lines to the module and ask it."""
+    from _home_isolation import apply_home
+    for profile in (LEGACY, OTHER):
+        out = tmp_path / f"render-{profile}"
+        r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-profile", profile, "--embed-model", f"{profile}-served",
+                     "--render-only", str(out)], tmp_path)
+        assert r.returncode == 0, r.stderr
+        env = dict(ln[len("Environment="):].split("=", 1) for ln in _conf(out).splitlines() if ln.startswith("Environment=MEM0_EMBED"))
+        with monkeypatch.context() as m:
+            apply_home(m, tmp_path / "empty-home")
+            for k in [k for k in os.environ if k.startswith("MEM0_EMBED")]:
+                m.delenv(k)
+            for k, v in env.items():
+                m.setenv(k, v)
+            assert EP.active().name == profile
+            assert EP.embed_model() == f"{profile}-served"
+
+
+def test_a_scoped_override_that_outranks_the_written_alias_is_refused(tmp_path):
+    """embedder_profile.embed_model reads MEM0_EMBED_MODEL_<PROFILE> before the unscoped variable. A
+    receipt carrying both for the default space would bind the server to the scoped one, not to the
+    alias the installer is about to write; the installer says so instead of rendering a lie."""
+    home = tmp_path / "home"
+    _stack_env(home, f"MEM0_EMBED_PROFILE={LEGACY}\nMEM0_EMBED_MODEL=from-the-flag\n{EP_KEY(LEGACY)}=outranks-it\n")
+    r, _ = _run(["--bind-ip", "192.0.2.9", "--embed-model", "from-the-flag", "--render-only", str(tmp_path / "render")], tmp_path)
+    assert r.returncode != 0
+    assert "outranks it" in r.stderr and "from-the-flag" in r.stderr, r.stderr
+
+
+def test_the_live_checks_name_the_profile_and_guard_a_rebind(tmp_path):
+    """The /v1/models check cannot run here (it needs a llama-swap); what it checks is pinned by text:
+    the profile's alias, the b11452 floor of the gemma-embedding2 architecture, and the refusal to bind
+    a store to a collection that holds no points."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    assert "does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model)" in sh
+    assert "b11452" in sh
+    i = sh.index('PREV_PROFILE="$RECORDED_PROFILE"')
+    guard = sh[i:i + 1500]
+    assert '/collections/$new_mem' in guard and "embedder-migrate.py" in guard and "holds no points" in guard
+    # an unrecorded store counts as the default space whether the box has a receipt or only Qdrant data on
+    # disk (a restored data dir): the same test that decided "existing store" decides "which space it is in"
+    assert 'if [ -z "$PREV_PROFILE" ] && store_exists; then PREV_PROFILE="$LEGACY_PROFILE"; fi' in guard
+    assert 'ep.collection("memories", ep.get(sys.argv[1]))' in guard, "the collection name comes from embedder_profile"
+    assert sh.index("holds no points") < sh.index("systemctl --user restart mem0.service"), "the guard runs before the server restarts"
 
 
 def test_stack_env_records_the_zfs_dataset(tmp_path):
@@ -606,3 +807,92 @@ def test_the_manifest_reads_the_directory_the_installers_stamp():
         text = installer.read_text(encoding="utf-8")
         assert re.search(rf'\b{var}="\$(HOME|USER_HOME)/apps/mem0-server"', text), \
             f"{installer.name}: {var} is not <home>/apps/mem0-server, where the manifest writer looks"
+
+
+# ---- the replica installer's embedding profile (install/linux-replica.sh) ------------------------
+# Dry runs only (the live path needs a Brain, ssh and systemd): the thin-client step and every tool the
+# installer reaches for are stubs, as in test_linux_replica.py. Nothing is written under HOME.
+
+REPLICA = REPO_ROOT / "install" / "linux-replica.sh"
+
+
+def _replica_dry_run(tmp_path, *args, stack_env=None):
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True, exist_ok=True)
+    if stack_env is not None:
+        (home / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name in ("claude", "ssh", "systemctl", "jq", "loginctl", "curl"):
+        stub = bindir / name
+        stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+    env = dict(home_env(home), PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    for k in [k for k in env if k.startswith("MEM0_")]:
+        del env[k]
+    r = subprocess.run([BASH, str(REPLICA), "--authority", "http://brain-host:18791", "--brain-ssh", "brain",
+                        "--user-id", "tenant-a", "--dry-run", *args],
+                       capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+    return r, home
+
+
+def test_a_replica_with_nothing_recorded_takes_the_default_space_and_says_so(tmp_path):
+    """A dry run asks nobody (the authority is not probed), so with no flag and no receipt the replica
+    names the default space; the live path would have asked the authority's /health/deep first."""
+    r, home = _replica_dry_run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"embed profile: {LEGACY} (the default space; the authority did not say)" in r.stdout, r.stdout
+    assert f"local llama-swap alias: {EP.get(LEGACY).model}" in r.stdout
+    assert f"MEM0_EMBED_PROFILE={LEGACY}" in r.stdout, "the plan names what stack.env will record"
+    assert not (home / ".mem0" / "replica.env").exists()
+
+
+def test_a_replica_follows_the_profile_it_is_given_and_the_one_it_recorded(tmp_path):
+    r, _ = _replica_dry_run(tmp_path, "--embed-profile", OTHER)
+    assert r.returncode == 0, r.stderr
+    assert f"embed profile: {OTHER}; local llama-swap alias: {EP.get(OTHER).model}" in r.stdout, r.stdout
+    # a re-run inherits the receipt; the flag outranks it; an explicit empty value clears it
+    r, _ = _replica_dry_run(tmp_path / "rerun", stack_env=f"MEM0_WSL_USER=t\nMEM0_EMBED_PROFILE={OTHER}\n")
+    assert f"--embed-profile inherited from ~/.mem0/stack.env: {OTHER}" in r.stdout, r.stdout
+    r, _ = _replica_dry_run(tmp_path / "flag", "--embed-profile", LEGACY, stack_env=f"MEM0_EMBED_PROFILE={OTHER}\n")
+    assert f"embed profile: {LEGACY};" in r.stdout and "--embed-profile inherited" not in r.stdout
+    r, _ = _replica_dry_run(tmp_path / "clear", "--embed-profile", "", stack_env=f"MEM0_EMBED_PROFILE={OTHER}\n")
+    assert "--embed-profile cleared (explicit empty value; not inherited)" in r.stdout
+    assert f"embed profile: {LEGACY} (the default space" in r.stdout
+
+
+def test_a_replica_uses_its_own_scoped_alias_for_the_check(tmp_path):
+    """A replica may serve the GGUF under its own name; the installer checks THAT alias is listed."""
+    r, _ = _replica_dry_run(tmp_path, stack_env=f"MEM0_EMBED_PROFILE={OTHER}\n{EP_KEY(OTHER)}=eg2-on-this-box\n")
+    assert r.returncode == 0, r.stderr
+    assert "local llama-swap alias: eg2-on-this-box" in r.stdout, r.stdout
+
+
+def test_a_replica_refuses_an_unknown_profile(tmp_path):
+    r, _ = _replica_dry_run(tmp_path, "--embed-profile", "no-such-space")
+    assert r.returncode != 0
+    assert "not a known embedding profile" in r.stderr and "no-such-space" in r.stderr
+
+
+def test_the_replica_installer_checks_the_authority_and_the_profiles_alias_on_a_live_run():
+    """The live checks need a Brain and a llama-swap; pinned by text: the authority's own /health/deep
+    answer must agree with the replica's profile, the alias is looked up in /v1/models, and the profile is
+    recorded through the one stack.env writer with the carry skipping the key it writes."""
+    sh = REPLICA.read_text(encoding="utf-8")
+    assert "$AUTHORITY/health/deep" in sh and ".embed_profile.profile" in sh
+    assert 'AUTH_PROFILE" != "$EMBED_PROFILE"' in sh and "a replica in another space answers nonsense" in sh
+    assert 'grep -q "\\"$EMBED_ALIAS\\""' in sh and "b11452" in sh
+    assert 'stack_env_carry "$MEM0_DIR/stack.env" MEM0_EMBED_PROFILE' in sh
+    assert 'MEM0_EMBED_PROFILE="$EMBED_PROFILE"' in sh
+    assert 'if [ "$DRY_RUN" = 0 ]; then   # a dry run touches nothing, and asks nobody' in sh
+
+
+def test_the_authority_installer_proves_the_server_came_up_in_the_resolved_space():
+    """After the restart the server must report the resolved profile and its memories collection: a drop-in
+    that did not take effect would otherwise leave mem0 on another space with /health/deep green."""
+    sh = SCRIPT.read_text(encoding="utf-8")
+    i = sh.index("bound_profile=")
+    tail = sh[i:]
+    assert ".embed_profile.profile" in tail and "is bound to embedding profile" in tail
+    assert 'ep.collection("memories", ep.get(sys.argv[1]))' in tail and "is bound to collection" in tail
+    assert sh.index('service key loaded by mem0') < i, "after the service-key post-condition"

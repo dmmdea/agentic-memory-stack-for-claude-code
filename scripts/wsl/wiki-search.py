@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Semantic search over the Obsidian LLM Wiki (wiki_pages_egemma_768) — CM5.
+"""Semantic search over the Obsidian LLM Wiki (the wiki profile's collection) — CM5.
 
 Embeds the query with the SAME EmbeddingGemma prefix-shim mem0 uses (query
 prefix, asymmetric to the document-prefixed index) and returns the top-K wiki
@@ -22,11 +22,21 @@ import os
 import sys
 from pathlib import Path
 
-COLLECTION = "wiki_pages_egemma_768"
 QDRANT_HOST = os.environ.get("WIKI_QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.environ.get("WIKI_QDRANT_PORT", "6333"))
 
-sys.path.insert(0, str(Path.home() / "apps" / "mem0-server"))
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as _ep  # noqa: E402
+
+# Queries go through the wiki space's hot alias: for a short query it returns the same vector as the
+# long alias the pages were built with (one space).
+WIKI_PROFILE = _ep.wiki_profile()
+COLLECTION = _ep.collection("wiki", WIKI_PROFILE)
 
 
 def main() -> int:
@@ -46,7 +56,7 @@ def main() -> int:
               f"— run wiki-index-build.py first (a dormant replica Qdrant has no collections)")
         return 1
 
-    vec = build_embedder().embed(args.query, memory_action="search")
+    vec = build_embedder(profile=WIKI_PROFILE).embed(args.query, memory_action="search")
     hits = client.query_points(collection_name=COLLECTION, query=list(vec), limit=args.k).points
     for h in hits:
         pl = h.payload or {}

@@ -35,7 +35,10 @@ from typing import Literal, Optional
 from mem0.embeddings.openai import OpenAIEmbedding
 from openai import RateLimitError
 
-# Verbatim from the EmbeddingGemma model card.
+import embedder_profile
+
+# Verbatim from the EmbeddingGemma model cards (both generations use the same strings; the
+# active profile in embedder_profile is the source the embedder instance reads).
 _QUERY_PREFIX = "task: search result | query: "
 _DOC_PREFIX = "title: none | text: "
 
@@ -138,11 +141,20 @@ def _truncate_for_embedding(text: str,
     return text
 
 
+def budget_for(profile: "embedder_profile.EmbedProfile") -> int:
+    """The embedding-input budget for a profile: its token budget minus the prefix reserve.
+    EmbeddingGemma-300m keeps the measured 1900 - 16; EmbeddingGemma-2's 8,192-token window is
+    what lets a long record or wiki page be embedded whole instead of as its first ~2,000 tokens."""
+    return profile.token_budget - _PREFIX_TOKEN_RESERVE
+
+
 class EmbeddingGemmaEmbedder(OpenAIEmbedding):
     """OpenAI-transport embedder that prepends EmbeddingGemma task prefixes.
 
     Reuses OpenAIEmbedding's HTTP client and batching unchanged; only the input
     text is rewritten with the action-appropriate prefix before it goes out.
+    The prefixes and the token budget come from the active embedder_profile, read
+    once when the instance is built (app.py builds it at server start).
     """
 
     # MEM-12: this class already does the bounded 429 retry internally.
@@ -151,21 +163,29 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
     # never a multiple of it).
     handles_429_retry = True
 
+    def __init__(self, config=None, profile: "Optional[embedder_profile.EmbedProfile]" = None):
+        super().__init__(config)
+        self.profile = profile or embedder_profile.active()
+        self._budget = budget_for(self.profile)
+
+    def _prefix(self, memory_action) -> str:
+        return self.profile.query_prefix if memory_action == "search" else self.profile.doc_prefix
+
     def embed(
         self,
         text,
         memory_action: Optional[Literal["add", "search", "update"]] = None,
     ):
         # v0.22 M4: ctx-safe truncation of the embedding input only (storage keeps
-        # the full text). Prevents a 2048-token overflow -> llama-server 500 ->
+        # the full text). Prevents a context overflow -> llama-server 500 ->
         # silent memory loss on token-dense records.
-        prefixed = _prefix_for(memory_action) + _truncate_for_embedding(text)
+        prefixed = self._prefix(memory_action) + _truncate_for_embedding(text, self._budget)
         # MEM-12: one bounded retry on a llama-swap 429 burst; see module header.
         parent = super()
         return _retry_on_429(lambda: parent.embed(prefixed, memory_action))
 
     def embed_batch(self, texts, memory_action="add"):
-        prefix = _prefix_for(memory_action)
-        prefixed = [prefix + _truncate_for_embedding(t) for t in texts]
+        prefix = self._prefix(memory_action)
+        prefixed = [prefix + _truncate_for_embedding(t, self._budget) for t in texts]
         parent = super()
         return _retry_on_429(lambda: parent.embed_batch(prefixed, memory_action))

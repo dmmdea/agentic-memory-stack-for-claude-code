@@ -40,10 +40,11 @@ for _cand in (Path(__file__).resolve().parents[2] / "mem0-server", Path.home() /
         sys.path.append(str(_cand))
         break
 import redact  # noqa: E402
+import embedder_profile as ep  # noqa: E402  (collection names of the active embedding space; same mem0-server dir)
 
 MEM0_URL = ams_env.mem0_url()
 QDRANT_URL = "http://127.0.0.1:6333"
-QDRANT_COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")  # env-overridable; default is the live collection (was the dead pre-egemma 'memories' -> 404)
+QDRANT_COLLECTION = ep.collection("memories")  # env-overridable (MEM0_QDRANT_COLLECTION / MEM0_COLLECTION); default is the active space's collection
 STATE_FILE = Path.home() / ".mem0" / "l10-state.json"
 FLAGS_FILE = Path.home() / ".mem0" / "audit-flags.jsonl"
 PROMOTE_LEDGER = Path.home() / ".mem0" / "tier-ledger.jsonl"

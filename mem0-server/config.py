@@ -19,21 +19,35 @@ WSL-native, no Docker. Backends:
 """
 from pathlib import Path
 
+import embedder_profile
+
+# The embedding space this server is bound to (embedder_profile: model alias, prefixes, token
+# budget and collections, resolved once at import from MEM0_EMBED_PROFILE / stack.env).
+EMBED_PROFILE = embedder_profile.active()
+
 # Embedder transport config, shared by build_config() (for schema validation) and
 # build_embedder() (the actual prefix-shim instance app.py installs on the Memory).
 EMBEDDER_CONFIG = {
-    # MEM0_EMBED_MODEL (2026-09-11): the llama-swap model name. The store is bound to the exact GGUF
-    # it was embedded with; a box whose stock "embeddinggemma" is a different conversion serves the
-    # matching file under another name (the native authority: embeddinggemma-ams).
-    "model": __import__("os").environ.get("MEM0_EMBED_MODEL", "embeddinggemma").strip() or "embeddinggemma",
-    "openai_base_url": "http://localhost:11436/v1",
+    # The llama-swap model name. The store is bound to the exact GGUF it was embedded with; a box
+    # whose stock alias is a different conversion serves the matching file under another name (the
+    # native authority: embeddinggemma-ams). embedder_profile.embed_model() scopes that override to
+    # its profile.
+    "model": embedder_profile.embed_model(EMBED_PROFILE),
+    "openai_base_url": embedder_profile.base_url(),
     "api_key": "sk-noop",
-    "embedding_dims": 768,
+    "embedding_dims": EMBED_PROFILE.dims,
 }
+MEMORIES_COLLECTION = embedder_profile.collection("memories", EMBED_PROFILE)
 
 
-def build_embedder():
+def build_embedder(long: bool = False, profile=None):
     """Return the EmbeddingGemma prefix-shim embedder instance.
+
+    profile: the embedding space to embed in (default: the server's, EMBED_PROFILE). The wiki
+    indexer passes embedder_profile.wiki_profile(), which may be another space than the memories'.
+    long=True returns that space served for long documents (wiki pages): the profile's long alias
+    and long token budget (embedder_profile.long_model), or the hot alias with the hot budget when
+    the profile or the box has none, so a caller never needs to care.
 
     app.py calls this and assigns the result to mem.embedding_model right after
     Memory.from_config(), so every add/search/update goes through the asymmetric
@@ -43,8 +57,16 @@ def build_embedder():
     (same transport) purely to pass validation, and this swap supplies the shim.
     """
     from mem0.configs.embeddings.base import BaseEmbedderConfig
-    from egemma_embedder import EmbeddingGemmaEmbedder
-    return EmbeddingGemmaEmbedder(BaseEmbedderConfig(**EMBEDDER_CONFIG))
+    from egemma_embedder import EmbeddingGemmaEmbedder, _PREFIX_TOKEN_RESERVE
+    p = profile or EMBED_PROFILE
+    cfg = dict(EMBEDDER_CONFIG) if p.name == EMBED_PROFILE.name else {
+        **EMBEDDER_CONFIG, "model": embedder_profile.embed_model(p), "embedding_dims": p.dims}
+    if not long:
+        return EmbeddingGemmaEmbedder(BaseEmbedderConfig(**cfg), profile=p)
+    alias, budget = embedder_profile.long_model(p)
+    emb = EmbeddingGemmaEmbedder(BaseEmbedderConfig(**{**cfg, "model": alias}), profile=p)
+    emb._budget = budget - _PREFIX_TOKEN_RESERVE
+    return emb
 
 
 EXTRACTION_PROMPT = """You extract memorable facts from conversation chunks.
@@ -94,12 +116,13 @@ def build_config() -> dict:
         "vector_store": {
             "provider": "qdrant",
             "config": {
-                # v0.22: re-embedded EmbeddingGemma vectors live in a NEW collection;
-                # the old nomic "memories" collection is retained untouched for rollback.
-                "collection_name": "mem0_egemma_768",
+                # One collection per embedding space (embedder_profile): mem0_egemma_768 for
+                # EmbeddingGemma-300m, mem0_eg2_768 for EmbeddingGemma-2. A space change builds
+                # the new collection beside the old one (scripts/wsl/embedder-migrate.py).
+                "collection_name": MEMORIES_COLLECTION,
                 "host": "localhost",
-                "port": 6333,
-                "embedding_model_dims": 768,
+                "port": int(__import__("os").environ.get("MEM0_QDRANT_PORT", "6333")),
+                "embedding_model_dims": EMBED_PROFILE.dims,
                 "on_disk": True,
             },
         },

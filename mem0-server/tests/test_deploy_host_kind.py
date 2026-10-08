@@ -34,8 +34,13 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 NATIVE_ENV = (
     "MEM0_WSL_USER=tenant\nMEM0_WIN_USER=\nMEM0_DISTRO=native\nMEM0_HOST_KIND=native\n"
     "MEM0_REPO_ROOT_WSL=/srv/checkout\nMEM0_BIND=192.0.2.9\nMEM0_ROLE=brain\n"
-    "MEM0_SECRETS_DIR=/srv/secrets\nMEM0_EMBED_MODEL=embeddinggemma\n"
+    "MEM0_SECRETS_DIR=/srv/secrets\nMEM0_EMBED_PROFILE=egemma-300m\nMEM0_EMBED_MODEL=embeddinggemma\n"
 )
+# The receipt a re-run of the installer inherits from: the embedding profile and its alias ride in it
+# (install/linux-authority.sh --embed-profile), and deploy.sh must treat it like any other native receipt.
+NATIVE_ENV_EG2 = NATIVE_ENV.replace("MEM0_EMBED_PROFILE=egemma-300m\nMEM0_EMBED_MODEL=embeddinggemma\n",
+                                    "MEM0_EMBED_PROFILE=egemma2\nMEM0_EMBED_MODEL_EGEMMA2=embeddinggemma2\n"
+                                    "MEM0_EMBED_MODEL=embeddinggemma-ams\n")
 WSL_ENV = (
     "MEM0_WSL_USER=tenant\nMEM0_WIN_USER=winuser\nMEM0_DISTRO=Ubuntu\nMEM0_HOST_KIND=wsl\n"
     "MEM0_REPO_ROOT_WSL=/srv/checkout\nMEM0_BIND=127.0.0.1\nMEM0_ROLE=brain\n"
@@ -130,6 +135,19 @@ def test_native_host_kind_is_matched_case_insensitively(tmp_path):
     assert r.returncode != 0
     assert _files(home) == before
     assert "linux-authority.sh" in r.stderr
+
+
+@pytest.mark.parametrize("args", [[], ["--dry-run"]], ids=["deploy", "dry-run"])
+def test_a_native_receipt_in_the_newer_embedding_space_is_refused_too(tmp_path, args):
+    """The receipt of an authority in the EmbeddingGemma-2 space (MEM0_EMBED_PROFILE, the scoped alias,
+    and the older space's alias kept for a rollback) is still a native receipt: refused before any
+    write, with the installer named - which inherits the profile from that very file."""
+    r, home, before, log = _run(tmp_path, NATIVE_ENV_EG2, *args)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert _files(home) == before, f"deploy.sh wrote under HOME on a native box: {_files(home)}"
+    assert not log.exists()
+    assert "install/linux-authority.sh --bind-ip 192.0.2.9 --secrets-dir /srv/secrets" in r.stderr, out
 
 
 def test_refusal_without_bind_or_secrets_still_names_the_flags(tmp_path):

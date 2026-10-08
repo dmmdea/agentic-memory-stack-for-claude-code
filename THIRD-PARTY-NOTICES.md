@@ -21,6 +21,7 @@ The stack **installs / fetches** the components below at install time — it doe
 | Model | License | Notes |
 |---|---|---|
 | **EmbeddingGemma-300m** (`ggml-org/embeddinggemma-300M-GGUF`) | **Gemma Terms of Use** — https://ai.google.dev/gemma/terms | The embedder. The installer downloads the GGUF from Hugging Face; **by downloading it you accept the Gemma Terms of Use** (a custom license with acceptable-use restrictions, not a standard OSS license). This repo ships no model weights. |
+| **EmbeddingGemma-2** (`ggml-org/embeddinggemma-2-GGUF`, text model only) | **Apache License 2.0** | The optional second embedding space (`egemma2`: the wiki index by default on the operator's authority, the memories only after a measured migration). Downloaded by the operator; needs llama.cpp b11452 or later (`gemma-embedding2`). This repo ships no model weights. |
 | **bge-reranker-v2-m3** (`BAAI/bge-reranker-v2-m3`) | MIT (see the model card) | Optional reranker; operator-provided in the llama-swap config. |
 
 ## Separately-installed proprietary tools (the operator's own)

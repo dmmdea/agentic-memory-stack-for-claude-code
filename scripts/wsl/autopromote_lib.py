@@ -34,6 +34,16 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (judge model/effort + the dream-gate usage ledger row)
 
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as ep  # noqa: E402  (the memories collection and the sibling cosine, per embedding space)
+
 
 # ── Dedup helper ──────────────────────────────────────────────────────────────
 def is_canonical_duplicate(candidate_text: str, normalized_canonicals) -> bool:
@@ -145,8 +155,11 @@ def source_class(metadata, trusted_sources=("operator-decision", "user-decision"
 # N = the candidate itself (1) + distinct sibling evidence records whose similarity is
 # >= threshold + a re-observation bonus (mem0 dedups on write, so an updated_at that differs
 # from created_at means a repeat observation was folded into this record -> +1).
-# sibling_scores must already EXCLUDE the candidate.
-def corroboration_count(sibling_scores=(), threshold: float = 0.6, was_reobserved: bool = False) -> int:
+# sibling_scores must already EXCLUDE the candidate. threshold=None reads the active embedding
+# space's calibrated sibling cosine (embedder_profile; 0.6 on EmbeddingGemma-300m).
+def corroboration_count(sibling_scores=(), threshold: float | None = None, was_reobserved: bool = False) -> int:
+    if threshold is None:
+        threshold = ep.threshold("sibling")
     siblings = sum(1 for s in (sibling_scores or []) if float(s) >= threshold)
     bonus = 1 if was_reobserved else 0
     return 1 + siblings + bonus
@@ -411,9 +424,14 @@ def _judge_tokens(res) -> int:
 
 
 def promotion_gate_verdict(memory_id: str, candidate_text: str, evidence_record, *,
-                           qdrant_url: str = "http://127.0.0.1:6333", collection: str = "mem0_egemma_768",
-                           sibling_threshold: float = 0.6, min_corroboration: int = 2, near_canonical_k: int = 5,
+                           qdrant_url: str = "http://127.0.0.1:6333", collection: str | None = None,
+                           sibling_threshold: float | None = None, min_corroboration: int = 2, near_canonical_k: int = 5,
                            judge=None, http=None) -> dict:
+    # None = the active embedding space's collection / calibrated sibling cosine (embedder_profile)
+    if collection is None:
+        collection = ep.collection("memories")
+    if sibling_threshold is None:
+        sibling_threshold = ep.threshold("sibling")
     qcol = f"{qdrant_url}/collections/{collection}"
     owns_http = http is None
     if owns_http:

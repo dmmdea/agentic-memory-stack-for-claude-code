@@ -59,11 +59,21 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (URL from authority-url)
 
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile  # noqa: E402  (collection names of the active embedding space)
+
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = "mem0_egemma_768"  # the live collection (config.py collection_name)
+COLLECTION = embedder_profile.collection("memories")  # the live collection (config.py collection_name)
 # AMS-19: the episode-vector collection (mirrors mem0-server/episode_embeddings.py
-# EPISODE_COLLECTION — this script is deployed standalone and does not import it).
-EPISODE_COLLECTION = "episodes_egemma_768"
+# EPISODE_COLLECTION; both resolve it from embedder_profile).
+EPISODE_COLLECTION = embedder_profile.collection("episodes")
 EPISODIC_DB = Path.home() / ".mem0" / "episodic.db"
 RECON_LOG = Path.home() / ".mem0" / "episodic-reconciliation.jsonl"
 QDRANT_BATCH = 256

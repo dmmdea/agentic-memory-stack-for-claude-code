@@ -19,11 +19,18 @@ paths that back each other up (and a PC-side catch-up that runs the fast one whe
 
 ## Scope
 
-One collection, `wiki_pages_egemma_768`, in the brain box's Qdrant: one point per page under
-the vault's `wiki/` tree (`entities/`, `concepts/`, `sources/`, `syntheses/`), embedded with the
-same EmbeddingGemma prefix shim as `mem0` (`MEM0_EMBED_MODEL`, the store's exact GGUF), payload
-`{path, title, type, tags, updated, summary, hash}`. Builds are idempotent and incremental on
-the content hash; deleted pages are removed.
+One collection in the brain box's Qdrant, in the **wiki's own embedding space**
+(`MEM0_WIKI_EMBED_PROFILE`, default the memories' space; see [embedder profiles](embedder-profiles.md)):
+`wiki_pages_egemma_768` on EmbeddingGemma-300m, `wiki_pages_eg2_768` on EmbeddingGemma-2. One point per
+page under the vault's `wiki/` tree (`entities/`, `concepts/`, `sources/`, `syntheses/`), embedded
+through the prefix shim with that profile's model, payload `{path, title, type, tags, updated, summary,
+hash}`. On EmbeddingGemma-300m a page is embedded as its title, first line and the first 1,200
+characters of the body; a profile with a larger window embeds the whole body up to its token budget
+(EmbeddingGemma-2: a 3,900-token budget, which the shim's deliberately conservative estimate turns into
+about 4,300 characters of English prose — measured as shipped, 2026-10-08, to answer detail questions about the late parts
+of a page far better, deep-detail MRR 0.788 vs 0.687). Builds are idempotent and incremental on the
+content hash; deleted pages are removed. A space change is a rebuild into the other collection; the old
+one is kept.
 
 ## Non-scope
 
@@ -37,7 +44,7 @@ the mem0 corpus (a different collection with a different life cycle).
 | --- | --- | --- |
 | `scripts/wsl/wiki-index-build.py` | brain box or a replica's WSL | embeds a `wiki/` snapshot (`WIKI_ROOT`, default `~/wiki-index/wiki`) into `WIKI_QDRANT_HOST:PORT` (default the local loopback) |
 | `scripts/wsl/wiki-search.py` | same | query embedding + top-K JSON lines |
-| `scripts/wsl/wiki-index.sh` | a replica's WSL | `snapshot` (tar of `wiki/` on stdin), `build` (then stamps `~/wiki-index/last-build` on the brain through the same tunnel; fail-soft), `search` — the last two through an SSH control-socket tunnel to the brain's loopback Qdrant (first free local port from `WIKI_TUNNEL_PORT`, default 16333; closed on exit). The brain alias resolves from `WIKI_BRAIN_SSH`, then `MEM0_BRAIN_SSH` in `stack.env` (no installer flag sets it; the operator adds the line by hand, and since 1.31.3 every `stack.env` writer carries it over on a re-run), then the `~/.ssh/config` Host whose `HostName` is the authority-url's host |
+| `scripts/wsl/wiki-index.sh` | a replica's WSL | `snapshot` (tar of `wiki/` on stdin), `build` (then stamps `~/wiki-index/last-build` on the brain through the same tunnel; fail-soft), `search` — the last two through an SSH control-socket tunnel to the brain's loopback Qdrant (first free local port from `WIKI_TUNNEL_PORT`, default 16333; closed on exit). Both follow the authority's wiki space (its `/health/deep`): a box that does not serve that space's model, or cannot read the space, streams the snapshot (`build-here`) or the query (`search-here`, arguments on stdin) to the brain over SSH instead, so a PC never writes the wiki in another space. The brain alias resolves from `WIKI_BRAIN_SSH`, then `MEM0_BRAIN_SSH` in `stack.env` (no installer flag sets it; the operator adds the line by hand, and since 1.31.3 every `stack.env` writer carries it over on a re-run), then the `~/.ssh/config` Host whose `HostName` is the authority-url's host |
 | `scripts/wsl/wiki-index-nightly.sh` | brain box, chain step `wiki-index` | pulls `wiki/` from the first reachable PC in `MEM0_WIKI_SOURCES`, builds locally, stamps `last-pull` and `last-build`, and receipts the night (below) |
 | `claude-config/wiki-index-refresh.sh` | a PC that mounts the vault (Git Bash), deployed to `~/.claude/scripts/` | the session refresh driver: tars the vault's `wiki/` into WSL, runs `wiki-index.sh snapshot` + `build`, and on success writes the local stamp `~/.claude/state/last-wiki-refresh`. The vault directory is operator configuration: the argument, `WIKI_VAULT`, or the first line of `~/.mem0/wiki-vault` |
 | `scripts/windows/wiki-index-catchup.ps1` | a replica PC, detached child of `memory-maintenance-spawn.ps1` at SessionStart | runs the driver when the index is due (below); no scheduled task |

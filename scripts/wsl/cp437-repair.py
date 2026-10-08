@@ -83,13 +83,25 @@ import httpx
 # Environment-driven configuration (same defaults as the sibling scripts)
 # ---------------------------------------------------------------------------
 
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+# embedder_profile is stdlib-only, so this script still runs without importing mem0.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as _ep  # noqa: E402  (a repair re-embeds in the ACTIVE embedding space)
+
+_PROFILE = _ep.active()
 QDRANT = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.environ.get("MEM0_COLLECTION", "mem0_egemma_768")
-EPISODES_COLLECTION = os.environ.get("MEM0_EPISODES_COLLECTION", "episodes_egemma_768")
+COLLECTION = _ep.collection("memories", _PROFILE)
+EPISODES_COLLECTION = _ep.collection("episodes", _PROFILE)
 EPISODIC_DB = Path(os.environ.get("MEM0_EPISODIC_DB", str(Path.home() / ".mem0" / "episodic.db")))
 HISTORY_DB = Path(os.environ.get("MEM0_HISTORY_DB", str(Path.home() / ".mem0" / "history.db")))
-EMBED_URL = os.environ.get("MEM0_EMBED_URL", "http://127.0.0.1:11436/v1/embeddings")
-EMBED_MODEL = os.environ.get("MEM0_EMBED_MODEL", "embeddinggemma")
+EMBED_URL = os.environ.get("MEM0_EMBED_URL") or (_ep.base_url() + "/embeddings")
+EMBED_MODEL = _ep.embed_model(_PROFILE)
 REPORT_PATH = Path(os.environ.get("MEM0_CP437_REPORT", str(Path.home() / ".mem0" / "cp437-repair-report.json")))
 RECEIPTS_PATH = Path(os.environ.get("MEM0_CP437_RECEIPTS", str(Path.home() / ".mem0" / "cp437-repair-receipts.jsonl")))
 
@@ -155,12 +167,14 @@ def diff_snippet(before: str, after: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Embedding semantics -- replicated from mem0-server/egemma_embedder.py (the
-# authority): EmbeddingGemma document prefix + conservative per-char-class
+# authority): the active profile's document prefix + conservative per-char-class
 # token-budget truncation of the EMBEDDING INPUT only (stored text untouched).
+# The prefix and the budget come from embedder_profile, so a repair embeds in the
+# space the store is in.
 # ---------------------------------------------------------------------------
 
-_DOC_PREFIX = "title: none | text: "
-_EMBED_TOKEN_BUDGET = 1900
+_DOC_PREFIX = _PROFILE.doc_prefix
+_EMBED_TOKEN_BUDGET = _PROFILE.token_budget
 _PREFIX_TOKEN_RESERVE = 16
 
 # Replicated from mem0-server/episode_embeddings.py: summaries below this floor

@@ -32,14 +32,25 @@ import datetime
 import json
 import os
 import sys
+from pathlib import Path
 
 import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 import brand_routing  # noqa: E402  (the C3 brand map)
 
+# The server modules live in mem0-server/: a sibling of scripts/ in the repo layout, and
+# ~/apps/mem0-server when the scripts are deployed flat into ~/apps/mem0-scripts.
+_SERVER_DIRS = [Path(__file__).resolve().parents[2] / "mem0-server",
+                Path.home() / "apps" / "mem0-server"]
+for _d in _SERVER_DIRS:
+    if _d.is_dir():
+        sys.path.insert(0, str(_d))
+        break
+import embedder_profile as ep  # noqa: E402  (collection names of the active embedding space)
+
 QDRANT = "http://127.0.0.1:6333"
-COLLECTION = os.environ.get("MEM0_QDRANT_COLLECTION", "mem0_egemma_768")
+COLLECTION = ep.collection("memories")
 MEM0 = ams_env.mem0_url()  # unused by the Qdrant scroll; kept so the audit reads the same authority as its siblings
 # Projects that are legitimately brand-neutral (cross-brand ecosystem facts).
 NEUTRAL_PROJECTS = {"", "ecosystem", "none"}

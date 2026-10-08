@@ -4,8 +4,9 @@
 # The LLM Wiki is a markdown vault on a cloud-synced folder that only the operator's PCs mount.
 # This step pulls the vault's curated wiki/ tree from the first reachable PC over SSH — a
 # dedicated key the operator pins on each PC to a forced command that can only stream that
-# tar — and embeds it into THIS box's Qdrant (wiki_pages_egemma_768), the index every
-# replica's `wiki-index.sh search` tunnels to. Idempotent: unchanged pages are skipped.
+# tar — and embeds it into THIS box's Qdrant (the wiki collection of the active embedding space,
+# wiki_pages_<space>: mem0-server/embedder_profile.py), the index every replica's `wiki-index.sh
+# search` tunnels to. Idempotent: unchanged pages are skipped.
 #
 # It is the BACKSTOP for the session-side refresh: a session that edits pages and forgets to
 # refresh is caught the next night. Nothing here is a source of truth — the vault is; a lost
@@ -54,11 +55,25 @@ if [ -z "$SOURCES" ]; then
     exit 1
 fi
 
-# The store is bound to the exact GGUF the brain serves under its own name (config.py); the
-# chain's environment does not carry it, so read it from the stack file like the server does.
-if [ -z "${MEM0_EMBED_MODEL:-}" ]; then
-    v="$(stack_val MEM0_EMBED_MODEL)"
-    [ -n "$v" ] && export MEM0_EMBED_MODEL="$v"
+# The store is bound to the exact GGUF the brain serves under its own name (config.py) and to its
+# embedding space (embedder_profile.py: the profile, its alias overrides). The chain's environment
+# carries neither, so read them from the stack file like the server does. The environment wins; the
+# alias override is scoped to its profile (MEM0_EMBED_MODEL_<PROFILE>, MEM0_EMBED_LONG_MODEL_<PROFILE>;
+# the unscoped MEM0_EMBED_MODEL names an EmbeddingGemma-300m file and counts for that profile only).
+export_from_stack() {  # <KEY>: export KEY from stack.env unless the environment already has it
+    local k="$1" v
+    [ -z "${!k:-}" ] || return 0
+    v="$(stack_val "$k")"
+    [ -z "$v" ] || export "$k=$v"
+    return 0
+}
+export_from_stack MEM0_EMBED_PROFILE
+export_from_stack MEM0_EMBED_MODEL
+export_from_stack MEM0_EMBED_BASE_URL
+if [ -n "${MEM0_EMBED_PROFILE:-}" ]; then
+    pk="$(printf '%s' "$MEM0_EMBED_PROFILE" | tr 'a-z-' 'A-Z_')"
+    export_from_stack "MEM0_EMBED_MODEL_$pk"
+    export_from_stack "MEM0_EMBED_LONG_MODEL_$pk"
 fi
 
 mkdir -p "$(dirname "$SNAP")"

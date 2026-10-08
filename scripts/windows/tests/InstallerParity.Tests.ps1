@@ -255,7 +255,37 @@ Describe 'WSL installer provisions EmbeddingGemma, not Ollama+nomic (v0.22 H3)' 
     It 'WSL installer verifies the :11436 EmbeddingGemma embed endpoint (not an Ollama check)' {
         $src = Get-Content $wslInstaller -Raw
         $src | Should -Match '11436/v1/embeddings' -Because 'the installer must verify mem0 can embed via llama-swap'
-        $src | Should -Match '"model":"embeddinggemma"'
+        # the probe names the ACTIVE profile's alias and carries its document prefix, both asked of
+        # embedder_profile.py (stack.env > default space) - a literal "model":"embeddinggemma" would
+        # report a healthy embedder for the wrong space
+        $src | Should -Match 'ep\.embed_model\(p\)' -Because 'the probe model is the active profile''s alias'
+        $src | Should -Match 'p\.doc_prefix \+ "ping"' -Because 'the probe carries the profile''s own document prefix'
+        $src | Should -Not -Match '"model":"embeddinggemma"' -Because 'the alias is profile-derived, not a literal'
+    }
+
+    It 'WSL installer stages the EmbeddingGemma-2 GGUF only when a space uses it, checksum-verified, and prints one ctx-4096 llama-swap entry' {
+        $src = Get-Content $wslInstaller -Raw
+        $src | Should -Match 'embeddinggemma-2-Q8_0\.gguf'
+        $src | Should -Match 'ggml-org/embeddinggemma-2-GGUF'
+        $src | Should -Match '2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135' -Because 'the Q8_0 file the stack was measured with (cosine >= 0.9996 against BF16)'
+        $src | Should -Match 'embeddinggemma-300M-Q8_0\.gguf' -Because 'the old space stays installable for the migration window and a rollback'
+        $src | Should -Match 'if \[ -n "\$EG2_WANTED" \] \|\| \[ "\$\{MEM0_STAGE_EG2:-\}" = 1 \]' -Because 'a default install fetches nothing it does not serve'
+        # one entry at ctx 4096 (the same VRAM as the 300m entry at 2048), with the llama.cpp floor of the
+        # gemma-embedding2 architecture; ctx 8192 measured no significant gain, so no long alias by default
+        $src | Should -Match 'members: \[embeddinggemma2\]'
+        $src | Should -Match '--ctx-size 4096 --batch-size 4096 --ubatch-size 4096'
+        $src | Should -Not -Match 'embeddinggemma2-long:'
+        $src | Should -Not -Match '--ctx-size 8192'
+        $src | Should -Match 'MEM0_EMBED_LONG_MODEL_EGEMMA2' -Because 'an operator who adds a long entry is told how to declare it'
+        $src | Should -Match 'b11452'
+    }
+
+    It 'WSL installer keeps the embedding profile across its own stack.env rewrite' {
+        # the carry (install/stack-env.sh) holds MEM0_EMBED_PROFILE and the alias overrides; a rewrite
+        # that dropped the profile would rebind the server to the default space's collections
+        $src = Get-Content $wslInstaller -Raw
+        $src | Should -Match 'stack_env_carry'
+        (Get-Content (Join-Path $repoRoot 'install\stack-env.sh') -Raw) | Should -Match 'MEM0_EMBED_\(PROFILE\|MODEL'
     }
 
     It 'WSL installer MEM0_MODULES includes egemma_embedder.py (config.py lazy import — fresh-install crash guard, v1.0 P7A B1)' {
@@ -263,6 +293,10 @@ Describe 'WSL installer provisions EmbeddingGemma, not Ollama+nomic (v0.22 H3)' 
         # startup. The python-side test_config_import_closure.py walks the real closure;
         # this is the Windows-side guard so a re-introduced omission fails the Pester gate too.
         (Get-Content $wslInstaller -Raw) | Should -Match 'MEM0_MODULES="[^"]*\begemma_embedder\.py\b'
+    }
+
+    It 'WSL installer MEM0_MODULES includes embedder_profile.py (config.py imports it at module load)' {
+        (Get-Content $wslInstaller -Raw) | Should -Match 'MEM0_MODULES="[^"]*\bembedder_profile\.py\b'
     }
 
     It 'WSL installer does NOT provision Ollama or pull nomic (decommissioned from mem0 path)' {
@@ -285,9 +319,17 @@ Describe 'WSL installer provisions EmbeddingGemma, not Ollama+nomic (v0.22 H3)' 
         Test-Path (Join-Path $repoRoot 'systemd\egemma-rollback-prune.timer')   | Should -BeTrue
     }
 
-    It 'WSL installer does NOT auto-enable the rollback-prune timer (one-shot migration cleanup)' {
+    It 'WSL installer does NOT auto-enable the rollback-prune timer (operator-armed migration cleanup)' {
         $src = Get-Content $wslInstaller -Raw
-        $src | Should -Not -Match 'enable[^\n]*egemma-rollback-prune\.timer' -Because 'the destructive one-shot must not be armed by a fresh install'
+        $src | Should -Not -Match 'enable[^\n]*egemma-rollback-prune\.timer' -Because 'the destructive cleanup must not be armed by a fresh install'
+    }
+
+    It 'the shipped rollback-prune timer is a far-future placeholder, so even a mistaken enable cannot fire it' {
+        # Persistent=true runs a PAST OnCalendar at once as a missed run
+        $timer = Get-Content (Join-Path $repoRoot 'systemd\egemma-rollback-prune.timer') -Raw
+        $m = [regex]::Match($timer, '(?m)^OnCalendar=(\d{4})-')
+        $m.Success | Should -BeTrue
+        [int]$m.Groups[1].Value | Should -BeGreaterThan ((Get-Date).Year + 50)
     }
 
     It '0-prereqs decodes wsl.exe output as UTF-16 and accepts the native Claude install (v1.23.5)' {
@@ -565,7 +607,12 @@ Describe 'installer is resumable / verify-as-you-go (v1.0 Phase 7B)' {
 
     It 'the expensive GGUF fetch is guarded by an existence check (resume == re-run, no re-download)' {
         $src = Get-Content $wslInstaller -Raw
-        $src | Should -Match 'if \[ ! -f "\$EGEMMA_GGUF" \]' -Because 'a re-run after a mid-install failure must NOT re-fetch the ~334MB GGUF'
+        # both GGUFs (the 300m file and EmbeddingGemma-2's) are staged by one function whose fetch sits
+        # behind the existence check, so a re-run after a mid-install failure re-fetches neither
+        $src | Should -Match 'stage_gguf\(\) \{' -Because 'one staging path for both embedder files'
+        $src | Should -Match 'if \[ ! -f "\$dest" \]' -Because 'a re-run after a mid-install failure must NOT re-fetch the ~334MB GGUF'
+        $src | Should -Match 'stage_gguf "\$EGEMMA_GGUF"'
+        $src | Should -Match 'stage_gguf "\$EG2_GGUF"'
     }
 
     It 'the mem0 venv + Qdrant binary are existence-guarded (idempotent re-run)' {

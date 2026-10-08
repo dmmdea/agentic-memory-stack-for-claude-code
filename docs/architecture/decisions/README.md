@@ -22,6 +22,7 @@ and keep existing ADRs aligned with code, but they do not make the decisions.
 | [Public Repo Primary](public-repo-primary.md) | Accepted |
 | [Harness auto-memory and the memory corpus are harmonized, not merged](auto-memory-system-a-vs-b.md) | Accepted |
 | [Fleet store sync and a native-Linux authority](fleet-store-sync-and-linux-authority.md) | Accepted |
+| [Embedder profiles: one definition per embedding space, the wiki in its own](embedder-profiles.md) | Proposed |
 
 ## When to write one
 

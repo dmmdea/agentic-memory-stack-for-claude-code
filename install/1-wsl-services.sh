@@ -10,15 +10,16 @@
 #   - Qdrant 1.18.2 binary at ~/qdrant-server/ + systemd-user service
 #   - mem0 v2.0.4 FastAPI wrapper at ~/apps/mem0-server/ + systemd-user service
 #   - l10-audit Python timer (heuristic memory audit)
-#   - EmbeddingGemma-300m embedder GGUF staged to ~/models/ (served on llama-swap
-#     :11436; v0.22 migration — replaces the decommissioned Ollama+nomic embedder)
+#   - EmbeddingGemma-300m and EmbeddingGemma-2 embedder GGUFs staged to ~/models/ (served on
+#     llama-swap :11436; v0.22 migration — replaces the decommissioned Ollama+nomic embedder; the
+#     active one is the profile in ~/.mem0/stack.env, see mem0-server/embedder_profile.py)
 #   - llama-swap binary + bge-reranker-v2-m3 model (optional reranker)
 
 set -eo pipefail
 # v1.0 Phase 7B: verify-as-you-go — fail fast with an ACTIONABLE message naming the
 # step + line, and remind that a re-run is safe (the installer is idempotent: every
 # expensive/external step is guarded by an existence/post-state check — the Qdrant
-# binary, the mem0 venv, the ~334MB EmbeddingGemma GGUF, the keys, the systemd units,
+# binary, the mem0 venv, the EmbeddingGemma GGUFs, the keys, the systemd units,
 # and the hook registrations all skip when already done, so resume == re-run).
 trap 'rc=$?; echo "FAILED at line $LINENO (exit $rc): $BASH_COMMAND" >&2; echo "  Fix the issue above and re-run install.ps1 — completed steps are skipped." >&2' ERR
 WSL_USER="${1:-$(whoami)}"
@@ -33,6 +34,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO_ROOT/install/stack-env.sh"
 # The release sha stamp (DEPLOYED_SHA) the backup manifest reads; the deployed tree has no .git.
 . "$REPO_ROOT/install/deploy-stamp.sh"
+# Shell access to the embedding-space definition (embedder_profile.py): the alias and the probe below
+# come from the module, not from literals.
+. "$REPO_ROOT/scripts/wsl/embed-profile.sh"
 
 if [ -z "$WIN_USER" ]; then
     # Try to derive from cmd.exe
@@ -109,7 +113,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
+MEM0_MODULES="app.py config.py embedder_profile.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"
@@ -297,6 +301,10 @@ MEM0_ROLE="${MEM0_ROLE:-brain}"
 # them: MEM0_BRAIN_SSH is the brain alias a Windows replica's wiki-index.sh tunnels through
 # (the wrapper's home is this WSL). Carried on every role: the writer cannot know the box's
 # next role, and a stale alias on a brain has no reader.
+# The embedding-space keys ride the same carry (MEM0_EMBED_PROFILE, the alias overrides): this
+# installer has no flag for them, and a rewrite that dropped the profile would rebind the server to
+# the default space's collections while the store sits in another. A profile change goes through
+# install/linux-authority.sh --embed-profile or scripts/wsl/embedder-migrate.py, never through here.
 mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")
 for kv in "${STACK_ENV_CARRY[@]}"; do echo "  ${kv%%=*} carried over from $USER_HOME/.mem0/stack.env: ${kv#*=}"; done
 # A Windows user name or repo path with a space would make every `. stack.env` run its second
@@ -346,7 +354,7 @@ elif [ "$MEM0_ROLE" = "replica" ] && [ -e "$SERVICE_KEY_FILE" ]; then
 fi
 
 # ----------------------------------------------------------------------
-# 3. Embedder model — EmbeddingGemma-300m on llama-swap :11436
+# 3. Embedder models — EmbeddingGemma-300m and EmbeddingGemma-2 on llama-swap :11436
 # ----------------------------------------------------------------------
 # v0.22 EmbeddingGemma migration (2026-06-13): mem0's embedder is multilingual
 # EmbeddingGemma-300m served on llama.cpp/llama-swap :11436 (a GPU model, OpenAI-compatible),
@@ -355,52 +363,82 @@ fi
 # ENTRY itself lives in the out-of-repo llama-swap config (same as bge-reranker — see
 # SKILL.md "llama-swap.yaml" manual step). We provision the model file + verify the
 # endpoint; we do NOT silently rewrite the user's llama-swap yaml.
+# EmbeddingGemma-2 (google/embeddinggemma-2, Gemma 4 backbone, trained at 8,192 tokens) is a
+# different vector space under its own aliases and collections (embedder_profile.py: egemma2): its
+# GGUF is staged BESIDE the 300m one, never instead of it (the old space stays served until the
+# migration is done and the rollback window is over). It needs llama.cpp b11452 or later (the
+# gemma-embedding2 architecture) and the card forbids float16, so the staged file is the Q8_0
+# (cosine >= 0.9996 against BF16 on house text, measured 2026-10-08) and it is checksum-verified.
 EGEMMA_GGUF="$USER_HOME/models/embeddinggemma-300M-Q8_0.gguf"
 EGEMMA_HF_REPO="ggml-org/embeddinggemma-300M-GGUF"
 EGEMMA_HF_FILE="embeddinggemma-300M-Q8_0.gguf"
+EG2_GGUF="$USER_HOME/models/embeddinggemma-2-Q8_0.gguf"
+EG2_HF_REPO="ggml-org/embeddinggemma-2-GGUF"
+EG2_HF_FILE="embeddinggemma-2-Q8_0.gguf"
+EG2_SHA256="2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
 mkdir -p "$USER_HOME/models"
-if [ ! -f "$EGEMMA_GGUF" ]; then
-    echo "==> Fetching EmbeddingGemma-300m GGUF (~334MB, one-time) to $EGEMMA_GGUF"
-    FETCHED=""
-    # Prefer huggingface-cli if present; else curl the resolve URL directly.
-    if command -v huggingface-cli >/dev/null 2>&1; then
-        if huggingface-cli download "$EGEMMA_HF_REPO" "$EGEMMA_HF_FILE" \
-            --local-dir "$USER_HOME/models" >/dev/null 2>&1 \
-            && [ -f "$USER_HOME/models/$EGEMMA_HF_FILE" ]; then
-            # huggingface-cli may nest under the repo path; normalize to the flat path
-            [ -f "$EGEMMA_GGUF" ] || mv "$USER_HOME/models/$EGEMMA_HF_FILE" "$EGEMMA_GGUF" 2>/dev/null || true
-            FETCHED=1
+
+# stage_gguf <dest> <hf repo> <hf file> <label> <sha256 or ""> [size note]
+# Never fails the installer (the llama-swap entry is a manual step anyway): a download that did not
+# arrive, or arrived with the wrong checksum, is removed and reported so a re-run fetches it again.
+stage_gguf() {
+    local dest="$1" repo="$2" file="$3" label="$4" want="$5" size="${6:-}" fetched="" got
+    if [ ! -f "$dest" ]; then
+        echo "==> Fetching $label GGUF (${size:+$size, }one-time) to $dest"
+        # Prefer huggingface-cli if present; else curl the resolve URL directly.
+        if command -v huggingface-cli >/dev/null 2>&1; then
+            if huggingface-cli download "$repo" "$file" \
+                --local-dir "$USER_HOME/models" >/dev/null 2>&1 \
+                && [ -f "$USER_HOME/models/$file" ]; then
+                # huggingface-cli may nest under the repo path; normalize to the flat path
+                [ -f "$dest" ] || mv "$USER_HOME/models/$file" "$dest" 2>/dev/null || true
+                fetched=1
+            fi
+        fi
+        if [ -z "$fetched" ]; then
+            curl -fsSL -o "$dest" \
+                "https://huggingface.co/$repo/resolve/main/$file" \
+                && fetched=1
+        fi
+        if [ -z "$fetched" ] || [ ! -s "$dest" ]; then
+            echo "  WARN: could not fetch the $label GGUF automatically."
+            echo "        Download $file from $repo to $dest manually."
+            rm -f "$dest" 2>/dev/null || true
+            return 0
+        fi
+        if [ -n "$want" ]; then
+            got="$(sha256sum "$dest" | cut -d' ' -f1)"
+            if [ "$got" != "$want" ]; then
+                echo "  WARN: the $label GGUF fetched to $dest has sha256 $got, not the expected $want — removed."
+                echo "        Re-run to fetch it again, or download $file from $repo by hand and check its sha256."
+                rm -f "$dest" 2>/dev/null || true
+                return 0
+            fi
+            echo "  $label GGUF staged at $dest (sha256 verified)"
+        else
+            echo "  $label GGUF staged at $dest"
+        fi
+    else
+        echo "==> $label GGUF already present at $dest (skipping download)"
+        if [ -n "$want" ]; then
+            got="$(sha256sum "$dest" | cut -d' ' -f1)"
+            [ "$got" = "$want" ] || echo "  WARN: $dest has sha256 $got, not the expected $want (a different file than the one this stack was measured with)"
         fi
     fi
-    if [ -z "$FETCHED" ]; then
-        curl -fsSL -o "$EGEMMA_GGUF" \
-            "https://huggingface.co/$EGEMMA_HF_REPO/resolve/main/$EGEMMA_HF_FILE" \
-            && FETCHED=1
-    fi
-    if [ -z "$FETCHED" ] || [ ! -s "$EGEMMA_GGUF" ]; then
-        echo "  WARN: could not fetch the EmbeddingGemma GGUF automatically."
-        echo "        Download $EGEMMA_HF_FILE from $EGEMMA_HF_REPO to $EGEMMA_GGUF manually."
-        rm -f "$EGEMMA_GGUF" 2>/dev/null || true
-    else
-        echo "  EmbeddingGemma GGUF staged at $EGEMMA_GGUF"
-    fi
-else
-    echo "==> EmbeddingGemma GGUF already present at $EGEMMA_GGUF (skipping download)"
+    return 0
+}
+stage_gguf "$EGEMMA_GGUF" "$EGEMMA_HF_REPO" "$EGEMMA_HF_FILE" "EmbeddingGemma-300m" "" "~334MB"
+# EmbeddingGemma-2 only when a space uses it — the memories' profile, the wiki's (MEM0_WIKI_EMBED_PROFILE)
+# — or MEM0_STAGE_EG2=1 ahead of a migration: a default install fetches nothing it does not serve.
+EG2_WANTED="$( export HOME="$USER_HOME"; ep_py 'print("1" if "egemma2" in (ep.active().name, ep.wiki_profile().name) else "")' 2>/dev/null || true )"
+if [ -n "$EG2_WANTED" ] || [ "${MEM0_STAGE_EG2:-}" = 1 ]; then
+    stage_gguf "$EG2_GGUF" "$EG2_HF_REPO" "$EG2_HF_FILE" "EmbeddingGemma-2" "$EG2_SHA256"
 fi
 
-# Verify the embedder endpoint is actually serving egemma (the llama-swap model
-# entry is the out-of-repo manual step in SKILL.md). A clean install that hasn't
-# added the entry yet WARNs here with the exact stanza to add — it does NOT install
-# or depend on Ollama.
-if curl -sf -m 20 -X POST http://127.0.0.1:11436/v1/embeddings \
-     -H 'Content-Type: application/json' \
-     -d '{"model":"embeddinggemma","input":"title: none | text: ping"}' \
-     | grep -q '"embedding"'; then
-    echo "  EmbeddingGemma reachable on :11436 (768-dim embedder OK)"
-else
-    echo "  WARN: EmbeddingGemma not reachable on :11436. Add this model entry to your"
-    echo "        llama-swap config (in a non-exclusive, non-swapping support group) and"
-    echo "        restart llama-swap — see install/llama-swap-setup.md section 4:"
+# The llama-swap entries, printed for the operator to add (see install/llama-swap-setup.md).
+print_stanza_300m() {
+    echo "        Add this model entry to your llama-swap config (in a non-exclusive, non-swapping"
+    echo "        support group) and restart llama-swap — see install/llama-swap-setup.md section 4:"
     echo "          groups:"
     echo "            support: {swap: false, exclusive: false, members: [embeddinggemma]}"
     echo "          embeddinggemma:"
@@ -410,6 +448,49 @@ else
     echo "                 --port \${PORT} --host 127.0.0.1"
     echo "            ttl: 300"
     echo "            aliases: [\"embeddinggemma\", \"egemma\", \"embeddinggemma-300m\"]"
+}
+print_stanza_eg2() {
+    echo "        EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture)."
+    echo "        Serve it at ctx 4096 (the same VRAM as EmbeddingGemma-300m at 2048), never the 262144 its GGUF"
+    echo "        header advertises, in the group that never evicts the memory stack:"
+    echo "          groups:"
+    echo "            support: {swap: false, exclusive: false, members: [embeddinggemma2]}"
+    echo "          embeddinggemma2:"
+    echo "            cmd: <llama.cpp>/llama-server --model $EG2_GGUF \\"
+    echo "                 --embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 4096 \\"
+    echo "                 -ngl 99 --flash-attn on --port \${PORT} --host 127.0.0.1"
+    echo "            ttl: 300"
+    echo "        (an optional ctx-8192 entry for whole long pages costs ~600 MiB more and measured no"
+    echo "        significant gain: declare it as MEM0_EMBED_LONG_MODEL_EGEMMA2 if you add one)"
+}
+
+# Verify the embedder endpoint is actually serving the ACTIVE profile's alias (the llama-swap model
+# entry is the out-of-repo manual step in SKILL.md): the profile and the alias come from
+# embedder_profile (stack.env, written above, then the default space), the probe carries the
+# profile's own document prefix. A clean install that hasn't added the entry yet WARNs here with the
+# exact stanza to add — it does NOT install or depend on Ollama.
+EMBED_PROFILE="$( export HOME="$USER_HOME"; ep_py 'print(ep.active().name)' )" \
+    || { echo "FATAL: the embedding profile in $USER_HOME/.mem0/stack.env is not one embedder_profile.py knows" >&2; exit 1; }
+EMBED_LABEL="$( export HOME="$USER_HOME"; ep_py 'print(ep.active().label)' )"
+EMBED_ALIAS="$( export HOME="$USER_HOME"; ep_py 'print(ep.embed_model())' )"
+EMBED_DIMS="$( export HOME="$USER_HOME"; ep_py 'print(ep.active().dims)' )"
+EMBED_PROBE="$( export HOME="$USER_HOME"; ep_py 'import json; p = ep.active(); print(json.dumps({"model": ep.embed_model(p), "input": p.doc_prefix + "ping"}))' )"
+echo "  embedding profile: $EMBED_PROFILE ($EMBED_LABEL), llama-swap alias: $EMBED_ALIAS"
+if curl -sf -m 20 -X POST http://127.0.0.1:11436/v1/embeddings \
+     -H 'Content-Type: application/json' \
+     -d "$EMBED_PROBE" \
+     | grep -q '"embedding"'; then
+    echo "  $EMBED_LABEL reachable on :11436 as '$EMBED_ALIAS' (${EMBED_DIMS}-dim embedder OK)"
+else
+    echo "  WARN: $EMBED_LABEL not reachable on :11436 as '$EMBED_ALIAS'."
+    if [ "$EMBED_PROFILE" = "$(ep_default_profile)" ]; then print_stanza_300m; else print_stanza_eg2; fi
+fi
+# EmbeddingGemma-2 staged but not served while the stack is still in the older space: say how to
+# serve it, once, for the migration (scripts/wsl/embedder-migrate.py builds the new space beside the old).
+if [ -s "$EG2_GGUF" ] && [ "$EMBED_PROFILE" = "$(ep_default_profile)" ] \
+   && ! curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q '"embeddinggemma2"'; then
+    echo "  NOTE: the EmbeddingGemma-2 GGUF is staged but not served. To migrate to it, add these entries first:"
+    print_stanza_eg2
 fi
 
 # ----------------------------------------------------------------------
@@ -436,9 +517,9 @@ done
 chmod +x "$SCRIPTS_DIR"/*.sh
 echo "  maintenance scripts deployed to $SCRIPTS_DIR (timers exec these, not the repo)"
 
-# DEPLOYED but the timer is NOT auto-enabled — it is a one-shot tied to the v0.22
-# migration window (fires 2026-06-21) and a fresh install starts directly on the
-# mem0_egemma_768 collection with no old `memories` rollback anchor to prune.
+# DEPLOYED but the timer is NOT auto-enabled — it prunes the PREVIOUS embedding space's collections
+# after a migration (scripts/wsl/embedder-migrate.py), once the operator has armed it for a date; a
+# fresh install starts directly in its profile's space with no old rollback anchor to prune.
 for unit in mem0.service qdrant.service l10-audit.service l10-audit.timer decay-scan.service decay-scan.timer stack-backup.service stack-backup.timer goals-stale-sweep.service goals-stale-sweep.timer contradiction-sweep.service contradiction-sweep.timer episodic-reconcile.service episodic-reconcile.timer egemma-rollback-prune.service egemma-rollback-prune.timer; do
     SRC="$REPO_ROOT/systemd/$unit"
     DST="$SYSTEMD_USER_DIR/$unit"
@@ -458,10 +539,10 @@ done
 
 # Deploy the rollback-prune script the unit's ExecStart points at (~/.mem0/), CRLF-
 # stripped (repo may live on a Windows drive). Deployed, not armed: the timer above
-# is intentionally left disabled (one-shot migration cleanup; see SKILL.md rollback).
+# is intentionally left disabled (operator-armed migration cleanup; see SKILL.md rollback).
 tr -d "\r" < "$REPO_ROOT/scripts/wsl/egemma-rollback-prune.sh" > "$USER_HOME/.mem0/egemma-rollback-prune.sh" \
     && chmod +x "$USER_HOME/.mem0/egemma-rollback-prune.sh" \
-    && echo "  egemma-rollback-prune.sh deployed (timer NOT auto-enabled — one-shot rollback-window cleanup)"
+    && echo "  egemma-rollback-prune.sh deployed (timer NOT auto-enabled — operator-armed rollback-window cleanup)"
 
 # Place l10-audit.py where the systemd unit expects it (also at the WSL-script path
 # referenced by the systemd ExecStart line: /mnt/c/Users/<winuser>/.claude/scripts/)

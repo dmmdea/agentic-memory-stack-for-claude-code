@@ -1485,8 +1485,9 @@ Write-Host "    Task Scheduler entry registered (next fire: 3:00 AM tomorrow, Wa
 # ----------------------------------------------------------------------
 # 5b. Register the nightly semantic-dedup task (4:30am, OFFSET from the 3am dream)
 # ----------------------------------------------------------------------
-# semantic-dedup is a WSL python script (tier-sensitive cosine over the LIVE mem0_egemma_768
-# collection). It runs offset from the dream so the dedup.lock mutual-exclusion never blocks the
+# semantic-dedup is a WSL python script (tier-sensitive cosine over the LIVE memories collection of
+# the active embedding profile, mem0-server/embedder_profile.py: the script resolves both the
+# collection and the per-tier cosines from it at run time, so this task names neither). It runs offset from the dream so the dedup.lock mutual-exclusion never blocks the
 # dream's consolidation. Every delete is preserved in the tier-ledger for restore. (Before 2026-06
 # it had NO scheduled trigger AND queried the dead pre-egemma 'memories' collection -> 404 abort;
 # both fixed: the collection is now env-driven and this task runs it nightly.)
@@ -1510,7 +1511,7 @@ $dedupAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
 $dedupTrigger = New-ScheduledTaskTrigger -Daily -At 4:30am
 $dedupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
 $dedupPrincipal = New-ScheduledTaskPrincipal -UserId $taskUserId -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine) over mem0_egemma_768; 4:30am, offset from the 3am dream.' | Out-Null
+Register-ScheduledTask -TaskName $dedupTaskName -Action $dedupAction -Trigger $dedupTrigger -Settings $dedupSettings -Principal $dedupPrincipal -Description 'Nightly semantic-dedup (tier-sensitive cosine, per the active embedding profile) over the live memories collection; 4:30am, offset from the 3am dream.' | Out-Null
 Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 } # end brain-role gate (v1.16 §6.3)
 
