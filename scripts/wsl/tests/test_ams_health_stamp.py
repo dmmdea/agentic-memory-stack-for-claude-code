@@ -285,3 +285,37 @@ def test_red_night_receipt_note_names_a_failing_write_path(tmp_path):
     row = json.loads((home / ".mem0" / "maintenance" / "receipts.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["ok"] is False and row["status"] == "failed"
     assert row["note"] == "health ok=False failed=- degraded=- pool 71.4% ONLINE write-path 503 upstream"
+
+
+# ---- capture (audit CRIT-01): a stalled capture is named on the verdict line, never red -------------------------
+CAP_STALLED = {"state": "stalled", "stalled": True, "success_at": "2099-01-01T00:00:00+00:00", "success_age_h": 120.0,
+               "activity_at": "2099-01-05T04:00:00+00:00", "activity_age_h": 0.5, "quiet_after_h": 48.0, "stalled_after_h": 96.0}
+
+
+def test_a_stalled_capture_is_named_on_the_stamp_line_and_the_stamp_stays_green(tmp_path):
+    r, _ = _stamp(tmp_path, dict(BASE, capture=CAP_STALLED))
+    assert r.returncode == 0, "the PCs being off is not a chain fault: a capture note never reddens the stamp"
+    assert r.stdout.splitlines()[-1] == GREEN_LINE + " capture stalled 120.0h"
+
+
+@pytest.mark.parametrize("cap", [{"state": "ok", "stalled": False}, {"state": "quiet", "stalled": False},
+                                 {"state": "unknown", "stalled": False, "note": "capture reader failed"}, "garbage", ["x"], 7, {}],
+                         ids=["ok", "quiet", "unknown", "string", "list", "number", "empty"])
+def test_any_other_capture_reading_leaves_the_stamp_line_byte_identical(tmp_path, cap):
+    r, _ = _stamp(tmp_path, dict(BASE, capture=cap))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[-1] == GREEN_LINE
+
+
+def test_a_stalled_capture_rides_beside_a_failing_write_path(tmp_path):
+    r, _ = _stamp(tmp_path, dict(BASE, ok=False, write_path=WP_RED, capture=CAP_STALLED))
+    assert r.returncode == 2
+    assert r.stdout.splitlines()[-1].endswith("write-path 503 upstream capture stalled 120.0h")
+
+
+def test_summary_names_a_stalled_capture_and_only_then(tmp_path):
+    t = _summary(tmp_path, [_row("dream")], health=dict(BASE, capture=CAP_STALLED))
+    assert "pool-health ONLINE capture stalled 120.0h\n" in t
+    (tmp_path / "second").mkdir()
+    t2 = _summary(tmp_path / "second", [_row("dream")], health=dict(BASE, capture={"state": "quiet", "stalled": False}))
+    assert "pool-health ONLINE\n" in t2 and "capture" not in t2, "a quiet capture is not a fault"

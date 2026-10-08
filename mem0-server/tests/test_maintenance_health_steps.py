@@ -374,6 +374,76 @@ def test_the_route_wires_the_write_path_snapshot():
     assert wired.get("write_path_reader") == "_write_path.snapshot"
 
 
+# ---- critical_failed_steps: failed_steps minus the steps that need a PC switched on ---------
+# An external monitor pages URGENTLY on this list (it rings through night quiet hours); failed_steps keeps paging
+# normally. wiki-index fails by design once every PC has been off for 72 h, which nobody can act on at 03:00.
+WIKI_FAILED = _r("2026-09-11T07:02:37Z", "wiki-index", ok=False, status="failed",
+                 note="no wiki source reachable and the index is 80 h old (limit 72 h)")
+BACKUP_FAILED = _r("2026-09-11T07:03:10Z", "stack-backup", ok=False, status="failed", note="rsync 23")
+
+
+def test_a_failed_wiki_index_is_a_failed_step_but_not_a_critical_one(tmp_path):
+    out = _build(tmp_path, [WIKI_FAILED])
+    assert out["failed_steps"] == [{"step": "wiki-index", "ts": "2026-09-11T07:02:37Z", "note": WIKI_FAILED["note"]}]
+    assert out["critical_failed_steps"] == []
+    assert out["ok"] is False, "the exemption never reaches `ok`: a failed wiki-index still turns the verdict red"
+
+
+def test_a_failed_backup_is_in_both_lists_with_the_same_entry(tmp_path):
+    out = _build(tmp_path, [BACKUP_FAILED])
+    assert out["failed_steps"] == [{"step": "stack-backup", "ts": "2026-09-11T07:03:10Z", "note": "rsync 23"}]
+    assert out["critical_failed_steps"] == out["failed_steps"]
+    assert out["ok"] is False
+    out["critical_failed_steps"][0]["note"] = "edited"
+    assert out["failed_steps"][0]["note"] == "rsync 23", "the two lists never share an entry object"
+
+
+def test_critical_failed_steps_is_always_present_and_empty_when_nothing_failed(tmp_path):
+    for rows in ([], [_r("2026-09-11T07:00:00Z", "dream"), _r("2026-09-11T07:01:00Z", "wiki-index")]):
+        out = _build(tmp_path, rows)
+        assert out["critical_failed_steps"] == [] and out["failed_steps"] == [] and out["ok"] is True
+
+
+def test_with_both_failing_only_the_actionable_step_is_critical(tmp_path):
+    out = _build(tmp_path, [WIKI_FAILED, BACKUP_FAILED])
+    assert [f["step"] for f in out["failed_steps"]] == ["stack-backup", "wiki-index"]   # sorted by step, as ever
+    assert [f["step"] for f in out["critical_failed_steps"]] == ["stack-backup"]
+    assert out["critical_failed_steps"][0] == out["failed_steps"][0]
+
+
+def test_degraded_and_stale_steps_are_never_critical_failed_steps(tmp_path):
+    out = _build(tmp_path, [_r("2026-09-11T07:00:00Z", "dream", status="degraded", note="posted-0-of-3"),
+                            _r("2026-09-08T03:00:00Z", "semantic-dedup")])
+    assert [d["step"] for d in out["degraded_steps"]] == ["dream"] and out["stale_steps"] == ["semantic-dedup"]
+    assert out["critical_failed_steps"] == [] and out["ok"] is False
+
+
+def test_a_later_ok_run_clears_a_critical_failure_with_the_failed_one(tmp_path):
+    out = _build(tmp_path, [BACKUP_FAILED, _r("2026-09-11T07:30:00Z", "stack-backup")])
+    assert out["critical_failed_steps"] == [] and out["failed_steps"] == [] and out["ok"] is True
+
+
+def test_the_exemption_changes_nothing_but_critical_failed_steps(tmp_path, monkeypatch):
+    """The same receipts with and without the exemption: every other key of the payload is identical, so neither `ok`
+    nor `failed_steps` can have started to read it."""
+    rows = [WIKI_FAILED, BACKUP_FAILED, _r("2026-09-11T07:00:00Z", "dream", status="degraded", note="posted-0-of-3")]
+    exempt = _build(tmp_path, rows)
+    monkeypatch.setattr(mh, "PC_DEPENDENT_STEPS", frozenset())
+    plain = _build(tmp_path, rows)
+    assert {k: v for k, v in exempt.items() if k != "critical_failed_steps"} == \
+           {k: v for k, v in plain.items() if k != "critical_failed_steps"}
+    assert [f["step"] for f in plain["critical_failed_steps"]] == ["stack-backup", "wiki-index"] == [f["step"] for f in plain["failed_steps"]]
+    assert [f["step"] for f in exempt["critical_failed_steps"]] == ["stack-backup"]
+
+
+def test_the_pc_dependent_steps_include_wiki_index_and_are_real_chain_steps():
+    assert "wiki-index" in mh.PC_DEPENDENT_STEPS
+    units = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "systemd")
+    chain = {n[len("ams-step-"):-len(".service")] for n in os.listdir(units) if n.startswith("ams-step-") and n.endswith(".service")}
+    assert len(chain) >= 15, chain   # the units are found; a listing that matched nothing must not pass
+    assert mh.PC_DEPENDENT_STEPS <= chain, "a renamed step would silently stop being exempt, and page urgently at night"
+
+
 # ---- the rest of C2: drift and wiki are reported, never folded into ok ----------------------
 def test_drift_is_reported_but_not_folded(tmp_path):
     out = _build(tmp_path, [], drift_reader=lambda: {"alarm": True, "before_retrievable": 6, "n_total": 7, "hwm": 7})

@@ -763,6 +763,48 @@ def _sanitize_fts(query: str) -> str | None:
 # Timestamp helper
 # ---------------------------------------------------------------------------
 
+# The capture verdict's reads, as constants so the query-plan test EXPLAINs exactly what runs.
+CAPTURE_ACTIVITY_SQL = "SELECT ended_at FROM episodes ORDER BY ended_at DESC LIMIT 1"
+# `+state` keeps the planner off idx_episodes_state (a sort of every complete row) and on idx_episodes_ended,
+# scanning newest-first to the first complete row.
+CAPTURE_SUCCESS_SQL = "SELECT ended_at FROM episodes WHERE +state = 'complete' ORDER BY ended_at DESC LIMIT 1"
+CAPTURE_FIRST_ACTIVITY_SQL = "SELECT MIN(started_at) FROM episodes WHERE ended_at > ?"
+
+
+def capture_signals(conn: sqlite3.Connection) -> dict:
+    """The authority-side facts the capture verdict (maintenance_health.capture_state) reads.
+
+    activity_at        the newest episodes.ended_at in ANY state. upsert_in_progress_episode moves it on every
+                       UserPromptSubmit (POST /v1/context/bundle, checkpoint=True) whether or not L1a ever runs, so it
+                       says "a PC session is happening". An index scan on idx_episodes_ended. The nightly chain does not
+                       write episodes.
+    success_at         the newest ended_at of a state='complete' episode. finalize_episode (POST /v1/episodes) sets it:
+                       l1a-extract.ps1 after its extraction returned an episode goal, and the operator's
+                       ship_log_reclassify.py when run with --apply --live, so it says "a run finished" (L1a in normal
+                       operation). Well under a millisecond while L1a is healthy; about a millisecond on the live store
+                       when thousands of newer episodes are not complete.
+    first_activity_at  the earliest started_at among the episodes touched after success_at: how long the sessions that
+                       went without a success have been going. A range read on idx_episodes_ended. None without a
+                       success, or when nothing was touched after it.
+    All are ISO-8601 UTC strings ('+00:00' from this server, 'Z' from PowerShell) or None.
+    """
+    act = conn.execute(CAPTURE_ACTIVITY_SQL).fetchone()
+    suc = conn.execute(CAPTURE_SUCCESS_SQL).fetchone()
+    first = None
+    if suc and suc[0]:
+        row = conn.execute(CAPTURE_FIRST_ACTIVITY_SQL, (suc[0],)).fetchone()
+        first = row[0] if row else None
+    return {"activity_at": act[0] if act else None, "success_at": suc[0] if suc else None,
+            "first_activity_at": first}
+
+
+def connect_readonly(path: Path | None = None, timeout: float = 1.0) -> sqlite3.Connection:
+    """A read-only connection for a health probe: never waits long on a lock (a polled endpoint has a short budget, and
+    a monitor reads a slow answer as an outage) and can never write."""
+    p = Path(path or EPISODIC_DB_PATH)
+    return sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout)
+
+
 def _iso_now() -> str:
     """Return the current UTC time as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()

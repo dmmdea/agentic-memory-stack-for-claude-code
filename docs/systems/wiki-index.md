@@ -112,6 +112,13 @@ exit N): <ssh stderr>`, so "host down", "tailnet offline", "sshd refusing" and a
 "vault not found" read differently. The outcome line follows the chain's step contract
 (one line written to `AMS_OUTCOME_FILE`, `<status>[:<reason>] <json>`).
 
+The step's `failed` outcome shows in `/health/maintenance` under `failed_steps`, but not under
+`critical_failed_steps`, the list an external monitor pages on urgently: the 72 h limit is what
+a stretch with every PC off runs into, and nobody can fix that at night
+([mem0-api.md](./mem0-api.md#get-healthmaintenance)). The exemption is by step, so the
+build-failure row above is held back from the urgent list too and still pages normally through
+`failed_steps`.
+
 ## Backup and restore
 
 The index is deliberately outside the stack backup and the replica restore manifest (only the

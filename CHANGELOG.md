@@ -4,6 +4,21 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.34.0 — capture liveness and urgent chain pages (2026-10-08)
+
+### Added
+- **`capture` on `GET /health/maintenance`** (audit CRIT-01): is the PC-side L1a extractor still finishing
+  runs? Read per request from `episodic.db` (index reads over a read-only connection): `activity_at` (the newest
+  episode touched, which every prompt does) and `success_at` (the newest complete episode: L1a's finished runs).
+  `state` is `ok` (a run within 48 h), `stalled` (no run for more than 96 h while sessions were active within
+  48 h and have been going for at least an hour, so the first prompt after a trip does not convict), `quiet` (any
+  other silence: PCs off, or inside the grace window) or `unknown` (no run on record, or the store could not be
+  read). It never turns `ok` false; the health stamp and the morning summary name a stalled capture, and an
+  external monitor can read `capture.stalled`.
+- **`critical_failed_steps` on `GET /health/maintenance`** (audit CRIT-02): `failed_steps` minus the steps whose
+  failure is not actionable at night because they depend on a PC being on (today `wiki-index`). An external
+  monitor can page urgently on it, through quiet hours, while `failed_steps` keeps paging normally.
+
 ## 1.33.0 — embedder profiles: one definition per embedding space, a measured migration path, the wiki in its own space (2026-10-08)
 
 ### Added
