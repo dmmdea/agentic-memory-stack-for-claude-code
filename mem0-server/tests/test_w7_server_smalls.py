@@ -243,7 +243,7 @@ def test_ams22_intent_events_are_registered_in_the_ledger_schema():
 # GET /v1/memories/{mid}: an id that is not a UUID is a 404, not a 500
 # ----------------------------------------------------------------------
 # Qdrant answers 400 ("Can not recognize ... as point id") to a short id, and the handler's blanket
-# `except Exception -> _upstream_error` relayed it as HTTP 500 (live 2026-09-19..10-07: five GETs by an 8-character
+# `except Exception -> _upstream_error` relayed it as HTTP 500 (live 2026-09-19..10-08: seven GETs by an 8-character
 # id). `import app` needs the live stack, so the handler is loaded from its source with stubbed collaborators.
 
 def _handler_namespace(retrieve):

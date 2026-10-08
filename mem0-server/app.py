@@ -1908,8 +1908,8 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
     if not _is_point_id(mid):
         # Not a UUID, so no such record can exist: the same 404 an absent UUID gets. Qdrant answers 400 to it and the
-        # blanket handler below relayed that as a 500 (live: five GETs by an 8-character id since 09-19, the short
-        # form MEMORY.md and the morning summary print; a 500 reads as a server fault to every client).
+        # blanket handler below relayed that as a 500 (live: seven GETs by an 8-character id from 09-19 to 10-08,
+        # the short form MEMORY.md and the morning summary print; a 500 reads as a server fault to every client).
         raise HTTPException(404, f"memory {mid} not found (a memory id is a full UUID, not a prefix)")
     # The canonical spelling: uuid.UUID accepts some that Qdrant refuses with a 400 (padded, `uuid:`-prefixed,
     # one-sided braces, a stray hyphen), so what reaches Qdrant is always the hyphenated form.
