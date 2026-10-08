@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS episode_links (
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (episode_id) REFERENCES episodes(id)
 );
+-- DC-03 (1.34.0): at most one goal link per (episode, link_type, goal). init_schema first deletes the duplicates an
+-- older promoter wrote (keeping the earliest row, so its created_at), logging how many, then enforces:
+CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_links_goal
+    ON episode_links(episode_id, link_type, target_id) WHERE target_kind = 'goal';
+-- Rolling back past 1.34.0: an older build inserts goal links with a plain INSERT, which this index refuses.
+-- Drop it first: sqlite3 ~/.mem0/episodic.db 'DROP INDEX IF EXISTS uq_episode_links_goal'
 
 -- schema_meta: version tracking for future migrations
 CREATE TABLE IF NOT EXISTS schema_meta (

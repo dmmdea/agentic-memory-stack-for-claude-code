@@ -72,6 +72,7 @@ from episodic import (
     create_goal as _episodic_create_goal,
     find_goal_by_title_fuzzy as _episodic_find_goal_by_title_fuzzy,
     link_episode_to_goal as _episodic_link_episode_to_goal,
+    retarget_goal_links as _episodic_retarget_goal_links,
     update_goal_status as _episodic_update_goal_status,
     get_goal as _episodic_get_goal,
     list_goals as _episodic_list_goals,
@@ -553,6 +554,15 @@ def _mid_lock_key(mid) -> str:
         return str(_uuid.UUID(str(mid).strip()))
     except (ValueError, AttributeError, TypeError):
         return str(mid)
+
+def _is_point_id(mid) -> bool:
+    """True when `mid` is some spelling of a UUID, the only kind of id mem0 mints. Qdrant resolves the hyphenated,
+    simple, braced and urn:uuid spellings (any case) to one point (see _mid_lock_key) and answers 400 to anything else."""
+    try:
+        _uuid.UUID(str(mid).strip())
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 def _mid_write_lock(mid):
     key = _mid_lock_key(mid)
@@ -1896,6 +1906,14 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
     substitutes for exact reads.  Avoids wrong-ID edits caused by search returning
     similar (but wrong) records."""
     auth(x_api_key)
+    if not _is_point_id(mid):
+        # Not a UUID, so no such record can exist: the same 404 an absent UUID gets. Qdrant answers 400 to it and the
+        # blanket handler below relayed that as a 500 (live: five GETs by an 8-character id since 09-19, the short
+        # form MEMORY.md and the morning summary print; a 500 reads as a server fault to every client).
+        raise HTTPException(404, f"memory {mid} not found (a memory id is a full UUID, not a prefix)")
+    # The canonical spelling: uuid.UUID accepts some that Qdrant refuses with a 400 (padded, `uuid:`-prefixed,
+    # one-sided braces, a stray hyphen), so what reaches Qdrant is always the hyphenated form.
+    mid = _mid_lock_key(mid)
     try:
         records = mem.vector_store.client.retrieve(
             collection_name=mem.vector_store.collection_name,
@@ -1941,6 +1959,13 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
     of 'returned' therefore does not guarantee bundle inclusion for
     insight-tier records (reported in `caveats`)."""
     auth(x_api_key)
+    if not _is_point_id(b.target_id):
+        # Same as GET /v1/memories/{mid}: not a UUID, so no such target. Qdrant's 400 used to surface as a 500 here
+        # although the contract (docs/api-contracts.md) says 404 when the target does not exist.
+        raise HTTPException(404, f"memory {b.target_id} not found (a memory id is a full UUID, not a prefix)")
+    # The canonical spelling (see GET /v1/memories/{mid}): Qdrant gets a form it accepts, and the probes below
+    # compare it with the ids search returns, which are canonical.
+    b.target_id = _mid_lock_key(b.target_id)
     try:
         # -- target fetch (same reshape as GET /v1/memories/{mid}) --
         records = mem.vector_store.client.retrieve(
@@ -3039,12 +3064,9 @@ def merge_goals_endpoint(
                     x_user_direct_token, x_user_direct_ts,
                     x_user_direct_nonce=x_user_direct_nonce,
                 )
-            # Re-target episode_links from source → target
-            cur = conn.execute(
-                "UPDATE episode_links SET target_id = ? WHERE target_kind = 'goal' AND target_id = ?",
-                (str(b.target_goal_id), str(source_goal_id)),
-            )
-            relinked = cur.rowcount
+            # Re-target episode_links from source → target. A source link the target already has would collide
+            # with uq_episode_links_goal (DC-03): it is redundant and dropped, and counted.
+            relinked, dropped = _episodic_retarget_goal_links(conn, source_goal_id, b.target_goal_id)
             # Mark source as duplicate (bypass VALID_GOAL_STATUSES — 'duplicate' is merge-only)
             conn.execute(
                 "UPDATE goals SET status = 'duplicate', updated_at = ? WHERE id = ?",
@@ -3057,6 +3079,7 @@ def merge_goals_endpoint(
                 "source_goal_id": source_goal_id,
                 "target_goal_id": b.target_goal_id,
                 "relinked_episodes": relinked,
+                "dropped_duplicates": dropped,
                 "actor": b.actor,
                 "reason": b.reason,
             })
@@ -3067,6 +3090,7 @@ def merge_goals_endpoint(
             "source_goal_id": source_goal_id,
             "target_goal_id": b.target_goal_id,
             "relinked_episodes": relinked,
+            "dropped_duplicates": dropped,
         }
     except HTTPException:
         raise

@@ -185,3 +185,106 @@ def test_promoter_writes_the_jobs_receipt_contract(tmp_path):
     rec = _j.loads(receipt.read_text().strip().splitlines()[-1])
     assert rec.get("jobs_key") == "pin-key-123"
     assert "ts" in rec and "outcome" in rec
+
+
+# --- DC-03: the nightly promoter must not re-insert the links it already made -----------------------------------------
+import argparse  # noqa: E402
+import sqlite3  # noqa: E402
+
+
+def _promoter_night(c, monkeypatch, tmp_path):
+    """One `goal-recurrence-promote.py --apply` pass against the fixture DB, its ledger and receipt under tmp_path."""
+    monkeypatch.setattr(promote, "LEDGER_DIR", tmp_path)
+    monkeypatch.setattr(promote, "RECEIPT", tmp_path / "goal-recurrence-promote.jsonl")
+    assert promote._run(c, argparse.Namespace(apply=True, days=14)) == 0
+
+
+def _goal_links(c):
+    return sorted(tuple(r) for r in c.execute("SELECT episode_id, link_type, target_id FROM episode_links WHERE target_kind='goal'"))
+
+
+def test_a_second_promoter_night_does_not_relink_the_same_episodes(conn, monkeypatch, tmp_path):
+    """The 14-day window re-presents the same two episodes every night; each LINK-EXISTING run inserted their links
+    again (live 2026-10-08: 4219 goal-link rows, 3815 distinct, one episode linked 20 times to one goal)."""
+    _ep(conn, "s1", 5, adv=[{"goal_title": "Ship The Widget", "unmatched": True}], brand="acme")
+    _ep(conn, "s2", 2, adv=[{"goal_title": "ship the  widget", "unmatched": True}], brand="acme")
+    _promoter_night(conn, monkeypatch, tmp_path)                    # night 1: CREATE, two links
+    first = _goal_links(conn)
+    assert len(first) == 2 and conn.execute("SELECT COUNT(*) FROM goals").fetchone()[0] == 1
+    _promoter_night(conn, monkeypatch, tmp_path)                    # nights 2 and 3: LINK-EXISTING
+    _promoter_night(conn, monkeypatch, tmp_path)
+    assert _goal_links(conn) == first, "re-running over the same window must add no link"
+    assert conn.execute("SELECT COUNT(*) FROM goals").fetchone()[0] == 1
+
+
+def test_link_episode_to_goal_is_idempotent_and_returns_the_existing_id(conn):
+    gid = episodic.create_goal(conn, title="g", created_by="manual")
+    eid = _ep(conn, "s1", 1)
+    a = episodic.link_episode_to_goal(conn, eid, gid, link_type="advanced_goal")
+    b = episodic.link_episode_to_goal(conn, eid, gid, link_type="advanced_goal")
+    assert a == b and a > 0, "POST /v1/goals/{id}/link_episode returns this id; a repeat must name the same link"
+    assert len(_goal_links(conn)) == 1
+    other = episodic.link_episode_to_goal(conn, eid, gid, link_type="blocked_goal")
+    assert other != a and len(_goal_links(conn)) == 2, "a different link_type is a different link"
+
+
+def test_init_schema_dedupes_existing_goal_links_then_enforces_uniqueness(conn, caplog):
+    """A table written by the old promoter already holds duplicates: the index must not fail on them (keep the
+    earliest row, so created_at is the first link's), must leave memory links alone, and must then refuse a new one."""
+    gid = episodic.create_goal(conn, title="g", created_by="manual")
+    eid = _ep(conn, "s1", 1)
+    conn.execute("DROP INDEX IF EXISTS uq_episode_links_goal")      # the pre-fix schema
+    for day in ("2026-10-01 08:00:00", "2026-10-02 08:00:00", "2026-10-03 08:00:00"):
+        conn.execute("INSERT INTO episode_links (episode_id, link_type, target_kind, target_id, created_at) VALUES (?, 'advanced_goal', 'goal', ?, ?)", (eid, str(gid), day))
+    for _ in range(2):                                              # memory links are not goal links
+        conn.execute("INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) VALUES (?, 'cited', 'mem0', 'm1')", (eid,))
+    conn.commit()
+    with caplog.at_level("WARNING", logger="episodic"):
+        episodic.init_schema(conn)
+    assert "removed 2 duplicate goal link(s)" in caplog.text           # a one-time live deletion is logged
+    rows = conn.execute("SELECT created_at FROM episode_links WHERE target_kind='goal'").fetchall()
+    assert [r[0] for r in rows] == ["2026-10-01 08:00:00"]
+    assert conn.execute("SELECT COUNT(*) FROM episode_links WHERE target_kind='mem0'").fetchone()[0] == 2
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) VALUES (?, 'advanced_goal', 'goal', ?)", (eid, str(gid)))
+    episodic.init_schema(conn)                                      # and a second boot is a no-op
+    assert len(_goal_links(conn)) == 1
+
+
+def test_goal_merge_retargets_collision_safely_under_the_unique_index(conn):
+    """A merge moves every source link to the target, drops (and counts) the ones the target already has, and
+    leaves nothing on the source. A plain UPDATE would raise IntegrityError on uq_episode_links_goal (the merge
+    endpoint would 500); a DELETE before the UPDATE would wipe the source's links."""
+    src = episodic.create_goal(conn, title="source", created_by="manual")
+    tgt = episodic.create_goal(conn, title="target", created_by="manual")
+    e1, e2, e3 = _ep(conn, "s1", 1), _ep(conn, "s2", 1), _ep(conn, "s3", 1)
+    for e in (e1, e2, e3):
+        episodic.link_episode_to_goal(conn, e, src, link_type="advanced_goal")
+    episodic.link_episode_to_goal(conn, e2, tgt, link_type="advanced_goal")      # the collision
+    episodic.link_episode_to_goal(conn, e3, tgt, link_type="blocked_goal")       # same episode, other type: no collision
+    moved, dropped = episodic.retarget_goal_links(conn, src, tgt)
+    conn.commit()
+    assert (moved, dropped) == (2, 1)
+    assert conn.execute("SELECT COUNT(*) FROM episode_links WHERE target_kind='goal' AND target_id=?",
+                        (str(src),)).fetchone()[0] == 0
+    on_target = sorted(tuple(r) for r in conn.execute("SELECT episode_id, link_type FROM episode_links "
+                                                      "WHERE target_kind='goal' AND target_id=?", (str(tgt),)))
+    assert on_target == sorted([(e1, "advanced_goal"), (e2, "advanced_goal"), (e3, "advanced_goal"),
+                                (e3, "blocked_goal")])
+
+
+def test_the_merge_endpoint_uses_the_tested_retarget_and_reports_the_drops():
+    """Source-static (app.py builds the live Memory client on import)."""
+    src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    assert ("            relinked, dropped = _episodic_retarget_goal_links(conn, source_goal_id, b.target_goal_id)\n"
+            "            # Mark source as duplicate") in src                  # nothing rewrites the counts in between
+    assert src.count('"dropped_duplicates": dropped,') == 2                       # the ledger line and the response
+    assert "UPDATE OR IGNORE episode_links" not in src                           # one implementation, in episodic.py
+
+
+def test_add_link_routes_a_goal_link_through_the_ensure_exists_path(conn):
+    gid = episodic.create_goal(conn, title="g", created_by="manual")
+    eid = _ep(conn, "s1", 1)
+    a = episodic.add_link(conn, eid, "advanced_goal", str(gid), target_kind="goal")
+    assert episodic.add_link(conn, eid, "advanced_goal", str(gid), target_kind="goal") == a     # no IntegrityError
+    assert len(_goal_links(conn)) == 1

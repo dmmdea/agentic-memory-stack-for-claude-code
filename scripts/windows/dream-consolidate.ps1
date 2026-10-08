@@ -654,14 +654,22 @@ try {
         # "non-fatal", leaving $canonicalNorm EMPTY so the canonical-dedup guard never ran.
         # Add the runtime user scope ($DcWslUser, line 17; no sentinels in this file).
         # v1.12 F1: PS 5.1 sends a STRING -Body as Latin-1 (non-ASCII -> 400); send UTF-8 BYTES.
+        # threshold 0 so no canonical is dropped by its cosine to the query (the request default is 0.1);
+        # a fixed non-empty query because mem0 2.1.0 rejects an empty one (HTTP 500, caught below as
+        # "non-fatal", which would leave the canonical-dedup guard empty again). limit 500: the server's cap on
+        # one search, so a full page means the set may be cut (logged below). Twin of dream-consolidate.py's
+        # CANONICAL_FETCH_QUERY / CANONICAL_FETCH_LIMIT.
         $canonicalResp = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/memories/search" `
             -Method Post `
             -Headers @{'X-API-Key' = $ckeyForFetch; 'Content-Type' = 'application/json'} `
-            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = ''; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 1000 } | ConvertTo-Json -Depth 4 -Compress))) `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = 'canonical facts'; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 500; threshold = 0.0 } | ConvertTo-Json -Depth 4 -Compress))) `
             -TimeoutSec 10
         if ($canonicalResp -and $canonicalResp.results) {
             $canonicalFacts = @($canonicalResp.results | ForEach-Object { $_.memory })
             $canonicalNorm  = @($canonicalFacts | ForEach-Object { ($_ -replace '\s+', ' ').ToLower().Trim() })
+            if ($canonicalFacts.Count -ge 500) {
+                Write-MemoryLog -Component 'dream' -Message "  autopromote: canonical fetch returned a full page ($($canonicalFacts.Count)); the set may be cut"
+            }
         }
     }
 } catch {
@@ -1036,7 +1044,10 @@ if (-not $DryRun) {
             }
             if ($hbHd.checks.retrieval_drift) {
                 $rd = $hbHd.checks.retrieval_drift
-                if ($rd.alarm) { $hbLines += "- DRIFT ALARM standing (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm))" }
+                # F-03: name the canary and the nights (twin of dream-consolidate.py)
+                $gone = @($rd.missing) -join ','
+                if (-not $gone) { $gone = '-' }
+                if ($rd.alarm) { $hbLines += "- DRIFT ALARM standing (before=$($rd.before_retrievable)/$($rd.n_total), hwm=$($rd.hwm), missing=$gone, nights-below-hwm=$($rd.consecutive_below_hwm))" }
                 if ([int]$rd.consecutive_snapshot_failures -ge 2) { $hbLines += '- DRIFT GUARD DEAD (>=2 consecutive snapshot failures)' }
             }
         } catch {

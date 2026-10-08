@@ -237,3 +237,122 @@ def test_ams22_intent_events_are_registered_in_the_ledger_schema():
     assert "delete-intent" in mod.SCHEMA
     assert "tier-change-intent" in mod.SCHEMA
     assert "status" in mod.SCHEMA["delete"]["optional"]
+
+
+# ----------------------------------------------------------------------
+# GET /v1/memories/{mid}: an id that is not a UUID is a 404, not a 500
+# ----------------------------------------------------------------------
+# Qdrant answers 400 ("Can not recognize ... as point id") to a short id, and the handler's blanket
+# `except Exception -> _upstream_error` relayed it as HTTP 500 (live 2026-09-19..10-07: five GETs by an 8-character
+# id). `import app` needs the live stack, so the handler is loaded from its source with stubbed collaborators.
+
+def _handler_namespace(retrieve):
+    import ast
+    import logging
+    import typing
+    import uuid
+
+    from fastapi import Header, HTTPException
+
+    src = (REPO_ROOT / "mem0-server" / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    wanted = {"_is_point_id", "_mid_lock_key", "get_memory_by_id", "diagnose_memory"}
+    nodes = []
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef) and n.name in wanted:
+            n.decorator_list = []                              # @app.get(...) needs the app
+            nodes.append(n)
+    assert any(n.name == "get_memory_by_id" for n in nodes)
+
+    class _Client:
+        def retrieve(self, *a, **kw):
+            return retrieve(*a, **kw)
+
+    class _Mem:
+        class vector_store:                                    # noqa: N801 — mirrors mem.vector_store
+            client = _Client()
+            collection_name = "c"
+
+    ns = {"Optional": typing.Optional, "Header": Header, "HTTPException": HTTPException, "_uuid": uuid,
+          "DiagnoseIn": object,                              # annotation only: the handler signature is evaluated at def time
+          "auth": lambda key: None, "mem": _Mem(), "_INTENT_KEYS": frozenset(),
+          "log": logging.getLogger("t"), "_upstream_error": lambda e: HTTPException(500, str(e))}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), ns)
+    return ns
+
+
+def test_a_short_memory_id_is_a_404_and_never_reaches_qdrant():
+    from fastapi import HTTPException
+    asked = []
+
+    def retrieve(**kw):
+        asked.append(kw["ids"])
+        raise RuntimeError("Unexpected Response: 400 (Bad Request) Can not recognize \"1a2b3c4d\" as point id")
+    get = _handler_namespace(retrieve)["get_memory_by_id"]
+    for short in ("1a2b3c4d", "5e6f7a8b", "", "not-an-id"):
+        with pytest.raises(HTTPException) as ei:
+            get(short)
+        assert ei.value.status_code == 404, f"{short!r} -> {ei.value.status_code}: a non-UUID cannot exist"
+    assert asked == [], "the id is refused before Qdrant is asked"
+
+
+def test_every_uuid_spelling_still_reaches_qdrant_and_an_absent_one_is_still_404():
+    from fastapi import HTTPException
+    asked = []
+
+    def retrieve(**kw):
+        asked.append(kw["ids"][0])
+        return []
+    ns = _handler_namespace(retrieve)
+    u = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+    spellings = (u, u.upper(), u.replace("-", ""), "{" + u + "}", "urn:uuid:" + u,
+                 "  " + u + " ", "uuid:" + u, "{" + u)      # uuid.UUID takes these too, Qdrant would 400 on them
+    for spelling in spellings:
+        with pytest.raises(HTTPException) as ei:
+            ns["get_memory_by_id"](spelling)
+        assert ei.value.status_code == 404
+    assert asked == [u] * len(spellings), "every spelling reaches Qdrant as the one canonical id"
+
+
+def test_a_genuine_qdrant_failure_on_a_valid_id_is_still_a_500():
+    """Scope guard: only the unknowable id changed. A store fault must stay loud."""
+    from fastapi import HTTPException
+
+    def retrieve(**kw):
+        raise RuntimeError("qdrant unreachable")
+    get = _handler_namespace(retrieve)["get_memory_by_id"]
+    with pytest.raises(HTTPException) as ei:
+        get("1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d")
+    assert ei.value.status_code == 500
+
+
+def test_diagnose_of_a_short_target_id_is_a_404_not_a_500():
+    """POST /v1/memories/diagnose documents 404 for an absent target; a short id used to reach Qdrant and come back 500."""
+    import types
+    from fastapi import HTTPException
+    asked = []
+
+    def retrieve(**kw):
+        asked.append(kw["ids"])
+        raise RuntimeError("Unexpected Response: 400 (Bad Request)")
+    diagnose = _handler_namespace(retrieve)["diagnose_memory"]
+    with pytest.raises(HTTPException) as ei:
+        diagnose(types.SimpleNamespace(target_id="1a2b3c4d"))
+    assert ei.value.status_code == 404 and asked == []
+
+
+def test_diagnose_sends_qdrant_the_canonical_spelling():
+    """The probes compare the target with the ids search returns (canonical), and Qdrant refuses some spellings
+    uuid.UUID accepts: diagnose normalizes the target once, before anything reads it."""
+    import types
+    from fastapi import HTTPException
+    asked = []
+
+    def retrieve(**kw):
+        asked.append(kw["ids"][0])
+        return []
+    diagnose = _handler_namespace(retrieve)["diagnose_memory"]
+    u = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+    with pytest.raises(HTTPException) as ei:
+        diagnose(types.SimpleNamespace(target_id="{" + u.upper() + "}"))
+    assert ei.value.status_code == 404 and asked == [u]

@@ -39,6 +39,9 @@ VERDICT_STEPS = frozenset({"health-stamp"})
 # build failed) is real, and still reaches the normal page through `failed_steps`.
 PC_DEPENDENT_STEPS = frozenset({"wiki-index"})
 MAX_RECEIPT_LINES = 2000
+# When the file holds more than MAX_RECEIPT_LINES, a step seen within this long of the window's first receipt may
+# have older runs beyond it (every chain step writes a receipt each night it runs, a no-op included).
+WINDOW_HISTORY_MARGIN_H = 36
 # Capture liveness (audit CRIT-01). The two thresholds are capabilities.py's own FRESH_H and L1A_CONVICT_H, so the
 # authority and the capability manifest mean the same by "quiet" and "convict".
 CAPTURE_QUIET_H = 48.0
@@ -62,10 +65,15 @@ def _parse_ts(s: str) -> Optional[dt.datetime]:
 
 def read_receipts(path: Path) -> list[dict]:
     """The last MAX_RECEIPT_LINES well-formed receipts (a line needs `step` and a parseable `ts`)."""
+    return read_receipt_window(path)[0]
+
+
+def read_receipt_window(path: Path) -> tuple[list[dict], bool]:
+    """read_receipts plus whether older lines were cut off (the file holds more than MAX_RECEIPT_LINES)."""
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except OSError:
-        return []
+        return [], False
     out: list[dict] = []
     for ln in lines[-MAX_RECEIPT_LINES:]:
         ln = ln.strip()
@@ -77,7 +85,7 @@ def read_receipts(path: Path) -> list[dict]:
             continue
         if isinstance(o, dict) and o.get("step") and _parse_ts(o.get("ts", "")):
             out.append(o)
-    return out
+    return out, len(lines) > MAX_RECEIPT_LINES
 
 
 def parse_zfs_list(text: str) -> tuple[int, int]:
@@ -250,12 +258,16 @@ def _wiki(stamp_dir: Optional[Path], now: dt.datetime) -> dict:
 
 
 def _drift(reader: Optional[Callable[[], dict]]) -> dict:
-    out: dict = {"alarm": None, "before": None, "n_total": None}
+    """The retrieval-drift guard's reading. `missing` (the canary ids not retrievable tonight) and
+    `below_hwm_nights` (consecutive compares below the high-water mark) ride along so a standing alarm names
+    its cause: `alarm: true, before: 6, n_total: 7` alone cost eight nights of "which canary?"."""
+    out: dict = {"alarm": None, "before": None, "n_total": None, "missing": None, "below_hwm_nights": None}
     if reader is None:
         return out
     try:
         d = dict(reader())
-        out = {"alarm": d.get("alarm"), "before": d.get("before_retrievable"), "n_total": d.get("n_total")}
+        out = {"alarm": d.get("alarm"), "before": d.get("before_retrievable"), "n_total": d.get("n_total"),
+               "missing": d.get("missing"), "below_hwm_nights": d.get("consecutive_below_hwm")}
     except Exception:  # noqa: BLE001 — a health endpoint never raises on a reader
         pass
     return out
@@ -355,33 +367,43 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
           write_path_reader: Optional[Callable[[], dict]] = None,
           capture_reader: Optional[Callable[[], dict]] = None) -> dict:
     by_step: dict[str, list[dict]] = {}
-    for r in read_receipts(Path(receipts_path)):
+    window, truncated = read_receipt_window(Path(receipts_path))
+    for r in window:
         by_step.setdefault(r["step"], []).append(r)
+    # Where the window starts when older receipts were cut off; None when it holds the whole file.
+    window_start = min((_parse_ts(r["ts"]) for r in window), default=None) if truncated else None
     steps: dict[str, dict] = {}
     stale: list[str] = []
     failed_steps: list[dict] = []
     degraded_steps: list[dict] = []
     for name, rows in by_step.items():
         s = steps[name] = {"last_success": None, "last_run": None, "duration_ms": None,
-                           "receipt_id": None, "ok": False, "status": "failed"}
+                           "receipt_id": None, "ok": False, "status": "failed", "last_noop": None}
         real_success: Optional[dt.datetime] = None   # latest ok receipt that actually ran the job
         latest_run: Optional[dict] = None            # latest receipt that actually ran the job
+        latest_noop: Optional[dict] = None           # latest weekly off-day / boot-guard no-op: a receipt, not a run
         for r in rows:
             ts = _parse_ts(r["ts"])
-            if s["last_run"] is None or ts >= _parse_ts(s["last_run"]):
-                s["last_run"] = r["ts"]
-                s["ok"] = bool(r.get("ok"))
-                s["status"] = _status(r)
-                s["duration_ms"] = r.get("duration_ms")
-                s["receipt_id"] = r.get("receipt_id")
-            if r.get("ok") and (s["last_success"] is None or ts >= _parse_ts(s["last_success"])):
-                s["last_success"] = r["ts"]
             if _is_no_op(r):
+                if latest_noop is None or ts >= _parse_ts(latest_noop["ts"]):
+                    latest_noop = r
                 continue
             if r.get("ok") and (real_success is None or ts > real_success):
                 real_success = ts
+                s["last_success"] = r["ts"]
             if latest_run is None or ts >= _parse_ts(latest_run["ts"]):
                 latest_run = r
+        # CDD-02: the headline (last_run / ok / status / duration / receipt_id) and last_success describe the
+        # latest REAL run. A boot-guard or weekly off-day no-op is an ok:true row in 0 ms; letting it overwrite
+        # them made every step "run" at boot in 0 ms and showed a Sunday-only step succeeding on a Thursday.
+        # It rides in `last_noop` instead. A step that has only ever no-op'd (its first Sunday not yet come)
+        # keeps that no-op as its headline, as before.
+        head = latest_run or latest_noop
+        s.update(last_run=head["ts"], ok=bool(head.get("ok")), status=_status(head),
+                 duration_ms=head.get("duration_ms"), receipt_id=head.get("receipt_id"))
+        if latest_noop is not None:
+            s["last_noop"] = {"ts": latest_noop["ts"], "note": str(latest_noop.get("note") or ""),
+                              "receipt_id": latest_noop.get("receipt_id")}
         # A step is judged on its LATEST real run (a later ok run clears it). The weekly / guard
         # no-ops are ok:true rows but not runs: Monday's off-day receipt must not erase Sunday's failure.
         if latest_run is not None and name not in VERDICT_STEPS:
@@ -392,13 +414,20 @@ def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple
             elif st == "degraded":
                 degraded_steps.append(entry)
         # Staleness: 48 h for a daily step; a weekly step is judged on its real runs against 8 days
-        # (its off-day no-ops would otherwise read "alive" for a Sunday run that never happened).
-        if _is_weekly(rows[-10:]):
-            ref = real_success or (_parse_ts(s["last_success"]) if s["last_success"] else None)
-            limit_h = WEEKLY_STALE_AFTER_H
-        else:
-            ref = _parse_ts(s["last_success"]) if s["last_success"] else None
-            limit_h = STALE_AFTER_H
+        # (its off-day no-ops would otherwise read "alive" for a Sunday run that never happened). A boot-guard
+        # no-op is ok:true too, so on a daily step it must not stand in for a success either: a step failing
+        # every night under a nightly reboot read "fresh" through its guard no-ops. Only a step with no real
+        # success at all is judged on its no-ops (it has not had its first run yet).
+        # Only when the window holds the step's whole history: a step already present at the start of a cut-off window
+        # may have real runs beyond it, scrolled out under no-ops (a day-long reboot loop writes a guard no-op per step
+        # per boot), so its no-ops prove nothing and it reads stale until a real run lands. A step that first appears
+        # later in the window (added since) has no older history and keeps its no-op reference.
+        first_seen = min(_parse_ts(r["ts"]) for r in rows)
+        whole_history = window_start is None or (first_seen - window_start) > dt.timedelta(hours=WINDOW_HISTORY_MARGIN_H)
+        noop_ref = (_parse_ts(latest_noop["ts"]) if latest_noop is not None and latest_noop.get("ok") and whole_history
+                    else None)
+        ref = real_success or noop_ref
+        limit_h = WEEKLY_STALE_AFTER_H if _is_weekly(rows[-10:]) else STALE_AFTER_H
         if name not in VERDICT_STEPS and (ref is None or (now - ref) > dt.timedelta(hours=limit_h)):
             stale.append(name)
     stale.sort()

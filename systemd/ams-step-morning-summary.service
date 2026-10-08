@@ -1,7 +1,7 @@
 [Unit]
 Description=AMS chain step: morning summary section from the night's receipts
 PartOf=ams-nightly.target
-After=mem0.service ams-step-pcloud-copy.service
+After=mem0.service ams-step-health-stamp.service
 
 [Service]
 Type=oneshot

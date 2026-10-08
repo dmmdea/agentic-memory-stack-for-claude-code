@@ -9,6 +9,11 @@ live calls (promotion_gate_verdict) takes injected clients and never raises.
 Exports (PowerShell name -> Python name):
   Test-CanonicalDuplicate         -> is_canonical_duplicate     dedup check
   Test-ImperativeOrTask           -> is_imperative_or_task      structural filter (FIX 4)
+  Test-ImperativeCanonical        -> imperative_canary.is_imperative_canonical
+                                                                the server's promote-canary, the 4th check of the
+                                                                structural filter (WG-01): imported from the server
+                                                                module here, an inline copy there that
+                                                                DreamAutopromote.Tests.ps1 pins to imperative_canary.py
   Invoke-PromotionGate            -> promotion_gate             4C contradiction + corroboration gate
   Resolve-GateBlocked             -> resolve_gate_blocked       enforce-only block decision
   Get-SourceClass                 -> source_class               source-reliability classification
@@ -43,6 +48,7 @@ for _d in _SERVER_DIRS:
         sys.path.insert(0, str(_d))
         break
 import embedder_profile as ep  # noqa: E402  (the memories collection and the sibling cosine, per embedding space)
+import imperative_canary as _canary  # noqa: E402  (the SERVER's promote-canary: the nominee filter must not be weaker)
 
 
 # ── Dedup helper ──────────────────────────────────────────────────────────────
@@ -86,6 +92,14 @@ def is_imperative_or_task(text: str) -> bool:
         return True
     # Leading verb-imperative (heuristic, case-sensitive, sentence start)
     if _RE_LEADING_VERB.search(text):
+        return True
+    # WG-01: PATCH /tier refuses canonical text the server's promote-canary reads as a standing order (HTTP 422):
+    # per sentence, case-insensitive, `Do not` / `Always` / `Never` / `Shall` / `RULE:` at ANY sentence start,
+    # `you must` anywhere. The three heuristics above look only at the start of the whole text and are
+    # case-sensitive, so a nominee with ". Do not audit them" in its second sentence cleared this filter, spent a
+    # Codex gate call and was refused by the server (2026-10-07). Applying the same predicate here
+    # keeps a text the server will refuse from ever being nominated, gated or retried.
+    if _canary.is_imperative_canonical(text):
         return True
     return False
 

@@ -355,6 +355,24 @@ def test_all_points_scrolls_qdrant_newest_first(home):
     assert pts[1]["metadata"]["source"] == "l1a" and pts[0]["memory"] == "new"
 
 
+def test_the_canonical_fetch_sends_a_non_empty_query_with_threshold_zero(home):
+    """mem0 2.1.0 rejects an empty query (HTTP 500, which the fetch read as "no canonicals": the canonical-dedup guard
+    then ran with nothing), and the request default threshold 0.1 could drop canonicals by their cosine to the query."""
+    import httpx
+    m = _mod()
+    seen = []
+
+    def h(req):
+        seen.append(json.loads(req.content))
+        return httpx.Response(200, json={"results": [{"id": "c1", "memory": "a canonical"}]})
+    c = m.Mem0Client("http://x", "k", "u", http=httpx.Client(transport=httpx.MockTransport(h)))
+    assert c.search_canonical() == [{"id": "c1", "memory": "a canonical"}]
+    body = seen[0]
+    assert body["query"].strip() and body["threshold"] == 0.0
+    # 500: the server caps one search there (_search_core min(limit, 500)); asking for more promised a complete set
+    assert body["filters"] == {"tier": "canonical", "user_id": "u"} and body["limit"] == m.CANONICAL_FETCH_LIMIT == 500
+
+
 # ---- the store judge (register P4-1b) ----------------------------------------------------
 # The nightly writes a PLAN; `ams-step-store-judge` applies it with `ams-store judge-apply`,
 # where every apply-guard lives. These scenarios pin the producer's half of that contract:
@@ -818,3 +836,17 @@ def test_the_client_asks_the_authority_for_finished_episodes_only():
     rows = m.Mem0Client("http://authority.invalid:1", "k", "u", http=http).episodes(7)
     assert http.urls == ["http://authority.invalid:1/v1/episodes?recent=7&state=complete"]
     assert rows == [{"goal_text": "g", "state": "complete"}]
+
+
+def test_heartbeat_names_the_canary_that_stands_the_drift_alarm(home, monkeypatch):
+    """F-03: the morning summary said `DRIFT ALARM standing (before=6/7, hwm=7)` nine mornings running and never which
+    canary was missing (relevance-threshold) or for how long; /health/deep already carries both."""
+    m = _mod()
+    monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (0, ""))
+    fm = FakeMem0(EV)
+    fm.health_deep = lambda: {"ok": True, "checks": {"retrieval_drift": {
+        "alarm": True, "before_retrievable": 6, "n_total": 7, "hwm": 7,
+        "missing": ["relevance-threshold"], "consecutive_below_hwm": 8}}}
+    _run(m, [], mem0=fm, judge=_judge(SIG, '{"insights":[]}', "[]"))
+    ms = (home / ".mem0" / "maintenance" / "morning-summary.md").read_text(encoding="utf-8")
+    assert "- DRIFT ALARM standing (before=6/7, hwm=7, missing=relevance-threshold, nights-below-hwm=8)" in ms

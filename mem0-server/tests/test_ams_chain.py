@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 STEPS = ["stack-backup", "health-stamp", "rtcwake"]
 ORDER = ["dream", "semantic-dedup", "index-refresh", "goal-recurrence-promote", "decay-scan", "goals-stale-sweep",
          "contradiction-sweep", "episodic-reconcile", "retrieval-pairs", "stack-backup", "syncoid", "pcloud-copy",
-         "morning-summary", "health-stamp", "rtcwake"]
+         "health-stamp", "morning-summary", "rtcwake"]
 WEEKLY = {"decay-scan", "goals-stale-sweep", "contradiction-sweep", "episodic-reconcile", "retrieval-pairs"}
 PYTHON = {"dream", "semantic-dedup", "index-refresh", "goal-recurrence-promote", "decay-scan", "goals-stale-sweep",
           "contradiction-sweep", "episodic-reconcile", "retrieval-pairs"}
@@ -162,8 +162,9 @@ def test_chain_units_exist_and_never_require():
         assert "WantedBy=ams-nightly.target" in text
         assert "PartOf=ams-nightly.target" in text
         assert "ams-step.sh " in text and (" " + s + " ") in text
-    assert "ams-step-morning-summary.service" in (SYSTEMD / "ams-step-health-stamp.service").read_text(encoding="utf-8")
-    assert "ams-step-health-stamp.service" in (SYSTEMD / "ams-step-rtcwake.service").read_text(encoding="utf-8")
+    assert "ams-step-pcloud-copy.service" in (SYSTEMD / "ams-step-health-stamp.service").read_text(encoding="utf-8")
+    assert "ams-step-health-stamp.service" in (SYSTEMD / "ams-step-morning-summary.service").read_text(encoding="utf-8")
+    assert "ams-step-morning-summary.service" in (SYSTEMD / "ams-step-rtcwake.service").read_text(encoding="utf-8")
     for f in ("ams-step.sh", "ams-rtcwake-arm.sh", "ams-health-stamp.sh"):
         r = subprocess.run([BASH, "-n", str(SCRIPTS / f)], capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr

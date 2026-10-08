@@ -1664,10 +1664,12 @@ def test_goal_merge_bulk_requires_hmac_user_direct():
         pytest.skip("episodic.db not found — cannot seed bulk links")
     conn = sqlite3.connect(str(db_path), timeout=10)
     try:
+        # 101 DISTINCT links: uq_episode_links_goal (DC-03) allows one per (episode, link_type, goal), so
+        # the rows differ in link_type (raw SQL, not validated here; the merge moves them by target alone)
         conn.executemany(
             "INSERT INTO episode_links (episode_id, link_type, target_kind, target_id) "
-            "VALUES (?, 'advanced_goal', 'goal', ?)",
-            [(eid, str(src_id))] * 101,
+            "VALUES (?, ?, 'goal', ?)",
+            [(eid, f"advanced_goal_{i}", str(src_id)) for i in range(101)],
         )
         conn.commit()
 

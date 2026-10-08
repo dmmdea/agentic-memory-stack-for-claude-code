@@ -1,5 +1,7 @@
 """1:1 counterparts of PromotionGate.Tests.ps1, DreamAutopromote.Tests.ps1, DreamGateVerdict.Tests.ps1
-(spec Phase 5 gate: every Pester scenario has a Python twin before the .ps1 can be retired)."""
+(spec Phase 5 gate: every Pester scenario has a Python twin before the .ps1 can be retired). The one scenario with no
+twin here is DreamAutopromote.Tests.ps1's pin of Test-ImperativeCanonical to imperative_canary.py: this port imports
+that module, so it has no copy to drift."""
 import json, sys
 from pathlib import Path
 import httpx, pytest
@@ -139,7 +141,14 @@ def test_dedup_against_canonical():
     assert [n["memory_id"] for n in d["deduped"]] == ["id0"] and [n["memory_id"] for n in d["surviving"]] == ["id1"]
 
 @pytest.mark.parametrize("text,rejected", [("MUST always do X", True), ("TODO fix the thing", True), ("Run the installer", True),
-                                           ("The stack binds port 18791", False), ("NEVER do X", True), ("ALWAYS do Y", True), ("feature WIP", True)])
+                                           ("The stack binds port 18791", False), ("NEVER do X", True), ("ALWAYS do Y", True), ("feature WIP", True),
+                                           # WG-01: what the server's per-sentence, case-insensitive promote-canary refuses (HTTP 422)
+                                           ("The old exporter is retired. Do not audit it.", True), ("Always bind the tailnet address", True),
+                                           ("Ollama is decommissioned.\nNever re-register it.", True), ("The stack binds port 18791. You must not expose it.", True),
+                                           ("RULE: keep the port closed", True),
+                                           # ... and what it lets through, which must stay nominatable
+                                           ("Port 80 is reserved for HTTP; do not bind it without approval.", False),
+                                           ("The operator must provide a reason when promoting a record", False)])
 def test_structural_filter(text, rejected):
     ev = [{"id": "id0", "memory": text, "metadata": {}}]
     d = ap.autopromote_decision(json.dumps([{"memory_id": "id0", "reason": "r", "confidence": 0.9}]), False, ev, [])

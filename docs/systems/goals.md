@@ -84,6 +84,8 @@ Valid statuses: `open`, `blocked`, `advanced`, `completed`, `abandoned`.
 
 `episode_links` rows with `target_kind='goal'` + `link_type` ∈ `{advanced_goal, blocked_goal, completed_goal, cited_goal}` connect episodes to goals. `get_goal` returns `linked_episode_count` from this table.
 
+**One link per (episode, link type, goal)** (1.34.0, audit DC-03; the unique index `uq_episode_links_goal`). `link_episode_to_goal` (and `add_link` for a goal) is ensure-exists: a repeat returns the existing link's id, which `POST /v1/goals/{id}/link_episode` returns too, and adds no row. Before it, the nightly recurrence promoter re-linked the same episodes every night for 14 days, which inflated `linked_episode_count` and kept those goals looking fresh; the first 1.34.0 start removes those duplicates (keeping the first link's time), so such a goal can read stale on the next Sunday's `goals-stale-sweep`. A merge (`POST /v1/goals/{source}/merge`, `episodic.retarget_goal_links`) moves each source link to the target; a link the target already has is dropped instead, and the response and the `goal-merged` ledger line count both (`relinked_episodes`, `dropped_duplicates`).
+
 ---
 
 ## Write path

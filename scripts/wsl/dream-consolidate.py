@@ -29,8 +29,10 @@ receipt ok:false, or /health/maintenance could never report a dream that breaks 
 
 Step outcome (C1, scripts/wsl/ams-step.sh): exit 0 says the dream finished, not that it did its job.
 Under the chain it also writes one line to $AMS_OUTCOME_FILE - `ok {counts}` or `degraded:<reasons>
-{counts}` (posted-<p>-of-<c>, drift-snapshot-failed, canonical-fetch-failed) - counts being
-{signals, consolidated, posted, spooled, replayed}. Phase 3 waits for a warm embedder first (up to
+{counts}` (posted-<p>-of-<c>, drift-snapshot-failed, canonical-fetch-failed, canonical-fetch-truncated,
+autopromote-failed-<n>) - counts
+being {signals, consolidated, posted, spooled, replayed, replay_failed, spool_depth, nominated,
+structural_rejected, promoted, promote_failed, gate_blocked}. Phase 3 waits for a warm embedder first (up to
 10 min), and an insight whose POST fails is spooled to dream/insight-spool.jsonl and replayed first
 on the next run.
 """
@@ -95,6 +97,12 @@ SPOOL_NAME = "insight-spool.jsonl"
 # hook_contract.py KNOWN_HOOK_CONTRACT_VERSIONS: '17.0' is the /v1/memories/search wire contract. The dream's
 # own searches carried no version, which is what /health/deep hook_contract.missing mostly counted.
 SEARCH_HOOK_CONTRACT_VERSION = "17.0"
+# The canonical fetch filters by tier with threshold 0, so its answer is the whole canonical set whatever the query
+# says, up to the server's cap on one search (_search_core: min(limit, 500)); the text only has to be non-empty
+# (mem0 2.1.0 rejects an empty or whitespace-only query). A full page means the set may be cut: the night reads
+# degraded:canonical-fetch-truncated (37 canonicals live on 2026-10-08).
+CANONICAL_FETCH_QUERY = "canonical facts"
+CANONICAL_FETCH_LIMIT = 500
 
 # ---- store judge (register P4-1b) --------------------------------------------------------
 # The fleet's per-workspace auto-memory stores are maintained deterministically on every PC
@@ -227,10 +235,12 @@ class Mem0Client:
         return pts
 
     def search_canonical(self) -> list[dict]:
-        # FIX 6 + A4a: filter-only fetch so the COMPLETE canonical set comes back; the server
-        # requires a scope key in filters (user_id) or it 500s.
-        body = {"query": "", "filters": {"tier": "canonical", "user_id": self.user_id}, "limit": 1000,
-                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
+        # FIX 6 + A4a: filter-only fetch so the canonical set comes back (to CANONICAL_FETCH_LIMIT); the server
+        # requires a scope key in filters (user_id) or it 500s. threshold 0 so no canonical is dropped
+        # by its cosine to the query (the request default is 0.1), and a fixed non-empty query because
+        # mem0 2.1.0 rejects an empty one (HTTP 500, which this fetch would read as "no canonicals").
+        body = {"query": CANONICAL_FETCH_QUERY, "filters": {"tier": "canonical", "user_id": self.user_id},
+                "limit": CANONICAL_FETCH_LIMIT, "threshold": 0.0, "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
         r = self.http.post(f"{self.url}/v1/memories/search", headers=self.h, json=body, timeout=10.0)
         r.raise_for_status()
         d = r.json()
@@ -693,6 +703,12 @@ class Dream:
         self.replay_failed = 0
         self.drift_snapshot_failed = False
         self.canonical_fetch_failed = False
+        self.canonical_fetch_truncated = False
+        # Phase 3.5, for the step outcome (WG-01): these were locals of the cycle and never reached the receipt.
+        self.nominated = 0
+        self.structural_rejected = 0
+        self.promote_failed = 0
+        self.gate_blocked = 0
 
     # -- receipts -------------------------------------------------------------------------
     def save_phase(self, phase: str, payload: dict) -> None:
@@ -882,7 +898,9 @@ class Dream:
         spool_depth = len(self._spool_read())
         work = {"signals": self.n_signals, "consolidated": self.consolidated, "posted": self.posted,
                 "spooled": self.spooled, "replayed": self.replayed,
-                "replay_failed": self.replay_failed, "spool_depth": spool_depth}
+                "replay_failed": self.replay_failed, "spool_depth": spool_depth,
+                "nominated": self.nominated, "structural_rejected": self.structural_rejected,
+                "promoted": self.promoted, "promote_failed": self.promote_failed, "gate_blocked": self.gate_blocked}
         if out.get("failed") or out.get("unreachable"):
             return f"failed:{'mem0-unreachable' if out.get('unreachable') else out.get('phase')}", work
         reasons = []
@@ -898,6 +916,12 @@ class Dream:
             reasons.append("drift-snapshot-failed")
         if self.canonical_fetch_failed:
             reasons.append("canonical-fetch-failed")
+        if self.canonical_fetch_truncated:
+            reasons.append("canonical-fetch-truncated")
+        if self.promote_failed:
+            # a promotion the server refused or could not complete (10-07: HTTP 422 from the imperative canary
+            # read as `ok` with no counters). A gate BLOCK is the gate working, so gate_blocked is a count only.
+            reasons.append(f"autopromote-failed-{self.promote_failed}")
         return ("degraded:" + ",".join(reasons) if reasons else "ok"), work
 
     def _write_outcome(self, outcome: str, work: dict) -> None:
@@ -1302,6 +1326,10 @@ class Dream:
         try:
             canonical_facts = [_mem_text(e) for e in self.mem0.search_canonical()]
             canonical_norm = [" ".join(t.split()).lower().strip() for t in canonical_facts]
+            if len(canonical_facts) >= CANONICAL_FETCH_LIMIT:
+                # a full page: canonicals past the cap are invisible to the dedup guard below
+                log(f"  autopromote: canonical fetch returned a full page ({len(canonical_facts)}); the set may be cut")
+                self.canonical_fetch_truncated = True
         except Exception as e:  # noqa: BLE001
             log(f"  autopromote: canonical fetch failed (non-fatal): {e}")
             self.canonical_fetch_failed = True
@@ -1324,6 +1352,8 @@ class Dream:
         for line in decision["logs"]:
             log(f"  {line}")
         surviving, deduped, over_cap = decision["surviving"], decision["deduped"], decision["over_cap"]
+        self.nominated = len(surviving) + len(deduped) + len(over_cap)
+        self.structural_rejected = len(decision["structural_rejects"])   # a standing one recurs nightly: make it countable
         if not self.dry:
             self.save_phase("promote", {"candidates": len(candidates), "nominated": len(surviving) + len(deduped) + len(over_cap),
                                         "surviving": len(surviving), "deduped": len(deduped), "over_cap": len(over_cap),
@@ -1332,7 +1362,6 @@ class Dream:
             log(f"  autopromote: DryRun=true -- phase state not written (candidates={len(candidates)} surviving={len(surviving)} deduped={len(deduped)} over_cap={len(over_cap)})")
 
         gate_mode = (os.environ.get("MEM0_PROMOTION_GATE_MODE") or ams_env.stack_env().get("MEM0_PROMOTION_GATE_MODE") or "shadow").strip().lower()
-        failed = blocked_n = 0
         summary = []
         by_id = {str(e.get("id")): e for e in candidates}
         for nom in surviving:
@@ -1357,7 +1386,7 @@ class Dream:
                 summary.append(f"- [DRY-RUN, not promoted] {short} [reason: {reason}]")
                 continue
             if gate_blocked:
-                blocked_n += 1
+                self.gate_blocked += 1
                 summary.append(f"- [GATE-BLOCKED, not promoted] {short} [reason: {reason}]")
                 log(f"  autopromote: GATE ENFORCE blocked id={nom.get('memory_id')} — not promoted to canonical")
                 continue
@@ -1367,8 +1396,11 @@ class Dream:
                 summary.append(f"- {short} [reason: {reason}]")
                 log(f"  autopromote: promoted id={nom.get('memory_id')} confidence={nom.get('confidence')} transport=autonomous")
             else:
-                failed += 1
-                log(f"  autopromote: promotion failed (exit={rc}) id={nom.get('memory_id')}: {_clip(out or '(no output)', 200)}")
+                self.promote_failed += 1
+                # the TAIL of the output: mem0-canonize.sh prints its banner first and `curl -f` the refusal
+                # (`curl: (22) ... returned error: 422`) last, so the head clipped the cause away.
+                log(f"  autopromote: promotion failed (exit={rc}) id={nom.get('memory_id')}: "
+                    f"{' '.join((out or '(no output)').split())[-200:]}")
                 summary.append(f"- [FAILED] {short} [reason: {reason}]")
             log(f"  autopromote: audit id={nom.get('memory_id')} reason={reason} confidence={nom.get('confidence')} exit={rc} transport=autonomous")
         if not self.dry:
@@ -1378,7 +1410,7 @@ class Dream:
                 self._append_morning(f"\n## Autonomous canonical promotions -- {stamp} (review/demote as needed)\n{body}\n")
             except OSError as e:
                 log(f"  autopromote: morning-summary append failed (non-fatal): {e}")
-        log(f"  autopromote done: promoted={self.promoted} failed={failed} gate_blocked={blocked_n} deduped={len(deduped)} over_cap={len(over_cap)} gate_codex_tokens={self.tokens['gate']} (DryRun={self.dry}, {promote_ms if promote_ms is not None else 'skipped'})")
+        log(f"  autopromote done: promoted={self.promoted} failed={self.promote_failed} gate_blocked={self.gate_blocked} deduped={len(deduped)} over_cap={len(over_cap)} gate_codex_tokens={self.tokens['gate']} (DryRun={self.dry}, {promote_ms if promote_ms is not None else 'skipped'})")
 
         # ---- phase 3.7: the store judge (register P4-1b) ---------------------------------
         # The plan only; `ams-step-store-judge` applies it after this step and before
@@ -1444,7 +1476,10 @@ class Dream:
                         hb.append(f"- capabilities: {len(dead)} dead-required, {len(unk)} unknown")
                     rd = (deep.get("checks") or {}).get("retrieval_drift") or {}
                     if rd.get("alarm"):
-                        hb.append(f"- DRIFT ALARM standing (before={rd.get('before_retrievable')}/{rd.get('n_total')}, hwm={rd.get('hwm')})")
+                        # F-03: name the canary and the nights. Nine mornings read "(before=6/7, hwm=7)" and nothing said which.
+                        gone = ",".join(str(x) for x in (rd.get("missing") or [])) or "-"
+                        hb.append(f"- DRIFT ALARM standing (before={rd.get('before_retrievable')}/{rd.get('n_total')}, hwm={rd.get('hwm')}, "
+                                  f"missing={gone}, nights-below-hwm={rd.get('consecutive_below_hwm')})")
                     if int(rd.get("consecutive_snapshot_failures") or 0) >= 2:
                         hb.append("- DRIFT GUARD DEAD (>=2 consecutive snapshot failures)")
                 if len(hb) <= 1 and deep is not None:
