@@ -18,10 +18,10 @@ forking mem0. It is weighted reciprocal rank fusion over the dense pool:
 rank_dense orders the pool by cosine; rank_bm25 and rank_entity order the candidates that have a
 keyword match / an entity boost (a candidate without one gets no term for that leg). Ranks do not
 care how compressed a model's cosine scale is, and the score keeps the top ranks well apart (with
-k=2 the dense leg alone gives rank 1 / 2 / 3 the values 0.61 / 0.45 / 0.36), so a freshness weight
+k=1 the dense leg alone gives rank 1 / 2 / 3 the values 0.57 / 0.38 / 0.29), so a freshness weight
 of 0.8 moves a memory a rank or two instead of to the bottom. The constants were chosen on the
-2026-10-08 lab (docs/systems/fusion.md). Ranks count from 1 (Qdrant's RRF counts from 0, so its
-default k = 2 is k = 1 here).
+2026-10-08 lab (docs/systems/fusion.md) and retuned for EmbeddingGemma-2 alone when it became the only
+space (1.35.0). Ranks count from 1 (Qdrant's RRF counts from 0, so its default k = 2 is this k = 1).
 
 Contract callers depend on (pinned in tests/test_fusion.py):
 * the caller's threshold gates the RAW cosine before any fusion (the context-bundle relevance gate,
@@ -45,9 +45,19 @@ import inspect
 import os
 from typing import Any, Dict, List, Optional
 
-RRF_K = 2.0            # on 1-based ranks; the lab's surface is flat between 1 and 3
-RRF_W_BM25 = 0.4       # the keyword leg's weight relative to the dense leg (1.0)
+# Defaults = the default space's (EmbeddingGemma-2); the server sets the active space's at start
+# (configure(), from embedder_profile: EmbeddingGemma-300m keeps k 2 / keyword 0.4, as measured).
+RRF_K = 1.0            # on 1-based ranks (= Qdrant's default k = 2 on its 0-based ranks)
+RRF_W_BM25 = 0.5       # the keyword leg's weight relative to the dense leg (1.0)
 RRF_W_ENTITY = 0.25    # the entity leg's weight (neutral on the lab sets, kept for entity-led queries)
+
+
+def configure(k: float, w_bm25: float, w_entity: float) -> None:
+    """Set the constants for the embedding space the server runs in (they were measured per model)."""
+    global RRF_K, RRF_W_BM25, RRF_W_ENTITY
+    if not (k > 0 and w_bm25 >= 0 and w_entity >= 0):
+        raise ValueError(f"fusion constants out of range: k={k}, w_bm25={w_bm25}, w_entity={w_entity}")
+    RRF_K, RRF_W_BM25, RRF_W_ENTITY = float(k), float(w_bm25), float(w_entity)
 MODES = ("rrf", "mem0")
 DEFAULT_MODE = "rrf"
 
@@ -211,6 +221,7 @@ def health(status: Dict[str, Any]) -> Dict[str, Any]:
                                  or mode() == "mem0"}
     out.update(status)
     out["mode"] = mode()
+    out["constants"] = {"k": RRF_K, "w_bm25": RRF_W_BM25, "w_entity": RRF_W_ENTITY}
     out["searches"] = dict(SEARCHES)
     return out
 

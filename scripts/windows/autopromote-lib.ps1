@@ -20,15 +20,16 @@
 # EmbeddingGemma-2). mem0-server/embedder_profile.py is the one definition. A PowerShell lib cannot
 # import it, so this table mirrors the two fields it needs, and EmbedderProfile.Tests.ps1 parses
 # that file and fails when the two drift. The profile NAME is read the way embedder_profile.py reads it:
-# MEM0_EMBED_PROFILE in the environment, then ~/.mem0/stack.env (inside WSL), then the default. An
-# unknown name throws (a configuration error, as embedder_profile.active() raises): quietly using the
-# default would query a space the store was not built in. Get-PromotionGateVerdict's caller already
+# MEM0_EMBED_PROFILE in the environment, then ~/.mem0/stack.env (inside WSL), then the legacy space (a
+# box that records none was built before profiles existed: embedder_profile.LEGACY_PROFILE). An unknown
+# name throws (a configuration error, as embedder_profile.active() raises): quietly using another
+# space would query one the store was not built in. Get-PromotionGateVerdict's caller already
 # treats a throw as a gate error (fail-safe BLOCK in enforce mode).
 $script:AmEmbedProfiles = @{
     'egemma-300m' = @{ Collection = 'mem0_egemma_768'; SiblingThreshold = 0.6 }
     'egemma2'     = @{ Collection = 'mem0_eg2_768';    SiblingThreshold = 0.825 }
 }
-$script:AmDefaultEmbedProfile = 'egemma-300m'
+$script:AmLegacyEmbedProfile = 'egemma-300m'
 
 # ~/.mem0/stack.env as a hashtable (KEY=VALUE lines, '#' comments, the FIRST occurrence of a key wins,
 # like embedder_profile._stack_env). An unreadable or absent file is an empty table, never an error.
@@ -78,7 +79,7 @@ function Get-AmEmbedProfile {
         $v
     }
     $name = & $setting 'MEM0_EMBED_PROFILE'
-    if (-not $name) { $name = $script:AmDefaultEmbedProfile }
+    if (-not $name) { $name = $script:AmLegacyEmbedProfile }
     $key = @($script:AmEmbedProfiles.Keys | Where-Object { $_ -ceq $name })
     if ($key.Count -ne 1) {
         throw "MEM0_EMBED_PROFILE='$name' is not a known embedding profile ($((@($script:AmEmbedProfiles.Keys) | Sort-Object) -join ', '))"

@@ -55,6 +55,18 @@ EmbeddingGemma-300m's best recipe on detail questions (+0.10, CI [+0.016, +0.194
 - **An 8K wiki alias** — measured +0.023 MRR (not significant) for about 600 MiB more VRAM; available per
   box, not the default.
 
+## Addendum (1.35.0, 2026-10-08): the memories move to EmbeddingGemma-2
+
+Annotation, not a rewrite of the decision above. The operator ordered EmbeddingGemma-2 for the whole
+stack (memories, entities, episodes and the wiki), multimodal, and the retirement of EmbeddingGemma-300m
+once the stores have moved. That supersedes the measurement gate of point 4 for this move: the measured
+cost on text, with the fusion retuned for EmbeddingGemma-2, is about 0.02 MRR@10 on paraphrases and
+identifiers and 0.03 on the per-prompt injection (`docs/systems/fusion.md`), accepted for images, audio
+and video in the memories' space. Point 2 changes with it: a fresh install records `egemma2`
+(`DEFAULT_PROFILE`), while a box that records no profile is still read as `egemma-300m`
+(`LEGACY_PROFILE`), so no store moves without the migration. Details:
+`docs/systems/embedder-profiles.md` (sections "The switch to EmbeddingGemma-2" and "Media memories").
+
 ## Related code
 
 - [`mem0-server/embedder_profile.py`](../../../mem0-server/embedder_profile.py)

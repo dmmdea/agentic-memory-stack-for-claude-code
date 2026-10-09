@@ -49,12 +49,17 @@ WIKI_PROFILE = _ep.wiki_profile()
 COLLECTION = _ep.collection("wiki", WIKI_PROFILE)
 DIMS = WIKI_PROFILE.dims
 # One vector per page: title + first line + body. EmbeddingGemma-300m's 2,048-token window takes the
-# first 1,200 characters of the body (the recipe its index was built and measured with); a space with
-# a larger window takes the whole body and the shim cuts it at the profile's token budget (2026-10-08:
-# whole pages on EmbeddingGemma-2 answered detail questions about the late parts of a page far better).
-EMBED_BODY_CHARS = 1200 if WIKI_PROFILE.ctx_tokens <= 2048 else None
+# first 1,200 characters of the body (the recipe its index was built and measured with); a space trained
+# on long inputs (a long window beyond its hot one) takes the whole body, and the embedder cuts it at
+# the budget of the alias it reaches: the long alias's when the box serves one, else the hot one's
+# (2026-10-08: whole pages on EmbeddingGemma-2 answered detail questions about the late parts of a page
+# far better).
+EMBED_BODY_CHARS = 1200 if WIKI_PROFILE.long_ctx_tokens <= WIKI_PROFILE.ctx_tokens else None
 # Recorded on every point: a recipe change re-embeds a page even when its text hash is unchanged.
-EMBED_RECIPE = f"{WIKI_PROFILE.name}/{WIKI_PROFILE.template_version}/body:{EMBED_BODY_CHARS or 'full'}"
+# A whole-page recipe names the token budget it was cut at: serving a long alias later (or a budget
+# change) re-embeds the pages.
+EMBED_RECIPE = (f"{WIKI_PROFILE.name}/{WIKI_PROFILE.template_version}/body:{EMBED_BODY_CHARS}" if EMBED_BODY_CHARS
+                else f"{WIKI_PROFILE.name}/{WIKI_PROFILE.template_version}/body:full/tokens:{_ep.long_model(WIKI_PROFILE)[1]}")
 # A point written before recipes were recorded was built with EmbeddingGemma-300m's recipe (it lives
 # in that space's collection), so an upgrade does not re-embed an unchanged index.
 LEGACY_RECIPE = "egemma-300m/eg-search-v1/body:1200"

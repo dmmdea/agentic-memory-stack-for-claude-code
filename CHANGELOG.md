@@ -4,6 +4,54 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.35.0 — EmbeddingGemma-2 for the whole stack, and media memories (2026-10-08)
+
+### Changed
+- **EmbeddingGemma-2 replaces EmbeddingGemma-300m** (operator order; [docs/systems/embedder-profiles.md](docs/systems/embedder-profiles.md),
+  addendum to the Proposed ADR `embedder-profiles.md`). A fresh install now records `egemma2`
+  (`embedder_profile.DEFAULT_PROFILE`). Existing stores do not move by themselves: a box that records no profile
+  is read as `egemma-300m` (the new `LEGACY_PROFILE`, also what a backup set without a profile means), and
+  `install/1-wsl-services.sh` now records the profile on every run (it only carried one before), so the
+  default's change can never rebind a store. Stores move with `embedder-migrate.py` and
+  `install/linux-authority.sh --embed-profile egemma2` ([docs/MIGRATION.md](docs/MIGRATION.md)). The measured
+  text cost against EmbeddingGemma-300m, with the fusion retuned: about 0.02 MRR@10 on paraphrases and
+  identifiers, 0.03 on the per-prompt injection.
+- EmbeddingGemma-2 is served with its projector (`--mmproj`, Q8_0) at ctx 4096 / ubatch 2048: 1,196 MiB loaded,
+  about 1,540 MiB peak after media, on the authority's RTX 3050. Its hot token budget is 1,900 (was 3,900 at
+  ubatch 4096, which would cost 1,870 MiB for inputs memories never reach); a ubatch-8192 long alias stays
+  optional for whole wiki pages. Text vectors are identical with and without the projector, so the calibrated
+  thresholds stand. The installer stages the projector (sha256-checked) and prints the new entry.
+- **Rank fusion retuned for EmbeddingGemma-2**: k 1 (was 2), keyword weight 0.5 (was 0.4), entity 0.25. On the
+  lab's captured queries: identifiers +0.011, per-prompt injection +0.009, paraphrases -0.001 (not significant)
+  ([docs/systems/fusion.md](docs/systems/fusion.md)). The constants are now per embedding space (profile
+  `fusion`, applied at start; `checks.fusion.constants` shows them): a box still on EmbeddingGemma-300m keeps
+  k 2 / keyword 0.4 until it migrates.
+- The nightly semantic dedup never deletes a media memory, and `install/0-prereqs.ps1` asks a fresh box for the
+  EmbeddingGemma-2 llama.cpp floor (b11452).
+- The context-bundle tier literal (`TIER_BUNDLE_POLICY`, `claude-config/model-tiers.json`) carries the default
+  space's relevance gate, 0.70; the server still applies the active space's gate at runtime.
+- The wiki indexer takes whole pages in any space trained for long inputs (it keyed on the hot window, which is
+  now 2,048 tokens on EmbeddingGemma-2 too).
+
+### Added
+- **Media memories** (`mem0-server/media.py`): `POST /v1/memories` takes `media: [{type, data, filename?}]`
+  (images png/jpeg/gif/webp/bmp, audio wav/mp3/flac, video mp4/webm; base64; the type is read from the bytes;
+  up to 4 items of 20 MB) with `infer: false` and the caption as the text. The files are stored
+  content-addressed under `~/.mem0/media`, the payload lists them, and the dense vector becomes one embedding
+  of the caption and the media (Qdrant `update_vectors` on the dense vector only, so BM25 stays); a failed
+  media embed keeps the caption vector and answers `media_embedded: false`. `POST /v1/memories/search` takes
+  `media` to search by an image, a recording or a clip. `GET /v1/memories/{id}/media/{n}` returns a file. A PUT
+  re-embeds the caption with the stored media. `/health/deep` reports `embed_profile.media` and
+  `checks.media` (passive counters).
+- MCP shim: `media_paths` on `memory_add` and `memory_search` (Windows or WSL paths; a media add is never queued
+  offline) and `memory_get_media`, which saves a file locally to open.
+- Backups carry the media as `media-<ts>.tar` (manifest `files.media`, pruned with the set, copied to pCloud);
+  `stack-restore.sh` and `restore-replica.sh` extract it additively.
+
+### Fixed
+- A media search swapped its query vector only when the query had no surrounding whitespace: mem0 strips the
+  query before embedding it, so the swap now compares stripped text (found by the new real-mem0 test).
+
 ## 1.34.0 — rank fusion for every search, capture liveness, urgent chain pages and maintenance observability (2026-10-08)
 
 ### Changed

@@ -17,7 +17,8 @@
 #   ep_load                    ep_table parsed into EP_* variables (below); never fails when the
 #                              module is absent (see the fallback); rc 1 = a configuration error
 #   ep_field <profile> <attr>  one attribute of a profile (model, memories, dims, doc_prefix ...)
-#   ep_default_profile         the profile an existing, unrecorded store was built in
+#   ep_legacy_profile          the profile an existing, unrecorded store (or an unlabelled set) was built in
+#   ep_fresh_profile           the profile a fresh install gets (embedder_profile.DEFAULT_PROFILE)
 #   ep_alias <profile>         the alias this box resolves for that profile (env + stack.env)
 #   ep_env_key <profile>       MEM0_EMBED_MODEL_<PROFILE>: the scoped alias override's name
 #   ep_base_url                the embedder's base URL (MEM0_EMBED_BASE_URL or the default)
@@ -94,7 +95,11 @@ ep_field() {  # <profile> <attr>
     ep_py 'print(getattr(ep.get(sys.argv[1]), sys.argv[2]))' "$1" "$2"
 }
 
-ep_default_profile() {
+ep_legacy_profile() {
+    ep_py 'print(ep.LEGACY_PROFILE)'
+}
+
+ep_fresh_profile() {
     ep_py 'print(ep.DEFAULT_PROFILE)'
 }
 

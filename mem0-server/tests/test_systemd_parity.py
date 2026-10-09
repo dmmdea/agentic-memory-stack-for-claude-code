@@ -338,8 +338,8 @@ def test_the_shell_names_the_scoped_alias_variable_as_embedder_profile_reads_it(
         assert EP.embed_model(EP.PROFILES[name]) == "served-as-this"
 
 
-def test_the_legacy_alias_variable_is_the_default_profiles_alone():
-    """linux-authority.sh writes the unscoped MEM0_EMBED_MODEL for the default profile and the scoped
+def test_the_legacy_alias_variable_is_the_legacy_profiles_alone():
+    """linux-authority.sh writes the unscoped MEM0_EMBED_MODEL for the legacy profile and the scoped
     variable for every other: that is embedder_profile.embed_model's own rule, asked rather than assumed."""
     import tempfile
     for name, p in EP.PROFILES.items():
@@ -349,7 +349,7 @@ def test_the_legacy_alias_variable_is_the_default_profiles_alone():
             out = subprocess.run(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import embedder_profile as ep; "
                                   "print(ep.embed_model(ep.get(sys.argv[2])))", str(REPO_ROOT / "mem0-server"), name],
                                  capture_output=True, text=True, env=env, timeout=30)
-        assert (out.stdout.strip() == "legacy-alias") == (name == EP.DEFAULT_PROFILE), (name, out.stdout, out.stderr)
+        assert (out.stdout.strip() == "legacy-alias") == (name == EP.LEGACY_PROFILE), (name, out.stdout, out.stderr)
 
 
 def test_rollback_prune_timer_ships_unarmed_and_the_authority_installer_turns_it_off():
@@ -467,13 +467,13 @@ def test_the_wsl_installer_stages_embeddinggemma2_beside_the_300m_file():
 
 @pytest.mark.skipif(BASH is None, reason="bash not available")
 def test_the_printed_llama_swap_entries_serve_the_trained_windows_and_name_the_llama_cpp_floor():
-    """The stanza is what an operator pastes into llama-swap: one EmbeddingGemma-2 entry at the
-    profile's served window (mean-pooled with flash attention, batch = ubatch = ctx so a full-window
-    input fits one ubatch), in the group that never evicts the memory stack, and the llama.cpp build
-    that has the gemma-embedding2 architecture. No long entry by default (measured: ctx 8192 bought
-    no significant retrieval for ~600 MiB)."""
+    """The stanza is what an operator pastes into llama-swap: one EmbeddingGemma-2 entry with its
+    projector (--mmproj: images, audio and video), mean-pooled with flash attention, its ubatch the
+    profile's ctx_tokens (the largest input one embed takes; 2048 measured 1,196 MiB loaded with the
+    projector, 4096 would cost 1,870 MiB), in the group that never evicts the memory stack, and the
+    llama.cpp build that has the gemma-embedding2 architecture. No long entry by default."""
     fn = _installer_function("print_stanza_eg2") + "\n" + _installer_function("print_stanza_300m")
-    r = subprocess.run([BASH, "-c", f'EG2_GGUF=/m/eg2.gguf; EGEMMA_GGUF=/m/300m.gguf\n{fn}\nprint_stanza_eg2; echo ----; print_stanza_300m'],
+    r = subprocess.run([BASH, "-c", f'EG2_GGUF=/m/eg2.gguf; EG2_MMPROJ=/m/mmproj.gguf; EGEMMA_GGUF=/m/300m.gguf\n{fn}\nprint_stanza_eg2; echo ----; print_stanza_300m'],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     eg2, old = r.stdout.split("----")
@@ -481,8 +481,8 @@ def test_the_printed_llama_swap_entries_serve_the_trained_windows_and_name_the_l
     assert "members: [embeddinggemma2]" in eg2 and "swap: false" in eg2
     p = EP.PROFILES["egemma2"]
     ctx = p.ctx_tokens
-    for flag in (f"--ctx-size {ctx}", f"--batch-size {ctx}", f"--ubatch-size {ctx}", "--pooling mean", "--embeddings",
-                 "-ngl 99", "--flash-attn on", "--model /m/eg2.gguf", "ttl: 300"):
+    for flag in ("--ctx-size 4096", "--batch-size 4096", f"--ubatch-size {ctx}", "--pooling mean", "--embeddings",
+                 "-ngl 99", "--flash-attn on", "--model /m/eg2.gguf", "--mmproj /m/mmproj.gguf", "ttl: 300"):
         assert flag in eg2, (flag, eg2)
     assert "MEM0_EMBED_LONG_MODEL_EGEMMA2" in eg2, "the optional long entry names the knob that declares it"
     assert "--ctx-size 2048" in old and "--model /m/300m.gguf" in old, "the 300m entry is unchanged"

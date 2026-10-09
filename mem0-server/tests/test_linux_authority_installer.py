@@ -24,10 +24,10 @@ WSL_ONLY = re.compile(r"/mnt/c|cmd\.exe|powershell\.exe|dpapi-fetch-key\.sh|/run
 from _home_isolation import home_env  # noqa: E402
 import embedder_profile as EP  # noqa: E402  (mem0-server is on sys.path: tests/ is a package)
 
-LEGACY = EP.DEFAULT_PROFILE                       # the space stores were built in before profiles
-FRESH = "egemma-300m"                             # the installer's policy: what a box with no store starts in
-OTHER = "egemma2"                                 # a non-default space, for the scoped-alias paths
-assert FRESH == LEGACY and OTHER in EP.PROFILES and OTHER != LEGACY
+LEGACY = EP.LEGACY_PROFILE                        # the space stores were built in before profiles
+FRESH = "egemma2"                                 # the installer's policy (1.35.0): what a box with no store starts in
+OTHER = "egemma2"                                 # a space other than the legacy one, for the scoped-alias paths
+assert FRESH == EP.DEFAULT_PROFILE and OTHER in EP.PROFILES and OTHER != LEGACY and FRESH != LEGACY
 
 
 def EP_KEY(profile):
@@ -374,14 +374,15 @@ def test_zfs_dataset_inherits_from_a_pre_v1232_drop_in(tmp_path):
 
 
 def test_first_install_applies_the_defaults(tmp_path):
-    """A box with no store starts in the default space (EmbeddingGemma-300m: on short facts it measured
-    better than EmbeddingGemma-2 through the per-prompt path, 2026-10-08), under its alias."""
+    """A box with no store starts in the default space (EmbeddingGemma-2 since 1.35.0, multimodal), under
+    its alias, recorded in the profile's own variable (the unscoped MEM0_EMBED_MODEL is the legacy space's)."""
     out = tmp_path / "render"
     r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
     assert r.returncode == 0, r.stderr
     conf = _conf(out)
     assert f"Environment=MEM0_EMBED_PROFILE={FRESH}\n" in conf
-    assert f"Environment=MEM0_EMBED_MODEL={EP.get(FRESH).model}\n" in conf
+    assert f"Environment={EP_KEY(FRESH)}={EP.get(FRESH).model}\n" in conf
+    assert "Environment=MEM0_EMBED_MODEL=" not in conf
     assert "MEM0_ZFS_DATASET" not in conf
     assert "inherited" not in r.stdout
     assert f"embed profile: {FRESH} (fresh install)" in r.stdout
@@ -401,7 +402,7 @@ def test_a_fresh_install_records_its_profile_and_a_rerun_keeps_it(tmp_path):
     r, _ = _run(["--bind-ip", "192.0.2.9", "--render-only", str(out)], tmp_path)
     assert r.returncode == 0, r.stderr
     se = _se_lines(out)
-    assert f"MEM0_EMBED_PROFILE={FRESH}" in se and f"MEM0_EMBED_MODEL={EP.get(FRESH).model}" in se
+    assert f"MEM0_EMBED_PROFILE={FRESH}" in se and f"{EP_KEY(FRESH)}={EP.get(FRESH).model}" in se
     (tmp_path / "home" / ".mem0").mkdir(parents=True, exist_ok=True)
     (tmp_path / "home" / ".mem0" / "stack.env").write_text((out / "stack.env").read_text(encoding="utf-8"), encoding="utf-8")
     out2 = tmp_path / "render2"

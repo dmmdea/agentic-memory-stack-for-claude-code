@@ -114,6 +114,8 @@ print(f.get("qdrant_snapshot") or "", f.get("episodic_db") or "", f.get("history
 [ -n "$QDRANT_FILE" ] && [ -n "$EPI_FILE" ] && [ -n "$HIST_FILE" ] || fail "manifest $TS is not a complete set (qdrant/episodic/history all required)"
 [ "${PTS:-0}" -gt 0 ] || fail "manifest $TS reports 0 Qdrant points — refusing to restore an empty brain"
 echo "    set $TS: $PTS points ($QDRANT_FILE, $EPI_FILE, $HIST_FILE)"
+# media memories' files (1.35.0): optional, absent from older sets and from sets made while there was no media
+MEDIA_FILE="$(printf '%s' "$MANIFEST_JSON" | python3 -c 'import json,sys; v=(json.load(sys.stdin).get("files") or {}).get("media"); print(v if isinstance(v,str) else "")')"
 
 # ---------------------------------------------------------------- 1b. the set's embedding space
 # "-" stands for an empty field (read would collapse a leading empty one): a set from before profiles
@@ -125,8 +127,8 @@ print(d.get("embed_profile") or "-", (d.get("collections") or {}).get("memories"
 [ "$MP_PROFILE" != "-" ] || MP_PROFILE=""
 [ "$MP_COLLECTION" != "-" ] || MP_COLLECTION=""
 if [ -z "$MP_PROFILE" ]; then
-    MP_PROFILE="$(ep_py 'print(ep.DEFAULT_PROFILE)')" || fail "embedder_profile.py not found beside the repo or in ~/apps/mem0-server: the replica cannot tell which embedding space set $TS is in"
-    echo "    set $TS records no embedding profile (made before profiles): the default space, $MP_PROFILE"
+    MP_PROFILE="$(ep_py 'print(ep.LEGACY_PROFILE)')" || fail "embedder_profile.py not found beside the repo or in ~/apps/mem0-server: the replica cannot tell which embedding space set $TS is in"
+    echo "    set $TS records no embedding profile (made before profiles): the legacy space, $MP_PROFILE"
 fi
 [ "$MP_PROFILE" != "unknown" ] || fail "set $TS was written without a resolvable embedding profile (embed_profile: unknown); fix the Brain's backup first (is embedder_profile.py deployed beside its scripts?)"
 LOCAL_PROFILE="$(ep_py 'print(ep.active().name)')" || fail "this replica's embedding profile does not resolve (embedder_profile.py missing, or MEM0_EMBED_PROFILE names an unknown profile)"
@@ -162,6 +164,21 @@ for f in "$QDRANT_FILE" "$EPI_FILE" "$HIST_FILE"; do
     [ "$got" = "$want" ] || { rm -f "$DEST/$f.part"; fail "$f: fetched $got B, expected $want B"; }
     mv "$DEST/$f.part" "$DEST/$f"; echo "    fetched: $f ($got B)"
 done
+if [ -n "$MEDIA_FILE" ]; then
+    want="$(remote "stat -c %s $BRAIN_BACKUP_DIR/$MEDIA_FILE" | tr -d '\r' | tail -1)"
+    if [ "${want:-0}" -gt 0 ]; then
+        if [ -f "$DEST/$MEDIA_FILE" ] && [ "$(stat -c %s "$DEST/$MEDIA_FILE")" = "$want" ]; then echo "    cached: $MEDIA_FILE ($want B)"
+        else
+            remote "cat $BRAIN_BACKUP_DIR/$MEDIA_FILE" > "$DEST/$MEDIA_FILE.part"
+            got="$(stat -c %s "$DEST/$MEDIA_FILE.part")"
+            [ "$got" = "$want" ] || { rm -f "$DEST/$MEDIA_FILE.part"; fail "$MEDIA_FILE: fetched $got B, expected $want B"; }
+            mv "$DEST/$MEDIA_FILE.part" "$DEST/$MEDIA_FILE"; echo "    fetched: $MEDIA_FILE ($got B)"
+        fi
+    else
+        echo "    WARN: the set lists $MEDIA_FILE but the Brain cannot size it; media memories will answer without their files"
+        MEDIA_FILE=""
+    fi
+fi
 # keep only the newest cached set
 find "$REPLICA_CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "$TS" -exec rm -rf {} + 2>/dev/null || true
 
@@ -182,6 +199,13 @@ rm -f "$MEM0_DIR"/episodic.db-shm "$MEM0_DIR"/episodic.db-wal "$MEM0_DIR"/histor
 cp "$DEST/$EPI_FILE" "$MEM0_DIR/episodic.db.tmp" && mv "$MEM0_DIR/episodic.db.tmp" "$MEM0_DIR/episodic.db"
 cp "$DEST/$HIST_FILE" "$MEM0_DIR/history.db.tmp" && mv "$MEM0_DIR/history.db.tmp" "$MEM0_DIR/history.db"
 echo "    ledgers: episodic.db + history.db replaced"
+if [ -n "$MEDIA_FILE" ] && [ -f "$DEST/$MEDIA_FILE" ]; then
+    # content-addressed names: additive, and an existing name already holds the same bytes
+    MEDIA_DST="${MEM0_MEDIA_DIR:-$MEM0_DIR/media}"
+    mkdir -p "$MEDIA_DST" && tar -C "$MEDIA_DST" --skip-old-files --no-same-owner -xf "$DEST/$MEDIA_FILE" \
+        || fail "media restore from $MEDIA_FILE into $MEDIA_DST failed"
+    echo "    media: $(find "$MEDIA_DST" -type f ! -name '*.tmp' | wc -l) file(s) in $MEDIA_DST"
+fi
 
 # ---------------------------------------------------------------- 4. the replica must actually answer
 say "[4] start mem0 and prove it answers (/health/deep embeds through the local embedder)"

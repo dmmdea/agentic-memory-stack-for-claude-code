@@ -79,3 +79,25 @@ def test_unchanged_needs_both_hash_and_recipe():
     assert not wib.unchanged(("h1", "p.md", EG2), "h2", recipe=EG2)
     assert not wib.unchanged(("h1", "p.md", EG300M), "h1", recipe=EG2)
     assert not wib.unchanged(None, "h1", recipe=EG2)
+
+
+def _load_in(monkeypatch, **env):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    spec = importlib.util.spec_from_file_location("wiki_index_build_env", _spec.origin)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_whole_page_recipe_names_the_token_budget_it_was_cut_at(monkeypatch):
+    """1.35.0: EmbeddingGemma-2's hot alias cuts a page at 1,900 tokens; a box that later serves the long
+    alias cuts it at 7,900. The recipe says which, so that change re-embeds the pages."""
+    hot = _load_in(monkeypatch, MEM0_WIKI_EMBED_PROFILE="egemma2", MEM0_EMBED_LONG_MODEL_EGEMMA2="none")
+    assert hot.EMBED_BODY_CHARS is None
+    assert hot.EMBED_RECIPE == "egemma2/eg-search-v1/body:full/tokens:1900"
+    long = _load_in(monkeypatch, MEM0_WIKI_EMBED_PROFILE="egemma2", MEM0_EMBED_LONG_MODEL_EGEMMA2="eg2-long")
+    assert long.EMBED_RECIPE == "egemma2/eg-search-v1/body:full/tokens:7900"
+    assert not long.unchanged(("h1", "p.md", hot.EMBED_RECIPE), "h1", recipe=long.EMBED_RECIPE)
+    legacy = _load_in(monkeypatch, MEM0_WIKI_EMBED_PROFILE="egemma-300m")
+    assert legacy.EMBED_RECIPE == legacy.LEGACY_RECIPE == "egemma-300m/eg-search-v1/body:1200"

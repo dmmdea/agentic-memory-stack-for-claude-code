@@ -113,7 +113,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py embedder_profile.py fusion.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
+MEM0_MODULES="app.py config.py embedder_profile.py fusion.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py media.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"
@@ -306,6 +306,19 @@ MEM0_ROLE="${MEM0_ROLE:-brain}"
 # the default space's collections while the store sits in another. A profile change goes through
 # install/linux-authority.sh --embed-profile or scripts/wsl/embedder-migrate.py, never through here.
 mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")
+# 1.35.0: the embedding space is RECORDED on every install, so a change of the default never moves a
+# store: a store already on the box with no recorded profile was built before profiles existed (the
+# legacy space, which is also how the server reads an unrecorded box); a fresh box starts on the default.
+if ! printf '%s\n' "${STACK_ENV_CARRY[@]}" | grep -q '^MEM0_EMBED_PROFILE='; then
+    if [ -f "$USER_HOME/.mem0/stack.env" ] || [ -n "$(ls -A "$QDRANT_DIR/storage/collections" 2>/dev/null)" ]; then
+        EP_RECORD="$(ep_legacy_profile)" || EP_RECORD=""; EP_WHY="existing store, no recorded profile"
+    else
+        EP_RECORD="$(ep_fresh_profile)" || EP_RECORD=""; EP_WHY="fresh install"
+    fi
+    [ -n "$EP_RECORD" ] || { echo "FATAL: cannot read the embedding profile from mem0-server/embedder_profile.py" >&2; exit 1; }
+    STACK_ENV_CARRY+=("MEM0_EMBED_PROFILE=$EP_RECORD")
+    echo "  embedding profile recorded: $EP_RECORD ($EP_WHY)"
+fi
 for kv in "${STACK_ENV_CARRY[@]}"; do echo "  ${kv%%=*} carried over from $USER_HOME/.mem0/stack.env: ${kv#*=}"; done
 # A Windows user name or repo path with a space would make every `. stack.env` run its second
 # word as a command (the 1.31.1 wiki-sources outage class), so such a value is refused here.
@@ -376,6 +389,10 @@ EG2_GGUF="$USER_HOME/models/embeddinggemma-2-Q8_0.gguf"
 EG2_HF_REPO="ggml-org/embeddinggemma-2-GGUF"
 EG2_HF_FILE="embeddinggemma-2-Q8_0.gguf"
 EG2_SHA256="2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
+# its projector: the vision and audio encoders that put images, audio and video into the same space
+EG2_MMPROJ="$USER_HOME/models/mmproj-embeddinggemma-2-Q8_0.gguf"
+EG2_MMPROJ_HF_FILE="mmproj-embeddinggemma-2-Q8_0.gguf"
+EG2_MMPROJ_SHA256="c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"
 mkdir -p "$USER_HOME/models"
 
 # stage_gguf <dest> <hf repo> <hf file> <label> <sha256 or ""> [size note]
@@ -433,6 +450,7 @@ stage_gguf "$EGEMMA_GGUF" "$EGEMMA_HF_REPO" "$EGEMMA_HF_FILE" "EmbeddingGemma-30
 EG2_WANTED="$( export HOME="$USER_HOME"; ep_py 'print("1" if "egemma2" in (ep.active().name, ep.wiki_profile().name) else "")' 2>/dev/null || true )"
 if [ -n "$EG2_WANTED" ] || [ "${MEM0_STAGE_EG2:-}" = 1 ]; then
     stage_gguf "$EG2_GGUF" "$EG2_HF_REPO" "$EG2_HF_FILE" "EmbeddingGemma-2" "$EG2_SHA256"
+    stage_gguf "$EG2_MMPROJ" "$EG2_HF_REPO" "$EG2_MMPROJ_HF_FILE" "the EmbeddingGemma-2 projector" "$EG2_MMPROJ_SHA256" "~555MB"
 fi
 
 # The llama-swap entries, printed for the operator to add (see install/llama-swap-setup.md).
@@ -451,17 +469,19 @@ print_stanza_300m() {
 }
 print_stanza_eg2() {
     echo "        EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture)."
-    echo "        Serve it at ctx 4096 (the same VRAM as EmbeddingGemma-300m at 2048), never the 262144 its GGUF"
-    echo "        header advertises, in the group that never evicts the memory stack:"
+    echo "        Serve it with its projector (--mmproj: images, audio and video embed into the same space)"
+    echo "        at ctx 4096 / ubatch 2048, never the 262144 its GGUF header advertises, in the group that"
+    echo "        never evicts the memory stack (measured: 1,196 MiB loaded, ~1,540 MiB peak after media):"
     echo "          groups:"
     echo "            support: {swap: false, exclusive: false, members: [embeddinggemma2]}"
     echo "          embeddinggemma2:"
     echo "            cmd: <llama.cpp>/llama-server --model $EG2_GGUF \\"
-    echo "                 --embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 4096 \\"
+    echo "                 --mmproj $EG2_MMPROJ \\"
+    echo "                 --embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 2048 \\"
     echo "                 -ngl 99 --flash-attn on --port \${PORT} --host 127.0.0.1"
     echo "            ttl: 300"
-    echo "        (an optional ctx-8192 entry for whole long pages costs ~600 MiB more and measured no"
-    echo "        significant gain: declare it as MEM0_EMBED_LONG_MODEL_EGEMMA2 if you add one)"
+    echo "        (an optional ubatch-8192 entry for whole long pages costs ~600 MiB more while it is loaded:"
+    echo "        declare it as MEM0_EMBED_LONG_MODEL_EGEMMA2 if you add one)"
 }
 
 # Verify the embedder endpoint is actually serving the ACTIVE profile's alias (the llama-swap model
@@ -483,11 +503,11 @@ if curl -sf -m 20 -X POST http://127.0.0.1:11436/v1/embeddings \
     echo "  $EMBED_LABEL reachable on :11436 as '$EMBED_ALIAS' (${EMBED_DIMS}-dim embedder OK)"
 else
     echo "  WARN: $EMBED_LABEL not reachable on :11436 as '$EMBED_ALIAS'."
-    if [ "$EMBED_PROFILE" = "$(ep_default_profile)" ]; then print_stanza_300m; else print_stanza_eg2; fi
+    if [ "$EMBED_PROFILE" = "$(ep_legacy_profile)" ]; then print_stanza_300m; else print_stanza_eg2; fi
 fi
 # EmbeddingGemma-2 staged but not served while the stack is still in the older space: say how to
 # serve it, once, for the migration (scripts/wsl/embedder-migrate.py builds the new space beside the old).
-if [ -s "$EG2_GGUF" ] && [ "$EMBED_PROFILE" = "$(ep_default_profile)" ] \
+if [ -s "$EG2_GGUF" ] && [ "$EMBED_PROFILE" = "$(ep_legacy_profile)" ] \
    && ! curl -sf -m 5 http://127.0.0.1:11436/v1/models | grep -q '"embeddinggemma2"'; then
     echo "  NOTE: the EmbeddingGemma-2 GGUF is staged but not served. To migrate to it, add these entries first:"
     print_stanza_eg2

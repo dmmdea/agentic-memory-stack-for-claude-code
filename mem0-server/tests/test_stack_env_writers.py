@@ -485,3 +485,40 @@ def test_the_carried_nli_flag_is_documented_as_not_read_from_stack_env():
     assert re.search(r"MEM0_NLI_GATE_ENABLED \(the NLI write gate\): NOT read from here", lib)
     assert "systemctl --user edit mem0" in lib and "systemctl --user edit mem0" in doc
     assert "does not turn the NLI write gate on" in doc
+
+
+def _wsl_record_block() -> str:
+    """install/1-wsl-services.sh's own text from the carry to the profile record (1.35.0), verbatim."""
+    text = (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
+    start = text.index('mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")')
+    end = text.index('    echo "  embedding profile recorded: $EP_RECORD ($EP_WHY)"\nfi\n', start)
+    return text[start:end] + '    echo "  embedding profile recorded: $EP_RECORD ($EP_WHY)"\nfi\n'
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("case,stack_env,collections,expected", [
+    ("fresh box", None, False, "MEM0_EMBED_PROFILE=egemma2"),
+    ("receipt from before profiles", "MEM0_WSL_USER=t\nMEM0_EMBED_MODEL=embeddinggemma-ams\n", False,
+     "MEM0_EMBED_PROFILE=egemma-300m"),
+    ("restored Qdrant data, no receipt yet", None, True, "MEM0_EMBED_PROFILE=egemma-300m"),
+    ("a recorded profile is kept", "MEM0_EMBED_PROFILE=egemma-300m\n", False, "MEM0_EMBED_PROFILE=egemma-300m"),
+    ("a recorded new profile is kept", "MEM0_EMBED_PROFILE=egemma2\n", True, "MEM0_EMBED_PROFILE=egemma2"),
+])
+def test_the_wsl_installer_records_the_profile_so_a_default_change_cannot_move_a_store(
+        tmp_path, case, stack_env, collections, expected):
+    """1.35.0: the WSL installer has no profile flag, and the server reads an unrecorded box as the legacy
+    space. So the installer records one on every run: the legacy space for a store already on the box, the
+    default for a fresh one, and whatever is recorded otherwise (exactly one MEM0_EMBED_PROFILE line)."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True)
+    if stack_env is not None:
+        (home / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
+    if collections:
+        (home / "qdrant-server" / "storage" / "collections" / "mem0_egemma_768").mkdir(parents=True)
+    script = (f'set -eo pipefail\n. "{LIB.as_posix()}"\n. "{(REPO_ROOT / "scripts/wsl/embed-profile.sh").as_posix()}"\n'
+              f'USER_HOME="{home.as_posix()}"; QDRANT_DIR="$USER_HOME/qdrant-server"\n'
+              + _wsl_record_block() + 'printf "%s\n" "${STACK_ENV_CARRY[@]}"\n')
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=home_env(home), timeout=60)
+    assert r.returncode == 0, (case, r.stderr)
+    lines = [ln for ln in r.stdout.splitlines() if ln.startswith("MEM0_EMBED_PROFILE=")]
+    assert lines == [expected], (case, r.stdout)

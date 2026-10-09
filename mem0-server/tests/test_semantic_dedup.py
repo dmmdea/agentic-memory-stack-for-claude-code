@@ -337,3 +337,15 @@ def test_each_generation_collection_is_judged_with_its_own_space():
     import embedder_profile as ep
     assert sd._space_of(ep.get("egemma2").memories).name == "egemma2"
     assert sd._space_of(ep.get("egemma-300m").memories).name == "egemma-300m"
+
+
+def test_a_media_memory_is_never_the_one_deleted():
+    """1.35.0: a media memory's vector can be its caption's alone (a media embed that failed), so two
+    photos with one caption look identical to the job while they are two memories."""
+    media = {"tier": "evidence", "media": [{"type": "image", "sha256": "a" * 64, "ext": "png"}]}
+    plain = {"tier": "evidence"}
+    assert sd._is_protected(media) and not sd._is_protected(plain)
+    assert sd.decide_pair(plain, media) == "delete-older"
+    assert sd.decide_pair(media, dict(media)) == "skip"
+    assert sd.decide_pair(media, plain) == "delete-newer"
+    assert not sd._is_protected({"tier": "evidence", "media": []})
