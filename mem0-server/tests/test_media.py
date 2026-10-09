@@ -207,6 +207,27 @@ def test_content_parts_have_the_shapes_llama_server_takes():
     assert media.content_part(vid) == {"type": "input_video", "input_video": {"url": "data:video/mp4;base64," + _b64(MP4)}}
 
 
+# ---------------------------------------------------------------- the server's media gate
+
+def test_every_media_gate_in_the_server_asks_the_box_not_just_the_profile():
+    """1.35.1: MEM0_MEDIA_EMBEDDER=off marks a box that serves its alias text-only, so the profile having a media
+    embedder (EMBED_PROFILE.media) is no longer enough to embed media here: every gate asks _media_on(). The PUT
+    re-embed of a memory's stored media is the one no endpoint test reaches: a text-only box that tested the
+    profile alone would send llama-server image parts it cannot read on an update. app.py cannot be imported
+    headless (it builds the live Memory client), so this reads its text."""
+    import re
+    app = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in app.splitlines() if not ln.lstrip().startswith("#"))
+    # the PUT re-embed of a memory's stored media
+    assert re.search(r'len\(_items\) == len\(_pre_payload\["media"\]\)\s+and _media_on\(\)', code), \
+        "the update's media re-embed must ask _media_on()"
+    # ...and the profile test survives only inside the helpers that define the gate and its reason
+    body = code[code.index("def _media_on()"):code.index("def _query_media(")]
+    rest = code.replace(body, "")
+    assert "EMBED_PROFILE.media" not in rest, "a gate that asks the profile alone ignores MEM0_MEDIA_EMBEDDER=off"
+    assert rest.count("_media_on()") >= 4, "search, add, update and /health/deep each ask the box"
+
+
 # ---------------------------------------------------------------- the MCP shim
 
 SHIM_PATH = Path(__file__).resolve().parents[2] / "scripts" / "wsl" / "mem0-mcp-shim.py"

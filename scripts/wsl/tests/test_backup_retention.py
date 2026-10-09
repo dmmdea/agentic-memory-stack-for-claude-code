@@ -1323,6 +1323,10 @@ def test_the_replica_restore_refuses_a_set_in_another_space_than_the_replicas(tm
         assert r.returncode != 0
         assert f"set 20261007-033000 is in embedding profile '{P2.name}' but this replica is configured for '{P300.name}'" in r.stderr, r.stderr
         assert f"install/linux-replica.sh --embed-profile {P2.name}" in r.stderr, "the refusal names the fix"
+        # llama-swap serves the ALIAS, not the profile's name: an operator told to serve 'egemma2' adds an entry
+        # nothing asks for
+        assert f"Serve '{P2.model}' (profile '{P2.name}') on llama-swap :11436" in r.stderr, r.stderr
+        assert P2.model != P2.name
     finally:
         swap.close()
     # and the other way: a legacy set on a replica that has moved to the new space
@@ -1445,3 +1449,97 @@ def test_both_restores_extract_media_without_rewriting_a_file():
     for script in (RESTORE, REPLICA_RESTORE):
         code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
         assert re.search(r'tar -C "\$MEDIA_DST" --skip-old-files --no-same-owner -xf ', code), script
+
+
+def test_both_restores_list_the_media_tar_before_extracting_it():
+    """The two bash restores cannot run their extraction here (they need a live stack), so the order is pinned
+    in their text: the tar is listed (tar -tvf, inside media_tar_problem) and a refusal comes BEFORE the
+    extraction. stack-restore.sh handles it like its other media failure (a warning that counts), restore-replica.sh
+    like its own (fail)."""
+    for script, refusal in ((RESTORE, 'echo "WARN: media restore REFUSED, nothing extracted ($MEDIA_PROBLEM)'),
+                            (REPLICA_RESTORE, 'fail "media restore from $MEDIA_FILE refused, nothing extracted ($MEDIA_PROBLEM)"')):
+        code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+        assert 'tar -tvf "$1"' in code, script
+        call = code.index('MEDIA_PROBLEM="$(media_tar_problem "')
+        assert code.index("media_tar_problem() {") < call < code.index('tar -C "$MEDIA_DST" --skip-old-files'), script
+        assert refusal in code[call:], script
+    restore = RESTORE.read_text(encoding="utf-8")
+    assert "WARNS=$((WARNS+1))" in restore[restore.index("media restore REFUSED"):restore.index("media restore FAILED")]
+
+
+def _media_tar_problem_fn(script: Path) -> str:
+    text = script.read_text(encoding="utf-8")
+    start = text.index("media_tar_problem() {")
+    return text[start:text.index("\n}\n", start) + 3]
+
+
+def _tar_with(path: Path, *members):
+    """A real tar holding the given (TarInfo, data-or-None) members, in order."""
+    import io
+    import tarfile
+    with tarfile.open(path, "w") as t:
+        for info, data in members:
+            t.addfile(info, io.BytesIO(data) if data is not None else None)
+    return path
+
+
+def _ti(name, kind="file", link=""):
+    import tarfile
+    ti = tarfile.TarInfo(name)
+    ti.mtime = 1_700_000_000
+    ti.uid = ti.gid = 1000
+    ti.mode = 0o644
+    if kind == "file":
+        ti.type, ti.size = tarfile.REGTYPE, 5
+    elif kind == "dir":
+        ti.type, ti.mode = tarfile.DIRTYPE, 0o755
+    elif kind == "symlink":
+        ti.type, ti.linkname = tarfile.SYMTYPE, link
+    elif kind == "hardlink":
+        ti.type, ti.linkname = tarfile.LNKTYPE, link
+    elif kind == "fifo":
+        ti.type = tarfile.FIFOTYPE
+    return ti
+
+
+_GOOD = ("./ab/ab" + "0" * 62 + ".png")
+
+
+@pytest.mark.skipif(shutil.which("tar") is None, reason="tar not available")
+@pytest.mark.parametrize("script", [RESTORE, REPLICA_RESTORE], ids=["stack-restore.sh", "restore-replica.sh"])
+@pytest.mark.parametrize("case,members,refused", [
+    ("what stack-backup.sh writes: ./, a directory, a regular file", [(_ti("./", "dir"), None), (_ti("./ab", "dir"), None), (_ti(_GOOD), b"12345")], None),
+    ("names with spaces and a dotted name are plain names", [(_ti("./ab/a b..png"), b"12345"), (_ti("./.hidden"), b"12345")], None),
+    ("an empty tar", [], None),
+    ("a symlink out of the media directory", [(_ti("./ab", "symlink", "/etc"), None), (_ti(_GOOD), b"12345")], "not a regular file or directory"),
+    ("a symlink to a relative target", [(_ti("./link", "symlink", "../../x"), None)], "not a regular file or directory"),
+    ("a hard link", [(_ti(_GOOD), b"12345"), (_ti("./ab/other", "hardlink", _GOOD), None)], "not a regular file or directory"),
+    ("a fifo", [(_ti("./pipe", "fifo"), None)], "not a regular file or directory"),
+    ("an absolute name", [(_ti("/etc/cron.d/evil"), b"12345")], "absolute or '..' name"),
+    ("a '..' component", [(_ti("./ab/../../evil"), b"12345")], "absolute or '..' name"),
+    ("a bare '..' directory", [(_ti("..", "dir"), None)], "absolute or '..' name"),
+])
+def test_the_media_tar_check_refuses_anything_but_relative_regular_files_and_directories(tmp_path, script, case, members, refused):
+    """Run for real: the bash function both restores carry, against tars made by Python's tarfile and listed by
+    this box's tar. Its exit 0 means 'do not extract' and it prints why; 1, silently, means every entry is fine."""
+    tar = _tar_with(tmp_path / "media.tar", *members)
+    fn = _media_tar_problem_fn(script)
+    r = subprocess.run(["bash", "-c", fn + '\nmedia_tar_problem "$1"; echo "rc=$?"', "x", str(tar)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out, rc = r.stdout.rsplit("rc=", 1)
+    if refused is None:
+        assert rc.strip() == "1" and out.strip() == "", (case, r.stdout)
+    else:
+        assert rc.strip() == "0" and refused in out, (case, r.stdout)
+
+
+@pytest.mark.skipif(shutil.which("tar") is None, reason="tar not available")
+@pytest.mark.parametrize("script", [RESTORE, REPLICA_RESTORE], ids=["stack-restore.sh", "restore-replica.sh"])
+def test_the_media_tar_check_refuses_a_tar_it_cannot_list(tmp_path, script):
+    bad = tmp_path / "media.tar"
+    bad.write_bytes(b"this is not a tar archive" * 100)
+    r = subprocess.run(["bash", "-c", _media_tar_problem_fn(script) + '\nmedia_tar_problem "$1"; echo "rc=$?"', "x", str(bad)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.rstrip().endswith("rc=0") and "tar could not list it" in r.stdout, r.stdout

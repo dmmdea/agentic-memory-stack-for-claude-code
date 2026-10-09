@@ -115,7 +115,7 @@ One more, added in 1.32.5:
 
 And one in 1.35.0:
 
-- **`media` — informational** (never flips `ok`): media memories ([embedder profiles](embedder-profiles.md#media-memories)). Shape: `{"enabled": bool, "dir": "...", "embeds_ok": N, "embeds_failed": N, "last_ok_ts": iso|null, "last_error": "..."|null}` — whether the active space embeds media, where the files live, and the passive counters of media embeds since start (no active probe: a cold projector load is slow). `embeds_failed > 0` means media memories were kept with their caption-only vectors; `last_error` says why (usually the alias served without `--mmproj`).
+- **`media` — informational** (never flips `ok`): media memories ([embedder profiles](embedder-profiles.md#media-memories)). Shape: `{"enabled": bool, "dir": "...", "embeds_ok": N, "embeds_failed": N, "last_ok_ts": iso|null, "last_error": "..."|null}` — whether the active space embeds media, where the files live, and the passive counters of media embeds since start (no active probe: a cold projector load is slow). `embeds_failed > 0` means media memories were kept with their caption-only vectors; `last_error` says why (usually the alias served without `--mmproj`). `enabled` is false on a space without a media embedder and on a box that records `MEM0_MEDIA_EMBEDDER=off` (1.35.1: its alias is served text-only); such a box answers the media fields of `POST /v1/memories` and `/v1/memories/search` with a `400` that says so.
 
 ### `GET /health/maintenance`
 

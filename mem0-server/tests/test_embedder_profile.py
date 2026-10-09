@@ -19,7 +19,7 @@ import embedder_profile as ep
 _KEYS = ("MEM0_EMBED_PROFILE", "MEM0_EMBED_MODEL", "MEM0_EMBED_MODEL_EGEMMA2", "MEM0_EMBED_MODEL_EGEMMA_300M",
          "MEM0_EMBED_LONG_MODEL_EGEMMA2", "MEM0_WIKI_EMBED_PROFILE",
          "MEM0_QDRANT_COLLECTION", "MEM0_COLLECTION", "MEM0_EPISODES_COLLECTION", "MEM0_WIKI_COLLECTION",
-         "MEM0_EMBED_BASE_URL")
+         "MEM0_EMBED_BASE_URL", "MEM0_MEDIA_EMBEDDER")
 
 
 @pytest.fixture
@@ -222,3 +222,22 @@ def test_threshold_overrides_are_reported_with_the_value_they_replace(clean, mon
     ov = ep.threshold_overrides()
     assert ov == {"episode_floor": {"env": "MEM0_RAW_FALLBACK_COSINE_FLOOR", "value": "0.25", "profile_value": 0.68}}
     assert ep.describe()["threshold_overrides"] == ov
+
+
+@pytest.mark.parametrize("value,expected", [("", True), ("on", True), ("off", False), ("OFF", False), ("0", False),
+                                            ("false", False), ("no", False)])
+def test_media_enabled_follows_the_profile_and_the_box_knob(clean, monkeypatch, value, expected):
+    """1.35.1: a box that serves its embedding alias text-only (no --mmproj; a replica on a small card) records
+    MEM0_MEDIA_EMBEDDER=off. The space still has a media embedder; this box just does not run it."""
+    if value:
+        monkeypatch.setenv("MEM0_MEDIA_EMBEDDER", value)
+    assert ep.media_enabled(ep.get("egemma2")) is expected
+    assert ep.media_enabled(ep.get("egemma-300m")) is False, "a space without a media embedder never has one"
+
+
+def test_media_enabled_reads_stack_env_and_the_environment_wins(clean, monkeypatch):
+    _stack_env(clean, MEM0_MEDIA_EMBEDDER="off")
+    assert ep.media_enabled(ep.get("egemma2")) is False
+    assert ep.describe(ep.get("egemma2"))["media"] is False, "/health/deep reports this box's capability"
+    monkeypatch.setenv("MEM0_MEDIA_EMBEDDER", "on")
+    assert ep.media_enabled(ep.get("egemma2")) is True

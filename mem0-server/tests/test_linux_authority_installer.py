@@ -544,13 +544,22 @@ def test_the_live_checks_name_the_profile_and_guard_a_rebind(tmp_path):
     assert "does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model)" in sh
     assert "b11452" in sh
     i = sh.index('PREV_PROFILE="$RECORDED_PROFILE"')
-    guard = sh[i:i + 1500]
+    guard = sh[i:sh.index("# The same rule judged from the store itself", i)]
     assert '/collections/$new_mem' in guard and "embedder-migrate.py" in guard and "holds no points" in guard
     # an unrecorded store counts as the default space whether the box has a receipt or only Qdrant data on
     # disk (a restored data dir): the same test that decided "existing store" decides "which space it is in"
     assert 'if [ -z "$PREV_PROFILE" ] && store_exists; then PREV_PROFILE="$LEGACY_PROFILE"; fi' in guard
     assert 'ep.collection("memories", ep.get(sys.argv[1]))' in guard, "the collection name comes from embedder_profile"
     assert sh.index("holds no points") < sh.index("systemctl --user restart mem0.service"), "the guard runs before the server restarts"
+    # 1.35.1: a collection pin on the old space cannot ride a profile change through the points check
+    assert 'own_mem="$(ep_py \'print(ep.get(sys.argv[1]).memories)\'' in guard
+    assert '[ "$new_mem" = "$own_mem" ] || fail' in guard
+    assert guard.index('[ "$new_mem" = "$own_mem" ]') < guard.index('/collections/$new_mem"'), "the pin check runs before the points check"
+    # ...and so can a MEM0_EPISODES_COLLECTION pin: the episodes collection is bound the same way
+    assert 'new_epi="$(ep_py \'print(ep.collection("episodes", ep.get(sys.argv[1])))\'' in guard
+    assert 'own_epi="$(ep_py \'print(ep.get(sys.argv[1]).episodes)\'' in guard
+    assert '[ "$new_epi" = "$own_epi" ] || fail' in guard and "MEM0_EPISODES_COLLECTION pins the episodes collection" in guard
+    assert guard.index('[ "$new_epi" = "$own_epi" ]') < guard.index('/collections/$new_mem"'), "the episodes pin check runs before the points check"
 
 
 def test_stack_env_records_the_zfs_dataset(tmp_path):

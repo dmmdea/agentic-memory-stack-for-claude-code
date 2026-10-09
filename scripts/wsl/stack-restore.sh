@@ -265,6 +265,28 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 WARNS=0   # optional-staging failures: reported, and the drill logs outcome=partial
+# A media tar is looked at before it is extracted (step 5g): stack-backup.sh tars the media directory, so a set holds
+# regular files and directories under relative names and nothing else, and tar would extract whatever a tampered one
+# holds: a link entry plants a link that points outside the media directory (GNU tar 1.35 will not write a file
+# through it, but the link is created and the server could later read through it), and an absolute or '..' name has
+# no place in a tar of one directory. Prints why and returns 0 when the tar must NOT be extracted; returns 1,
+# silently, when every entry is fine. tar's own diagnostics (lines starting 'tar:') are not entries.
+media_tar_problem() {
+    local listing line name
+    listing="$(tar -tvf "$1" 2>&1)" || { echo "tar could not list it: $listing"; return 0; }
+    while IFS= read -r line; do
+        case "$line" in ''|'tar: '*) continue ;; esac
+        case "${line:0:1}" in -|d) ;; *) echo "it holds an entry that is not a regular file or directory: $line"; return 0 ;; esac
+        # 'mode owner/group size date time name'; a line this does not fit is not trusted
+        if [[ "$line" =~ ^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}(:[0-9]{2})?[[:space:]]+(.+)$ ]]; then
+            name="${BASH_REMATCH[2]}"
+        else
+            echo "tar listed an entry this script cannot read: $line"; return 0
+        fi
+        case "/$name/" in //*|*/../*) echo "it holds an entry with an absolute or '..' name: $line"; return 0 ;; esac
+    done <<< "$listing"
+    return 1
+}
 echo "=== Starting live restore ==="
 
 # ---------------------------------------------------------------------------
@@ -451,7 +473,9 @@ if [ -n "$MEDIA_FILE" ] && [ -f "$BACKUP_DIR/$MEDIA_FILE" ]; then
     echo ""
     echo "--- Step 5g: media restore ---"
     MEDIA_DST="${MEM0_MEDIA_DIR:-$HOME/.mem0/media}"
-    if mkdir -p "$MEDIA_DST" && tar -C "$MEDIA_DST" --skip-old-files --no-same-owner -xf "$BACKUP_DIR/$MEDIA_FILE"; then
+    if MEDIA_PROBLEM="$(media_tar_problem "$BACKUP_DIR/$MEDIA_FILE")"; then
+        echo "WARN: media restore REFUSED, nothing extracted ($MEDIA_PROBLEM); memories keep their captions; their media cannot be fetched" >&2; WARNS=$((WARNS+1))
+    elif mkdir -p "$MEDIA_DST" && tar -C "$MEDIA_DST" --skip-old-files --no-same-owner -xf "$BACKUP_DIR/$MEDIA_FILE"; then
         echo "media restored into: $MEDIA_DST ($(find "$MEDIA_DST" -type f ! -name '*.tmp' | wc -l) file(s) present)"
     else
         echo "WARN: media restore FAILED (memories keep their captions; their media cannot be fetched)" >&2; WARNS=$((WARNS+1))

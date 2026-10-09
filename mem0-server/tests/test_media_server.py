@@ -84,6 +84,17 @@ def test_embed_media_refuses_a_space_without_a_media_embedder_and_an_overfull_wi
         _embedder().embed_media("x", [vid] * 4)
 
 
+def test_embed_media_refuses_on_a_box_that_serves_its_alias_text_only(monkeypatch):
+    """1.35.1: the profile has a media embedder, but MEM0_MEDIA_EMBEDDER=off says this box serves the alias without
+    the projector. embed_media must refuse before any request reaches a llama-server that cannot read the media."""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("no request may be sent"))
+    monkeypatch.setenv("MEM0_MEDIA_EMBEDDER", "off")
+    img = media.decode([{"type": "image", "data": _b64(PNG)}])[0]
+    assert EG2.media, "the space itself has a media embedder; it is the box that has none"
+    with pytest.raises(RuntimeError, match="MEM0_MEDIA_EMBEDDER=off"):
+        _embedder().embed_media("x", [img])
+
+
 def test_embed_media_retries_a_429_and_checks_the_dims(monkeypatch):
     import egemma_embedder
     monkeypatch.setattr(egemma_embedder.time, "sleep", lambda s: None)
@@ -316,3 +327,23 @@ def test_a_media_search_is_not_reranked(appmod, client, monkeypatch):
     q = seen["query_media"]
     assert q is not None and q.text == "board" and [m.type for m in q.items] == ["image"]
     assert egemma_embedder.QUERY_MEDIA.get() is None, "scoped to that one search"
+
+
+def test_a_text_only_box_refuses_media_with_a_400_that_says_why(appmod, client, monkeypatch, media_dir):
+    """1.35.1: MEM0_MEDIA_EMBEDDER=off (the alias is served without the projector): media adds and media searches
+    are refused before anything is written or sent to llama-server, and /health/deep says media is off."""
+    monkeypatch.setattr(appmod, "mem", None)
+    monkeypatch.setattr(appmod, "EMBED_PROFILE", EG2)
+    monkeypatch.setenv("MEM0_MEDIA_EMBEDDER", "off")
+    h = {"X-API-Key": appmod.API_KEY}
+    item = [{"type": "image", "data": _b64(PNG)}]
+    r = client.post("/v1/memories", json={"messages": "the whiteboard", "user_id": "test-media", "infer": False,
+                                          "media": item}, headers=h)
+    assert r.status_code == 400 and "MEM0_MEDIA_EMBEDDER=off" in r.text, r.text
+    r = client.post("/v1/memories/search", json={"query": "board", "filters": {"user_id": "test-media"}, "media": item},
+                    headers=h)
+    assert r.status_code == 400 and "MEM0_MEDIA_EMBEDDER=off" in r.text, r.text
+    assert appmod._media_on() is False
+    assert not media_dir.exists()
+    monkeypatch.setenv("MEM0_MEDIA_EMBEDDER", "on")
+    assert appmod._media_on() is True

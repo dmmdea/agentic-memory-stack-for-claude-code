@@ -5,6 +5,14 @@
 # Args:
 #   $1 = WSL username (e.g., output of `whoami` on the WSL side)
 #   $2 = Windows username (e.g., $env:USERNAME on the Windows side)
+#   $3 = WSL distro name (optional; install.ps1 passes the one it detected)
+#
+# Env (optional): MEM0_SET_EMBED_PROFILE=<profile> switches the embedding profile recorded in
+#   ~/.mem0/stack.env (install.ps1 -EmbedProfile sets it). Unset, the recorded profile is only carried.
+#   Either role is refused when stack.env pins the memories or episodes collection to another than the new
+#   profile's own. A replica then records it and clears the offline watcher's replica-restored.txt marker
+#   (/mnt/c/Users/<winuser>/.claude/state; MEM0_WIN_HOME names the Windows profile directory instead); a brain
+#   is also refused unless the new profile's collection already holds points and llama-swap lists its alias.
 #
 # Installs:
 #   - Qdrant 1.18.2 binary at ~/qdrant-server/ + systemd-user service
@@ -303,8 +311,9 @@ MEM0_ROLE="${MEM0_ROLE:-brain}"
 # next role, and a stale alias on a brain has no reader.
 # The embedding-space keys ride the same carry (MEM0_EMBED_PROFILE, the alias overrides): this
 # installer has no flag for them, and a rewrite that dropped the profile would rebind the server to
-# the default space's collections while the store sits in another. A profile change goes through
-# install/linux-authority.sh --embed-profile or scripts/wsl/embedder-migrate.py, never through here.
+# the default space's collections while the store sits in another. A run changes the profile only when
+# asked (MEM0_SET_EMBED_PROFILE, below); a native brain's change goes through install/linux-authority.sh
+# --embed-profile and scripts/wsl/embedder-migrate.py.
 mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")
 # 1.35.0: the embedding space is RECORDED on every install, so a change of the default never moves a
 # store: a store already on the box with no recorded profile was built before profiles existed (the
@@ -320,6 +329,115 @@ if ! printf '%s\n' "${STACK_ENV_CARRY[@]}" | grep -q '^MEM0_EMBED_PROFILE='; the
     echo "  embedding profile recorded: $EP_RECORD ($EP_WHY)"
 fi
 for kv in "${STACK_ENV_CARRY[@]}"; do echo "  ${kv%%=*} carried over from $USER_HOME/.mem0/stack.env: ${kv#*=}"; done
+# 1.35.1: the one way to CHANGE the profile through this installer, and only when asked: install.ps1
+# -EmbedProfile <name> sets MEM0_SET_EMBED_PROFILE on the bash line (wsl.exe passes no environment), and inside
+# WSL it is `MEM0_SET_EMBED_PROFILE=<name> bash install/1-wsl-services.sh <wsluser> <winuser> <distro>`. Without
+# it nothing here changes: the profile is carried or recorded, never switched. The name is checked against
+# embedder_profile.py before anything is written. Both roles are refused when stack.env pins the memories or
+# the episodes collection to anything but the new profile's own: the server binds a pin over the profile's
+# collection, and a replica's restore compares each set's collection with the one the server binds, so a pin
+# would make it refuse every set. A replica holds no store of its own (it restores a backup set made in the
+# profile it serves), so past that check the switch is a record. A brain's store sits in the old profile's
+# collections, and mem0 creates an absent collection EMPTY, so a switch to a space with no points would start a
+# second, empty store: it is refused unless the new profile's memories collection already holds points
+# (scripts/wsl/embedder-migrate.py builds it; install/linux-authority.sh makes the same check) and llama-swap
+# already lists the new alias (mem0 is restarted onto the space at once). Every refusal happens before
+# stack.env is written.
+EP_SWITCHED=""
+if [ -n "${MEM0_SET_EMBED_PROFILE:-}" ]; then
+    EP_NEW="$MEM0_SET_EMBED_PROFILE"
+    ep_field "$EP_NEW" name >/dev/null 2>&1 \
+        || { echo "FATAL: MEM0_SET_EMBED_PROFILE='$EP_NEW' is not an embedding profile embedder_profile.py knows; stack.env was not touched" >&2; exit 1; }
+    EP_OLD=""; EP_KEEP=()
+    for kv in "${STACK_ENV_CARRY[@]}"; do
+        if [ "${kv%%=*}" = "MEM0_EMBED_PROFILE" ]; then EP_OLD="${kv#*=}"; else EP_KEEP+=("$kv"); fi
+    done
+    if [ "$EP_NEW" = "$EP_OLD" ]; then
+        echo "  embedding profile is already $EP_NEW (MEM0_SET_EMBED_PROFILE changes nothing)"
+    else
+        EP_ALIAS="$( export HOME="$USER_HOME"; ep_alias "$EP_NEW" )" \
+            || { echo "FATAL: cannot read the llama-swap alias of embedding profile $EP_NEW from embedder_profile.py" >&2; exit 1; }
+        # The profile's OWN collections, not ep.collection(): that one honours MEM0_QDRANT_COLLECTION /
+        # MEM0_COLLECTION / MEM0_EPISODES_COLLECTION from stack.env, so with a pin on the old space the check would
+        # read the old collection, find points and let a switch through that the server never follows.
+        EP_COLL="$( export HOME="$USER_HOME"; ep_py 'print(ep.get(sys.argv[1]).memories)' "$EP_NEW" )" \
+            || { echo "FATAL: cannot read the memories collection of embedding profile $EP_NEW from embedder_profile.py" >&2; exit 1; }
+        EP_EPI="$( export HOME="$USER_HOME"; ep_py 'print(ep.get(sys.argv[1]).episodes)' "$EP_NEW" )" \
+            || { echo "FATAL: cannot read the episodes collection of embedding profile $EP_NEW from embedder_profile.py" >&2; exit 1; }
+        # ...and the server binds a pin over the profile's collection (MEM0_QDRANT_COLLECTION first), so a pin that
+        # names any other collection keeps mem0 on it whatever MEM0_EMBED_PROFILE says: vectors from one space
+        # searched with the other's model, nothing erroring (both are 768-dim). This needs no Qdrant, so a replica
+        # is held to it too, and before anything is written: its restore compares each set's collection with the
+        # one the server binds, and a pin would make it refuse every set made in the new space.
+        EP_PIN_Q=""; EP_PIN_L=""; EP_PIN_E=""
+        for kv in ${EP_KEEP[@]+"${EP_KEEP[@]}"}; do
+            case "${kv%%=*}" in
+                MEM0_QDRANT_COLLECTION) EP_PIN_Q="${kv#*=}" ;;
+                MEM0_COLLECTION) EP_PIN_L="${kv#*=}" ;;
+                MEM0_EPISODES_COLLECTION) EP_PIN_E="${kv#*=}" ;;
+            esac
+        done
+        EP_PIN="${EP_PIN_Q:-$EP_PIN_L}"
+        if [ -n "$EP_PIN" ] && [ "$EP_PIN" != "$EP_COLL" ]; then
+            echo "FATAL: refusing to switch this $MEM0_ROLE from $EP_OLD to $EP_NEW: $USER_HOME/.mem0/stack.env pins the memories collection to '$EP_PIN' (MEM0_QDRANT_COLLECTION / MEM0_COLLECTION), which mem0 would keep binding instead of $EP_NEW's '$EP_COLL'. Remove that line (or set it to '$EP_COLL') and re-run. stack.env was not touched" >&2
+            exit 1
+        fi
+        if [ -n "$EP_PIN_E" ] && [ "$EP_PIN_E" != "$EP_EPI" ]; then
+            echo "FATAL: refusing to switch this $MEM0_ROLE from $EP_OLD to $EP_NEW: $USER_HOME/.mem0/stack.env pins the episodes collection to '$EP_PIN_E' (MEM0_EPISODES_COLLECTION), which mem0 would keep binding instead of $EP_NEW's '$EP_EPI'. Remove that line (or set it to '$EP_EPI') and re-run. stack.env was not touched" >&2
+            exit 1
+        fi
+        if [ "$MEM0_ROLE" = "replica" ]; then
+            EP_NOTE="a replica: restore a set made in $EP_NEW next; its local llama-swap must serve $EP_ALIAS"
+        else
+            EP_BODY="$(curl -s -m 10 "http://127.0.0.1:6333/collections/$EP_COLL" 2>/dev/null)" || EP_BODY=""
+            # rc 3: Qdrant did not answer with JSON; an absent collection answers JSON with no result, so 0 points
+            EP_PTS="$(printf '%s' "$EP_BODY" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+r = d.get("result") if isinstance(d, dict) else None
+print(int((r.get("points_count") if isinstance(r, dict) else 0) or 0))' 2>/dev/null)" || EP_PTS=""
+            if [ -z "$EP_PTS" ]; then
+                echo "FATAL: refusing to switch this brain from $EP_OLD to $EP_NEW: Qdrant on 127.0.0.1:6333 cannot be read, so the new space cannot be checked (is qdrant.service running?). stack.env was not touched" >&2
+                exit 1
+            fi
+            if [ "$EP_PTS" -le 0 ]; then
+                echo "FATAL: refusing to switch this brain from $EP_OLD to $EP_NEW: collection '$EP_COLL' holds no points (or does not exist), and binding mem0 to it would start a second, empty store. Build the new space first with scripts/wsl/embedder-migrate.py (docs/MIGRATION.md). stack.env was not touched" >&2
+                exit 1
+            fi
+            # The alias must already be served: the restart below binds mem0 to the new space at once, and every
+            # embed call fails until llama-swap lists the alias (install/linux-authority.sh refuses the same way).
+            # The body first, then the match: `curl | grep -q` under pipefail can read a served alias as missing.
+            EP_MODELS="$(curl -sf -m 5 http://127.0.0.1:11436/v1/models 2>/dev/null || true)"
+            printf '%s' "$EP_MODELS" | grep -q "\"$EP_ALIAS\"" || {
+                echo "FATAL: refusing to switch this brain from $EP_OLD to $EP_NEW: llama-swap on 127.0.0.1:11436 does not list the alias '$EP_ALIAS', so mem0 could not embed once it is bound to the new space. Serve it first (install/llama-swap-setup.md section 4b; EmbeddingGemma-2 needs llama.cpp b11452 or later, and MEM0_STAGE_EG2=1 stages its files ahead of the switch). stack.env was not touched" >&2
+                exit 1
+            }
+            EP_NOTE="a brain: '$EP_COLL' holds $EP_PTS points and llama-swap serves $EP_ALIAS; mem0 is restarted below to bind it"
+        fi
+        STACK_ENV_CARRY=(${EP_KEEP[@]+"${EP_KEEP[@]}"} "MEM0_EMBED_PROFILE=$EP_NEW")
+        EP_SWITCHED=1
+        echo "  embedding profile switched: $EP_OLD -> $EP_NEW ($EP_NOTE)"
+    fi
+fi
+# 1.35.1: MEM0_SET_MEDIA_EMBEDDER=on|off records whether this box's embedding alias is served with the media
+# projector (install.ps1 -MediaEmbedder). off = text-only (a replica on a small card: the same text vectors,
+# media memories are added and searched on the authority), and the server then refuses media requests with a
+# 400 instead of sending image parts to a llama-server that cannot read them. Carried like any operator key.
+if [ -n "${MEM0_SET_MEDIA_EMBEDDER:-}" ]; then
+    case "$MEM0_SET_MEDIA_EMBEDDER" in
+        on|off) ;;
+        *) echo "FATAL: MEM0_SET_MEDIA_EMBEDDER='$MEM0_SET_MEDIA_EMBEDDER' must be on or off; stack.env was not touched" >&2; exit 1 ;;
+    esac
+    ME_KEEP=()
+    for kv in ${STACK_ENV_CARRY[@]+"${STACK_ENV_CARRY[@]}"}; do
+        [ "${kv%%=*}" = "MEM0_MEDIA_EMBEDDER" ] || ME_KEEP+=("$kv")
+    done
+    STACK_ENV_CARRY=(${ME_KEEP[@]+"${ME_KEEP[@]}"} "MEM0_MEDIA_EMBEDDER=$MEM0_SET_MEDIA_EMBEDDER")
+    echo "  media embedder recorded: $MEM0_SET_MEDIA_EMBEDDER"
+fi
 # A Windows user name or repo path with a space would make every `. stack.env` run its second
 # word as a command (the 1.31.1 wiki-sources outage class), so such a value is refused here.
 if ! stack_env_write "$USER_HOME/.mem0/stack.env" MEM0_WSL_USER="$WSL_USER" MEM0_WIN_USER="$WIN_USER" \
@@ -329,6 +447,27 @@ if ! stack_env_write "$USER_HOME/.mem0/stack.env" MEM0_WSL_USER="$WSL_USER" MEM0
     exit 1
 fi
 echo "  stack.env written ($USER_HOME/.mem0/stack.env): user=$WSL_USER distro=$DISTRO bind=$MEM0_BIND role=$MEM0_ROLE"
+# 1.35.1: a replica's profile switch leaves its last restore in the old space, and the offline watcher refreshes a
+# replica only when %USERPROFILE%\.claude\state\replica-restored.txt is older than 24 h, so a switch that was made
+# removes the marker: the next go_offline restores instead of trusting that restore. It is done here, not in
+# install.ps1, because only this script knows whether a switch happened (the profile may already be recorded, or the
+# name refused) and it covers the in-WSL form of the command too. The Windows profile is reached as the other WSL
+# scripts reach it (/mnt/c/Users/<winuser>); MEM0_WIN_HOME names another one. It runs after the stack.env write, so a
+# refused switch never gets here, and a cleared marker only ever forces a restore. A brain has no such marker.
+if [ -n "$EP_SWITCHED" ] && [ "$MEM0_ROLE" = "replica" ]; then
+    RESTORED_DIR="${MEM0_WIN_HOME:-/mnt/c/Users/$WIN_USER}/.claude/state"
+    if [ -e "$RESTORED_DIR/replica-restored.txt" ]; then
+        if rm -f "$RESTORED_DIR/replica-restored.txt"; then
+            echo "  cleared $RESTORED_DIR/replica-restored.txt (the replica's last restore is not in the $EP_NEW space)"
+        else
+            echo "  WARN: could not clear $RESTORED_DIR/replica-restored.txt - delete it, or the offline watcher keeps trusting the last restore, made in the old space, for up to 24 hours" >&2
+        fi
+    elif [ -d "$RESTORED_DIR" ]; then
+        echo "  no replica-restored.txt marker in $RESTORED_DIR (nothing to clear)"
+    else
+        echo "  no Windows state directory at $RESTORED_DIR, so no replica-restored.txt marker to clear (if this distro cannot see the Windows profile, delete %USERPROFILE%\\.claude\\state\\replica-restored.txt by hand)"
+    fi
+fi
 
 # Generate canonical-key if not present (v0.14 B: HMAC auth for tier=canonical promotions).
 # Fix-pass guard: a DPAPI-backed box has NO plaintext canonical-key — only the
@@ -454,9 +593,12 @@ if [ -n "$EG2_WANTED" ] || [ "${MEM0_STAGE_EG2:-}" = 1 ]; then
 fi
 
 # The llama-swap entries, printed for the operator to add (see install/llama-swap-setup.md).
+# The `support:` line in each is the SHAPE of the group: an existing config already lists the embedder and the
+# reranker there, and pasting a one-member line over it would evict them.
 print_stanza_300m() {
     echo "        Add this model entry to your llama-swap config (in a non-exclusive, non-swapping"
-    echo "        support group) and restart llama-swap — see install/llama-swap-setup.md section 4:"
+    echo "        support group) and restart llama-swap — see install/llama-swap-setup.md section 4."
+    echo "        Add the name to the members of the support group you already have; do not replace them:"
     echo "          groups:"
     echo "            support: {swap: false, exclusive: false, members: [embeddinggemma]}"
     echo "          embeddinggemma:"
@@ -471,7 +613,9 @@ print_stanza_eg2() {
     echo "        EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture)."
     echo "        Serve it with its projector (--mmproj: images, audio and video embed into the same space)"
     echo "        at ctx 4096 / ubatch 2048, never the 262144 its GGUF header advertises, in the group that"
-    echo "        never evicts the memory stack (measured: 1,196 MiB loaded, ~1,540 MiB peak after media):"
+    echo "        never evicts the memory stack (measured: 1,196 MiB loaded, ~1,540 MiB peak after media)."
+    echo "        Add embeddinggemma2 to the members of the support group you already have (or to the set a"
+    echo "        llama-swap matrix keeps the memory models in); do not replace the members already there:"
     echo "          groups:"
     echo "            support: {swap: false, exclusive: false, members: [embeddinggemma2]}"
     echo "          embeddinggemma2:"
@@ -593,6 +737,13 @@ enable_brain_unit() {
 
 enable_brain_unit qdrant.service
 enable_brain_unit mem0.service
+# 1.35.1: `enable --now` leaves a server that is already running on the collections it started with, so a
+# brain whose profile was just switched restarts mem0 to bind the new space (a replica's units are off).
+if [ -n "$EP_SWITCHED" ] && [ "$MEM0_ROLE" != "replica" ]; then
+    systemctl --user restart mem0.service \
+        && echo "  mem0 restarted to bind embedding profile $EP_NEW" \
+        || echo "  WARN: could not restart mem0.service - restart it so it binds embedding profile $EP_NEW: systemctl --user restart mem0.service"
+fi
 enable_brain_unit l10-audit.timer
 enable_brain_unit decay-scan.timer
 enable_brain_unit stack-backup.timer

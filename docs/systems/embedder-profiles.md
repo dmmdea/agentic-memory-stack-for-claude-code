@@ -43,7 +43,13 @@ the dense model and is copied verbatim by a migration. llama-swap entries are op
   installer records it: a fresh install records `DEFAULT_PROFILE` (`egemma2` since 1.35.0), a store found
   without a record gets `LEGACY_PROFILE` (`egemma-300m`, the space every store was built in before
   profiles). A box that records nothing is read as `egemma-300m`, so a code upgrade never moves a store.
-  Memories, entities and episodes are always in it.
+  Memories, entities and episodes are always in it. An installer run changes the record only when asked:
+  `install/linux-authority.sh --embed-profile` and `install/linux-replica.sh --embed-profile` on Linux, and on
+  a Windows PC (stack inside WSL) `install.ps1 -EmbedProfile <profile>`, which reaches
+  `install/1-wsl-services.sh` as `MEM0_SET_EMBED_PROFILE` (validated against this module; either role is
+  refused when `stack.env` pins the memories or episodes collection to another than the new profile's own, and a
+  brain is refused unless the new space already holds points and llama-swap lists its alias; the two Linux
+  installers refuse a change of the recorded profile on the same pins).
 - **Media memory** — a memory whose text is a caption and which carries images, audio or video
   (EmbeddingGemma-2 only, served with its `--mmproj` projector): its dense vector is one embedding of the
   caption and the media together (see "Media memories" below).
@@ -172,7 +178,10 @@ The nightly semantic dedup never deletes a media memory (its vector may be its c
 take `media_paths` (Windows or WSL paths), and `memory_get_media` saves a file locally to look at or
 listen to. Limits: 4 items per memory (`MEM0_MEDIA_MAX_ITEMS`), 20 MB each (`MEM0_MEDIA_MAX_BYTES`), and
 the caption plus the media must fit the alias's ubatch (an image costs 280 tokens, audio 25 per second,
-a short video about 600). A PUT to a media memory re-embeds its caption with the stored media. Deleting
+a short video about 600). A PUT to a media memory re-embeds its caption with the stored media. A box
+that serves the alias without the projector (a replica on a small card) records `MEM0_MEDIA_EMBEDDER=off`
+(1.35.1; `install.ps1 -MediaEmbedder off`): its text vectors are unchanged, and it answers media adds and media
+searches with a 400 (`embedder_profile.media_enabled`). Deleting
 a media memory keeps its files: a name is a content hash that another memory may share, and nothing
 prunes the directory yet, so files of deleted memories stay on disk and in the backups.
 
@@ -182,9 +191,15 @@ prunes the directory yet, so files of deleted memories stay on disk and in the b
   [MIGRATION.md](../MIGRATION.md#moving-to-another-embedding-space). In short: serve the new alias,
   `embedder-migrate.py --to <profile>` builds the new collections beside the old ones, `--verify`; then,
   with mem0 stopped, `--catch-up` (a `--dry-run` first) and the switch through
-  `install/linux-authority.sh --embed-profile <profile>`, which records the profile and starts mem0. The
-  tool refuses to write a collection the stack is using, so no catch-up runs into the new space after the
-  switch. Rollback is the same tool in reverse (with mem0 stopped) plus the old profile.
+  `install/linux-authority.sh --embed-profile <profile>` (a brain whose stack runs in WSL: `install.ps1 -Role
+  brain -EmbedProfile <profile>`; the Linux installer would overwrite the distro's receipt), which records the
+  profile and starts mem0. The tool refuses to write a collection the stack is using, so no catch-up runs
+  into the new space after the switch. Rollback is the same tool in reverse (with mem0 stopped) plus the old profile. Replicas and PCs
+  move after the brain: each serves the new alias locally, switches its recorded profile (a Linux replica with
+  `install/linux-replica.sh --embed-profile`, a Windows replica with `install.ps1 -EmbedProfile`), and restores
+  a set made in the new space; a restore refuses any other. A Windows replica's go-offline restore can only use
+  the snapshot cache it already holds, so it needs a set in the new space seeded while online
+  (`travel-mode.ps1 on -DryRun`).
 - **Moving the wiki** is a rebuild, not a migration: set `MEM0_WIKI_EMBED_PROFILE`, serve its alias on
   the authority, run `wiki-index-build.py`. A PC that refreshes the wiki without serving the alias sends
   its builds and searches to the brain (`wiki-index.sh`). The old wiki collection
@@ -197,8 +212,9 @@ incremental indexers skip by point id or content hash, so a reused name would si
 vectors. `~/.mem0/embed-identity.json` records what each collection was built with. `stack-backup.sh`
 snapshots the active space's collections and, while they exist, the other generation's (the rollback
 anchor); the manifest records the profile. Media files live in `~/.mem0/media`; each backup set carries
-them as one `media-<ts>.tar` (absent while there is no media), and both restore paths extract it
-additively (names are content hashes, so an existing name already holds the same bytes).
+them as one `media-<ts>.tar` (absent while there is no media), and every restore path extracts it
+additively (names are content hashes, so an existing name already holds the same bytes) after listing it:
+a tar that holds anything but regular files and directories, or an absolute or `..` name, is not extracted.
 
 ## Interfaces and entry points
 

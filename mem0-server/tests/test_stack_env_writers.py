@@ -19,6 +19,7 @@ The contract pinned here:
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -456,6 +457,7 @@ KEY_READERS = {   # key -> [(file, the text of its stack.env read)]
     "MEM0_RELEVANCE_THRESHOLD": [("mem0-server/embedder_profile.py", '"relevance_gate": "MEM0_RELEVANCE_THRESHOLD"')],
     "MEM0_RAW_FALLBACK_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"episode_floor": "MEM0_RAW_FALLBACK_COSINE_FLOOR"')],
     "MEM0_NLI_GATE_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"nli_floor": "MEM0_NLI_GATE_COSINE_FLOOR"')],
+    "MEM0_MEDIA_EMBEDDER": [("mem0-server/embedder_profile.py", '_setting("MEM0_MEDIA_EMBEDDER")')],
 }
 
 
@@ -522,3 +524,514 @@ def test_the_wsl_installer_records_the_profile_so_a_default_change_cannot_move_a
     assert r.returncode == 0, (case, r.stderr)
     lines = [ln for ln in r.stdout.splitlines() if ln.startswith("MEM0_EMBED_PROFILE=")]
     assert lines == [expected], (case, r.stdout)
+
+
+# --- 1.35.1: an explicit, validated profile switch (MEM0_SET_EMBED_PROFILE) ------------------
+# A Windows PC replica had no sanctioned way to change its profile: install.ps1 and
+# 1-wsl-services.sh took no profile input, and the only command the restore error named
+# (install/linux-replica.sh) is Linux-only. The switch is env-driven because wsl.exe passes no
+# environment: install.ps1 -EmbedProfile puts it on the bash line.
+
+def _wsl_stack_env_block() -> str:
+    """install/1-wsl-services.sh's own text from the carry through the stack.env write and what follows it
+    there (a replica's restore-marker clearing), verbatim: the carry, the profile record, the explicit
+    switch, the write that persists them, and the marker."""
+    text = (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
+    start = text.index('mapfile -t STACK_ENV_CARRY < <(stack_env_carry "$USER_HOME/.mem0/stack.env")')
+    assert text.index('echo "  stack.env written ($USER_HOME/.mem0/stack.env)', start) > start
+    return text[start:text.index("# Generate canonical-key if not present", start)]
+
+
+_CURL_STUB = """#!/bin/sh
+# stands in for curl: the block asks for two things, the Qdrant collection and llama-swap's model list
+for a in "$@"; do u="$a"; done
+printf '%s\\n' "$u" >> "$STUB_CURL_LOG"
+case "$u" in
+    */v1/models) printf '%s' "$STUB_MODELS_BODY"; exit "${STUB_MODELS_EXIT:-0}" ;;
+esac
+printf '%s' "$STUB_CURL_BODY"
+exit "${STUB_CURL_EXIT:-0}"
+"""
+_QDRANT_POINTS = '{"result":{"points_count":16946,"status":"green"},"status":"ok","time":0.0002}'
+_MODELS_ALL = ('{"object":"list","data":[{"id":"embeddinggemma2"},{"id":"embeddinggemma"},'
+               '{"id":"embeddinggemma-ams"},{"id":"bge-reranker-v2-m3"}]}')
+_QDRANT_URL = "http://127.0.0.1:6333/collections/mem0_eg2_768"
+_MODELS_URL = "http://127.0.0.1:11436/v1/models"
+_QDRANT_404 ='{"status":{"error":"Not found: Collection `mem0_eg2_768` does not exist!"},"time":0.0001}'
+
+
+def _win_marker(tmp_path) -> Path:
+    """Where the block looks for the offline watcher's marker: MEM0_WIN_HOME is the fake Windows profile."""
+    return tmp_path / "winhome" / ".claude" / "state" / "replica-restored.txt"
+
+
+def _put_marker(tmp_path) -> Path:
+    m = _win_marker(tmp_path)
+    m.parent.mkdir(parents=True, exist_ok=True)
+    m.write_text("2026-10-09T03:00:00Z\n", encoding="utf-8")
+    return m
+
+
+def _run_switch(tmp_path, *, role, stack_env, switch=None, body="", curl_exit=0, models=_MODELS_ALL, models_exit=0,
+                media=None):
+    """Runs the real stack.env block in bash with a fake HOME and a stub curl (the box's own Qdrant and
+    llama-swap must never answer these). `body` is Qdrant's answer, `models` llama-swap's model list. The
+    Windows profile is a directory under tmp_path (MEM0_WIN_HOME), so a run never looks at a real one; a
+    test that wants the restore marker there puts it with _put_marker first.
+    Returns (completed process, stack.env text or None, the URLs curl was asked for, in order)."""
+    home = tmp_path / "home"
+    (home / ".mem0").mkdir(parents=True, exist_ok=True)
+    se = home / ".mem0" / "stack.env"
+    if stack_env is not None:
+        se.write_text(stack_env, encoding="utf-8", newline="")
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "curl"
+    stub.write_text(_CURL_STUB, encoding="utf-8", newline="\n")
+    stub.chmod(0o755)
+    log = tmp_path / "curl.log"
+    log.write_text("", encoding="utf-8")
+    env = {k: v for k, v in home_env(home).items()
+           if not k.startswith(("MEM0_EMBED", "MEM0_SET_EMBED", "MEM0_SET_MEDIA", "MEM0_MEDIA"))}
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    env.update(STUB_CURL_LOG=str(log), STUB_CURL_BODY=body, STUB_CURL_EXIT=str(curl_exit),
+               STUB_MODELS_BODY=models, STUB_MODELS_EXIT=str(models_exit), MEM0_WIN_HOME=str(tmp_path / "winhome"))
+    if switch is not None:
+        env["MEM0_SET_EMBED_PROFILE"] = switch
+    if media is not None:
+        env["MEM0_SET_MEDIA_EMBEDDER"] = media
+    script = (f'set -eo pipefail\n. "{LIB.as_posix()}"\n. "{(REPO_ROOT / "scripts/wsl/embed-profile.sh").as_posix()}"\n'
+              f'USER_HOME="{home.as_posix()}"; QDRANT_DIR="$USER_HOME/qdrant-server"\n'
+              f'WSL_USER=tenant; WIN_USER=winuser; DISTRO=Ubuntu; REPO_ROOT_WSL=/opt/repo; MEM0_BIND=127.0.0.1; MEM0_ROLE={role}\n'
+              + _wsl_stack_env_block())
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+    return r, (se.read_text(encoding="utf-8") if se.exists() else None), log.read_text(encoding="utf-8").split()
+
+
+def _profile_lines(stack_env_text):
+    return [ln for ln in (stack_env_text or "").splitlines() if ln.startswith("MEM0_EMBED_PROFILE=")]
+
+
+REPLICA_300M = "MEM0_ROLE=replica\nMEM0_EMBED_PROFILE=egemma-300m\nMEM0_EMBED_MODEL=embeddinggemma-ams\nMEM0_BRAIN_SSH=op@brain-alias\n"
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_replica_switch_replaces_the_recorded_profile_with_exactly_one_line(tmp_path):
+    r, se, asked = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"], se
+    # every other carried key survives the rewrite
+    assert "MEM0_EMBED_MODEL=embeddinggemma-ams" in se and "MEM0_BRAIN_SSH=op@brain-alias" in se
+    assert ("embedding profile switched: egemma-300m -> egemma2 (a replica: restore a set made in egemma2 next; "
+            "its local llama-swap must serve embeddinggemma2)") in r.stdout, r.stdout
+    assert asked == [], "a replica has no store to check: Qdrant is not asked"
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_replica_switch_names_the_alias_this_box_resolves_for_the_new_profile(tmp_path):
+    """Going back to EmbeddingGemma-300m: the box's own alias override for that space is the one named."""
+    r, se, _ = _run_switch(tmp_path, role="replica",
+                           stack_env="MEM0_ROLE=replica\nMEM0_EMBED_PROFILE=egemma2\nMEM0_EMBED_MODEL=embeddinggemma-ams\n",
+                           switch="egemma-300m")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma-300m"], se
+    assert ("switched: egemma2 -> egemma-300m (a replica: restore a set made in egemma-300m next; "
+            "its local llama-swap must serve embeddinggemma-ams)") in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("name", ["egemma-3", "EGEMMA2", "egemma2 ", "../egemma2", "x;y"])
+@pytest.mark.parametrize("role", ["replica", "brain"])
+def test_an_unknown_profile_is_fatal_and_writes_nothing(tmp_path, role, name):
+    r, se, asked = _run_switch(tmp_path, role=role, stack_env=REPLICA_300M, switch=name, body="{}")
+    assert r.returncode != 0
+    assert "is not an embedding profile embedder_profile.py knows" in r.stderr, r.stderr
+    assert se == REPLICA_300M, "stack.env must be byte-for-byte what it was"
+    assert asked == [] and not list((tmp_path / "home" / ".mem0").glob("stack.env.tmp.*"))
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_an_unknown_profile_on_a_box_with_no_stack_env_creates_none(tmp_path):
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=None, switch="nope")
+    assert r.returncode != 0 and se is None
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("case,body,curl_exit,why", [
+    ("the collection does not exist", _QDRANT_404, 0, "holds no points (or does not exist)"),
+    ("the collection exists and is empty", '{"result":{"points_count":0,"status":"green"},"status":"ok"}', 0,
+     "holds no points (or does not exist)"),
+    ("Qdrant is down", "", 7, "cannot be read"),
+    ("Qdrant answers something that is not JSON", "<html>502</html>", 0, "cannot be read"),
+])
+def test_a_brain_is_refused_a_switch_to_a_space_with_no_points(tmp_path, case, body, curl_exit, why):
+    """mem0 creates an absent collection EMPTY: a brain bound to one starts a second, empty store while
+    the real one sits in the old space. The check is linux-authority.sh's, made here too."""
+    stack_env = "MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\n"
+    r, se, asked = _run_switch(tmp_path, role="brain", stack_env=stack_env, switch="egemma2", body=body, curl_exit=curl_exit)
+    assert r.returncode != 0, (case, r.stdout)
+    assert "refusing to switch this brain from egemma-300m to egemma2" in r.stderr and why in r.stderr, (case, r.stderr)
+    if "holds no points" in why:
+        assert "scripts/wsl/embedder-migrate.py" in r.stderr
+    assert se == stack_env, (case, "stack.env must not be touched")
+    assert asked == ["http://127.0.0.1:6333/collections/mem0_eg2_768"], (case, asked)
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_brain_may_switch_to_a_space_that_holds_points(tmp_path):
+    r, se, asked = _run_switch(tmp_path, role="brain",
+                               stack_env="MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\nMEM0_BRAIN_SSH=op@brain-alias\n",
+                               switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"], se
+    assert "MEM0_BRAIN_SSH=op@brain-alias" in se
+    assert asked == [_QDRANT_URL, _MODELS_URL], "the space is checked first, then the alias"
+    assert ("embedding profile switched: egemma-300m -> egemma2 (a brain: 'mem0_eg2_768' holds 16946 points "
+            "and llama-swap serves embeddinggemma2; mem0 is restarted below to bind it)") in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("case,models,models_exit", [
+    ("the alias is not in the list", '{"data":[{"id":"embeddinggemma"},{"id":"bge-reranker-v2-m3"}]}', 0),
+    ("only a longer alias is served", '{"data":[{"id":"embeddinggemma2-long"}]}', 0),
+    ("llama-swap is down", "", 7),
+    ("llama-swap answers something that is not a model list", "<html>502</html>", 0),
+])
+def test_a_brain_is_refused_a_switch_to_an_alias_llama_swap_does_not_serve(tmp_path, case, models, models_exit):
+    """The restart that follows binds mem0 to the new space at once, and every embed call fails until the
+    alias is served: the refusal comes first, with stack.env as it was (install/linux-authority.sh's rule)."""
+    stack_env = "MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\n"
+    r, se, asked = _run_switch(tmp_path, role="brain", stack_env=stack_env, switch="egemma2", body=_QDRANT_POINTS,
+                               models=models, models_exit=models_exit)
+    assert r.returncode != 0, (case, r.stdout)
+    assert ("refusing to switch this brain from egemma-300m to egemma2: llama-swap on 127.0.0.1:11436 does not "
+            "list the alias 'embeddinggemma2'") in r.stderr, (case, r.stderr)
+    assert "MEM0_STAGE_EG2=1" in r.stderr and "llama-swap-setup.md" in r.stderr
+    assert se == stack_env, (case, "stack.env must not be touched")
+    assert asked == [_QDRANT_URL, _MODELS_URL], (case, asked)
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_alias_a_brain_must_find_is_the_one_this_box_resolves_for_the_new_profile(tmp_path):
+    """A box that serves the file under another name records it (MEM0_EMBED_MODEL_EGEMMA2); that is the
+    alias the server will ask for, so it is the one checked."""
+    stack_env = "MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\nMEM0_EMBED_MODEL_EGEMMA2=eg2-local\n"
+    r, se, asked = _run_switch(tmp_path, role="brain", stack_env=stack_env, switch="egemma2", body=_QDRANT_POINTS,
+                               models='{"data":[{"id":"eg2-local"}]}')
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"] and "MEM0_EMBED_MODEL_EGEMMA2=eg2-local" in se
+    assert "llama-swap serves eg2-local" in r.stdout
+    r, se, _ = _run_switch(tmp_path / "other", role="brain", stack_env=stack_env, switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode != 0 and "does not list the alias 'eg2-local'" in r.stderr, "the stock name does not satisfy it"
+    assert se == stack_env
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("pin", [
+    "MEM0_QDRANT_COLLECTION=mem0_custom",
+    "MEM0_QDRANT_COLLECTION=mem0_egemma_768",   # the old space's own name, pinned
+    "MEM0_COLLECTION=memories",                 # the pre-profile key
+    "MEM0_QDRANT_COLLECTION=mem0_custom\nMEM0_COLLECTION=mem0_eg2_768",  # the first key wins, as in embedder_profile
+])
+def test_a_brain_is_refused_when_stack_env_pins_another_collection_over_the_new_space(tmp_path, pin):
+    """embedder_profile.collection() lets a pin in stack.env override the profile's collection. A check
+    that asked for that bound collection would read the OLD space (it holds points), pass, and leave mem0
+    searching it with the new model: both spaces are 768-dim, so nothing errors and /health/deep stays green.
+    The new profile's own collection is what must hold the points, and nothing may pin another over it."""
+    stack_env = f"MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\n{pin}\n"
+    r, se, asked = _run_switch(tmp_path, role="brain", stack_env=stack_env, switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode != 0, (pin, r.stdout)
+    assert "refusing to switch this brain from egemma-300m to egemma2" in r.stderr and "pins the memories collection to" in r.stderr, r.stderr
+    assert "instead of egemma2's 'mem0_eg2_768'" in r.stderr and "Remove that line" in r.stderr
+    assert se == stack_env, "stack.env must not be touched"
+    assert asked == [], "refused before Qdrant or llama-swap is asked"
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("pin", [
+    "MEM0_QDRANT_COLLECTION=mem0_eg2_768",
+    "MEM0_COLLECTION=mem0_eg2_768",
+    "MEM0_QDRANT_COLLECTION=mem0_eg2_768\nMEM0_COLLECTION=memories",   # the stale legacy key loses to the first
+])
+def test_a_pin_that_names_the_new_profiles_own_collection_does_not_stop_a_brain_switch(tmp_path, pin):
+    r, se, asked = _run_switch(tmp_path, role="brain",
+                               stack_env=f"MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\n{pin}\n",
+                               switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode == 0, (pin, r.stderr)
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"], se
+    assert all(ln in se for ln in pin.splitlines()), "the pin is the operator's and is carried"
+    assert asked == [_QDRANT_URL, _MODELS_URL]
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("pin", [
+    "MEM0_QDRANT_COLLECTION=mem0_custom",
+    "MEM0_QDRANT_COLLECTION=mem0_egemma_768",   # the old space's own name, pinned
+    "MEM0_COLLECTION=memories",                 # the pre-profile key
+    "MEM0_QDRANT_COLLECTION=mem0_custom\nMEM0_COLLECTION=mem0_eg2_768",  # the first key wins, as in embedder_profile
+])
+def test_a_replica_is_refused_when_stack_env_pins_another_memories_collection_over_the_new_space(tmp_path, pin):
+    """Changed in 1.35.1 (this test was test_a_collection_pin_does_not_stop_a_replica_switch, which pinned the
+    defect): a replica needs no Qdrant for the check, and a pin it carried into the new space would make
+    restore-replica refuse every set (the set holds the new profile's own collection; the server binds the pin).
+    So the replica is held to the same rule as a brain, before anything is written."""
+    stack_env = REPLICA_300M + pin + "\n"
+    marker = _put_marker(tmp_path)
+    r, se, asked = _run_switch(tmp_path, role="replica", stack_env=stack_env, switch="egemma2")
+    assert r.returncode != 0, (pin, r.stdout)
+    assert "refusing to switch this replica from egemma-300m to egemma2" in r.stderr and "pins the memories collection to" in r.stderr, r.stderr
+    assert "instead of egemma2's 'mem0_eg2_768'" in r.stderr and "Remove that line" in r.stderr
+    assert se == stack_env, "stack.env must not be touched"
+    assert asked == [], "a replica is refused without Qdrant or llama-swap being asked"
+    assert marker.exists(), "a refused switch leaves the restore marker alone"
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("pin", [
+    "MEM0_QDRANT_COLLECTION=mem0_eg2_768",
+    "MEM0_COLLECTION=mem0_eg2_768",
+    "MEM0_QDRANT_COLLECTION=mem0_eg2_768\nMEM0_COLLECTION=memories",   # the stale legacy key loses to the first
+    "MEM0_EPISODES_COLLECTION=episodes_eg2_768",
+])
+def test_a_pin_that_names_the_new_profiles_own_collection_does_not_stop_a_replica_switch(tmp_path, pin):
+    r, se, asked = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M + pin + "\n", switch="egemma2")
+    assert r.returncode == 0, (pin, r.stderr)
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"], se
+    assert all(ln in se for ln in pin.splitlines()), "the pin is the operator's and is carried"
+    assert asked == []
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("role", ["replica", "brain"])
+@pytest.mark.parametrize("pin", [
+    "MEM0_EPISODES_COLLECTION=episodes_egemma_768",   # the old space's own name, pinned
+    "MEM0_EPISODES_COLLECTION=episodes_custom",
+])
+def test_either_role_is_refused_when_stack_env_pins_another_episodes_collection_over_the_new_space(tmp_path, role, pin):
+    """The episodes collection is bound like the memories one (MEM0_EPISODES_COLLECTION over the profile's own), so
+    a pin on the old space's keeps the episode fallback on the old vectors. The check names the episodes key and
+    runs before Qdrant or llama-swap is asked."""
+    stack_env = f"MEM0_ROLE={role}\nMEM0_EMBED_PROFILE=egemma-300m\n{pin}\n"
+    r, se, asked = _run_switch(tmp_path, role=role, stack_env=stack_env, switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode != 0, (role, pin, r.stdout)
+    assert f"refusing to switch this {role} from egemma-300m to egemma2" in r.stderr, r.stderr
+    assert "pins the episodes collection to" in r.stderr and "MEM0_EPISODES_COLLECTION" in r.stderr, r.stderr
+    assert "instead of egemma2's 'episodes_eg2_768'" in r.stderr and "Remove that line" in r.stderr
+    assert se == stack_env, "stack.env must not be touched"
+    assert asked == []
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_an_episodes_pin_on_the_new_profiles_own_collection_does_not_stop_a_brain_switch(tmp_path):
+    r, se, asked = _run_switch(tmp_path, role="brain",
+                               stack_env="MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\nMEM0_EPISODES_COLLECTION=episodes_eg2_768\n",
+                               switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"] and "MEM0_EPISODES_COLLECTION=episodes_eg2_768" in se
+    assert asked == [_QDRANT_URL, _MODELS_URL]
+
+
+# --- 1.35.1: a switch that was made clears the offline watcher's restore marker (a replica's) -------------------
+# install.ps1 used to clear it before the WSL phase whenever -EmbedProfile was given on a replica, even when the
+# phase then made no switch (profile already recorded, name refused): a stale marker at go_offline forces a restore
+# that can throw. The WSL script knows whether a switch happened, and the in-WSL form of the command needs it too.
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_real_replica_switch_removes_the_restore_marker_and_says_so(tmp_path):
+    marker = _put_marker(tmp_path)
+    r, se, asked = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"], se
+    assert not marker.exists(), "the next go_offline must restore, not trust the old-space restore"
+    assert f"cleared {marker} (the replica's last restore is not in the egemma2 space)" in r.stdout, r.stdout
+    assert marker.parent.is_dir(), "only the marker goes"
+    assert r.stdout.index("stack.env written") < r.stdout.index("cleared "), "after the write that made the switch real"
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_real_replica_switch_with_no_marker_says_none_was_present(tmp_path):
+    state = _win_marker(tmp_path).parent
+    state.mkdir(parents=True)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"]
+    assert f"no replica-restored.txt marker in {state} (nothing to clear)" in r.stdout, r.stdout
+    assert "cleared" not in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_real_replica_switch_where_the_windows_profile_is_not_visible_says_so_and_still_succeeds(tmp_path):
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"]
+    assert "no Windows state directory at" in r.stdout and "delete %USERPROFILE%" in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_marker_that_cannot_be_removed_is_a_warning_not_a_failed_install(tmp_path):
+    """The switch is already written when the marker is handled, so an unremovable one (a directory stands in:
+    rm -f refuses it) must not abort the installer; it says what to do."""
+    marker = _win_marker(tmp_path)
+    marker.mkdir(parents=True)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"]
+    assert f"WARN: could not clear {marker}" in r.stderr and "up to 24 hours" in r.stderr, r.stderr
+    assert marker.is_dir()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_restore_marker_stays_when_the_profile_is_already_recorded(tmp_path):
+    """A switch to the profile already recorded changes nothing, so the last restore is still in the right space."""
+    marker = _put_marker(tmp_path)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env="MEM0_ROLE=replica\nMEM0_EMBED_PROFILE=egemma2\n", switch="egemma2")
+    assert r.returncode == 0, r.stderr
+    assert "embedding profile is already egemma2" in r.stdout
+    assert marker.exists() and "cleared" not in r.stdout and "replica-restored" not in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("name", ["egemma-3", "EGEMMA2"])
+def test_the_restore_marker_stays_when_the_name_is_refused(tmp_path, name):
+    marker = _put_marker(tmp_path)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch=name)
+    assert r.returncode != 0 and se == REPLICA_300M
+    assert marker.exists()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_restore_marker_stays_when_a_pin_refuses_the_switch(tmp_path):
+    marker = _put_marker(tmp_path)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M + "MEM0_EPISODES_COLLECTION=episodes_custom\n",
+                           switch="egemma2")
+    assert r.returncode != 0
+    assert marker.exists()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_restore_marker_stays_without_a_switch(tmp_path):
+    marker = _put_marker(tmp_path)
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M)
+    assert r.returncode == 0, r.stderr
+    assert marker.exists() and "replica-restored" not in r.stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_a_brain_switch_never_touches_the_restore_marker(tmp_path):
+    """A brain has no offline-watcher marker of its own to clear; a marker that is there is not this installer's."""
+    marker = _put_marker(tmp_path)
+    r, se, asked = _run_switch(tmp_path, role="brain", stack_env="MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma-300m\n",
+                               switch="egemma2", body=_QDRANT_POINTS)
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"] and asked == [_QDRANT_URL, _MODELS_URL]
+    assert marker.exists() and "replica-restored" not in r.stdout
+
+
+def test_the_marker_clearing_reaches_the_windows_profile_the_way_the_other_wsl_scripts_do():
+    """/mnt/c/Users/<winuser> (stack-backup.sh, job_liveness.py) unless MEM0_WIN_HOME says otherwise, after the
+    stack.env write, and only for a replica whose profile was switched."""
+    text = (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    m = re.search(r'if \[ -n "\$EP_SWITCHED" \] && \[ "\$MEM0_ROLE" = "replica" \]; then\s*'
+                  r'RESTORED_DIR="\$\{MEM0_WIN_HOME:-/mnt/c/Users/\$WIN_USER\}/\.claude/state"', code)
+    assert m, "the marker is cleared for a switched replica, from the Windows profile"
+    assert code.index("stack_env_write") < code.index('echo "  stack.env written') < m.start()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("role", ["replica", "brain"])
+def test_switching_to_the_profile_already_recorded_changes_nothing_and_needs_no_qdrant(tmp_path, role):
+    stack_env = f"MEM0_ROLE={role}\nMEM0_EMBED_PROFILE=egemma2\n"
+    r, se, asked = _run_switch(tmp_path, role=role, stack_env=stack_env, switch="egemma2", curl_exit=7)
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"]
+    assert "embedding profile is already egemma2" in r.stdout and "switched" not in r.stdout
+    assert asked == []
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("role,stack_env,expected,note", [
+    ("replica", REPLICA_300M, "egemma-300m", "a recorded profile is carried"),
+    ("brain", "MEM0_ROLE=brain\nMEM0_EMBED_PROFILE=egemma2\n", "egemma2", "a recorded new profile is carried"),
+    ("brain", "MEM0_ROLE=brain\nMEM0_WSL_USER=t\n", "egemma-300m", "an unrecorded receipt is the legacy space"),
+    ("replica", None, "egemma2", "a fresh box starts on the default"),
+])
+def test_without_the_switch_the_installer_behaves_as_it_did_in_1_35_0(tmp_path, role, stack_env, expected, note):
+    """No MEM0_SET_EMBED_PROFILE: the profile is carried or recorded and nothing else is said or asked."""
+    r, se, asked = _run_switch(tmp_path, role=role, stack_env=stack_env, body='{"result":{"points_count":9}}')
+    assert r.returncode == 0, (note, r.stderr)
+    assert _profile_lines(se) == [f"MEM0_EMBED_PROFILE={expected}"], (note, se)
+    assert "switched" not in r.stdout and "MEM0_SET_EMBED_PROFILE" not in r.stdout + r.stderr, note
+    assert asked == [], note
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_an_empty_switch_variable_is_the_same_as_none(tmp_path):
+    r, se, asked = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma-300m"] and asked == []
+
+
+def test_the_gguf_staging_and_the_probe_read_the_profile_after_the_switch_is_written():
+    """The EmbeddingGemma-2 GGUF + projector are staged when the ACTIVE profile (stack.env, as just
+    written) is egemma2, so a switch to it fetches them on the same run: the write comes first, and the
+    staging asks embedder_profile, never the env variable."""
+    text = (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
+    write = text.index('if ! stack_env_write "$USER_HOME/.mem0/stack.env"')
+    staging = text.index("EG2_WANTED=")
+    probe = text.index("EMBED_PROFILE=\"$( export HOME=\"$USER_HOME\"; ep_py 'print(ep.active().name)' )\"")
+    assert text.index("MEM0_SET_EMBED_PROFILE:-") < write < staging < probe
+    wanted = text[staging:text.index("\n", staging)]
+    assert "ep.active().name" in wanted and "MEM0_SET_EMBED_PROFILE" not in wanted
+    assert 'stage_gguf "$EG2_GGUF"' in text and 'stage_gguf "$EG2_MMPROJ"' in text
+
+
+def test_a_switched_brain_restarts_mem0_to_bind_the_new_space_and_a_replica_does_not():
+    code = "\n".join(ln for ln in (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8").splitlines()
+                     if not ln.lstrip().startswith("#"))
+    m = re.search(r'if \[ -n "\$EP_SWITCHED" \] && \[ "\$MEM0_ROLE" != "replica" \]; then\s*systemctl --user restart mem0\.service', code)
+    assert m, "a switched brain must restart mem0 (enable --now leaves a running server on its old collections)"
+    assert code.index("enable_brain_unit mem0.service") < m.start() < code.index("enable_brain_unit l10-audit.timer")
+
+
+def test_the_installer_documents_the_switch_where_an_operator_meets_it():
+    inst = (REPO_ROOT / "install" / "1-wsl-services.sh").read_text(encoding="utf-8")
+    assert "MEM0_SET_EMBED_PROFILE=<profile>" in inst and "install.ps1 -EmbedProfile" in inst
+
+
+# --- 1.35.1: the per-box media switch (MEM0_SET_MEDIA_EMBEDDER, install.ps1 -MediaEmbedder) -------------------
+
+def _media_lines(stack_env_text):
+    return [ln for ln in (stack_env_text or "").splitlines() if ln.startswith("MEM0_MEDIA_EMBEDDER=")]
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_media_switch_records_one_line_and_later_runs_carry_it(tmp_path):
+    """A text-only replica records MEM0_MEDIA_EMBEDDER=off once; a plain re-run keeps it (it is an operator key),
+    and switching it back replaces the line rather than adding a second one."""
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, media="off")
+    assert r.returncode == 0, r.stderr
+    assert _media_lines(se) == ["MEM0_MEDIA_EMBEDDER=off"], se
+    assert "media embedder recorded: off" in r.stdout
+    assert "MEM0_BRAIN_SSH=op@brain-alias" in se and _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma-300m"]
+    r, se2, _ = _run_switch(tmp_path, role="replica", stack_env=se)
+    assert r.returncode == 0, r.stderr
+    assert _media_lines(se2) == ["MEM0_MEDIA_EMBEDDER=off"], "a re-run without the switch keeps the recorded value"
+    r, se3, _ = _run_switch(tmp_path, role="replica", stack_env=se2, media="on")
+    assert r.returncode == 0, r.stderr
+    assert _media_lines(se3) == ["MEM0_MEDIA_EMBEDDER=on"], se3
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+def test_the_media_switch_together_with_a_profile_switch(tmp_path):
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, switch="egemma2", media="off")
+    assert r.returncode == 0, r.stderr
+    assert _profile_lines(se) == ["MEM0_EMBED_PROFILE=egemma2"] and _media_lines(se) == ["MEM0_MEDIA_EMBEDDER=off"], se
+
+
+@pytest.mark.skipif(BASH is None, reason="bash not available")
+@pytest.mark.parametrize("bad", ["Off", "yes", "1", "of f"])
+def test_a_bad_media_switch_value_is_refused_before_stack_env_is_written(tmp_path, bad):
+    r, se, _ = _run_switch(tmp_path, role="replica", stack_env=REPLICA_300M, media=bad)
+    assert r.returncode != 0 and "must be on or off" in r.stderr, (r.stdout, r.stderr)
+    assert se == REPLICA_300M, "nothing written"

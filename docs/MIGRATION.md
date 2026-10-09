@@ -188,9 +188,24 @@ $P $T --to egemma2 --verify          # counts match; a sampled re-embed reproduc
 systemctl --user stop mem0
 $P $T --to egemma2 --catch-up --dry-run    # read to_delete / to_delete_ids before anything is deleted
 $P $T --to egemma2 --catch-up              # refuses more than --max-delete deletions (default 200)
-install/linux-authority.sh --embed-profile egemma2   # records the profile, re-renders the unit, starts mem0
+# a NATIVE-LINUX authority (no WSL anywhere; a brain whose stack runs in WSL switches as shown below this block).
+# Run it from the release tree you are moving to. --bind-ip and --secrets-dir are required on every run
+# (the installer exits without them); the other optional flags are inherited from ~/.mem0/stack.env.
+bash install/linux-authority.sh --bind-ip <tailscale0 ipv4> --secrets-dir <dir with the *.cred files> \
+     --embed-profile egemma2                 # records the profile, re-renders the unit, starts mem0
 curl -s http://<authority>:18791/health/deep | jq '.collection, .embed_profile'
 ```
+
+**A brain whose stack runs in WSL** (the `install.ps1` topology) switches with the Windows installer instead,
+from the release tree: `.\install.ps1 -Role brain -EmbedProfile egemma2` (inside WSL the same is
+`MEM0_SET_EMBED_PROFILE=egemma2 bash install/1-wsl-services.sh <wsluser> <winuser> <distro>`). Do not run
+`install/linux-authority.sh` there: it is the native-Linux installer and would overwrite the distro's receipt
+(`MEM0_DISTRO`, `MEM0_WIN_USER`). The switch checks the box before it writes anything, and refuses (with
+`stack.env` untouched) unless the new profile's own memories collection already holds points in the local
+Qdrant, llama-swap on `:11436` lists the profile's alias, and `stack.env` pins no other memories or episodes
+collection over it (`MEM0_QDRANT_COLLECTION` / `MEM0_COLLECTION` / `MEM0_EPISODES_COLLECTION` would keep mem0 on
+the old space whatever the profile says: remove the line, or set it to the new collection, and re-run).
+`install/linux-authority.sh` makes the same two pin checks. It then restarts `mem0.service` to bind the new space.
 
 Do not edit `MEM0_EMBED_PROFILE` in stack.env by hand before the installer: the installer compares the
 recorded profile with the new one to decide whether a store is being rebound, and refuses a rebind to a
@@ -219,10 +234,60 @@ On top of the steps above:
 4. **Rebuild the wiki** into `wiki_pages_eg2_768` (if it is not there already) and set any consumer's
    wiki score cut-off for EmbeddingGemma-2 (about 0.62, measured on whole pages at 3,900 tokens; the
    hot alias now cuts pages at 1,900, so re-check it, or serve the long alias).
-5. **Replicas and PCs** restore the new sets only while they serve `embeddinggemma2` locally
-   (`restore-replica.sh` refuses a set in a space the box does not serve): add the entry there, then
-   `install/linux-replica.sh --embed-profile egemma2`. A set from before the switch keeps restoring into
-   the legacy space.
+5. **Replicas and PCs** restore the new sets only while they serve `embeddinggemma2` locally and record
+   that profile (both restore scripts refuse a set in a space the box does not serve or is not set to). Each
+   box needs three things: the alias served on its own llama-swap (llama.cpp b11452 or later, the entry in
+   [`install/llama-swap-setup.md`](../install/llama-swap-setup.md)), its recorded profile switched, and a
+   set made in the new space to restore. How depends on the kind of replica:
+   - **Linux replicas** (`install/linux-replica.sh`): re-run it with its original `--authority` and
+     `--brain-ssh` and `--embed-profile egemma2`; the next `restore-replica.sh` restores the new set. The change
+     is refused, before anything runs (a dry run included), when its `~/.mem0/stack.env` pins the memories or
+     episodes collection (`MEM0_QDRANT_COLLECTION` / `MEM0_COLLECTION` / `MEM0_EPISODES_COLLECTION`) to anything
+     but the new profile's own, for the reason given under the Windows replicas below. Remove the line, or set it
+     to the new collection, and re-run.
+   - **Windows replicas** (a PC running `install.ps1 -Role replica`, its stack inside WSL). The order matters,
+     because each step needs the one before:
+     1. **Switch the recorded profile and stage the model files.** Run `.\install.ps1 -Role replica -EmbedProfile
+        egemma2` from the release tree. It forwards the choice to `install/1-wsl-services.sh` as
+        `MEM0_SET_EMBED_PROFILE`, which checks the name against `embedder_profile.py`, writes
+        `MEM0_EMBED_PROFILE=egemma2` to the distro's `stack.env`, downloads the EmbeddingGemma-2 model and
+        projector files (the llama-swap entry points at them, and nothing else on this path creates them), and
+        prints the entry. Inside WSL the same is `MEM0_SET_EMBED_PROFILE=egemma2 bash install/1-wsl-services.sh
+        <wsluser> <winuser> <distro>`; to stage the files ahead of the switch, run it with `MEM0_STAGE_EG2=1`
+        instead. A switch that is made (the profile changes) also clears the offline watcher's
+        `replica-restored.txt` marker, which `install/1-wsl-services.sh` removes from the Windows profile as the
+        distro sees it (`/mnt/c/Users/<winuser>/.claude/state`, `<winuser>` being the Windows user name) and says
+        what it cleared, so the watcher restores at the next go-offline rather than trusting the old restore for
+        up to 24 hours. The in-WSL form clears it too. If the distro cannot see the profile there (a profile
+        directory that is not named after the user), the script says so and names the file to delete by hand,
+        `%USERPROFILE%\.claude\state\replica-restored.txt`. A run that makes no switch (the profile is already
+        the one named, or the name is refused) leaves the marker alone. The switch is refused, with `stack.env` untouched, when it pins the memories or
+        episodes collection to anything but the new profile's own (`MEM0_QDRANT_COLLECTION` /
+        `MEM0_COLLECTION` / `MEM0_EPISODES_COLLECTION`): the restore would then refuse every set, because it
+        compares the set's collection with the one the server binds. Remove the line, or set it to the new
+        collection, and re-run.
+     2. **Serve the alias** on the box's own llama-swap ([`install/llama-swap-setup.md`](../install/llama-swap-setup.md),
+        section 4b, llama.cpp b11452 or later), added to the members of the support group it already has. A
+        replica whose card cannot hold the projector serves it text-only and says so with
+        `.\install.ps1 -MediaEmbedder off` (it can ride step 1's run): its text vectors are the same space, and
+        media memories are made and searched on the authority.
+     3. **Put a set made in the new space into the offline cache, while online.** After the brain has written a
+        backup set in the new space (its nightly backup, or `stack-backup.sh` by hand), run
+        `scripts\travel\travel-mode.ps1 on -DryRun`. It seeds the local snapshot cache from pCloud and touches
+        nothing else; check that the `snapshot:` stamp it prints is newer than the brain's switch. This step is
+        not optional: the go-offline restore runs when the brain is unreachable, and `travel-mode.ps1` fetches
+        from pCloud only while it answers, so that restore can only use what the cache already holds. With only
+        old-space sets there, it refuses (the set's profile is not the box's) and the watcher brings nothing up.
+     4. **Restore.** The watcher does it at the next go-offline. To prove it now, `scripts\travel\travel-mode.ps1 on`
+        restores the set and puts this PC in travel mode (memory reads served by the replica, writes queued)
+        until `scripts\travel\travel-mode.ps1 off`.
+     Both run `restore-replica.ps1`, which checks the set's profile against the box's, binds `/health/deep` to it,
+     and extracts the set's media files. Do not run `install/linux-replica.sh` on a Windows PC: it is the
+     native-Linux installer and would rewrite the distro's receipt and register a second watcher. A plain
+     `install.ps1` re-run never changes the profile, and a brain refuses the same switch unless its checks pass
+     (the WSL-hosted brain paragraph under the runbook above).
+
+   A set from before the switch keeps restoring into the legacy space on a box that still records it.
 6. **Retire EmbeddingGemma-300m** after the new space has served real traffic and at least one backup
    set holds it: `egemma-rollback-prune.sh` for the old collections, then remove the
    `embeddinggemma`/`embeddinggemma-ams` llama-swap entries this stack added and their GGUF copies
@@ -230,7 +295,10 @@ On top of the steps above:
 
 **Rollback** (same shape, reverse direction): stop mem0, `embedder-migrate.py --from <new> --to <old>
 --catch-up --dry-run`, then without `--dry-run` (it brings the old collections up to date with the writes
-made since the switch), then `install/linux-authority.sh --embed-profile <old>`. The tool refuses to write
+made since the switch), then the same switch with `<old>`: `bash install/linux-authority.sh --bind-ip
+<tailscale0 ipv4> --secrets-dir <dir> --embed-profile <old>` from the release tree on a native-Linux
+authority, `.\install.ps1 -Role brain -EmbedProfile <old>` on a brain whose stack runs in WSL (the old
+collections hold the points, so its checks pass once the old alias is served). The tool refuses to write
 any collection the stack is using (the server's bound collections, or the active profile's while mem0 is
 stopped), so a catch-up run one step early or in the wrong direction stops instead of mirroring the live
 space. **Prune** the old space only after the new one has served real traffic for a while:

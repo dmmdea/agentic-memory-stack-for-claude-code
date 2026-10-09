@@ -197,8 +197,9 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
         """ONE embedding of `text` (task prefix, truncated to what the media leave of the budget) followed
         by the media items, as OpenAI-style content parts on llama-server's /v1/embeddings (the alias
         must be served with --mmproj). Raises on any failure; callers keep the text-only vector."""
-        if not self.profile.media:
-            raise RuntimeError(f"embedding profile {self.profile.name} has no media embedder")
+        if not embedder_profile.media_enabled(self.profile):
+            raise RuntimeError(f"embedding profile {self.profile.name}: no media embedder on this box "
+                               "(the profile has none, or MEM0_MEDIA_EMBEDDER=off)")
         room = self._budget - _media.tokens(items)
         if room < _MEDIA_MIN_TEXT_TOKENS:
             raise ValueError(f"media take ~{_media.tokens(items)} of the {self._budget}-token embed window")

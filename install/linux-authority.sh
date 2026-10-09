@@ -351,6 +351,16 @@ if [ "$DRY_RUN" = 0 ]; then
     if [ -z "$PREV_PROFILE" ] && store_exists; then PREV_PROFILE="$LEGACY_PROFILE"; fi
     if [ -n "$PREV_PROFILE" ] && [ "$PREV_PROFILE" != "$EMBED_PROFILE" ]; then
         new_mem="$(ep_py 'print(ep.collection("memories", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        # 1.35.1: ep.collection() honours a MEM0_QDRANT_COLLECTION / MEM0_COLLECTION pin, and a pin on the old
+        # space's collection would pass the points check below while mem0 keeps searching the old vectors with
+        # the new model (both 768-d, nothing errors). A profile change binds the new space's own collection.
+        own_mem="$(ep_py 'print(ep.get(sys.argv[1]).memories)' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        [ "$new_mem" = "$own_mem" ] || fail "profile change $PREV_PROFILE -> $EMBED_PROFILE: MEM0_QDRANT_COLLECTION / MEM0_COLLECTION pins the memories collection to '$new_mem', not $EMBED_PROFILE's own '$own_mem'. Remove that line from ~/.mem0/stack.env (or set it to '$own_mem') and re-run"
+        # The episodes collection is bound the same way (MEM0_EPISODES_COLLECTION), and a pin on the old space's
+        # keeps the raw-trace fallback searching the old vectors with the new model.
+        new_epi="$(ep_py 'print(ep.collection("episodes", ep.get(sys.argv[1])))' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        own_epi="$(ep_py 'print(ep.get(sys.argv[1]).episodes)' "$EMBED_PROFILE")" || fail "cannot read the collections of profile $EMBED_PROFILE"
+        [ "$new_epi" = "$own_epi" ] || fail "profile change $PREV_PROFILE -> $EMBED_PROFILE: MEM0_EPISODES_COLLECTION pins the episodes collection to '$new_epi', not $EMBED_PROFILE's own '$own_epi'. Remove that line from ~/.mem0/stack.env (or set it to '$own_epi') and re-run"
         new_pts="$(curl -sf -m 10 "http://127.0.0.1:6333/collections/$new_mem" | jq -r '.result.points_count // 0' 2>/dev/null || echo 0)"
         [ "${new_pts:-0}" -gt 0 ] || fail "profile change $PREV_PROFILE -> $EMBED_PROFILE: collection '$new_mem' holds no points (or Qdrant is down). Build the new space first with scripts/wsl/embedder-migrate.py; binding mem0 to an empty collection starts a second, empty store"
         echo "    profile change $PREV_PROFILE -> $EMBED_PROFILE: '$new_mem' holds $new_pts points"
