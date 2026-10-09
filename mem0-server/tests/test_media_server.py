@@ -20,10 +20,17 @@ import pytest
 pytest.importorskip("mem0")
 import embedder_profile as ep  # noqa: E402
 import media  # noqa: E402
-from test_media import MP4, PNG, _b64, _wav, media_dir  # noqa: E402,F401  (media_dir is a fixture)
+from test_media import MP4, PNG, _b64, _wav  # noqa: E402
 
 EG2 = ep.get("egemma2")
 LEGACY = ep.get(ep.LEGACY_PROFILE)
+
+
+@pytest.fixture
+def media_dir(tmp_path, monkeypatch):
+    d = tmp_path / "media"
+    monkeypatch.setenv("MEM0_MEDIA_DIR", str(d))
+    return d
 
 # ---------------------------------------------------------------- the embedder
 
