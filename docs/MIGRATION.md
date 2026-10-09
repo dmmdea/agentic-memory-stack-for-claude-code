@@ -207,15 +207,23 @@ On top of the steps above:
    group that never evicts the memory stack, llama.cpp b11452 or later. Budget about 1.5 GiB on the
    card while it is loaded. Check one image embeds before migrating: `/health/deep` reports
    `embed_profile.media`, and a media add answers `media_embedded: true`.
-2. **Migrate, catch up, switch** exactly as above (`--to egemma2`). There are no media memories before
-   the switch, so nothing needs re-embedding with media.
-3. **Rebuild the wiki** into `wiki_pages_eg2_768` (if it is not there already) and set any consumer's
-   wiki score cut-off for EmbeddingGemma-2 (about 0.62).
-4. **Replicas and PCs** restore the new sets only while they serve `embeddinggemma2` locally
+2. **Deploy 1.35.0 first, on the old space.** The box keeps `egemma-300m` (recorded, or read as the legacy
+   space); `/health/deep` must still report it, its collections and `checks.fusion.constants` k 2 /
+   w_bm25 0.4, with `checks.media.enabled` false. Run `embedder-migrate.py` only from the 1.35.0 tree:
+   it embeds with the profile's 1,900-token budget, which the ubatch-2048 entry needs (an older tree
+   sends inputs up to 3,900 tokens and long memories fail).
+3. **Migrate, catch up, switch** exactly as above (`--to egemma2`). There are no media memories before
+   the switch, so nothing needs re-embedding with media. While the build and the catch-up run, both
+   embedders are loaded (the live server still queries EmbeddingGemma-300m): budget about 2.35 GiB for
+   the memory stack on the card for that window (1,536 + 486 + 326 MiB), or run it under a GPU lease.
+4. **Rebuild the wiki** into `wiki_pages_eg2_768` (if it is not there already) and set any consumer's
+   wiki score cut-off for EmbeddingGemma-2 (about 0.62, measured on whole pages at 3,900 tokens; the
+   hot alias now cuts pages at 1,900, so re-check it, or serve the long alias).
+5. **Replicas and PCs** restore the new sets only while they serve `embeddinggemma2` locally
    (`restore-replica.sh` refuses a set in a space the box does not serve): add the entry there, then
    `install/linux-replica.sh --embed-profile egemma2`. A set from before the switch keeps restoring into
    the legacy space.
-5. **Retire EmbeddingGemma-300m** after the new space has served real traffic and at least one backup
+6. **Retire EmbeddingGemma-300m** after the new space has served real traffic and at least one backup
    set holds it: `egemma-rollback-prune.sh` for the old collections, then remove the
    `embeddinggemma`/`embeddinggemma-ams` llama-swap entries this stack added and their GGUF copies
    (other consumers of the stock `embeddinggemma` alias keep theirs).
