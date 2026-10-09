@@ -39,7 +39,8 @@ def _isolated(monkeypatch):
 
 def test_the_shipped_constants():
     # the lab's chosen point (docs/systems/fusion.md); a change here is a ranking change: re-run the lab
-    assert (fusion.RRF_K, fusion.RRF_W_BM25, fusion.RRF_W_ENTITY) == (2.0, 0.4, 0.25)
+    # (1.35.0: retuned for EmbeddingGemma-2 alone; 1.34.0 shipped 2.0 / 0.4 for EmbeddingGemma-300m)
+    assert (fusion.RRF_K, fusion.RRF_W_BM25, fusion.RRF_W_ENTITY) == (1.0, 0.5, 0.25)
 
 
 def test_the_threshold_gates_the_raw_cosine_before_any_fusion():
@@ -57,7 +58,7 @@ def test_the_formula_on_a_small_pool():
     assert out["m1"] == pytest.approx((1 / (K + 2) + WB / (K + 2)) / NORM)
     assert out["m2"] == pytest.approx((1 / (K + 3) + WB / (K + 1)) / NORM)
     # the same three numbers as literals, so the weights cannot drift with the formula
-    assert (out["m0"], out["m1"], out["m2"]) == pytest.approx((0.757576, 0.636364, 0.606061), abs=1e-6)
+    assert (out["m0"], out["m1"], out["m2"]) == pytest.approx((0.714286, 0.571429, 0.571429), abs=1e-6)
 
 
 def test_without_keyword_or_entity_evidence_the_order_is_the_cosine_order():
@@ -68,11 +69,11 @@ def test_without_keyword_or_entity_evidence_the_order_is_the_cosine_order():
 
 
 def test_equal_fused_scores_keep_the_dense_order():
-    # dense rank 1 alone == dense rank 2 + entity rank 1 (1/3 == 1/4 + 0.25/3), exactly in floats
-    for pool in (_pool(0.80, 0.70), list(reversed(_pool(0.80, 0.70)))):
-        out = fusion.ams_score_and_rank(pool, {}, {"m1": 0.5}, threshold=0.0, top_k=10)
+    # dense rank 1 alone == dense rank 3 + keyword rank 1 (1/2 == 1/4 + 0.5/2), exactly in floats
+    for pool in (_pool(0.80, 0.70, 0.60), list(reversed(_pool(0.80, 0.70, 0.60)))):
+        out = fusion.ams_score_and_rank(pool, {"m2": 0.9}, {}, threshold=0.0, top_k=10)
         assert out[0]["score"] == out[1]["score"]
-        assert _ids(out) == ["m0", "m1"]
+        assert _ids(out) == ["m0", "m2", "m1"]
 
 
 def test_scores_are_in_zero_one_and_one_only_for_rank_one_everywhere():
@@ -287,10 +288,30 @@ def test_the_server_binds_the_fusion_at_start_and_deep_health_folds_its_verdict(
 def test_every_server_search_is_bracketed_by_the_fusion_hooks():
     src = _app_source()
     assert src.count("mem.search(") == 2                      # the search core and diagnose
-    assert ("    _fusion.begin_search()\n"
-            "    results = mem.search(\n") in src
-    assert ("    )\n"
-            "    _fusion.end_search(results)\n") in src
+    # 1.35.0: inside the try that scopes a media search's query vector (QUERY_MEDIA) to this search
+    assert ("        _fusion.begin_search()\n"
+            "        results = mem.search(\n") in src
+    assert ("        )\n"
+            "        _fusion.end_search(results)\n") in src
     assert ("        _fusion.begin_search()\n"
             "        probe = mem.search(") in src
     assert "        _fusion.end_search(probe)\n" in src
+
+
+def test_the_constants_are_the_active_spaces():
+    """1.35.0: measured per model. The module defaults are the default space's; the server sets the active
+    space's before it binds the fusion, so a box still on EmbeddingGemma-300m keeps the 1.34.0 constants."""
+    import embedder_profile as ep
+    assert ep.get(ep.DEFAULT_PROFILE).fusion == (fusion.RRF_K, fusion.RRF_W_BM25, fusion.RRF_W_ENTITY)
+    assert ep.get("egemma-300m").fusion == (2.0, 0.4, 0.25)
+    src = _app_source()
+    assert src.index("_fusion.configure(*EMBED_PROFILE.fusion)") < src.index("FUSION_STATUS = _fusion.install()")
+    saved = (fusion.RRF_K, fusion.RRF_W_BM25, fusion.RRF_W_ENTITY)
+    try:
+        fusion.configure(*ep.get("egemma-300m").fusion)
+        assert (fusion.RRF_K, fusion.RRF_W_BM25) == (2.0, 0.4)
+        assert fusion.health({"bound": True})["constants"] == {"k": 2.0, "w_bm25": 0.4, "w_entity": 0.25}
+        with pytest.raises(ValueError):
+            fusion.configure(0, 0.4, 0.25)
+    finally:
+        fusion.configure(*saved)

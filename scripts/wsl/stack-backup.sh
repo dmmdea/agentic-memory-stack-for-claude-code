@@ -140,6 +140,18 @@ if [ -f "$EPISODIC_SRC" ]; then
   fi
 fi
 
+# 1e2. media memories (1.35.0, mem0-server/media.py): the image/audio/video files media memories point
+# to, content-addressed under ~/.mem0/media. One uncompressed tar per set (the files are already
+# compressed and never change); no file at all while there is no media.
+MEDIA_SRC="${MEM0_MEDIA_DIR:-$HOME/.mem0/media}"
+MEDIA_DST="$BACKUP_DIR/media-$TS.tar"
+if [ -d "$MEDIA_SRC" ] && [ -n "$(find "$MEDIA_SRC" -type f ! -name '*.tmp' -print -quit 2>/dev/null)" ]; then
+  tar -C "$MEDIA_SRC" --exclude='*.tmp' -cf "$MEDIA_DST.tmp" . \
+    && mv "$MEDIA_DST.tmp" "$MEDIA_DST" \
+    && echo "media backed up ($(find "$MEDIA_SRC" -type f ! -name '*.tmp' | wc -l) file(s))" \
+    || { rm -f "$MEDIA_DST.tmp"; echo "WARN: media backup failed" >&2; rc=1; }
+fi
+
 # 1f. ~/.claude/settings.json (Windows side) — v0.20 Final (adversarial-review
 # HIGH): the UserPromptSubmit/SessionStart hook registrations the whole prompt
 # pipeline depends on lived ONLY outside every backup. Capture them so DR
@@ -360,7 +372,7 @@ prune_kind() {  # <kind> <extension>
 }
 for spec in qdrant:snapshot history:db tier-ledger:jsonl MEMORY:md audit-flags:baseline episodic:db \
             claude-settings:json l10-flags:jsonl l10-state:json promote-review:jsonl \
-            stale-worksheet:jsonl; do
+            stale-worksheet:jsonl media:tar; do
   prune_kind "${spec%%:*}" "${spec#*:}"
 done
 # Secondary-collection snapshots: one retention window per collection, found by what is on disk

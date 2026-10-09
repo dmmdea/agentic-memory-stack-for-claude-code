@@ -138,7 +138,7 @@ Keep the old `~/.mem0/backups` for a few weeks as the rollback anchor, then reti
 | Restore refuses with `target collection ... already exists` | the fresh install's server start created the empty collection — verify `points_count:0`, delete it, rerun (exact sequence in Phase 3) |
 | Restore lands in `-restore` targets | you omitted the explicit `--target-*` flags (the safe default protects populated stores) — rerun as in Phase 3 |
 | `mem0.service` up but canonical promotion 503s | the key chain isn't provisioned — Phase 2 step 1; check the tmpfs key per the DPAPI doc's Recovery section |
-| Old memories don't retrieve but health is green | you restored into the alternate collection — check `curl :6333/collections` for `*-restore` names and redo with `--target-collection mem0_egemma_768` |
+| Old memories don't retrieve but health is green | you restored into the alternate collection — check `curl :6333/collections` for `*-restore` names and redo with `--target-collection <the set's memories collection: mem0_eg2_768, or mem0_egemma_768 for a set from before 1.35.0>` |
 | Hooks never fire in Claude Code | restart VS Code after the installer (hooks + MCP load at session start) |
 
 ---
@@ -152,8 +152,10 @@ collections are named by model and the thresholds are calibrated per profile. Th
 never written, so they stay the rollback anchor.
 
 **Measure first.** A newer model is not automatically better here: on 2026-10-08 EmbeddingGemma-2 lost
-about a quarter of the per-prompt path's MRR on this store and won only on whole wiki pages. Run the
-house evals (`eval/embedder-ab/` in the operator repo) against a shadow server before moving the memories.
+about a quarter of the per-prompt path's MRR on this store under mem0's additive fusion, and still about
+0.02 under rank fusion. Run the house evals (`eval/embedder-ab/` in the operator repo) against a shadow
+server before moving the memories. The 1.35.0 move to EmbeddingGemma-2 was an operator decision taken
+with that cost measured, for media memories (runbook below).
 
 ## The wiki (a rebuild)
 
@@ -194,6 +196,37 @@ Do not edit `MEM0_EMBED_PROFILE` in stack.env by hand before the installer: the 
 recorded profile with the new one to decide whether a store is being rebound, and refuses a rebind to a
 space with no points. Re-anchor the retrieval-drift canaries whose stored text names the old embedder or
 collection.
+
+### The 1.35.0 move to EmbeddingGemma-2 (multimodal)
+
+On top of the steps above:
+
+1. **Serve it with its projector.** `install/1-wsl-services.sh` stages `embeddinggemma-2-Q8_0.gguf` and
+   `mmproj-embeddinggemma-2-Q8_0.gguf` (`MEM0_STAGE_EG2=1` ahead of the move) and prints the llama-swap
+   entry: `--mmproj`, `--ctx-size 4096 --batch-size 4096 --ubatch-size 2048`, `--flash-attn on`, in the
+   group that never evicts the memory stack, llama.cpp b11452 or later. Budget about 1.5 GiB on the
+   card while it is loaded. Check one image embeds before migrating: `/health/deep` reports
+   `embed_profile.media`, and a media add answers `media_embedded: true`.
+2. **Deploy 1.35.0 first, on the old space.** The box keeps `egemma-300m` (recorded, or read as the legacy
+   space); `/health/deep` must still report it, its collections and `checks.fusion.constants` k 2 /
+   w_bm25 0.4, with `checks.media.enabled` false. Run `embedder-migrate.py` only from the 1.35.0 tree:
+   it embeds with the profile's 1,900-token budget, which the ubatch-2048 entry needs (an older tree
+   sends inputs up to 3,900 tokens and long memories fail).
+3. **Migrate, catch up, switch** exactly as above (`--to egemma2`). There are no media memories before
+   the switch, so nothing needs re-embedding with media. While the build and the catch-up run, both
+   embedders are loaded (the live server still queries EmbeddingGemma-300m): budget about 2.35 GiB for
+   the memory stack on the card for that window (1,536 + 486 + 326 MiB), or run it under a GPU lease.
+4. **Rebuild the wiki** into `wiki_pages_eg2_768` (if it is not there already) and set any consumer's
+   wiki score cut-off for EmbeddingGemma-2 (about 0.62, measured on whole pages at 3,900 tokens; the
+   hot alias now cuts pages at 1,900, so re-check it, or serve the long alias).
+5. **Replicas and PCs** restore the new sets only while they serve `embeddinggemma2` locally
+   (`restore-replica.sh` refuses a set in a space the box does not serve): add the entry there, then
+   `install/linux-replica.sh --embed-profile egemma2`. A set from before the switch keeps restoring into
+   the legacy space.
+6. **Retire EmbeddingGemma-300m** after the new space has served real traffic and at least one backup
+   set holds it: `egemma-rollback-prune.sh` for the old collections, then remove the
+   `embeddinggemma`/`embeddinggemma-ams` llama-swap entries this stack added and their GGUF copies
+   (other consumers of the stock `embeddinggemma` alias keep theirs).
 
 **Rollback** (same shape, reverse direction): stop mem0, `embedder-migrate.py --from <new> --to <old>
 --catch-up --dry-run`, then without `--dry-run` (it brings the old collections up to date with the writes

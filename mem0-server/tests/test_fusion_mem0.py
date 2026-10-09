@@ -58,7 +58,10 @@ def _scored(res):
 @pytest.fixture
 def stock(monkeypatch):
     """mem0 as shipped, with spaCy kept out (both helpers are module globals read at call time)."""
-    monkeypatch.setattr(mm, "score_and_rank", mm.score_and_rank)    # whatever install() does is undone
+    # whatever install() does is undone; and when an earlier test in the session imported app (which
+    # installs the fusion), mem0's real function is the one the fusion kept, not the module global
+    real = fusion._MEM0_ORIGINAL if mm.score_and_rank is fusion.ams_score_and_rank else mm.score_and_rank
+    monkeypatch.setattr(mm, "score_and_rank", real)
     monkeypatch.setattr(mm, "lemmatize_for_bm25", lambda q: q)
     monkeypatch.setattr(mm, "extract_entities", lambda q: [])
     monkeypatch.setattr(fusion, "_MEM0_ORIGINAL", None)

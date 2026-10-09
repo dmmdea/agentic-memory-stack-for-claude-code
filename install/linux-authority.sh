@@ -34,9 +34,9 @@
 #                  share a collection, and a query embedded in the wrong one scores noise with no error.
 #                  Taken from stack.env on a re-run. With no recorded profile, a box that already holds
 #                  a store (a stack.env, or Qdrant collections on disk) is egemma-300m, the space stores
-#                  were built in before profiles existed; a fresh install starts on egemma-300m too
-#                  (measured 2026-10-08: EmbeddingGemma-2 lost about a quarter of the per-prompt
-#                  path's MRR on short facts; docs/systems/embedder-profiles.md). Changing
+#                  were built in before profiles existed (embedder_profile.LEGACY_PROFILE); a fresh
+#                  install starts on the default, egemma2 since 1.35.0 (EmbeddingGemma-2, multimodal;
+#                  docs/systems/embedder-profiles.md). Changing
 #                  the profile of an existing store needs the new space built first (scripts/wsl/
 #                  embedder-migrate.py): mem0 creates an absent collection EMPTY, so the installer
 #                  refuses to rebind a store to a collection that holds no points. Recorded in
@@ -91,11 +91,6 @@ WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
 PROMOTION_GATE_MODE=""; SET_PROMOTION_GATE_MODE=0
 AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
 SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0; SET_EMBED_PROFILE=0
-# The space a FRESH install (no store on the box) starts in. An existing store never takes this:
-# it keeps its recorded profile, or the profile stores were built in before profiles existed.
-# EmbeddingGemma-300m: on short memory facts it measured better than EmbeddingGemma-2 through the
-# per-prompt path (2026-10-08). The wiki's space is separate (MEM0_WIKI_EMBED_PROFILE).
-FRESH_INSTALL_PROFILE="egemma-300m"
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
 QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
@@ -184,18 +179,18 @@ inherit_from_stack_env EMBED_PROFILE MEM0_EMBED_PROFILE --embed-profile
 PROFILE_BASIS="flag or receipt"
 if [ -z "$EMBED_PROFILE" ]; then
     if store_exists; then
-        EMBED_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile from mem0-server/embedder_profile.py"
+        EMBED_PROFILE="$(ep_legacy_profile)" || fail "cannot read the legacy embedding profile from mem0-server/embedder_profile.py"
         PROFILE_BASIS="existing store, no recorded profile"
     else
-        EMBED_PROFILE="$FRESH_INSTALL_PROFILE"
+        EMBED_PROFILE="$(ep_fresh_profile)" || fail "cannot read the default embedding profile from mem0-server/embedder_profile.py"
         PROFILE_BASIS="fresh install"
     fi
 fi
 # An unknown name is refused here (embedder_profile.get exits with the list of known ones).
 ep_field "$EMBED_PROFILE" name >/dev/null || fail "--embed-profile '$EMBED_PROFILE' is not a known embedding profile (see mem0-server/embedder_profile.py)"
-LEGACY_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile"
+LEGACY_PROFILE="$(ep_legacy_profile)" || fail "cannot read the legacy embedding profile"
 # The alias is recorded under the variable embedder_profile reads for the profile: the unscoped
-# MEM0_EMBED_MODEL predates profiles and counts for the default space only (embedder_profile.embed_model),
+# MEM0_EMBED_MODEL predates profiles and counts for the legacy space only (embedder_profile.embed_model),
 # every other profile has its own MEM0_EMBED_MODEL_<PROFILE>.
 if [ "$EMBED_PROFILE" = "$LEGACY_PROFILE" ]; then EMBED_MODEL_KEY=MEM0_EMBED_MODEL; else EMBED_MODEL_KEY="$(ep_env_key "$EMBED_PROFILE")"; fi
 inherit_from_stack_env EMBED_MODEL "$EMBED_MODEL_KEY" --embed-model

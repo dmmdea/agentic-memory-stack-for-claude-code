@@ -245,9 +245,11 @@ def _is_operator_insight(payload) -> bool:
 
 def _is_protected(payload) -> bool:
     """Records the job may never delete: canonical (user-locked), a record migrated out of an
-    auto-memory store (the only live copy) and an operator-sourced insight."""
+    auto-memory store (the only live copy), an operator-sourced insight, and a media memory (1.35.0):
+    its vector can be its caption's alone (a media embed that failed), so two photos with one caption
+    look identical here while they are two memories."""
     return (payload.get("tier") == "canonical" or _is_migration_protected(payload)
-            or _is_operator_insight(payload))
+            or _is_operator_insight(payload) or bool(payload.get("media")))
 
 
 def decide_pair(p_older, p_newer) -> str:

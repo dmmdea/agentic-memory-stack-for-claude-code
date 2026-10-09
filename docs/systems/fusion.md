@@ -37,8 +37,10 @@ deliberate searches and is unchanged.
   candidates that have one).
 - **Fused score** — `score` on every search result:
   `[1/(k + r_dense) + w_bm25/(k + r_bm25) + w_entity/(k + r_entity)] / [(1 + w_bm25 + w_entity)/(k + 1)]`
-  with k = 2, w_bm25 = 0.4, w_entity = 0.25. It lies in (0, 1], is 1.0 only for a candidate ranked first
-  by every leg, and orders the results. It is not a cosine.
+  with constants measured per embedding space (the profile's `fusion`, set at server start): k = 1,
+  w_bm25 = 0.5, w_entity = 0.25 on EmbeddingGemma-2 (the 1.35.0 retune), k = 2, w_bm25 = 0.4,
+  w_entity = 0.25 on EmbeddingGemma-300m (1.34.0). It lies in (0, 1], is 1.0 only for a candidate ranked
+  first by every leg, and orders the results. It is not a cosine.
 - **Raw cosine** — still what every relevance threshold compares (the gate runs before fusion); each
   search result carries it as `cosine`.
 
@@ -63,7 +65,7 @@ scores of evidence-tier memories by 0.77-0.90 (their age) and re-sorts: on close
 lets age outvote relevance as well, the more so the more compressed the model's cosine scale is.
 
 Rank fusion fixes both. Ranks ignore how compressed a cosine scale is, and the fused scores keep the
-top ranks well apart (with the dense leg alone, rank 1, 2, 3 score 0.61, 0.45, 0.36), so a freshness
+top ranks well apart (with the dense leg alone, rank 1, 2, 3 score 0.57, 0.38, 0.29), so a freshness
 weight moves a memory a rank or two instead of to the bottom.
 
 ### The measurement (2026-10-08 lab)
@@ -108,7 +110,23 @@ leg.
 
 Under rank fusion EmbeddingGemma-2 recovers most of what mem0's formula cost it (paraphrase 0.944 EN
 against 0.542) but still trails EmbeddingGemma-300m in every cell (by 0.01-0.04, significantly in four
-of nine). The memories stay on EmbeddingGemma-300m ([embedder profiles](embedder-profiles.md)).
+of nine). In 1.35.0 the memories moved to EmbeddingGemma-2 anyway, by operator order, for its images,
+audio and video ([embedder profiles](embedder-profiles.md)), and the constants were retuned for it alone
+on the same captured lab queries (154 variants, objective 0.5 paraphrase + 0.5 identifier MRR@10,
+paired bootstrap of 4,000 over queries):
+
+| EmbeddingGemma-2, freshness on | paraphrase | identifier | injected per prompt |
+|---|---|---|---|
+| 1.34.0 constants (k = 2, w_bm25 = 0.4) | 0.948 | 0.712 | 0.818 |
+| 1.35.0 constants (k = 1, w_bm25 = 0.5) | 0.947 | 0.723 | 0.828 |
+| difference, 95% CI | -0.001 [-0.002, +0.000] | +0.011 [+0.007, +0.016] | +0.009 [+0.001, +0.018] |
+| for scale: EmbeddingGemma-300m, 1.34.0 constants | 0.966 | 0.741 | 0.858 |
+
+Higher keyword weights win more identifiers but cost paraphrases significantly (w_bm25 = 0.8: +0.047
+identifier, -0.017 paraphrase); k = 1 / w_bm25 = 0.5 is the point that loses nothing on paraphrases.
+The cost of the switch on text retrieval is the last row: about 0.02 MRR on paraphrases and identifiers
+and 0.03 on what is injected per prompt. The constants are per space: a box still on EmbeddingGemma-300m
+keeps k = 2 / w_bm25 = 0.4 until it migrates, because the new ones were measured on EmbeddingGemma-2 only.
 
 ## Important flows
 
@@ -134,7 +152,8 @@ of nine). The memories stay on EmbeddingGemma-300m ([embedder profiles](embedder
 `fusion.install()` (server start), `fusion.ams_score_and_rank` (mem0's hook), `fusion.begin_search()` /
 `fusion.end_search()` (around the server's `mem.search`: the request's legs start empty, then each
 result gets its `cosine` and the search is counted), `fusion.last_legs()` (the current request's legs),
-`fusion.health()` (`GET /health/deep` `checks.fusion`: `{ok, mode, bound, callers_bound, searches:
+`fusion.configure()` (server start: the active space's constants), `fusion.health()` (`GET /health/deep`
+`checks.fusion`: `{ok, mode, bound, callers_bound, constants: {k, w_bm25, w_entity}, searches:
 {reached, bypassed}[, error]}`), `MEM0_FUSION` (`rrf` default, `mem0`). A search with `explain` adds a
 `fusion` stage to the `_explain` trace: the mode and the legs (raw cosine, ranks, BM25 value, entity
 boost, fused score) of the first 20 results.

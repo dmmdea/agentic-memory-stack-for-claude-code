@@ -127,6 +127,16 @@ if (-not $embedProfile) {
     try { $embedProfile = ([string](wsl.exe -d $Distro -e bash -lc "sed -n 's/^MEM0_EMBED_PROFILE=//p' ~/.mem0/stack.env 2>/dev/null | head -1")).Trim() } catch { $embedProfile = '' }
 }
 if ($embedProfile -notmatch '^[a-z0-9][a-z0-9-]*$') { $embedProfile = '' }
+# 1.35.0: no recorded profile and no store on the box = a fresh install, which the installer records as
+# EmbeddingGemma-2 (embedder_profile.DEFAULT_PROFILE); a store without a record stays EmbeddingGemma-300m.
+if (-not $embedProfile) {
+    $hasStore = $false
+    try {
+        $probe = [string](wsl.exe -d $Distro -e bash -lc "if [ -f ~/.mem0/stack.env ] || [ -n `"`$(ls -A ~/qdrant-server/storage/collections 2>/dev/null)`" ]; then echo store; fi")
+        $hasStore = $probe.Trim() -eq 'store'
+    } catch { $hasStore = $true }
+    if (-not $hasStore) { $embedProfile = 'egemma2' }
+}
 $llamaReq = Get-LlamaBuildRequirement -Profile $embedProfile
 # EmbeddingGemma-300m keeps its original wording; any other profile names its architecture too.
 $llamaFloor = if ($embedProfile -and $embedProfile -ne 'egemma-300m') { "$($llamaReq.Floor) ($($llamaReq.Arch))" } else { $llamaReq.Floor }

@@ -71,8 +71,8 @@ jobs:
       # which builds the live Memory client at import time). Those suites are guarded:
       # mem0-server/tests/conftest.py refuses a non-loopback MEM0_URL/QDRANT_URL unless
       # AMS_ALLOW_LIVE_PROD_TESTS=1, and any request carrying the stack's own tenant;
-      # test_live_guard.py (listed below) pins that. test_egemma_embedder needs
-      # the heavy `mem0` package and runs locally only.
+      # test_live_guard.py (listed below) pins that. test_egemma_embedder and
+      # test_media_server need the heavy `mem0` package and run locally only.
       - name: Run the suites that need no live stack
         run: |
           python -m pytest -q \
@@ -101,6 +101,7 @@ jobs:
             mem0-server/tests/test_failure_injection.py \
             mem0-server/tests/test_freshness.py \
             mem0-server/tests/test_fusion.py \
+            mem0-server/tests/test_media.py \
             mem0-server/tests/test_goal_redesign.py \
             mem0-server/tests/test_job_liveness.py \
             mem0-server/tests/test_l10_audit.py \

@@ -81,6 +81,7 @@ def _resolve_tenant(user_id):
                 return val
     return user_id
 
+import base64 as _b64
 import json as _json
 import uuid as _uuid
 import datetime as _dt
@@ -90,6 +91,9 @@ LOCAL_URL = "http://127.0.0.1:18791"           # dormant local replica, up only 
 OUTBOX = Path.home() / ".mem0" / "outbox.jsonl"
 _CONNECT_TIMEOUT = 1.5
 _READ_TIMEOUT = 30.0
+# 1.35.0: a media add or search waits for the server's multimodal embed, which includes a cold load of
+# the projector after an idle spell (seconds to tens of seconds, a video longer).
+_MEDIA_READ_TIMEOUT = 120.0
 # Connect-level failures = fail over. A read timeout or HTTP status is NOT a connect failure.
 _FAILOVER_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
@@ -109,10 +113,11 @@ class OfflineError(Exception):
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
-def _timeout() -> "httpx.Timeout":
-    return httpx.Timeout(connect=_CONNECT_TIMEOUT, read=_READ_TIMEOUT, write=_READ_TIMEOUT, pool=_CONNECT_TIMEOUT)
+def _timeout(read: float = _READ_TIMEOUT) -> "httpx.Timeout":
+    return httpx.Timeout(connect=_CONNECT_TIMEOUT, read=read, write=read, pool=_CONNECT_TIMEOUT)
 
-def _request(method: str, path: str, *, json: dict | None = None, params: dict | None = None):
+def _request(method: str, path: str, *, json: dict | None = None, params: dict | None = None,
+             read_timeout: float = _READ_TIMEOUT):
     """Reads: try authority (short connect), else fail over to the local replica.
     Returns (payload, source). Raises OfflineError if BOTH are unusable (connect-
     unreachable, or answering a _RETRYABLE_STATUS).
@@ -121,7 +126,7 @@ def _request(method: str, path: str, *, json: dict | None = None, params: dict |
     for url, source in ((AUTHORITY_URL, "authority"), (LOCAL_URL, "local-replica")):
         try:
             r = httpx.request(method, f"{url}{path}", json=json, params=params,
-                              headers=_headers(), timeout=_timeout())
+                              headers=_headers(), timeout=_timeout(read_timeout))
         except _FAILOVER_EXC as e:
             last_exc = e
             continue
@@ -152,7 +157,8 @@ def _refusal_detail(r) -> str:
     return " ".join(str(detail).split())[:_REFUSAL_DETAIL_MAX]
 
 def _authority_only(method: str, path: str, *, json: dict | None = None,
-                    params: dict | None = None, explain_refusal: bool = False) -> dict:
+                    params: dict | None = None, explain_refusal: bool = False,
+                    read_timeout: float = _READ_TIMEOUT) -> dict:
     """Writes/mutations: authority only. Raise OfflineError on connect failure, or on a
     _RETRYABLE_STATUS answer, so the caller queues to the outbox instead of losing the
     write (a 503 means the authority cannot serve right now, not that the op is bad).
@@ -161,7 +167,7 @@ def _authority_only(method: str, path: str, *, json: dict | None = None,
     extra = {"params": params} if params else {}
     try:
         r = httpx.request(method, f"{AUTHORITY_URL}{path}", json=json,
-                          headers=_headers(), timeout=_timeout(), **extra)
+                          headers=_headers(), timeout=_timeout(read_timeout), **extra)
     except _FAILOVER_EXC:
         raise OfflineError()
     if r.status_code in _RETRYABLE_STATUS:
@@ -252,8 +258,42 @@ def _partial_supersession_note(items) -> str | None:
             "in each is out of date, see its detail, and the rest still stands. They were NOT "
             "withheld; check the detail before relying on the claim it names")
 
+# 1.35.0 media memories: the server takes images, audio and video as base64 items and embeds them with
+# the caption into the memories' space (mem0-server/media.py validates the bytes; this only reads files).
+_MEDIA_EXT = {"png": "image", "jpg": "image", "jpeg": "image", "gif": "image", "webp": "image", "bmp": "image",
+              "wav": "audio", "mp3": "audio", "flac": "audio", "mp4": "video", "webm": "video"}
+
+def _local_path(p: str) -> str:
+    """A Windows drive path (C: followed by a backslash or a slash), which is what a Windows client hands
+    over, as the /mnt path this WSL process can open; anything else unchanged."""
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", p.strip())
+    if m and os.path.isdir("/mnt"):
+        return f"/mnt/{m.group(1).lower()}/" + m.group(2).replace("\\", "/")
+    return p.strip()
+
+def _read_media(paths) -> list[dict]:
+    items = []
+    for raw in paths or []:
+        lp = _local_path(str(raw))
+        ext = lp.rsplit(".", 1)[-1].lower() if "." in os.path.basename(lp) else ""
+        kind = _MEDIA_EXT.get(ext)
+        if kind is None:
+            raise ValueError(f"{raw}: not a supported media file (images png/jpg/gif/webp/bmp, "
+                             "audio wav/mp3/flac, video mp4/webm)")
+        items.append({"type": kind, "data": _b64.b64encode(Path(lp).read_bytes()).decode("ascii"),
+                      "filename": os.path.basename(lp)})
+    return items
+
+def _windows_path(linux_path: str) -> str | None:
+    try:
+        out = subprocess.run(["wslpath", "-w", linux_path], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
 @mcp.tool
-def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, metadata: dict | None = None) -> dict:
+def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, metadata: dict | None = None,
+               media_paths: list[str] | None = None) -> dict:
     """Add a memory to mem0. Set infer=False to store as-is; True to LLM-extract facts.
     metadata dict can include {source, tier, kind, workspace, project, ...}.
 
@@ -261,8 +301,21 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     with a note explaining how to promote via mem0-canonize.sh CLI. tier='insight' is ALWAYS
     downgraded to 'evidence' with a note (1.32.5): only the nightly dream on the authority, holding
     the authority's service key, writes insight records, whatever `source` an MCP call names.
+
+    media_paths (1.35.0): images (png/jpg/gif/webp/bmp), audio (wav/mp3/flac) or video (mp4/webm), up to 4
+    files, stored WITH the memory; `text` is their caption (what it shows or says, why it matters). The
+    memory is then found by what the media show or say, not only by the caption, and memory_get_media
+    returns the files. A media memory is stored as written (infer is forced False) and is not queued
+    while the authority is offline.
     """
     user_id = _resolve_tenant(user_id)
+    media = None
+    if media_paths:
+        try:
+            media = _read_media(media_paths)
+        except (OSError, ValueError) as e:
+            return {"error": f"media: {e}"}
+        infer = False
     md = dict(metadata or {})
     note = None
     if md.get("tier") == "canonical":
@@ -289,9 +342,14 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     # contract is versioned server-side, the shim is already compliant.
     payload = {"messages": text, "user_id": user_id, "infer": infer, "metadata": md,
                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
+    if media:
+        payload["media"] = media
     try:
-        result = _authority_only("POST", "/v1/memories", json=payload)
+        result = _authority_only("POST", "/v1/memories", json=payload,
+                                 read_timeout=_MEDIA_READ_TIMEOUT if media else _READ_TIMEOUT)
     except OfflineError:
+        if media:
+            return {"error": "the memory authority is offline; a media memory is not queued (retry when it is back)"}
         return _queue_op("add", {"text": text, "user_id": user_id, "infer": infer, "metadata": md})
     if (not infer) and isinstance(text, str) and len(text) > OVERSIZE_ADVISORY_CHARS:
         adv = (f"stored INTACT ({len(text)} chars) - above the l10-audit oversize advisory "
@@ -305,7 +363,7 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
     return result
 
 @mcp.tool
-def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, threshold: float = 0.1, rerank: bool | None = None, query_class: str = "durable", brand: str | None = None, allow_cross_brand: bool = False) -> dict:
+def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, threshold: float = 0.1, rerank: bool | None = None, query_class: str = "durable", brand: str | None = None, allow_cross_brand: bool = False, media_paths: list[str] | None = None) -> dict:
     """Semantic search over mem0. Returns up to `limit` memories above `threshold`.
     Auto-reranks via the bge cross-encoder when limit>=5 (measured 2026-06-22 to IMPROVE
     relevance — blind Codex A/B 7/11). The reranker is a GPU model behind llama-swap that unloads
@@ -322,8 +380,17 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     pass it when working in a brand context. v0.19 fail-closed default: a
     search WITHOUT brand returns only brand-neutral (null-brand) records.
     allow_cross_brand: explicit opt-in for a brandless search to also return
-    brand-scoped records from every brand (audited; use deliberately)."""
+    brand-scoped records from every brand (audited; use deliberately).
+    media_paths (1.35.0): search BY an image, audio or video file as well: the query becomes one
+    embedding of `query` (say what to look for) and the media, so a photo or a clip finds the memories
+    about it, media memories included."""
     user_id = _resolve_tenant(user_id)
+    media = None
+    if media_paths:
+        try:
+            media = _read_media(media_paths)
+        except (OSError, ValueError) as e:
+            return {"error": f"media: {e}"}
     filters: dict = {"user_id": user_id}
     if brand:
         filters["brand"] = brand
@@ -334,7 +401,10 @@ def memory_search(query: str, user_id: str = "__WSL_USER__", limit: int = 5, thr
     # inflating /health/deep hook_contract.missing).
     payload = {"query": query, "filters": filters, "limit": limit, "threshold": threshold, "rerank": eff_rerank, "query_class": query_class,
                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
-    data, source = _request("POST", "/v1/memories/search", json=payload)
+    if media:
+        payload["media"] = media
+    data, source = _request("POST", "/v1/memories/search", json=payload,
+                            read_timeout=_MEDIA_READ_TIMEOUT if media else _READ_TIMEOUT)
     if source == "local-replica":
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -860,6 +930,35 @@ def goal_complete(goal_id: int, reason: str, actor: str = "claude-autonomous") -
 # ---------------------------------------------------------------------------
 
 @mcp.tool
+def memory_get_media(memory_id: str, index: int = 0) -> dict:
+    """1.35.0: save the index-th image/audio/video of a media memory (0-based; a search result's
+    metadata.media lists them) to a local file and return {path, windows_path, mime, bytes}. Open the
+    file to see or hear it (the Read tool shows images)."""
+    last = None
+    for url, source in ((AUTHORITY_URL, "authority"), (LOCAL_URL, "local-replica")):
+        try:
+            r = httpx.get(f"{url}/v1/memories/{memory_id}/media/{int(index)}", headers=_headers(),
+                          timeout=_timeout(_MEDIA_READ_TIMEOUT))
+        except _FAILOVER_EXC as e:
+            last = e
+            continue
+        if r.status_code in _RETRYABLE_STATUS:
+            last = f"{source} answered {r.status_code}"
+            continue
+        if r.status_code != 200:
+            return {"error": f"{r.status_code}: {_refusal_detail(r)}"}
+        mime = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+        m = re.search(r'filename="?([^";]+)"?', r.headers.get("content-disposition", ""))
+        ext = (m.group(1).rsplit(".", 1)[-1] if m and "." in m.group(1) else mime.rsplit("/", 1)[-1]).lower()
+        out_dir = Path(os.environ.get("TMPDIR") or "/tmp") / "ams-media"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{re.sub(r'[^0-9a-fA-F-]', '', memory_id)}-{int(index)}.{re.sub(r'[^0-9a-z]', '', ext) or 'bin'}"
+        out.write_bytes(r.content)
+        return {"path": str(out), "windows_path": _windows_path(str(out)), "mime": mime,
+                "bytes": len(r.content), "source": source}
+    return {"error": f"authority and local replica both unreachable: {last}"}
+
+@mcp.tool
 def memory_get_by_id(memory_id: str) -> dict:
     """Exact read by memory_id. Returns text, metadata, tier, retrievable, source, timestamps.
 
@@ -1069,7 +1168,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.34.0"
+SHIM_STACK_VERSION = "1.35.0"
 
 
 def _write_start_receipt() -> None:

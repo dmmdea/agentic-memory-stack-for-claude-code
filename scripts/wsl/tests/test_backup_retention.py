@@ -1205,7 +1205,7 @@ def test_stack_restore_warns_but_does_not_refuse_when_the_box_is_in_another_spac
     assert f"--embed-profile {P300.name}" in r.stderr, "the warning says how to switch the box"
 
 
-def test_stack_restore_reads_a_set_from_before_profiles_as_the_default_space(home, qdrant, tmp_path):
+def test_stack_restore_reads_a_set_from_before_profiles_as_the_legacy_space(home, qdrant, tmp_path):
     ts = _restorable_set(home, qdrant)
     mp = home / ".mem0" / "backups" / f"manifest-{ts}.json"
     m = json.loads(mp.read_text())
@@ -1214,8 +1214,8 @@ def test_stack_restore_reads_a_set_from_before_profiles_as_the_default_space(hom
     mp.write_text(json.dumps(m))
     r = _restore_dry_run(home, ts, tmp_path)
     assert r.returncode == 0, r.stderr
-    assert "none recorded (a set from before embedding profiles: the default space)" in r.stdout, r.stdout
-    assert f"qdrant_collection: {EP.PROFILES[EP.DEFAULT_PROFILE].memories}" in r.stdout
+    assert "none recorded (a set from before embedding profiles: the legacy space)" in r.stdout, r.stdout
+    assert f"qdrant_collection: {EP.PROFILES[EP.LEGACY_PROFILE].memories}" in r.stdout
 
 
 # --------------------------------------------------------------------------- restore-replica.sh
@@ -1302,12 +1302,12 @@ def test_the_replica_restore_takes_profile_and_collection_from_the_manifest(tmp_
         swap.close()
 
 
-def test_a_set_from_before_profiles_restores_into_the_default_space(tmp_path):
+def test_a_set_from_before_profiles_restores_into_the_legacy_space(tmp_path):
     home, swap, bin_ = _replica_box(tmp_path, {}, aliases=[P300.model])   # no embed_profile, no collections
     try:
         r = _replica_restore(home, swap, bin_)
         assert r.returncode == 0, r.stderr
-        assert f"records no embedding profile (made before profiles): the default space, {P300.name}" in r.stdout
+        assert f"records no embedding profile (made before profiles): the legacy space, {P300.name}" in r.stdout
         assert f"restoring into collection '{P300.memories}'" in r.stdout
     finally:
         swap.close()
@@ -1395,3 +1395,53 @@ def test_the_replica_restore_checks_the_restored_server_is_bound_to_the_restored
         for n in _space(p):
             assert n not in code, n
     assert 'COLLECTION=""' in code, "the default collection is no longer a literal"
+
+
+# --------------------------------------------------------------------------- media memories (1.35.0)
+
+def test_the_media_files_travel_in_the_set_as_one_tar(home, qdrant):
+    """Media memories point at files under ~/.mem0/media: the set carries them (one tar, listed in the
+    manifest, pruned with the set); a box without media writes no tar and the manifest says null."""
+    import tarfile
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    b = home / ".mem0" / "backups"
+    assert not list(b.glob("media-*.tar"))
+    assert json.loads(next(b.glob("manifest-*.json")).read_text())["files"]["media"] is None
+    for f in b.iterdir():
+        f.unlink()
+    d = home / ".mem0" / "media" / "ab"
+    d.mkdir(parents=True)
+    (d / ("ab" + "0" * 62 + ".png")).write_bytes(b"\x89PNG\r\n\x1a\n-one")
+    (d / ("ab" + "1" * 62 + ".png.tmp")).write_bytes(b"half-written")
+    r = _run(BACKUP, home, qdrant)
+    assert r.returncode == 0, r.stderr
+    tars = list(b.glob("media-*.tar"))
+    assert len(tars) == 1
+    with tarfile.open(tars[0]) as t:
+        names = sorted(n for n in t.getnames() if not n.endswith("/") and n not in (".", "./ab"))
+    assert names == ["./ab/ab" + "0" * 62 + ".png"], names
+    m = json.loads(next(b.glob("manifest-*.json")).read_text())
+    assert m["files"]["media"] == tars[0].name
+
+
+def test_stack_restore_plans_the_media_extraction(home, qdrant, tmp_path):
+    ts = _restorable_set(home, qdrant)
+    b = home / ".mem0" / "backups"
+    (b / f"media-{ts}.tar").write_bytes(b"\0" * 1024)
+    mp = b / f"manifest-{ts}.json"
+    m = json.loads(mp.read_text())
+    m["files"]["media"] = f"media-{ts}.tar"
+    mp.write_text(json.dumps(m))
+    r = _restore_dry_run(home, ts, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert f"5g. media          : {b}/media-{ts}.tar -> {home}/.mem0/media (additive" in r.stdout, r.stdout
+
+
+def test_both_restores_extract_media_without_rewriting_a_file():
+    """Names are content hashes, so an existing name already holds the same bytes: extraction is
+    additive (--skip-old-files) and never takes the archive's owners."""
+    import re
+    for script in (RESTORE, REPLICA_RESTORE):
+        code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+        assert re.search(r'tar -C "\$MEDIA_DST" --skip-old-files --no-same-owner -xf ', code), script

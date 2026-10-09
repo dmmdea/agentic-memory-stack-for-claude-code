@@ -11,7 +11,7 @@ trained for, the embedding-input token budget, the asymmetric task prefixes, a t
 names carry the model, so two spaces can never share a collection.
 
 Resolution (first match wins):
-  profile         MEM0_EMBED_PROFILE env > ~/.mem0/stack.env MEM0_EMBED_PROFILE > DEFAULT_PROFILE
+  profile         MEM0_EMBED_PROFILE env > ~/.mem0/stack.env MEM0_EMBED_PROFILE > LEGACY_PROFILE
   model alias     MEM0_EMBED_MODEL_<PROFILE> (env > stack.env) > the profile's model; the
                   unscoped MEM0_EMBED_MODEL counts for egemma-300m only (see embed_model)
   long alias      MEM0_EMBED_LONG_MODEL_<PROFILE> > the profile's long_model ("none": use the hot one)
@@ -20,10 +20,13 @@ Resolution (first match wins):
   wiki            MEM0_WIKI_COLLECTION > the wiki profile's (MEM0_WIKI_EMBED_PROFILE > the active one)
   base URL        MEM0_EMBED_BASE_URL > http://localhost:11436/v1
 
-DEFAULT_PROFILE stays the space existing stores were built in, so upgrading the code never moves
-a store to another space by itself. A fresh install records its profile in stack.env (the
-installers pass --embed-profile); an existing store changes space only through
-scripts/wsl/embedder-migrate.py, which builds the new collections beside the old ones.
+DEFAULT_PROFILE is the space a FRESH install records: EmbeddingGemma-2 since 1.35.0 (operator order
+2026-10-08: it replaces EmbeddingGemma-300m everywhere, multimodal). A box that records no profile is
+read as LEGACY_PROFILE (EmbeddingGemma-300m), the space every store was built in before profiles
+existed, so a code upgrade never moves a store by itself, whatever the default says. Every installer
+records the profile in stack.env; an existing store changes space only through
+scripts/wsl/embedder-migrate.py, which builds the new collections beside the old ones, followed by
+install/linux-authority.sh --embed-profile. egemma-300m stays defined as the source of that migration.
 
 mem0 stores entity vectors in "<memories collection>_entities"; that name follows the memories
 collection automatically.
@@ -58,7 +61,8 @@ class EmbedProfile:
     name: str
     label: str
     model: str            # llama-swap alias for the hot path (queries, memories, entities, episodes)
-    ctx_tokens: int       # that alias's llama-server --ctx-size (= --batch-size = --ubatch-size)
+    ctx_tokens: int       # the largest input one embed takes: that alias's llama-server --ubatch-size
+                          # (a non-causal embedder needs the whole input in one ubatch)
     token_budget: int     # upper bound for a hot-path embedding input, task prefix included
     dims: int
     query_prefix: str
@@ -75,6 +79,12 @@ class EmbedProfile:
     long_ctx_tokens: int = 0
     long_token_budget: int = 0
     thresholds: Thresholds | None = None
+    # The served model also embeds images, audio and video into the same space (its alias is started
+    # with --mmproj); the server's media memories and media searches require it (media.py).
+    media: bool = False
+    # Rank-fusion constants (k, keyword weight, entity weight; fusion.py), measured per model on the
+    # 2026-10-08 lab: EmbeddingGemma-300m's are the 1.34.0 ones, EmbeddingGemma-2's the 1.35.0 retune.
+    fusion: tuple = (2.0, 0.4, 0.25)
 
     @property
     def entities(self) -> str:
@@ -89,7 +99,8 @@ _EG_DOC = "title: none | text: "
 
 PROFILES = {
     "egemma-300m": EmbedProfile(
-        name="egemma-300m", label="EmbeddingGemma-300m", model="embeddinggemma",
+        name="egemma-300m", label="EmbeddingGemma-300m (retired 1.35.0; kept as a migration source)",
+        model="embeddinggemma",
         ctx_tokens=2048, token_budget=1900, dims=768,
         query_prefix=_EG_QUERY, doc_prefix=_EG_DOC, template_version="eg-search-v1",
         memories="mem0_egemma_768", episodes="episodes_egemma_768", wiki="wiki_pages_egemma_768",
@@ -104,23 +115,25 @@ PROFILES = {
                    ("insight", 0.95)),
             dedup_fallback=0.92, rerank_skip=1.0),
     ),
-    # google/embeddinggemma-2: Gemma 4 backbone, 270M text-only parameters, 768-d output (Matryoshka
-    # 512/256/128 unused here), mean pooling, trained at 8,192 tokens. Its GGUF header advertises the
-    # backbone's 262,144: never serve the header value. Needs llama.cpp with the gemma-embedding2
-    # architecture (b11452 or later). The card forbids float16; Q8_0 measured cosine >= 0.9996 against
-    # BF16 on house text (2026-10-08), so Q8_0 is the served file.
-    # Served at ctx 4096 (measured 2026-10-08, b11490, flash attention on): the same VRAM as
-    # EmbeddingGemma-300m at 2048 (+735 vs +742 MiB); ctx 8192 costs about 600 MiB more and bought no
-    # significant retrieval on the house wiki (budgets 3,900 vs 7,900 tokens; the shim's conservative
-    # estimator keeps ~4,300 vs ~8,800 characters of English prose at those budgets: deep-detail MRR
-    # 0.788 vs 0.811, 95% CI of the difference [-0.022, +0.075]). So no long alias by default; a box
-    # can still declare one (MEM0_EMBED_LONG_MODEL_EGEMMA2 + a ctx-8192 llama-swap entry).
+    # google/embeddinggemma-2: 740M parameters, a 270M text model (Gemma 4 backbone) plus a 170M vision and
+    # a 300M audio encoder, all mapped into one 768-d space (Matryoshka 512/256/128 unused here), mean
+    # pooling, trained at 8,192 tokens. Its GGUF header advertises the backbone's 262,144: never serve the
+    # header value. Needs llama.cpp with the gemma-embedding2 architecture (b11452 or later). Q8_0 text
+    # weights measured cosine >= 0.9996 against BF16 on house text, and the Q8_0 projector (the vision +
+    # audio encoders, --mmproj) cosine >= 0.9993 against BF16 on images and speech (2026-10-08, b11490).
+    # Served on the RTX 3050 authority at --ctx-size 4096 --batch-size 4096 --ubatch-size 2048 with the
+    # projector: 1,196 MiB loaded, 1,466 MiB peak after image embeds (1,536 after a video); ubatch 4096
+    # would cost 1,870 MiB for inputs past ~1,900 tokens, which memories (4,000-char cap) never reach.
+    # The text vectors are identical with and without the projector (cosine 1.0). Images, audio and
+    # video are sent as OpenAI-style content parts on /v1/embeddings (media.py); they take no prefix.
+    # The wiki's whole-page recipe beat EmbeddingGemma-300m's best by +0.10 MRR at 3,900 tokens; a box
+    # that wants that window declares a long alias (MEM0_EMBED_LONG_MODEL_EGEMMA2 + a ubatch-8192 entry).
     "egemma2": EmbedProfile(
         name="egemma2", label="EmbeddingGemma-2", model="embeddinggemma2",
-        ctx_tokens=4096, token_budget=3900, dims=768,
+        ctx_tokens=2048, token_budget=1900, dims=768,
         query_prefix=_EG_QUERY, doc_prefix=_EG_DOC, template_version="eg-search-v1",
         memories="mem0_eg2_768", episodes="episodes_eg2_768", wiki="wiki_pages_eg2_768",
-        long_ctx_tokens=8192, long_token_budget=7900,
+        long_ctx_tokens=8192, long_token_budget=7900, media=True, fusion=(1.0, 0.5, 0.25),
         # Calibrated 2026-10-08 in the lab A/B on the restored 2026-10-07 store (16,946 memories), see
         # docs/systems/embedder-profiles.md. Gate 0.70: the clean-separation point of the house
         # relevance probes (off-topic max 0.694, relevant min 0.720 EN / 0.727 ES); the house rule's
@@ -139,7 +152,11 @@ PROFILES = {
     ),
 }
 
-DEFAULT_PROFILE = "egemma-300m"
+# The space a fresh install records (installers only; the server never falls back to it).
+DEFAULT_PROFILE = "egemma2"
+# The space of every store and backup set made before profiles existed (before 1.33.0): a box with no
+# recorded profile, or a set whose manifest names none, means THIS, whatever DEFAULT_PROFILE says.
+LEGACY_PROFILE = "egemma-300m"
 DEFAULT_BASE_URL = "http://localhost:11436/v1"
 
 
@@ -163,7 +180,9 @@ def _setting(key: str) -> str:
 
 
 def profile_name() -> str:
-    return _setting("MEM0_EMBED_PROFILE") or DEFAULT_PROFILE
+    """The recorded profile, else LEGACY_PROFILE: an unrecorded box is a store from before profiles, never
+    a fresh one (installers record the profile, a fresh install included)."""
+    return _setting("MEM0_EMBED_PROFILE") or LEGACY_PROFILE
 
 
 def active() -> EmbedProfile:
@@ -295,6 +314,8 @@ def describe(profile: EmbedProfile | None = None) -> dict:
         "long_model": long_model(p)[0],
         "long_token_budget": long_model(p)[1],
         "template_version": p.template_version,
+        "media": p.media,
+        "fusion": list(p.fusion),
         "collections": {k: collection(k, p) for k in ("memories", "entities", "episodes")},
         "wiki": {"profile": w.name, "model": embed_model(w), "collection": collection("wiki", w)},
         "threshold_overrides": threshold_overrides(p),

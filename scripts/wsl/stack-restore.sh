@@ -146,9 +146,9 @@ MANIFEST_EMBED_MODEL=$(mkey embed_model)
 MANIFEST_TEMPLATE=$(mkey template_version)
 MANIFEST_COLLECTION=$(mkey collections memories)
 if [ -z "$MANIFEST_EMBED_PROFILE" ]; then
-    MANIFEST_EMBED_NOTE="none recorded (a set from before embedding profiles: the default space)"
-    if declare -F ep_default_profile >/dev/null 2>&1; then
-        MANIFEST_EMBED_PROFILE_EFFECTIVE=$(ep_default_profile 2>/dev/null || echo "")
+    MANIFEST_EMBED_NOTE="none recorded (a set from before embedding profiles: the legacy space)"
+    if declare -F ep_legacy_profile >/dev/null 2>&1; then
+        MANIFEST_EMBED_PROFILE_EFFECTIVE=$(ep_legacy_profile 2>/dev/null || echo "")
         [ -z "$MANIFEST_COLLECTION" ] && [ -n "$MANIFEST_EMBED_PROFILE_EFFECTIVE" ] && MANIFEST_COLLECTION=$(ep_field "$MANIFEST_EMBED_PROFILE_EFFECTIVE" memories 2>/dev/null || echo "")
     fi
 else
@@ -184,6 +184,7 @@ L10STATE_FILE=$(mfile l10_state)
 PRQ_FILE=$(mfile promote_review)
 WS_FILE=$(mfile stale_worksheet)
 CLAUDE_SETTINGS_FILE=$(mfile claude_settings)
+MEDIA_FILE=$(mfile media)
 
 echo "--- Manifest contents ---"
 echo "  app_version    : $MANIFEST_APP_VERSION"
@@ -215,7 +216,7 @@ for pair in "qdrant_snapshot:$QDRANT_SNAP_FILE" "history_db:$HISTORY_FILE" \
     fi
 done
 # MEMORY, audit and the 2026-08-24 additions are optional (may not exist in older backups)
-for fname in "$MEMORY_FILE" "$AUDIT_FILE" "$L10FLAGS_FILE" "$L10STATE_FILE" "$PRQ_FILE" "$WS_FILE" "$CLAUDE_SETTINGS_FILE"; do
+for fname in "$MEMORY_FILE" "$AUDIT_FILE" "$L10FLAGS_FILE" "$L10STATE_FILE" "$PRQ_FILE" "$WS_FILE" "$CLAUDE_SETTINGS_FILE" "$MEDIA_FILE"; do
     if [ -n "$fname" ] && [ ! -f "$BACKUP_DIR/$fname" ]; then
         echo "INFO: optional file absent: $BACKUP_DIR/$fname (non-fatal)"
     fi
@@ -247,6 +248,9 @@ echo "  5d. promote-review : $BACKUP_DIR/$PRQ_FILE -> $HOME/.mem0/contradiction-
 fi
 if [ -n "$WS_FILE" ] && [ -f "$BACKUP_DIR/$WS_FILE" ]; then
 echo "  5e. worksheet      : $BACKUP_DIR/$WS_FILE -> $HOME/.mem0/stale-paths-worksheet-restore.jsonl"
+fi
+if [ -n "$MEDIA_FILE" ] && [ -f "$BACKUP_DIR/$MEDIA_FILE" ]; then
+echo "  5g. media          : $BACKUP_DIR/$MEDIA_FILE -> ${MEM0_MEDIA_DIR:-$HOME/.mem0/media} (additive; files are content-addressed)"
 fi
 echo "  6. episodic.db     : $BACKUP_DIR/$EPISODIC_FILE -> $TARGET_EPISODIC"
 echo "     (integrity_check + schema migration to current version)"
@@ -438,6 +442,19 @@ if [ -n "$CLAUDE_SETTINGS_FILE" ] && [ -f "$BACKUP_DIR/$CLAUDE_SETTINGS_FILE" ];
         echo "claude settings.json restored to: $DST (copy to the Windows ~/.claude after review)"
     else
         rm -f "$DST.tmp"; echo "WARN: claude settings staging FAILED" >&2; WARNS=$((WARNS+1))
+    fi
+fi
+# 5g. media memories (1.35.0): the files are named by their sha256, so extracting into the live
+# directory is additive and safe — a name that already exists holds the same bytes, and
+# --skip-old-files never rewrites it. The vectors that point at them come back with the snapshot.
+if [ -n "$MEDIA_FILE" ] && [ -f "$BACKUP_DIR/$MEDIA_FILE" ]; then
+    echo ""
+    echo "--- Step 5g: media restore ---"
+    MEDIA_DST="${MEM0_MEDIA_DIR:-$HOME/.mem0/media}"
+    if mkdir -p "$MEDIA_DST" && tar -C "$MEDIA_DST" --skip-old-files --no-same-owner -xf "$BACKUP_DIR/$MEDIA_FILE"; then
+        echo "media restored into: $MEDIA_DST ($(find "$MEDIA_DST" -type f ! -name '*.tmp' | wc -l) file(s) present)"
+    else
+        echo "WARN: media restore FAILED (memories keep their captions; their media cannot be fetched)" >&2; WARNS=$((WARNS+1))
     fi
 fi
 

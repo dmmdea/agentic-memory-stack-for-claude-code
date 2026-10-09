@@ -9,7 +9,8 @@ The load-bearing claims:
   * an unknown profile name fails loud instead of falling back to a space the store was not
     built in;
   * the shim reads its prefixes and its token budget from the profile, so EmbeddingGemma-2's
-    8,192-token window is actually used.
+    8,192-token window is actually used where a box serves its long alias;
+  * a fresh install records the default (EmbeddingGemma-2 since 1.35.0); only an installer applies it.
 """
 import pytest
 
@@ -33,6 +34,14 @@ def _stack_env(home, **kv):
     (home / ".mem0" / "stack.env").write_text("".join(f"{k}={v}\n" for k, v in kv.items()), encoding="utf-8")
 
 
+def test_the_default_is_what_a_fresh_install_records_and_never_a_fallback(clean):
+    """1.35.0: EmbeddingGemma-2 (multimodal) is the default a fresh install records; a box that records
+    nothing is the legacy space, so the default's change cannot rebind a store."""
+    assert ep.DEFAULT_PROFILE == "egemma2" and ep.get(ep.DEFAULT_PROFILE).media is True
+    assert ep.LEGACY_PROFILE == "egemma-300m" and ep.get(ep.LEGACY_PROFILE).media is False
+    assert ep.profile_name() == ep.LEGACY_PROFILE != ep.DEFAULT_PROFILE
+
+
 def test_default_is_the_existing_space(clean):
     p = ep.active()
     assert p.name == "egemma-300m"
@@ -49,9 +58,9 @@ def test_profile_switch_moves_model_and_every_collection(clean, monkeypatch):
     d = ep.describe()
     assert d["profile"] == "egemma2"
     assert d["model"] == "embeddinggemma2"
-    assert d["ctx_tokens"] == 4096
+    assert d["ctx_tokens"] == 2048 and d["media"] is True
     # no long alias by default: whole pages go through the hot alias at the hot budget
-    assert (d["long_model"], d["long_token_budget"]) == ("embeddinggemma2", 3900)
+    assert (d["long_model"], d["long_token_budget"]) == ("embeddinggemma2", 1900)
     assert d["collections"] == {"memories": "mem0_eg2_768", "entities": "mem0_eg2_768_entities",
                                 "episodes": "episodes_eg2_768"}
     assert d["wiki"] == {"profile": "egemma2", "model": "embeddinggemma2", "collection": "wiki_pages_eg2_768"}
@@ -125,23 +134,23 @@ def test_shim_reads_prefixes_and_budget_from_the_profile():
     shim = EmbeddingGemmaEmbedder(cfg, profile=eg2)
     assert shim._prefix("search") == eg2.query_prefix
     assert shim._prefix("add") == eg2.doc_prefix
-    assert shim._budget == budget_for(eg2) > budget_for(ep.get("egemma-300m"))
-    # ~4,000 chars of hex is ~3,600 estimated tokens: cut under EmbeddingGemma-300m's budget,
-    # embedded whole under EmbeddingGemma-2's hot-path budget.
+    assert shim._budget == budget_for(eg2)
+    # ~4,000 chars of hex is ~3,600 estimated tokens: cut under the hot-path budget (ubatch 2048, served
+    # with the projector), embedded whole under EmbeddingGemma-2's long budget.
     blob = "0123456789abcdef" * 250
-    assert len(_truncate_for_embedding(blob, budget_for(ep.get("egemma-300m")))) < len(blob)
-    assert _truncate_for_embedding(blob, budget_for(eg2)) == blob
+    assert len(_truncate_for_embedding(blob, budget_for(eg2))) < len(blob)
+    assert _truncate_for_embedding(blob, eg2.long_token_budget) == blob
 
 
 def test_long_alias_resolution(clean, monkeypatch):
     eg2, eg1 = ep.get("egemma2"), ep.get("egemma-300m")
-    assert ep.long_model(eg2) == ("embeddinggemma2", 3900)
+    assert ep.long_model(eg2) == ("embeddinggemma2", 1900)
     # A profile without a long alias embeds long documents through the hot one, hot budget.
     assert ep.long_model(eg1) == ("embeddinggemma", 1900)
     monkeypatch.setenv("MEM0_EMBED_LONG_MODEL_EGEMMA2", "eg2-long-ams")
     assert ep.long_model(eg2) == ("eg2-long-ams", 7900)
     monkeypatch.setenv("MEM0_EMBED_LONG_MODEL_EGEMMA2", "none")
-    assert ep.long_model(eg2) == ("embeddinggemma2", 3900)
+    assert ep.long_model(eg2) == ("embeddinggemma2", 1900)
 
 
 def test_thresholds_default_profile_unchanged(clean):
@@ -201,7 +210,7 @@ def test_build_embedder_in_the_wiki_space(clean, monkeypatch):
     importlib.reload(config)
     emb = config.build_embedder(long=True, profile=ep.wiki_profile())
     assert emb.profile.name == "egemma2" and emb.config.model == "embeddinggemma2"
-    assert emb._budget == 3900 - 16
+    assert emb._budget == 1900 - 16
     hot = config.build_embedder()
     assert hot.profile.name == "egemma-300m" and hot.config.model == "embeddinggemma"
 

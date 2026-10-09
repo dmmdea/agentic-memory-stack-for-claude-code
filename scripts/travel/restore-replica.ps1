@@ -54,7 +54,7 @@ $epScript = @'
 import json, os, sys
 sys.path.insert(0, os.path.expanduser("~/apps/mem0-server"))
 import embedder_profile as ep
-p = ep.get(ep.DEFAULT_PROFILE if sys.argv[1] == "-" else sys.argv[1])
+p = ep.get(ep.LEGACY_PROFILE if sys.argv[1] == "-" else sys.argv[1])
 print(json.dumps({"profile": p.name, "local": ep.active().name, "alias": ep.embed_model(p),
                   "collection": ep.collection("memories", p), "base_url": ep.base_url()}))
 '@

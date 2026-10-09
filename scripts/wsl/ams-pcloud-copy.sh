@@ -88,7 +88,7 @@ for f in "$src"/*-"$stamp".*; do
     [ -f "$f" ] || continue
     case "$f" in
         "$src"/manifest-*) continue ;;
-        *.db|*.jsonl|*.snapshot|*.md|*.baseline|*.json) ;;
+        *.db|*.jsonl|*.snapshot|*.md|*.baseline|*.json|*.tar) ;;
         *) continue ;;   # -wal/-shm sidecars, .tmp partials, anything unknown
     esac
     copy_one "$f"

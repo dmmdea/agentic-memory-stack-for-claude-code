@@ -65,6 +65,7 @@ BeforeAll {
         }
     }
     $script:pyDefault = [regex]::Match($py, '(?m)^DEFAULT_PROFILE\s*=\s*"([^"]+)"').Groups[1].Value
+    $script:pyLegacy  = [regex]::Match($py, '(?m)^LEGACY_PROFILE\s*=\s*"([^"]+)"').Groups[1].Value
     $script:pyDocPrefix = [regex]::Match($py, '(?m)^_EG_DOC\s*=\s*"([^"]*)"').Groups[1].Value
     $script:pySource = $py
 
@@ -84,7 +85,8 @@ Describe 'embedder_profile.py is parsed correctly (the parity tests below are no
         $script:pyProfiles['egemma-300m'].Memories | Should -Be 'mem0_egemma_768'
         $script:pyProfiles['egemma2'].Memories     | Should -Be 'mem0_eg2_768'
         $script:pyProfiles['egemma2'].Model        | Should -Be 'embeddinggemma2'
-        $script:pyDefault   | Should -Be 'egemma-300m'
+        $script:pyDefault   | Should -Be 'egemma2'
+        $script:pyLegacy    | Should -Be 'egemma-300m'
         $script:pyDocPrefix | Should -Be 'title: none | text: '
     }
 }
@@ -99,8 +101,8 @@ Describe 'autopromote-lib.ps1 mirrors embedder_profile.py (collection + sibling 
             $script:AmEmbedProfiles[$k].SiblingThreshold | Should -Be $script:pyProfiles[$k].Sibling -Because "$k sibling cosine"
         }
     }
-    It 'defaults to the profile embedder_profile.py defaults to' {
-        $script:AmDefaultEmbedProfile | Should -BeExactly $script:pyDefault
+    It 'reads an unrecorded box as the space embedder_profile.py reads it as (the legacy one)' {
+        $script:AmLegacyEmbedProfile | Should -BeExactly $script:pyLegacy
     }
     It 'names a collection or a cosine nowhere but in that table' {
         $code = script:Get-CodeText $script:libPath

@@ -27,15 +27,37 @@ config.py registers this class under the provider key "egemma" in mem0's
 EmbedderFactory, then sets embedder.provider = "egemma". Transport is the stock
 OpenAI-compatible path against llama-swap :11436/v1 (model "embeddinggemma").
 """
+import contextvars
 import random
 import time
 import unicodedata
 from typing import Literal, Optional
 
+import httpx
 from mem0.embeddings.openai import OpenAIEmbedding
 from openai import RateLimitError
 
 import embedder_profile
+import media as _media
+
+# A search that carries media (SearchIn.media): (query text, [media.Media]) for this request. The shim's
+# embed(text, "search") returns the interleaved multimodal vector for exactly that text and nothing
+# else, so mem0's other embeds in the same search (entity texts, a second query) stay text-only.
+# The server sets it right before mem.search and resets it right after (app.py _search_core).
+QUERY_MEDIA: contextvars.ContextVar = contextvars.ContextVar("ams_query_media", default=None)
+
+
+class QueryMedia:
+    """One media search's query: its text and its media, spent by the FIRST search embed of that text.
+    mem0 embeds the query before anything else in its search; mem0 2.0.4 then embeds each extracted
+    entity with embed(entity, "search") one at a time, and an entity that is the whole query must get
+    its text vector there, not the media one (nor cost a second media request)."""
+    __slots__ = ("text", "items", "used")
+
+    def __init__(self, text: str, items):
+        self.text, self.items, self.used = text, items, False
+_MEDIA_TIMEOUT_S = 120.0     # a cold projector load plus a video can take tens of seconds
+_MEDIA_MIN_TEXT_TOKENS = 64  # a caption keeps at least this much room next to its media
 
 # Verbatim from the EmbeddingGemma model cards (both generations use the same strings; the
 # active profile in embedder_profile is the source the embedder instance reads).
@@ -171,11 +193,46 @@ class EmbeddingGemmaEmbedder(OpenAIEmbedding):
     def _prefix(self, memory_action) -> str:
         return self.profile.query_prefix if memory_action == "search" else self.profile.doc_prefix
 
+    def embed_media(self, text: str, items, memory_action: Optional[str] = "add") -> list:
+        """ONE embedding of `text` (task prefix, truncated to what the media leave of the budget) followed
+        by the media items, as OpenAI-style content parts on llama-server's /v1/embeddings (the alias
+        must be served with --mmproj). Raises on any failure; callers keep the text-only vector."""
+        if not self.profile.media:
+            raise RuntimeError(f"embedding profile {self.profile.name} has no media embedder")
+        room = self._budget - _media.tokens(items)
+        if room < _MEDIA_MIN_TEXT_TOKENS:
+            raise ValueError(f"media take ~{_media.tokens(items)} of the {self._budget}-token embed window")
+        content = []
+        if text:
+            content.append({"type": "text",
+                            "text": self._prefix(memory_action) + _truncate_for_embedding(text, room)})
+        content.extend(_media.content_part(m) for m in items)
+        url = str(self.config.openai_base_url or embedder_profile.base_url()).rstrip("/") + "/embeddings"
+        body = {"model": self.config.model, "input": [{"content": content}], "encoding_format": "float"}
+        headers = {"Authorization": f"Bearer {self.config.api_key or 'noop'}"}
+        for attempt in range(_RETRY_429_ATTEMPTS):
+            r = httpx.post(url, json=body, headers=headers, timeout=_MEDIA_TIMEOUT_S)
+            if r.status_code == 429 and attempt < _RETRY_429_ATTEMPTS - 1:
+                time.sleep(_RETRY_429_BASE_SLEEP_S * (2 ** attempt) + random.random() * _RETRY_429_JITTER_S)
+                continue
+            r.raise_for_status()
+            break
+        vec = r.json()["data"][0]["embedding"]
+        if len(vec) != self.profile.dims:
+            raise ValueError(f"media embed returned {len(vec)} dims, the space has {self.profile.dims}")
+        return vec
+
     def embed(
         self,
         text,
         memory_action: Optional[Literal["add", "search", "update"]] = None,
     ):
+        q = QUERY_MEDIA.get()
+        # mem0 2.1 strips the query before it embeds it (_validate_and_trim_search_query): compare stripped
+        if (q is not None and not q.used and memory_action == "search" and isinstance(text, str)
+                and text.strip() == q.text.strip()):
+            q.used = True
+            return self.embed_media(text, q.items, "search")
         # v0.22 M4: ctx-safe truncation of the embedding input only (storage keeps
         # the full text). Prevents a context overflow -> llama-server 500 ->
         # silent memory loss on token-dense records.

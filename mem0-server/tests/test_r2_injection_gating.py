@@ -5,7 +5,11 @@ levers are (a) memory_cap (K) capped at 1-2 (ReasoningBank k=1 49.7% > k=4 44.4%
 frontier=2, small=1; and (b) the hook's block-level NOOP (no memory clears -> no
 block), tested in Pester.
 
-relevance_threshold is KEPT at 0.30 (NOT raised). The CALIBRATE-FIRST probe
+1.35.0: the threshold literal is the DEFAULT embedding space's calibrated relevance gate
+(embedder_profile; EmbeddingGemma-2: 0.70) and the server applies the ACTIVE space's at runtime.
+The history below is EmbeddingGemma-300m's, where it was 0.30.
+
+relevance_threshold was KEPT at 0.30 (NOT raised). The CALIBRATE-FIRST probe
 (eval/injection-gating/, 2026-06-15) found mem0 2.0.4 does HYBRID search:
 score_and_rank() gates each candidate on its SEMANTIC score (raw Qdrant cosine)
 but returns the higher combined (semantic+bm25+entity) score. On the SEMANTIC scale
@@ -47,20 +51,22 @@ def _client_tiers() -> dict:
     return json.loads(_TIERS_JSON.read_text(encoding="utf-8"))["tiers"]
 
 
-def test_r2_relevance_threshold_kept_at_030():
-    """Both tiers gate at 0.30 — KEPT, not raised. The calibration found the
-    threshold gates the hybrid-search SEMANTIC score whose EmbeddingGemma separation
-    is compressed (off-domain <=0.12, relevant 0.25-0.57), so 0.30 is already correct
-    and a raise craters recall. Unified across tiers (small was 0.33, which
-    over-abstains on this scale); per-tier scaling lives in K, not the threshold."""
+def test_r2_relevance_threshold_is_the_default_spaces_gate():
+    """Both tiers carry the default embedding space's calibrated relevance gate (unified
+    across tiers; per-tier scaling lives in K, not the threshold). A cosine gate is not
+    portable between spaces, so the literal follows embedder_profile, never a bare number."""
+    import sys
+    sys.path.insert(0, str(_SERVER_DIR))
+    import embedder_profile as ep
+    gate = ep.get(ep.DEFAULT_PROFILE).thresholds.relevance_gate
     server = _server_policy()
     client = _client_tiers()
     for tier in ("frontier", "small"):
-        assert server[tier]["relevance_threshold"] == 0.30, (
-            f"{tier} relevance_threshold must be 0.30 (calibration-confirmed; not "
-            f"raised), got {server[tier]['relevance_threshold']} (app.py)")
-        assert client[tier]["relevance_threshold"] == 0.30, (
-            f"{tier} relevance_threshold must be 0.30 in model-tiers.json, got "
+        assert server[tier]["relevance_threshold"] == gate, (
+            f"{tier} relevance_threshold must be {gate} (the {ep.DEFAULT_PROFILE} space's calibrated "
+            f"gate), got {server[tier]['relevance_threshold']} (app.py)")
+        assert client[tier]["relevance_threshold"] == gate, (
+            f"{tier} relevance_threshold must be {gate} in model-tiers.json, got "
             f"{client[tier]['relevance_threshold']}")
 
 

@@ -113,6 +113,10 @@ One more, added in 1.32.5:
 
 - **`service_key` — informational** (never flips `ok`): whether this server loaded the service key that proves a server-side job label (see Auth). Shape: `{"present": bool, "source": "credential"|"runtime"|"plaintext"|"none"}`. A box without it is healthy and refuses every job label, which is correct on a replica or PC. On the brain the capability row `service-key` (required for role `brain`) reads `dead` when `present` is false, because the dream's insight writes and the sweep's stamps would all get `403 service-credential-required`; the installer (`install/linux-authority.sh`) fails the install unless `/health/deep` reports `checks.service_key.present: true`, and `scripts/wsl/deploy.sh` asserts it after a WSL restart.
 
+And one in 1.35.0:
+
+- **`media` — informational** (never flips `ok`): media memories ([embedder profiles](embedder-profiles.md#media-memories)). Shape: `{"enabled": bool, "dir": "...", "embeds_ok": N, "embeds_failed": N, "last_ok_ts": iso|null, "last_error": "..."|null}` — whether the active space embeds media, where the files live, and the passive counters of media embeds since start (no active probe: a cold projector load is slow). `embeds_failed > 0` means media memories were kept with their caption-only vectors; `last_error` says why (usually the alias served without `--mmproj`).
+
 ### `GET /health/maintenance`
 
 The authority's nightly chain, folded from `~/.mem0/maintenance/receipts.jsonl` (v1.21; v1.22 adds `dataset` and `usage`): `steps.<name>` = `{last_success, last_run, duration_ms, receipt_id, ok, status, last_noop}` (`status` = `ok|degraded|failed`, the receipt's outcome). The first six describe the step's latest REAL run: a `weekly:` off-day or `guard:` boot-guard no-op receipt (ok, 0 ms) never overwrites them and never counts as a success; it rides in `last_noop` = `{ts, note, receipt_id}` (null when none). A step that has only ever no-op'd keeps its latest no-op as the headline and has `last_success: null`; `stale_steps` = daily steps without a real success in 48 h (a guard no-op does not stand in for one), and `--weekly` steps (recognised by their `weekly:` off-day no-op receipts, or by every recent receipt falling on a Sunday) without a real run in 8 days; `failed_steps` / `degraded_steps` = `[{step, ts, note}]` for each step whose LATEST real run failed / degraded (a later ok run clears it; the `weekly:` and `guard:` no-op receipts are not runs, so a Sunday failure stays listed all week; `health-stamp` is excluded because it exits non-zero on the verdict it prints); `judge_transport` = `native|shim|none`; `pool` = `{used_pct, alarm, threshold_pct, health, health_alarm[, health_ack]}` of the **pool** as `zpool list` reports capacity (alarm at 85 %) and `zpool list -H -o health` reports health (`health_alarm` on anything but `ONLINE`; `health` is `"unknown"`, with no alarm, when the box has no ZFS dataset configured or the reader fails: fail-open on the reader, loud in the value). **Pool-health acknowledgment.** A known, dated non-`ONLINE` pool (a planned disk swap) is acknowledged by the operator with `MEM0_POOL_HEALTH_ACK=<STATE>:<YYYY-MM-DD>` (e.g. `DEGRADED:2026-10-06`), read on every call: the process environment first, then `~/.mem0/stack.env` (the server unit does not load that file into its environment, so the endpoint opens it itself). The ack is active iff it parses, today's UTC date is on or before its date, and the live `health` equals its `STATE` (case-insensitive). Active: `health` stays the live value, `health_alarm` is `false`, `health_ack` = `{state, until, active: true}`, and `ok` no longer counts the pool health (capacity and every step still count). Not active: `health_alarm` stays as the live value dictates and `health_ack` = `{state, until, active: false, reason}` with `reason` = `expired` (the date has passed), `mismatch` (the pool is in a different state than the ack names, e.g. an ack for `DEGRADED` while the pool is `FAULTED`) or `malformed` (`state` and `until` null, plus the raw `value`). No key: no `health_ack` field. An ack never makes an `ONLINE` pool alarm, and it hides a `FAULTED` or `UNAVAIL` pool only when it names exactly that state. To set and clear it, see [../operations.md](../operations.md), "Pool-health acknowledgment". `dataset` = `{used_bytes, avail_bytes, used_pct}` of the AMS dataset (quota headroom, informational; present only with `MEM0_ZFS_DATASET`); `usage` = the newest Codex plan-window probe `{used_percent, resets_in_days, probed_at, note}`; `drift` = `{alarm, before, n_total, missing, below_hwm_nights}` from the retrieval-drift state file (`missing` = the canary ids not retrievable tonight, `below_hwm_nights` = consecutive compares below the high-water mark) and `wiki` = `{last_pull_age_h, last_build_age_h, fresh_age_h}` from the `~/wiki-index/last-pull` and `last-build` epoch stamps (`fresh_age_h` is the newer of the two; each null when unreadable) — both reported, neither folded into `ok`; `boots_7d` = boot ids of the last seven days. `ok` is `not pool.alarm and not pool.health_alarm and not stale_steps and not failed_steps and not degraded_steps and write_path.ok is not false`: a step that ran but did nothing (`degraded`) turns it false just as a failed one does, and so does a failing write path (below). Previously `ok` looked at the pool alarm and staleness only, so a step that failed last night after succeeding the night before, and a DEGRADED mirror, both read green. Never raises on a reader: an unreadable pool/journal/ledger reads as unknown.
@@ -149,11 +153,21 @@ Request: {
   "messages": "<string> | [{"role":"user","content":"..."},...] | {"content":"..."}",
   "user_id": "youruser",
   "infer": false,
-  "metadata": {"tier": "evidence", "source": "l1a-extractor", ...}
+  "metadata": {"tier": "evidence", "source": "l1a-extractor", ...},
+  "media": [{"type": "image|audio|video", "data": "<base64 or data: URL>", "filename": "board.png"}]
 }
 ```
 
 - `infer=false` stores as-is (used by all automated paths). `infer=true` runs mem0's LLM extraction pipeline.
+- **`media`** (1.35.0, optional): images (png, jpeg, gif, webp, bmp), audio (wav, mp3, flac) or video (mp4,
+  webm) stored with the memory; the text is their caption. Needs `infer=false` and a profile with a media
+  embedder (EmbeddingGemma-2 served with `--mmproj`). The type is read from the bytes and must match
+  `type`. Up to 4 items (`MEM0_MEDIA_MAX_ITEMS`), 20 MB each (`MEM0_MEDIA_MAX_BYTES`). The files are
+  stored content-addressed under `~/.mem0/media`, the payload's `media` lists them, and the dense vector
+  becomes one embedding of the caption and the media; each result's `media_embedded` says whether it
+  did (false: the caption-only vector stands, the write is kept). `media` and `media_embedded` in a
+  caller's `metadata` are ignored. A media memory is not deduplicated by its caption
+  ([embedder profiles](embedder-profiles.md#media-memories)).
 - **Tier restrictions on add (server-enforced):**
   - `tier=canonical` → `403` always. Add as `evidence`, promote via the HMAC-signed `PATCH /tier` (`mem0-canonize.sh`).
   - `tier=insight` → `403` unless `metadata.source` is one of the exact consolidator allowlist actors (`c1-consolidator`, `dream-consolidator`, `c1-dream-consolidator`) **and** the request carries the service key in `X-AMS-Service-Key` (1.32.5). A job-label `source` without the key is `403 service-credential-required: metadata.source=<label> is a server-side job label and ...`; a `source` that is neither on the allowlist nor a job label is the plain "reserved for the C1/dream consolidator" `403`. The header is read only on an insight add. The old substring check (`"c1" in source`) was trivially bypassable and was replaced by the exact allowlist `INSIGHT_ALLOWED_ACTORS` (one copy, in `security_invariants`); the allowlist alone then proved nothing, since the label was free text any API-key holder could type, which is what the service key closes. Over MCP an insight add never gets here: the shim downgrades it to `evidence`.
@@ -163,11 +177,12 @@ Request: {
 - **Idempotency:** on `infer=false`, a byte-identical memory already stored in the same scope returns the existing id (`"deduplicated": true`) and writes nothing.
 
 ```
-Response 200: {"results": [{"id": "<uuid>", "memory": "...", ...}]}
-Response 400: empty memory
+Response 200: {"results": [{"id": "<uuid>", "memory": "...", ...}]}   (+ "media_embedded" on a media add)
+Response 400: empty memory; media without a media embedder, without infer=false, or not valid (base64, type, size, count)
 Response 403: tier enforcement, insight-source missing, or an insight source that is a job label sent without the service key (service-credential-required)
 Response 413: payload exceeds MAX_MEMORY_CHARS
 Response 500: Qdrant/llama-swap unreachable
+Response 507: the media files could not be written under the media directory
 ```
 
 ### `GET /v1/memories`
@@ -192,9 +207,16 @@ Request: {
   "limit": 5,
   "threshold": 0.1,
   "rerank": false,
-  "query_class": "durable"
+  "query_class": "durable",
+  "media": [{"type": "image", "data": "<base64>"}]
 }
 ```
+
+- `media` (1.35.0, optional; same shape as on add): search BY an image, audio or video as well. The query
+  vector becomes one embedding of `query` and the media, so a photo or a clip finds the memories about
+  it; `query` is still required (it says what to look for). Only the dense leg changes: the keyword and
+  entity legs read `query` as before. `400` without a media embedder, with an empty query, or with
+  invalid media.
 
 - `score` is the [hybrid fusion](fusion.md) score: reciprocal rank fusion of the dense, keyword and entity legs, in (0, 1]; the fusion ranks by it, and later stages re-order without rewriting it (durable freshness by `durable_freshness_score`, the reranker by `rerank_score`). It is not a cosine, so never threshold on it as one: `threshold` in the request is compared to the raw cosine, before fusion, and each result carries that raw cosine as `cosine` (absent on a `lexical_only` rescue).
 - `rerank=true` triggers `bge-reranker-v2-m3` post-processing (`reranker.py`), applied only when there are ≥ 3 results **and** the head is not unanimous (fused score < `RERANK_SKIP_IF_TOP_SCORE`, 1.0; `RERANK_MIN_N`). The reranker is a cross-encoder served on llama-swap `:11436` (GPU since 2026-08-13; raw-logit score scale is device-independent); any reranker failure returns the dense-only order unchanged and logs a WARN (fail-soft).
@@ -218,6 +240,15 @@ Response 413: text exceeds MAX_MEMORY_CHARS
 Response 500: carry-over restore exhausted for a canonical/insight record (inconsistent state — manual verification)
 Response 503: pre-update payload read failed (refused fail-closed rather than wiping custom metadata; MCP shim queues 503s to the outbox and replays)
 ```
+
+A PUT to a media memory re-embeds the new caption with its stored media (1.35.0); when that fails the
+record keeps its caption-only vector and `media_embedded` turns false.
+
+### `GET /v1/memories/{id}/media/{n}`
+
+1.35.0: the n-th media file (0-based, in the order of the payload's `media`) of a media memory, with its
+stored type and file name. `404` for an unknown memory, an index past the list, or a file missing from
+the media directory (restore the set's `media-<ts>.tar`).
 
 ### `PATCH /v1/memories/{id}/tier`
 
@@ -273,8 +304,9 @@ Response 200: mem0 delete result
 
 The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 
-- `memory_add(text, user_id, infer, metadata)` — POST /v1/memories (an `insight` tier request is always downgraded to `evidence` with a note since 1.32.5: no MCP session holds the service key)
-- `memory_search(query, user_id, limit, threshold)` — POST /v1/memories/search
+- `memory_add(text, user_id, infer, metadata, media_paths)` — POST /v1/memories (an `insight` tier request is always downgraded to `evidence` with a note since 1.32.5: no MCP session holds the service key). `media_paths` (1.35.0): local image/audio/video files (Windows or WSL paths) sent as `media`, `infer` forced false; a media add is never queued offline
+- `memory_search(query, user_id, limit, threshold, media_paths)` — POST /v1/memories/search (`media_paths`: search by media too)
+- `memory_get_media(memory_id, index)` — GET /v1/memories/{id}/media/{n}, saved to a local file (`path`, `windows_path`) to open
 - `memory_list(user_id, limit)` — GET /v1/memories (limit hard-clamped at 500 client-side too)
 - `memory_update(memory_id, text)` — PUT /v1/memories/{id} (text only; never append a `SUPERSEDED` marker, use `memory_supersede`)
 - `memory_supersede(memory_id, superseded_by, scope, detail, reason)` — POST /v1/memories/{id}/supersede (1.32.4)

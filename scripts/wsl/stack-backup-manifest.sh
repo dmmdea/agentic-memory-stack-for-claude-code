@@ -190,7 +190,8 @@ cat > "$MANIFEST.tmp" <<EOF
     "stale_worksheet": $(mf "stale-worksheet-$TS.jsonl"),
     "qdrant_episodes": $(mf "qcol-episodes-$TS.snapshot"),
     "qdrant_entities": $(mf "qcol-entities-$TS.snapshot"),
-    "qdrant_wiki": $(mf "qcol-wiki-$TS.snapshot")
+    "qdrant_wiki": $(mf "qcol-wiki-$TS.snapshot"),
+    "media": $(mf "media-$TS.tar")
   },
   "qdrant_extra_collections": $EXTRA_COLLECTIONS_JSON,
   "deliberately_excluded": "pair-verdict-cache.db (TTL'd rebuildable cache), jobs.db (transient queue), canonical-replay.jsonl (anti-replay nonce ledger; signed tokens carry a 300s skew gate and the ledger GCs at 600s, so a lost ledger reopens at most a 10-minute window), telemetry ledgers (retrieval-log, admission-rejected, receipts). The three secondary Qdrant collections (episodes, entities, wiki) are snapshotted into the set when present; if one is missing, rebuild episodes with episode-embed-backfill.py (from episodic.db) and wiki with wiki-index-build.py - entities is written by the mem0 library and has no rebuild path, its snapshot is the only copy. See docs/data-backup.md",

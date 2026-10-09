@@ -179,7 +179,7 @@ if [ -n "$AUTH_PROFILE" ] && [ -n "$EMBED_PROFILE" ] && [ "$AUTH_PROFILE" != "$E
 fi
 [ -n "$EMBED_PROFILE" ] || EMBED_PROFILE="$AUTH_PROFILE"
 if [ -z "$EMBED_PROFILE" ]; then
-    EMBED_PROFILE="$(ep_default_profile)" || fail "cannot read the default embedding profile from mem0-server/embedder_profile.py"
+    EMBED_PROFILE="$(ep_legacy_profile)" || fail "cannot read the legacy embedding profile from mem0-server/embedder_profile.py"
     echo "    embed profile: $EMBED_PROFILE (the default space; the authority did not say)"
 fi
 ep_field "$EMBED_PROFILE" name >/dev/null || fail "--embed-profile '$EMBED_PROFILE' is not a known embedding profile (see mem0-server/embedder_profile.py)"

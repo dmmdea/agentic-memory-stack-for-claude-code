@@ -191,8 +191,66 @@ log.info("mem0 initialized (embedder: %s prefix-shim, model: %s, collection: %s)
 # the cosine scale in its place. /health/deep reports the binding, so a mem0 release that moves the
 # scoring fails the deploy gate instead of silently ranking the old way.
 import fusion as _fusion  # noqa: E402
+# 1.35.0: the rank-fusion constants are the active space's (embedder_profile: measured per model)
+_fusion.configure(*EMBED_PROFILE.fusion)
 FUSION_STATUS = _fusion.install()
 log.info("fusion: %s", FUSION_STATUS)
+# 1.35.0 media memories and media searches (media.py): the embedder embeds images, audio and video into
+# the memories' space when the profile has a media embedder (EmbeddingGemma-2 + its --mmproj projector).
+import media as _media  # noqa: E402
+import egemma_embedder as _egemma_embedder  # noqa: E402
+# Passive counters for /health/deep checks.media (no active probe: a cold projector load is slow).
+_media_stats: dict = {"embeds_ok": 0, "embeds_failed": 0, "last_ok_ts": None, "last_error": None}
+
+
+def _set_media_vector(mid: str, caption: str, items) -> bool:
+    """Replace memory `mid`'s dense vector with ONE interleaved embedding of its caption and media, and
+    record media_embedded=true. The BM25 sparse vector is untouched (update_vectors names only the
+    dense one). Any failure keeps the caption-only vector mem0 wrote: the memory is never lost."""
+    try:
+        vec = mem.embedding_model.embed_media(caption, items, "add")
+        from qdrant_client import models as _qm
+        coll = mem.vector_store.collection_name
+        mem.vector_store.client.update_vectors(collection_name=coll,
+                                               points=[_qm.PointVectors(id=mid, vector={"": vec})])
+        mem.vector_store.client.set_payload(collection_name=coll, payload={"media_embedded": True}, points=[mid])
+        _media_stats["embeds_ok"] += 1
+        _media_stats["last_ok_ts"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        return True
+    except Exception as e:  # noqa: BLE001 - fail-soft by design: the caption vector stands
+        _media_stats["embeds_failed"] += 1
+        _media_stats["last_error"] = f"{type(e).__name__}: {e}"[:200]
+        log.warning("media embed failed for %s (the caption-only vector stays): %s", mid, e)
+        return False
+
+
+def _mark_media_unembedded(mid: str) -> None:
+    """Record that `mid` holds its caption-only vector (best effort: a failure here only leaves the flag)."""
+    try:
+        mem.vector_store.client.set_payload(collection_name=mem.vector_store.collection_name,
+                                            payload={"media_embedded": False}, points=[mid])
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not mark %s media_embedded=false: %s", mid, e)
+
+
+def _query_media(b) -> list:
+    """SearchIn.media decoded, or []. A media search needs a profile with a media embedder and a query
+    text (mem0 rejects an empty one): it says what to look for, the media refine it."""
+    if not getattr(b, "media", None):
+        return []
+    if not EMBED_PROFILE.media:
+        raise HTTPException(400, f"search: the embedding profile {EMBED_PROFILE.name} has no media embedder")
+    if not (b.query or "").strip():
+        raise HTTPException(400, "search: a media search needs a query text too (what to look for)")
+    try:
+        items = _media.decode(b.media)
+    except _media.MediaError as e:
+        raise HTTPException(400, f"search: {e}")
+    room = _egemma_embedder.budget_for(EMBED_PROFILE) - _egemma_embedder._MEDIA_MIN_TEXT_TOKENS
+    if _media.tokens(items) > room:
+        raise HTTPException(400, f"search: the media take ~{_media.tokens(items)} tokens; the embed window leaves "
+                                 f"{room} beside the query (fewer or shorter items)")
+    return items
 
 def _stamp_tier_fetch(ids):
     """One batched retrieve of the CURRENT tier of each contradicts_canonical target (payload-only,
@@ -312,6 +370,9 @@ class AddIn(BaseModel):
     run_id: Optional[str] = None
     metadata: Optional[dict] = None
     infer: bool = True
+    # 1.35.0: images / audio / video stored with the memory (media.py): [{type, data (base64), filename?}].
+    # The text is their caption; requires infer=false and a profile with a media embedder.
+    media: Optional[list] = None
 
 class SearchIn(BaseModel):
     query: str
@@ -326,6 +387,9 @@ class SearchIn(BaseModel):
     # history (v0.19 I.1): forensic class — same allowlist as durable but the
     #   admission gate's supersession/contradiction checks are disabled.
     query_class: Optional[str] = "durable"  # durable | operational | canonical | history
+    # 1.35.0: search BY media too (media.py): the query vector is ONE embedding of the query text and
+    # these items, so a photo or a clip finds the memories about it. Same shape as AddIn.media.
+    media: Optional[list] = None
     # v0.19 M15: hook contract version stamped by the Windows hook search callers
     # (user-prompt-extract.ps1 0.D; pre-tool-check.ps1 also stamped it until
     # AMS-16 retired that hook, 2026-08-09). The search contract was
@@ -800,11 +864,14 @@ def _nli_gate_stamp(records, user_id, brand):
 # nudge that over-abstains on this compressed scale; unified to 0.30 — per-tier
 # scaling lives only in K). Threshold/caps MUST stay in sync with
 # claude-config/model-tiers.json (test_tier_parity.py + test_r2_injection_gating.py).
+# 1.35.0: the 0.30 above was EmbeddingGemma-300m's. The literal now carries the DEFAULT space's
+# calibrated gate (EmbeddingGemma-2: 0.70, embedder_profile.py); test_r2_injection_gating.py holds the two
+# together.
 TIER_BUNDLE_POLICY: dict[str, dict[str, Any]] = {
-    "frontier": {"memory_cap": 2, "goal_cap": 5, "oq_cap": 3, "relevance_threshold": 0.30},
-    "small":    {"memory_cap": 1, "goal_cap": 3, "oq_cap": 2, "relevance_threshold": 0.30},
+    "frontier": {"memory_cap": 2, "goal_cap": 5, "oq_cap": 3, "relevance_threshold": 0.70},
+    "small":    {"memory_cap": 1, "goal_cap": 3, "oq_cap": 2, "relevance_threshold": 0.70},
 }
-# The literal above is the EmbeddingGemma-300m calibration (kept in parity with
+# The literal above is the default space's calibration (kept in parity with
 # claude-config/model-tiers.json by tests/test_tier_parity.py). The gate the server applies is the
 # ACTIVE embedding space's (embedder_profile): cosine scales are not portable between models, and
 # EmbeddingGemma-2 scores off-topic questions where EmbeddingGemma-300m scores relevant ones. Env
@@ -813,9 +880,10 @@ RELEVANCE_GATE = _embedder_profile.threshold("relevance_gate", EMBED_PROFILE)
 for _tier_policy in TIER_BUNDLE_POLICY.values():
     _tier_policy["relevance_threshold"] = RELEVANCE_GATE
 # A threshold knob is not scoped to a space: one fitted on another model's scores and left set is noise
-# here. Say so loudly where it matters most, on a space other than the default.
+# here. Say so loudly where it matters most, on a space other than the legacy one (every knob set before
+# profiles existed was fitted on EmbeddingGemma-300m's scores).
 for _name, _ov in _embedder_profile.threshold_overrides(EMBED_PROFILE).items():
-    if EMBED_PROFILE.name != _embedder_profile.DEFAULT_PROFILE:
+    if EMBED_PROFILE.name != _embedder_profile.LEGACY_PROFILE:
         log.warning("threshold override %s=%s replaces %s's calibrated %s=%s — verify it was fitted on this "
                     "embedding space", _ov["env"], _ov["value"], EMBED_PROFILE.name, _name, _ov["profile_value"])
 
@@ -1153,6 +1221,10 @@ def health_deep() -> dict:
     # Hybrid fusion (fusion.install at start, fusion.end_search per search): not bound, or a search that
     # returned results without reaching it, means mem0 ranks with its own additive formula again (a mem0
     # release moved the scoring). That flips ok, so the deploy gates fail; MEM0_FUSION=mem0 is exempt.
+    # 1.35.0: media memories (informational; never flips ok): whether this space embeds media, where the
+    # files live, and the passive counters of the media embeds since start.
+    out["checks"]["media"] = {"enabled": bool(EMBED_PROFILE.media), "dir": str(_media.media_dir()),
+                              **_media_stats}
     out["checks"]["fusion"] = fusion_check = _fusion.health(FUSION_STATUS)
     if not fusion_check["ok"]:
         out["ok"] = False
@@ -1303,6 +1375,19 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
     if not text_for_check.strip():
         raise HTTPException(400, "add: refusing to store an empty memory (messages coerced to an empty string).")
 
+    # 1.35.0: media memories (media.py). The text is the caption; the items ride beside it and the
+    # stored vector becomes one interleaved embedding of both (set after mem0's write, below).
+    _media_items = []
+    if b.media:
+        if not EMBED_PROFILE.media:
+            raise HTTPException(400, f"add: the embedding profile {EMBED_PROFILE.name} has no media embedder")
+        if b.infer is not False:
+            raise HTTPException(400, "add: a media memory is stored as written: send infer=false, with a caption as the text")
+        try:
+            _media_items = _media.decode(b.media)
+        except _media.MediaError as e:
+            raise HTTPException(400, f"add: {e}")
+
     # Enforce: only evidence|temporal|insight* can be written via add.
     # - canonical NEVER via add — must use PATCH /v1/memories/{id}/tier with actor='user-direct'
     # - insight via add allowed ONLY when source contains 'c1-consolidator' (the nightly synthesizer)
@@ -1343,6 +1428,8 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
     # the NLI gate produces) with NO Codex/neighbor. Strip them here so the gate's own
     # server-side stamp is the ONLY writer of contradicts_canonical on the add path.
     if b.metadata:
+        # the media keys are the server's own record of what it stored, never a caller's claim
+        b.metadata = {k: v for k, v in b.metadata.items() if k not in ("media", "media_embedded")}
         _stripped = _ADD_FORBIDDEN_META & set(b.metadata.keys())
         if _stripped:
             b.metadata = {k: v for k, v in b.metadata.items() if k not in _ADD_FORBIDDEN_META}
@@ -1379,7 +1466,9 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
     #
     # infer=True is deliberately NOT guarded: those facts are LLM-derived, so their stored hashes
     # are not knowable before the write.
-    if b.infer is False:
+    # A media memory is not deduplicated by its caption: the same caption over another photo is
+    # another memory.
+    if b.infer is False and not _media_items:
         _existing = _find_existing_by_hash(text_for_check, b.user_id, b.metadata)
         if _existing:
             log.info("add(): idempotent no-op — identical memory already stored as %s", _existing)
@@ -1392,6 +1481,16 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
                 "deduplicated": True,
             }
 
+    if _media_items:
+        try:
+            for _m in _media_items:
+                _media.store(_m)
+        except OSError as e:
+            log.exception("media store failed")
+            raise HTTPException(507, f"add: could not store the media under {_media.media_dir()}: {e}")
+        b.metadata["media"] = [_media.payload_meta(_m) for _m in _media_items]
+        b.metadata["media_embedded"] = False
+
     try:
         result = mem.add(
             messages=b.messages,
@@ -1401,6 +1500,10 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
             metadata=b.metadata,
             infer=b.infer,
         )
+        if _media_items and isinstance(result, dict):
+            for _r in result.get("results") or []:
+                if _r.get("id") and _r.get("event", "ADD") == "ADD":
+                    _r["media_embedded"] = _set_media_vector(str(_r["id"]), text_for_check, _media_items)
         # infer=False embeds every message it stores, but skips system-role and malformed ones without an
         # embed call and answers {"results": []}: like a duplicate, that 200 says nothing about the write
         # path. infer=True is different on purpose: mem0 embeds the incoming text (its existing-memory
@@ -1482,6 +1585,12 @@ def _search_core(b: SearchIn, _route: str = "search"):
     capped_limit = min(b.limit, 500)
     _explain_on = bool(getattr(b, "explain", False))
     _trace: list = []
+    # 1.35.0: a media search's query vector is one embedding of the query text and the media. The
+    # cross-encoder reads only the text (the query against each caption), so it would sink exactly the
+    # memories the media found: no rerank on a media search.
+    _qmedia = _query_media(b)
+    if _qmedia and b.rerank:
+        b = b.model_copy(update={"rerank": False})
     # v0.30 over-fetch: post-fetch filters (retired/_canonical_intent/admission) can drop
     # records and leave a gap; over-fetch a buffer, filter, then trim to capped_limit (below).
     _buf = int(os.environ.get("MEM0_SEARCH_OVERFETCH_BUFFER", "50"))
@@ -1517,15 +1626,22 @@ def _search_core(b: SearchIn, _route: str = "search"):
             "overfetch_limit": overfetch_limit,
             "collapsed": bool(capped_limit > 0 and overfetch_limit == capped_limit)}})
     # mem0 ranks the dense pool through fusion.py (rank fusion): each result's `score` is the fused
-    # score, and end_search adds its raw `cosine`, the value b.threshold compared.
-    _fusion.begin_search()
-    results = mem.search(
-        query=b.query,
-        filters=search_filters,
-        top_k=overfetch_limit,
-        threshold=b.threshold,
-    )
-    _fusion.end_search(results)
+    # score, and end_search adds its raw `cosine`, the value b.threshold compared. A media search
+    # (b.media) embeds the query text and the media as one vector: the shim swaps it in for exactly
+    # this query text while QUERY_MEDIA is set.
+    _qm_token = _egemma_embedder.QUERY_MEDIA.set(_egemma_embedder.QueryMedia(b.query, _qmedia)) if _qmedia else None
+    try:
+        _fusion.begin_search()
+        results = mem.search(
+            query=b.query,
+            filters=search_filters,
+            top_k=overfetch_limit,
+            threshold=b.threshold,
+        )
+        _fusion.end_search(results)
+    finally:
+        if _qm_token is not None:
+            _egemma_embedder.QUERY_MEDIA.reset(_qm_token)
     if _explain_on:
         _n = len(results.get("results") or []) if isinstance(results, dict) else 0
         _trace.append({"stage": "dense_fetch", "out": _n})
@@ -1893,6 +2009,8 @@ def search(b: SearchIn, x_api_key: Optional[str] = Header(None)):
     _warn_hook_contract_version("/v1/memories/search", b.hook_contract_version)
     try:
         return _search_core(b)
+    except HTTPException:
+        raise                       # a caller error (a media search's 400s) stays a 400
     except Exception as e:
         log.exception("search failed")
         raise _upstream_error(e)
@@ -1943,6 +2061,36 @@ def get_memory_by_id(mid: str, x_api_key: Optional[str] = Header(None)):
     except Exception as e:
         log.exception("get_by_id failed")
         raise _upstream_error(e)
+
+
+@app.get("/v1/memories/{mid}/media/{n}")
+def get_memory_media(mid: str, n: int, x_api_key: Optional[str] = Header(None)):
+    """1.35.0: the n-th media item of a media memory (payload `media`, 0-based), as stored (media.py)."""
+    auth(x_api_key)
+    if not _is_point_id(mid):
+        raise HTTPException(404, f"memory {mid} not found (a memory id is a full UUID, not a prefix)")
+    mid = _mid_lock_key(mid)
+    try:
+        records = mem.vector_store.client.retrieve(
+            collection_name=mem.vector_store.collection_name,
+            ids=[mid], with_payload=True, with_vectors=False,
+        )
+    except Exception as e:
+        log.exception("get_media failed")
+        raise _upstream_error(e)
+    if not records:
+        raise HTTPException(404, f"memory {mid} not found")
+    payload = getattr(records[0], "payload", None) or {}
+    items = payload.get("media") if isinstance(payload.get("media"), list) else []
+    if not 0 <= n < len(items):
+        raise HTTPException(404, f"memory {mid} has {len(items)} media item(s); there is no index {n}")
+    meta = items[n] if isinstance(items[n], dict) else {}
+    path = _media.path_for(meta)
+    if path is None:
+        raise HTTPException(404, f"memory {mid} media {n}: the stored file is missing from {_media.media_dir()}")
+    from fastapi.responses import FileResponse
+    return FileResponse(path, media_type=meta.get("mime") or "application/octet-stream",
+                        filename=meta.get("filename") or path.name)
 
 
 @app.post("/v1/memories/diagnose")
@@ -2195,6 +2343,15 @@ def update(
             result = mem.update(memory_id=mid, data=b.text,
                                 metadata=(_carryover or None))
             _put_carryover_bump(puts=1)
+            # 1.35.0: mem0 re-embedded the new text alone; a media memory gets its interleaved vector
+            # (new caption + the stored media) back, or media_embedded=false says it has the text one.
+            if isinstance(_pre_payload.get("media"), list) and _pre_payload.get("media"):
+                _metas = [x for x in _pre_payload["media"] if isinstance(x, dict)]
+                _items = [m for m in (_media.load(x) for x in _metas) if m is not None]
+                # every stored item, or the text vector: a vector of some of the media is not the memory's
+                if not (_items and len(_items) == len(_pre_payload["media"]) and EMBED_PROFILE.media
+                        and _set_media_vector(mid, b.text, _items)):
+                    _mark_media_unembedded(mid)
             # v0.17 F.2.5 / H1, generalized by AMS-01: post-verify the carry-over
             # LANDED. With the pre-merge this is a tripwire for mem0-contract
             # drift (the single external assumption: _update_memory deepcopies
@@ -3465,7 +3622,7 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             query=(b.prompt or "")[:500],
             filters=filters,
             limit=_tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped below
-            threshold=_tp["relevance_threshold"],  # v1.0 R2: 0.30 both tiers (kept; calibration-confirmed)
+            threshold=_tp["relevance_threshold"],  # the active space's calibrated gate, both tiers
             rerank=False,
             query_class="durable",
         ), _route="bundle")
