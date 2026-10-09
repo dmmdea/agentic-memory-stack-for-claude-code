@@ -45,6 +45,7 @@ There are two installs. **The authority** — the one box that holds the memory 
 .\install.ps1                          # auto-detects your default WSL distro
 .\install.ps1 -Distro <your-distro>    # multi-distro / non-default; see: wsl -l -q
 .\install.ps1 -Role replica -AuthorityUrl http://<authority-host>:18791 -AuthoritySsh <ssh-alias>   # a replica PC: first install only, re-runs keep the recorded role and flags
+.\install.ps1 -Role replica -EmbedProfile egemma2   # a replica PC moving to another embedding profile (docs/MIGRATION.md); re-runs without it keep the recorded one
 ```
 
 **Linux thin client** — a native-Linux box that should use another machine's Brain (no WSL, no local store): from a checkout, `bash install/linux-client.sh --authority http://<brain-host>:18791 --api-key-file <a file holding the authority's API key>`. It deploys only the MCP shim and the Outbox replay driver, registers the `mem0` MCP server, and proves itself with a real `memory_health` call through the shim. Details: [docs/systems/installer-and-deploy.md](./docs/systems/installer-and-deploy.md). To also carry a dormant read-only copy of the Brain for offline use, `bash install/linux-replica.sh --authority ... --brain-ssh <alias>` on top (Linux replica: local Qdrant + mem0 started only while the Brain is unreachable, refreshed daily while online).

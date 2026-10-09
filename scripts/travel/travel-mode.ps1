@@ -160,9 +160,48 @@ function Resolve-TravelDefaults {
 # about complete SETS, never about "does the directory exist" or "how fresh are the files":
 # an existing-but-empty local dir must not shadow a good cloud set, and a 30-day-old local set
 # must not shadow a 4-day-old cloud one.
-function Get-SetFiles([string]$dir, [string]$stamp) {
-    return @("manifest-$stamp.json", "episodic-$stamp.db", "history-$stamp.db", "qdrant-$stamp.snapshot") |
-           ForEach-Object { Join-Path $dir $_ }
+function Get-SetFiles([string]$dir, [string]$stamp, [switch]$WithMedia) {
+    $files = @("manifest-$stamp.json", "episodic-$stamp.db", "history-$stamp.db", "qdrant-$stamp.snapshot") |
+             ForEach-Object { Join-Path $dir $_ }
+    # -WithMedia adds the set's media tar, for the callers that COPY or PRUNE a set. Completeness never asks
+    # for it: it is optional (absent from sets made before 1.35.0 and from sets made while no media memory existed).
+    if ($WithMedia) { $files = @($files) + @(Get-SetMediaFile $dir $stamp) }
+    return $files
+}
+
+function Get-SetMediaFile([string]$dir, [string]$stamp) {
+    # The media tar (media-<ts>.tar) the set's manifest names as files.media, when it is also in the directory.
+    # The name comes from the manifest, so only a plain file name is trusted; anything else is no file.
+    try {
+        $m = Get-Content -Raw -LiteralPath (Join-Path $dir "manifest-$stamp.json") -ErrorAction Stop | ConvertFrom-Json
+        if ($null -eq $m) { throw 'the manifest is empty' }
+        $name = $m.files.media
+    } catch {
+        # A manifest that cannot be read cannot say what the set holds, but stack-backup.sh always names the tar
+        # media-<ts>.tar. Falling back to that name keeps retention from skipping the set's tar for good (the
+        # prune is driven by the manifests that are there, and an unreadable one would leave it behind forever).
+        $f = Join-Path $dir "media-$stamp.tar"
+        if (Test-Path -LiteralPath $f) { return @($f) }
+        return @()
+    }
+    if ($name -is [string] -and $name -match '^[A-Za-z0-9][A-Za-z0-9._-]*\.tar$') {
+        $f = Join-Path $dir $name
+        if (Test-Path -LiteralPath $f) { return @($f) }
+    }
+    return @()
+}
+
+function Test-SetMediaMissing([string]$cloudDir, [string]$localDir, [string]$stamp) {
+    # True when the cloud copy of this set has its media tar and the local copy does not hold it whole (absent, or
+    # another size: a torn copy). Completeness never asks for the tar, so a set whose tar copy failed, or that a
+    # travel-mode from before 1.35.1 seeded without it, looks complete, and "is the cloud stamp newer" alone
+    # would never fetch it.
+    foreach ($src in @(Get-SetMediaFile $cloudDir $stamp)) {
+        $dst = Join-Path $localDir (Split-Path $src -Leaf)
+        if (-not (Test-Path -LiteralPath $dst)) { return $true }
+        if ((Get-Item -LiteralPath $dst).Length -ne (Get-Item -LiteralPath $src).Length) { return $true }
+    }
+    return $false
 }
 
 function Get-NewestCompleteSet([string]$dir) {
@@ -238,10 +277,15 @@ switch ($Mode) {
               try {
                   $cloudStamp = Get-NewestCompleteSet $CloudBackupDir
                   $localStamp = Get-NewestCompleteSet $LocalBackupDir
-                  if ($cloudStamp -and $cloudStamp -gt "$localStamp") {
+                  # A newer cloud set, or the same set whose media tar the local copy lacks (the tar is copied
+                  # last and is not part of "complete", so a failed copy leaves the set looking whole). The copy
+                  # loop below skips every file already held at the right size, so the second case fetches
+                  # only the tar.
+                  if ($cloudStamp -and (($cloudStamp -gt "$localStamp") -or
+                                        ($cloudStamp -eq "$localStamp" -and (Test-SetMediaMissing $CloudBackupDir $LocalBackupDir $cloudStamp)))) {
                       New-Item -ItemType Directory -Force -Path $LocalBackupDir | Out-Null
                       Write-Host "    seeding local snapshot cache from pCloud: $cloudStamp"
-                      foreach ($src in (Get-SetFiles $CloudBackupDir $cloudStamp)) {
+                      foreach ($src in (Get-SetFiles $CloudBackupDir $cloudStamp -WithMedia)) {
                           $dst = Join-Path $LocalBackupDir (Split-Path $src -Leaf)
                           if ((Test-Path $dst) -and (Get-Item $dst).Length -eq (Get-Item $src).Length) { continue }
                           # .part + atomic same-volume rename: a torn 686MB copy (sleep, Ctrl-C,
@@ -256,7 +300,7 @@ switch ($Mode) {
                       Get-ChildItem (Join-Path $LocalBackupDir 'manifest-*.json') -File |
                           ForEach-Object { $_.BaseName -replace '^manifest-', '' } |
                           Where-Object { $keep -notcontains $_ } |
-                          ForEach-Object { Get-SetFiles $LocalBackupDir $_ | Where-Object { Test-Path $_ } | Remove-Item -Force }
+                          ForEach-Object { Get-SetFiles $LocalBackupDir $_ -WithMedia | Where-Object { Test-Path $_ } | Remove-Item -Force }
                   }
               } catch {
                   Write-Host "    (could not refresh from pCloud: $($_.Exception.Message) — using the local cache as-is)" -ForegroundColor DarkYellow

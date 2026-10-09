@@ -301,6 +301,19 @@ def threshold_overrides(profile: EmbedProfile | None = None) -> dict:
     return out
 
 
+_MEDIA_OFF = ("off", "0", "false", "no")
+
+
+def media_enabled(profile: EmbedProfile | None = None) -> bool:
+    """Whether THIS box embeds images, audio and video: its profile has a media embedder AND its alias is served
+    with the projector. MEM0_MEDIA_EMBEDDER=off (env > stack.env) records that the box serves the alias text-only
+    (a replica on a small card: same text vectors, no projector), so media adds and media searches are refused
+    with a clear 400 instead of reaching a llama-server that cannot read them. Read per call (a stack.env edit
+    applies without a restart)."""
+    p = profile or active()
+    return bool(p.media) and _setting("MEM0_MEDIA_EMBEDDER").lower() not in _MEDIA_OFF
+
+
 def describe(profile: EmbedProfile | None = None) -> dict:
     """What /health/deep and the receipts report: the binding a reader can check."""
     p = profile or active()
@@ -314,7 +327,7 @@ def describe(profile: EmbedProfile | None = None) -> dict:
         "long_model": long_model(p)[0],
         "long_token_budget": long_model(p)[1],
         "template_version": p.template_version,
-        "media": p.media,
+        "media": media_enabled(p),
         "fusion": list(p.fusion),
         "collections": {k: collection(k, p) for k in ("memories", "entities", "episodes")},
         "wiki": {"profile": w.name, "model": embed_model(w), "collection": collection("wiki", w)},

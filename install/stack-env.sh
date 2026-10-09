@@ -71,11 +71,16 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 #     not turn the gate on. To turn it on, set Environment=MEM0_NLI_GATE_ENABLED=1 in a mem0.service
 #     drop-in of your own (systemctl --user edit mem0 writes override.conf; the installer rewrites
 #     only native.conf) and restart the service.
-# Only the gate mode has an installer flag (linux-authority.sh --promotion-gate-mode); a flag that
-# sets a key here passes its name as a skip argument to stack_env_carry so the line is written
-# exactly once.
+#   MEM0_MEDIA_EMBEDDER (1.35.1; on|off, default on): off records that this box serves its embedding
+#     alias text-only (no --mmproj projector; a replica on a small card). Read, after the process
+#     environment, by mem0-server/embedder_profile.py (media_enabled), per call: media adds and media
+#     searches then answer 400 here and /health/deep reports checks.media.enabled false.
+# The installer flags that set a key here: linux-authority.sh --promotion-gate-mode, and on a WSL box
+# install.ps1 -MediaEmbedder (MEM0_SET_MEDIA_EMBEDDER in install/1-wsl-services.sh). A writer that
+# sets a key passes its name as a skip argument to stack_env_carry (or replaces the carried line) so
+# the line is written exactly once.
 # A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK MEM0_WIKI_EMBED_PROFILE MEM0_QDRANT_COLLECTION MEM0_COLLECTION MEM0_EPISODES_COLLECTION MEM0_WIKI_COLLECTION MEM0_RELEVANCE_THRESHOLD MEM0_RAW_FALLBACK_COSINE_FLOOR MEM0_NLI_GATE_COSINE_FLOOR"
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK MEM0_WIKI_EMBED_PROFILE MEM0_QDRANT_COLLECTION MEM0_COLLECTION MEM0_EPISODES_COLLECTION MEM0_WIKI_COLLECTION MEM0_RELEVANCE_THRESHOLD MEM0_RAW_FALLBACK_COSINE_FLOOR MEM0_NLI_GATE_COSINE_FLOOR MEM0_MEDIA_EMBEDDER"
 # The embedding-space keys (mem0-server/embedder_profile.py reads them from this file when the process
 # environment has none) are carried by PATTERN, not by name, so a profile added later is covered:
 # MEM0_EMBED_PROFILE, the alias overrides MEM0_EMBED_MODEL (EmbeddingGemma-300m only) and

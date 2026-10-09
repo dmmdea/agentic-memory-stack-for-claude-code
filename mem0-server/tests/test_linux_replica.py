@@ -427,6 +427,56 @@ def test_installer_explicit_empty_flag_clears_the_inherited_value(tmp_path):
     assert "--brain-backup-dir inherited" not in r.stdout
 
 
+def _profile_change_dry_run(tmp_path, stack_env, *flags):
+    """A dry run of the installer on a scratch box whose stack.env is `stack_env` (a replica recorded in the
+    300m space); --embed-profile egemma2 is the change. The pin check reads stack.env only, so it runs here."""
+    home, env = _scratch_home(tmp_path)
+    (home / ".mem0" / "stack.env").write_text(stack_env, encoding="utf-8")
+    base = [BASH, str(INSTALLER), "--authority", "http://brain-host:18791", "--brain-ssh", "brain", "--user-id", "t", "--dry-run"]
+    return subprocess.run(base + list(flags), capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+
+
+_RECORDED_300M = "MEM0_WSL_USER=t\nMEM0_ROLE=replica\nMEM0_EMBED_PROFILE=egemma-300m\n"
+
+
+@pytestmark_bash
+def test_a_memories_pin_on_the_old_space_stops_a_profile_change(tmp_path):
+    """The collection pin is carried through the stack.env rewrite and the server binds it over the profile's own
+    collection, so restore-replica.sh (which compares each set's collection with the bound one) would refuse every
+    set made in the new space. Same refusal install/1-wsl-services.sh makes for a Windows PC's replica."""
+    for key in ("MEM0_QDRANT_COLLECTION", "MEM0_COLLECTION"):
+        r = _profile_change_dry_run(tmp_path / key, _RECORDED_300M + f"{key}=mem0_egemma_768\n", "--embed-profile", "egemma2")
+        assert r.returncode != 0, r.stdout
+        assert "profile change egemma-300m -> egemma2" in r.stderr and "'mem0_egemma_768'" in r.stderr and "'mem0_eg2_768'" in r.stderr, r.stderr
+        assert "[1] thin client" not in r.stdout, "refused before anything runs"
+
+
+@pytestmark_bash
+def test_an_episodes_pin_on_the_old_space_stops_a_profile_change(tmp_path):
+    r = _profile_change_dry_run(tmp_path, _RECORDED_300M + "MEM0_EPISODES_COLLECTION=episodes_egemma_768\n", "--embed-profile", "egemma2")
+    assert r.returncode != 0, r.stdout
+    assert "episodes collection to 'episodes_egemma_768'" in r.stderr and "'episodes_eg2_768'" in r.stderr, r.stderr
+
+
+@pytestmark_bash
+def test_a_pin_equal_to_the_new_profiles_own_collections_does_not_stop_a_profile_change(tmp_path):
+    r = _profile_change_dry_run(tmp_path, _RECORDED_300M + "MEM0_QDRANT_COLLECTION=mem0_eg2_768\nMEM0_EPISODES_COLLECTION=episodes_eg2_768\n",
+                                "--embed-profile", "egemma2")
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "[1] thin client" in r.stdout
+
+
+@pytestmark_bash
+def test_a_pin_is_left_alone_when_the_profile_does_not_change(tmp_path):
+    """With the profile unchanged (inherited, or the same one named) a pin is the operator's own choice, the
+    documented way to restore under a name they bind themselves: only a change is held to the new space."""
+    pin = "MEM0_QDRANT_COLLECTION=restore_copy\nMEM0_EPISODES_COLLECTION=episodes_copy\n"
+    for flags in ((), ("--embed-profile", "egemma-300m")):
+        r = _profile_change_dry_run(tmp_path / ("same" + "".join(flags)), _RECORDED_300M + pin, *flags)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "pins the" not in r.stderr
+
+
 @pytestmark_bash
 def test_installer_ams_hub_reaches_the_client_from_the_receipt_and_clears_when_told(tmp_path):
     """session-12 WP-12: a replica is a client plus a dormant brain; a re-run without --ams-hub

@@ -4,6 +4,165 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.35.1 — a Windows PC replica can change its embedding profile, and its restore knows the 1.35.0 set (2026-10-09)
+
+### Added
+- **`install.ps1 -EmbedProfile <profile>`**: the sanctioned way to switch the embedding profile of a PC whose
+  stack runs in WSL (a replica restoring sets made in another space; [docs/MIGRATION.md](docs/MIGRATION.md),
+  "Replicas and PCs"). The name must match `^[a-z0-9][a-z0-9-]*$` (case-sensitive) and reaches the WSL phase as
+  `MEM0_SET_EMBED_PROFILE` on the same `bash -c` line as `MEM0_ROLE`, only when given. A re-run without it
+  keeps the recorded profile. A replica switch that is actually made also clears the offline watcher's
+  `replica-restored.txt` marker, so the next go-offline restores instead of trusting the old restore for up to
+  24 hours; that is done by `install/1-wsl-services.sh` (below), not by `install.ps1`, which knows only that
+  the switch was asked for. **That restore cannot fetch a set**: at go-offline the brain is unreachable, and
+  `travel-mode.ps1` seeds its local snapshot cache from pCloud only while the brain answers. The cache must
+  already hold a set made in the new space, so after the brain's first backup in it, run
+  `scripts\travel\travel-mode.ps1 on -DryRun` while online (it seeds the cache and changes nothing else);
+  `install.ps1` prints this reminder. With only old-space sets in the cache the restore refuses loudly and the
+  watcher brings nothing up, which is the safer failure than a store that starts empty.
+- **`MEM0_SET_EMBED_PROFILE=<profile>` in `install/1-wsl-services.sh`** (inside WSL: `MEM0_SET_EMBED_PROFILE=<p>
+  bash install/1-wsl-services.sh <wsluser> <winuser> <distro>`). The name is checked against
+  `embedder_profile.py` (an unknown one is fatal and `stack.env` is untouched). On a replica the new value
+  replaces the carried `MEM0_EMBED_PROFILE` (the file keeps exactly one line) and the installer prints the alias
+  the local llama-swap must serve. **Either role** is refused, before `stack.env` is written, when `stack.env`
+  pins the memories collection (`MEM0_QDRANT_COLLECTION` / `MEM0_COLLECTION`) or the episodes collection
+  (`MEM0_EPISODES_COLLECTION`) to anything but the new profile's own: the server binds a pin over the profile's
+  collection, so mem0 would stay on the old space whatever the profile says (both spaces are 768-dim, so
+  nothing would error), and a replica's restore, which compares each set's collection with the one the server
+  binds, would refuse every set. The check needs no Qdrant; a pin equal to the new profile's own collection is
+  allowed. A brain is also refused, before `stack.env` is written, unless the new profile's own memories
+  collection already holds points in the local Qdrant (the check `install/linux-authority.sh` makes: mem0
+  creates an absent collection empty, so a rebind would start a second, empty store) and llama-swap on
+  `:11436` lists the new alias; it is refused too when Qdrant cannot be read. An allowed brain switch restarts
+  `mem0.service` to bind the new space. **A replica switch that is made clears the offline watcher's
+  `replica-restored.txt` marker** from the Windows profile (`/mnt/c/Users/<winuser>/.claude/state`, reached as
+  the other WSL scripts reach it; `MEM0_WIN_HOME` names another profile directory, which the tests use), once
+  `stack.env` is written, and prints what it cleared or that none was there (a profile directory that is not named
+  after the user is not found: the script says so and names `%USERPROFILE%\.claude\state\replica-restored.txt` to
+  delete by hand). It is here, not in `install.ps1`,
+  because only this script knows whether a switch happened: a run that makes none (the profile is already the
+  one named, or the name is refused) leaves the marker alone, and the in-WSL form of the command clears it too.
+  A brain never touches it. Without the variable the
+  installer behaves as in 1.35.0 (the only other output change is the wording of the printed llama-swap
+  stanzas). The EmbeddingGemma-2 GGUF and projector staging is unchanged: it already read the profile that
+  `stack.env` had just been given (the write precedes it, as in 1.35.0), so a switch to `egemma2` stages them
+  on the same run, on a replica too.
+- **`restore-replica.ps1` extracts the set's media**: when the manifest's `files.media` names a `media-<ts>.tar`
+  in the backup directory it is extracted into the distro's media directory after the snapshot upload,
+  additively (`tar --skip-old-files --no-same-owner`). The directory is the one the server uses: the mem0
+  unit's `MEM0_MEDIA_DIR` when a drop-in sets one, else the login shell's, else `~/.mem0/media`. (The server
+  reads that variable from its process environment only; `stack.env` is not a source for it.) A failed
+  extraction is a warning that carries tar's own message: the memories keep their captions and vectors. A
+  manifest-supplied name that is not a plain file name is ignored. The tar is listed (`tar -tvf`) first and is
+  not extracted when it holds anything but regular files and directories, or a name that is absolute or has a
+  `..` component (see Fixed).
+- **`restore-replica.ps1` verifies the binding**: after mem0 starts it reads `/health/deep` and refuses when
+  `embed_profile.profile` differs from the set's profile or `collection` from the restored collection (a server
+  that reports neither is not second-guessed), as `restore-replica.sh` does. mem0 and Qdrant are left running.
+  A restore under an explicit `-Collection` name (the documented way to restore under a name you will bind
+  yourself) skips the collection comparison and prints a note that the server's binding was not checked against
+  it; the profile comparison stays (see Fixed).
+- `travel-mode.ps1` seeds `media-<ts>.tar` from pCloud into the local cache with the rest of the set, and prunes
+  it with the set. The tar is optional: a set stays complete without it. Because the tar is copied last and is
+  not part of "complete", a set whose tar copy failed (or that 1.35.0 seeded without it) looks whole, so the
+  seeding also runs when the newest cloud set has the same stamp as the local one and the local copy lacks the
+  tar or holds it at another size; only the tar is fetched. A set whose manifest cannot be read falls back to
+  the fixed name `media-<ts>.tar` when it is there, so the retention prune still reaches it.
+- `install/llama-swap-setup.md` has an EmbeddingGemma-2 entry (section 4b: `--mmproj`, ctx 4096 / batch 4096 /
+  ubatch 2048, flash attention on, llama.cpp b11452 or later), where its GGUF files come from (the installer
+  stages them; `MEM0_STAGE_EG2=1` does it ahead of a switch), and the rule that it joins the members of the
+  existing support group, or the memory models' set in a llama-swap matrix, never replaces them.
+- Tests: `test_stack_env_writers.py` runs the installer's real stack.env block (replica switch, unknown name,
+  brain refused and allowed with a stubbed Qdrant and llama-swap, refused on a memories or episodes pin (replica
+  and brain) and on an unserved alias, the replica's marker cleared on a real switch and left alone on no switch,
+  a refused name, a pin refusal and a brain, unchanged without the variable); `test_linux_replica.py` dry-runs
+  `install/linux-replica.sh` against a scratch `stack.env` (a profile change refused on a memories pin under either
+  key and on an episodes pin, allowed on a pin equal to the new profile's own, and a pin left alone when the
+  profile does not change); `test_backup_retention.py` runs the
+  media-tar check of both bash restores against real tars (symlink, hard link, fifo, absolute and `..` names, an
+  unlistable tar) and pins its order before the extraction; `test_media_server.py` asserts that `embed_media`
+  refuses under `MEM0_MEDIA_EMBEDDER=off` and `test_media.py` that every media gate in `app.py`, the PUT
+  re-embed included, asks `_media_on()`; the new
+  `scripts/windows/tests/WindowsReplicaProfile.Tests.ps1` evaluates the installer's `wsl.exe` line (and pins that
+  `install.ps1` no longer removes the marker, and that `-MediaEmbedder` is case-sensitive) and runs
+  `restore-replica.ps1` against a scripted distro (a banner line before `media-ok`, refused tar listings, an
+  explicit `-Collection`), and checks the cache-retention fallback of `travel-mode.ps1`.
+
+- **`MEM0_MEDIA_EMBEDDER=off`** (`install.ps1 -MediaEmbedder on|off`, `MEM0_SET_MEDIA_EMBEDDER` for
+  `install/1-wsl-services.sh`, carried like any operator key): records that this box serves its embedding alias
+  WITHOUT the media projector (a replica on a small card: about 0.5 GiB instead of 1.2-1.5, the same text
+  vectors). `-MediaEmbedder` takes `on` or `off` in lower case only (PowerShell's `ValidateSet` ignores case and
+  does not normalise, so `ON` used to reach the WSL phase, which then refused it). `embedder_profile.media_enabled()` then reads false: media adds and media searches answer a `400`
+  that names the setting (they were a 5xx once llama-server rejected the image part), `/health/deep` reports
+  `checks.media.enabled: false` and `embed_profile.media: false`. Media memories are made and searched on the
+  authority, which keeps the projector.
+
+### Fixed
+- **`install/linux-authority.sh` let a collection pin ride a profile change.** Its rebind check read the
+  collection the server would bind, which honours `MEM0_QDRANT_COLLECTION` / `MEM0_COLLECTION`, so a pin on the
+  old space's collection passed the points check and mem0 kept searching the old vectors with the new model
+  (both 768-dim, nothing errors). A profile change now refuses unless the bound collection is the new space's
+  own, and the same holds for the episodes collection (`MEM0_EPISODES_COLLECTION`), here and in
+  `install/1-wsl-services.sh`.
+- **`install.ps1 -EmbedProfile` on a replica cleared the restore marker even when nothing was switched.** It
+  removed `replica-restored.txt` before the WSL phase whenever the parameter was given, also when
+  `install/1-wsl-services.sh` then made no switch (the profile was already recorded, or the name was refused). A
+  marker cleared for nothing makes the watcher restore at go-offline from a cache that may hold no set in the
+  box's space; the restore throws and the watcher starts nothing. The script that knows whether a switch was made
+  now clears it, after the `stack.env` write (which also covers the in-WSL form, so the docs no longer tell the
+  operator to delete it by hand); `install.ps1` removes nothing.
+- **A replica was not held to the collection-pin check.** Only a brain was refused when `stack.env` pinned the
+  memories collection to another than the new profile's, so a replica switched into a space its own restore then
+  refused for every set (`restore-replica` compares each set's collection with the one the server binds). Both
+  roles are refused now, before anything is written and without Qdrant, and `install/linux-replica.sh
+  --embed-profile` is held to the same check when it changes the recorded profile (it carried the pins through its
+  rewrite too, so a native-Linux replica hit the same refusal; a dry run refuses as well, and with the profile
+  unchanged a pin is left alone). This reverses the previous behaviour
+  (a replica's pin was carried through), so `test_a_collection_pin_does_not_stop_a_replica_switch` became a
+  refusal test.
+- **The pin check covered the memories collection only.** A `MEM0_EPISODES_COLLECTION` pin on the old space
+  kept the episode fallback on the old vectors through a switch. `install/1-wsl-services.sh` and
+  `install/linux-authority.sh` now refuse it too.
+- `restore-replica.ps1` reported a good media extraction as a failure whenever a line came before `media-ok`
+  (a login-shell banner, a tar warning): the output lines were joined with a space, so `^media-ok` matched only
+  as the first line. They are joined with newlines now.
+- **A media tar was extracted without being looked at.** `restore-replica.ps1`, `restore-replica.sh` and
+  `stack-restore.sh` now list it (`tar -tvf`) first and refuse it when any entry is not a regular file or a
+  directory, or any name is absolute or has a `..` component (a link entry plants a link that points outside the
+  media directory: GNU tar 1.35 will not write a file through it, but the link is created and the server could
+  later read through it). `stack-backup.sh` only ever writes
+  regular files and directories. The refusal is a warning in the two that already warned on a media failure
+  (`stack-restore.sh` counts it in its partial-restore warnings) and a failure in `restore-replica.sh`, which
+  already failed on one.
+- **`restore-replica.ps1` threw after the upload under an explicit `-Collection`.** The server was still bound
+  to the profile's own collection, which is why the operator chose a name of their own, and the bound-collection
+  check compared the two. With `-Collection` given the comparison is skipped and a note says the binding was not
+  checked against it; the profile comparison stays.
+- `travel-mode.ps1`'s retention never pruned the media tar of a set whose manifest could not be read: the tar's
+  name comes from the manifest, and the lookup returned nothing when it failed. It falls back to
+  `media-<ts>.tar` when that file exists. The test that pinned the old result (`adds nothing ... without a
+  readable manifest`) pinned this defect and now asserts the fallback; a manifest that reads and lists no
+  media still adds nothing.
+- `install.ps1 -MediaEmbedder ON` was accepted by the parameter (`ValidateSet` ignores case and does not
+  normalise) and refused later by the WSL phase. The set is case-sensitive now, like `-EmbedProfile`.
+- **A Windows replica could not be moved to another embedding profile.** `restore-replica.ps1`'s refusal, its
+  header and `docs/MIGRATION.md` sent the operator to `install/linux-replica.sh --embed-profile`, which is the
+  native-Linux installer: on a WSL distro it would overwrite `MEM0_DISTRO` and `MEM0_WIN_USER` and register a
+  second (Linux) watcher. They now name `install.ps1 -EmbedProfile <profile>` (or the WSL form), which records
+  the profile and stages the model files, and the alias to serve on the local llama-swap.
+  `restore-replica.sh` keeps `linux-replica.sh`, says it is the native-Linux command and what a Windows PC
+  uses, and names the profile's llama-swap alias (`embeddinggemma2`), not its name (`egemma2`).
+- A restored set's media files were never extracted on a Windows replica, and `travel-mode.ps1` never copied
+  the tar into the offline cache.
+- `docs/MIGRATION.md`'s authority switch (and its rollback) omitted the required `--bind-ip` and
+  `--secrets-dir`, so the installer exited without doing anything. The same runbook now names the switch for a
+  WSL-hosted brain (`install.ps1 -Role brain -EmbedProfile`), and says `linux-authority.sh` is the
+  native-Linux one.
+- The printed llama-swap stanza's one-member `support` group line read as something to paste; the installer and
+  the setup guide now say to add the alias to the existing members.
+- `docs/systems/offline-travel.md`, `installer-and-deploy.md` and `embedder-profiles.md` still described the
+  restore as EmbeddingGemma@768 / `mem0_egemma_768` only.
+
 ## 1.35.0 — EmbeddingGemma-2 for the whole stack, and media memories (2026-10-08)
 
 ### Changed

@@ -233,13 +233,26 @@ def _mark_media_unembedded(mid: str) -> None:
         log.warning("could not mark %s media_embedded=false: %s", mid, e)
 
 
+def _media_on() -> bool:
+    """This box embeds media: its space has a media embedder and its alias is served with the projector
+    (1.35.1: MEM0_MEDIA_EMBEDDER=off marks a text-only box, embedder_profile.media_enabled)."""
+    return _embedder_profile.media_enabled(EMBED_PROFILE)
+
+
+def _no_media_reason() -> str:
+    if EMBED_PROFILE.media:
+        return ("this box serves its embedder without the media projector (MEM0_MEDIA_EMBEDDER=off): media "
+                "memories are added and searched on the authority")
+    return f"the embedding profile {EMBED_PROFILE.name} has no media embedder"
+
+
 def _query_media(b) -> list:
-    """SearchIn.media decoded, or []. A media search needs a profile with a media embedder and a query
-    text (mem0 rejects an empty one): it says what to look for, the media refine it."""
+    """SearchIn.media decoded, or []. A media search needs a box that embeds media and a query text (mem0
+    rejects an empty one): it says what to look for, the media refine it."""
     if not getattr(b, "media", None):
         return []
-    if not EMBED_PROFILE.media:
-        raise HTTPException(400, f"search: the embedding profile {EMBED_PROFILE.name} has no media embedder")
+    if not _media_on():
+        raise HTTPException(400, f"search: {_no_media_reason()}")
     if not (b.query or "").strip():
         raise HTTPException(400, "search: a media search needs a query text too (what to look for)")
     try:
@@ -1223,7 +1236,7 @@ def health_deep() -> dict:
     # release moved the scoring). That flips ok, so the deploy gates fail; MEM0_FUSION=mem0 is exempt.
     # 1.35.0: media memories (informational; never flips ok): whether this space embeds media, where the
     # files live, and the passive counters of the media embeds since start.
-    out["checks"]["media"] = {"enabled": bool(EMBED_PROFILE.media), "dir": str(_media.media_dir()),
+    out["checks"]["media"] = {"enabled": _media_on(), "dir": str(_media.media_dir()),
                               **_media_stats}
     out["checks"]["fusion"] = fusion_check = _fusion.health(FUSION_STATUS)
     if not fusion_check["ok"]:
@@ -1379,8 +1392,8 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
     # stored vector becomes one interleaved embedding of both (set after mem0's write, below).
     _media_items = []
     if b.media:
-        if not EMBED_PROFILE.media:
-            raise HTTPException(400, f"add: the embedding profile {EMBED_PROFILE.name} has no media embedder")
+        if not _media_on():
+            raise HTTPException(400, f"add: {_no_media_reason()}")
         if b.infer is not False:
             raise HTTPException(400, "add: a media memory is stored as written: send infer=false, with a caption as the text")
         try:
@@ -2349,7 +2362,7 @@ def update(
                 _metas = [x for x in _pre_payload["media"] if isinstance(x, dict)]
                 _items = [m for m in (_media.load(x) for x in _metas) if m is not None]
                 # every stored item, or the text vector: a vector of some of the media is not the memory's
-                if not (_items and len(_items) == len(_pre_payload["media"]) and EMBED_PROFILE.media
+                if not (_items and len(_items) == len(_pre_payload["media"]) and _media_on()
                         and _set_media_vector(mid, b.text, _items)):
                     _mark_media_unembedded(mid)
             # v0.17 F.2.5 / H1, generalized by AMS-01: post-verify the carry-over

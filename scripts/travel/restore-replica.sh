@@ -45,6 +45,28 @@ LOG="$MEM0_DIR/replica-restore.log"
 STAMP_FILE="$MEM0_DIR/replica-restored"
 fail() { echo "FAIL: $*" >&2; log_line failed "$*"; exit 1; }
 say()  { echo "==> $*"; }
+# A media tar is looked at before it is extracted: stack-backup.sh tars the media directory, so a set holds regular
+# files and directories under relative names and nothing else, and tar would extract whatever a tampered one holds:
+# a link entry plants a link that points outside the media directory (GNU tar 1.35 will not write a file through it,
+# but the link is created and the server could later read through it), and an absolute or '..' name has no place in
+# a tar of one directory. Prints why and returns 0 when the tar must NOT be extracted; returns 1, silently, when
+# every entry is fine. tar's own diagnostics (lines starting 'tar:') are not entries.
+media_tar_problem() {
+    local listing line name
+    listing="$(tar -tvf "$1" 2>&1)" || { echo "tar could not list it: $listing"; return 0; }
+    while IFS= read -r line; do
+        case "$line" in ''|'tar: '*) continue ;; esac
+        case "${line:0:1}" in -|d) ;; *) echo "it holds an entry that is not a regular file or directory: $line"; return 0 ;; esac
+        # 'mode owner/group size date time name'; a line this does not fit is not trusted
+        if [[ "$line" =~ ^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}(:[0-9]{2})?[[:space:]]+(.+)$ ]]; then
+            name="${BASH_REMATCH[2]}"
+        else
+            echo "tar listed an entry this script cannot read: $line"; return 0
+        fi
+        case "/$name/" in //*|*/../*) echo "it holds an entry with an absolute or '..' name: $line"; return 0 ;; esac
+    done <<< "$listing"
+    return 1
+}
 log_line() { # outcome, note
     printf '{"ts":"%s","event":"replica-restore","outcome":"%s","snapshot":"%s","note":%s}\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${TS:-}" "$(printf '%s' "$2" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')" >> "$LOG" 2>/dev/null || true
@@ -133,7 +155,10 @@ fi
 [ "$MP_PROFILE" != "unknown" ] || fail "set $TS was written without a resolvable embedding profile (embed_profile: unknown); fix the Brain's backup first (is embedder_profile.py deployed beside its scripts?)"
 LOCAL_PROFILE="$(ep_py 'print(ep.active().name)')" || fail "this replica's embedding profile does not resolve (embedder_profile.py missing, or MEM0_EMBED_PROFILE names an unknown profile)"
 if [ "$MP_PROFILE" != "$LOCAL_PROFILE" ]; then
-    fail "set $TS is in embedding profile '$MP_PROFILE' but this replica is configured for '$LOCAL_PROFILE' (~/.mem0/stack.env MEM0_EMBED_PROFILE). Restoring would load vectors this replica embeds every query against in another space. Serve '$MP_PROFILE' on llama-swap :11436, then re-run: bash install/linux-replica.sh --embed-profile $MP_PROFILE"
+    # what llama-swap must serve is the profile's ALIAS (embeddinggemma2), not its name (egemma2); a set in a
+    # profile this tree does not know has no alias to name, so the profile name stands in
+    SET_ALIAS="$(ep_py 'print(ep.embed_model(ep.get(sys.argv[1])))' "$MP_PROFILE" 2>/dev/null)" || SET_ALIAS="$MP_PROFILE"
+    fail "set $TS is in embedding profile '$MP_PROFILE' but this replica is configured for '$LOCAL_PROFILE' (~/.mem0/stack.env MEM0_EMBED_PROFILE). Restoring would load vectors this replica embeds every query against in another space. Serve '$SET_ALIAS' (profile '$MP_PROFILE') on llama-swap :11436, then on this native-Linux replica re-run: bash install/linux-replica.sh --embed-profile $MP_PROFILE (a Windows PC replica uses install.ps1 -EmbedProfile $MP_PROFILE and scripts/travel/restore-replica.ps1 instead)"
 fi
 LOCAL_ALIAS="$(ep_py 'print(ep.embed_model(ep.get(sys.argv[1])))' "$MP_PROFILE")" || fail "cannot resolve the llama-swap alias of profile '$MP_PROFILE'"
 EMBED_BASE="$(ep_py 'print(ep.base_url())')" || fail "cannot resolve the embedder base URL"
@@ -202,6 +227,9 @@ echo "    ledgers: episodic.db + history.db replaced"
 if [ -n "$MEDIA_FILE" ] && [ -f "$DEST/$MEDIA_FILE" ]; then
     # content-addressed names: additive, and an existing name already holds the same bytes
     MEDIA_DST="${MEM0_MEDIA_DIR:-$MEM0_DIR/media}"
+    if MEDIA_PROBLEM="$(media_tar_problem "$DEST/$MEDIA_FILE")"; then
+        fail "media restore from $MEDIA_FILE refused, nothing extracted ($MEDIA_PROBLEM)"
+    fi
     mkdir -p "$MEDIA_DST" && tar -C "$MEDIA_DST" --skip-old-files --no-same-owner -xf "$DEST/$MEDIA_FILE" \
         || fail "media restore from $MEDIA_FILE into $MEDIA_DST failed"
     echo "    media: $(find "$MEDIA_DST" -type f ! -name '*.tmp' | wc -l) file(s) in $MEDIA_DST"

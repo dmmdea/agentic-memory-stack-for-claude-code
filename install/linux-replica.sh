@@ -27,6 +27,8 @@
 #   --embed-profile: the Brain's embedding space. Taken from the authority's /health/deep when omitted
 #                and nothing is recorded in stack.env (a re-run keeps the recorded value; "" clears it);
 #                the default space when the authority does not say. Recorded as MEM0_EMBED_PROFILE.
+#                Changing an already-recorded profile is refused while stack.env pins the memories or
+#                episodes collection to another than the new profile's own (see the check below).
 #   --ams-hub and its two companions are forwarded verbatim to install/linux-client.sh, which
 #                is where the fleet store is installed; a replica joins the store as a client. An
 #                omitted --ams-hub inherits the recorded hub (client-receipt.json); "" clears it.
@@ -64,7 +66,7 @@ QDRANT_DIR="$HOME/qdrant-server"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
 
-usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --authority) AUTHORITY="${2:-}"; shift 2 ;;
@@ -164,11 +166,13 @@ echo "    stack $STACK_VERSION; authority $AUTHORITY; brain via ssh '$BRAIN_SSH'
 echo "    server: qdrant $QDRANT_VERSION ($QDRANT_ASSET, ${PAGE_SIZE}-byte pages), $(echo "$MEM0_MODULES" | wc -w) modules, specs: $PIP_SPECS"
 # The embedding space: flag > stack.env (the recorded value) > the authority's own answer > the default
 # space. An explicit empty value clears the recorded one, like the other inherited settings.
+RECORDED_PROFILE=""
+[ ! -f "$MEM0_DIR/stack.env" ] || RECORDED_PROFILE="$(sed -n 's/^MEM0_EMBED_PROFILE=//p' "$MEM0_DIR/stack.env" | head -n1 | tr -d '\r')"
 if [ "$SET_EMBED_PROFILE" = 1 ]; then
     [ -n "$EMBED_PROFILE" ] || echo "    --embed-profile cleared (explicit empty value; not inherited)"
-elif [ -f "$MEM0_DIR/stack.env" ]; then
-    EMBED_PROFILE="$(sed -n 's/^MEM0_EMBED_PROFILE=//p' "$MEM0_DIR/stack.env" | head -n1 | tr -d '\r')"
-    [ -z "$EMBED_PROFILE" ] || echo "    --embed-profile inherited from ~/.mem0/stack.env: $EMBED_PROFILE"
+elif [ -n "$RECORDED_PROFILE" ]; then
+    EMBED_PROFILE="$RECORDED_PROFILE"
+    echo "    --embed-profile inherited from ~/.mem0/stack.env: $EMBED_PROFILE"
 fi
 AUTH_PROFILE=""
 if [ "$DRY_RUN" = 0 ]; then   # a dry run touches nothing, and asks nobody
@@ -183,6 +187,20 @@ if [ -z "$EMBED_PROFILE" ]; then
     echo "    embed profile: $EMBED_PROFILE (the default space; the authority did not say)"
 fi
 ep_field "$EMBED_PROFILE" name >/dev/null || fail "--embed-profile '$EMBED_PROFILE' is not a known embedding profile (see mem0-server/embedder_profile.py)"
+# 1.35.1: a CHANGE of the recorded profile binds the new space's own collections. stack.env's collection pins are
+# carried through the rewrite below, the server binds a pin over the profile's collection, and restore-replica.sh
+# compares each set's collection with the one the server binds, so a pin on the old space would make it refuse
+# every set made in the new one (the check install/1-wsl-services.sh makes for a Windows PC's replica). It reads
+# only stack.env, so a dry run makes it too; with the profile unchanged a pin is the operator's own choice.
+if [ -n "$RECORDED_PROFILE" ] && [ "$RECORDED_PROFILE" != "$EMBED_PROFILE" ]; then
+    stack_env_pin() { sed -n "s/^$1=//p" "$MEM0_DIR/stack.env" | head -n1 | tr -d '\r' || true; }
+    own_mem="$(ep_field "$EMBED_PROFILE" memories)" || fail "cannot read the memories collection of profile $EMBED_PROFILE"
+    own_epi="$(ep_field "$EMBED_PROFILE" episodes)" || fail "cannot read the episodes collection of profile $EMBED_PROFILE"
+    pin_mem="$(stack_env_pin MEM0_QDRANT_COLLECTION)"; [ -n "$pin_mem" ] || pin_mem="$(stack_env_pin MEM0_COLLECTION)"
+    pin_epi="$(stack_env_pin MEM0_EPISODES_COLLECTION)"
+    [ -z "$pin_mem" ] || [ "$pin_mem" = "$own_mem" ] || fail "profile change $RECORDED_PROFILE -> $EMBED_PROFILE: ~/.mem0/stack.env pins the memories collection to '$pin_mem' (MEM0_QDRANT_COLLECTION / MEM0_COLLECTION), which the server would keep binding instead of $EMBED_PROFILE's own '$own_mem', so every restore would be refused. Remove that line (or set it to '$own_mem') and re-run"
+    [ -z "$pin_epi" ] || [ "$pin_epi" = "$own_epi" ] || fail "profile change $RECORDED_PROFILE -> $EMBED_PROFILE: ~/.mem0/stack.env pins the episodes collection to '$pin_epi' (MEM0_EPISODES_COLLECTION), which the server would keep binding instead of $EMBED_PROFILE's own '$own_epi'. Remove that line (or set it to '$own_epi') and re-run"
+fi
 # The alias THIS box serves the profile under: its own scoped override in stack.env, else the profile's.
 EMBED_ALIAS="$(ep_alias "$EMBED_PROFILE")" || fail "cannot read the llama-swap alias of profile $EMBED_PROFILE"
 echo "    embed profile: $EMBED_PROFILE; local llama-swap alias: $EMBED_ALIAS"
