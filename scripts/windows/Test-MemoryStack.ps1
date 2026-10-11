@@ -1176,6 +1176,83 @@ try {
     else               { Add-Check 'RECOVERY' 'dedup task launch path' 'WARN' 'task not registered on a brain - install incomplete; re-run 2-windows-config.ps1' }
 }
 
+# R2f (1.35.2): the replica's TAKEOVER. A replica takes over only through the mem0-offline-watcher task
+# (3 failed probes of the authority -> restore the cached snapshot and start the local store), and it
+# restores whatever set the cache holds, which only mem0-replica-cache-refresh keeps current. Nothing
+# checked either before: a desktop replica ran as one with no watcher for four weeks, and both PC replicas
+# held a two-day-old set with nothing to refresh it. The decisions are pure functions (tested in
+# ReplicaTakeover.Tests.ps1); the row block only gathers the live task, state and record.
+function Get-TmsWatcherVerdict {
+    # $Task / $Info: the mem0-offline-watcher task and its Get-ScheduledTaskInfo ($null when absent).
+    param([bool]$IsReplica, $Task, $Info, [bool]$RefreshTaskPresent, [datetime]$Now, [scriptblock]$PathExists = { param($p) Test-Path -LiteralPath $p })
+    if (-not $IsReplica) {
+        if ($Task -or $RefreshTaskPresent) { return @('FAIL', 'registered on the BRAIN: its go_online would stop the live mem0/qdrant - re-run 2-windows-config.ps1 (a brain run removes mem0-offline-watcher and mem0-replica-cache-refresh)') }
+        return @('OK', 'brain role: absent by design (the watcher is for a replica)')
+    }
+    if (-not $Task) { return @('FAIL', 'NOT registered: this replica will not take over when the authority is down - re-run 2-windows-config.ps1 -Role replica (1.35.2 registers it) or scripts\travel\install-offline-watcher.ps1') }
+    $args_ = [string]$Task.Actions[0].Arguments
+    $script_ = if ($args_ -match '-File\s+"([^"]*offline-watcher\.ps1)"') { $Matches[1] } else { '' }
+    if (-not $script_ -or -not (& $PathExists $script_)) { return @('FAIL', "the task runs a script that is not there: $args_ - re-run scripts\travel\install-offline-watcher.ps1 from the deployed checkout") }
+    if ([string]$Task.State -eq 'Disabled') { return @('FAIL', 'the task is DISABLED: this replica will not take over') }
+    if (-not $RefreshTaskPresent) { return @('WARN', 'ticking, but mem0-replica-cache-refresh is not registered, so the takeover snapshot is never refreshed - re-run scripts\travel\install-offline-watcher.ps1') }
+    $last = if ($Info) { $Info.LastRunTime } else { $null }
+    if (-not $last -or $last.Year -lt 2001) { return @('WARN', 'registered but has never run (it ticks every 2 min)') }
+    $ageMin = ($Now - $last).TotalMinutes
+    if ($ageMin -gt 15) { return @('WARN', "has not ticked for $([int]$ageMin) min (every 2 min expected; last run $last)") }
+    # 267009 (SCHED_S_TASK_RUNNING) is the result a tick reports while it is still running: not a failure.
+    if ([int64]$Info.LastTaskResult -eq 267009) { return @('OK', "armed: a tick is running now (started $([int][math]::Max(0, $ageMin)) min ago)") }
+    if ([int64]$Info.LastTaskResult -ne 0) { return @('WARN', "last tick exited $($Info.LastTaskResult) ($([int]$ageMin) min ago)") }
+    return @('OK', "armed: ticked $([int][math]::Max(0, $ageMin)) min ago, exit 0 (takes over after 3 failed probes, ~6 min)")
+}
+
+function Get-TmsReplicaCacheVerdict {
+    # $Record: replica-cache-refresh.json ($null when absent); $NowEpoch/$Now: the clock, injectable.
+    # A set stamp is yyyyMMdd-HHmmss in the authority's local time (stack-backup.sh).
+    param($Record, [int64]$NowEpoch, [datetime]$Now, [double]$MaxRefreshAgeH = 36, [double]$MaxSetAgeH = 48)
+    if (-not $Record) { return @('WARN', 'the snapshot cache has never been refreshed (1.35.2 mem0-replica-cache-refresh): a takeover restores whatever set was last copied by hand') }
+    $state = [string]$Record.state
+    $stamp = [string]$Record.local_stamp
+    # The set's age from its manifest's file time (the authority's own clock, as copied: local_set_epoch),
+    # else from the stamp, which is in the authority's local time and so only right when the zones match.
+    $setAgeH = $null
+    $se = 0L
+    if ($null -ne $Record.local_set_epoch -and [int64]::TryParse("$($Record.local_set_epoch)", [ref]$se) -and $se -gt 0) { $setAgeH = ($NowEpoch - $se) / 3600.0 }
+    else {
+        $dt = [datetime]::MinValue
+        if ($stamp -and [datetime]::TryParseExact($stamp, 'yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$dt)) { $setAgeH = ($Now - $dt).TotalHours }
+    }
+    $setTxt = if (-not $stamp) { 'nothing (the cache holds no complete set)' } elseif ($null -ne $setAgeH) { "$stamp ($([math]::Round($setAgeH, 1)) h old)" } else { "'$stamp'" }
+    if ($state -eq 'running') {
+        # A running record keeps the previous result (travel-mode.ps1 New-RunningRecord), so say both.
+        $runH = if ($Record.started_epoch) { ($NowEpoch - [int64]$Record.started_epoch) / 3600.0 } else { 99 }
+        if ($runH -le 2) { return @('OK', "a refresh is running (started $([int]($runH * 60)) min ago); until it ends a takeover restores $setTxt") }
+        return @('WARN', "a refresh started $([math]::Round($runH, 1)) h ago never finished (killed or stalled; the watcher retries 6 h after it started); a takeover restores $setTxt")
+    }
+    $agoH = if ($Record.finished_epoch) { ($NowEpoch - [int64]$Record.finished_epoch) / 3600.0 } else { 999 }
+    if (-not $stamp) { return @('WARN', "the cache holds no complete set, so a takeover has nothing to restore: $($Record.error)") }
+    if ($Record.ok -ne $true) { return @('WARN', "last refresh $([math]::Round($agoH, 1)) h ago did NOT leave the cache current: $($Record.error); a takeover would restore $setTxt") }
+    if ($agoH -gt $MaxRefreshAgeH) { return @('WARN', "last successful refresh was $([math]::Round($agoH, 1)) h ago (expected every 12 h while online); the cache holds $setTxt") }
+    if ($null -ne $setAgeH -and $setAgeH -gt $MaxSetAgeH) { return @('WARN', "the cache holds $setTxt, pCloud's newest: is the authority's nightly backup + pCloud copy running?") }
+    return @('OK', "a takeover restores $setTxt (refreshed $([math]::Round($agoH, 1)) h ago from $($Record.local_dir))")
+}
+
+try {
+    $owTask = Get-ScheduledTask -TaskName 'mem0-offline-watcher' -ErrorAction SilentlyContinue
+    $owInfo = if ($owTask) { $owTask | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue } else { $null }
+    $rfPresent = [bool](Get-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction SilentlyContinue)
+    $v = Get-TmsWatcherVerdict -IsReplica $TmsIsReplica -Task $owTask -Info $owInfo -RefreshTaskPresent $rfPresent -Now (Get-Date)
+    Add-Check 'RECOVERY' 'offline watcher (takeover)' $v[0] $v[1]
+} catch { Add-Check 'RECOVERY' 'offline watcher (takeover)' 'WARN' "could not read the task: $($_.Exception.Message)" }
+if ($TmsIsReplica) {
+    try {
+        $rfRec = $null
+        $rfPath = Join-Path $env:USERPROFILE '.claude\state\replica-cache-refresh.json'
+        try { if (Test-Path -LiteralPath $rfPath) { $rfRec = Get-Content -Raw -LiteralPath $rfPath | ConvertFrom-Json -ErrorAction Stop } } catch { $rfRec = $null }
+        $v = Get-TmsReplicaCacheVerdict -Record $rfRec -NowEpoch ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Now (Get-Date)
+        Add-Check 'RECOVERY' 'replica snapshot cache' $v[0] $v[1]
+    } catch { Add-Check 'RECOVERY' 'replica snapshot cache' 'WARN' "could not read the refresh record: $($_.Exception.Message)" }
+}
+
 # R2c: the 5am auto-memory compactor (workspace stores are machine-local, so this row runs on
 # every role). Since 1.25.0 (P4-1a) install/2-windows-config.ps1 step 1d RETIRES the task on a
 # box whose store hub path is proven and keeps it only where that path is not proven. This row

@@ -4,6 +4,53 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.35.2 — a Windows PC replica actually takes over, with last night's memory (2026-10-11)
+
+### Fixed
+- **Nothing armed a Windows replica.** A replica takes over during an authority outage only through the
+  `mem0-offline-watcher` task, and registering it was a separate manual step (`scripts/travel/install-offline-watcher.ps1`)
+  that no installer ran. A box made a replica after its install never got one: a desktop replica ran as one from the
+  2026-09-14 cutover to 2026-10-11 with no watcher, so an authority outage would have left it with no memory at all.
+  `2-windows-config.ps1 -Role replica` (and so `install.ps1 -Role replica`) now runs `install-offline-watcher.ps1` and
+  fails the install if it cannot register the tasks; a brain run removes them (a brain's `go_online` would stop its live
+  store).
+- **A Windows replica took over with a stale snapshot.** The local snapshot cache a takeover restores from was refreshed
+  only by `travel-mode.ps1 on`, which skips the refresh when the authority is down (that is, at every takeover), or by
+  an operator running `on -DryRun`. On 2026-10-11 both PC replicas held a two-day-old set with nothing to refresh it.
+  The watcher now starts a refresh while online (below). A takeover restores again whenever the cache's newest complete
+  set is newer than the set it last restored, instead of restarting the older restore for up to 24 h: `travel-mode.ps1 on`
+  writes `<time> <set stamp>` to `replica-restored.txt`, and `Test-ReplicaRestoreStale` compares set stamps (a marker
+  from before 1.35.2 names no set and forces one restore). A re-restore that fails now starts the previous restore
+  instead of leaving the box with nothing, and the watcher logs its transitions and failures to
+  `~\.claude\state\offline-watcher.log` (the tick has no console).
+
+### Added
+- **`travel-mode.ps1 refresh`**: copies pCloud's newest complete snapshot set into the local cache
+  (`D:\memory-backups\<authority host>`) while the authority answers, and touches no service or model. It writes
+  `~\.claude\state\replica-cache-refresh.json` (`state`, `ok`, `local_stamp` vs `cloud_stamp`, `local_set_epoch`,
+  `error`; a `running` record keeps the previous result) and holds a lock the OS releases if it dies. It exits 1 when
+  the cache is not left holding pCloud's newest restorable set, 0 when it is or when another refresh holds the lock.
+  The seeding is the code `on` already ran, moved into `Update-LocalCache` so both modes share it, with three
+  safeguards both now get: a set made in another embedding profile than the box restores is never copied (the restore
+  would refuse it; the run fails naming the switch to make), the cache is pruned BEFORE a copy (newest 2 kept, 3 after)
+  and on every pass, so a nearly full disk cannot wedge it, and dead `.part` files are removed. Retention counts
+  complete sets only.
+- **The `mem0-replica-cache-refresh` task** (no trigger; `IgnoreNew`; 2 h limit), registered by
+  `install-offline-watcher.ps1`. The watcher starts it on a steady online tick when a refresh is due
+  (`Test-CacheRefreshDue`: no record, 12 h after a refresh that left the cache current, 6 h after one that did not or
+  after a `running` record, which is a refresh that died), so its 2-minute tick never waits on the copy.
+- **Health rows.** `Test-MemoryStack.ps1` RECOVERY `offline watcher (takeover)` FAILs a replica with no watcher, a
+  watcher whose script is gone or that is disabled, and a brain that has one; WARNs a stalled or failing tick or a
+  missing refresh task (a tick that is still running is OK). `replica snapshot cache` WARNs a replica whose cache was
+  never refreshed or holds no complete set, whose last refresh failed or is over 36 h old, or whose newest set is over
+  48 h old (aged from the set's own file time, so the authority's time zone does not matter). `3-verify.ps1` checks both
+  tasks on a replica.
+
+### Upgrading
+Re-run `.\install\2-windows-config.ps1 -WslUser <wsluser> -Role replica` (or `install.ps1 -Role replica`) on each
+Windows PC replica ([docs/MIGRATION.md](docs/MIGRATION.md), "1.35.2: arm every Windows replica"). Linux replicas are
+unchanged: `offline-watcher.py` already refreshed while online.
+
 ## 1.35.1 — a Windows PC replica can change its embedding profile, and its restore knows the 1.35.0 set (2026-10-09)
 
 ### Added

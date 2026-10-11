@@ -212,6 +212,21 @@ recorded profile with the new one to decide whether a store is being rebound, an
 space with no points. Re-anchor the retrieval-drift canaries whose stored text names the old embedder or
 collection.
 
+### 1.35.2: arm every Windows replica
+
+A Windows replica takes over during an authority outage only through the `mem0-offline-watcher` task, and
+before 1.35.2 nothing registered it (it was a separate manual step), nor refreshed the snapshot it restores. After
+deploying 1.35.2, re-run the Windows phase on each PC replica from its release tree:
+
+```powershell
+.\install\2-windows-config.ps1 -WslUser <wsluser> -Role replica    # or .\install.ps1 -Role replica
+```
+
+It registers `mem0-offline-watcher` and `mem0-replica-cache-refresh`. Within two minutes the watcher starts the
+first cache refresh (a ~700 MB copy from pCloud); `Test-MemoryStack.ps1` then shows the `offline watcher
+(takeover)` and `replica snapshot cache` rows green. `scripts\travel\install-offline-watcher.ps1` alone registers
+the same two tasks. See [`systems/offline-travel.md`](systems/offline-travel.md).
+
 ### The 1.35.0 move to EmbeddingGemma-2 (multimodal)
 
 On top of the steps above:

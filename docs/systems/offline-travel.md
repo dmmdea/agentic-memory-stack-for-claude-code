@@ -65,10 +65,13 @@ The PowerShell hooks are a *separate* client that follows the same two rules sin
 The shim can only fail reads over to a *running* local replica. Keeping that replica stopped when online (one live brain) and bringing it up during an outage is the job of the `mem0-offline-watcher` scheduled task, which ticks every **2 minutes** ([`../../scripts/travel/offline-watcher.ps1`](../../scripts/travel/offline-watcher.ps1)). Each tick:
 
 1. Probes the authority's `/health` (short timeout).
-2. Steps a small hysteresis state machine that debounces flapping links: from `online`, **3 consecutive down** ticks transition to `offline` (`go_offline`); from `offline`, **2 consecutive up** ticks transition to `online` (`go_online`). Steady ticks with no transition do nothing.
-3. Acts only on a transition:
-   - **`go_offline`** — if the replica snapshot is stale (>24h since the last restore), refresh and bring it up read-only by reusing `travel-mode.ps1 on`; otherwise just start the local `qdrant`/`mem0` user services.
+2. Steps a small hysteresis state machine that debounces flapping links: from `online`, **3 consecutive down** ticks transition to `offline` (`go_offline`); from `offline`, **2 consecutive up** ticks transition to `online` (`go_online`). A steady tick changes nothing locally, except (1.35.2) that it may start the cache refresh (step 4).
+3. Acts on a transition:
+   - **`go_offline`** — if the last restore is stale, restore the newest set in the local snapshot cache and bring it up read-only by reusing `travel-mode.ps1 on`; otherwise just start the local `qdrant`/`mem0` user services. Stale means no `replica-restored.txt` marker, a marker older than 24 h, or (1.35.2) a marker that does not name a set older than the newest complete set in the cache: `travel-mode.ps1 on` writes `<time> <set stamp>` there after a restore, and `Test-ReplicaRestoreStale` compares set stamps, never clock times. A re-restore that fails starts the previous restore instead of nothing, and every transition and failure is logged to `~\.claude\state\offline-watcher.log`.
    - **`go_online`** — run the replay driver to drain the Outbox to the authority, then stop the local `qdrant`/`mem0` services and remove the vestigial `~/.mem0/travel.json` flag. (Nothing re-points the hooks: their authority file was never changed.)
+4. (1.35.2) On a steady online tick, starts the **`mem0-replica-cache-refresh`** task when a refresh is due (`Test-CacheRefreshDue`: no record yet, 12 h after a refresh that left the cache current, 6 h after one that did not, or a `running` record older than 6 h, a refresh that died). The task runs `travel-mode.ps1 refresh`, which copies pCloud's newest complete set into the local cache (`D:\memory-backups\<authority host>`) while the authority answers and touches no service or model. It never copies a set made in another embedding profile than the one the box restores (`restore-replica.ps1` would refuse it, and a cache full of such sets would leave the takeover nothing to restore): that run fails with the switch to make. It prunes before copying (newest 2 sets kept, 3 after the copy) and removes dead `.part` files, so a nearly full disk cannot wedge it. It is a separate task so the 2-minute tick never waits on a ~700 MB copy.
+
+**The installer arms it (1.35.2).** `2-windows-config.ps1 -Role replica` (and so `install.ps1 -Role replica`) runs `install-offline-watcher.ps1`, which registers both tasks, and fails the install if it cannot; a brain run removes both. Before 1.35.2 the watcher was a separate manual step, and a desktop replica ran as one for four weeks after the 2026-09-14 cutover with no watcher at all: an authority outage would have left it with no memory. `Test-MemoryStack.ps1` (the `offline watcher (takeover)` and `replica snapshot cache` rows) and `3-verify.ps1` now check both.
 
 The watcher resolves the authority carefully: an explicit `-Authority` wins; otherwise `MEM0_URL`, but **only if it is not a local/loopback/unspecified/malformed host** (a `Test-IsLocalUrl` guard). This guard dates from when `travel-mode.ps1 on` set a user-scope `MEM0_URL` pointing at the *replica* — without it, a fresh watcher tick inherited the replica as its "authority", probed it as healthy, and replayed the Outbox *into the disposable local store*, a One-Brain violation. Since v1.23 neither travel mode nor the watcher writes that variable (the hooks resolve the per-host file), and the guard stays as the belt against a stray value from anywhere else.
 
@@ -76,7 +79,7 @@ The watcher resolves the authority carefully: an explicit `-Authority` wins; oth
 
 On a native-Linux replica ([`installer-and-deploy.md`](installer-and-deploy.md), `install/linux-replica.sh`) the same two layers run: the shim fails over per call, and `offline-watcher.py` ticks every 2 minutes from a systemd user timer with the identical hysteresis (3 down → `go_offline`, 2 up → `go_online`), the identical authority resolution (explicit → `MEM0_URL` unless local → `~/.mem0/authority-url` unless local → refuse), and the identical transitions: `go_offline` starts the dormant `qdrant.service` + `mem0.service`; `go_online` drains the Outbox through the sibling `replay-ops.py` (logged to `~/.mem0/outbox-drain.log`) and stops them. There is no `MEM0_URL` juggling because the Linux shim reads the authority from the file and fails over by itself.
 
-The one difference: **the replica is refreshed while online.** The PowerShell watcher tries to restore a fresh snapshot at `go_offline`, which is the one moment the Brain cannot be reached — so a stale replica stayed stale. The Linux watcher instead runs `restore-replica.sh` on a steady online tick whenever the last restore (`~/.mem0/replica-restored`) is older than 24 h: it pulls the newest set from the Brain over SSH, restores it into the dormant store (started for the duration), proves `/health/deep`, and stops the services again. The copy the box carries into an outage is therefore at most a day old, and `go_offline` only has to start what is already restored.
+Both watchers now refresh while online, in different shapes. Before 1.35.2 the PowerShell watcher tried to refresh only at `go_offline`, the one moment the Brain cannot be reached, so a stale replica stayed stale (on 2026-10-11 both PC replicas held a two-day-old set). It now keeps the snapshot **cache** current (step 4 above) and restores from it at `go_offline`; a Windows restore starts the store and loads the embedder, which a daily background restore on a desktop's shared cards would cost every day for nothing. The Linux watcher instead runs `restore-replica.sh` on a steady online tick whenever the last restore (`~/.mem0/replica-restored`) is older than 24 h: it pulls the newest set from the Brain over SSH, restores it into the dormant store (started for the duration), proves `/health/deep`, and stops the services again. The copy the box carries into an outage is therefore at most a day old, and `go_offline` only has to start what is already restored.
 
 ### The legacy switch
 
@@ -135,7 +138,10 @@ All state is under `~/.mem0/` (WSL home) or `~/.claude/state/` (Windows), never 
 | `~/.mem0/mutation-conflicts.jsonl` | records that could not be applied and must not be lost |
 | `~/.mem0/travel.json` | **vestigial** — only feeds `travel-mode.ps1 status`; the shim never reads it |
 | `~/.claude/state/offline-mode.json` | the watcher's hysteresis state (`mode`, consecutive up/down counts) |
-| `~/.claude/state/replica-restored.txt` | timestamp marker of the last successful replica restore (the 24h-staleness check) |
+| `~/.claude/state/replica-restored.txt` | marker of the last successful replica restore: `<time> <set stamp>` since 1.35.2 (written by `travel-mode.ps1 on`), a bare time before; the takeover's staleness check |
+| `~/.claude/state/offline-watcher.log` | 1.35.2: the watcher's transitions and failures (the tick has no console); trimmed to its last 400 lines past 256 KB |
+| `~/.claude/state/replica-cache-refresh.json` | 1.35.2: the last cache refresh (`state` running/done, `ok`, `local_stamp` vs `cloud_stamp`, `local_set_epoch`, `error`; a running record keeps the previous result); the watcher reads it to decide when to refresh and where the cache is |
+| `D:\memory-backups\<authority host>\` | the local snapshot cache a takeover restores from (newest 3 complete sets) |
 | `~/.claude/state/mem0-post-failures.jsonl` | the PowerShell hooks' DLQ (separate from the Outbox) |
 | local `episodic.db`, `history.db`, the profile's Qdrant collection (`mem0_eg2_768`, or `mem0_egemma_768` for the legacy space), `~/.mem0/media` (or the unit's `MEM0_MEDIA_DIR`) | the read-only replica's restored data |
 
@@ -146,7 +152,9 @@ All state is under `~/.mem0/` (WSL home) or `~/.claude/state/` (Windows), never 
 - **`replay-ops.py [--outbox <path>] [--authority <url>]`** — the reconnect replay driver (run inside WSL; also callable manually to drain a stranded queue).
 - **`restore-replica.ps1 -BackupDir <dir> -Stamp <stamp>`** — stands up the read-only replica from a snapshot set.
 - **`travel-mode.ps1 status | on | off`** — the **legacy** operator switch; `status` is still a useful read-out.
-- **`install-offline-watcher.ps1`** — registers the watcher task (refuses to run on the authority box, whose `go_online` would stop the live brain).
+- **`mem0-replica-cache-refresh`** (1.35.2) — an on-demand task (no trigger; `travel-mode.ps1 refresh`, `IgnoreNew`, 2 h limit) the watcher starts when a refresh is due. Its exit code is 0 only when the cache holds pCloud's newest complete set.
+- **`install-offline-watcher.ps1`** — registers both tasks (refuses to run on the authority box, whose `go_online` would stop the live brain). `2-windows-config.ps1 -Role replica` runs it.
+- **`travel-mode.ps1 refresh`** (1.35.2) — seed the local cache while online; safe to run by hand.
 
 ## Dependencies
 
@@ -223,9 +231,10 @@ All state is under `~/.mem0/` (WSL home) or `~/.claude/state/` (Windows), never 
 - [`../../scripts/wsl/mem0-mcp-shim.py`](../../scripts/wsl/mem0-mcp-shim.py) — the shim: `_request` read failover, `_authority_only` writes, `_queue_op` Outbox writer, offline pending-add merge.
 - [`../../scripts/wsl/replay-ops.py`](../../scripts/wsl/replay-ops.py) — the reconnect replay driver (reachability gate, atomic rotation, adds-first sort, key-ledger dedup, conflict log).
 - [`../../scripts/travel/offline-watcher.ps1`](../../scripts/travel/offline-watcher.ps1) — the 2-minute tick: authority probe, hysteresis state machine, offline/online transitions.
-- [`../../scripts/travel/install-offline-watcher.ps1`](../../scripts/travel/install-offline-watcher.ps1) — registers the `mem0-offline-watcher` task (refuses on the brain box).
+- [`../../scripts/travel/install-offline-watcher.ps1`](../../scripts/travel/install-offline-watcher.ps1) — registers the `mem0-offline-watcher` and `mem0-replica-cache-refresh` tasks (refuses on the brain box).
 - [`../../scripts/travel/restore-replica.ps1`](../../scripts/travel/restore-replica.ps1) — read-only replica restore (SQLite copy + Qdrant snapshot upload + health assertion).
-- [`../../scripts/travel/travel-mode.ps1`](../../scripts/travel/travel-mode.ps1) — the **legacy** operator switch (`status`/`on`/`off`); its `on` restore path is reused by the watcher.
+- [`../../scripts/travel/travel-mode.ps1`](../../scripts/travel/travel-mode.ps1) — the **legacy** operator switch (`status`/`on`/`off`); its `on` restore path is reused by the watcher, and its `refresh` mode (1.35.2) is what `mem0-replica-cache-refresh` runs.
+- [`../../scripts/windows/tests/ReplicaTakeover.Tests.ps1`](../../scripts/windows/tests/ReplicaTakeover.Tests.ps1) — 1.35.2: refresh due/stale decisions, the cache seeding, `travel-mode.ps1 refresh` run end to end against a local authority stub, the task registration and the health rows.
 - [`../../scripts/travel/replay-outbox.ps1`](../../scripts/travel/replay-outbox.ps1) — the PowerShell wrapper that key/health-checks then invokes `replay-ops.py`.
 - [`../../scripts/travel/README.md`](../../scripts/travel/README.md) — the travel-scripts overview.
 - [`../../scripts/windows/memory-common.ps1`](../../scripts/windows/memory-common.ps1) — the PowerShell hooks' non-failover client + DLQ (the contrast to the shim).
