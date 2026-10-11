@@ -105,6 +105,15 @@ if ($stackRole -eq 'replica') {
     Check "replica authority is NOT loopback (One-Brain Rule)" {
         $authorityUrl -notmatch '^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:|/|$)'
     } "This replica points at itself ($authorityUrl). Queued writes would replay into its disposable local store and be lost. Re-run 2-windows-config.ps1 -Role replica -AuthorityUrl http://<brain-host>:18791"
+    # 1.35.2: the replica takes over only through these two tasks (2-windows-config.ps1 -Role replica now
+    # registers both). Without the watcher, an authority outage leaves this box with no memory at all.
+    Check "offline watcher registered (replica takes over when the authority is down)" {
+        $t = Get-ScheduledTask -TaskName 'mem0-offline-watcher' -ErrorAction SilentlyContinue
+        [bool]($t -and [string]$t.State -ne 'Disabled')
+    } "Re-run 2-windows-config.ps1 -Role replica, or scripts\travel\install-offline-watcher.ps1"
+    Check "snapshot-cache refresh task registered (the takeover restores last night's set)" {
+        [bool](Get-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction SilentlyContinue)
+    } "Re-run 2-windows-config.ps1 -Role replica, or scripts\travel\install-offline-watcher.ps1"
 }
 # v0.22 EmbeddingGemma migration: mem0's embedder is EmbeddingGemma on llama-swap :11436
 # (single-stack llama.cpp). Ollama fully decommissioned 2026-06-13 — no longer a stack

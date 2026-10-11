@@ -60,3 +60,21 @@ try {
 $check = Get-ScheduledTask -TaskName 'mem0-offline-watcher' -ErrorAction SilentlyContinue
 if (-not $check) { throw "Register-ScheduledTask reported success but 'mem0-offline-watcher' does not exist." }
 Write-Host "Registered scheduled task 'mem0-offline-watcher' (every 2 min, windowless)."
+
+# 1.35.2: the snapshot-cache refresh, started by the watcher when one is due (travel-mode.ps1 refresh).
+# No trigger of its own: the watcher decides when (Test-CacheRefreshDue) and starts it with
+# Start-ScheduledTask, so the 2-minute tick never waits on a ~700 MB copy. IgnoreNew makes a start while
+# one runs a no-op; 2 h bounds a pCloud stall.
+$tm = Join-Path $PSScriptRoot 'travel-mode.ps1'
+$rAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "//nologo `"$hiddenVbs`" pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$tm`" refresh"
+$rSet    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+try {
+    Register-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -Action $rAction -Settings $rSet -Force -RunLevel Limited `
+        -Description 'Copies the authority''s newest nightly memory snapshot from pCloud into the local takeover cache. Started by mem0-offline-watcher when a refresh is due.' -ErrorAction Stop | Out-Null
+} catch {
+    throw "Failed to register 'mem0-replica-cache-refresh': $($_.Exception.Message)"
+}
+if (-not (Get-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction SilentlyContinue)) {
+    throw "Register-ScheduledTask reported success but 'mem0-replica-cache-refresh' does not exist."
+}
+Write-Host "Registered scheduled task 'mem0-replica-cache-refresh' (on demand, started by the watcher when a refresh is due)."

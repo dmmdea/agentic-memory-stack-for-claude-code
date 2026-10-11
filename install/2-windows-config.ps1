@@ -1445,7 +1445,28 @@ if ($Role -ne 'brain') {
             Write-Host "    removed stale task from replica: $t" -ForegroundColor Yellow
         }
     }
+    # 1.35.2: a replica takes over only through the offline watcher, and before this nothing registered it:
+    # it was a separate manual step (scripts/travel/install-offline-watcher.ps1), so a desktop made a
+    # replica after its install ran for four weeks with no watcher at all. Registering it here arms
+    # every replica the installer touches, together with the snapshot-cache refresh task it starts. It
+    # runs from this checkout ($RepoRootWin), like the other travel scripts; its own guard refuses a brain.
+    Write-Host "==> [5c] Role=replica: registering the offline watcher + snapshot-cache refresh"
+    try {
+        & (Join-Path $RepoRootWin 'scripts\travel\install-offline-watcher.ps1')
+    } catch {
+        Write-Host "    FAILED to register the offline watcher: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "    this replica will NOT take over when the authority is down; fix the cause and run scripts\travel\install-offline-watcher.ps1" -ForegroundColor Red
+        $script:watcherRegistrationFailed = $true
+    }
 } else {
+    # A brain must never run the watcher: its go_online stops mem0/qdrant, which are the live brain here.
+    # A box promoted from replica to brain keeps the tasks it had, so remove them.
+    foreach ($t in @('mem0-offline-watcher', 'mem0-replica-cache-refresh')) {
+        if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $t -Confirm:$false
+            Write-Host "    removed replica-only task from the brain: $t" -ForegroundColor Yellow
+        }
+    }
 Write-Host "==> [5] Registering Task Scheduler entry: ClaudeCode-DreamConsolidator-3am"
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
@@ -1524,6 +1545,11 @@ Write-Host "    Semantic-dedup task registered (next fire: 4:30 AM)"
 # decisions once for the fleet. Section 1d removes the task on every box whose hub path is
 # proven; nothing registers it any more. memory-compact.ps1 stays deployed until the Phase 5
 # gate deletes the PowerShell originals.
+
+if ($script:watcherRegistrationFailed) {
+    # Fail loud at the end (every other step has run): a replica that cannot take over is not installed.
+    throw "the offline watcher was not registered (see [5c] above): this replica would NOT take over when the authority is down"
+}
 
 Write-Host ""
 Write-Host "==> Windows config complete." -ForegroundColor Green

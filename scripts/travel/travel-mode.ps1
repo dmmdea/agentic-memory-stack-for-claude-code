@@ -25,14 +25,22 @@
   fired anywhere, and deriving the hostname from the authority URL is equally vacuous on the
   brain (its authority is loopback). Fail-closed: an undeterminable role refuses too.
 
+  REFRESH (1.35.2) seed the local snapshot cache from pCloud while the authority is reachable, and
+       touch nothing else. The mem0-replica-cache-refresh task runs it when the offline watcher
+       finds a refresh due, so a takeover restores last night's set rather than whatever an
+       operator last copied down. It writes ~\.claude\state\replica-cache-refresh.json and exits 1 when
+       the cache is not left holding pCloud's newest restorable set; 0 when it is, or when another refresh
+       already holds the lock.
+
 .EXAMPLE
   travel-mode.ps1 status
   travel-mode.ps1 on
   travel-mode.ps1 off
+  travel-mode.ps1 refresh
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('on', 'off', 'status')]
+    [ValidateSet('on', 'off', 'status', 'refresh')]
     [string]$Mode = 'status',
 
     # Snapshot source. LEAVE EMPTY — 'on' resolves it: a COMPLETE set on local disk wins, else the
@@ -121,8 +129,13 @@ function Assert-NotTheAuthority([string]$verb) {
     $isLocalAuth = Test-IsLocalAuthorityUrl $auth
     if ($role -eq 'brain' -or $isLocalAuth) {
         $why = if ($role -eq 'brain') { "~/.mem0/role says 'brain'" } else { "the authority URL ($auth) is this machine" }
+        $harm = switch ($verb) {
+            'on'      { 'overwrite the live brain with a day-old snapshot' }
+            'refresh' { 'fill a replica snapshot cache on the machine those snapshots are taken from' }
+            default   { 'stop and disable the LIVE mem0/qdrant' }
+        }
         throw ("REFUSED: this machine ($env:COMPUTERNAME) IS the memory authority — $why. " +
-               "'$verb' would " + $(if ($verb -eq 'on') { 'overwrite the live brain with a day-old snapshot' } else { 'stop and disable the LIVE mem0/qdrant' }) + '. ' +
+               "'$verb' would $harm. " +
                'Travel mode is for a replica box. (If this box was genuinely demoted to a replica, fix ~/.mem0/role and the authority URL first.)')
     }
     if (-not $role -and -not $auth) {
@@ -218,6 +231,176 @@ function Get-NewestCompleteSet([string]$dir) {
     return $null
 }
 
+function Get-CompleteStamps([string]$dir) {
+    # Every stamp in $dir whose four required files are present, newest first. Never throws.
+    try {
+        @(Get-ChildItem (Join-Path $dir 'manifest-*.json') -File -ErrorAction Stop | Sort-Object Name -Descending |
+          ForEach-Object { $_.BaseName -replace '^manifest-', '' } |
+          Where-Object { -not (Get-SetFiles $dir $_ | Where-Object { -not (Test-Path $_) }) })
+    } catch { @() }
+}
+
+function Invoke-CacheRetention([string]$LocalBackupDir, [int]$Keep, [string]$Protect = '') {
+    # Keep the newest $Keep COMPLETE sets plus $Protect (a set being copied, whose finished files a retry
+    # must not fetch again); remove every other set's files, an incomplete set's included. Counting only
+    # complete sets means a torn copy can never push a restorable set out of the cache.
+    # ($keepStamps, not $keep: PowerShell names are case-insensitive, and $keep IS the [int] $Keep parameter.)
+    $keepStamps = @(Get-CompleteStamps $LocalBackupDir | Select-Object -First $Keep) + @($Protect | Where-Object { $_ })
+    Get-ChildItem (Join-Path $LocalBackupDir 'manifest-*.json') -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.BaseName -replace '^manifest-', '' } |
+        Where-Object { $keepStamps -notcontains $_ } |
+        ForEach-Object { Get-SetFiles $LocalBackupDir $_ -WithMedia | Where-Object { Test-Path $_ } | Remove-Item -Force }
+}
+
+function Get-SetProfile([string]$dir, [string]$stamp, [string]$LegacyProfile) {
+    # The embedding profile a set was made in: the manifest's embed_profile, else the legacy space (a set
+    # from before profiles existed), exactly as restore-replica.ps1 reads it.
+    try {
+        $m = Get-Content -Raw -LiteralPath (Join-Path $dir "manifest-$stamp.json") -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($m.embed_profile) { return "$($m.embed_profile)".Trim() }
+    } catch {}
+    return $LegacyProfile
+}
+
+function Update-LocalCache([string]$CloudBackupDir, [string]$LocalBackupDir, [string]$BoxProfile = '', [string]$LegacyProfile = '') {
+    # Seed/refresh the LOCAL cache from pCloud. The caller decides we are online (Test-Endpoint on the
+    # authority, not a probe of P:: pCloud keeps its drive letter mounted with no network, so a
+    # filesystem probe can stall). Copies only the newest COMPLETE cloud set (not every file in the
+    # folder), and only when it is newer than what we already hold. Never throws: returns what it
+    # found and did, with the error text when something failed. A failed copy leaves no .part behind and
+    # never removes a complete set it was not replacing.
+    # 1.35.2: $BoxProfile (the embedding profile this box restores, when known) gates the copy. A set made
+    # in another space is neither copied nor allowed to push the restorable sets out: restore-replica.ps1
+    # refuses such a set, and a cache filled with them would leave the takeover nothing to restore.
+    $r = [ordered]@{ cloud_stamp = $null; local_stamp = $null; local_set_epoch = $null; seeded = $false; error = $null }
+    try {
+        if (Test-Path -LiteralPath $LocalBackupDir) {
+            # A copy killed mid-file (task time limit, reboot, full disk) leaves <file>.part, which no
+            # retention by set name ever matches. One refresh runs at a time (the lock), so any .part is dead.
+            Get-ChildItem -LiteralPath $LocalBackupDir -Filter '*.part' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+        }
+        $cloudStamp = Get-NewestCompleteSet $CloudBackupDir
+        $localStamp = Get-NewestCompleteSet $LocalBackupDir
+        $r.cloud_stamp = $cloudStamp
+        $setProfile = if ($cloudStamp -and $BoxProfile) { Get-SetProfile $CloudBackupDir $cloudStamp $LegacyProfile } else { '' }
+        if ($cloudStamp -and $BoxProfile -and $setProfile -and $setProfile -ne $BoxProfile) {
+            throw ("pCloud's newest set $cloudStamp is in embedding profile '$setProfile' but this box restores '$BoxProfile': " +
+                   "not copied, and the cache keeps the sets it can restore. Switch this replica first: install.ps1 -Role replica -EmbedProfile $setProfile")
+        }
+        # A newer cloud set, or the same set whose media tar the local copy lacks (the tar is copied
+        # last and is not part of "complete", so a failed copy leaves the set looking whole). The copy
+        # loop below skips every file already held at the right size, so the second case fetches
+        # only the tar.
+        if ($cloudStamp -and (($cloudStamp -gt "$localStamp") -or
+                              ($cloudStamp -eq "$localStamp" -and (Test-SetMediaMissing $CloudBackupDir $LocalBackupDir $cloudStamp)))) {
+            New-Item -ItemType Directory -Force -Path $LocalBackupDir | Out-Null
+            # Make room FIRST: keep the newest 2 complete sets (3 with the incoming one). Pruning only after
+            # the copy wedged a disk with room for 3 sets but not 4: every copy failed, so nothing was pruned.
+            Invoke-CacheRetention $LocalBackupDir 2 -Protect $cloudStamp
+            Write-Host "    seeding local snapshot cache from pCloud: $cloudStamp"
+            foreach ($src in (Get-SetFiles $CloudBackupDir $cloudStamp -WithMedia)) {
+                $dst = Join-Path $LocalBackupDir (Split-Path $src -Leaf)
+                if ((Test-Path $dst) -and (Get-Item $dst).Length -eq (Get-Item $src).Length) { continue }
+                # .part + atomic same-volume rename: a torn 686MB copy (sleep, Ctrl-C,
+                # pCloud stall) must never masquerade as a complete set on the plane.
+                try {
+                    Copy-Item $src "$dst.part" -Force -ErrorAction Stop
+                    Move-Item "$dst.part" $dst -Force -ErrorAction Stop
+                } catch {
+                    Remove-Item -LiteralPath "$dst.part" -Force -ErrorAction SilentlyContinue
+                    throw
+                }
+            }
+            $r.seeded = $true
+        }
+        # Retention on every pass (not only after a copy), so a prune that failed once is retried:
+        # keep the newest 3 complete sets (~721MB each).
+        if (Test-Path -LiteralPath $LocalBackupDir) { Invoke-CacheRetention $LocalBackupDir 3 }
+    } catch {
+        $r.error = $_.Exception.Message
+    }
+    $r.local_stamp = Get-NewestCompleteSet $LocalBackupDir
+    if ($r.local_stamp) {
+        try { $r.local_set_epoch = [DateTimeOffset]::new((Get-Item -LiteralPath (Join-Path $LocalBackupDir "manifest-$($r.local_stamp).json")).LastWriteTimeUtc).ToUnixTimeSeconds() } catch {}
+    }
+    [pscustomobject]$r
+}
+
+function Get-RefreshRecordPath { Join-Path $env:USERPROFILE '.claude\state\replica-cache-refresh.json' }
+
+function Read-RefreshRecord([string]$Path) {
+    # $null when absent or unreadable: a torn record must never stop the next refresh.
+    try { if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -ErrorAction Stop) } } catch {}
+    return $null
+}
+
+function Write-RefreshRecord([string]$Path, $Record) {
+    # tmp + rename, so the watcher never reads half a record. The rename is retried: it fails while a
+    # reader (the watcher tick, Test-MemoryStack) has the file open, and a lost final write would leave
+    # a 'running' record behind a refresh that finished.
+    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
+    $tmp = "$Path.$PID.tmp"
+    ([pscustomobject]$Record | ConvertTo-Json -Compress) | Set-Content -LiteralPath $tmp -Encoding utf8
+    for ($i = 1; ; $i++) {
+        try { [IO.File]::Move($tmp, $Path, $true); return }
+        catch { if ($i -ge 20) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }; Start-Sleep -Milliseconds 100 }
+    }
+}
+
+function New-RunningRecord {
+    # Written when a refresh starts. It keeps the previous result's fields (ok, stamps, error), so the
+    # health row and the backoff still see how the last refresh ended while this one runs, or if it dies.
+    param($Prior, [int64]$StartedEpoch)
+    $rec = [ordered]@{ state = 'running'; started_epoch = $StartedEpoch; pid = $PID }
+    if ($Prior) {
+        foreach ($k in 'ok', 'finished_epoch', 'finished', 'cloud_stamp', 'local_stamp', 'local_set_epoch', 'local_dir', 'error') {
+            if ($Prior.PSObject.Properties[$k]) { $rec[$k] = $Prior.$k }
+        }
+    }
+    $rec
+}
+
+function New-RefreshResult {
+    # The record a finished refresh writes. ok means the local cache now holds the newest complete set
+    # pCloud has. local_stamp is what a takeover would restore; it comes from the disk after the attempt
+    # (errors or not), or from the previous record when this run never reached the cache.
+    param($Seed, $Prior, [int64]$StartedEpoch, [int64]$NowEpoch, [string]$LocalDir, [string]$CloudDir, [string]$ErrorText = '',
+          [string]$FallbackLocalStamp = '')
+    $err = if ($ErrorText) { $ErrorText } elseif ($Seed -and $Seed.error) { [string]$Seed.error } else { $null }
+    $cloud = if ($Seed) { $Seed.cloud_stamp } else { $null }
+    $local = if ($Seed) { $Seed.local_stamp } elseif ($FallbackLocalStamp) { $FallbackLocalStamp } elseif ($Prior) { $Prior.local_stamp } else { $null }
+    $setEpoch = if ($Seed) { $Seed.local_set_epoch } elseif ($Prior -and "$local" -eq "$($Prior.local_stamp)") { $Prior.local_set_epoch } else { $null }
+    if (-not $err -and -not $cloud) { $err = "no complete snapshot set in $CloudDir" }
+    $ok = (-not $err) -and [bool]$cloud -and ("$local" -eq "$cloud")
+    if (-not $err -and -not $ok) { $err = "the local cache holds '$local' but pCloud's newest complete set is '$cloud'" }
+    [ordered]@{
+        state           = 'done'
+        ok              = $ok
+        started_epoch   = $StartedEpoch
+        finished_epoch  = $NowEpoch
+        finished        = [DateTimeOffset]::FromUnixTimeSeconds($NowEpoch).ToString('o')
+        cloud_stamp     = $cloud
+        local_stamp     = $local
+        local_set_epoch = $setEpoch
+        seeded          = [bool]($Seed -and $Seed.seeded)
+        local_dir       = $LocalDir
+        error           = $err
+    }
+}
+
+function Get-BoxEmbedProfile {
+    # The embedding profile this box restores (ep.active(), as restore-replica.ps1 asks it) and the legacy
+    # profile name, from the deployed server inside WSL. Both '' when WSL or the module does not answer:
+    # the refresh then copies without the profile gate, as before 1.35.2.
+    # On stdin, as restore-replica.ps1 sends its probe: no quoting through wsl.exe's command line.
+    $py = "import os, sys`nsys.path.insert(0, os.path.expanduser('~/apps/mem0-server'))`nimport embedder_profile as ep`nprint(ep.active().name + ' ' + ep.LEGACY_PROFILE)`n"
+    try {
+        $out = "$($py | wsl.exe -d $Distro -e python3 - 2>$null | Select-Object -First 1)".Trim()
+        if ($out -match '^([a-z0-9][a-z0-9-]*) ([a-z0-9][a-z0-9-]*)$') { return @($Matches[1], $Matches[2]) }
+    } catch {}
+    return @('', '')
+}
+
 function Wsl([string]$cmd) { wsl.exe -d $Distro -e bash -lc $cmd }
 
 function Test-Endpoint([string]$url) {
@@ -274,36 +457,10 @@ switch ($Mode) {
       if (-not $BackupDir) {
           $online = Test-Endpoint $Authority
           if ($online) {
-              try {
-                  $cloudStamp = Get-NewestCompleteSet $CloudBackupDir
-                  $localStamp = Get-NewestCompleteSet $LocalBackupDir
-                  # A newer cloud set, or the same set whose media tar the local copy lacks (the tar is copied
-                  # last and is not part of "complete", so a failed copy leaves the set looking whole). The copy
-                  # loop below skips every file already held at the right size, so the second case fetches
-                  # only the tar.
-                  if ($cloudStamp -and (($cloudStamp -gt "$localStamp") -or
-                                        ($cloudStamp -eq "$localStamp" -and (Test-SetMediaMissing $CloudBackupDir $LocalBackupDir $cloudStamp)))) {
-                      New-Item -ItemType Directory -Force -Path $LocalBackupDir | Out-Null
-                      Write-Host "    seeding local snapshot cache from pCloud: $cloudStamp"
-                      foreach ($src in (Get-SetFiles $CloudBackupDir $cloudStamp -WithMedia)) {
-                          $dst = Join-Path $LocalBackupDir (Split-Path $src -Leaf)
-                          if ((Test-Path $dst) -and (Get-Item $dst).Length -eq (Get-Item $src).Length) { continue }
-                          # .part + atomic same-volume rename: a torn 686MB copy (sleep, Ctrl-C,
-                          # pCloud stall) must never masquerade as a complete set on the plane.
-                          Copy-Item $src "$dst.part" -Force -ErrorAction Stop
-                          Move-Item "$dst.part" $dst -Force -ErrorAction Stop
-                      }
-                      # Retention: keep the newest 3 complete sets (~721MB each), prune the rest.
-                      $keep = @(Get-ChildItem (Join-Path $LocalBackupDir 'manifest-*.json') -File |
-                                Sort-Object Name -Descending | Select-Object -First 3 |
-                                ForEach-Object { $_.BaseName -replace '^manifest-', '' })
-                      Get-ChildItem (Join-Path $LocalBackupDir 'manifest-*.json') -File |
-                          ForEach-Object { $_.BaseName -replace '^manifest-', '' } |
-                          Where-Object { $keep -notcontains $_ } |
-                          ForEach-Object { Get-SetFiles $LocalBackupDir $_ -WithMedia | Where-Object { Test-Path $_ } | Remove-Item -Force }
-                  }
-              } catch {
-                  Write-Host "    (could not refresh from pCloud: $($_.Exception.Message) — using the local cache as-is)" -ForegroundColor DarkYellow
+              $bp = Get-BoxEmbedProfile
+              $seed = Update-LocalCache $CloudBackupDir $LocalBackupDir -BoxProfile $bp[0] -LegacyProfile $bp[1]
+              if ($seed.error) {
+                  Write-Host "    (could not refresh from pCloud: $($seed.error) — using the local cache as-is)" -ForegroundColor DarkYellow
               }
           }
       }
@@ -348,6 +505,15 @@ switch ($Mode) {
       # 3. Restore into the LOCAL stack
       & "$PSScriptRoot\restore-replica.ps1" -BackupDir $BackupDir -Stamp $stamp -Distro $Distro
 
+      # 1.35.2: the restore marker names the SET it restored ("<time> <stamp>"), written here, after a
+      # restore that did not throw, by every caller (the watcher's takeover and an operator alike). The
+      # watcher restores again at the next takeover whenever the cache's newest complete set is newer than
+      # this stamp. Comparing clock times instead (marker time against the refresh's finish time) missed a
+      # set seeded while a restore ran, and every set seeded by hand.
+      $marker = Join-Path $env:USERPROFILE '.claude\state\replica-restored.txt'
+      New-Item -ItemType Directory -Force -Path (Split-Path $marker) | Out-Null
+      Set-Content -LiteralPath $marker -Value "$((Get-Date).ToUniversalTime().ToString('o')) $stamp" -Encoding utf8
+
       # 4. Flip: travel.json is what the shim actually reads (per call, host-pinned).
       $state = @{ mode = 'travel'; host = $env:COMPUTERNAME; replica_url = $Replica
                   since = (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz'); snapshot = $stamp } | ConvertTo-Json -Compress
@@ -365,6 +531,61 @@ EOF"
       Write-Host "==> Travel mode ON. Recall works offline. Run 'travel-mode.ps1 off' when you're back online." -ForegroundColor Green
       Show-Status
       break
+  }
+
+  'refresh' {
+      # 1.35.2: keep the takeover snapshot current. Before this, the cache was refreshed only by 'on'
+      # (at a takeover, when the authority is down and the refresh is skipped) or by an operator running
+      # 'on -DryRun', so a replica took over with whatever set was last copied by hand: on 2026-10-11
+      # both PC replicas held a set two days old and nothing would have refreshed it. The
+      # mem0-replica-cache-refresh task runs this when the offline watcher finds a refresh due; it
+      # touches no service and no model, only the files under the local cache folder.
+      $recPath = Get-RefreshRecordPath
+      $lockPath = [IO.Path]::ChangeExtension($recPath, '.lock')
+      New-Item -ItemType Directory -Force -Path (Split-Path $recPath) | Out-Null
+      # One refresh at a time. The OS releases the lock if this process dies, so it can never go stale.
+      # A second run while one holds it exits 0 and writes nothing: the running one owns the record.
+      # (The task's IgnoreNew already stops a second task instance; this covers a run by hand.)
+      $lock = $null; $refreshFailed = $false
+      try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+      catch { Write-Host "==> replica cache refresh already running (lock held: $lockPath); nothing to do"; exit 0 }
+      try {
+          $prior = Read-RefreshRecord $recPath
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          # A 'running' record first: the watcher waits on it instead of starting another refresh, and a
+          # run that dies leaves the record that says when it started.
+          Write-RefreshRecord $recPath (New-RunningRecord -Prior $prior -StartedEpoch $started)
+          $seed = $null; $failure = ''
+          try {
+              # The guard runs inside the recorded section on purpose: a refusal (or a WSL that does not
+              # answer the role question) still writes a failed record, so the watcher waits $RetryHours
+              # instead of starting the task again every two minutes.
+              Assert-NotTheAuthority 'refresh'
+              Resolve-TravelDefaults
+              Write-Host "==> replica cache refresh: $CloudBackupDir -> $LocalBackupDir"
+              # Only while the authority answers: with no network pCloud's drive can stall instead of failing.
+              if (Test-Endpoint $Authority) {
+                  $bp = Get-BoxEmbedProfile
+                  $seed = Update-LocalCache $CloudBackupDir $LocalBackupDir -BoxProfile $bp[0] -LegacyProfile $bp[1]
+              }
+              else { $failure = "the authority $Authority is unreachable; a refresh runs only while online" }
+          } catch { $failure = $_.Exception.Message }
+          # A run that never reached the cache still says what a takeover would restore, read from the disk.
+          $onDisk = if (-not $seed -and $LocalBackupDir) { "$(Get-NewestCompleteSet $LocalBackupDir)" } else { '' }
+          $result = New-RefreshResult -Seed $seed -Prior $prior -StartedEpoch $started -NowEpoch ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) `
+                                      -LocalDir $LocalBackupDir -CloudDir $CloudBackupDir -ErrorText $failure -FallbackLocalStamp $onDisk
+          Write-RefreshRecord $recPath $result
+          if ($result.ok) {
+              Write-Host "    cache holds $($result.local_stamp), the newest complete set$(if ($result.seeded) { ' (copied now)' } else { ' (already held)' })" -ForegroundColor Green
+          } else {
+              Write-Host "    NOT refreshed: $($result.error)" -ForegroundColor Yellow
+              $refreshFailed = $true
+          }
+      } finally { if ($lock) { $lock.Dispose() } }
+      # The exit code is the task's LastTaskResult. Both outcomes are explicit: falling off the end would
+      # leave whatever the last native call returned (a wsl.exe probe), not the refresh's own result.
+      if ($refreshFailed) { exit 1 }
+      exit 0
   }
 
   'off' {

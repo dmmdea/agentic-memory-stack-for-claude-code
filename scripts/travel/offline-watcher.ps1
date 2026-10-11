@@ -35,6 +35,94 @@ function Test-IsLocalUrl {
     return $false   # non-IP hostnames other than localhost are remote (your-machine, any operator's host)
 }
 
+function Test-CacheRefreshDue {
+    # 1.35.2: is it time to refresh the local snapshot cache (travel-mode.ps1 refresh, through the
+    # mem0-replica-cache-refresh task)? $Record is replica-cache-refresh.json (or $null). Due when there is
+    # no record, $OkHours after a refresh that left the cache current (the authority writes one set a
+    # night, so 12 h picks each one up the same day), $RetryHours after one that did not, and $StaleRunHours
+    # after a 'running' record (a refresh that died mid-copy: the task's 2 h limit killed it, or a reboot;
+    # the same 6 h as a failure, so a refresh that keeps dying is not restarted back to back). Epoch
+    # seconds, never parsed dates: pwsh's ConvertFrom-Json turns ISO strings into DateTimes of whatever kind
+    # it guesses. A stamp in the future (a clock moved back) is treated as due, so a bad clock can never
+    # stop the refresh for good.
+    param($Record, [int64]$NowEpoch, [double]$OkHours = 12, [double]$RetryHours = 6, [double]$StaleRunHours = 6)
+    if (-not $Record) { return $true }
+    $state = [string]$Record.state
+    $at = if ($state -eq 'running') { $Record.started_epoch } else { $Record.finished_epoch }
+    $t = 0L
+    if ($null -eq $at -or -not [int64]::TryParse("$at", [ref]$t) -or $t -le 0) { return $true }
+    $ageH = ($NowEpoch - $t) / 3600.0
+    if ($ageH -lt 0) { return $true }
+    if ($state -eq 'running') { return $ageH -ge $StaleRunHours }
+    if ($Record.ok -eq $true) { return $ageH -ge $OkHours }
+    return $ageH -ge $RetryHours
+}
+
+function Read-RestoreMarker {
+    # replica-restored.txt: "<ISO time> <set stamp>" since 1.35.2 (travel-mode.ps1 on writes it after a
+    # restore), a bare time before. Returns Epoch (file mtime, UTC) and Stamp ('' for an old marker), or $null.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $stamp = ''
+    try {
+        $tok = @("$(Get-Content -Raw -LiteralPath $Path)".Trim() -split '\s+')
+        if ($tok.Count -ge 2 -and $tok[1] -match '^[0-9]{8}-[0-9]{6}$') { $stamp = $tok[1] }
+    } catch {}
+    [pscustomobject]@{ Epoch = [DateTimeOffset]::new((Get-Item -LiteralPath $Path).LastWriteTimeUtc).ToUnixTimeSeconds(); Stamp = $stamp }
+}
+
+function Get-CacheNewestStamp {
+    # The newest COMPLETE set in the local cache: the four files sharing a stamp, as travel-mode.ps1's
+    # Get-NewestCompleteSet decides it (ReplicaTakeover.Tests.ps1 runs both on the same folders). '' when none.
+    param([string]$Dir)
+    try {
+        if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return '' }
+        foreach ($m in @(Get-ChildItem (Join-Path $Dir 'manifest-*.json') -File -ErrorAction Stop | Sort-Object Name -Descending)) {
+            $s = $m.BaseName -replace '^manifest-', ''
+            $need = @("episodic-$s.db", "history-$s.db", "qdrant-$s.snapshot") | ForEach-Object { Join-Path $Dir $_ }
+            if (-not ($need | Where-Object { -not (Test-Path -LiteralPath $_) })) { return $s }
+        }
+    } catch {}
+    return ''
+}
+
+function Get-LocalCacheDir {
+    # Where the takeover snapshot cache is: the folder the last refresh recorded, else travel-mode.ps1's
+    # convention, D:\memory-backups\<authority host> (no folder for an IP literal or a local host).
+    param($Record, [string]$Authority)
+    if ($Record -and $Record.local_dir) { return [string]$Record.local_dir }
+    $h = ''
+    try { $h = ([System.Uri]$Authority).Host } catch {}
+    $h = ($h -split '\.')[0].ToLowerInvariant()
+    if (-not $h -or $h -match '^\d+$' -or $h -in @('127', 'localhost')) { return '' }
+    return "D:\memory-backups\$h"
+}
+
+function Test-ReplicaRestoreStale {
+    # Must a takeover restore again (travel-mode.ps1 on), or may it restart the replica it last restored?
+    # Restore again when there is no restore marker, when it is older than $MaxHours, when it does not name
+    # the set it restored (written before 1.35.2), or when the cache now holds a newer complete set than
+    # that one: the replica would otherwise come up with the older set while the newer one sits beside it.
+    # Set stamps, not clock times: a set seeded while a restore ran, or seeded by hand, is still seen.
+    param($Marker, [string]$CacheStamp, [int64]$NowEpoch, [double]$MaxHours = 24)
+    if (-not $Marker -or $Marker.Epoch -le 0) { return $true }
+    if ((($NowEpoch - $Marker.Epoch) / 3600.0) -gt $MaxHours) { return $true }
+    if (-not $Marker.Stamp) { return $true }
+    if ($CacheStamp -and $CacheStamp -gt $Marker.Stamp) { return $true }
+    return $false
+}
+
+function Write-WatcherLog {
+    # The tick runs windowless, so Write-Host goes nowhere: transitions and failures also go here
+    # (~\.claude\state\offline-watcher.log, trimmed to its last 400 lines past 256 KB).
+    param([string]$Line)
+    try {
+        $p = Join-Path $env:USERPROFILE '.claude\state\offline-watcher.log'
+        Add-Content -LiteralPath $p -Value "$((Get-Date).ToString('s')) $Line" -Encoding utf8
+        if ((Get-Item -LiteralPath $p).Length -gt 256KB) { Set-Content -LiteralPath $p -Value (Get-Content -LiteralPath $p -Tail 400) -Encoding utf8 }
+    } catch {}
+}
+
 if ($DefineOnly) { return }
 # --- tick body added in Task 7 ---
 $ErrorActionPreference = 'Continue'
@@ -91,18 +179,36 @@ if (Test-Path $StateFile) {
 $next = Step-OfflineState -State $prev -Reachable:$reachable
 
 # 4. act on transitions
+$RefreshRecordPath = Join-Path $env:USERPROFILE '.claude\state\replica-cache-refresh.json'
+$refreshRecord = $null
+try { if (Test-Path -LiteralPath $RefreshRecordPath) { $refreshRecord = Get-Content -Raw -LiteralPath $RefreshRecordPath | ConvertFrom-Json -ErrorAction Stop } } catch { $refreshRecord = $null }
+$nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
 if ($next.transition -eq 'go_offline') {
-    # refresh replica if stale (>24h), then bring it up read-only
+    # Restore again if the last restore is stale (no marker, >24 h, or older than the newest complete set
+    # in the cache), then bring the replica up read-only.
     $lastRestore = Join-Path $env:USERPROFILE '.claude\state\replica-restored.txt'
-    $stale = -not (Test-Path $lastRestore) -or ((Get-Date) - (Get-Item $lastRestore).LastWriteTime).TotalHours -gt 24
+    $marker = Read-RestoreMarker $lastRestore
+    $cacheStamp = Get-CacheNewestStamp (Get-LocalCacheDir -Record $refreshRecord -Authority $Authority)
+    $stale = Test-ReplicaRestoreStale -Marker $marker -CacheStamp $cacheStamp -NowEpoch $nowEpoch
+    Write-WatcherLog "go_offline: $Authority unreachable x3; cache newest=$(if ($cacheStamp) { $cacheStamp } else { 'none' }) restored=$(if ($marker -and $marker.Stamp) { $marker.Stamp } elseif ($marker) { '(unnamed)' } else { 'never' }) -> $(if ($stale) { 'restore' } else { 'start the existing restore' })"
     if ($stale) {
-        # stamp the marker ONLY when travel-mode actually succeeded, or later cycles
-        # would treat a failed/partial restore as a fresh replica
+        # travel-mode.ps1 on writes the marker itself, after a restore that did not throw, naming the set
+        # it restored; a failed or partial restore leaves the old marker, so the next takeover tries again.
         $global:LASTEXITCODE = 0
-        $tmOk = $false
-        try { & "$PSScriptRoot\travel-mode.ps1" on | Out-Null; $tmOk = $? } catch { $tmOk = $false }
-        if ($tmOk -and $LASTEXITCODE -eq 0) { Set-Content $lastRestore (Get-Date).ToString('o') }
-        else { Write-Host "offline-watcher: travel-mode.ps1 on failed; not stamping replica-restored marker" }
+        $tmOk = $false; $tmErr = ''
+        try { & "$PSScriptRoot\travel-mode.ps1" on | Out-Null; $tmOk = $? } catch { $tmOk = $false; $tmErr = $_.Exception.Message }
+        if ($tmOk -and $LASTEXITCODE -eq 0) { Write-WatcherLog "go_offline: restored and started the replica" }
+        else {
+            Write-WatcherLog "go_offline: travel-mode.ps1 on FAILED: $tmErr"
+            if ($marker) {
+                # A failed re-restore must not leave the box with no memory when a previous restore is on
+                # disk: start that one (older, but it answers). Nothing is stamped, so the next takeover
+                # tries the newer set again.
+                Wsl "systemctl --user start qdrant.service mem0.service 2>/dev/null; true" | Out-Null
+                Write-WatcherLog "go_offline: started the previous restore ($(if ($marker.Stamp) { $marker.Stamp } else { 'unnamed' })) instead"
+            }
+        }
     } else {
         Wsl "systemctl --user start qdrant.service mem0.service 2>/dev/null; true" | Out-Null
     }
@@ -127,6 +233,7 @@ elseif ($next.transition -eq 'go_online') {
             $drainTs, (($drainOut | Out-String).Trim() | ForEach-Object { if ($_ -match '^\s*\{') { $_ } else { ($_ | ConvertTo-Json -Compress) } }))
         Wsl "printf '%s\n' '$($drainLine -replace "'", "''")' >> ~/.mem0/outbox-drain.log" | Out-Null
         Write-Host "offline-watcher: outbox drain -> $drainOut"
+        Write-WatcherLog "go_online: $Authority back; outbox drain -> $((($drainOut | Out-String).Trim() -replace '\s+', ' '))"
     } else {
         # transient WSL failure: skip replay rather than run a garbage path — the outbox
         # persists on disk, so the drain happens on the next offline->online cycle
@@ -138,6 +245,14 @@ elseif ($next.transition -eq 'go_online') {
     Wsl 'rm -f ~/.mem0/travel.json' | Out-Null
     # v1.23 P2-7: the Windows hooks resolve the authority from ~\.mem0\authority-url, which travel
     # mode never changes any more — nothing to restore on reconnect.
+}
+elseif ($next.mode -eq 'online' -and $reachable -and (Test-CacheRefreshDue -Record $refreshRecord -NowEpoch $nowEpoch)) {
+    # 1.35.2: while the authority answers, keep the takeover snapshot current. The refresh copies a ~700 MB
+    # set from pCloud, so it runs as its own task (install-offline-watcher.ps1 registers it): this tick
+    # returns at once and keeps probing, the task has its own time limit, and its LastTaskResult is
+    # readable. The task ignores a start while one is already running.
+    try { Start-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction Stop }
+    catch { Write-WatcherLog "could not start mem0-replica-cache-refresh ($($_.Exception.Message)); re-run install-offline-watcher.ps1" }
 }
 
 # 5. persist
