@@ -934,7 +934,12 @@ function Invoke-LogRotation {
     # (Audit finding 2026-06-08: l1a.log/c1.log/audit-flags.jsonl had no rotation.)
     param([int]$MaxBytes = 1MB, [int]$KeepN = 5)
     if (-not (Test-Path -LiteralPath $script:LogDir)) { return }
-    foreach ($f in (Get-ChildItem -LiteralPath $script:LogDir -File -ErrorAction SilentlyContinue)) {
+    # Only a live log rotates (a name ending in .log or .jsonl). An archive (<name>.<yyyyMMdd-HHmmss>)
+    # is itself over MaxBytes, and taking it for a live log renamed it again on every pass: the
+    # archives grew chained names (l1a.log.20260930-130831.20260930-132156...) instead of KeepN copies.
+    $live = @(Get-ChildItem -LiteralPath $script:LogDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.(log|jsonl)$' })
+    foreach ($f in $live) {
         if ($f.Length -gt $MaxBytes) {
             $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
             $archived = "$($f.FullName).$ts"
@@ -1260,12 +1265,20 @@ function Resolve-BrandFromMap {
         if (Test-BrandPattern $p $hay -IsPath) { $contentWorkspace = $true; break }
     }
     if (-not $contentWorkspace) { return $null }
+    $found = @(Get-NamedContentBrands -Map $Map -Text $Text)
+    if ($found.Count -eq 1) { return [string]$found[0] }
+    return $null
+}
+
+function Get-NamedContentBrands {
+    # The distinct brands whose content rules match the text. One is a brand; none and several are
+    # both no brand, but a caller that keeps a brand across prompts must tell them apart.
+    param($Map, [string]$Text = '')
     $found = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($r in @(Get-BrandMapList $Map 'content_rules')) {
         if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $Text)) { [void]$found.Add([string]$r.brand) }
     }
-    if ($found.Count -eq 1) { return [string]@($found)[0] }
-    return $null
+    return @($found)
 }
 
 function Get-BrandMap {

@@ -162,6 +162,8 @@ def wired_app(monkeypatch):
     monkeypatch.setattr(app, "_episodic_list_goals", _goals)
     monkeypatch.setattr(app, "_episodic_list_open_questions", _oqs)
     monkeypatch.setattr(app, "_episode_raw_fallback", _raw)
+    # A warm embedder, so the control case searches (test_bundle_cold_gate.py covers the cold one).
+    monkeypatch.setattr(app, "_bundle_embed_gate", lambda: {"embed": True, "state": "loaded"})
     return app, calls
 
 

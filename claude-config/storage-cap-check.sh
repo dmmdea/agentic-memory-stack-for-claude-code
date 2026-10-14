@@ -30,15 +30,30 @@ infer_brand_from_cwd() {
     if [ -f "$cfg" ]; then
         python3 - "$cwd" "$cfg" <<'PY' 2>/dev/null
 import sys, json, re
-cwd = sys.argv[1].lower()
+# The C3 resolver's path matching (scripts/wsl/brand_routing.py, pinned by its shared corpus):
+# backslash, slash and space are one separator, normalized to "-" in the path and in the pattern,
+# so "Projects/ClientA" matches a Windows path, a /mnt path and a Claude Code slug alike.
+def norm_pattern(p):
+    p = re.sub(r"\\\\|\\/|\\ |[/ ]", "-", p)
+    return re.sub(r"\[[^\]]*\]", lambda m: re.sub(r"-{2,}", "-", m.group(0)), p)
+def path_match(p, hay):
+    if not isinstance(p, str) or not p:
+        return False
+    try:
+        return re.search(norm_pattern(p), hay, re.I) is not None
+    except re.error:
+        return False
+cwd = re.sub(r"[\\/ ]", "-", sys.argv[1])
 try:
     rules = json.load(open(sys.argv[2])).get("rules", [])
 except Exception:
     rules = []
 out = ""
 for r in rules:
+    if not isinstance(r, dict):
+        continue
     p = r.get("pattern")
-    if p and re.search(p, cwd, re.I):
+    if path_match(p, cwd):
         out = r.get("brand", ""); break
 print(out)
 PY
@@ -60,15 +75,30 @@ infer_campaign_from_cwd() {
     [ -f "$cfg" ] || { echo ""; return; }
     python3 - "$cwd" "$cfg" <<'PY' 2>/dev/null
 import sys, json, re
-cwd = sys.argv[1].lower()
+# The C3 resolver's path matching (scripts/wsl/brand_routing.py, pinned by its shared corpus):
+# backslash, slash and space are one separator, normalized to "-" in the path and in the pattern,
+# so "Projects/ClientA" matches a Windows path, a /mnt path and a Claude Code slug alike.
+def norm_pattern(p):
+    p = re.sub(r"\\\\|\\/|\\ |[/ ]", "-", p)
+    return re.sub(r"\[[^\]]*\]", lambda m: re.sub(r"-{2,}", "-", m.group(0)), p)
+def path_match(p, hay):
+    if not isinstance(p, str) or not p:
+        return False
+    try:
+        return re.search(norm_pattern(p), hay, re.I) is not None
+    except re.error:
+        return False
+cwd = re.sub(r"[\\/ ]", "-", sys.argv[1])
 try:
     rules = json.load(open(sys.argv[2])).get("rules", [])
 except Exception:
     rules = []
 out = ""
 for r in rules:
+    if not isinstance(r, dict):
+        continue
     p = r.get("pattern")
-    if p and re.search(p, cwd, re.I):
+    if path_match(p, cwd):
         out = r.get("campaign", ""); break
 print(out)
 PY
@@ -88,7 +118,11 @@ infer_initiative_from_cwd() {
     if [ -n "$top" ]; then
         basename "$top"
     else
-        basename "$cwd"
+        # A Windows cwd from the hook's stdin uses backslashes; take its leaf too.
+        local unix
+        unix=$(printf '%s' "$cwd" | tr '\134' '/')
+        unix="${unix%/}"
+        basename "$unix"
     fi
 }
 
@@ -304,7 +338,46 @@ if [ "${_cq:-0}" -gt 0 ] || [ "${_cd:-0}" -gt 0 ]; then
 fi
 
 # v0.17 Phase 0.E: brand context auto-load
-SESSION_CWD="${CLAUDE_CWD:-$PWD}"
+# The session's working directory is the hook's stdin JSON "cwd". $PWD is not it: wsl.exe starts this
+# script in $HOME whenever it cannot translate the Windows cwd (a drive WSL does not mount, such as a
+# cloud-sync letter), and a brand inferred from $HOME is none, so the whole brand block (canonical facts,
+# open goals) was skipped for every session started there. Read once, bounded; CLAUDE_CWD still wins.
+_HOOK_CWD=""
+if [ -z "${CLAUDE_CWD:-}" ] && [ ! -t 0 ]; then
+  _HOOK_CWD=$(python3 -c "
+import json, os, select, time
+buf = b''
+cwd = ''
+end = time.monotonic() + 2.0
+while len(buf) < 65536:
+    left = end - time.monotonic()
+    if left <= 0 or not select.select([0], [], [], left)[0]:
+        break
+    chunk = os.read(0, 65536 - len(buf))
+    if not chunk:
+        break
+    buf += chunk
+    try:
+        d = json.loads(buf.decode('utf-8'))
+    except ValueError:
+        continue
+    c = d.get('cwd') if isinstance(d, dict) else None
+    cwd = c if isinstance(c, str) else ''
+    break
+print(cwd)
+" 2>/dev/null)
+fi
+# A Windows path WSL can enter is used in its /mnt form, the form $PWD would have had: rules written
+# with forward slashes match it and git finds the repository root for the initiative. A drive WSL does
+# not mount (why $PWD is $HOME) has no such form and stays as given; its leaf is the initiative.
+case "$_HOOK_CWD" in
+  [A-Za-z]:\\*|[A-Za-z]:/*)
+    if command -v wslpath >/dev/null 2>&1; then
+      _WSL_CWD=$(wslpath -u "$_HOOK_CWD" 2>/dev/null)
+      [ -n "$_WSL_CWD" ] && [ -d "$_WSL_CWD" ] && _HOOK_CWD="$_WSL_CWD"
+    fi ;;
+esac
+SESSION_CWD="${CLAUDE_CWD:-${_HOOK_CWD:-$PWD}}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
 # Funnel/campaign axis (2026-06-20): isolates funnel-specific canonical rules so a
 # a campaign-a session never sees campaign-b's rules and vice-versa.
@@ -348,12 +421,22 @@ fi
 # The endpoint is public (no key). A malformed or missing body prints nothing: this line must never
 # be the reason a session start fails.
 if [ "$MEM0_UP" = 1 ]; then
-  curl -sf --max-time 1.5 "$AMS_URL/health/maintenance" 2>/dev/null | python3 -c "
-import json, sys
+  curl -sf --max-time 1.5 "$AMS_URL/health/maintenance" 2>/dev/null | AMS_ROLE="$_ROLE" python3 -c "
+import json, os, sys
 try:
     d = json.load(sys.stdin)
     if not isinstance(d, dict):
         raise ValueError
+    # The review queue lives on the authority. The brain prints it from its own file further down;
+    # every other role reads it here, or no session would ever see it (the brain runs none).
+    rq = d.get('review_queue'); rq = rq if isinstance(rq, dict) else {}
+    n_rq = rq.get('pending') if isinstance(rq.get('pending'), int) else 0
+    if os.environ.get('AMS_ROLE') != 'brain' and n_rq > 0:
+        age = rq.get('oldest_age_d')
+        age_txt = (', oldest %sd' % age) if isinstance(age, (int, float)) else ''
+        sys.stdout.buffer.write(('[AMS] %d contradiction verdict(s) await review on the authority%s '
+                                 '(there: contradiction-sweep.py --promote <id> | --resolve-supersede <id> --winner <w> | --dismiss <id>; '
+                                 'list: ~/.mem0/contradiction-promote-review.jsonl)\n' % (n_rq, age_txt)).encode('utf-8'))
     drift = d.get('drift'); drift = drift if isinstance(drift, dict) else {}
     pool = d.get('pool'); pool = pool if isinstance(pool, dict) else {}
     wpath = d.get('write_path'); wpath = wpath if isinstance(wpath, dict) else {}
@@ -389,35 +472,65 @@ except BaseException:
 " 2>/dev/null
 fi
 # WP-2: a replica's recent sessions come from the authority (its own episodic.db froze at the
-# cutover). GET /v1/episodes?recent=20&state=complete (1.5 s; unfinished sessions have no goal and the
-# newest ended_at, so without the filter they can fill the window), keep the 5 newest that have a goal,
+# cutover). GET /v1/episodes?recent=60&state=complete (1.5 s; unfinished sessions have no goal and the
+# newest ended_at, so without the filter they can fill the window), keep the 5 newest sessions that have a goal,
 # label the source. Authority reachable but the read fails -> one "unavailable" line, never silent.
 if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
-  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20&state=complete" 2>/dev/null)
-  _epout=$(printf '%s' "$_eps" | python3 -c "
-import sys, json
+  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=60&state=complete" 2>/dev/null)
+  _epout=$(printf '%s' "$_eps" | AMS_BRAND="$BRAND" AMS_BRANDS_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/brands.json" python3 -c "
+import os, sys, json, datetime as dt
 try:
     rows = json.load(sys.stdin)
     if not isinstance(rows, list):
         raise ValueError
 except Exception:
     print('UNAVAILABLE'); raise SystemExit(0)
+def ago(iso):
+    # ended_at is UTC; printed bare it read as a local time hours in the future. An age needs no zone.
+    try:
+        t = dt.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+        s = max(0, int((dt.datetime.now(dt.timezone.utc) - t).total_seconds()))
+    except Exception:
+        return (str(iso or '')[:16].replace('T', ' ') or '?')
+    return ('%dm ago' % (s // 60)) if s < 3600 else ('%dh ago' % (s // 3600)) if s < 172800 else ('%dd ago' % (s // 86400))
+def clip(text, n=90):
+    # Cut at a word boundary, never mid-word.
+    if len(text) <= n:
+        return text
+    cut = text[:n].rsplit(' ', 1)[0].rstrip(' ,;:-')
+    return (cut or text[:n]) + '\u2026'
+# One line per session (a session writes an episode per extraction window, so the newest rows were
+# mostly one session's), and the memory admission rule for brands: the session's own brand, a shared
+# brand, or untagged. Another brand's session titles never print here.
+session_brand = os.environ.get('AMS_BRAND', '').strip().lower()
+try:
+    shared = set(json.load(open(os.environ.get('AMS_BRANDS_JSON', ''), encoding='utf-8')).get('shared_brands') or [])
+except Exception:
+    shared = set()
+shared = {str(b).strip().lower() for b in shared | set(os.environ.get('MEM0_SHARED_BRANDS', '').split(','))} - {''}
+seen = set()
 out = []
-for r in rows:
+for i, r in enumerate(rows):
     if not isinstance(r, dict):
         continue
     goal = (r.get('goal_text') or '').strip()
     if not goal:
         continue
-    ended = (r.get('ended_at') or '')[:16].replace('T', ' ')
-    brand = r.get('brand') or ''
+    brand = (r.get('brand') or '').strip()
+    if brand and brand.lower() != session_brand and brand.lower() not in shared:
+        continue
+    sid = r.get('session_id') or ('row-' + str(i))
+    if sid in seen:
+        continue
+    seen.add(sid)
     tag = ('[' + brand + '] ') if brand else ''
-    out.append('  - ' + ended + ': ' + tag + goal[:90])
+    out.append('  - ' + ago(r.get('ended_at')) + ': ' + tag + clip(goal))
     if len(out) == 5:
         break
 if out:
-    print('[agentic-memory-stack] recent sessions (last 5) (authority):')
-    print(chr(10).join(out))
+    # Bytes, not print(): a goal or the ellipsis is not ASCII, and a C locale would make print() raise.
+    sys.stdout.buffer.write(('[agentic-memory-stack] recent sessions (last 5) (authority):' + chr(10) + chr(10).join(out) + chr(10)).encode('utf-8'))
 " 2>/dev/null)
   if [ "$_epout" = UNAVAILABLE ]; then
     echo "[agentic-memory-stack] recent sessions unavailable: authority unreachable"

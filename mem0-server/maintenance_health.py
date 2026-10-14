@@ -357,6 +357,35 @@ def _capture(reader: Optional[Callable[[], dict]], now: dt.datetime) -> Optional
     return out
 
 
+def review_queue(path: Path, now: dt.datetime) -> dict:
+    """The contradiction review queue's depth and age: {"pending", "oldest_at", "oldest_age_d"}.
+
+    The sweep QUEUES the verdicts it may not enforce for an operator decision, and the session-start
+    banner printed the depth only on the brain, which runs no interactive sessions: replica PCs never
+    showed it, so the queue filled unseen. Served here so a replica's banner can print it. A missing
+    or unreadable file is an empty queue; a line that is not a JSON object still counts as pending
+    (an operator can see it in the file). Never raises."""
+    out: dict = {"pending": 0, "oldest_at": None, "oldest_age_d": None}
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    except OSError:
+        return out
+    out["pending"] = len(lines)
+    oldest: Optional[dt.datetime] = None
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        ts = _parse_ts(rec.get("ts") or "") if isinstance(rec, dict) else None
+        if ts is not None and (oldest is None or ts < oldest):
+            oldest = ts
+    if oldest is not None:
+        out["oldest_at"] = oldest.astimezone(dt.timezone.utc).isoformat()
+        out["oldest_age_d"] = round(max(0.0, (now - oldest).total_seconds() / 86400.0), 1)
+    return out
+
+
 def build(receipts_path: Path, now: dt.datetime, pool_reader: Callable[[], tuple],
           boots_reader: Callable[[], list[str]], judge_transport: Callable[[], str],
           usage_reader: Optional[Callable[[], dict]] = None,

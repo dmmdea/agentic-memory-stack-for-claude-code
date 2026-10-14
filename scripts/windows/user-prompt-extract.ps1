@@ -373,7 +373,8 @@ if ($script:DaemonServedBundle) {
 } elseif ($transcriptPath -and (Test-FunctionAvailable 'Get-BrandFromTranscriptPath')) {
     # C3: one resolver for brand AND workspace. The workspace is the transcript dir; it was the
     # constant 'ai-ecosystem', wrong for every other project's sessions.
-    $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)
+    # The prompt is the text a content-classified workspace's rules read (brands.json content_rules).
+    $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Text ([string]$prompt)
     $brand = $brandInfo.brand
     $workspace = $brandInfo.workspace
 }

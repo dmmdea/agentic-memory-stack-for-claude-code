@@ -19,7 +19,9 @@ shims first on PATH, so no test ever touches a network or a real store.
 from __future__ import annotations
 
 import json
+import re
 import os
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -58,7 +60,16 @@ UNREACHABLE = "[AMS] authority unreachable"
 class Box:
     """One fixture HOME plus the recording shims."""
 
-    def __init__(self, tmp: Path, role: str | None):
+    def __init__(self, tmp: Path, role: str | None, brands: dict | None = None):
+        self.script = SCRIPT
+        if brands is not None:
+            # The script reads brands.json beside itself: run a copy that has one.
+            cfg = tmp / "cfg"
+            cfg.mkdir()
+            for n in ("storage-cap-check.sh", "sessionstart_bundle.py"):
+                shutil.copy(SCRIPT.parent / n, cfg / n)
+            (cfg / "brands.json").write_text(json.dumps(brands))
+            self.script = cfg / "storage-cap-check.sh"
         self.home = tmp / "home"
         self.fake = tmp / "fake"
         self.bin = tmp / "bin"
@@ -85,22 +96,42 @@ class Box:
         if episodes is not None:
             (self.fake / "episodes.json").write_text(json.dumps(episodes))
 
-    def run(self) -> str:
+    def env(self, claude_cwd: str | None = "/tmp") -> dict:
         env = {
             "HOME": str(self.home), "USERPROFILE": str(self.home),
             "HOMEDRIVE": os.path.splitdrive(str(self.home))[0],
             "HOMEPATH": os.path.splitdrive(str(self.home))[1],
             "PATH": f"{self.bin}:/usr/bin:/bin",
-            "CLAUDE_CWD": "/tmp",
             "FAKE_DIR": str(self.fake),
             # The morning-summary counter only runs when the script lives under /mnt/c/Users/*, which
             # no repo-path test run does; this override (honoured by the script only when set) points
             # it at the fixture profile so the role gate on that block is actually exercised.
             "AMS_WINPROFILE_OVERRIDE": str(self.winprofile),
         }
-        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+        if claude_cwd is not None:
+            env["CLAUDE_CWD"] = claude_cwd
+        return env
+
+    def run(self, *, stdin: str | None = None, claude_cwd: str | None = "/tmp") -> str:
+        res = subprocess.run(["bash", str(self.script)], env=self.env(claude_cwd), capture_output=True,
+                             text=True, timeout=60, input=stdin if stdin is not None else "",
+                             cwd=str(self.home))
         assert res.returncode == 0, f"script must always exit 0: {res.stderr}"
         return res.stdout
+
+    def run_with_open_stdin(self, payload: str) -> tuple[str, float]:
+        """The hook JSON arrives but stdin is never closed (a host that does not forward EOF)."""
+        t0 = time.monotonic()
+        proc = subprocess.Popen(["bash", str(self.script)], env=self.env(None), cwd=str(self.home),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
+            out = proc.stdout.read().decode("utf-8")
+            assert proc.wait(timeout=60) == 0
+        finally:
+            proc.stdin.close()
+        return out, time.monotonic() - t0
 
     def calls(self) -> str:
         p = self.fake / "calls.log"
@@ -115,8 +146,11 @@ def _ok_maintenance() -> dict:
     }
 
 
-def _ep(goal: str, ended: str, brand: str = "") -> dict:
-    return {"id": 1, "goal_text": goal, "ended_at": ended, "brand": brand}
+def _ep(goal: str, ended: str, brand: str = "", session_id: str | None = None) -> dict:
+    row = {"id": 1, "goal_text": goal, "ended_at": ended, "brand": brand}
+    if session_id is not None:
+        row["session_id"] = session_id
+    return row
 
 
 def _plant_brain_artifacts(home: Path) -> None:
@@ -223,18 +257,21 @@ def test_brain_still_prints_its_artifacts_and_spawns_the_rejudge(tmp_path):
 
 
 def test_replica_recent_sessions_come_from_the_authority(tmp_path):
-    box = Box(tmp_path, "replica")
+    box = Box(tmp_path, "replica", brands={"rules": [], "shared_brands": ["cross-brand"]})
     _plant_brain_artifacts(box.home)
     eps = [_ep("", "2026-09-29T20:00:00Z")] + [
-        _ep(f"live goal {i}", f"2026-09-29T1{9 - i}:00:00Z", "brand-a" if i == 0 else "") for i in range(7)]
+        _ep(f"live goal {i}", f"2026-09-29T1{9 - i}:00:00Z", "cross-brand" if i == 0 else "") for i in range(7)]
     box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
     out = box.run()
     assert "[agentic-memory-stack] recent sessions (last 5) (authority):" in out
-    assert "live goal 0" in out and "[brand-a]" in out and "2026-09-29 19:00" in out
+    assert "live goal 0" in out and "[cross-brand]" in out
+    # The UTC ended_at prints as an age (a bare UTC stamp read as a local time in the future).
+    assert re.search(r"  - \d+[mhd] ago: \[cross-brand\] live goal 0", out), out
+    assert "2026-09-29 19:00" not in out
     assert "live goal 4" in out
     assert "live goal 5" not in out, "only the 5 newest goal-bearing rows"
     assert "FROZEN-LOCAL-GOAL" not in out
-    assert "/v1/episodes?recent=20&state=complete" in box.calls()
+    assert "/v1/episodes?recent=60&state=complete" in box.calls()
 
 
 def test_replica_recent_sessions_read_failure_prints_one_unavailable_line(tmp_path):
@@ -352,3 +389,169 @@ def test_banner_replica_authority_down(tmp_path):
     assert out.splitlines().count(UNREACHABLE) == 1, out
     assert "memory server still starting" not in out
     assert "recent sessions" not in out
+
+
+# --- usability audit 2026-10: what a replica's banner must still show ------------------------------
+
+
+def test_replica_prints_the_authoritys_review_queue(tmp_path):
+    """The brain runs no sessions; a replica that does not print the queue leaves it unseen."""
+    box = Box(tmp_path, "replica")
+    m = _ok_maintenance()
+    m["review_queue"] = {"pending": 18, "oldest_at": "2026-10-04T08:12:43+00:00", "oldest_age_d": 9.7}
+    box.authority(up=True, maintenance=m, episodes=[])
+    out = box.run()
+    assert out.count("contradiction verdict(s) await review on the authority") == 1, out
+    assert "[AMS] 18 contradiction verdict(s) await review on the authority, oldest 9.7d" in out
+    assert "brain NOT OK" not in out, "a pending queue is not a health failure"
+
+
+def test_replica_prints_no_review_line_for_an_empty_or_absent_queue(tmp_path):
+    for rq in ({"pending": 0, "oldest_at": None, "oldest_age_d": None}, None):
+        box = Box(tmp_path / ("z" if rq else "n"), "replica")
+        m = _ok_maintenance()
+        if rq is not None:
+            m["review_queue"] = rq
+        box.authority(up=True, maintenance=m, episodes=[])
+        assert "await review" not in box.run()
+
+
+def test_brain_does_not_print_the_authority_review_line_twice(tmp_path):
+    box = Box(tmp_path, "brain")
+    m = _ok_maintenance()
+    m["review_queue"] = {"pending": 2, "oldest_at": None, "oldest_age_d": None}
+    box.authority(up=True, maintenance=m, episodes=[])
+    assert "await review on the authority" not in box.run()
+
+
+def test_replica_recent_session_goal_is_cut_at_a_word_boundary(tmp_path):
+    box = Box(tmp_path, "replica")
+    goal = "Complete and verify CPU and GPU firmware documentation and tools repositories, then prepare the release"
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[_ep(goal, "2026-09-29T19:00:00Z")])
+    out = box.run()
+    line = next(ln for ln in out.splitlines() if "Complete and verify" in ln)
+    assert line.endswith("…"), line
+    clipped = line.split(": ", 1)[1].rstrip("…")
+    assert goal.startswith(clipped) and len(clipped) <= 90, line
+    assert goal[len(clipped)] in " ,;:-", f"cut mid-word: {line!r}"
+
+
+def test_brand_comes_from_the_hooks_stdin_cwd_when_wsl_could_not_enter_it(tmp_path):
+    """wsl.exe starts the hook in $HOME when it cannot translate the Windows cwd; the brand must come
+    from the hook's stdin JSON, or the brand block (canonical facts, open goals) is skipped."""
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup",
+                          "cwd": r"X:\Shared Drive\Dev\agentic-memory-stack"})
+    out = box.run(stdin=hook_in, claude_cwd=None)
+    assert "[agentic-memory-stack] brand context (ai-ecosystem):" in out, out
+
+
+def test_no_stdin_and_no_claude_cwd_falls_back_to_pwd(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin="", claude_cwd=None)          # PWD is the fixture HOME: no brand
+    assert "brand context (" not in out, out
+
+
+def test_claude_cwd_still_wins_over_stdin(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"cwd": r"X:\Work\agentic-memory-stack"})
+    out = box.run(stdin=hook_in, claude_cwd="/tmp")
+    assert "brand context (" not in out, out
+
+
+def test_replica_recent_sessions_one_line_per_session(tmp_path):
+    box = Box(tmp_path, "replica")
+    eps = [_ep(f"window {i} of session A", f"2026-09-29T19:{50 - i:02d}:00Z", session_id="A") for i in range(4)]
+    eps += [_ep("session B goal", "2026-09-29T18:00:00Z", session_id="B")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    out = box.run()
+    assert "window 0 of session A" in out and "session B goal" in out
+    assert "window 1 of session A" not in out, "only the newest episode of a session prints"
+
+
+def test_replica_recent_sessions_hide_another_brands_sessions(tmp_path):
+    box = Box(tmp_path, "replica")
+    eps = [_ep("other brand work", "2026-09-29T19:00:00Z", "brand-b", "S1"),
+           _ep("neutral work", "2026-09-29T18:00:00Z", "", "S2")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    out = box.run()                                   # CLAUDE_CWD=/tmp: a brandless session
+    assert "neutral work" in out
+    assert "other brand work" not in out and "[brand-b]" not in out
+
+
+def test_stdin_that_never_reaches_eof_is_read_without_waiting_for_it(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"session_id": "s1", "cwd": r"X:\Shared Drive\Dev\agentic-memory-stack"})
+    t0 = time.monotonic()
+    box.run(stdin=hook_in, claude_cwd=None)
+    closed = time.monotonic() - t0
+    out, open_s = box.run_with_open_stdin(hook_in)
+    assert "brand context (ai-ecosystem):" in out, "the cwd was lost with the stdin read"
+    assert open_s < closed + 1.0, f"waited on stdin: {open_s:.2f}s open vs {closed:.2f}s closed"
+
+
+def test_a_windows_cwd_with_slash_brand_rules_resolves_the_brand(tmp_path):
+    """Brand rules are written with forward slashes; a Windows-form cwd (a drive WSL does not
+    mount, so no /mnt form exists) must still match them."""
+    box = Box(tmp_path, "replica", brands={"rules": [{"pattern": "projects/clienta", "brand": "brand-a"}]})
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin=json.dumps({"cwd": r"X:\Projects\ClientA\site"}), claude_cwd=None)
+    assert "brand context (brand-a):" in out, out
+
+
+def test_a_windows_cwd_wsl_can_enter_uses_its_mnt_form_and_the_repo_root(tmp_path):
+    """A mounted drive: the stdin cwd is translated (wslpath) to the form $PWD had, so git finds the
+    repository root and the initiative is the repo, not the subdirectory the session started in."""
+    repo = tmp_path / "agentic-memory-stack"
+    sub = repo / "docs"
+    sub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    box = Box(tmp_path, "replica")
+    (box.bin / "wslpath").write_text(f"#!/bin/bash\necho '{sub}'\n")
+    (box.bin / "wslpath").chmod(0o755)
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin=json.dumps({"cwd": r"D:\Work\agentic-memory-stack\docs"}), claude_cwd=None)
+    assert "brand context (ai-ecosystem):" in out, out
+    goals = [ln for ln in box.calls().splitlines() if "/v1/goals?" in ln]
+    assert goals and "initiative=agentic-memory-stack" in goals[0], goals
+
+
+def test_recent_sessions_brand_filter_is_case_insensitive_and_reads_the_env_shared_list(tmp_path):
+    box = Box(tmp_path, "replica", brands={"rules": [{"pattern": "projects/clienta", "brand": "brand-a"}],
+                                           "shared_brands": []})
+    eps = [_ep("own brand work", "2026-09-29T19:00:00Z", "Brand-A", "S1"),
+           _ep("shared via env", "2026-09-29T18:30:00Z", "Ops-Shared", "S2"),
+           _ep("other brand work", "2026-09-29T18:00:00Z", "brand-b", "S3")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    env_run = box.env(None)
+    env_run["MEM0_SHARED_BRANDS"] = "ops-shared"
+    res = subprocess.run(["bash", str(box.script)], env=env_run, capture_output=True, text=True, timeout=60,
+                         input=json.dumps({"cwd": r"X:\Projects\ClientA"}), cwd=str(box.home))
+    out = res.stdout
+    assert "own brand work" in out and "shared via env" in out, out
+    assert "other brand work" not in out
+
+
+def test_banner_brand_rules_match_like_the_c3_resolver_on_the_shared_corpus(tmp_path):
+    """The banner's path-rule step must agree with scripts/wsl/brand_routing.py on every corpus row
+    whose answer comes from the path alone (no text: the banner has no prompt at session start)."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    fn = src[src.index("infer_brand_from_cwd() {"):]
+    body = fn.split("<<'PY' 2>/dev/null\n", 1)[1].split("\nPY\n", 1)[0]
+    corpus = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "brand-routing-cases.jsonl"
+    rows = [json.loads(ln) for ln in corpus.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    checked = 0
+    for i, row in enumerate(rows):
+        if row.get("text") or not isinstance(row.get("map"), dict):
+            continue
+        cfg = tmp_path / f"map{i}.json"
+        cfg.write_text(json.dumps(row["map"]))
+        got = subprocess.run(["python3", "-", row.get("path") or "", str(cfg)], input=body,
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        assert got == (row.get("expect") or ""), (row.get("path"), row.get("expect"), got)
+        checked += 1
+    assert checked >= 5, f"only {checked} path-only corpus rows"

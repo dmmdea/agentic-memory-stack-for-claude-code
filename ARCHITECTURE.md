@@ -36,8 +36,8 @@ flowchart LR
     end
     subgraph AUTH["Authority (native Linux, systemd --user)"]
         MEM0["mem0 FastAPI server :18791<br/>tailnet address only<br/>tiers, admission gate, context bundle,<br/>episodic / goals / open-questions"]
-        QD["Qdrant 127.0.0.1:6333<br/>mem0_egemma_768 (768-d cosine)<br/>+ episodes and wiki collections"]
-        LS["llama-swap 127.0.0.1:11436<br/>EmbeddingGemma-300m (embed) + bge-reranker-v2-m3 (rerank)<br/>GPU, unload after 300 s idle"]
+        QD["Qdrant 127.0.0.1:6333<br/>mem0_eg2_768 (768-d cosine; the embedding profile's collection)<br/>+ episodes and wiki collections"]
+        LS["llama-swap 127.0.0.1:11436<br/>EmbeddingGemma-2 (embed) + bge-reranker-v2-m3 (rerank)<br/>GPU, unload after 300 s idle"]
         CHAIN["ams-nightly.timer 03:00<br/>18-step chain"]
         JUDGE["Codex CLI (native judge)"]
         STORE["System A hub checkout<br/>ams-store judge-apply"]
@@ -101,10 +101,10 @@ sequenceDiagram
 
 ### 2. Storage + hybrid search
 
-- **Store**: Qdrant (systemd-user, loopback :6333), collection `mem0_egemma_768` — 768-d cosine, on-disk. A second collection holds **episode-summary embeddings** for the raw-trace fallback.
-- **Embedder**: **EmbeddingGemma-300m** on llama-swap (:11436, on the GPU; it unloads after 300 s idle, so the first call after an idle spell pays a cold load, which the SessionStart pre-warm `GET /health/embedder` absorbs). Multilingual — EN/ES recall@1 ≈ 0.90 both (see [design decisions](#design-decisions-worth-knowing)). It requires *asymmetric task prefixes* (query vs document), applied by the prefix-shim `egemma_embedder.py` installed onto the mem0 embedding model at server start.
+- **Store**: Qdrant (systemd-user, loopback :6333), the active embedding profile's collection — `mem0_eg2_768` on the default EmbeddingGemma-2 profile, `mem0_egemma_768` on the legacy EmbeddingGemma-300m one ([embedder profiles](./docs/systems/embedder-profiles.md)) — 768-d cosine, on-disk. A second collection holds **episode-summary embeddings** for the raw-trace fallback.
+- **Embedder**: the profile's model on llama-swap — **EmbeddingGemma-2** by default, EmbeddingGemma-300m on the legacy profile (:11436, on the GPU; it unloads after 300 s idle, so the first call after an idle spell pays a cold load: the SessionStart pre-warm `GET /health/embedder` absorbs it at session start, and a per-prompt bundle that finds it unloaded abstains while a background warm runs, see [recall](#4-recall--the-read-path)). Multilingual — EN/ES recall@1 ≈ 0.90 both on EmbeddingGemma-300m (see [design decisions](#design-decisions-worth-knowing)). It requires *asymmetric task prefixes* (query vs document), applied by the prefix-shim `egemma_embedder.py` installed onto the mem0 embedding model at server start.
 - **Server**: a FastAPI wrapper around mem0 2.x (the authority's tailnet address, :18791) that owns the tier protocol, admission gate, context bundle, and the episodic/goals/open-questions sidecar. `/health` and `/health/deep` report the stack version and end-to-end store/embedder health — including the GATING `sparse_leg` BM25-liveness canary.
-- **Search is hybrid**: dense cosine is the **gate** (a candidate must clear the semantic threshold), then BM25 keyword + entity boosts shape the returned ranking. The BM25 leg depends on the **fastembed** sparse encoder (explicit in the installer, with a loadability post-condition) — when it is missing, mem0 silently falls back to dense-only, so the GATING `sparse_leg` check on `/health/deep` (a deterministic oldest-point canary) turns that silent fallback into a failed health/deploy gate ([`docs/systems/mem0-api.md`](./docs/systems/mem0-api.md)). The gate is calibrated on the *raw semantic* scale — off-domain tops out ≈0.12, relevant runs 0.25–0.57, so the **0.30 gate** rejects noise with margin. (Raising it was measured to crater recall; calibration record in `eval/injection-gating/`, private repo.)
+- **Search is hybrid**: dense cosine is the **gate** (a candidate must clear the semantic threshold), then BM25 keyword + entity boosts shape the returned ranking. The BM25 leg depends on the **fastembed** sparse encoder (explicit in the installer, with a loadability post-condition) — when it is missing, mem0 silently falls back to dense-only, so the GATING `sparse_leg` check on `/health/deep` (a deterministic oldest-point canary) turns that silent fallback into a failed health/deploy gate ([`docs/systems/mem0-api.md`](./docs/systems/mem0-api.md)). The gate is calibrated on the *raw semantic* scale of each embedding profile, because cosine scales do not carry between models: on EmbeddingGemma-300m off-domain tops out ≈0.12 and relevant runs 0.25–0.57, so its **0.30 gate** rejects noise with margin (raising it was measured to crater recall; calibration record in `eval/injection-gating/`, private repo); on EmbeddingGemma-2 the house probes put off-topic at ≤0.694 and relevant at ≥0.720, so its gate is **0.70** (`mem0-server/embedder_profile.py`).
 - **Reranker**: `bge-reranker-v2-m3`, a cross-encoder on the GPU behind the same llama-swap (same 300 s idle unload), applied only where its cost is acceptable — deliberate `memory_search` calls (auto-on at `limit ≥ 5`) — never on the hot per-prompt path. After an idle unload the first search pays a cold load: one budget-bounded retry, then the fail-open dense order, and `rerank_status` says which ([reranker](./docs/systems/reranker.md)).
 
 ### 3. Trust tiers + the admission gate
@@ -134,7 +134,7 @@ At **read time** every hit passes the **admission gate** (`admission_gate.py`) f
 
 Four delivery channels, all precision-first:
 
-1. **Per-prompt injection** (`UserPromptSubmit` → one `POST /v1/context/bundle` round-trip): the top **K = 2** (frontier models) / **K = 1** (small) memories that clear the **0.30** gate, plus open goals/questions, rendered as a `[MEMORY CONTEXT]` block above the prompt. **Abstention-first**: if nothing clears the gate, no block renders at all. Unchanged goals/OQ are not re-injected every prompt; the `insight` tier is filtered server-side from this hot path; client-side defense-in-depth caps and truncates before anything reaches context.
+1. **Per-prompt injection** (`UserPromptSubmit` → one `POST /v1/context/bundle` round-trip): the top **K = 2** (frontier models) / **K = 1** (small) memories that clear the active profile's relevance gate (0.70 on EmbeddingGemma-2, 0.30 on EmbeddingGemma-300m), plus open goals/questions, rendered as a `[MEMORY CONTEXT]` block above the prompt. llama-swap holds a request for an unloaded model until it has loaded, which takes longer than the hook allows (the daemon gives the bundle request 3 s, inside the hook's 5 s timeout), so the hook's bundle first reads llama-swap's model listing: an unloaded embedder gets one background warm and that prompt's bundle abstains on memories (the checkpoint still lands) instead of timing out. `memory_recall` and the session-start précis are not degraded; they wait for the load. **Abstention-first**: if nothing clears the gate, no block renders at all. Unchanged goals/OQ are not re-injected every prompt; the `insight` tier is filtered server-side from this hot path; client-side defense-in-depth caps and truncates before anything reaches context.
 2. **Explicit deeper recall** (`memory_recall` MCP tool), in addition to the per-prompt injection: the same gated bundle **plus** a separate `canonical`-class search — the curated "what do we know" call for when the injected block is empty, for canonical facts (the hook never injects them) or for another brand's scope.
 3. **Deliberate search** (`memory_search` MCP tool): free-text semantic search with the cross-encoder reranker auto-on at `limit ≥ 5`.
 4. **Session start** (`sessionstart_bundle.py`): a resume précis — after a compaction it reuses the **PreCompact-captured conversation query** (K=2); on a cold boot it builds a recency pseudo-query (K=1, precision-first).
@@ -243,8 +243,8 @@ The short codes used across `docs/systems/`, `docs/flows/`, and code comments:
 | C1 / "dream" | Nightly consolidator | `scripts/wsl/dream-consolidate.py` (the authority's chain step; `scripts/windows/dream-consolidate.ps1` on a Windows-hosted brain) |
 | 4C | Promotion gate (contradiction/corroboration, enforced) | `scripts/wsl/autopromote_lib.py` (`scripts/windows/autopromote-lib.ps1` on a Windows-hosted brain) |
 | M1 | mem0 API server | `mem0-server/app.py` |
-| M3 | Vector index | Qdrant `mem0_egemma_768` |
-| R1 | Embedder | EmbeddingGemma-300m via `mem0-server/egemma_embedder.py` |
+| M3 | Vector index | Qdrant, the profile's collection (`mem0_eg2_768` by default) |
+| R1 | Embedder | the profile's model (EmbeddingGemma-2 by default) via `mem0-server/egemma_embedder.py` |
 | R2 | Reranker | `mem0-server/reranker.py` (bge cross-encoder; deliberate-search path) |
 | R4 | Raw-trace episode fallback | `app.py` `_episode_raw_fallback` + `episode_embeddings.py` |
 | R5 | Governance (write-gate / freshness / reconciliation) | `nli_write_gate.py`, `freshness.py`, `contradiction-sweep.py` |
@@ -282,13 +282,16 @@ mem0's official server is Docker-first and Windows-fragile under WSL2. The wrapp
 
 Production-grade, single binary, persistent on disk, first-class mem0 support. (Chroma: simpler but slower; FAISS: no native persistence; pgvector: drags in Postgres.)
 
-### Why EmbeddingGemma-300m
+### Why EmbeddingGemma (300m, then EmbeddingGemma-2)
+
+Since 1.35.0 the default profile is EmbeddingGemma-2 (collection `mem0_eg2_768`, gate 0.70); the history below is how the stack first moved to EmbeddingGemma-300m, which remains the legacy profile ([embedder profiles](./docs/systems/embedder-profiles.md)).
+
 
 The corpus is EN+ES; the previous `nomic-embed-text` is structurally English-only — a measured defect (ES recall@1 0.33 vs EmbeddingGemma 0.93 on 30 real query pairs; EN a tie ≈0.9). EmbeddingGemma needs asymmetric task prefixes that neither llama.cpp nor stock mem0 applies — `egemma_embedder.py` is that shim. The migration re-embedded the full corpus into a new collection (`mem0_egemma_768`) because the vector spaces differ, recalibrated the search gate 0.4 → 0.30 (EmbeddingGemma's compressed cosine scale), and allowed Ollama to be fully decommissioned. An earlier EmbeddingGemma trial had been wrongly rejected — the test predated the prefix shim.
 
-### Why the 0.30 gate is not higher
+### Why the 0.30 gate is not higher (EmbeddingGemma-300m)
 
-On EmbeddingGemma's scale, 0.35 craters recall to ~0.47 and 0.50 drops everything. Precision comes from admission + tiers + abstention, not a blunt threshold.
+On EmbeddingGemma-300m's scale, 0.35 craters recall to ~0.47 and 0.50 drops everything. Precision comes from admission + tiers + abstention, not a blunt threshold.
 
 ### Why never auto-hide
 

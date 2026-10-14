@@ -80,6 +80,10 @@ def health_client():
 
 
 def test_health_embedder_warms_and_reports_loaded(health_client, monkeypatch):
+    import app as appmod
+    # The listing below names "embeddinggemma"; pin the configured model to it, or the result
+    # depends on the box's embedding profile (EmbeddingGemma-2 is "embeddinggemma2").
+    monkeypatch.setitem(appmod.EMBEDDER_CONFIG, "model", "embeddinggemma")
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _llama_swap(200, _models("loaded")))
     monkeypatch.setattr(httpx, "post", _embedding_ok)
     r = health_client.get("/health/embedder")
