@@ -457,7 +457,7 @@ def test_no_stdin_and_no_claude_cwd_falls_back_to_pwd(tmp_path):
 def test_claude_cwd_still_wins_over_stdin(tmp_path):
     box = Box(tmp_path, "replica")
     box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
-    hook_in = json.dumps({"cwd": r"X:\Dev\agentic-memory-stack"})
+    hook_in = json.dumps({"cwd": r"X:\Work\agentic-memory-stack"})
     out = box.run(stdin=hook_in, claude_cwd="/tmp")
     assert "brand context (" not in out, out
 
@@ -514,7 +514,7 @@ def test_a_windows_cwd_wsl_can_enter_uses_its_mnt_form_and_the_repo_root(tmp_pat
     (box.bin / "wslpath").write_text(f"#!/bin/bash\necho '{sub}'\n")
     (box.bin / "wslpath").chmod(0o755)
     box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
-    out = box.run(stdin=json.dumps({"cwd": r"D:\Dev\agentic-memory-stack\docs"}), claude_cwd=None)
+    out = box.run(stdin=json.dumps({"cwd": r"D:\Work\agentic-memory-stack\docs"}), claude_cwd=None)
     assert "brand context (ai-ecosystem):" in out, out
     goals = [ln for ln in box.calls().splitlines() if "/v1/goals?" in ln]
     assert goals and "initiative=agentic-memory-stack" in goals[0], goals
