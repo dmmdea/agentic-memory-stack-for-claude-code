@@ -1160,21 +1160,7 @@ def _bundle_embed_gate() -> dict:
     run its dense search now, or is the embedder unloaded (then a background warm starts and the
     bundle abstains instead of waiting out the load past the hook's budget)?
     MEM0_BUNDLE_COLD_DEGRADE=0 turns the check off (the search then waits for the load, as before)."""
-    if os.environ.get("MEM0_BUNDLE_COLD_DEGRADE", "1").strip() == "0":
-        return {"embed": True, "state": "disabled"}
-    import httpx as _httpx
-
-    def _list() -> list:
-        r = _httpx.get(f"{_embed_base()}/models", timeout=0.5)
-        r.raise_for_status()
-        return r.json().get("data") or []
-
-    def _warm() -> None:
-        r = _httpx.post(f"{_embed_base()}/embeddings",
-                        json={"model": _embed_model(), "input": "warm"}, timeout=60.0)
-        r.raise_for_status()
-
-    return _embedder_503.bundle_embed_gate(_list, _warm, _embed_model())
+    return _embedder_503.bundle_gate_for(_embed_base(), _embed_model())
 
 
 def _qdrant_base() -> str:

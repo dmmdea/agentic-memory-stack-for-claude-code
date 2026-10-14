@@ -478,12 +478,20 @@ function Resolve-BrandFromMap {
         if (Test-BrandPattern $p $hay -IsPath) { $contentWorkspace = $true; break }
     }
     if (-not $contentWorkspace) { return $null }
+    $found = @(Get-NamedContentBrands -Map $Map -Text $Text)
+    if ($found.Count -eq 1) { return [string]$found[0] }
+    return $null
+}
+
+function Get-NamedContentBrands {
+    # The distinct brands whose content rules match the text. One is a brand; none and several are
+    # both no brand, but a caller that keeps a brand across prompts must tell them apart.
+    param($Map, [string]$Text = '')
     $found = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($r in @(Get-BrandMapList $Map 'content_rules')) {
         if ($r -and $r.brand -and (Test-BrandPattern $r.pattern $Text)) { [void]$found.Add([string]$r.brand) }
     }
-    if ($found.Count -eq 1) { return [string]@($found)[0] }
-    return $null
+    return @($found)
 }
 
 function Get-BrandMap {

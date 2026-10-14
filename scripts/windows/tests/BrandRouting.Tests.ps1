@@ -54,7 +54,7 @@ Describe 'the two library copies are one resolver' {
     It 'keeps <fn> byte-identical (comment-stripped) in user-prompt-lib.ps1 and memory-common.ps1' -ForEach @(
         @{ fn = 'ConvertTo-BrandPath' }, @{ fn = 'ConvertTo-BrandPattern' }, @{ fn = 'Test-BrandPattern' },
         @{ fn = 'Get-BrandMapList' }, @{ fn = 'Resolve-BrandFromMap' }, @{ fn = 'Get-BrandMap' },
-        @{ fn = 'Get-SharedBrands' }, @{ fn = 'Get-BrandFromTranscriptPath' }
+        @{ fn = 'Get-SharedBrands' }, @{ fn = 'Get-BrandFromTranscriptPath' }, @{ fn = 'Get-NamedContentBrands' }
     ) {
         $a = script:Get-FunctionBody (Join-Path $script:winDir 'user-prompt-lib.ps1') $fn
         $b = script:Get-FunctionBody (Join-Path $script:winDir 'memory-common.ps1') $fn

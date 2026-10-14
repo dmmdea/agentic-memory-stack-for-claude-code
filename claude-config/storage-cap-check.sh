@@ -30,15 +30,30 @@ infer_brand_from_cwd() {
     if [ -f "$cfg" ]; then
         python3 - "$cwd" "$cfg" <<'PY' 2>/dev/null
 import sys, json, re
-cwd = sys.argv[1].lower()
+# The C3 resolver's path matching (scripts/wsl/brand_routing.py, pinned by its shared corpus):
+# backslash, slash and space are one separator, normalized to "-" in the path and in the pattern,
+# so "Projects/ClientA" matches a Windows path, a /mnt path and a Claude Code slug alike.
+def norm_pattern(p):
+    p = re.sub(r"\\\\|\\/|\\ |[/ ]", "-", p)
+    return re.sub(r"\[[^\]]*\]", lambda m: re.sub(r"-{2,}", "-", m.group(0)), p)
+def path_match(p, hay):
+    if not isinstance(p, str) or not p:
+        return False
+    try:
+        return re.search(norm_pattern(p), hay, re.I) is not None
+    except re.error:
+        return False
+cwd = re.sub(r"[\\/ ]", "-", sys.argv[1])
 try:
     rules = json.load(open(sys.argv[2])).get("rules", [])
 except Exception:
     rules = []
 out = ""
 for r in rules:
+    if not isinstance(r, dict):
+        continue
     p = r.get("pattern")
-    if p and re.search(p, cwd, re.I):
+    if path_match(p, cwd):
         out = r.get("brand", ""); break
 print(out)
 PY
@@ -60,15 +75,30 @@ infer_campaign_from_cwd() {
     [ -f "$cfg" ] || { echo ""; return; }
     python3 - "$cwd" "$cfg" <<'PY' 2>/dev/null
 import sys, json, re
-cwd = sys.argv[1].lower()
+# The C3 resolver's path matching (scripts/wsl/brand_routing.py, pinned by its shared corpus):
+# backslash, slash and space are one separator, normalized to "-" in the path and in the pattern,
+# so "Projects/ClientA" matches a Windows path, a /mnt path and a Claude Code slug alike.
+def norm_pattern(p):
+    p = re.sub(r"\\\\|\\/|\\ |[/ ]", "-", p)
+    return re.sub(r"\[[^\]]*\]", lambda m: re.sub(r"-{2,}", "-", m.group(0)), p)
+def path_match(p, hay):
+    if not isinstance(p, str) or not p:
+        return False
+    try:
+        return re.search(norm_pattern(p), hay, re.I) is not None
+    except re.error:
+        return False
+cwd = re.sub(r"[\\/ ]", "-", sys.argv[1])
 try:
     rules = json.load(open(sys.argv[2])).get("rules", [])
 except Exception:
     rules = []
 out = ""
 for r in rules:
+    if not isinstance(r, dict):
+        continue
     p = r.get("pattern")
-    if p and re.search(p, cwd, re.I):
+    if path_match(p, cwd):
         out = r.get("campaign", ""); break
 print(out)
 PY
@@ -314,16 +344,39 @@ fi
 # open goals) was skipped for every session started there. Read once, bounded; CLAUDE_CWD still wins.
 _HOOK_CWD=""
 if [ -z "${CLAUDE_CWD:-}" ] && [ ! -t 0 ]; then
-  _HOOK_CWD=$(timeout 2 head -c 65536 2>/dev/null | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
+  _HOOK_CWD=$(python3 -c "
+import json, os, select, time
+buf = b''
+cwd = ''
+end = time.monotonic() + 2.0
+while len(buf) < 65536:
+    left = end - time.monotonic()
+    if left <= 0 or not select.select([0], [], [], left)[0]:
+        break
+    chunk = os.read(0, 65536 - len(buf))
+    if not chunk:
+        break
+    buf += chunk
+    try:
+        d = json.loads(buf.decode('utf-8'))
+    except ValueError:
+        continue
     c = d.get('cwd') if isinstance(d, dict) else None
-    print(c if isinstance(c, str) else '')
-except Exception:
-    print('')
+    cwd = c if isinstance(c, str) else ''
+    break
+print(cwd)
 " 2>/dev/null)
 fi
+# A Windows path WSL can enter is used in its /mnt form, the form $PWD would have had: rules written
+# with forward slashes match it and git finds the repository root for the initiative. A drive WSL does
+# not mount (why $PWD is $HOME) has no such form and stays as given; its leaf is the initiative.
+case "$_HOOK_CWD" in
+  [A-Za-z]:\\*|[A-Za-z]:/*)
+    if command -v wslpath >/dev/null 2>&1; then
+      _WSL_CWD=$(wslpath -u "$_HOOK_CWD" 2>/dev/null)
+      [ -n "$_WSL_CWD" ] && [ -d "$_WSL_CWD" ] && _HOOK_CWD="$_WSL_CWD"
+    fi ;;
+esac
 SESSION_CWD="${CLAUDE_CWD:-${_HOOK_CWD:-$PWD}}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
 # Funnel/campaign axis (2026-06-20): isolates funnel-specific canonical rules so a
@@ -450,11 +503,12 @@ def clip(text, n=90):
 # One line per session (a session writes an episode per extraction window, so the newest rows were
 # mostly one session's), and the memory admission rule for brands: the session's own brand, a shared
 # brand, or untagged. Another brand's session titles never print here.
-session_brand = os.environ.get('AMS_BRAND', '').strip()
+session_brand = os.environ.get('AMS_BRAND', '').strip().lower()
 try:
     shared = set(json.load(open(os.environ.get('AMS_BRANDS_JSON', ''), encoding='utf-8')).get('shared_brands') or [])
 except Exception:
-    shared = {'cross-brand'}
+    shared = set()
+shared = {str(b).strip().lower() for b in shared | set(os.environ.get('MEM0_SHARED_BRANDS', '').split(','))} - {''}
 seen = set()
 out = []
 for i, r in enumerate(rows):
@@ -464,7 +518,7 @@ for i, r in enumerate(rows):
     if not goal:
         continue
     brand = (r.get('brand') or '').strip()
-    if brand and brand != session_brand and brand not in shared:
+    if brand and brand.lower() != session_brand and brand.lower() not in shared:
         continue
     sid = r.get('session_id') or ('row-' + str(i))
     if sid in seen:

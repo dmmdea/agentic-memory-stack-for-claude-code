@@ -431,6 +431,36 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         ($script:bundleBodies[2] | ConvertFrom-Json).brand | Should -BeNullOrEmpty -Because 'another session starts neutral'
     }
 
+    It 'a prompt that names two businesses stays brandless and does not inherit the session''s brand' {
+        Mock Get-Mem0ApiKeyCached { 'k' }
+        Mock Get-BrandMap {
+            [pscustomobject]@{
+                rules = @()
+                shared_brands = @()
+                content_rule_workspaces = @('Solutions[\/ -]+Mixed')
+                content_rules = @([pscustomobject]@{ pattern = 'beta ?shop'; brand = 'brand-b' },
+                                  [pscustomobject]@{ pattern = 'alpha ?store'; brand = 'brand-a' })
+            }
+        }
+        $script:bundleBodies = @()
+        Mock Invoke-Mem0Post {
+            $script:bundleBodies += $Body
+            '{"ok":true,"checkpoint":{"ok":true,"episode_id":9,"action":"updated"},"memories":[],"goals":[],"open_questions":[]}'
+        }
+        $tp = 'C:\\h\\.claude\\projects\\g--My-Drive-Solutions-Mixed\\' + [guid]::NewGuid().ToString() + '.jsonl'
+        foreach ($p in @('draft the Beta Shop launch email for the list',
+                         'compare Beta Shop and Alpha Store pricing side by side',
+                         'continue with the second paragraph please')) {
+            $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"' + $p + '","transcript_path":"' + $tp + '"}'
+            $null = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
+        }
+        $script:bundleBodies.Count | Should -Be 3
+        ($script:bundleBodies[0] | ConvertFrom-Json).brand | Should -Be 'brand-b'
+        ($script:bundleBodies[1] | ConvertFrom-Json).brand | Should -BeNullOrEmpty -Because 'several businesses named => no brand, never the last one'
+        ($script:bundleBodies[2] | ConvertFrom-Json).brand | Should -Be 'brand-b' -Because 'the ambiguous prompt does not erase the session brand'
+        Should -Invoke Get-BrandMap -Exactly 3 -Because 'one brands.json read per prompt, not one per resolver call'
+    }
+
     It 'decision-like prompt -> needs_0b TRUE (M4: 0.B verdict computed daemon-side)' {
         Mock Get-Mem0ApiKeyCached { 'k' }
         Mock Invoke-Mem0Post { '{"ok":true,"episode_id":3,"action":"updated"}' }

@@ -14,26 +14,35 @@ receipts but never reached the session. This release fixes the ones that rest on
 - **A cold embedder cost the whole per-prompt block.** The embedder unloads after 300 s idle, and
   llama-swap holds a request for an unloaded model until it has loaded instead of refusing it, so the
   bundle's dense search waited out the load (5.75 s measured for EmbeddingGemma-2 with its projector,
-  against 0.38 s warm). The hook's budget is 5 s: the first prompt after any idle spell timed out with
+  against 0.38 s warm). The daemon gives the bundle request 3 s, inside the hook's 5 s timeout: the first prompt after any idle spell timed out with
   no block, 22-27 % of typed prompts in real use. The `cold-embedder` 503 path could never fire, because
   nothing raised. The hook's bundle (`checkpoint: true`) now reads llama-swap's model listing first
   (`embedder_503.bundle_embed_gate`, a few ms): an embedder listed as not loaded gets one background
   warm, single flight, and that prompt's bundle skips the dense search and the raw-trace fallback. The
   checkpoint, goals and open questions are served; the response carries `embedder: {state: "warming"}`.
-  `memory_recall` and the session-start précis (`checkpoint: false`) still wait for the load.
-  `/health/deep` adds `bundle_cold_today` and `embedder_warm`; `MEM0_BUNDLE_COLD_DEGRADE=0` restores
-  the old wait.
+  `memory_recall` and the session-start précis (`checkpoint: false`) still wait for the load (the shim reads
+  for up to 30 s; the précis's 6 s is a thin margin over a cold load).
+  `/health/deep` adds `bundle_cold_today` and `embedder_warm` (a failed warm's class and message, also
+  logged); `MEM0_BUNDLE_COLD_DEGRADE=0` restores the old wait. Only a known not-loaded state skips the
+  search: a state word the gate does not know searches as before, so a renamed state cannot suppress
+  memories for good.
 - **The session-start brand block was skipped for sessions started on a drive WSL does not mount.**
   `wsl.exe` starts the hook in `$HOME` when it cannot translate the Windows working directory, and the
   banner inferred the brand from `$PWD`: no brand, so no canonical facts and no open goals (81 % of
-  banners in real use). The banner now reads the session's `cwd` from the hook's stdin JSON (bounded;
-  `CLAUDE_CWD` still overrides it), and a Windows path's leaf is the initiative.
+  banners in real use). The banner now reads the session's `cwd` from the hook's stdin JSON (one bounded
+  read that stops as soon as the JSON parses, so a stdin without EOF costs nothing; `CLAUDE_CWD` still
+  overrides it). A path WSL can enter is translated with `wslpath` to its `/mnt` form, so git finds the
+  repository root; on a drive WSL does not mount, the path stays in Windows form and its leaf is the
+  initiative. The banner's brand and campaign rules now match a path the way the per-prompt resolver
+  does (backslash, slash and space are one separator, in the path and in the pattern); before, a rule
+  written `Projects/ClientA` never matched a Windows-form path. A test runs the banner's rule step over
+  the shared brand-routing corpus.
 - **Content-classified workspaces never resolved a brand when reading.** A workspace listed in
   `content_rule_workspaces` takes its brand from text. The extractor passed each fact's text and wrote
   branded records, but the per-prompt hooks called the resolver with no text, so those records were never
   injected in that workspace (0 of 7,163 injections). The daemon and the inline fallback now pass the
   prompt; in the daemon a follow-up that names no business keeps the session's last content brand (only
-  where no path rule names one).
+  where no path rule names one), and a prompt that names several businesses stays brandless.
 - **The contradiction review queue had no reader on a replica fleet.** The banner printed it only on the
   brain, which runs no interactive sessions. `/health/maintenance` now carries `review_queue`
   (`{pending, oldest_at, oldest_age_d}`, informational) and a replica's banner prints one line from the
@@ -42,7 +51,8 @@ receipts but never reached the session. This release fixes the ones that rest on
   operator west of UTC), cut goals at 90 characters mid-word, listed one line per extraction window (one
   session filled most of the five lines) and showed every brand's sessions. It now prints an age
   (`3h ago`), cuts at a word boundary, prints one line per session, and keeps the session's own brand, a
-  shared brand or untagged ones (the memory admission rule). A session whose brand is unknown at
+  shared brand or untagged ones (the memory admission rule: case-insensitive, `shared_brands` plus
+  `MEM0_SHARED_BRANDS`). A session whose brand is unknown at
   session start (a content-classified workspace before its first prompt) therefore no longer lists that
   workspace's branded sessions.
 - **Log rotation re-rotated its own archives.** `Invoke-LogRotation` took every file over the size cap for

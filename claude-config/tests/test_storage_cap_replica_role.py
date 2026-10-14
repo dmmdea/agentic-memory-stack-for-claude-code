@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 import os
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -59,7 +60,16 @@ UNREACHABLE = "[AMS] authority unreachable"
 class Box:
     """One fixture HOME plus the recording shims."""
 
-    def __init__(self, tmp: Path, role: str | None):
+    def __init__(self, tmp: Path, role: str | None, brands: dict | None = None):
+        self.script = SCRIPT
+        if brands is not None:
+            # The script reads brands.json beside itself: run a copy that has one.
+            cfg = tmp / "cfg"
+            cfg.mkdir()
+            for n in ("storage-cap-check.sh", "sessionstart_bundle.py"):
+                shutil.copy(SCRIPT.parent / n, cfg / n)
+            (cfg / "brands.json").write_text(json.dumps(brands))
+            self.script = cfg / "storage-cap-check.sh"
         self.home = tmp / "home"
         self.fake = tmp / "fake"
         self.bin = tmp / "bin"
@@ -86,7 +96,7 @@ class Box:
         if episodes is not None:
             (self.fake / "episodes.json").write_text(json.dumps(episodes))
 
-    def run(self, *, stdin: str | None = None, claude_cwd: str | None = "/tmp") -> str:
+    def env(self, claude_cwd: str | None = "/tmp") -> dict:
         env = {
             "HOME": str(self.home), "USERPROFILE": str(self.home),
             "HOMEDRIVE": os.path.splitdrive(str(self.home))[0],
@@ -100,10 +110,28 @@ class Box:
         }
         if claude_cwd is not None:
             env["CLAUDE_CWD"] = claude_cwd
-        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60,
-                             input=stdin if stdin is not None else "", cwd=str(self.home))
+        return env
+
+    def run(self, *, stdin: str | None = None, claude_cwd: str | None = "/tmp") -> str:
+        res = subprocess.run(["bash", str(self.script)], env=self.env(claude_cwd), capture_output=True,
+                             text=True, timeout=60, input=stdin if stdin is not None else "",
+                             cwd=str(self.home))
         assert res.returncode == 0, f"script must always exit 0: {res.stderr}"
         return res.stdout
+
+    def run_with_open_stdin(self, payload: str) -> tuple[str, float]:
+        """The hook JSON arrives but stdin is never closed (a host that does not forward EOF)."""
+        t0 = time.monotonic()
+        proc = subprocess.Popen(["bash", str(self.script)], env=self.env(None), cwd=str(self.home),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
+            out = proc.stdout.read().decode("utf-8")
+            assert proc.wait(timeout=60) == 0
+        finally:
+            proc.stdin.close()
+        return out, time.monotonic() - t0
 
     def calls(self) -> str:
         p = self.fake / "calls.log"
@@ -229,7 +257,7 @@ def test_brain_still_prints_its_artifacts_and_spawns_the_rejudge(tmp_path):
 
 
 def test_replica_recent_sessions_come_from_the_authority(tmp_path):
-    box = Box(tmp_path, "replica")
+    box = Box(tmp_path, "replica", brands={"rules": [], "shared_brands": ["cross-brand"]})
     _plant_brain_artifacts(box.home)
     eps = [_ep("", "2026-09-29T20:00:00Z")] + [
         _ep(f"live goal {i}", f"2026-09-29T1{9 - i}:00:00Z", "cross-brand" if i == 0 else "") for i in range(7)]
@@ -452,3 +480,78 @@ def test_replica_recent_sessions_hide_another_brands_sessions(tmp_path):
     out = box.run()                                   # CLAUDE_CWD=/tmp: a brandless session
     assert "neutral work" in out
     assert "other brand work" not in out and "[brand-b]" not in out
+
+
+def test_stdin_that_never_reaches_eof_is_read_without_waiting_for_it(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"session_id": "s1", "cwd": r"X:\Shared Drive\Dev\agentic-memory-stack"})
+    t0 = time.monotonic()
+    box.run(stdin=hook_in, claude_cwd=None)
+    closed = time.monotonic() - t0
+    out, open_s = box.run_with_open_stdin(hook_in)
+    assert "brand context (ai-ecosystem):" in out, "the cwd was lost with the stdin read"
+    assert open_s < closed + 1.0, f"waited on stdin: {open_s:.2f}s open vs {closed:.2f}s closed"
+
+
+def test_a_windows_cwd_with_slash_brand_rules_resolves_the_brand(tmp_path):
+    """Brand rules are written with forward slashes; a Windows-form cwd (a drive WSL does not
+    mount, so no /mnt form exists) must still match them."""
+    box = Box(tmp_path, "replica", brands={"rules": [{"pattern": "projects/clienta", "brand": "brand-a"}]})
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin=json.dumps({"cwd": r"X:\Projects\ClientA\site"}), claude_cwd=None)
+    assert "brand context (brand-a):" in out, out
+
+
+def test_a_windows_cwd_wsl_can_enter_uses_its_mnt_form_and_the_repo_root(tmp_path):
+    """A mounted drive: the stdin cwd is translated (wslpath) to the form $PWD had, so git finds the
+    repository root and the initiative is the repo, not the subdirectory the session started in."""
+    repo = tmp_path / "agentic-memory-stack"
+    sub = repo / "docs"
+    sub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    box = Box(tmp_path, "replica")
+    (box.bin / "wslpath").write_text(f"#!/bin/bash\necho '{sub}'\n")
+    (box.bin / "wslpath").chmod(0o755)
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin=json.dumps({"cwd": r"D:\Dev\agentic-memory-stack\docs"}), claude_cwd=None)
+    assert "brand context (ai-ecosystem):" in out, out
+    goals = [ln for ln in box.calls().splitlines() if "/v1/goals?" in ln]
+    assert goals and "initiative=agentic-memory-stack" in goals[0], goals
+
+
+def test_recent_sessions_brand_filter_is_case_insensitive_and_reads_the_env_shared_list(tmp_path):
+    box = Box(tmp_path, "replica", brands={"rules": [{"pattern": "projects/clienta", "brand": "brand-a"}],
+                                           "shared_brands": []})
+    eps = [_ep("own brand work", "2026-09-29T19:00:00Z", "Brand-A", "S1"),
+           _ep("shared via env", "2026-09-29T18:30:00Z", "Ops-Shared", "S2"),
+           _ep("other brand work", "2026-09-29T18:00:00Z", "brand-b", "S3")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    env_run = box.env(None)
+    env_run["MEM0_SHARED_BRANDS"] = "ops-shared"
+    res = subprocess.run(["bash", str(box.script)], env=env_run, capture_output=True, text=True, timeout=60,
+                         input=json.dumps({"cwd": r"X:\Projects\ClientA"}), cwd=str(box.home))
+    out = res.stdout
+    assert "own brand work" in out and "shared via env" in out, out
+    assert "other brand work" not in out
+
+
+def test_banner_brand_rules_match_like_the_c3_resolver_on_the_shared_corpus(tmp_path):
+    """The banner's path-rule step must agree with scripts/wsl/brand_routing.py on every corpus row
+    whose answer comes from the path alone (no text: the banner has no prompt at session start)."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    fn = src[src.index("infer_brand_from_cwd() {"):]
+    body = fn.split("<<'PY' 2>/dev/null\n", 1)[1].split("\nPY\n", 1)[0]
+    corpus = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "brand-routing-cases.jsonl"
+    rows = [json.loads(ln) for ln in corpus.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    checked = 0
+    for i, row in enumerate(rows):
+        if row.get("text") or not isinstance(row.get("map"), dict):
+            continue
+        cfg = tmp_path / f"map{i}.json"
+        cfg.write_text(json.dumps(row["map"]))
+        got = subprocess.run(["python3", "-", row.get("path") or "", str(cfg)], input=body,
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        assert got == (row.get("expect") or ""), (row.get("path"), row.get("expect"), got)
+        checked += 1
+    assert checked >= 5, f"only {checked} path-only corpus rows"

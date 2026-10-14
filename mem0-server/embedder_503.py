@@ -8,6 +8,8 @@ log `cold-embedder` instead of an empty bundle. A 4xx from the embedder is not a
 is left to FastAPI's default handling."""
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 from typing import Callable, Optional
@@ -123,7 +125,7 @@ def listing_loaded(entry: dict) -> Optional[bool]:
 # request until the upstream's health check passes and then serves it. A cold embedder therefore
 # raises none of the outage types above on the bundle path; the search simply waits out the whole
 # load (measured 2026-10-13: 5.75 s with EmbeddingGemma-2 and its projector, against 0.38 s warm)
-# and the hook client, whose budget is 5 s, times out with no block at all. In real use that was
+# and the hook's bundle request (3 s in the daemon, 5 s for the whole hook) times out with no block. In real use that was
 # 22-27 % of typed prompts, because every prompt that follows more than five idle minutes finds
 # the embedder unloaded.
 #
@@ -135,24 +137,48 @@ def listing_loaded(entry: dict) -> Optional[bool]:
 # The model still unloads after its idle TTL: the warm is work for the prompt in hand, not residency.
 # ---------------------------------------------------------------------------
 
+log = logging.getLogger("mem0-server.embedder_503")
+
 _warm_lock = threading.Lock()
 _warm_state: dict = {"running": False, "started_at": None, "last_ok_at": None, "last_error": None,
                      "started": 0}
+
+# The states that mean "a request now would wait for a load". Only these skip the search: a state
+# word this list does not know (a llama-swap release that renames one) is unknown, and unknown
+# searches as before, so a rename can never suppress memories for good.
+_NOT_LOADED_STATES = ("unloaded", "stopped", "starting", "loading", "stopping", "shutdown")
 
 
 def embedder_listed_ready(list_models: Callable[[], list], model: str) -> Optional[bool]:
     """Whether llama-swap lists `model` as loaded: True, False, or None when unknown.
 
     `list_models` returns the `data` array of GET /v1/models. Any failure reading it is None, as is
-    a listing with no entry for the model or an entry that reports no state."""
+    a listing with no entry for the model, an entry that reports no state, or a state word that is
+    neither a loaded one nor one of `_NOT_LOADED_STATES`."""
     try:
         entries = list_models() or []
     except Exception:
         return None
     for entry in entries:
         if isinstance(entry, dict) and str(entry.get("id", "")) == model:
-            return listing_loaded(entry)
+            if listing_loaded(entry):
+                return True
+            state = entry.get("state")
+            if state is None:
+                state = entry.get("status")
+            if isinstance(state, dict):
+                state = state.get("value")
+            if state is not None and str(state).lower() in _NOT_LOADED_STATES:
+                return False
+            return None
     return None
+
+
+def _error_text(exc: BaseException) -> str:
+    """The class and a bounded message: '500 upstream exited prematurely' and a timeout need
+    different fixes, and the class name alone does not say which."""
+    msg = " ".join(str(exc).split())[:200]
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
 def _spawn_daemon(fn: Callable[[], None]) -> None:
@@ -174,8 +200,10 @@ def start_background_warm(warm: Callable[[], None],
             warm()
             _warm_state["last_ok_at"] = time.time()
             _warm_state["last_error"] = None
-        except Exception as exc:  # reported on /health/deep, never raised into a request
-            _warm_state["last_error"] = type(exc).__name__
+        except Exception as exc:  # reported on /health/deep and in the log, never raised into a request
+            _warm_state["last_error"] = _error_text(exc)
+            log.warning("embedder background warm failed; hook bundles abstain on memories until "
+                        "it loads: %s", _warm_state["last_error"], exc_info=True)
         finally:
             with _warm_lock:
                 _warm_state["running"] = False
@@ -185,7 +213,8 @@ def start_background_warm(warm: Callable[[], None],
     except Exception as exc:
         with _warm_lock:
             _warm_state["running"] = False
-        _warm_state["last_error"] = type(exc).__name__
+        _warm_state["last_error"] = _error_text(exc)
+        log.warning("embedder background warm could not start: %s", _warm_state["last_error"])
         return False
     return True
 
@@ -202,6 +231,29 @@ def bundle_embed_gate(list_models: Callable[[], list], warm: Callable[[], None],
     if ready:
         return {"embed": True, "state": "loaded"}
     return {"embed": False, "state": "warming", "warm_started": start_background_warm(warm, spawn)}
+
+
+def bundle_gate_for(base: str, model: str, environ=None, http=httpx,
+                    spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> dict:
+    """`bundle_embed_gate` bound to one OpenAI-compatible embedder at `base` (…/v1).
+
+    The listing read gets 0.5 s, so a hung llama-swap costs the bundle half a second, not the hook's
+    budget; the warm gets 60 s, which covers a cold load. `MEM0_BUNDLE_COLD_DEGRADE=0` turns the
+    check off: the search then waits for the load, as before this gate existed."""
+    env = os.environ if environ is None else environ
+    if str(env.get("MEM0_BUNDLE_COLD_DEGRADE", "1")).strip() == "0":
+        return {"embed": True, "state": "disabled"}
+
+    def _list() -> list:
+        r = http.get(f"{base}/models", timeout=0.5)
+        r.raise_for_status()
+        return r.json().get("data") or []
+
+    def _warm() -> None:
+        r = http.post(f"{base}/embeddings", json={"model": model, "input": "warm"}, timeout=60.0)
+        r.raise_for_status()
+
+    return bundle_embed_gate(_list, _warm, model, spawn)
 
 
 def warm_state() -> dict:

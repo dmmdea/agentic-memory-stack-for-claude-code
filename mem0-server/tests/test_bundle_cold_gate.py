@@ -2,7 +2,7 @@
 
 llama-swap holds a request for an unloaded model until the model has loaded (it does not refuse it),
 so a cold embedder made the bundle's dense search wait out the whole load: 5.75 s measured against a
-0.38 s warm call, past the hook's 5 s budget. In real use that cost the [MEMORY CONTEXT] block on
+0.38 s warm call, past the daemon's 3 s bundle request and the hook's 5 s timeout. In real use that cost the [MEMORY CONTEXT] block on
 22-27 % of typed prompts. The bundle now reads llama-swap's model listing first; an embedder listed
 as not loaded gets one background warm and that prompt's bundle skips the search.
 
@@ -54,6 +54,8 @@ def _run_now(fn):
     ({"id": MODEL, "state": "ready"}, True),                    # the flat schema
     ({"id": MODEL, "state": "stopped"}, False),
     ({"id": MODEL}, None),                                      # a server that reports no state
+    ({"id": MODEL, "status": {"value": "warm-ish"}}, None),     # a state word nobody taught us
+    ({"id": MODEL, "state": "active"}, None),                   # unknown searches, never suppresses
 ])
 def test_listed_ready_reads_both_listing_schemas(entry, expected):
     assert e5.embedder_listed_ready(_listing({"id": "other", "status": {"value": "loaded"}}, entry), MODEL) is expected
@@ -108,13 +110,15 @@ def test_a_running_warm_is_not_started_twice():
     assert third["warm_started"] is True
 
 
-def test_a_failed_warm_is_recorded_and_frees_the_slot():
+def test_a_failed_warm_is_recorded_logged_and_frees_the_slot(caplog):
     def _fail():
         raise ConnectionError("seat could not start")
-    got = e5.bundle_embed_gate(_listing({"id": MODEL, "state": "stopped"}), _fail, MODEL, spawn=_run_now)
+    with caplog.at_level("WARNING", logger="mem0-server.embedder_503"):
+        got = e5.bundle_embed_gate(_listing({"id": MODEL, "state": "stopped"}), _fail, MODEL, spawn=_run_now)
     assert got["embed"] is False and got["warm_started"] is True
     st = e5.warm_state()
-    assert st["last_error"] == "ConnectionError" and st["running"] is False
+    assert st["last_error"] == "ConnectionError: seat could not start" and st["running"] is False
+    assert any("seat could not start" in r.getMessage() for r in caplog.records)
 
 
 def test_a_spawn_failure_never_leaves_the_slot_held():
@@ -124,6 +128,96 @@ def test_a_spawn_failure_never_leaves_the_slot_held():
                                spawn=_no_threads)
     assert got == {"embed": False, "state": "warming", "warm_started": False}
     assert e5.warm_state()["running"] is False
+
+
+# ---------------------------------------------------------------------------
+# bundle_gate_for: the HTTP binding app._bundle_embed_gate delegates to (headless)
+# ---------------------------------------------------------------------------
+
+class _FakeHttp:
+    """Records each call; `listing` is the /v1/models `data` array it serves."""
+
+    def __init__(self, listing):
+        self.listing = listing
+        self.calls = []
+
+    def _resp(self, payload):
+        class _R:
+            def raise_for_status(self_inner):
+                return None
+
+            def json(self_inner):
+                return payload
+        return _R()
+
+    def get(self, url, timeout=None):
+        self.calls.append(("GET", url, timeout))
+        return self._resp({"data": self.listing})
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append(("POST", url, timeout, json))
+        return self._resp({"data": [{"embedding": [0.0]}]})
+
+
+BASE = "http://127.0.0.1:11436/v1"
+
+
+def test_gate_for_reads_the_listing_fast_and_warms_the_named_model():
+    http = _FakeHttp([{"id": MODEL, "status": {"value": "unloaded"}}])
+    got = e5.bundle_gate_for(BASE, MODEL, environ={}, http=http, spawn=_run_now)
+    assert got == {"embed": False, "state": "warming", "warm_started": True}
+    assert http.calls[0] == ("GET", f"{BASE}/models", 0.5)
+    assert http.calls[1] == ("POST", f"{BASE}/embeddings", 60.0, {"model": MODEL, "input": "warm"})
+
+
+def test_gate_for_searches_when_loaded():
+    http = _FakeHttp([{"id": MODEL, "status": {"value": "loaded"}}])
+    assert e5.bundle_gate_for(BASE, MODEL, environ={}, http=http, spawn=_run_now) == \
+        {"embed": True, "state": "loaded"}
+    assert [c[0] for c in http.calls] == ["GET"]
+
+
+@pytest.mark.parametrize("value", ["0", " 0 "])
+def test_gate_for_is_off_when_the_operator_says_so(value):
+    http = _FakeHttp([{"id": MODEL, "status": {"value": "unloaded"}}])
+    got = e5.bundle_gate_for(BASE, MODEL, environ={"MEM0_BUNDLE_COLD_DEGRADE": value}, http=http,
+                             spawn=_run_now)
+    assert got == {"embed": True, "state": "disabled"}
+    assert http.calls == [], "a disabled gate must not even read the listing"
+
+
+# ---------------------------------------------------------------------------
+# WIRING pinned in source: app.py cannot be imported headless, so CI would skip the runtime tests
+# below; these fail the headless lane when a guard is reverted. The runtime tests prove behaviour.
+# ---------------------------------------------------------------------------
+
+def _bundle_handler_src() -> str:
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    start = src.index("def context_bundle(")
+    return src[start:src.index('@app.post("/v1/episodes")', start)]
+
+
+def test_only_the_hook_path_probes_the_embedder():
+    body = _bundle_handler_src()
+    assert '_gate = _bundle_embed_gate() if b.checkpoint else {"embed": True, "state": "deliberate"}' in body
+
+
+def test_a_failing_probe_searches_and_a_cold_one_skips_search_and_raw_fallback():
+    body = _bundle_handler_src()
+    probe = body[body.index("_gate = _bundle_embed_gate()"):]
+    assert probe.index("except Exception:") < probe.index('_gate = {"embed": True, "state": "unknown"}')
+    assert "    if not _cold:\n        try:\n            filters" in body, "the dense search must sit behind _cold"
+    fallback = [ln for ln in body.splitlines() if "RAW_FALLBACK_ENABLED and" in ln]
+    assert fallback and all("not _cold" in ln for ln in fallback), fallback
+
+
+def test_the_app_gate_delegates_to_the_tested_binding():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    fn = src[src.index("def _bundle_embed_gate("):]
+    fn = fn[:fn.index("\ndef ")]
+    assert "_embedder_503.bundle_gate_for(_embed_base(), _embed_model())" in fn
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +302,8 @@ def test_a_failing_readiness_check_searches_as_before(wired_app, monkeypatch):
 
 
 def test_a_deliberate_recall_never_degrades_on_a_cold_embedder(wired_app, monkeypatch):
-    """memory_recall and the session-start precis send checkpoint=False and have a budget that
-    covers the load: they must search (and wait), never return an empty 'nothing stored'."""
+    """memory_recall and the session-start precis send checkpoint=False and wait for the load
+    (the shim reads for up to 30 s): they must search (and wait), never return an empty 'nothing stored'."""
     app, calls = wired_app
     probes = []
 

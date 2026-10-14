@@ -157,16 +157,20 @@ function Invoke-DaemonRawBundle {
         # The prompt is the text the content rules read: without it a content-classified workspace
         # (brands.json content_rule_workspaces) could never resolve a brand, and its sessions saw
         # only brand-neutral memories while their brand's records were never injected.
-        $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Text ([string]$prompt)
+        $brandMap = Get-BrandMap
+        $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Text ([string]$prompt) -Map $brandMap
         $brand = $brandInfo.brand
         $workspace = $brandInfo.workspace
-        # Stickiness applies only where no path rule names the brand, i.e. where it came from the text.
-        if (-not (Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)).brand) {
+        # Stickiness applies only where no path rule names the brand, i.e. where it came from the text,
+        # and a follow-up inherits only when it names no business: one that names several is
+        # deliberately brandless (the content rule), not a follow-up.
+        if (-not (Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Map $brandMap).brand) {
             $stickyKey = [string]$sessionId + '|' + [string]$workspace
             if ($brand) {
                 if ($script:ContentBrandBySession.Count -gt 500) { $script:ContentBrandBySession.Clear() }
                 $script:ContentBrandBySession[$stickyKey] = $brand
-            } elseif ($script:ContentBrandBySession.ContainsKey($stickyKey)) {
+            } elseif ($script:ContentBrandBySession.ContainsKey($stickyKey) -and
+                      @(Get-NamedContentBrands -Map $brandMap -Text ([string]$prompt)).Count -eq 0) {
                 $brand = $script:ContentBrandBySession[$stickyKey]
             }
         }
