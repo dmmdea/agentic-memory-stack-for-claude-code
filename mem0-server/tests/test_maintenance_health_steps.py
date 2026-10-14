@@ -559,3 +559,32 @@ def test_a_guard_noop_does_not_keep_a_failing_daily_step_out_of_stale(tmp_path):
     out = _build(tmp_path, rows)   # judged Friday 2026-09-11 08:00: last real success is 77 h old
     assert out["stale_steps"] == ["dream"]
     assert [f["step"] for f in out["failed_steps"]] == ["dream"]
+
+
+# --- review_queue: the contradiction queue, served so a replica's banner can print it ---------------
+
+def test_review_queue_counts_lines_and_ages_the_oldest(tmp_path):
+    q = tmp_path / "contradiction-promote-review.jsonl"
+    q.write_text("\n".join([
+        json.dumps({"memory_id": "a", "kind": "supersede", "ts": "2026-09-09T08:00:00+00:00"}),
+        json.dumps({"memory_id": "b", "kind": "canonical-possibly-stale", "ts": "2026-09-01T08:00:00Z"}),
+        "not json, still a pending line",
+        "",
+    ]), encoding="utf-8")
+    got = mh.review_queue(q, FRIDAY)
+    assert got["pending"] == 3
+    assert got["oldest_at"] == "2026-09-01T08:00:00+00:00"
+    assert got["oldest_age_d"] == 10.0
+
+
+def test_review_queue_absent_or_empty_is_zero(tmp_path):
+    empty = tmp_path / "q.jsonl"
+    empty.write_text("\n\n", encoding="utf-8")
+    for p in (tmp_path / "missing.jsonl", empty):
+        assert mh.review_queue(p, FRIDAY) == {"pending": 0, "oldest_at": None, "oldest_age_d": None}
+
+
+def test_review_queue_without_timestamps_has_no_age(tmp_path):
+    q = tmp_path / "q.jsonl"
+    q.write_text(json.dumps({"memory_id": "a"}) + "\n", encoding="utf-8")
+    assert mh.review_queue(q, FRIDAY) == {"pending": 1, "oldest_at": None, "oldest_age_d": None}

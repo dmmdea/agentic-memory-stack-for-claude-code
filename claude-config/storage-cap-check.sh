@@ -348,12 +348,22 @@ fi
 # The endpoint is public (no key). A malformed or missing body prints nothing: this line must never
 # be the reason a session start fails.
 if [ "$MEM0_UP" = 1 ]; then
-  curl -sf --max-time 1.5 "$AMS_URL/health/maintenance" 2>/dev/null | python3 -c "
-import json, sys
+  curl -sf --max-time 1.5 "$AMS_URL/health/maintenance" 2>/dev/null | AMS_ROLE="$_ROLE" python3 -c "
+import json, os, sys
 try:
     d = json.load(sys.stdin)
     if not isinstance(d, dict):
         raise ValueError
+    # The review queue lives on the authority. The brain prints it from its own file further down;
+    # every other role reads it here, or no session would ever see it (the brain runs none).
+    rq = d.get('review_queue'); rq = rq if isinstance(rq, dict) else {}
+    n_rq = rq.get('pending') if isinstance(rq.get('pending'), int) else 0
+    if os.environ.get('AMS_ROLE') != 'brain' and n_rq > 0:
+        age = rq.get('oldest_age_d')
+        age_txt = (', oldest %sd' % age) if isinstance(age, (int, float)) else ''
+        sys.stdout.buffer.write(('[AMS] %d contradiction verdict(s) await review on the authority%s '
+                                 '(there: contradiction-sweep.py --promote <id> | --resolve-supersede <id> --winner <w> | --dismiss <id>; '
+                                 'list: ~/.mem0/contradiction-promote-review.jsonl)\n' % (n_rq, age_txt)).encode('utf-8'))
     drift = d.get('drift'); drift = drift if isinstance(drift, dict) else {}
     pool = d.get('pool'); pool = pool if isinstance(pool, dict) else {}
     wpath = d.get('write_path'); wpath = wpath if isinstance(wpath, dict) else {}
@@ -395,13 +405,28 @@ fi
 if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
   _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20&state=complete" 2>/dev/null)
   _epout=$(printf '%s' "$_eps" | python3 -c "
-import sys, json
+import sys, json, datetime as dt
 try:
     rows = json.load(sys.stdin)
     if not isinstance(rows, list):
         raise ValueError
 except Exception:
     print('UNAVAILABLE'); raise SystemExit(0)
+def ago(iso):
+    # ended_at is UTC; printed bare it read as a local time hours in the future. An age needs no zone.
+    try:
+        t = dt.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+        s = max(0, int((dt.datetime.now(dt.timezone.utc) - t).total_seconds()))
+    except Exception:
+        return (str(iso or '')[:16].replace('T', ' ') or '?')
+    return ('%dm ago' % (s // 60)) if s < 3600 else ('%dh ago' % (s // 3600)) if s < 172800 else ('%dd ago' % (s // 86400))
+def clip(text, n=90):
+    # Cut at a word boundary, never mid-word.
+    if len(text) <= n:
+        return text
+    cut = text[:n].rsplit(' ', 1)[0].rstrip(' ,;:-')
+    return (cut or text[:n]) + '…'
 out = []
 for r in rows:
     if not isinstance(r, dict):
@@ -409,15 +434,14 @@ for r in rows:
     goal = (r.get('goal_text') or '').strip()
     if not goal:
         continue
-    ended = (r.get('ended_at') or '')[:16].replace('T', ' ')
     brand = r.get('brand') or ''
     tag = ('[' + brand + '] ') if brand else ''
-    out.append('  - ' + ended + ': ' + tag + goal[:90])
+    out.append('  - ' + ago(r.get('ended_at')) + ': ' + tag + clip(goal))
     if len(out) == 5:
         break
 if out:
-    print('[agentic-memory-stack] recent sessions (last 5) (authority):')
-    print(chr(10).join(out))
+    # Bytes, not print(): a goal or the ellipsis is not ASCII, and a C locale would make print() raise.
+    sys.stdout.buffer.write(('[agentic-memory-stack] recent sessions (last 5) (authority):' + chr(10) + chr(10).join(out) + chr(10)).encode('utf-8'))
 " 2>/dev/null)
   if [ "$_epout" = UNAVAILABLE ]; then
     echo "[agentic-memory-stack] recent sessions unavailable: authority unreachable"

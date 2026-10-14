@@ -19,6 +19,7 @@ shims first on PATH, so no test ever touches a network or a real store.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sqlite3
 import subprocess
@@ -230,7 +231,10 @@ def test_replica_recent_sessions_come_from_the_authority(tmp_path):
     box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
     out = box.run()
     assert "[agentic-memory-stack] recent sessions (last 5) (authority):" in out
-    assert "live goal 0" in out and "[brand-a]" in out and "2026-09-29 19:00" in out
+    assert "live goal 0" in out and "[brand-a]" in out
+    # The UTC ended_at prints as an age (a bare UTC stamp read as a local time in the future).
+    assert re.search(r"  - \d+[mhd] ago: \[brand-a\] live goal 0", out), out
+    assert "2026-09-29 19:00" not in out
     assert "live goal 4" in out
     assert "live goal 5" not in out, "only the 5 newest goal-bearing rows"
     assert "FROZEN-LOCAL-GOAL" not in out
@@ -352,3 +356,48 @@ def test_banner_replica_authority_down(tmp_path):
     assert out.splitlines().count(UNREACHABLE) == 1, out
     assert "memory server still starting" not in out
     assert "recent sessions" not in out
+
+
+# --- usability audit 2026-10: what a replica's banner must still show ------------------------------
+
+
+def test_replica_prints_the_authoritys_review_queue(tmp_path):
+    """The brain runs no sessions; a replica that does not print the queue leaves it unseen."""
+    box = Box(tmp_path, "replica")
+    m = _ok_maintenance()
+    m["review_queue"] = {"pending": 18, "oldest_at": "2026-10-04T08:12:43+00:00", "oldest_age_d": 9.7}
+    box.authority(up=True, maintenance=m, episodes=[])
+    out = box.run()
+    assert out.count("contradiction verdict(s) await review on the authority") == 1, out
+    assert "[AMS] 18 contradiction verdict(s) await review on the authority, oldest 9.7d" in out
+    assert "brain NOT OK" not in out, "a pending queue is not a health failure"
+
+
+def test_replica_prints_no_review_line_for_an_empty_or_absent_queue(tmp_path):
+    for rq in ({"pending": 0, "oldest_at": None, "oldest_age_d": None}, None):
+        box = Box(tmp_path / ("z" if rq else "n"), "replica")
+        m = _ok_maintenance()
+        if rq is not None:
+            m["review_queue"] = rq
+        box.authority(up=True, maintenance=m, episodes=[])
+        assert "await review" not in box.run()
+
+
+def test_brain_does_not_print_the_authority_review_line_twice(tmp_path):
+    box = Box(tmp_path, "brain")
+    m = _ok_maintenance()
+    m["review_queue"] = {"pending": 2, "oldest_at": None, "oldest_age_d": None}
+    box.authority(up=True, maintenance=m, episodes=[])
+    assert "await review on the authority" not in box.run()
+
+
+def test_replica_recent_session_goal_is_cut_at_a_word_boundary(tmp_path):
+    box = Box(tmp_path, "replica")
+    goal = "Complete and verify CPU and GPU firmware documentation and tools repositories, then prepare the release"
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[_ep(goal, "2026-09-29T19:00:00Z")])
+    out = box.run()
+    line = next(ln for ln in out.splitlines() if "Complete and verify" in ln)
+    assert line.endswith("…"), line
+    clipped = line.split(": ", 1)[1].rstrip("…")
+    assert goal.startswith(clipped) and len(clipped) <= 90, line
+    assert goal[len(clipped)] in " ,;:-", f"cut mid-word: {line!r}"

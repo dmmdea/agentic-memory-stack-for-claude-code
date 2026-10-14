@@ -1112,7 +1112,8 @@ def health_maintenance() -> dict:
     ds = _os.environ.get("MEM0_ZFS_DATASET", "").strip()
     pool = _mh.zfs_pool_reader(ds) if ds else _mh.disk_usage_reader(str(Path.home()))
     maint = Path.home() / ".mem0" / "maintenance"
-    return _mh.build(maint / "receipts.jsonl", _dt.datetime.now(_dt.timezone.utc), pool,
+    now = _dt.datetime.now(_dt.timezone.utc)
+    out = _mh.build(maint / "receipts.jsonl", now, pool,
                      _mh.journal_boots_reader(), codex_shim_client.judge_transport,
                      usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
                      # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
@@ -1125,6 +1126,9 @@ def health_maintenance() -> dict:
                      write_path_reader=_write_path.snapshot,
                      # CRIT-01: is a PC's L1a still finishing runs while PC sessions go on? (informational)
                      capture_reader=_capture_signals)
+    # The contradiction review queue, for the replica banners (informational: never changes `ok`).
+    out["review_queue"] = _mh.review_queue(Path.home() / ".mem0" / "contradiction-promote-review.jsonl", now)
+    return out
 
 
 @app.get("/health/morning-summary")
