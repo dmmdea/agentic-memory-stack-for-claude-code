@@ -4,6 +4,53 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.36.0 — memory reaches the session it was meant for (2026-10-13)
+
+A usability audit of the stack in real use (the per-prompt block, the session-start banner and the
+explicit tools, measured against the transcripts of a replica PC) found layers that worked by their own
+receipts but never reached the session. This release fixes the ones that rest on direct measurement.
+
+### Fixed
+- **A cold embedder cost the whole per-prompt block.** The embedder unloads after 300 s idle, and
+  llama-swap holds a request for an unloaded model until it has loaded instead of refusing it, so the
+  bundle's dense search waited out the load (5.75 s measured for EmbeddingGemma-2 with its projector,
+  against 0.38 s warm). The hook's budget is 5 s: the first prompt after any idle spell timed out with
+  no block, 22-27 % of typed prompts in real use. The `cold-embedder` 503 path could never fire, because
+  nothing raised. The hook's bundle (`checkpoint: true`) now reads llama-swap's model listing first
+  (`embedder_503.bundle_embed_gate`, a few ms): an embedder listed as not loaded gets one background
+  warm, single flight, and that prompt's bundle skips the dense search and the raw-trace fallback. The
+  checkpoint, goals and open questions are served; the response carries `embedder: {state: "warming"}`.
+  `memory_recall` and the session-start précis (`checkpoint: false`) still wait for the load.
+  `/health/deep` adds `bundle_cold_today` and `embedder_warm`; `MEM0_BUNDLE_COLD_DEGRADE=0` restores
+  the old wait.
+- **The session-start brand block was skipped for sessions started on a drive WSL does not mount.**
+  `wsl.exe` starts the hook in `$HOME` when it cannot translate the Windows working directory, and the
+  banner inferred the brand from `$PWD`: no brand, so no canonical facts and no open goals (81 % of
+  banners in real use). The banner now reads the session's `cwd` from the hook's stdin JSON (bounded;
+  `CLAUDE_CWD` still overrides it), and a Windows path's leaf is the initiative.
+- **Content-classified workspaces never resolved a brand when reading.** A workspace listed in
+  `content_rule_workspaces` takes its brand from text. The extractor passed each fact's text and wrote
+  branded records, but the per-prompt hooks called the resolver with no text, so those records were never
+  injected in that workspace (0 of 7,163 injections). The daemon and the inline fallback now pass the
+  prompt; in the daemon a follow-up that names no business keeps the session's last content brand (only
+  where no path rule names one).
+- **The contradiction review queue had no reader on a replica fleet.** The banner printed it only on the
+  brain, which runs no interactive sessions. `/health/maintenance` now carries `review_queue`
+  (`{pending, oldest_at, oldest_age_d}`, informational) and a replica's banner prints one line from the
+  read it already makes.
+- **"Recent sessions" read wrong.** It printed the UTC `ended_at` with no zone (hours in the future for an
+  operator west of UTC), cut goals at 90 characters mid-word, listed one line per extraction window (one
+  session filled most of the five lines) and showed every brand's sessions. It now prints an age
+  (`3h ago`), cuts at a word boundary, prints one line per session, and keeps the session's own brand, a
+  shared brand or untagged ones (the memory admission rule). A session whose brand is unknown at
+  session start (a content-classified workspace before its first prompt) therefore no longer lists that
+  workspace's branded sessions.
+- **Log rotation re-rotated its own archives.** `Invoke-LogRotation` took every file over the size cap for
+  a live log, including its archives, which grew chained timestamp names instead of `KeepN` copies. It now
+  rotates `*.log` and `*.jsonl` only.
+- A live-only `/health/embedder` test pinned the pre-1.35 model id; `ARCHITECTURE.md`, `CLAUDE.md` and the
+  retrieval flow described the legacy embedder, collection and 0.30 gate as current.
+
 ## 1.35.2 — a Windows PC replica actually takes over, with last night's memory (2026-10-11)
 
 ### Fixed
