@@ -205,3 +205,21 @@ def test_a_failing_readiness_check_searches_as_before(wired_app, monkeypatch):
     monkeypatch.setattr(app, "_bundle_embed_gate", _broken)
     out = app.context_bundle(_body(app), x_api_key="k")
     assert calls["search"] == 1 and [m["id"] for m in out["memories"]] == ["m1"]
+
+
+def test_a_deliberate_recall_never_degrades_on_a_cold_embedder(wired_app, monkeypatch):
+    """memory_recall and the session-start precis send checkpoint=False and have a budget that
+    covers the load: they must search (and wait), never return an empty 'nothing stored'."""
+    app, calls = wired_app
+    probes = []
+
+    def _cold_gate():
+        probes.append(1)
+        return {"embed": False, "state": "warming", "warm_started": True}
+    monkeypatch.setattr(app, "_bundle_embed_gate", _cold_gate)
+    body = app.ContextBundleIn(session_id="mcp-memory-recall", prompt="how does the outbox replay a queued write",
+                               brand=None, workspace=None, project=None, checkpoint=False)
+    out = app.context_bundle(body, x_api_key="k")
+    assert [m["id"] for m in out["memories"]] == ["m1"]
+    assert "embedder" not in out
+    assert calls["search"] == 1 and probes == [], "the readiness probe is the hook path's only"

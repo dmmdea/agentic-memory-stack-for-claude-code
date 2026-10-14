@@ -3668,8 +3668,11 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
     # takes longer than the hook's whole budget, so the search is skipped while a background warm
     # runs (embedder_503.bundle_embed_gate). The bundle then abstains on memories (and on the raw
     # fallback, which embeds too); the checkpoint above has landed and goals/OQ are still served.
+    # Only the per-prompt hook (checkpoint=True) has a budget the load outlasts. The deliberate
+    # callers (memory_recall, the session-start precis) send checkpoint=False and keep waiting for the
+    # load: an empty answer there would read as "nothing relevant is stored".
     try:
-        _gate = _bundle_embed_gate()
+        _gate = _bundle_embed_gate() if b.checkpoint else {"embed": True, "state": "deliberate"}
     except Exception:
         log.exception("bundle: embedder readiness check failed (non-fatal; searching as before)")
         _gate = {"embed": True, "state": "unknown"}
