@@ -86,20 +86,22 @@ class Box:
         if episodes is not None:
             (self.fake / "episodes.json").write_text(json.dumps(episodes))
 
-    def run(self) -> str:
+    def run(self, *, stdin: str | None = None, claude_cwd: str | None = "/tmp") -> str:
         env = {
             "HOME": str(self.home), "USERPROFILE": str(self.home),
             "HOMEDRIVE": os.path.splitdrive(str(self.home))[0],
             "HOMEPATH": os.path.splitdrive(str(self.home))[1],
             "PATH": f"{self.bin}:/usr/bin:/bin",
-            "CLAUDE_CWD": "/tmp",
             "FAKE_DIR": str(self.fake),
             # The morning-summary counter only runs when the script lives under /mnt/c/Users/*, which
             # no repo-path test run does; this override (honoured by the script only when set) points
             # it at the fixture profile so the role gate on that block is actually exercised.
             "AMS_WINPROFILE_OVERRIDE": str(self.winprofile),
         }
-        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+        if claude_cwd is not None:
+            env["CLAUDE_CWD"] = claude_cwd
+        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60,
+                             input=stdin if stdin is not None else "", cwd=str(self.home))
         assert res.returncode == 0, f"script must always exit 0: {res.stderr}"
         return res.stdout
 
@@ -116,8 +118,11 @@ def _ok_maintenance() -> dict:
     }
 
 
-def _ep(goal: str, ended: str, brand: str = "") -> dict:
-    return {"id": 1, "goal_text": goal, "ended_at": ended, "brand": brand}
+def _ep(goal: str, ended: str, brand: str = "", session_id: str | None = None) -> dict:
+    row = {"id": 1, "goal_text": goal, "ended_at": ended, "brand": brand}
+    if session_id is not None:
+        row["session_id"] = session_id
+    return row
 
 
 def _plant_brain_artifacts(home: Path) -> None:
@@ -227,18 +232,18 @@ def test_replica_recent_sessions_come_from_the_authority(tmp_path):
     box = Box(tmp_path, "replica")
     _plant_brain_artifacts(box.home)
     eps = [_ep("", "2026-09-29T20:00:00Z")] + [
-        _ep(f"live goal {i}", f"2026-09-29T1{9 - i}:00:00Z", "brand-a" if i == 0 else "") for i in range(7)]
+        _ep(f"live goal {i}", f"2026-09-29T1{9 - i}:00:00Z", "cross-brand" if i == 0 else "") for i in range(7)]
     box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
     out = box.run()
     assert "[agentic-memory-stack] recent sessions (last 5) (authority):" in out
-    assert "live goal 0" in out and "[brand-a]" in out
+    assert "live goal 0" in out and "[cross-brand]" in out
     # The UTC ended_at prints as an age (a bare UTC stamp read as a local time in the future).
-    assert re.search(r"  - \d+[mhd] ago: \[brand-a\] live goal 0", out), out
+    assert re.search(r"  - \d+[mhd] ago: \[cross-brand\] live goal 0", out), out
     assert "2026-09-29 19:00" not in out
     assert "live goal 4" in out
     assert "live goal 5" not in out, "only the 5 newest goal-bearing rows"
     assert "FROZEN-LOCAL-GOAL" not in out
-    assert "/v1/episodes?recent=20&state=complete" in box.calls()
+    assert "/v1/episodes?recent=60&state=complete" in box.calls()
 
 
 def test_replica_recent_sessions_read_failure_prints_one_unavailable_line(tmp_path):
@@ -401,3 +406,49 @@ def test_replica_recent_session_goal_is_cut_at_a_word_boundary(tmp_path):
     clipped = line.split(": ", 1)[1].rstrip("…")
     assert goal.startswith(clipped) and len(clipped) <= 90, line
     assert goal[len(clipped)] in " ,;:-", f"cut mid-word: {line!r}"
+
+
+def test_brand_comes_from_the_hooks_stdin_cwd_when_wsl_could_not_enter_it(tmp_path):
+    """wsl.exe starts the hook in $HOME when it cannot translate the Windows cwd; the brand must come
+    from the hook's stdin JSON, or the brand block (canonical facts, open goals) is skipped."""
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup",
+                          "cwd": r"X:\Shared Drive\Dev\agentic-memory-stack"})
+    out = box.run(stdin=hook_in, claude_cwd=None)
+    assert "[agentic-memory-stack] brand context (ai-ecosystem):" in out, out
+
+
+def test_no_stdin_and_no_claude_cwd_falls_back_to_pwd(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    out = box.run(stdin="", claude_cwd=None)          # PWD is the fixture HOME: no brand
+    assert "brand context (" not in out, out
+
+
+def test_claude_cwd_still_wins_over_stdin(tmp_path):
+    box = Box(tmp_path, "replica")
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=[])
+    hook_in = json.dumps({"cwd": r"X:\Dev\agentic-memory-stack"})
+    out = box.run(stdin=hook_in, claude_cwd="/tmp")
+    assert "brand context (" not in out, out
+
+
+def test_replica_recent_sessions_one_line_per_session(tmp_path):
+    box = Box(tmp_path, "replica")
+    eps = [_ep(f"window {i} of session A", f"2026-09-29T19:{50 - i:02d}:00Z", session_id="A") for i in range(4)]
+    eps += [_ep("session B goal", "2026-09-29T18:00:00Z", session_id="B")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    out = box.run()
+    assert "window 0 of session A" in out and "session B goal" in out
+    assert "window 1 of session A" not in out, "only the newest episode of a session prints"
+
+
+def test_replica_recent_sessions_hide_another_brands_sessions(tmp_path):
+    box = Box(tmp_path, "replica")
+    eps = [_ep("other brand work", "2026-09-29T19:00:00Z", "brand-b", "S1"),
+           _ep("neutral work", "2026-09-29T18:00:00Z", "", "S2")]
+    box.authority(up=True, maintenance=_ok_maintenance(), episodes=eps)
+    out = box.run()                                   # CLAUDE_CWD=/tmp: a brandless session
+    assert "neutral work" in out
+    assert "other brand work" not in out and "[brand-b]" not in out

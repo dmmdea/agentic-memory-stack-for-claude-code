@@ -88,7 +88,11 @@ infer_initiative_from_cwd() {
     if [ -n "$top" ]; then
         basename "$top"
     else
-        basename "$cwd"
+        # A Windows cwd from the hook's stdin uses backslashes; take its leaf too.
+        local unix
+        unix=$(printf '%s' "$cwd" | tr '\134' '/')
+        unix="${unix%/}"
+        basename "$unix"
     fi
 }
 
@@ -304,7 +308,23 @@ if [ "${_cq:-0}" -gt 0 ] || [ "${_cd:-0}" -gt 0 ]; then
 fi
 
 # v0.17 Phase 0.E: brand context auto-load
-SESSION_CWD="${CLAUDE_CWD:-$PWD}"
+# The session's working directory is the hook's stdin JSON "cwd". $PWD is not it: wsl.exe starts this
+# script in $HOME whenever it cannot translate the Windows cwd (a drive WSL does not mount, such as a
+# cloud-sync letter), and a brand inferred from $HOME is none, so the whole brand block (canonical facts,
+# open goals) was skipped for every session started there. Read once, bounded; CLAUDE_CWD still wins.
+_HOOK_CWD=""
+if [ -z "${CLAUDE_CWD:-}" ] && [ ! -t 0 ]; then
+  _HOOK_CWD=$(timeout 2 head -c 65536 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    c = d.get('cwd') if isinstance(d, dict) else None
+    print(c if isinstance(c, str) else '')
+except Exception:
+    print('')
+" 2>/dev/null)
+fi
+SESSION_CWD="${CLAUDE_CWD:-${_HOOK_CWD:-$PWD}}"
 BRAND="$(infer_brand_from_cwd "$SESSION_CWD")"
 # Funnel/campaign axis (2026-06-20): isolates funnel-specific canonical rules so a
 # a campaign-a session never sees campaign-b's rules and vice-versa.
@@ -399,13 +419,13 @@ except BaseException:
 " 2>/dev/null
 fi
 # WP-2: a replica's recent sessions come from the authority (its own episodic.db froze at the
-# cutover). GET /v1/episodes?recent=20&state=complete (1.5 s; unfinished sessions have no goal and the
-# newest ended_at, so without the filter they can fill the window), keep the 5 newest that have a goal,
+# cutover). GET /v1/episodes?recent=60&state=complete (1.5 s; unfinished sessions have no goal and the
+# newest ended_at, so without the filter they can fill the window), keep the 5 newest sessions that have a goal,
 # label the source. Authority reachable but the read fails -> one "unavailable" line, never silent.
 if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
-  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=20&state=complete" 2>/dev/null)
-  _epout=$(printf '%s' "$_eps" | python3 -c "
-import sys, json, datetime as dt
+  _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=60&state=complete" 2>/dev/null)
+  _epout=$(printf '%s' "$_eps" | AMS_BRAND="$BRAND" AMS_BRANDS_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/brands.json" python3 -c "
+import os, sys, json, datetime as dt
 try:
     rows = json.load(sys.stdin)
     if not isinstance(rows, list):
@@ -426,15 +446,30 @@ def clip(text, n=90):
     if len(text) <= n:
         return text
     cut = text[:n].rsplit(' ', 1)[0].rstrip(' ,;:-')
-    return (cut or text[:n]) + '…'
+    return (cut or text[:n]) + '\u2026'
+# One line per session (a session writes an episode per extraction window, so the newest rows were
+# mostly one session's), and the memory admission rule for brands: the session's own brand, a shared
+# brand, or untagged. Another brand's session titles never print here.
+session_brand = os.environ.get('AMS_BRAND', '').strip()
+try:
+    shared = set(json.load(open(os.environ.get('AMS_BRANDS_JSON', ''), encoding='utf-8')).get('shared_brands') or [])
+except Exception:
+    shared = {'cross-brand'}
+seen = set()
 out = []
-for r in rows:
+for i, r in enumerate(rows):
     if not isinstance(r, dict):
         continue
     goal = (r.get('goal_text') or '').strip()
     if not goal:
         continue
-    brand = r.get('brand') or ''
+    brand = (r.get('brand') or '').strip()
+    if brand and brand != session_brand and brand not in shared:
+        continue
+    sid = r.get('session_id') or ('row-' + str(i))
+    if sid in seen:
+        continue
+    seen.add(sid)
     tag = ('[' + brand + '] ') if brand else ''
     out.append('  - ' + ago(r.get('ended_at')) + ': ' + tag + clip(goal))
     if len(out) == 5:
