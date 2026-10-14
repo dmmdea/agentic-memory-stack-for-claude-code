@@ -17,7 +17,7 @@ Retrieval fires through four channels, each with its own trigger:
 
 - **The `UserPromptSubmit` client + resident daemon** — issues the per-prompt bundle round-trip and applies client-side admission and placement.
 - **The mem0 server** (`:18791`) — the bundle / search / recall endpoints, the semantic gate, the K-cap, and the insight filter.
-- **EmbeddingGemma-300m** on llama-swap (`:11436`) — the asymmetric 768-d embedder, with the `egemma_embedder.py` prefix shim.
+- **The embedding profile's model** on llama-swap (`:11436`) — EmbeddingGemma-2 by default, EmbeddingGemma-300m on the legacy profile ([embedder profiles](../systems/embedder-profiles.md)): the asymmetric 768-d embedder, with the `egemma_embedder.py` prefix shim.
 - **Qdrant** — the vector store the dense / BM25 / entity legs query.
 - **The bge cross-encoder reranker** on `:11436` (`reranker.py`) — the deliberate-path reorder.
 - **`sessionstart_bundle.py`** — the session-start précis.
@@ -51,8 +51,8 @@ One `POST /v1/context/bundle` round-trip per prompt (checkpoint + gated memories
 
 | Model tier | Memories (K) | Goals | Open questions | Gate |
 |---|---|---|---|---|
-| frontier | 2 | 5 | 3 | 0.30 |
-| small | 1 | 3 | 2 | 0.30 |
+| frontier | 2 | 5 | 3 | the profile's gate (0.70 on EmbeddingGemma-2, 0.30 on EmbeddingGemma-300m) |
+| small | 1 | 3 | 2 | the profile's gate |
 
 The properties that keep it trustworthy:
 
@@ -63,6 +63,7 @@ The properties that keep it trustworthy:
 - **Hygiene on repeat content.** The `insight` tier is filtered out of this hot path server-side (insights are for deliberate recall). Within a session, the client does not repeat itself (C10). It records what each emitted block showed in a per-session state file (`~/.claude/state/mem0-injected-<session_id>.json`, holding only hashes of the rendered lines), and both the daemon and the inline path read that file. A memory line already shown in the session is dropped. The goals and frontier-questions sections render only when their content differs from what the session was last shown. If every admitted memory was already shown, the R2 rule applies and no block renders at all. A compaction resets the state: `stop-extract.ps1` clears it on `PreCompact` (synchronous, so no prompt can slip in between), and `mem0-hook-daemon-spawn.ps1` clears it again on `SessionStart` with source `compact` (or `clear`) as a backstop. `resume` keeps the state, because a resumed context still holds its blocks. The first prompt after a compaction therefore re-surfaces everything. None of this can fail silently, and no failure can leave content suppressed. Every reset also writes a compaction marker (`mem0-injected-<session_id>.compacted`) holding the reset time, and the reader ignores any state saved before it. Each save is stamped with its request's start time, captured before the bundle POST. So a save that was already in flight when the reset landed reads as stale, and the daemon's cache does not keep it. A reset that cannot delete the file overwrites it with an empty state; if that also fails, the marker alone invalidates the stale file. The 7-day sweep removes a marker only when its state is gone or was saved after it. A marker that still guards a surviving stale file is kept, and each marker removal is logged. Each reset logs its outcome: `absent`, `removed`, `truncated`, `invalidated` or `FAILED`. An unreadable state reads as empty and is logged, and a failed save is logged with its path and exception. The log is `~/.claude/logs/user-prompt-extract.log`, or `~/.mem0/hook-daemon.log` for lines written inside the resident daemon; each line starts with `C10 injection-state:`. If the logs directory is unwritable, the line goes to stderr, which Claude Code shows in the hook's error output. The daemon keeps each session's state in memory and reloads it only when the file's mtime, its length or the marker changes, so a warm prompt pays no file read. Dedupe only removes lines, so any block that is emitted is byte-identical to the pre-C10 render of the reduced bundle, and the caps, the gate and the R6 placement are unchanged. This replaces the daemon-only goals/questions blanking (HK-5) and its fixed 25-prompt refresh, which stood in for the compaction signal.
 - **Client-side defense-in-depth** (`Select-AdmittedMemoryResults`): a tier allowlist (only stable+evidence surface here; canonical/insight never echo through this path), a fail-closed brand guard (an unknown-brand session sees only brand-neutral rows), a top-3 cap and 200-char per-memory truncation — rejections logged for observability.
 - **Fail-open, bounded.** The hook never blocks the prompt; the daemon path has an 8 s internal budget and the whole chain exits 0 on any failure.
+- **Never waits out a cold embedder.** The embedder unloads after 300 s idle, and llama-swap holds a request for an unloaded model until the load has finished (5.75 s measured for EmbeddingGemma-2 with its projector, against 0.38 s warm), longer than the hook's 5 s budget; before this check such a prompt timed out with no block at all, 22–27 % of typed prompts in real use. So the bundle first reads llama-swap's model listing (`embedder_503.bundle_embed_gate`, a loopback call of a few ms): an embedder listed as not loaded gets one background warm (single flight) and that prompt's bundle skips the dense search and the raw-trace fallback, returning no memories and `embedder: {state: "warming"}`. The checkpoint has already landed and the next prompt finds the embedder warm. A listing that cannot be read, or reports no state, searches as before. Counted on `/health/deep` as `bundle_cold_today`.
 - **Raw-trace fallback.** When the condensed search admits *nothing*, one past-episode snippet may surface instead — gated on raw episode-summary cosine ≥ 0.20 (its own dedicated collection), fail-closed on brand. Recall of lived history without breaking abstention.
 
 ### Channel 2 — `memory_recall` (deliberate pull)
@@ -110,7 +111,8 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 
 | Failure | Guard |
 |---|---|
-| Off-domain prompt pulls in noise | 0.30 semantic gate + block-level abstention |
+| Off-domain prompt pulls in noise | the profile's semantic gate + block-level abstention |
+| Embedder unloaded after its idle TTL (a load outlasts the hook budget) | the bundle's listing check: abstain on memories + background warm (`bundle_cold_today` on `/health/deep`) |
 | Stale fact outranks its correction | operational recency decay; reconciliation hides the superseded record (human-gated) |
 | Cross-brand leak | fail-closed brand policy at server *and* client |
 | Slow retrieval blocks typing | fail-open hook, 8 s daemon budget, rerank off the hot path |

@@ -14,9 +14,10 @@ Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it 
    `:18791` (the authority binds its tailnet address; a dormant replica's copy is loopback).
    Owns add/search/list/update/tier-change. `X-API-Key` auth (the five health probes are keyless, as are FastAPI's own `/openapi.json`, `/docs` and `/redoc`).
 2. **Qdrant** — vector store on `127.0.0.1:6333` (loopback only; never bind 0.0.0.0).
-   768-dim collection `mem0_egemma_768`.
-3. **llama-swap** — local inference on `127.0.0.1:11436`: EmbeddingGemma-300m
-   (embedder; asymmetric task prefixes applied by `mem0-server/egemma_embedder.py`)
+   768-dim collection of the active embedding profile: `mem0_eg2_768` on the default EmbeddingGemma-2,
+   `mem0_egemma_768` on the legacy EmbeddingGemma-300m (`docs/systems/embedder-profiles.md`).
+3. **llama-swap** — local inference on `127.0.0.1:11436`: the profile's embedder, EmbeddingGemma-2 by default
+   (asymmetric task prefixes applied by `mem0-server/egemma_embedder.py`)
    + bge-reranker-v2-m3, both on the GPU with a 300 s idle unload. Setup guide: `install/llama-swap-setup.md`.
 4. **Codex CLI** — optional; runs the unattended extraction/consolidation jobs.
 5. **canonical key** (`~/.mem0/canonical-key`, mode 600; a systemd credential on the native

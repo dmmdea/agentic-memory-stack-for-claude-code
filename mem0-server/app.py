@@ -675,6 +675,20 @@ def _raw_fallback_bump(fired=0, abstained=0, errors=0):
     _raw_fallback_today["errors"] += errors
 
 
+# Per-prompt bundles served without the dense search because the embedder was unloaded
+# (_bundle_embed_gate): `degraded` counts them, `warms_started` the background warms they began.
+# Same zero-I/O daily-counter pattern; informational on /health/deep.
+_bundle_cold_today = {"date": None, "degraded": 0, "warms_started": 0}
+
+
+def _bundle_cold_bump(degraded=0, warms_started=0):
+    today = _dt.date.today().isoformat()
+    if _bundle_cold_today["date"] != today:
+        _bundle_cold_today.update({"date": today, "degraded": 0, "warms_started": 0})
+    _bundle_cold_today["degraded"] += degraded
+    _bundle_cold_today["warms_started"] += warms_started
+
+
 def _put_carryover_bump(puts=0, restored=0, lost=0):
     today = _dt.date.today().isoformat()
     if _put_carryover_today["date"] != today:
@@ -1137,6 +1151,28 @@ def _embed_base() -> str:
     return str(EMBEDDER_CONFIG.get("openai_base_url") or _embedder_profile.DEFAULT_BASE_URL).rstrip("/")
 
 
+def _bundle_embed_gate() -> dict:
+    """embedder_503.bundle_embed_gate bound to this server's embedder: may the per-prompt bundle
+    run its dense search now, or is the embedder unloaded (then a background warm starts and the
+    bundle abstains instead of waiting out the load past the hook's budget)?
+    MEM0_BUNDLE_COLD_DEGRADE=0 turns the check off (the search then waits for the load, as before)."""
+    if os.environ.get("MEM0_BUNDLE_COLD_DEGRADE", "1").strip() == "0":
+        return {"embed": True, "state": "disabled"}
+    import httpx as _httpx
+
+    def _list() -> list:
+        r = _httpx.get(f"{_embed_base()}/models", timeout=0.5)
+        r.raise_for_status()
+        return r.json().get("data") or []
+
+    def _warm() -> None:
+        r = _httpx.post(f"{_embed_base()}/embeddings",
+                        json={"model": _embed_model(), "input": "warm"}, timeout=60.0)
+        r.raise_for_status()
+
+    return _embedder_503.bundle_embed_gate(_list, _warm, _embed_model())
+
+
 def _qdrant_base() -> str:
     """The Qdrant the Memory instance is bound to (config vector_store host/port)."""
     vs = build_config()["vector_store"]["config"]
@@ -1321,6 +1357,10 @@ def health_deep() -> dict:
     # AMS-39: raw-fallback fire/abstain receipt (informational, never gates).
     _raw_fallback_bump()   # roll the date on idle days
     out["checks"]["raw_fallback_today"] = dict(_raw_fallback_today)
+    # Bundles that abstained because the embedder was unloaded, and the background warm's state.
+    _bundle_cold_bump()    # roll the date on idle days
+    out["checks"]["bundle_cold_today"] = dict(_bundle_cold_today)
+    out["checks"]["embedder_warm"] = _embedder_503.warm_state()
     # W5 T6.1: OPAQUE total only (F6) — the per-rule split never leaves the box.
     _redactions_bump()
     out["checks"]["redactions_would_apply_today"] = dict(_redactions_today)
@@ -3619,44 +3659,62 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
     # 0.30 the search returns zero memories and the hook emits NO block (abstention).
     # This is the embedding-similarity threshold only — NOT the reranker's
     # MEM0_RELEVANCE_FLOOR_OPERATIONAL.
+    #
+    # Cold embedder: llama-swap holds a request for an unloaded model until it has loaded, which
+    # takes longer than the hook's whole budget, so the search is skipped while a background warm
+    # runs (embedder_503.bundle_embed_gate). The bundle then abstains on memories (and on the raw
+    # fallback, which embeds too); the checkpoint above has landed and goals/OQ are still served.
     try:
-        filters: dict[str, Any] = {"user_id": DEFAULT_USER_ID}
-        if b.brand:
-            filters["brand"] = b.brand
-        # rerank=False is LOAD-BEARING (W5 T5): it structurally excludes the
-        # keyword union leg and the cross-encoder call from the per-prompt
-        # bundle hot path. Originally a CPU-cost decision; since the
-        # 2026-08-13 GPU move the cost argument is weak (~143ms typical), but
-        # the decision now rests on the MEASURED quality result (2026-08-11,
-        # n=578 paired): bge reranking does not improve recall@1 over dense
-        # order (p=0.43). Revisit only with a reranker that measurably does
-        # (llama.cpp PR #24083 / nemotron-rerank was such a candidate).
-        sr = _search_core(SearchIn(
-            query=(b.prompt or "")[:500],
-            filters=filters,
-            limit=_tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped below
-            threshold=_tp["relevance_threshold"],  # the active space's calibrated gate, both tiers
-            rerank=False,
-            query_class="durable",
-        ), _route="bundle")
-        _mems = sr.get("results", []) if isinstance(sr, dict) else []
-        # W5 T2.1 (ADOPT-3): forward the withheld counters onto the bundle
-        # response — _search_core computes them but the bundle previously
-        # dropped every non-results field, leaving memory_recall blind to
-        # superseded/contradicted withholding.
-        for _wk in ("rejected_brand_scoped", "rejected_superseded",
-                    "rejected_contradicted"):
-            out[_wk] = int(sr.get(_wk) or 0) if isinstance(sr, dict) else 0
-        # v1.12 HK-6: the hook client's admission list REJECTS tier=insight — observed
-        # in production as "0.D admission: 2 of 2 results rejected" (full bundle latency
-        # paid, zero memories injected, dead churn in admission-rejected.jsonl). Filter
-        # server-side so an insight hit can't burn a K-slot the client will throw away;
-        # the +2 over-fetch above lets an admissible memory take that slot instead.
-        out["memories"] = [m for m in _mems
-                           if ((m.get("metadata") or {}).get("tier")) != "insight"][:_tp["memory_cap"]]
+        _gate = _bundle_embed_gate()
     except Exception:
-        log.exception("bundle: search failed (non-fatal)")
+        log.exception("bundle: embedder readiness check failed (non-fatal; searching as before)")
+        _gate = {"embed": True, "state": "unknown"}
+    _cold = not _gate.get("embed", True)
+    if _cold:
+        out["embedder"] = {"state": _gate.get("state"), "warm_started": bool(_gate.get("warm_started"))}
+        _bundle_cold_bump(degraded=1, warms_started=int(bool(_gate.get("warm_started"))))
+        for _wk in ("rejected_brand_scoped", "rejected_superseded", "rejected_contradicted"):
+            out[_wk] = 0
         out["memories"] = []
+    if not _cold:
+        try:
+            filters: dict[str, Any] = {"user_id": DEFAULT_USER_ID}
+            if b.brand:
+                filters["brand"] = b.brand
+            # rerank=False is LOAD-BEARING (W5 T5): it structurally excludes the
+            # keyword union leg and the cross-encoder call from the per-prompt
+            # bundle hot path. Originally a CPU-cost decision; since the
+            # 2026-08-13 GPU move the cost argument is weak (~143ms typical), but
+            # the decision now rests on the MEASURED quality result (2026-08-11,
+            # n=578 paired): bge reranking does not improve recall@1 over dense
+            # order (p=0.43). Revisit only with a reranker that measurably does
+            # (llama.cpp PR #24083 / nemotron-rerank was such a candidate).
+            sr = _search_core(SearchIn(
+                query=(b.prompt or "")[:500],
+                filters=filters,
+                limit=_tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped below
+                threshold=_tp["relevance_threshold"],  # the active space's calibrated gate, both tiers
+                rerank=False,
+                query_class="durable",
+            ), _route="bundle")
+            _mems = sr.get("results", []) if isinstance(sr, dict) else []
+            # W5 T2.1 (ADOPT-3): forward the withheld counters onto the bundle
+            # response — _search_core computes them but the bundle previously
+            # dropped every non-results field, leaving memory_recall blind to
+            # superseded/contradicted withholding.
+            for _wk in ("rejected_brand_scoped", "rejected_superseded",
+                        "rejected_contradicted"):
+                out[_wk] = int(sr.get(_wk) or 0) if isinstance(sr, dict) else 0
+            # v1.12 HK-6: the hook client's admission list REJECTS tier=insight — observed
+            # in production as "0.D admission: 2 of 2 results rejected" (full bundle latency
+            # paid, zero memories injected, dead churn in admission-rejected.jsonl). Filter
+            # server-side so an insight hit can't burn a K-slot the client will throw away;
+            # the +2 over-fetch above lets an admissible memory take that slot instead.
+            out["memories"] = [m for m in _mems
+                               if ((m.get("metadata") or {}).get("tier")) != "insight"][:_tp["memory_cap"]]
+        except Exception:
+            log.exception("bundle: search failed (non-fatal)")
+            out["memories"] = []
 
     # 2b) v0.29 R4 — raw-trace fallback. Only when the condensed semantic search
     # admitted NOTHING (low-confidence) do we attempt a SEMANTIC-cosine match
@@ -3665,7 +3723,7 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
     # live, see the v0.29 CHANGELOG) keeps R2 abstention intact for off-domain
     # prompts. Never blocks the bundle. v0.29.3: enabled by default (its episodic
     # test-pollution gate was cleared + live-verified in v0.29.2).
-    if RAW_FALLBACK_ENABLED and not out.get("memories"):
+    if RAW_FALLBACK_ENABLED and not out.get("memories") and not _cold:
         try:
             rf = _episode_raw_fallback((b.prompt or "")[:500], b.brand)
             if rf:

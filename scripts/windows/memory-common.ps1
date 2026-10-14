@@ -934,7 +934,12 @@ function Invoke-LogRotation {
     # (Audit finding 2026-06-08: l1a.log/c1.log/audit-flags.jsonl had no rotation.)
     param([int]$MaxBytes = 1MB, [int]$KeepN = 5)
     if (-not (Test-Path -LiteralPath $script:LogDir)) { return }
-    foreach ($f in (Get-ChildItem -LiteralPath $script:LogDir -File -ErrorAction SilentlyContinue)) {
+    # Only a live log rotates (a name ending in .log or .jsonl). An archive (<name>.<yyyyMMdd-HHmmss>)
+    # is itself over MaxBytes, and taking it for a live log renamed it again on every pass: the
+    # archives grew chained names (l1a.log.20260930-130831.20260930-132156...) instead of KeepN copies.
+    $live = @(Get-ChildItem -LiteralPath $script:LogDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.(log|jsonl)$' })
+    foreach ($f in $live) {
         if ($f.Length -gt $MaxBytes) {
             $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
             $archived = "$($f.FullName).$ts"

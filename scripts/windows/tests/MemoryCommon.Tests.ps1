@@ -685,3 +685,37 @@ Describe 'Resolve-L1aSessionId (the episode is keyed on the real session, not th
         $a | Should -Not -Be $b
     }
 }
+
+Describe 'Invoke-LogRotation rotates live logs only (never re-rotates its own archives)' {
+    BeforeEach {
+        $script:LogDir = Join-Path $TestDrive ('rot' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+    }
+
+    It 'leaves an oversize archive name alone while rotating the oversize live log' {
+        $big = 'x' * 2048
+        $live = Join-Path $script:LogDir 'l1a.log'
+        $archive = Join-Path $script:LogDir 'l1a.log.20260930-130831'
+        Set-Content -LiteralPath $live -Value $big -NoNewline
+        Set-Content -LiteralPath $archive -Value $big -NoNewline
+
+        Invoke-LogRotation -MaxBytes 1024 -KeepN 5
+
+        Test-Path -LiteralPath $archive | Should -BeTrue -Because 'an archive is not a live log'
+        Test-Path -LiteralPath $live | Should -BeFalse -Because 'the oversize live log was rotated'
+        $names = @(Get-ChildItem -LiteralPath $script:LogDir -File | ForEach-Object Name)
+        $names.Count | Should -Be 2
+        @($names | Where-Object { $_ -match '^l1a\.log\.\d{8}-\d{6}\.\d{8}-\d{6}' }).Count | Should -Be 0 -Because 'no chained archive names'
+    }
+
+    It 'rotates an oversize .jsonl log and leaves a small one untouched' {
+        Set-Content -LiteralPath (Join-Path $script:LogDir 'codex-usage.jsonl') -Value ('y' * 2048) -NoNewline
+        Set-Content -LiteralPath (Join-Path $script:LogDir 'user-prompt-extract.log') -Value 'small' -NoNewline
+
+        Invoke-LogRotation -MaxBytes 1024 -KeepN 5
+
+        Test-Path -LiteralPath (Join-Path $script:LogDir 'codex-usage.jsonl') | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:LogDir -File -Filter 'codex-usage.jsonl.*').Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $script:LogDir 'user-prompt-extract.log') | Should -BeTrue
+    }
+}
