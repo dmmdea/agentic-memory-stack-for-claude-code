@@ -44,6 +44,8 @@ Brand isolation keeps one business's memories out of another's sessions. This sy
 2. Otherwise, if the path matches any `content_rule_workspaces` pattern, every `content_rules` pattern runs over the fact text. Exactly one distinct brand matched gives that brand; none, or several, gives no brand.
 3. Otherwise no brand.
 
+**Resolution for one prompt.** The per-prompt hooks (the daemon and the inline fallback) run the same resolver over the transcript path with the prompt as the text, so a content-rule workspace scopes a prompt that names its business to that brand. Before they passed the prompt, such a workspace never resolved a brand on the read path: its sessions saw only brand-neutral memories, and its brand's records, written with a brand by the extractor, were never injected there. In the daemon a prompt that names no business (`continue`, `ok`) keeps the session's last brand resolved this way; that stickiness applies only where no path rule names the brand, and is keyed by session and workspace.
+
 Patterns are case-insensitive. Path separators (backslash, slash, space) are one character to the matcher: the path is normalized so each becomes `-`, and the same three literals inside a pattern are normalized the same way. So `Projects/ClientA` matches `G:\My Drive\Projects\ClientA`, the Claude Code slug `g--My-Drive-Projects-ClientA` and `/home/u/projects/clienta`. An invalid regex or a malformed entry is skipped; the resolver never throws.
 
 **Shared brand.** A label written as-is on the record but treated as brand-neutral by the admission gate: visible to a brandless search and to every other brand's search. A search scoped to the shared label itself still rejects other brands' records.

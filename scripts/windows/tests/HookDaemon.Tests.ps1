@@ -401,6 +401,36 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         $body.brand | Should -BeNullOrEmpty -Because 'an unrouted transcript dir carries no brand'
     }
 
+    It 'a content-classified workspace takes its brand from the prompt, and a brandless follow-up keeps it' {
+        Mock Get-Mem0ApiKeyCached { 'k' }
+        Mock Get-BrandMap {
+            [pscustomobject]@{
+                rules = @([pscustomobject]@{ pattern = 'routed-dir'; brand = 'brand-r' })
+                shared_brands = @()
+                content_rule_workspaces = @('Solutions[\/ -]+Mixed')
+                content_rules = @([pscustomobject]@{ pattern = 'beta ?shop'; brand = 'brand-b' })
+            }
+        }
+        $script:bundleBodies = @()
+        Mock Invoke-Mem0Post {
+            $script:bundleBodies += $Body
+            '{"ok":true,"checkpoint":{"ok":true,"episode_id":9,"action":"updated"},"memories":[],"goals":[],"open_questions":[]}'
+        }
+        $sidM = [guid]::NewGuid().ToString()
+        $tp = 'C:\\h\\.claude\\projects\\g--My-Drive-Solutions-Mixed\\' + $sidM + '.jsonl'
+        foreach ($p in @('draft the Beta Shop launch email for the list', 'continue with the second paragraph please')) {
+            $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"' + $p + '","transcript_path":"' + $tp + '"}'
+            $null = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
+        }
+        $other = 'C:\\h\\.claude\\projects\\g--My-Drive-Solutions-Mixed\\' + [guid]::NewGuid().ToString() + '.jsonl'
+        $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"continue with the second paragraph please","transcript_path":"' + $other + '"}'
+        $null = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
+        $script:bundleBodies.Count | Should -Be 3
+        ($script:bundleBodies[0] | ConvertFrom-Json).brand | Should -Be 'brand-b'
+        ($script:bundleBodies[1] | ConvertFrom-Json).brand | Should -Be 'brand-b' -Because 'a follow-up that names no brand keeps the session''s content brand'
+        ($script:bundleBodies[2] | ConvertFrom-Json).brand | Should -BeNullOrEmpty -Because 'another session starts neutral'
+    }
+
     It 'decision-like prompt -> needs_0b TRUE (M4: 0.B verdict computed daemon-side)' {
         Mock Get-Mem0ApiKeyCached { 'k' }
         Mock Invoke-Mem0Post { '{"ok":true,"episode_id":3,"action":"updated"}' }

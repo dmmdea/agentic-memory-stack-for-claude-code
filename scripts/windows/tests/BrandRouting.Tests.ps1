@@ -173,3 +173,27 @@ Describe 'Select-AdmittedMemoryResults treats shared brands as neutral (C3 clien
         @(Select-AdmittedMemoryResults -Hits $hits -Brand '' -AuditPath $script:audit | ForEach-Object { $_.id }) | Should -Be @('n')
     }
 }
+
+Describe 'the per-prompt hooks give the resolver the prompt text (content-classified workspaces)' {
+    # A content_rule_workspaces path resolves a brand ONLY from text. The per-prompt hooks called the
+    # resolver without it, so such a workspace never resolved a brand and its brand's memories were
+    # never injected there (they were only ever written with one, by the extractor, which passes text).
+    It '<f> passes -Text to Get-BrandFromTranscriptPath on the bundle path' -ForEach @(
+        @{ f = 'mem0-hook-daemon.ps1' }, @{ f = 'user-prompt-extract.ps1' }
+    ) {
+        $code = script:Get-CodeLines (Join-Path $script:winDir $f)
+        $code | Should -Match ([regex]::Escape('Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Text ([string]$prompt)'))
+    }
+
+    It 'a content workspace resolves from the prompt and stays neutral on a brandless prompt' {
+        $map = [pscustomobject]@{
+            rules = @([pscustomobject]@{ pattern = 'clienta'; brand = 'brand-a' })
+            content_rule_workspaces = @('Solutions[\/ -]+Mixed')
+            content_rules = @([pscustomobject]@{ pattern = 'beta ?shop'; brand = 'brand-b' })
+        }
+        $t = 'C:\Users\u\.claude\projects\g--My-Drive-Solutions-Mixed\0b1c.jsonl'
+        (Get-BrandFromTranscriptPath -Path $t -Text 'draft the Beta Shop launch email' -Map $map).brand | Should -Be 'brand-b'
+        (Get-BrandFromTranscriptPath -Path $t -Text 'continue' -Map $map).brand | Should -BeNullOrEmpty
+        (Get-BrandFromTranscriptPath -Path $t -Map $map).brand | Should -BeNullOrEmpty
+    }
+}

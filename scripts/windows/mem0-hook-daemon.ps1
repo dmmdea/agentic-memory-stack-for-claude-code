@@ -89,6 +89,11 @@ function ConvertTo-DaemonB64 {
 # writing, a compaction reset deleting, a marker appearing) changes its stamp and forces a reload.
 $script:InjectionStateCache = @{}
 
+# A workspace that brands.json classifies by content (content_rule_workspaces) resolves a brand only
+# from the prompt's text. A prompt that names no brand ("continue", "ok") keeps the session's last
+# content-resolved brand, so one session does not flip in and out of its brand turn by turn.
+$script:ContentBrandBySession = @{}
+
 function Invoke-DaemonRawBundle {
     <#
     .SYNOPSIS
@@ -149,9 +154,22 @@ function Invoke-DaemonRawBundle {
     $brand = $null
     $workspace = $null
     if ($transcriptPath) {
-        $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)
+        # The prompt is the text the content rules read: without it a content-classified workspace
+        # (brands.json content_rule_workspaces) could never resolve a brand, and its sessions saw
+        # only brand-neutral memories while their brand's records were never injected.
+        $brandInfo = Get-BrandFromTranscriptPath -Path ([string]$transcriptPath) -Text ([string]$prompt)
         $brand = $brandInfo.brand
         $workspace = $brandInfo.workspace
+        # Stickiness applies only where no path rule names the brand, i.e. where it came from the text.
+        if (-not (Get-BrandFromTranscriptPath -Path ([string]$transcriptPath)).brand) {
+            $stickyKey = [string]$sessionId + '|' + [string]$workspace
+            if ($brand) {
+                if ($script:ContentBrandBySession.Count -gt 500) { $script:ContentBrandBySession.Clear() }
+                $script:ContentBrandBySession[$stickyKey] = $brand
+            } elseif ($script:ContentBrandBySession.ContainsKey($stickyKey)) {
+                $brand = $script:ContentBrandBySession[$stickyKey]
+            }
+        }
     }
     $project = $null
     # v0.22 Pillar 1 + Pillar 2 (B latency fix): resolve initiative + tier from
