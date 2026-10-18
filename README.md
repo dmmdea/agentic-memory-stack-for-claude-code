@@ -10,7 +10,7 @@ A persistent, multi-tier, **measurably faithful** memory backend for [Claude Cod
 
 ## What you get
 
-- **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, per-prompt correction capture, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
+- **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
 - **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deeper, deliberate pulls on top of that injection; a resume précis at session start.
 - **Trust, not just recall** — five tiers from auto-captured `evidence` up to HMAC-locked `canonical` ground truth; an admission gate hides superseded, contradicted, or wrong-workspace records at read time; time-sensitive tiers age out on a Weibull curve.
 - **A memory that polices itself** — weekly Codex-judged contradiction sweeps, an on-demand supersession sweep, an optional write-time NLI gate, and a queue-gated resolution policy: false flags auto-clear, evidence-vs-evidence hides are human-confirmed, and every hide is one-command reversible and forensically visible.

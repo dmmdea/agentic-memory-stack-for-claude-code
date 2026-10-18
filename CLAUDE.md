@@ -27,7 +27,7 @@ Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it 
    moves a record out of canonical or, since 1.32.5, out of insight.
 6. **service key** (`ams-service-key`: a systemd credential on the native authority,
    `~/.mem0/service-key` mode 600 on a WSL-hosted brain) — proves a server-side job label
-   (the dream's, the sweep's) in the `X-AMS-Service-Key` header; without it the server
+   (the dream's, the sweep's, decay-scan's) in the `X-AMS-Service-Key` header; without it the server
    answers 403 `service-credential-required`. Authority only: no replica, PC or MCP session
    holds it. Regenerable (the installer makes it; nothing to back up), and kept apart from
    the canonical key. `/health/deep` reports it as `checks.service_key`. Hand runs of the
@@ -99,7 +99,7 @@ look and how to work; `docs/` explains how the application works.
 
 `evidence` → `insight` → `canonical`. Writes land as evidence/temporal; `canonical`
 is ground truth and can only be set via the HMAC-signed CLI path. `insight` is written
-only by the nightly dream on the authority (service key) and leaves the tier only through
+only by the dream on the authority (service key; on the native authority its insight pass runs weekly) and leaves the tier only through
 the same signed path: the MCP `memory_add` downgrades an insight to evidence, and
 `memory_demote` cannot move one. When two memories
 disagree, higher tier wins; same tier → newer wins. The admission gate fail-closes on

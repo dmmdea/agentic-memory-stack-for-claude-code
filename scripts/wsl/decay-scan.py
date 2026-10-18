@@ -53,7 +53,7 @@ RETIRE_CAP = 300
 RETRIEVAL_LOG_MIN_DAYS = 28
 RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
 DIRECTIVE_LEAD = re.compile(r"^\W*(OPERATOR DECISION|OPERATOR RULE|DECISION|STANDING RULE|STANDING ORDER|HARD RULE|RULE|"
-                            r"LESSON|FRAMING PRINCIPLE|PRINCIPLE|POLICY|DIRECTIVE|Open before|NEVER|ALWAYS|Daniel)", re.I)
+                            r"LESSON|FRAMING PRINCIPLE|PRINCIPLE|POLICY|DIRECTIVE|Open before|NEVER|ALWAYS|\w+ (?:RULE|DOCTRINE|DECISION)\b)", re.I)
 REPORT = Path.home() / ".mem0" / "decay-report.jsonl"
 LEDGER_DIR = Path.home() / ".mem0"
 

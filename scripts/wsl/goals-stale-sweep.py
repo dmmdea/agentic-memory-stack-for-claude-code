@@ -15,8 +15,8 @@ abandonment or review'.
 1.37.0 (audit GQ-03, operator decision 2026-10-18): the open-question registry gets the same
 pressure. It was write-only (4,954 open, median age 53 d, about 2 % ever resolved). With
 --auto-abandon, an open question untouched for --oq-abandon-days (default 30) is set to
-'abandoned', one open-question-status-change ledger event each; the goal tools and the
-open_question_resolve door still work on it."""
+'abandoned', one open-question-status-change ledger event each. To resolve one later, reopen it
+first (PATCH /v1/open_questions/{id}/status), since open_question_resolve acts on open questions only."""
 from __future__ import annotations
 
 import argparse

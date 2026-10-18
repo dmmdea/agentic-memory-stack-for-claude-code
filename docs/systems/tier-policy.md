@@ -33,7 +33,7 @@ TRUSTED_PATCH_ACTORS = {                            # PATCH /metadata job labels
 }
 LEGACY_PATCH_ACTOR_KEYS = {
     "backfill-apply-v013": {"retrievable"},
-    "decay-scan": {"expires_at"},
+    "decay-scan": {"expires_at", "retrievable"},     # 1.37.0: retrievable=false soft-retires old evidence
     "system": {"expires_at", "tier_actor"},
 }
 SERVICE_KEY_HEADER = "X-AMS-Service-Key"            # carries the authority-only service key (1.32.5)
@@ -64,7 +64,7 @@ An actor or `source` string is a **label**: free text any API-key holder can typ
 | `dream-consolidator` | The authority's nightly dream (`scripts/wsl/dream-consolidate.py`; `dream-consolidate.ps1` on a Windows brain): the insight add and the `touched_by_dream` stamp; a privileged label, and the dream sends the service key | insight writes |
 | `dream-autopromote` | The dream's gated canonical autopromotion (at most 3 a night, through the 4C gate); it still signs the HMAC token, through `mem0-canonize.sh --actor dream-autopromote` | canonical only |
 | `claude-autonomous` | Claude acting without explicit the operator direction (every MCP promotion and demotion) | evidence, stable, temporal only; never moves an insight record in either direction |
-| `stamp-retired-v013`, `contradiction-sweep-v019`, `backfill-apply-v013`, `decay-scan`, `system` | Server-side job labels for `PATCH /metadata` (retired_at; the sweep's contradiction stamps; `retrievable`; `expires_at`; `expires_at` and `tier_actor`), each limited to its own keys; privileged labels, need the service key | those keys only |
+| `stamp-retired-v013`, `contradiction-sweep-v019`, `backfill-apply-v013`, `decay-scan`, `system` | Server-side job labels for `PATCH /metadata` (retired_at; the sweep's contradiction stamps; `retrievable`; `expires_at` and, since 1.37.0, `retrievable`; `expires_at` and `tier_actor`), each limited to its own keys; privileged labels, need the service key | those keys only |
 
 ## Ledger Format
 
@@ -82,6 +82,7 @@ Every tier change (promotion or demotion) and every insight add appends one JSON
 - `add` — insight add via POST (the dream's path only)
 - `metadata-merge` — PATCH /metadata (added in C.1, lands Phase C)
 - `decay-delete` — DELETE called by decay scanner (added in D.2, lands Phase D)
+- `decay-retire` — soft-retire (`retrievable=false`) of one flagged evidence record by the decay scanner or its `--retire-ids` mode (1.37.0); each run also appends one `decay-scan-summary` event
 
 The ledger is append-only. Never truncate it. It is the audit trail for all consequential memory operations.
 
@@ -150,13 +151,13 @@ Until 1.32.5 the server trusted a free-text label sent with the ordinary shared 
 
 The **service key** (`ams-service-key`) is an authority-only secret, separate from the API key and from `canonical-key`. A privileged label counts only when the request carries the key in the `X-AMS-Service-Key` header; otherwise the server answers `403 service-credential-required: <field>=<label> is a server-side job label and ...`.
 
-- **Native authority:** the systemd credential `ams-service-key` (`LoadCredentialEncrypted=` on `mem0.service`, on the dream and contradiction-sweep chain steps, and on the transient units of `ams-dream-now.sh` and `ams-service-run.sh`).
+- **Native authority:** the systemd credential `ams-service-key` (`LoadCredentialEncrypted=` on `mem0.service`, on the dream, contradiction-sweep and decay-scan chain steps, and on the transient units of `ams-dream-now.sh` and `ams-service-run.sh`).
 - **WSL authority (brain inside WSL on Windows):** plaintext `~/.mem0/service-key`, mode 600, created by the WSL installer on a brain (removed on a replica) and by `scripts/wsl/deploy.sh` before its restart.
 - **Replicas and PCs never hold it.** Their server refuses every privileged label, by design.
 - **Regenerable:** only the authority's units and server hold it, so there is no copy to keep and nothing to back up. `install/linux-authority.sh` generates it when it is missing or when the existing `.cred` does not decrypt on this host (the stale file is set aside as `<file>.undecryptable-<UTC stamp>`, never deleted), and fails the install if `/health/deep` does not report `checks.service_key.present: true`. Once `mem0.service` carries the credential line, a missing or undecryptable file stops mem0 from starting; re-run the installer.
 - **Visible at** `/health/deep` as `checks.service_key: {present, source}` (informational, never flips `ok`) and as the capability `service-key` (required on the brain, dead when absent).
 
-Callers that send it when they hold it: the dream, the contradiction sweep, `stamp-retired-at.py` and `ship_log_reclassify.py`, through `scripts/wsl/ams_env.py` (`service_key()`, then `mem0_headers()`); the Windows-brain dream reads `service-key` beside the API key.
+Callers that send it when they hold it: the dream, the contradiction sweep, `stamp-retired-at.py`, `ship_log_reclassify.py` and `decay-scan.py` (the 1.37.0 soft-retire), through `scripts/wsl/ams_env.py` (`service_key()`, then `mem0_headers()`); the Windows-brain dream reads `service-key` beside the API key.
 
 ### Fail closed in the policy functions
 
@@ -172,7 +173,7 @@ Callers that send it when they hold it: the dream, the contradiction sweep, `sta
 
 ### Operator hand runs on the authority
 
-The jobs that send a job label also run by hand. On the native authority they go through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> [args]`; the allowed scripts are `contradiction-sweep.py` (for example `--unstamp <id>` and `--promote <id>`), `stamp-retired-at.py` and `ship_log_reclassify.py`. The wrapper refuses unless the role is `brain`, runs the script in a transient user unit that loads `ams-api-key` and `ams-service-key` (with `MEM0_URL` at the tailnet bind), and pipes the output to the terminal: a dropped ssh session stops the unit at its next write, so run a long scroll in `tmux` or `screen`. On a WSL brain it runs the script directly. `ship_log_reclassify.py --live` refuses up front when it has no service key.
+The jobs that send a job label also run by hand. On the native authority they go through `bash ~/apps/mem0-scripts/ams-service-run.sh <script> [args]`; the allowed scripts are `contradiction-sweep.py` (for example `--unstamp <id>` and `--promote <id>`), `stamp-retired-at.py`, `ship_log_reclassify.py` and `decay-scan.py` (for `--retire-ids FILE --reason TEXT [--live]`, 1.37.0). The wrapper refuses unless the role is `brain`, runs the script in a transient user unit that loads `ams-api-key` and `ams-service-key` (with `MEM0_URL` at the tailnet bind), and pipes the output to the terminal: a dropped ssh session stops the unit at its next write, so run a long scroll in `tmux` or `screen`. On a WSL brain it runs the script directly. `ship_log_reclassify.py --live` refuses up front when it has no service key.
 
 The boundary this draws, and what it leaves open, is stated under [Threat Model](#threat-model-v017-f13--explicit).
 
@@ -476,7 +477,7 @@ v0.13 C.2 marked 366 `backfill-v012` records `retrievable=false` to exclude them
 The hold period ensures:
 - Any ongoing ledger replay / stack-restore drill that references these records can complete.
 - If a restore scenario requires a retired record's embedding or payload, it has not yet been purged.
-- the operator has time to notice if a mistaken retirement needs reversal (PATCH `retrievable=true`; `retrievable` is a forbidden metadata key that only the `backfill-apply-v013` job label may write, and since 1.32.5 only with the service key, so the reversal is an authority-side hand run).
+- the operator has time to notice if a mistaken retirement needs reversal (PATCH `retrievable=true`; `retrievable` is a forbidden metadata key that only the `backfill-apply-v013` job label (and, since 1.37.0, `decay-scan`) may write, and since 1.32.5 only with the service key, so the reversal is an authority-side hand run).
 
 ### stamp-retired-at.py usage
 

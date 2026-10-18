@@ -45,7 +45,7 @@ The tier is the system's answer to the defining problem of a **self-writing** me
 
 - **Purpose:** everything auto-captured lands here first. It is deliberately *mid-trust*: retrievable and useful, but never authoritative — a future agent should verify an `evidence` fact before consequential action.
 - **Written by:** the L1a extractor (session facts), MCP `memory_add`.
-- **Lifecycle:** born at extraction → surfaced by durable/operational searches → candidates for **promotion** (dream nightly nomination → 4C gate → `canonical`) or **hiding** (superseded/contradicted via reconciliation, or retired by a session's own `memory_supersede`) → **decays** on the durable path by Weibull half-life ~365 d (env-gated) and is flagged for review after 90 d without reinforcement (decay-scan).
+- **Lifecycle:** born at extraction → surfaced by durable/operational searches → candidates for **promotion** (dream nightly nomination → 4C gate → `canonical`) or **hiding** (superseded/contradicted via reconciliation, or retired by a session's own `memory_supersede`) → **decays** on the durable path by Weibull half-life ~365 d (env-gated) and is flagged for review after 90 d without reinforcement (decay-scan). Since 1.37.0 decay-scan also soft-retires (`retrievable=false`, reversible, ledgered) a flagged record older than 120 d that is long (over 600 characters) or never appeared in the retrieval log, once `AMS_DECAY_RETIRE=live`; `user-direct`, `automemory:*` and `learn-rules` sources and records that open with a directive word are never touched.
 - **Example:** `"llama-swap serves EmbeddingGemma on :11436; Ollama is decommissioned."`
 
 #### `temporal` — explicitly perishable (write-side parking)
@@ -60,14 +60,14 @@ The tier is the system's answer to the defining problem of a **self-writing** me
   payload.
 - **Consequence — decay-scan's expiry arm has never fired.** `decay-scan.py` hard-deletes `tier=temporal`
   records whose `expires_at` has passed, but nothing writes that field, so the arm is inert *by
-  construction*. Treat decay-scan as a ONE-armed job: its surviving arm only **flags**, and nothing
-  consumes `decay-report.jsonl` yet. Temporal is parking with **no automatic expiry** — records sit
+  construction*. Until 1.37.0 the job's other arm only **flagged** evidence and nothing consumed `decay-report.jsonl`; since
+  1.37.0 that arm soft-retires old evidence (the Freshness table below), but the temporal arm is still inert. Temporal is parking with **no automatic expiry** — records sit
   indefinitely unless something PATCHes an expiry onto them.
 - **Lifecycle — and an honest caveat:** in the current admission policies temporal is admitted by **no query class at all** — it is *write-side parking*: stored and ledgered, but invisible to every read path until a class admits it. Use it to record expiring state for the audit trail, not for retrieval.
 
 #### `insight` — consolidated knowledge (machine-written, machine-only)
 
-- **Purpose:** higher-order patterns distilled *across* sessions by the nightly dream ("the operator prefers X across all repos", "errors of class Y always trace to Z"). One insight compresses many evidence records.
+- **Purpose:** higher-order patterns distilled *across* sessions by the dream (on the native authority its insight pass runs weekly since 1.37.0) ("the operator prefers X across all repos", "errors of class Y always trace to Z"). One insight compresses many evidence records.
 - **Written by:** **only** the authority's nightly dream, whose consolidator label counts only on a request that carries the authority's service key (1.32.5; `ADD_ALLOWED_TIERS` blocks it for everyone else) — lineage-tracked to its source evidence. **No MCP session can create or move an insight record:** `memory_add` with `tier=insight` is always downgraded to `evidence` (before 1.32.5 a session that typed a consolidator `source` got through), and `memory_promote` / `memory_demote` cannot move an insight in either direction.
 - **Read:** admitted on durable/operational searches, but **filtered out of the per-prompt hot bundle server-side** — insights are for deliberate recall, not ambient injection.
 - **Lifecycle:** no stored decay or expiry (operational reads recency-weight it like everything else); can be promoted to `canonical` like evidence. It leaves the tier only on the operator's signed token, like `canonical` (`mem0-canonize.sh --action demote`, or a signed delete); no job label exempts it, because nothing in the stack demotes an insight.
@@ -112,19 +112,19 @@ The cognitive taxonomy, mapped to concrete machinery — each type exists becaus
 **Read moment:** `episodic_*` MCP tools; the **raw-trace fallback** (when a durable search admits nothing, one relevant past-episode snippet may surface at raw cosine ≥ 0.20); the session-start précis anchor.
 
 #### Working memory (the current task)
-**Implementation:** the per-prompt `[MEMORY CONTEXT]` block (top K = 1–2 gated memories + open goals/questions) + the in-progress episode checkpoint. Ephemeral by design — regenerated every prompt, never stored as such.
+**Implementation:** the per-prompt `[MEMORY CONTEXT]` block (top K = 1–2 gated memories; goals and open questions are off since 1.37.0) + the in-progress episode checkpoint. Ephemeral by design — regenerated every prompt, never stored as such.
 
 #### Prospective memory (intentions)
 **Failure it prevents:** goals silently dying at session boundaries.
-**Implementation:** the goals tree (adjacency-list hierarchy, FTS5, dedup by fuzzy title) + open questions, extracted per session (0–3 advanced goals, 0–2 blocked, 0–5 open questions raised) and surfaced at session start and in the bundle. Stale goals get swept weekly.
+**Implementation:** the goals tree (adjacency-list hierarchy, FTS5, dedup by fuzzy title) + open questions, extracted per session (0–3 advanced goals, 0–2 blocked, 0–5 open questions raised) and surfaced at session start (the per-prompt bundle's goal and open-question caps are 0 since 1.37.0). A recurrence promoter mints a goal only for an intent that recurs in at least 3 sessions over at least 5 days, and stale goals and open questions get swept weekly.
 
 #### Consolidated memory / "insights"
 **Failure it prevents:** patterns spread across 30 sessions that no single session's facts express.
 **Implementation:** the `insight` tier — the dream's surprise-weighted synthesis (corrections, decisions, surprises, contradictions carry the most signal — an Information-Gain heuristic).
 
-#### Correction memory (real-time)
-**Failure it prevents:** an operator correction ("no — always X, never Y") depending on the nightly cycle to become durable.
-**Implementation:** `Test-CorrectionLikePrompt` on the per-prompt path appends correction-shaped prompts to `~/.mem0/learn-rules.jsonl` the moment they happen, redacted with the shared `Redact-Secrets` rules at write time. `learn-rules-drain.ps1` (spawned by `memory-maintenance-spawn.ps1` at SessionStart on **every** role, throttled to once an hour) then posts each pending correction to the authority as an evidence-tier memory (`infer` off, `source=learn-rules`, `kind=correction`, with the capture time, session id and brand) and stamps the line `drained` with the returned memory id. It is a queue of *evidence*, not of rules: a correction reaches the store within an hour of a session start on that PC, and promotion above evidence stays with the dream and the operator. Test-failure lines (an older hook wrote them here) are stamped `dropped` and never posted; a deterministic 4xx marks a line `rejected`; an unreachable authority or a 5xx leaves every line `pending` for the next run. A failed queue swap after successful POSTs cannot cause a re-post: the accepted lines are journaled to `learn-rules.jsonl.pending-commit` and applied by the next run. At most 50 corrections are posted per run, and finished lines are pruned after 30 days. The pending lines are **not** dream debt any more: `dream-catchup.ps1` no longer counts them. `Test-MemoryStack` warns when a pending correction is older than 48 h, which means the drain is not running or cannot reach the authority.
+#### Correction memory (real-time capture retired in 1.37.0)
+**Failure it prevented:** an operator correction ("no — always X, never Y") depending on the nightly cycle to become durable.
+**Implementation:** retired in 1.37.0 (operator decision: recall of at most 4 % on hand-labelled corrections, and half of what it stored was pasted handoffs). Nothing on the per-prompt path calls `Test-CorrectionLikePrompt` or `Add-LearnRuleCapture` any more, so nothing new is appended to `~/.mem0/learn-rules.jsonl`; a correction reaches memory the way any other fact does, through the L1a extractor and the dream. What remains is the drain. Correction-shaped prompts used to be appended to `~/.mem0/learn-rules.jsonl` the moment they happened, redacted with the shared `Redact-Secrets` rules at write time; `learn-rules-drain.ps1` (spawned by `memory-maintenance-spawn.ps1` at SessionStart on **every** role, throttled to once an hour) still posts each pending correction an older client left to the authority as an evidence-tier memory (`infer` off, `source=learn-rules`, `kind=correction`, with the capture time, session id and brand) and stamps the line `drained` with the returned memory id. It is a queue of *evidence*, not of rules: a leftover correction reaches the store within an hour of a session start on that PC, and promotion above evidence stays with the dream and the operator. Test-failure lines (an older hook wrote them here) are stamped `dropped` and never posted; a deterministic 4xx marks a line `rejected`; an unreachable authority or a 5xx leaves every line `pending` for the next run. A failed queue swap after successful POSTs cannot cause a re-post: the accepted lines are journaled to `learn-rules.jsonl.pending-commit` and applied by the next run. At most 50 corrections are posted per run, and finished lines are pruned after 30 days. The pending lines are **not** dream debt any more: `dream-catchup.ps1` no longer counts them. `Test-MemoryStack` warns when a pending correction is older than 48 h, which means the drain is not running or cannot reach the authority.
 
 ### Freshness: the decay math
 
@@ -134,7 +134,7 @@ The cognitive taxonomy, mapped to concrete machinery — each type exists becaus
 |---|---|---|---|
 | operational reads | **all** admitted results | 30 d (`MEM0_OPERATIONAL_HALF_LIFE_DAYS`) | a 30-day-old operational note ranks at half weight |
 | durable reads (env-gated, default off) | **only `evidence`** (`DURABLE_DECAY_TIERS`) | 365 d | a 30-day-old evidence fact keeps ≈ 0.945 of its score; a year-old one, half |
-| decay-scan (weekly) | `temporal` expiry; `evidence` > 90 d flagged | — | expired temporal is deleted (ledgered + reported); old evidence is only flagged for review |
+| decay-scan (weekly) | `temporal` expiry; `evidence` > 90 d flagged; flagged `evidence` > 120 d that is long or never retrieved, since 1.37.0 | — | expired temporal is deleted (ledgered + reported); flagged evidence is reported, and with `AMS_DECAY_RETIRE=live` the old long or never-retrieved part is soft-retired (`retrievable=false`, at most 300 a run, ledgered `decay-retire`); the default `dry-run` only reports `would-retire-decay` |
 
 Canonical, stable, and insight have **no stored decay and no expiry** — atemporal knowledge shouldn't age out; staleness for them is handled by *reconciliation*, not time. (Nuance: the *operational* class recency-weights **every** result it returns, whatever the tier — per-query ranking, not stored decay.)
 
@@ -207,7 +207,7 @@ Two credentials sit above the shared API key every PC and MCP session holds. The
 
 ## Observability and debugging
 
-The tier ledger (`~/.mem0/tier-ledger-YYYY-MM.jsonl`) is the audit trail for every tier movement; the dream-rebuilt `~/.mem0/MEMORY.md` gives a lean at-a-glance tier census; decay-scan writes a report of what it expired or flagged. `query_class="history"` is the debugging lens for "why is this record no longer retrieved." When the dream's insight writes or the sweep's stamps are refused, check `/health/deep`: `checks.service_key.present` (the capability `service-key`, required on the brain) says whether the authority loaded the service key, and without it every job label is refused with `403 service-credential-required`.
+The tier ledger (`~/.mem0/tier-ledger-YYYY-MM.jsonl`) is the audit trail for every tier movement; the dream-rebuilt `~/.mem0/MEMORY.md` gives a lean at-a-glance tier census; decay-scan writes a report of what it expired, flagged or retired (or, in dry-run, would have retired), and a `decay-scan-summary` event per run. `query_class="history"` is the debugging lens for "why is this record no longer retrieved." When the dream's insight writes or the sweep's stamps are refused, check `/health/deep`: `checks.service_key.present` (the capability `service-key`, required on the brain) says whether the authority loaded the service key, and without it every job label is refused with `403 service-credential-required`.
 
 ## Testing notes
 

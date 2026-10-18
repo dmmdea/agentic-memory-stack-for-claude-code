@@ -60,7 +60,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18791/health/deep' -TimeoutSec 5 | Sele
 
 ## Forgetting + backup infrastructure
 
-- `decay-scan.timer` (Sun 02:00): soft-deletes expired `tier=temporal` records (by `expires_at`, which only a trusted PATCH can set, so none expire today) + near-duplicate cleanup (`semantic-dedup.py`, 0.94 cosine).
+- `decay-scan.timer` (Sun 02:00): soft-deletes expired `tier=temporal` records (by `expires_at`, which only a trusted PATCH can set, so none expire today) + near-duplicate cleanup (`semantic-dedup.py`, 0.94 cosine). Since 1.37.0 it also flags old `evidence` records and, with `AMS_DECAY_RETIRE=live` (the default is `dry-run`: it only reports `would-retire-decay` in `~/.mem0/decay-report.jsonl`), soft-retires the old long or never-retrieved ones (`retrievable=false`, reversible, needs the service key: `~/.mem0/service-key` on a WSL brain).
 - `stack-backup.timer` (Sun 03:30): snapshots Qdrant + history.db + episodic.db + tier-ledger + MEMORY.md + a manifest (app/schema version, git SHA, counts) to `~/.mem0/backups/` (keeps 8 weeks). Restore: `bash scripts/wsl/stack-restore.sh --snapshot <TS>` (supports `--dry-run`).
 
 ```bash

@@ -65,6 +65,10 @@ This means every session that Codex extracts open questions from automatically p
 
 `PATCH /v1/open_questions/{id}/status` with `{status, actor, reason?}` handles `abandoned` and `duplicate` transitions. `resolved` is intentionally routed through the dedicated resolve endpoint to enforce the resolution_text field and ledger event.
 
+### 5. Weekly abandonment sweep (1.37.0)
+
+The registry was write-only: questions piled up (thousands open, a median age of weeks) and almost none were ever resolved. `goals-stale-sweep.py --auto-abandon` (Sundays; both the chain step and the WSL timer pass the flag) now also sets `status='abandoned'` on every open question whose `updated_at` is older than `--oq-abandon-days` (default 30; `0` turns the pass off), one `open-question-status-change` ledger event each (`new_status: abandoned`, actor `goals-stale-sweep`). The sweep's own log line (`~/.mem0/goals-stale-sweep.jsonl`) carries `oq_abandoned_count` and `oq_abandon_days`. Without `--auto-abandon` the sweep is report-only and touches no question. Nothing is deleted: `PATCH /v1/open_questions/{id}/status` with `{"status": "open", ...}` reopens an abandoned question, and `open_question_resolve` acts only on an open one, so reopen before resolving.
+
 ---
 
 ## Read path
@@ -115,7 +119,7 @@ The gather phase `orient.json` artifact now includes `open_questions_count` for 
 - **brand-a** [P3] When does the nightly cart sync run?
 ```
 
-This section appears in Claude's context at every SessionStart, so frontier questions are visible without requiring a memory_search call.
+This section appears in Claude's context at every SessionStart, so frontier questions are visible without requiring a memory_search call. The per-prompt `[MEMORY CONTEXT]` block does not carry them (`oq_cap` is 0 for both tiers since 1.37.0).
 
 ---
 

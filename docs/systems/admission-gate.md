@@ -473,8 +473,8 @@ candidate contradicts the canonical statement.
   and points `MEM0_URL` at the authority's bind address; on a WSL brain it runs
   the script directly, which reads `~/.mem0/service-key`. It refuses on any
   other role (exit 3: no replica or PC holds the key) and runs only
-  `contradiction-sweep.py`, `stamp-retired-at.py` and
-  `ship_log_reclassify.py`. Output is piped to the terminal, and a dropped ssh
+  `contradiction-sweep.py`, `stamp-retired-at.py`,
+  `ship_log_reclassify.py` and `decay-scan.py` (its `--retire-ids` mode, 1.37.0). Output is piped to the terminal, and a dropped ssh
   session stops the unit at its next write, so run a long scroll in `tmux` or
   `screen` (a single `--unstamp` needs neither). There is no hand-typed `curl`
   fallback any more: a PATCH that names that actor without the service key is

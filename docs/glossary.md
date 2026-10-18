@@ -32,11 +32,11 @@ The settled-durable tier between machine-captured Evidence and operator-locked C
 
 ## Evidence
 
-The default tier — every auto-captured fact lands here first. It is deliberately mid-trust: retrievable and useful but never authoritative, so an agent should verify an Evidence fact before consequential action. It is a candidate for promotion or for env-gated Weibull decay on the durable path. See [memory-model.md](systems/memory-model.md).
+The default tier — every auto-captured fact lands here first. It is deliberately mid-trust: retrievable and useful but never authoritative, so an agent should verify an Evidence fact before consequential action. It is a candidate for promotion, for env-gated Weibull decay on the durable path, or (since 1.37.0, once old and long or never retrieved) for the weekly decay-scan's soft-retire. See [memory-model.md](systems/memory-model.md).
 
 ## Insight
 
-The consolidated-knowledge tier: higher-order patterns distilled *across* sessions by the nightly Dream and written only under the Dream's Server-Side Job Label, which the server accepts only with the Service Key. A record leaves the tier only through the operator's signed `demote` (since 1.32.5; no job label exempts it). `insight` is both a trust tier and a memory type; it is admitted on durable/operational reads but filtered out of the per-prompt hot bundle. See [memory-model.md](systems/memory-model.md).
+The consolidated-knowledge tier: higher-order patterns distilled *across* sessions by the Dream (on the native authority its insight pass runs weekly since 1.37.0) and written only under the Dream's Server-Side Job Label, which the server accepts only with the Service Key. A record leaves the tier only through the operator's signed `demote` (since 1.32.5; no job label exempts it). `insight` is both a trust tier and a memory type; it is admitted on durable/operational reads but filtered out of the per-prompt hot bundle. See [memory-model.md](systems/memory-model.md).
 
 ## Temporal
 
@@ -48,7 +48,7 @@ A privileged `actor` (request body or query string) or `metadata.source` string 
 
 ## Service Key
 
-The authority-only secret (`ams-service-key`) that proves a Server-Side Job Label, sent in the `X-AMS-Service-Key` header. On the native authority it is a systemd credential loaded by the server and by the Dream, the contradiction sweep and the operator's hand-run wrapper (`scripts/wsl/ams-service-run.sh`); on a WSL-hosted brain it is `~/.mem0/service-key` (mode 600). No replica, PC or MCP session holds it, and the installer regenerates it when missing, so it needs no backup. It is a separate secret from the Canonical signing key: a job holding it cannot sign a canonical token. It separates the authority's jobs from callers that hold only the shared API key; it does not resist a shell on the authority as the service user. `/health/deep` reports it as `checks.service_key`. See [key-custody.md](systems/key-custody.md).
+The authority-only secret (`ams-service-key`) that proves a Server-Side Job Label, sent in the `X-AMS-Service-Key` header. On the native authority it is a systemd credential loaded by the server and by the Dream, the contradiction sweep, the decay scan and the operator's hand-run wrapper (`scripts/wsl/ams-service-run.sh`); on a WSL-hosted brain it is `~/.mem0/service-key` (mode 600). No replica, PC or MCP session holds it, and the installer regenerates it when missing, so it needs no backup. It is a separate secret from the Canonical signing key: a job holding it cannot sign a canonical token. It separates the authority's jobs from callers that hold only the shared API key; it does not resist a shell on the authority as the service user. `/health/deep` reports it as `checks.service_key`. See [key-custody.md](systems/key-custody.md).
 
 ## Receipt
 
@@ -64,7 +64,7 @@ The `Test-MemoryStack.ps1` check (code **R9**) that SHA256-compares repository s
 
 ## Dream
 
-The nightly consolidator (Windows Task Scheduler, 3am, 24h-throttled): a four-phase orient → gather → consolidate → prune cycle that synthesizes 1–3 lineage-tracked Insights and may autonomously promote at most 3 facts/night to Canonical through the 4C Promotion Gate. See [dream-skill.md](systems/dream-skill.md).
+The nightly consolidator (Windows Task Scheduler, 3am, 24h-throttled): a four-phase orient → gather → consolidate → prune cycle that synthesizes 1–3 lineage-tracked Insights (on the native authority the gather and consolidate phases run once a week since 1.37.0) and may autonomously promote at most 3 facts/night to Canonical through the 4C Promotion Gate. See [dream-skill.md](systems/dream-skill.md).
 
 ## Drift Canary
 

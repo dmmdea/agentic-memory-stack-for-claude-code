@@ -1193,6 +1193,11 @@ class Dream:
         insight_night = self.dry or args.force or INSIGHT_INTERVAL_S <= 0 or ams_env.throttle_ok("dream-insights", INSIGHT_INTERVAL_S)
         if not insight_night:
             log(f"=== phases 2-3 skipped: insights run every {INSIGHT_INTERVAL_S // 3600} h (AMS_DREAM_INSIGHT_INTERVAL_S) ===")
+            # The memory-index and drift-guard capability rows read the gather receipt and the drift
+            # compare; both stay fresh on the six nights without insights (promotion still writes).
+            self.save_phase("gather", {"signals": [], "skipped": "weekly insight cadence", "dry_run": self.dry})
+            self._wait_for_embedder()
+            drift_before = self.drift_snapshot("before")
         else:
             # ---- phase 2: gather (store-fed on the authority; local transcripts appended when present)
             log("=== phase 2: gather (surprise-weighted) ===")

@@ -29,6 +29,7 @@ The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insi
 
 - **The five phases** — orient, gather, consolidate, autopromote (3.5), prune, plus a zero-Codex drift canary (5).
 - **Nightly throttle (23h)** — one consolidation per day, independent of the L1a 10-min throttle.
+- **Weekly insight cadence (1.37.0)** — on the native authority the insight phases (2 and 3) run once a week; promotion, the store judge and prune + index stay nightly (below).
 - **Shared Codex mutex** — the dream and L1a contend for one Codex lock so they never invoke Codex concurrently.
 - **4C promotion gate** — the contradiction + source-weighted-corroboration gate that decides whether an autopromotion nominee reaches canonical.
 - **Retrieval-drift canary** — a before/after snapshot of whether a fixed canary set stays retrievable across a consolidation, run only when an eval checkout is present (`EvalRootWsl`).
@@ -38,6 +39,8 @@ The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insi
 The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the nightly throttle and exits immediately if the last successful run was < 23h ago. It then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every Codex call goes through the ChatGPT-subscription Codex CLI, never Claude — see [`codex-hooks.md`](./codex-hooks.md) for why.
 
 If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a queued promotion, or a last run > 48h ago; pending learn-rules are drained by `learn-rules-drain.ps1`, not by the dream) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own nightly throttle + Codex lock prevent a double-run.
+
+**Weekly insight cadence (1.37.0).** The authority's Python dream (`scripts/wsl/dream-consolidate.py`) runs phases 2 and 3 (gather and consolidate, about 25k Codex tokens a night) only when `INSIGHT_INTERVAL_S` has passed since its throttle marker `dream-insights` (`~/.mem0/maintenance/last-dream-insights`) was written: 6.5 days (561600 s) by default, so the stamp that lands a minute after 03:00 never pushes a run to the eighth night. `AMS_DREAM_INSIGHT_INTERVAL_S` overrides it, read from the process environment only, and `0` restores every night. On the other nights the dream logs `phases 2-3 skipped` and goes straight on: phase 3.5 (autopromotion), the store judge (3.7) and phase 4 (prune + index) still run every night, and the 23 h `dream` throttle and its freshness are unchanged. The retrieval-drift canary brackets the night's write phases: inside phase 3 on an insight night, around promotion on the others (which also write the gather receipt, marked `skipped: weekly insight cadence`, so the capability rows stay fresh). `--force` and `--dry-run` always take the insight phases, so `ams-dream-now.sh` does too. A real night that gathers no signals counts as the insight night and marks both throttles. The Windows-hosted brain's `dream-consolidate.ps1` was not changed and still runs every phase nightly.
 
 ## Important flows
 
@@ -159,6 +162,7 @@ What is the same: the four phases and their prompts, the 23 h throttle, the 4C g
 promotions, the drift canary before/after, the morning summary and the usage ledger rows
 (`dream-gather`, `dream-consolidate`, `dream-promote`, `dream-gate`, `dream`). What differs:
 
+- **Insights run weekly (1.37.0).** Phases 2 and 3 run only when 6.5 days have passed since `last-dream-insights` (`AMS_DREAM_INSIGHT_INTERVAL_S`, `0` = every night; see "Weekly insight cadence" above), so on six nights in seven the gather and consolidate usage rows (`dream-gather`, `dream-consolidate`) are absent and the receipt posts no insight. Everything else runs nightly.
 - **Judge transport.** Every Codex call is `codex_shim_client.judge` on the native transport; its
   file lock is the single-flight mutex, and the whole cycle additionally holds
   `~/.mem0/maintenance/dream.lock` so a chain re-entry is a receipted skip.
@@ -186,7 +190,7 @@ promotions, the drift canary before/after, the morning summary and the usage led
   no longer reads as a green receipt. The dream's canonical search carries `hook_contract_version` 17.0.
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
-  throttle stamp is `~/.mem0/maintenance/last-dream`, written by Python only.
+  throttle stamps are `~/.mem0/maintenance/last-dream` and, since 1.37.0, `last-dream-insights`, written by Python only.
 - **Secrets.** The step unit loads three credentials (`LoadCredentialEncrypted=` lines): the API key
   (`ams-api-key`, reached through `MEM0_API_KEY_FILE`), the canonical key (`ams-canonical-key`) and, since
   1.32.5, the service key (`ams-service-key`), all under `$CREDENTIALS_DIRECTORY`. The service key is what
