@@ -4,6 +4,16 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.37.1 — decay expiry keeps preferences (2026-10-18)
+
+### Fixed
+- **The never-retrieved expiry rule would have retired standing preferences.** The first dry run on the
+  authority proposed 300 records, 288 of them short and never retrieved, and 52 of those read as
+  preferences or instructions ("daily reports should use yesterday's closed figures"). The
+  never-retrieved rule now skips a record phrased that way (should, must, never, always, prefers,
+  declined, wants, requires, do not, instead of ...), and records of kind decision, preference, rule,
+  directive or constraint are never expired. Long records are judged as before.
+
 ## 1.37.0 — the operator's decisions on the usability audit (2026-10-18)
 
 The 2026-10-13 usability audit ended with decisions only the operator could take. This release carries

@@ -8,7 +8,9 @@
    (counted only when the log covers >= RETRIEVAL_LOG_MIN_DAYS) is soft-retired: retrievable=false
    through PATCH /metadata (actor decay-scan, service key), reversible, ledgered, at most
    RETIRE_CAP a run. Never touched: user-direct, auto-memory mirrors, learn-rules corrections and any
-   record that opens as a standing directive (RULE, DECISION, LESSON, "Open before" ...).
+   record that opens as a standing directive (RULE, DECISION, LESSON, "Open before" ...), and records
+   of kind decision/preference/rule/directive/constraint. 1.37.1: the never-retrieved rule also skips a
+   record phrased as a preference or instruction (should, must, never, prefers, declined ...).
    Mode from AMS_DECAY_RETIRE (environment, else ~/.mem0/stack.env): off | dry-run (default) | live.
 4. --retire-ids FILE --reason TEXT [--live]: the same soft-retire for an operator-reviewed id list
    (one id per line or a JSON list), run by hand through ams-service-run.sh.
@@ -54,6 +56,12 @@ RETRIEVAL_LOG_MIN_DAYS = 28
 RETRIEVAL_LOG = Path.home() / ".mem0" / "retrieval-log.jsonl"
 DIRECTIVE_LEAD = re.compile(r"^\W*(OPERATOR DECISION|OPERATOR RULE|DECISION|STANDING RULE|STANDING ORDER|HARD RULE|RULE|"
                             r"LESSON|FRAMING PRINCIPLE|PRINCIPLE|POLICY|DIRECTIVE|Open before|NEVER|ALWAYS|\w+ (?:RULE|DOCTRINE|DECISION)\b)", re.I)
+# 1.37.1: a short record that states a preference or a standing instruction is not expired just for
+# going unretrieved (the first live dry run: 52 of 300 never-retrieved candidates read like
+# "reports should use yesterday's closed figures"). Applies to the never-retrieved rule only.
+PREFERENCE_SHAPE = re.compile(r"\b(should|must|never|always|prefer\w*|declin\w*|wants?|requires?|rule|policy|"
+                              r"do not|don.t|only use|instead of)\b", re.I)
+PROTECTED_KINDS = {"decision", "preference", "rule", "directive", "constraint"}
 REPORT = Path.home() / ".mem0" / "decay-report.jsonl"
 LEDGER_DIR = Path.home() / ".mem0"
 
@@ -102,6 +110,8 @@ def protected(payload: dict) -> str | None:
         return "learn-rules"
     if DIRECTIVE_LEAD.search(str(payload.get("data") or "")):
         return "directive-lead"
+    if str(payload.get("kind") or "").lower() in PROTECTED_KINDS:
+        return "kind"
     return None
 
 
@@ -218,7 +228,7 @@ def main():
                                 if mode != "off" and live_rec and age > RETIRE_AGE_DAYS and not protected(payload):
                                     if len(text) > RETIRE_LONG_CHARS:
                                         why = f"long ({len(text)} chars)"
-                                    elif use_never_retrieved and mid not in seen:
+                                    elif use_never_retrieved and mid not in seen and not PREFERENCE_SHAPE.search(text):
                                         why = f"never retrieved in {int(log_days)}d of retrieval log"
                                 if why and (retired + would_retire) < RETIRE_CAP:
                                     reason = f"decay expiry: age {age}d > {RETIRE_AGE_DAYS}d, {why}"
