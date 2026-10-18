@@ -1197,9 +1197,14 @@ $psSessionCapture = New-HookCommand 'sessionstart-capture.ps1'
 # two identical runs wrote settings.json with the event blocks shuffled and the "second run
 # changes nothing" readback could never be byte-for-byte. The order below is the stable one.
 $hookEntries = [ordered]@{
-    'Stop'               = @(@{ markers = @('stop-extract.ps1');           command = $psDispatcher })
+    # 1.38.0: on Stop the dispatcher only spawns the detached L1a extractor and prints nothing, yet its
+    # cold PowerShell start held every turn's end for ~0.5 s (measured 535 ms). Async: nothing waits on it.
+    # PreCompact stays synchronous: there it also resets the per-prompt injection state (C10), which
+    # must land before the compaction, and it fires a few times a day inside a much longer compaction.
+    'Stop'               = @(@{ markers = @('stop-extract.ps1');           command = $psDispatcher; async = $true; timeout = 15 })
     'PreCompact'         = @(
         @{ markers = @('stop-extract.ps1');                                command = $psDispatcher },
+        # Also synchronous (~0.3 s): the post-compact SessionStart banner reads the marker it writes.
         # B1 Phase 2: capture-only conversation query for the post-compact SessionStart top-up.
         @{ markers = @('precompact_capture.py');                           command = $bashPreCompactCapture }
     )

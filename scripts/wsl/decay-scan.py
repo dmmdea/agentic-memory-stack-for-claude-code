@@ -214,6 +214,26 @@ def main():
                         except ValueError:
                             pass
                 elif tier == "evidence":
+                    # 1.38.0: a record that named its own expiry (metadata.valid_until, the write-time lint's
+                    # field) is soft-retired once that date has passed, whatever its age.
+                    vu = payload.get("valid_until")
+                    if (vu and mode != "off" and payload.get("retrievable") is not False
+                            and not payload.get("superseded_by") and (retired + would_retire) < RETIRE_CAP):
+                        try:
+                            vu_d = dt.date.fromisoformat(str(vu)[:10])
+                        except ValueError:
+                            vu_d = None
+                        if vu_d and vu_d < now.date():
+                            reason = f"named expiry passed: valid_until {vu_d.isoformat()}"
+                            text = str(payload.get("data") or "")
+                            if mode == "live":
+                                if soft_retire(c, mid, reason):
+                                    retired += 1
+                                    report.write(json.dumps({"id": mid, "action": "retired-expired", "valid_until": str(vu), "chars": len(text), "preview": text[:80]}) + "\n")
+                            else:
+                                would_retire += 1
+                                report.write(json.dumps({"id": mid, "action": "would-retire-expired", "valid_until": str(vu), "chars": len(text), "preview": text[:80]}) + "\n")
+                            continue
                     created = payload.get("created_at")
                     if created:
                         try:

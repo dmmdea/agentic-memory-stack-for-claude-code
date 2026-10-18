@@ -235,6 +235,49 @@ BUNDLE_HOOK_CONTRACT_VERSION = "20.0"
 # semantics) is told to split when the record bundles several claims.
 OVERSIZE_ADVISORY_CHARS = 1200
 
+# 1.38.0 write-time lints (advisory, like the oversize line: the record is always stored as written
+# and the WRITER is told what is missing). Adopted from the firstmate /stow decay rules and the gstack
+# decision-log schema:
+# - a PERISHABLE claim (state that will stop being true: "currently", "pending", "not yet deployed")
+#   names a checkable expiry in metadata.valid_until (ISO date); decay-scan retires the record after it;
+# - a REINFORCEMENT (a record that re-confirms an earlier one: metadata.reinforces, or "still holds",
+#   "re-verified") names the evidence from this session in metadata.evidence (a commit, file:line,
+#   command and its result, URL);
+# - a DECISION record (kind=decision) carries decision, rationale, scope and confidence, plus supersedes
+#   when it replaces an earlier decision.
+_PERISHABLE_RE = re.compile(
+    r"\b(currently|right now|at the moment|for now|as of (?:today|now)|today|tonight|this (?:session|week)|"
+    r"is (?:running|down|offline|pending|blocked|in progress|open|failing)|awaiting|pending|in progress|"
+    r"not yet (?:merged|deployed|shipped|done|fixed)|still (?:open|running|pending|failing|down)|WIP)\b", re.I)
+_REINFORCE_RE = re.compile(r"\b(still holds|confirmed again|re-?confirmed|re-?verified|verified again|reinforc\w*)\b", re.I)
+_DECISION_FIELDS = ("decision", "rationale", "scope", "confidence")
+
+
+def _write_lints(text: str, md: dict) -> list[str]:
+    notes: list[str] = []
+    t = text if isinstance(text, str) else ""
+    vu = md.get("valid_until")
+    if vu:
+        try:
+            _dt.date.fromisoformat(str(vu)[:10])
+        except ValueError:
+            notes.append(f"metadata.valid_until={vu!r} is not an ISO date (YYYY-MM-DD); decay-scan cannot act on it")
+    else:
+        m = _PERISHABLE_RE.search(t)
+        if m:
+            notes.append(f"reads as perishable ({m.group(0)!r}): name a checkable expiry with metadata.valid_until "
+                         "(ISO date; decay-scan retires the record after it), or restate it as a dated fact")
+    if (md.get("reinforces") or _REINFORCE_RE.search(t)) and not md.get("evidence"):
+        notes.append("a reinforcement counts only with named evidence from this session: put it in metadata.evidence "
+                     "(commit sha, file:line, the command and its result, or a URL)")
+    if str(md.get("kind") or "").lower() == "decision":
+        missing = [f for f in _DECISION_FIELDS if not md.get(f)]
+        if missing:
+            notes.append("kind=decision record is missing " + ", ".join(missing) + " (schema: decision, rationale, "
+                         "scope, confidence low|medium|high, supersedes when it replaces an earlier decision; "
+                         "also call memory_supersede on that one)")
+    return notes
+
 mcp = FastMCP("mem0")
 
 def _headers() -> dict:
@@ -358,6 +401,9 @@ def memory_add(text: str, user_id: str = "__WSL_USER__", infer: bool = False, me
                "retrieves better. A single coherent record (a milestone, a causal finding) "
                "is fine as-is - the flag is advisory, never a failure.")
         note = f"{note} | {adv}" if note else adv
+    if not infer:
+        for lint in _write_lints(text, md):
+            note = f"{note} | {lint}" if note else lint
     if note:
         result["note"] = note
     return result
@@ -1169,7 +1215,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.37.1"
+SHIM_STACK_VERSION = "1.38.0"
 
 
 def _write_start_receipt() -> None:

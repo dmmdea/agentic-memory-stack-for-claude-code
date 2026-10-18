@@ -18,6 +18,11 @@ Server enforcement (the audit-trail boundary added 2026-06-08 to prevent silent 
 
 When you notice durable facts during a session (decisions made, identity, preferences, system state changes, paths/IDs/credentials), proactively call `mcp__mem0__memory_add` with `tier: "evidence"` and a descriptive `source` field. The L1a hook-fired extractor (Codex CLI) provides a backstop, but inline capture during the live session is higher quality.
 
+**Write rules (the shim answers with a `note` when one is missing; the record is stored either way):**
+- A perishable claim (state that will stop being true: "currently down", "PR pending", "not yet deployed") names a checkable expiry: `metadata.valid_until` as an ISO date. decay-scan retires the record after that date. Or write it as a dated fact ("as of 2026-10-18, ...") that stays true.
+- A reinforcement (re-confirming an earlier record: `metadata.reinforces=<id>`, or "still holds", "re-verified") names the evidence from this session in `metadata.evidence`: a commit, a file:line, the command and its result, or a URL. Without it, it is just a repeat.
+- A decision record (`kind: "decision"`) carries `decision`, `rationale`, `scope` and `confidence` (low, medium or high) in its metadata, plus `supersedes` when it replaces an earlier decision (and `memory_supersede` on that one). Keep autonomous rulings short (under ~600 characters) and do not open them with RULE/DECISION/POLICY: those lead words exempt a record from decay and are for the operator's standing orders.
+
 **Correcting a fact.** When a stored fact turns out to be out of date (the operator corrects it, or you see the change yourself):
 
 1. `mcp__mem0__memory_get_by_id` both records (the old one and the newer one, if it exists) so you act on the right ids.

@@ -4,6 +4,30 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.38.0 — faster hooks, and writes that name their expiry and evidence (2026-10-18)
+
+### Changed
+- **The Stop hook no longer holds the end of every turn.** On Stop, `stop-extract.ps1` only spawns
+  the detached L1a extractor and prints nothing, yet its cold PowerShell start held the end of every
+  turn for about half a second (535 ms measured). The installer now registers it `async` on Stop.
+  PreCompact keeps both hooks synchronous: there the dispatcher also resets the per-prompt injection
+  state (C10) before the compaction, and the conversation capture writes the marker the post-compact
+  banner reads; both fire a few times a day inside a much longer compaction.
+- **The SessionStart banner fetches its ranked bundle in the background.** The bundle precis was the
+  slowest step of the synchronous banner (0.6 s of 1.4 s inside the script, one round trip to the
+  authority). It now starts right after the health probe and the banner collects its output in the
+  same place, so the round trip overlaps the rest of the script.
+- **Write-time lints in `memory_add`** (advisory: the record is always stored, the `note` says what
+  is missing), adopted from the firstmate decay rules and a decision-log schema:
+  - a perishable claim ("currently", "pending", "not yet deployed") should name a checkable expiry in
+    `metadata.valid_until` (ISO date);
+  - a reinforcement (`metadata.reinforces`, or "still holds", "re-verified") should name the evidence
+    from this session in `metadata.evidence`;
+  - a `kind=decision` record should carry `decision`, `rationale`, `scope` and `confidence`, plus
+    `supersedes` when it replaces an earlier decision.
+- **decay-scan honours a named expiry.** An evidence record whose `valid_until` has passed is
+  soft-retired (`named expiry passed`), whatever its age, under the same mode switch and weekly cap.
+
 ## 1.37.1 — decay expiry keeps preferences (2026-10-18)
 
 ### Fixed
