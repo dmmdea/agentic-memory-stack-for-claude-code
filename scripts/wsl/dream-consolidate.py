@@ -77,6 +77,11 @@ import httpx  # noqa: E402
 
 COMPONENT = "dream"
 THROTTLE_S = 82800            # 23 h, NOT 24 h (2026-07-24): the stamp lands ~1 min after 03:00
+# 1.37.0 (audit NC-05, operator decision 2026-10-18): the insight phases (gather + consolidate, about
+# 25k Codex tokens a night) run once a week; promotion, the store judge and the index still run every
+# night. 6.5 days, so the stamp landing a minute after 03:00 never pushes the run to the 8th night.
+# AMS_DREAM_INSIGHT_INTERVAL_S overrides it (0 = every night, as before).
+INSIGHT_INTERVAL_S = int(os.environ.get("AMS_DREAM_INSIGHT_INTERVAL_S", "561600"))
 EVIDENCE_WINDOW_H = 36
 DEDUP_LOCK_MAX_MIN = 30
 TRANSCRIPT_FILES = 10
@@ -1183,141 +1188,155 @@ class Dream:
             log("  mem0 unreachable, aborting")
             return {"phase": "orient", "posted": 0, "promoted": 0, "note": "mem0 unreachable, aborting", "unreachable": True}
 
-        # ---- phase 2: gather (store-fed on the authority; local transcripts appended when present)
-        log("=== phase 2: gather (surprise-weighted) ===")
-        window_ev = evidence_window(all_ev, self.now)
-        ev_lines = _lines(f"- [{e.get('id')}] [{(e.get('metadata') or {}).get('source') or 'unsourced'}] {_clip(_mem_text(e), 180)}" for e in window_ev)
-        tdir = args.transcripts_dir
-        if tdir is None:
-            default = Path.home() / ".claude" / "projects"
-            tdir = str(default) if default.is_dir() else ""
-        transcripts = gather_transcripts(tdir, self.now)
-        corpus = ""
-        if ev_lines:
-            corpus += f"=== evidence captured in the last {EVIDENCE_WINDOW_H}h ({len(window_ev)}) ===\n{ev_lines}\n\n"
-        if transcripts:
-            corpus += transcripts
-        if not corpus.strip():
-            log("  no recent evidence or transcripts, skipping gather")
-            return {"phase": "gather", "posted": 0, "promoted": 0, "note": "no recent evidence or transcripts, skipping gather"}
+        # ---- insight cadence: gather + consolidate only when the weekly interval has elapsed
+        drift_before = None
+        insight_night = self.dry or args.force or INSIGHT_INTERVAL_S <= 0 or ams_env.throttle_ok("dream-insights", INSIGHT_INTERVAL_S)
+        if not insight_night:
+            log(f"=== phases 2-3 skipped: insights run every {INSIGHT_INTERVAL_S // 3600} h (AMS_DREAM_INSIGHT_INTERVAL_S) ===")
+            # The memory-index and drift-guard capability rows read the gather receipt and the drift
+            # compare; both stay fresh on the six nights without insights (promotion still writes).
+            self.save_phase("gather", {"signals": [], "skipped": "weekly insight cadence", "dry_run": self.dry})
+            self._wait_for_embedder()
+            drift_before = self.drift_snapshot("before")
+        else:
+            # ---- phase 2: gather (store-fed on the authority; local transcripts appended when present)
+            log("=== phase 2: gather (surprise-weighted) ===")
+            window_ev = evidence_window(all_ev, self.now)
+            ev_lines = _lines(f"- [{e.get('id')}] [{(e.get('metadata') or {}).get('source') or 'unsourced'}] {_clip(_mem_text(e), 180)}" for e in window_ev)
+            tdir = args.transcripts_dir
+            if tdir is None:
+                default = Path.home() / ".claude" / "projects"
+                tdir = str(default) if default.is_dir() else ""
+            transcripts = gather_transcripts(tdir, self.now)
+            corpus = ""
+            if ev_lines:
+                corpus += f"=== evidence captured in the last {EVIDENCE_WINDOW_H}h ({len(window_ev)}) ===\n{ev_lines}\n\n"
+            if transcripts:
+                corpus += transcripts
+            if not corpus.strip():
+                log("  no recent evidence or transcripts, skipping gather")
+                return {"phase": "gather", "posted": 0, "promoted": 0, "note": "no recent evidence or transcripts, skipping gather"}
 
-        g = self._judge_call("dream-gather", gather_prompt(memorymd, insights, ep_lines, open_goals, blocked, oqs, corpus),
-                             ams_env.MODEL_CLASSIFY, "medium", GATHER_TIMEOUT_S)
-        self.ms["gather"], self.tokens["gather"] = g["duration_ms"], int(g.get("tokens_used") or 0)
-        if not g.get("ok"):
-            log(f"  gather codex failed: {g.get('error_type')} {g.get('error', '')}")
-            return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}", "failed": True}
-        parsed = extract_json(g.get("response", ""), "signals")
-        signals = list(parsed.get("signals") or []) if parsed else []
-        self.n_signals = len(signals)
-        self.save_phase("gather", {"signals": signals, "codex_ms": self.ms["gather"], "tokens": self.tokens["gather"], "dry_run": self.dry})
-        log(f"  gathered {len(signals)} signals (codex {self.ms['gather']}ms, {self.tokens['gather']} tokens)")
-        if not signals:
-            log("  no signals; nothing to consolidate")
-            if not self.dry:
-                ams_env.mark_throttle("dream")   # a REAL no-op night marks the throttle; a dry run never does
-            return {"phase": "gather", "posted": 0, "promoted": 0, "note": "no signals; nothing to consolidate"}
+            g = self._judge_call("dream-gather", gather_prompt(memorymd, insights, ep_lines, open_goals, blocked, oqs, corpus),
+                                 ams_env.MODEL_CLASSIFY, "medium", GATHER_TIMEOUT_S)
+            self.ms["gather"], self.tokens["gather"] = g["duration_ms"], int(g.get("tokens_used") or 0)
+            if not g.get("ok"):
+                log(f"  gather codex failed: {g.get('error_type')} {g.get('error', '')}")
+                return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}", "failed": True}
+            parsed = extract_json(g.get("response", ""), "signals")
+            signals = list(parsed.get("signals") or []) if parsed else []
+            self.n_signals = len(signals)
+            self.save_phase("gather", {"signals": signals, "codex_ms": self.ms["gather"], "tokens": self.tokens["gather"], "dry_run": self.dry})
+            log(f"  gathered {len(signals)} signals (codex {self.ms['gather']}ms, {self.tokens['gather']} tokens)")
+            if not signals:
+                log("  no signals; nothing to consolidate")
+                if not self.dry:
+                    ams_env.mark_throttle("dream")   # a REAL no-op night marks the throttle; a dry run never does
+                    ams_env.mark_throttle("dream-insights")
+                return {"phase": "gather", "posted": 0, "promoted": 0, "note": "no signals; nothing to consolidate"}
 
-        # ---- dedup mutex: skip WITHOUT marking (AMS-06: a marked skip cost two nights)
-        dl = Path.home() / ".mem0" / "dedup.lock"
-        if dl.exists():
-            age_min = (time.time() - dl.stat().st_mtime) / 60
-            if age_min < DEDUP_LOCK_MAX_MIN:
-                note = f"semantic-dedup mutex held (lock {int(age_min)}min old), skipping consolidate phase; throttle NOT marked"
-                log(f"  {note}")
-                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": note}
+            # ---- dedup mutex: skip WITHOUT marking (AMS-06: a marked skip cost two nights)
+            dl = Path.home() / ".mem0" / "dedup.lock"
+            if dl.exists():
+                age_min = (time.time() - dl.stat().st_mtime) / 60
+                if age_min < DEDUP_LOCK_MAX_MIN:
+                    note = f"semantic-dedup mutex held (lock {int(age_min)}min old), skipping consolidate phase; throttle NOT marked"
+                    log(f"  {note}")
+                    return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": note}
 
-        # Phase 3 embeds (the drift snapshot, the insight POSTs): wait for a warm embedder first.
-        self._wait_for_embedder()
-        drift_before = self.drift_snapshot("before")
+            # Phase 3 embeds (the drift snapshot, the insight POSTs): wait for a warm embedder first.
+            self._wait_for_embedder()
+            drift_before = self.drift_snapshot("before")
 
-        # ---- phase 3: consolidate
-        log("=== phase 3: consolidate ===")
-        replayed_hashes = self._replay_spool() if not self.dry else set()
-        signal_bullets = _lines(f"- [{s.get('kind')} p{s.get('priority')}] {s.get('text')}" for s in signals)
-        evidence = [e for e in all_ev if _tier(e) in ("evidence", None)][:30]
-        evidence_bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in evidence)
-        evidence_ids = [str(e.get("id")) for e in evidence]
-        c = self._judge_call("dream-consolidate", consolidate_prompt(signal_bullets, evidence_bullets),
-                             ams_env.MODEL_SYNTHESIS, ams_env.EFFORT_SYNTHESIS, SYNTH_TIMEOUT_S)
-        self.ms["consolidate"], self.tokens["consolidate"] = c["duration_ms"], int(c.get("tokens_used") or 0)
-        if not c.get("ok"):
-            log(f"  consolidate codex failed: {c.get('error_type')} {c.get('error', '')}")
-            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate codex failed: {c.get('error_type')}", "failed": True}
-        parsed = extract_json(c.get("response", ""), "insights")
-        if parsed is None:
-            log("  consolidate: malformed JSON from codex; skipping throttle mark")
-            log(f"  preview: {_clip(c.get('response', ''), 300)}")
-            return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from codex; throttle NOT marked", "failed": True}
-        ins_list = list(parsed.get("insights") or [])
-        self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
+            # ---- phase 3: consolidate
+            log("=== phase 3: consolidate ===")
+            replayed_hashes = self._replay_spool() if not self.dry else set()
+            signal_bullets = _lines(f"- [{s.get('kind')} p{s.get('priority')}] {s.get('text')}" for s in signals)
+            evidence = [e for e in all_ev if _tier(e) in ("evidence", None)][:30]
+            evidence_bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in evidence)
+            evidence_ids = [str(e.get("id")) for e in evidence]
+            c = self._judge_call("dream-consolidate", consolidate_prompt(signal_bullets, evidence_bullets),
+                                 ams_env.MODEL_SYNTHESIS, ams_env.EFFORT_SYNTHESIS, SYNTH_TIMEOUT_S)
+            self.ms["consolidate"], self.tokens["consolidate"] = c["duration_ms"], int(c.get("tokens_used") or 0)
+            if not c.get("ok"):
+                log(f"  consolidate codex failed: {c.get('error_type')} {c.get('error', '')}")
+                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate codex failed: {c.get('error_type')}", "failed": True}
+            parsed = extract_json(c.get("response", ""), "insights")
+            if parsed is None:
+                log("  consolidate: malformed JSON from codex; skipping throttle mark")
+                log(f"  preview: {_clip(c.get('response', ''), 300)}")
+                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from codex; throttle NOT marked", "failed": True}
+            ins_list = list(parsed.get("insights") or [])
+            self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
 
-        if ins_list and not self.dry:
-            evidence_by_id = {str(e.get("id")): e for e in evidence}
-            try:
-                shared_brands = brand_routing.shared_brands(brand_routing.load_brand_map())
-            except Exception as e:  # noqa: BLE001 - brand routing must never cost an insight
-                log(f"  brand map unreadable ({e}); insights post brand-neutral")
-                shared_brands = set()
-            for ins in ins_list:
-                text = str(ins.get("text") or "").strip()
-                if not text:
-                    continue
-                self.consolidated += 1
-                lineage = []
-                for raw in ins.get("source_memory_ids") or []:
-                    rid = str(raw or "")
-                    if not rid:
+            if ins_list and not self.dry:
+                evidence_by_id = {str(e.get("id")): e for e in evidence}
+                try:
+                    shared_brands = brand_routing.shared_brands(brand_routing.load_brand_map())
+                except Exception as e:  # noqa: BLE001 - brand routing must never cost an insight
+                    log(f"  brand map unreadable ({e}); insights post brand-neutral")
+                    shared_brands = set()
+                for ins in ins_list:
+                    text = str(ins.get("text") or "").strip()
+                    if not text:
                         continue
-                    matched = [i for i in evidence_ids if i == rid or i.startswith(rid)]
-                    if len(matched) == 1:
-                        lineage.append(matched[0])
-                    elif len(matched) > 1:
-                        log(f"  lineage: prefix {rid} matched {len(matched)} evidence ids (ambiguous, dropping)")
-                    else:
-                        log(f"  lineage: id {rid} matched no evidence in this window (dropping)")
-                if not lineage:
-                    lineage = evidence_ids[:5]
-                try:
-                    conf = float(ins.get("confidence")) if ins.get("confidence") is not None else None
-                except (TypeError, ValueError):
-                    conf = None
-                if _insight_hash(text) in replayed_hashes:
-                    # last night's spooled copy of this very insight landed a moment ago: it is stored
-                    log("  insight already stored by the spool replay; not posting a duplicate")
-                    self.posted += 1
-                    continue
-                metadata = {"tier": "insight", "category": "insight", "confidence": conf,
-                            "source_memory_ids": lineage, "window_evidence_count": len(evidence),
-                            "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
-                            "dream_phase": "consolidate", "source": "dream-consolidator"}
-                # C3: the brand goes into `metadata` BEFORE the post, so the same dict reaches the spool
-                # (_spool_add below) and a spooled insight replays the next night with its brand.
-                ib = insight_brand(lineage, evidence_by_id, shared_brands)
-                if ib:
-                    metadata["brand"] = ib
-                try:
-                    ok = self.mem0.add(text, metadata)
-                except Exception as e:  # noqa: BLE001
-                    # 1.32.5: name the one refusal a retry cannot fix, so a backlog is not misread.
-                    _resp = getattr(e, "response", None)
-                    _why = ""
-                    if getattr(_resp, "status_code", 0) == 403 and "service-credential-required" in (getattr(_resp, "text", "") or ""):
-                        _why = (" [the server refused the dream-consolidator label: this process holds no service key "
-                                "(the ams-service-key credential, or ~/.mem0/service-key on a WSL brain)]")
-                    log(f"  insight post failed (non-fatal; spooled for the next run): {e}{_why}")
-                    ok = False
-                if not ok:
-                    self.spooled += int(self._spool_add(text, metadata, lineage))
-                if ok:
-                    self.posted += 1
-                    for mid in lineage:
-                        try:
-                            self.mem0.patch_metadata(mid, {"touched_by_dream": self.now.isoformat()}, "dream-consolidator",
-                                                     "cited as source_memory_id by insight")
-                        except Exception as e:  # noqa: BLE001
-                            log(f"  PATCH touched_by_dream failed for {mid}: {e}")
-        log(f"  consolidated {len(ins_list)} insights, posted {self.posted} (codex {self.ms['consolidate']}ms, {self.tokens['consolidate']} tokens)")
+                    self.consolidated += 1
+                    lineage = []
+                    for raw in ins.get("source_memory_ids") or []:
+                        rid = str(raw or "")
+                        if not rid:
+                            continue
+                        matched = [i for i in evidence_ids if i == rid or i.startswith(rid)]
+                        if len(matched) == 1:
+                            lineage.append(matched[0])
+                        elif len(matched) > 1:
+                            log(f"  lineage: prefix {rid} matched {len(matched)} evidence ids (ambiguous, dropping)")
+                        else:
+                            log(f"  lineage: id {rid} matched no evidence in this window (dropping)")
+                    if not lineage:
+                        lineage = evidence_ids[:5]
+                    try:
+                        conf = float(ins.get("confidence")) if ins.get("confidence") is not None else None
+                    except (TypeError, ValueError):
+                        conf = None
+                    if _insight_hash(text) in replayed_hashes:
+                        # last night's spooled copy of this very insight landed a moment ago: it is stored
+                        log("  insight already stored by the spool replay; not posting a duplicate")
+                        self.posted += 1
+                        continue
+                    metadata = {"tier": "insight", "category": "insight", "confidence": conf,
+                                "source_memory_ids": lineage, "window_evidence_count": len(evidence),
+                                "window_signal_count": len(signals), "consolidated_at": self.now.isoformat(),
+                                "dream_phase": "consolidate", "source": "dream-consolidator"}
+                    # C3: the brand goes into `metadata` BEFORE the post, so the same dict reaches the spool
+                    # (_spool_add below) and a spooled insight replays the next night with its brand.
+                    ib = insight_brand(lineage, evidence_by_id, shared_brands)
+                    if ib:
+                        metadata["brand"] = ib
+                    try:
+                        ok = self.mem0.add(text, metadata)
+                    except Exception as e:  # noqa: BLE001
+                        # 1.32.5: name the one refusal a retry cannot fix, so a backlog is not misread.
+                        _resp = getattr(e, "response", None)
+                        _why = ""
+                        if getattr(_resp, "status_code", 0) == 403 and "service-credential-required" in (getattr(_resp, "text", "") or ""):
+                            _why = (" [the server refused the dream-consolidator label: this process holds no service key "
+                                    "(the ams-service-key credential, or ~/.mem0/service-key on a WSL brain)]")
+                        log(f"  insight post failed (non-fatal; spooled for the next run): {e}{_why}")
+                        ok = False
+                    if not ok:
+                        self.spooled += int(self._spool_add(text, metadata, lineage))
+                    if ok:
+                        self.posted += 1
+                        for mid in lineage:
+                            try:
+                                self.mem0.patch_metadata(mid, {"touched_by_dream": self.now.isoformat()}, "dream-consolidator",
+                                                         "cited as source_memory_id by insight")
+                            except Exception as e:  # noqa: BLE001
+                                log(f"  PATCH touched_by_dream failed for {mid}: {e}")
+            log(f"  consolidated {len(ins_list)} insights, posted {self.posted} (codex {self.ms['consolidate']}ms, {self.tokens['consolidate']} tokens)")
+            if not self.dry:
+                ams_env.mark_throttle("dream-insights")
 
         # ---- phase 3.5: autonomous canonical promotion
         log("=== phase 3.5: autonomous canonical promotion ===")

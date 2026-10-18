@@ -38,9 +38,9 @@ Stale-sweep (episode-upkeep daily; episodic-reconcile Sundays too) → episodes.
 
 The critical property: after the FIRST user message in any session, there is
 a durable `in_progress` row in `episodic.db`. If VS Code crashes before Stop
-fires, that row remains. The next SessionStart will show the decision log via
-`recent-decisions.jsonl` (Phase 0.C), and the next dream cycle will find the
-orphaned `in_progress` row.
+fires, that row remains. The next SessionStart will show the recent sessions (Phase 0.C; it reads
+`episodic.db` since 2026-06-24, and `recent-decisions.jsonl` is no longer written since 1.37.0),
+and the next dream cycle will find the orphaned `in_progress` row.
 
 ---
 
@@ -92,7 +92,7 @@ idle, or kill the hidden powershell running `mem0-hook-daemon.ps1`).
 3. Infer `brand` from transcript path keywords (brand-a, brand-b, brand-d, ai-ecosystem).
 4. POST to `http://127.0.0.1:18791/v1/episodes/checkpoint` with `{session_id, prompt_text[:300], brand, workspace, project}`.
 5. Server calls `upsert_in_progress_episode()` — creates or updates the in_progress row.
-6. Proceed to Phase 0.B decision detection.
+6. (Until 1.37.0: proceed to Phase 0.B decision detection. It is retired, so the hook now ends after the checkpoint and the memory block.)
 
 **The running summary records what a person typed.** Claude Code raises UserPromptSubmit for
 background task notifications and for messages another agent session relays, as well as for human
@@ -137,6 +137,8 @@ v0.16 callers are unaffected.
 
 ## Phase 0.B — Auto-Capture User Decisions
 
+> **Retired in 1.37.0** (operator decision from the 2026-10 usability audit). It stored mostly bare answers ("ok", "1", "done") and some machine turns. The hook daemon now always returns `needs_0b: false`, so an older client exe never starts the 0.B pass, and `user-prompt-extract.ps1` no longer runs it; nothing writes `user-decision` records or `recent-decisions.jsonl` any more. `Test-DecisionLikePrompt` still lives in the lib, but no hook path calls it. The rest of this section is the v0.17 design, kept as the record of what it did.
+
 **Trigger conditions (all must be true):**
 1. Current user prompt is short: word count ≤ 25.
 2. Current user prompt matches a decision token pattern:
@@ -173,6 +175,8 @@ v0.16 callers are unaffected.
 ---
 
 ## Phase 0.C — SessionStart Hydration of Recent Decisions
+
+> **Note:** since 2026-06-24 the banner was repointed from `recent-decisions.jsonl` to the last sessions in `episodic.db`, and with Phase 0.B retired (1.37.0) that file receives no new lines. The text below is the original v0.17 design.
 
 **Modified file:** `claude-config/storage-cap-check.sh` (deployed to `~/.claude/scripts/`)
 
@@ -215,6 +219,8 @@ a Python-side helper that catches `OperationalError: duplicate column name` so
 ---
 
 ## Known Limitations
+
+Items 1, 2, 4 and 5 describe the Phase 0.B decision capture, retired in 1.37.0; they stay as the record of its limits.
 
 1. **Transcript format dependency:** Decision detection reads the transcript JSONL
    and parses assistant turn content. If Claude Code changes the transcript format,
@@ -260,7 +266,7 @@ a Python-side helper that catches `OperationalError: duplicate column name` so
 **What it fetches (in order):**
 
 1. **mem0 semantic search** — `POST /v1/memories/search` with `{query: prompt[:500], filters:{user_id:'youruser', brand?}, limit:5, threshold:0.4, rerank:true}`. Top 3 hits rendered with tier and brand tags.
-2. **Open goals** — `GET /v1/goals?status=open&limit=5&brand=<inferred>`. Rendered with priority.
+2. **Open goals** — `GET /v1/goals?status=open&limit=5&brand=<inferred>`. Rendered with priority. (Since 1.37.0 the per-prompt bundle serves neither goals nor open questions: `goal_cap` and `oq_cap` are 0.)
 3. **Open questions** — `GET /v1/open_questions?status=open&limit=3&brand=<inferred>` (404-safe; silently skipped pre-Phase-D since that endpoint ships later in v0.17).
 
 **Output format (emitted to stdout → Claude Code injects into LLM context):**

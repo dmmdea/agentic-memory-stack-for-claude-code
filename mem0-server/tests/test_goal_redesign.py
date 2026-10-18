@@ -196,6 +196,8 @@ def _promoter_night(c, monkeypatch, tmp_path):
     """One `goal-recurrence-promote.py --apply` pass against the fixture DB, its ledger and receipt under tmp_path."""
     monkeypatch.setattr(promote, "LEDGER_DIR", tmp_path)
     monkeypatch.setattr(promote, "RECEIPT", tmp_path / "goal-recurrence-promote.jsonl")
+    monkeypatch.setattr(promote, "MIN_SESSIONS", 2)   # the fixtures seed two sessions on one day
+    monkeypatch.setattr(promote, "MIN_SPAN_DAYS", 0)
     assert promote._run(c, argparse.Namespace(apply=True, days=14)) == 0
 
 

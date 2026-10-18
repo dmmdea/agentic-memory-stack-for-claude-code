@@ -222,7 +222,8 @@ METADATA_FORBIDDEN_KEYS = frozenset({
 # key cannot be smuggled in alongside an authorized one (v0.20 Final, mixed-key bypass).
 LEGACY_PATCH_ACTOR_KEYS: dict[str, frozenset[str]] = {
     "backfill-apply-v013": frozenset({"retrievable"}),
-    "decay-scan": frozenset({"expires_at"}),
+    # 1.37.0: decay expiry soft-retires flagged evidence (retrievable=false); service key required.
+    "decay-scan": frozenset({"expires_at", "retrievable"}),
     "system": frozenset({"expires_at", "tier_actor"}),
 }
 

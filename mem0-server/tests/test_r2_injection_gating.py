@@ -81,13 +81,3 @@ def test_r2_memory_cap_k_is_1_to_2():
     assert client["frontier"]["memory_cap"] == 2
     assert client["small"]["memory_cap"] == 1
 
-
-def test_r2_goal_oq_caps_unchanged():
-    """R2 is a minimal change: it touches K + threshold + block-level abstention,
-    NOT the goal/OQ caps. The block-abstention (no memory -> no block) is what
-    drops goal/OQ injection FREQUENCY; their per-fire caps stay as-is."""
-    server = _server_policy()
-    assert server["frontier"]["goal_cap"] == 5
-    assert server["frontier"]["oq_cap"] == 3
-    assert server["small"]["goal_cap"] == 3
-    assert server["small"]["oq_cap"] == 2

@@ -10,6 +10,7 @@
 #   bash ~/apps/mem0-scripts/ams-service-run.sh contradiction-sweep.py --promote <id>
 #   bash ~/apps/mem0-scripts/ams-service-run.sh stamp-retired-at.py --dry-run
 #   bash ~/apps/mem0-scripts/ams-service-run.sh ship_log_reclassify.py --live
+#   bash ~/apps/mem0-scripts/ams-service-run.sh decay-scan.py --retire-ids <file> --reason <why> [--live]
 # Only the scripts in ALLOWED below run (each one sends a server-side job label); the rest of the
 # arguments pass through verbatim.
 #   - role != brain     -> exit 3 (no replica or PC holds the service key, by design)
@@ -20,7 +21,7 @@
 #                          inside tmux or screen.
 #   - WSL brain         -> run directly: ams_env.service_key() reads ~/.mem0/service-key
 set -euo pipefail
-ALLOWED="contradiction-sweep.py stamp-retired-at.py ship_log_reclassify.py"
+ALLOWED="contradiction-sweep.py stamp-retired-at.py ship_log_reclassify.py decay-scan.py"
 [[ $# -ge 1 ]] || { echo "usage: ams-service-run.sh <$(echo "$ALLOWED" | tr ' ' '|')> [args...]" >&2; exit 2; }
 ENVF="$HOME/.mem0/stack.env"
 env_val() { sed -n "s/^$1=//p" "$ENVF" 2>/dev/null | head -n1; }

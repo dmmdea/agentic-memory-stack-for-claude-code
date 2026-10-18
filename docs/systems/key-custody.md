@@ -56,7 +56,7 @@ answers `403 service-credential-required`. Nothing else about the API key change
 | | |
 |---|---|
 | class | **regenerable, authority-only** |
-| native authority | systemd credential `ams-service-key`, file `<secrets-dir>/ams-service-key.cred` (`--with-key=host+tpm2`). Loaded by `mem0.service`, the dream and contradiction-sweep step units, and the transient units of `ams-dream-now.sh` and `ams-service-run.sh` |
+| native authority | systemd credential `ams-service-key`, file `<secrets-dir>/ams-service-key.cred` (`--with-key=host+tpm2`). Loaded by `mem0.service`, the dream, contradiction-sweep and decay-scan step units, and the transient units of `ams-dream-now.sh` and `ams-service-run.sh` |
 | WSL authority | `~/.mem0/service-key`, mode 600. Made by `install/1-wsl-services.sh` on a `brain` and by `scripts/wsl/deploy.sh` before its restart; there is no DPAPI blob |
 | replica, PC, thin client | never. `1-wsl-services.sh` removes the file on a box that becomes a replica; a replica's server, dormant or live, refuses every job label by design |
 | backup | none; `key-backup.sh` does not collect it |

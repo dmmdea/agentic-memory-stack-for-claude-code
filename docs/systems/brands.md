@@ -16,7 +16,7 @@ Brand isolation keeps one business's memories out of another's sessions. This sy
 
 - The brand map (`brands.json`) and its resolvers: PowerShell (`memory-common.ps1`, `user-prompt-lib.ps1`), Python (`scripts/wsl/brand_routing.py`) and the Go judge, all run over one shared corpus.
 - Shared brands (`MEM0_SHARED_BRANDS`, `shared_brands`) in the admission gate and the hook's client-side backstop.
-- Where a brand is stamped: L1a episodes and facts, the user-decision write, dream insights, drained operator corrections.
+- Where a brand is stamped: L1a episodes and facts, dream insights, drained operator corrections (the user-decision write was retired in 1.37.0).
 - The audit (`brand-scope-audit.py`) and the reviewed backfill (`brand-backfill.py`).
 
 ## Non-scope
@@ -60,11 +60,11 @@ Patterns are case-insensitive. Path separators (backslash, slash, space) are one
 
 **Missing or malformed.** The Python resolver returns no brand and prints one stderr warning per problem (a missing file is the normal unconfigured state and stays silent). The PowerShell resolver keeps its long-standing behavior: with no usable `rules` it falls back to a single rule that brands this stack's own workspace, and nothing else.
 
-**Sessions.** The UserPromptSubmit hook, the resident daemon and the L1a extractor all call `Get-BrandFromTranscriptPath`, one pinned copy in `memory-common.ps1` and one in `user-prompt-lib.ps1` (they do not dot-source each other, so a Pester test pins the two byte-identical). The workspace recorded with a session is the transcript's directory name, no longer a constant, and an unrouted session is no longer stamped with a hard-coded brand on the user-decision write.
+**Sessions.** The UserPromptSubmit hook, the resident daemon and the L1a extractor all call `Get-BrandFromTranscriptPath`, one pinned copy in `memory-common.ps1` and one in `user-prompt-lib.ps1` (they do not dot-source each other, so a Pester test pins the two byte-identical). The workspace recorded with a session is the transcript's directory name, no longer a constant, and an unrouted session is no longer stamped with a hard-coded brand (the user-decision write that once did it was retired in 1.37.0).
 
 **L1a facts.** The extractor resolves the brand before the facts loop and routes each fact with its own text, so a fact posted from a routed workspace carries that brand, a fact from a content-rule workspace carries the brand its text names, and an unrouted path posts no `brand` key at all. The episode keeps its path-only brand. When the worker analyses a PreCompact snapshot (a temp copy whose directory routes to nothing) it routes by the real transcript's path, passed as `-OriginTranscriptPath`, for the facts and the episode alike; the extraction cursor stays keyed on the file it actually reads.
 
-**Corrections.** The correction-queue drain (`learn-rules-drain.ps1`) posts each queued operator correction with the brand its transcript path routes to and, in a content-rule workspace, the brand its own text names: the same `Get-BrandFromTranscriptPath -Path <transcript> -Text <correction>` call an L1a fact gets. A correction that routes nowhere keeps the brand recorded when it was captured, and one with neither carries no `brand` key ([`memory-capture.md`](../flows/memory-capture.md)).
+**Corrections.** Real-time correction capture is retired (1.37.0), so only a queue an older client left remains: the correction-queue drain (`learn-rules-drain.ps1`) posts each queued operator correction with the brand its transcript path routes to and, in a content-rule workspace, the brand its own text names: the same `Get-BrandFromTranscriptPath -Path <transcript> -Text <correction>` call an L1a fact gets. A correction that routes nowhere keeps the brand recorded when it was captured, and one with neither carries no `brand` key ([`memory-capture.md`](../flows/memory-capture.md)).
 
 **Dream insights.** An insight takes the brand held by more than half of the memories it cites (neutral sources count in the denominator). A tie, no brand, or a shared label leaves it brand-neutral. The brand is decided when the insight is consolidated and travels in its metadata: an insight whose POST fails is spooled with that brand and replays the next night with it, whatever tonight's evidence holds ([`dream-skill.md`](./dream-skill.md)).
 

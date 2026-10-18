@@ -269,7 +269,7 @@ def _body(app):
                                brand=None, workspace=None, project=None)
 
 
-def test_cold_bundle_abstains_but_keeps_checkpoint_and_goals(wired_app, monkeypatch):
+def test_cold_bundle_abstains_but_keeps_checkpoint(wired_app, monkeypatch):
     app, calls = wired_app
     monkeypatch.setattr(app, "_bundle_embed_gate",
                         lambda: {"embed": False, "state": "warming", "warm_started": True})
@@ -278,7 +278,7 @@ def test_cold_bundle_abstains_but_keeps_checkpoint_and_goals(wired_app, monkeypa
     out = app.context_bundle(_body(app), x_api_key="k")
     assert out["memories"] == [] and "raw_fallback" not in out
     assert out["embedder"] == {"state": "warming", "warm_started": True}
-    assert calls == {"checkpoint": 1, "search": 0, "raw_fallback": 0, "goals": 1}
+    assert calls == {"checkpoint": 1, "search": 0, "raw_fallback": 0, "goals": 0}  # 1.37.0: goal_cap 0
     assert app._bundle_cold_today["degraded"] == before + 1
 
 

@@ -256,154 +256,12 @@ def test_bundle_oversized_prompt_truncated():
 # brand semantics.
 # ---------------------------------------------------------------------------
 
-def test_bundle_brandless_session_excludes_brand_tagged_goal():
-    """A brand-tagged open goal must be absent from a bundle POSTed WITHOUT a
-    brand (unknown-brand session => brand-neutral goals only), AND a brand-neutral
-    goal must STILL surface — the positive control (review L12) that guards against
-    an over-broad only_brand_neutral that strips every goal."""
-    title = f"manual-{uuid.uuid4()}"  # conftest debris pattern
-    gr = httpx.post(f"{URL}/v1/goals", json={"title": title, "brand": "brand-a"}, headers=H, timeout=10)
-    assert gr.status_code == 200, f"goal seed failed: {gr.text}"
-    gid = gr.json()["goal_id"]
-    # brand-neutral (no brand => NULL) control, priority 1 so it is within limit-5
-    neutral_title = f"manual-{uuid.uuid4()}"  # NULL-brand control
-    nr = httpx.post(f"{URL}/v1/goals", json={"title": neutral_title, "priority": 1}, headers=H, timeout=10)
-    assert nr.status_code == 200, f"neutral goal seed failed: {nr.text}"
-    ngid = nr.json()["goal_id"]
-    try:
-        br = _bundle({
-            "session_id": f"test-bundle-{uuid.uuid4()}",
-            "prompt": "v0.21 M2 brandless goal leak probe",
-            "hook_contract_version": "20.0",
-        })
-        assert br.status_code == 200, f"bundle failed: {br.text}"
-        titles = {g["title"] for g in br.json()["goals"]}
-        assert title not in titles, (
-            f"BRAND LEAK: brand-tagged goal {title!r} surfaced in a brandless bundle: {titles}"
-        )
-        assert neutral_title in titles, (
-            f"REGRESSION: brand-neutral goal {neutral_title!r} was stripped from a brandless "
-            f"bundle (only_brand_neutral over-broad): {titles}"
-        )
-    finally:
-        delete_goal_rows([gid, ngid])
-
-
-def test_bundle_brandless_session_excludes_brand_tagged_open_question():
-    """A brand-tagged open question must be absent from a brandless bundle, AND a
-    brand-neutral OQ must STILL surface (review L12 positive control)."""
-    q_text = f"v0.21 M2 brand-tagged OQ leak probe [test-oq-{uuid.uuid4().hex[:8]}]"
-    cr = httpx.post(f"{URL}/v1/open_questions",
-                    json={"question_text": q_text, "brand": "brand-a"},
-                    headers=H, timeout=10)
-    assert cr.status_code == 200, f"OQ seed failed: {cr.text}"
-    oq_id = cr.json()["open_question_id"]
-    # brand-neutral control, priority 1 so it is within limit-3
-    neutral_q = f"v0.21 M2 brand-neutral OQ control [test-oq-{uuid.uuid4().hex[:8]}]"
-    nr = httpx.post(f"{URL}/v1/open_questions",
-                    json={"question_text": neutral_q, "priority": 1},
-                    headers=H, timeout=10)
-    assert nr.status_code == 200, f"neutral OQ seed failed: {nr.text}"
-    neutral_oq_id = nr.json()["open_question_id"]
-    try:
-        br = _bundle({
-            "session_id": f"test-bundle-{uuid.uuid4()}",
-            "prompt": "v0.21 M2 brandless open-question leak probe",
-            "hook_contract_version": "20.0",
-        })
-        assert br.status_code == 200, f"bundle failed: {br.text}"
-        texts = {q.get("question_text") for q in br.json()["open_questions"]}
-        assert q_text not in texts, (
-            f"BRAND LEAK: brand-tagged OQ surfaced in a brandless bundle: {texts}"
-        )
-        assert neutral_q in texts, (
-            f"REGRESSION: brand-neutral OQ was stripped from a brandless bundle "
-            f"(only_brand_neutral over-broad): {texts}"
-        )
-    finally:
-        for _id in (oq_id, neutral_oq_id):
-            httpx.patch(f"{URL}/v1/open_questions/{_id}/status",
-                        json={"status": "abandoned", "actor": "test-cleanup"},
-                        headers=H, timeout=5)
-
-
-def test_bundle_empty_string_brand_normalizes_to_neutral():
-    """Review L4: a bundle POSTed with brand='' must behave exactly like a
-    brandless (None) bundle — brand-tagged rows excluded, brand-neutral rows
-    surface — mirroring the memory Layer-2 str(... or '').strip() normalization.
-    Pre-fix, brand='' produced `AND brand = ''`, which returned the EMPTY set
-    (no neutral rows) instead of the intended brand-neutral set."""
-    tagged = f"manual-{uuid.uuid4()}"
-    tr = httpx.post(f"{URL}/v1/goals", json={"title": tagged, "brand": "brand-a"}, headers=H, timeout=10)
-    assert tr.status_code == 200, f"tagged goal seed failed: {tr.text}"
-    tgid = tr.json()["goal_id"]
-    neutral_title = f"manual-{uuid.uuid4()}"  # NULL-brand control
-    nr = httpx.post(f"{URL}/v1/goals", json={"title": neutral_title, "priority": 1}, headers=H, timeout=10)
-    assert nr.status_code == 200, f"neutral goal seed failed: {nr.text}"
-    ngid = nr.json()["goal_id"]
-    try:
-        br = _bundle({
-            "session_id": f"test-bundle-{uuid.uuid4()}",
-            "prompt": "review L4 empty-string brand normalization probe",
-            "brand": "",
-            "hook_contract_version": "20.0",
-        })
-        assert br.status_code == 200, f"bundle failed: {br.text}"
-        titles = {g["title"] for g in br.json()["goals"]}
-        assert tagged not in titles, (
-            f"BRAND LEAK: brand-tagged goal surfaced for brand='' bundle: {titles}"
-        )
-        assert neutral_title in titles, (
-            f"REGRESSION: brand='' did not normalize to neutral — brand-neutral goal "
-            f"absent (the AND brand='' bug): {titles}"
-        )
-    finally:
-        delete_goal_rows([tgid, ngid])
-
-
 # ---------------------------------------------------------------------------
 # v0.22 Pillar 1: initiative-scoped goal injection — stop cross-initiative
 # bleed. Two open goals under the SAME brand (ai-ecosystem) but different
 # initiatives: a bundle for initiative='agentic-memory-stack' must EXCLUDE the
 # 'local-offload' goal yet INCLUDE the cross-cutting (NULL-initiative) one.
 # ---------------------------------------------------------------------------
-
-def test_bundle_initiative_scopes_goal_injection():
-    """Same-brand, different-initiative open goal must not bleed into a bundle
-    scoped to another initiative; a NULL-initiative goal still surfaces."""
-    bleed_title = f"manual-{uuid.uuid4()}"   # local-offload, must be EXCLUDED
-    cross_title = f"manual-{uuid.uuid4()}"   # NULL initiative, must be INCLUDED
-    g_bleed = httpx.post(f"{URL}/v1/goals",
-                         json={"title": bleed_title, "brand": "ai-ecosystem", "initiative": "local-offload"},
-                         headers=H, timeout=10)
-    assert g_bleed.status_code == 200, f"bleed goal seed failed: {g_bleed.text}"
-    g_cross = httpx.post(f"{URL}/v1/goals",
-                         json={"title": cross_title, "brand": "ai-ecosystem"},  # no initiative => cross-cutting
-                         headers=H, timeout=10)
-    assert g_cross.status_code == 200, f"cross goal seed failed: {g_cross.text}"
-    gid_bleed = g_bleed.json()["goal_id"]
-    gid_cross = g_cross.json()["goal_id"]
-    try:
-        br = _bundle({
-            "session_id": f"test-bundle-{uuid.uuid4()}",
-            "prompt": "v0.22 initiative goal bleed probe for the memory stack",
-            "brand": "ai-ecosystem",
-            "initiative": "agentic-memory-stack",
-            "hook_contract_version": "20.0",
-        })
-        assert br.status_code == 200, f"bundle failed: {br.text}"
-        titles = {g["title"] for g in br.json()["goals"]}
-        assert bleed_title not in titles, (
-            f"INITIATIVE BLEED: local-offload goal {bleed_title!r} surfaced in an "
-            f"agentic-memory-stack bundle: {titles}"
-        )
-        assert cross_title in titles, (
-            f"cross-cutting (NULL-initiative) goal {cross_title!r} must surface for "
-            f"any initiative but was absent: {titles}"
-        )
-    finally:
-        delete_goal_rows([gid_bleed, gid_cross])
-
 
 # ---------------------------------------------------------------------------
 # v0.22 Phase D: tier-scaled bundle caps. The request `tier` selects a per-tier
@@ -446,30 +304,6 @@ def _abandon_open_questions(ids) -> None:
                     headers=H, timeout=5)
 
 
-def test_bundle_frontier_tier_caps_unchanged():
-    """Regression: tier='frontier' (and the default, no-tier request) must serve
-    today's caps — up to 5 goals and 3 open questions. Seed 6 goals + 4 OQ
-    (brand-neutral) so the caps, not scarcity, bound the result."""
-    gids = _seed_open_goals(6)
-    oqids = _seed_open_questions(4)
-    try:
-        for body in (
-            {"session_id": f"test-bundle-{uuid.uuid4()}", "prompt": "frontier cap probe",
-             "tier": "frontier", "hook_contract_version": "20.0"},
-            {"session_id": f"test-bundle-{uuid.uuid4()}", "prompt": "default cap probe",
-             "hook_contract_version": "20.0"},  # no tier => default frontier
-        ):
-            r = _bundle(body)
-            assert r.status_code == 200, f"bundle failed: {r.text}"
-            d = r.json()
-            assert len(d["goals"]) == 5, f"frontier goal cap regressed: {len(d['goals'])} (want 5)"
-            assert len(d["open_questions"]) == 3, (
-                f"frontier OQ cap regressed: {len(d['open_questions'])} (want 3)")
-    finally:
-        delete_goal_rows(gids)
-        _abandon_open_questions(oqids)
-
-
 def test_bundle_small_tier_scales_caps_down():
     """tier='small' must cap goals at 3 and open questions at 2 (strictly below
     frontier's 5/3). Seed 6 goals + 4 OQ so the small caps bound the result."""
@@ -490,28 +324,6 @@ def test_bundle_small_tier_scales_caps_down():
         # memories also tier-capped — v1.0 R2 small K=1
         assert len(d["memories"]) <= 1, (
             f"small memory cap not applied: {len(d['memories'])} (want <=1)")
-    finally:
-        delete_goal_rows(gids)
-        _abandon_open_questions(oqids)
-
-
-def test_bundle_unknown_tier_defaults_to_frontier():
-    """An unrecognized tier string must fail-open to frontier caps (5/3), never
-    drop the bundle to small."""
-    gids = _seed_open_goals(6)
-    oqids = _seed_open_questions(4)
-    try:
-        r = _bundle({
-            "session_id": f"test-bundle-{uuid.uuid4()}",
-            "prompt": "unknown tier fail-open probe",
-            "tier": "bogus-tier-xyz",
-            "hook_contract_version": "20.0",
-        })
-        assert r.status_code == 200, f"bundle failed: {r.text}"
-        d = r.json()
-        assert len(d["goals"]) == 5, f"unknown tier did not fail-open to frontier: {len(d['goals'])}"
-        assert len(d["open_questions"]) == 3, (
-            f"unknown tier did not fail-open to frontier: {len(d['open_questions'])}")
     finally:
         delete_goal_rows(gids)
         _abandon_open_questions(oqids)

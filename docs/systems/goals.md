@@ -11,7 +11,8 @@ Goals are the persistent, multi-session objectives that episodic memory tracks a
 >    `unmatched: true`.
 > 2. **The nightly recurrence promoter** (`goal-recurrence-promote.py`,
 >    04:45) is the only automatic producer: a goal is created when the same
->    intent recurs across ≥2 distinct sessions, with brand inherited from the
+>    intent recurs across ≥3 distinct sessions spread over ≥5 days (≥2 sessions
+>    until 1.37.0), with brand inherited from the
 >    sessions and `created_by='recurrence-promoter'`. `test-` sessions
 >    (live-suite fixtures, v0.19 A.1 prefix convention) are excluded from
 >    mining — paired fixture sessions satisfy the recurrence rule by
@@ -19,6 +20,17 @@ Goals are the persistent, multi-session objectives that episodic memory tracks a
 > 3. **Auto-abandon is standing but scoped** (weekly sweep, `--auto-abandon`):
 >    only auto-created goals, only past 90 days of inactivity; `created_by=
 >    'manual'` rows are never touched.
+>
+> **1.37.0 (operator decisions from the 2026-10 usability audit).** The promoter's output was
+> context-free noise, so its bar is now ≥3 sessions over ≥5 days. Every goal it mints is born with a
+> one-line description built from its contributing episodes (`Recurred in N sessions, FIRST to
+> LAST. Latest: ...` with the newest episode's goal, else its summary), and a promoter goal
+> (`created_by='recurrence-promoter'`, open or blocked) with no new episode link for 14 days is
+> abandoned by the promoter itself (ledger event `goal-abandoned`, actor `recurrence-promoter`;
+> reversible through the goal tools, though a reopened goal is abandoned again unless an episode links to it). Goals no longer ride the per-prompt `[MEMORY CONTEXT]` block
+> (`goal_cap` is 0 for both tiers); the session-start banner and `MEMORY.md` still list them. The
+> weekly sweep's `--auto-abandon` also abandons open questions untouched for 30 days
+> ([`open-questions.md`](./open-questions.md)).
 >
 > **Field truth:** `priority`, `initiative`, and `related_goal_id` (on
 > open_questions) measured 100% unused in nine weeks of production — no
@@ -160,7 +172,7 @@ FTS5 query strings are sanitized via `_sanitize_fts`: non-word characters stripp
 
 ### Dream-consolidator gather phase
 
-`dream-consolidate.ps1` includes a goal context block in the nightly consolidation prompt (Phase 2 Gather). Open + blocked goals surface as priority signals — a goal blocked across multiple episodes escalates as a consolidation target.
+`dream-consolidate.ps1` includes a goal context block in the consolidation prompt (Phase 2 Gather; the insight phases run weekly on the native authority since 1.37.0). Open + blocked goals surface as priority signals — a goal blocked across multiple episodes escalates as a consolidation target.
 
 ### MEMORY.md hydration
 

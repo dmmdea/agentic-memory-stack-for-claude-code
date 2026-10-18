@@ -86,7 +86,7 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
   compared zero pairs; `dead` past 96 h.
 - **Nightly receipts** (`dream-cycle`, `backup-pipeline`, `memory-index`,
   `sweep-job`): age ≤ 48h → `alive` (one missed night tolerated); ≤ 96h → `degraded`; older →
-  `dead`; no signal → `unknown`.
+  `dead`; no signal → `unknown`. Since 1.37.0 the native authority's dream runs its insight phases weekly; on the other nights it still writes `gather.json` (marked `skipped: weekly insight cadence`) and runs the drift compare around the night's promotion phase, so the `memory-index` and `drift-guard` rows stay fresh. `dream-cycle` (the `last-dream` marker) and `sweep-job` (`prune.json`) are written every night as before.
 - **`bm25-sparse-leg`**: `sparse_leg.ok: false` → `dead`; alive but coverage < 0.95 → `degraded`
   (a half-backfilled corpus is degraded, not dead).
 - **`search-fusion`**: `fusion.ok: false` (not bound, or a search bypassed it) → `dead`; `mode: mem0` → `degraded`

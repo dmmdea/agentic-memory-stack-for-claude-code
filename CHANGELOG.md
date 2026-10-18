@@ -4,6 +4,50 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.37.0 — the operator's decisions on the usability audit (2026-10-18)
+
+The 2026-10-13 usability audit ended with decisions only the operator could take. This release carries
+out the ones that change code; the store-side ones (retiring long ship-log records, the contradiction
+queue, stale pointers and per-PR authorizations) were done on the authority with the existing doors.
+
+### Changed
+- **Goals and open questions leave the per-prompt block.** They were picked without reference to the
+  prompt: about 1 block in 4 held anything relevant (goals 1 in 13), yet they were 23 % of injected
+  characters. `goal_cap` and `oq_cap` are 0 for both tiers (`TIER_BUNDLE_POLICY`, `model-tiers.json`),
+  and the bundle skips the query when a cap is 0. The session-start banner still lists them; they come
+  back to the per-prompt block only with a per-item relevance gate.
+- **Nightly insights run once a week.** The dream's insight phases (gather and consolidate, about 25k
+  Codex tokens a night) produced 398 insights that reached 0 injections and 0 banners. They now run when
+  6.5 days have passed (`AMS_DREAM_INSIGHT_INTERVAL_S`, 0 restores every night; throttle marker
+  `dream-insights`). Autopromotion, the store judge and the index rebuild still run every night, and the
+  dream's own 23 h throttle and freshness are unchanged.
+- **The recurrence promoter mints fewer, better goals.** A goal now needs the same intent in at least 3
+  sessions spread over at least 5 days (was 2 sessions), is born with a one-line description built from
+  its episodes (27 of 27 earlier ones had none), and is abandoned after 14 days without a new episode
+  link (ledger `goal-abandoned`, actor `recurrence-promoter`).
+- **decay-scan writes expiries.** It flagged 3,033 candidates and acted on none while the store grew
+  about 950 records a week. A flagged evidence record older than 120 days that is long (over 600
+  characters) or never appeared in the retrieval log (counted only once the log covers 28 days) is now
+  soft-retired (`retrievable=false`, reversible), at most 300 a run, each one ledgered (`decay-retire`,
+  plus one `decay-scan-summary` per run). User-direct records, auto-memory mirrors, learn-rules
+  corrections and records that open as a standing directive are never touched. `AMS_DECAY_RETIRE`
+  (environment or `~/.mem0/stack.env`) selects `off`, `dry-run` (the default) or `live`. The
+  `decay-scan` actor may now write `retrievable` and needs the service key, which its unit loads.
+- **decay-scan --retire-ids** soft-retires an operator-reviewed id list (`ams-service-run.sh
+  decay-scan.py --retire-ids FILE --reason TEXT [--live]`; dry-run without `--live`).
+- **The open-question registry is swept.** It was write-only: 4,954 open, median age 53 days, about 2 %
+  ever resolved. `goals-stale-sweep.py --auto-abandon` also abandons open questions untouched for
+  `--oq-abandon-days` (default 30, 0 turns it off), one `open-question-status-change` ledger event each.
+
+### Removed
+- **Real-time correction capture (learn-rules).** It caught at most 4 % of hand-labelled corrections,
+  nothing after 2026-10-03, and half of what it stored were pasted handoffs injected into operator
+  blocks. The hook daemon and the inline hook no longer queue corrections; `learn-rules-drain.ps1` still
+  drains a queue an older client left.
+- **Phase 0.B decision capture.** 61 of its 71 records were bare answers ("ok", "1", "done"), two held
+  a task notification, and one stored a one-time code unredacted. The daemon returns `needs_0b=false`,
+  so an older client exe never starts the 0.B pass, and `user-prompt-extract.ps1` no longer runs it.
+
 ## 1.36.0 — memory reaches the session it was meant for (2026-10-13)
 
 A usability audit of the stack in real use (the per-prompt block, the session-start banner and the

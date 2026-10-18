@@ -7,8 +7,8 @@ guiding principle is that memory leverage should live with the capable agent tha
 actually use it, and the cheaper a model is, the less context it should have to wade
 through.
 
-This is purely additive for the dominant path: **the frontier tier reproduces v0.21
-behavior byte-for-byte** (regression-guarded in
+This is purely additive for the dominant path: **the frontier tier reproduced v0.21
+behavior byte-for-byte at v0.22** (regression-guarded in
 `scripts/windows/tests/UserPromptExtract.Tests.ps1`). Only the small tier renders a
 different (flatter, shorter) block, and the offload tier renders none.
 
@@ -24,20 +24,23 @@ different (flatter, shorter) block, and the offload tier renders none.
 
 ## Tier matrix
 
-The canonical source is `claude-config/model-tiers.json`. As of v0.22 (post-EmbeddingGemma
-migration, with thresholds recalibrated for the 768-d EmbeddingGemma-300m embedder):
+The canonical source is `claude-config/model-tiers.json` (its server mirror is `TIER_BUNDLE_POLICY` in
+`mem0-server/app.py`). Current values: v0.23 folded the old `mid` tier into `frontier`, 1.35.0 moved the
+relevance gate to the active embedder profile's calibration (0.70 on EmbeddingGemma-2), memory caps were cut
+to 2 and 1, and 1.37.0 set both the goal cap and the open-question cap to 0, so the per-prompt block holds
+memories only (goals and open questions return only behind a per-item relevance gate; the session-start
+banner still lists them):
 
 | Tier | Matches (substring, case-insensitive) | mem cap | goal cap | OQ cap | relevance threshold | format | legend | block |
 |---|---|---|---|---|---|---|---|---|
-| **frontier** | `opus`, `fable` | 5 | 5 | 3 | 0.30 | full | no | yes — full `[tier\|brand] text` bullets |
-| **mid** | `sonnet` | 5 | 4 | 3 | 0.30 | full | no | yes — same full format as frontier |
-| **small** | `haiku` | 3 | 3 | 2 | 0.33 | flat | yes | yes — flat, highest-tier-first, 1-line legend, `[brand]` tag dropped when brand known |
+| **frontier** | `opus`, `fable`, `sonnet` | 2 | 0 | 0 | 0.70 | full | no | yes — full `[tier\|brand] text` bullets |
+| **small** | `haiku` | 1 | 0 | 0 | 0.70 | flat | yes | yes — flat, highest-tier-first, 1-line legend, `[brand]` tag dropped when brand known |
 | **offload** | Gemma cascade (`mcp__local-offload__*`) | — | — | — | — | — | — | **none — by construction** (see below) |
 
 Notes:
 
 - **Thresholds** are read from `model-tiers.json`, not hardcoded. They were lowered from
-  0.4 (nomic era) to 0.30/0.33 in v0.22 when mem0's embedder migrated from English-only
+  0.4 (nomic era) to 0.30/0.33 in v0.22 (0.70 now, the active profile's calibrated gate) when mem0's embedder migrated from English-only
   `nomic-embed-text` to multilingual **EmbeddingGemma-300m** (768-d, via llama-swap
   on `:11436`); the reranker is **bge-reranker-v2-m3** (GPU since 2026-08-13; CPU before —
   score scale is device-independent, so threshold calibration was unaffected). Ollama was
@@ -45,8 +48,8 @@ Notes:
 - **Caps** are applied server-side in `context_bundle` (per `ContextBundleIn.tier`). The
   client `Select-AdmittedMemoryResults` independently hard-caps surfaced memories at
   **top-3** (defense in depth, every tier) and truncates each memory to 200 chars.
-- **Frontier == v0.21**: 5/5/3 caps, full format, no legend — byte-identical output, so
-  the main Opus/Fable driver sees no change.
+- **Frontier format**: full `[tier|brand] text` bullets, no legend. At v0.22 it matched v0.21 output
+  byte for byte; its caps have moved since (K = 2, and goals and open questions off in 1.37.0).
 - **Small format**: prepends a one-line trust legend, orders memories highest-tier-first
   (canonical/insight/stable before evidence/temporal), and drops the redundant `|brand`
   suffix when the session brand is known (every surfaced row is same-brand or

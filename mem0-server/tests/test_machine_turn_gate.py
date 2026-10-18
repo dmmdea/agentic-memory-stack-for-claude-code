@@ -193,5 +193,4 @@ def test_bundle_human_prompt_control_is_unchanged(wired_app):
     out = app.context_bundle(_body(app, "what is the state of the admission gate"), x_api_key="k")
     assert calls["checkpoint"] == 1 and calls["search"] == 1
     assert [m["id"] for m in out["memories"]] == ["m1"]
-    assert out["goals"] and out["open_questions"]
     assert "machine_turn" not in out

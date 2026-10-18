@@ -458,7 +458,8 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
         verb fetches them explicitly; trust them as ground truth.
       - memories: the per-prompt bundle's top gated durable/evidence facts for `query` (K<=2,
         threshold-gated — the same pipeline the per-prompt hook injects from).
-      - goals / open_questions: open goals + questions, optionally scoped to brand/initiative.
+      - goals / open_questions: empty since 1.37.0 (the bundle's goal_cap/oq_cap are 0; the
+        goals_open / open_questions_open tools list them).
 
     No side effects — the episode checkpoint is suppressed (checkpoint=False), so a recall never
     pollutes the SessionStart resume banner. brand: pass it when working in a brand context
@@ -1168,7 +1169,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.36.0"
+SHIM_STACK_VERSION = "1.37.0"
 
 
 def _write_start_receipt() -> None:

@@ -894,9 +894,13 @@ def _nli_gate_stamp(records, user_id, brand):
 # 1.35.0: the 0.30 above was EmbeddingGemma-300m's. The literal now carries the DEFAULT space's
 # calibrated gate (EmbeddingGemma-2: 0.70, embedder_profile.py); test_r2_injection_gating.py holds the two
 # together.
+# 1.37.0 (audit GQ-01, operator decision 2026-10-18): goal_cap/oq_cap are 0. Goals and open
+# questions were picked without reference to the prompt (about 1 block in 4 held anything relevant,
+# goals 1 in 13) yet cost 23 % of injected characters. They come back only with a per-item
+# relevance gate; the session-start banner still lists them.
 TIER_BUNDLE_POLICY: dict[str, dict[str, Any]] = {
-    "frontier": {"memory_cap": 2, "goal_cap": 5, "oq_cap": 3, "relevance_threshold": 0.70},
-    "small":    {"memory_cap": 1, "goal_cap": 3, "oq_cap": 2, "relevance_threshold": 0.70},
+    "frontier": {"memory_cap": 2, "goal_cap": 0, "oq_cap": 0, "relevance_threshold": 0.70},
+    "small":    {"memory_cap": 1, "goal_cap": 0, "oq_cap": 0, "relevance_threshold": 0.70},
 }
 # The literal above is the default space's calibration (kept in parity with
 # claude-config/model-tiers.json by tests/test_tier_parity.py). The gate the server applies is the
@@ -3752,8 +3756,10 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # WP-4: never serve a session its OWN goals/open questions (they are minted from the
             # session you are in, so they were echoed straight back: 41 % of prompts), and rank what
             # is left by how recently an episode touched it rather than by priority alone.
-            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
-            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True)
+            # 1.37.0: a cap of 0 means the section is off (SQLite reads LIMIT 0 as none, but a
+            # negative or missing cap must not turn into an unbounded listing).
+            out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("goal_cap", 0) > 0 else []
+            out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("oq_cap", 0) > 0 else []
     except Exception:
         log.exception("bundle: goals/open_questions failed (non-fatal)")
         out.setdefault("goals", [])

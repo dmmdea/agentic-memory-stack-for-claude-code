@@ -195,25 +195,8 @@ $fastPrompt = $null; $fastTranscript = $null; $fastSession = $null; $fastBrand =
 # Phase 0.B runs. Any surprise here exits 0: the inline path must never run in
 # this mode (it would double-pay the bundle/checkpoint the daemon already did).
 if ($stdinRaw -and ($env:MEM0_HOOK_DAEMON_SERVED -eq '1')) {
-    try {
-        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Web.Extensions')
-        $jss0B = [Activator]::CreateInstance([System.Web.Script.Serialization.JavaScriptSerializer])
-        $jss0B.MaxJsonLength = 16MB
-        $he0B = $jss0B.DeserializeObject($stdinRaw)
-        if ($he0B -and $he0B.hook_event_name -eq 'UserPromptSubmit' -and $he0B.prompt -and
-            $he0B.transcript_path -and [System.IO.File]::Exists([string]$he0B.transcript_path)) {
-            $needs0B = $false
-            try { $needs0B = Test-DecisionLikePrompt -Prompt $he0B.prompt } catch { $needs0B = $false }
-            if (-not $needs0B) { exit 0 }   # exe pre-gate disagrees -> nothing left to do
-            $script:DaemonServedBundle = $true
-            $fastPrompt = $he0B.prompt; $fastTranscript = [string]$he0B.transcript_path
-            $fastSession = $null   # section 2 re-derives it from the transcript path
-            if (Test-FunctionAvailable 'Get-InferredBrandFromPath') {
-                $fastBrand = Get-InferredBrandFromPath -Path $fastTranscript
-            }
-            Write-Log "0.B-only mode (exe daemon-served): decision-like prompt, running capture"
-        } else { exit 0 }
-    } catch { exit 0 }
+    # 1.37.0: Phase 0.B is retired, so an older client exe that still launches this pass has nothing to do.
+    exit 0
 }
 elseif ($stdinRaw -and (-not $SkipDaemon) -and (Test-FunctionAvailable 'Invoke-DaemonRawTransaction')) {
     try {
@@ -228,15 +211,9 @@ elseif ($stdinRaw -and (-not $SkipDaemon) -and (Test-FunctionAvailable 'Invoke-D
             Write-Log "0.A+0.D served by daemon: session=$($fast.session_id) $($fast.diag)"
             $fastPrompt = $fast.prompt; $fastTranscript = $fast.transcript_path
             $fastSession = $fast.session_id; $fastBrand = $fast.brand
-            # Only Phase 0.B remains client-side. Cheap pre-gates here; if no
-            # decision capture is possible (the overwhelmingly common case),
-            # exit now — the fallback init below (JSS/transport/api-key)
-            # never runs on this path.
-            $needs0B = $false
-            if ($fastPrompt -and $fastTranscript -and [System.IO.File]::Exists($fastTranscript)) {
-                try { $needs0B = Test-DecisionLikePrompt -Prompt $fastPrompt } catch { $needs0B = $false }
-            }
-            if (-not $needs0B) { exit 0 }
+            # The daemon served the whole transaction; Phase 0.B (the only client-side step left)
+            # is retired in 1.37.0, so there is nothing more to do.
+            exit 0
         }
     } catch { $script:DaemonServedBundle = $false }
 }
@@ -558,146 +535,8 @@ if ($contextBlock) { [Console]::Out.WriteLine($contextBlock) }
 }   # end v0.20 A.5 daemon-served guard (section 4)
 
 # ---------------------------------------------------------------------------
-# 5. Phase 0.B: Auto-capture user decisions
+# 5. Phase 0.B decision capture and the inline correction capture (learn-rules) were retired in
+#    1.37.0 (audit CP-01/CP-02/CP-07, operator decision 2026-10-18).
 # ---------------------------------------------------------------------------
-
-# --- Phase 0.B decision detection (wrapped so early exits don't block the tail) ---
-$questionPreview = $null
-
-# --- Step 1 (2026-06-30): real-time correction-capture (inline path). Runs
-#     INDEPENDENT of the decision-capture transcript guard below -- a correction
-#     is worth recording even without a readable transcript. Fail-open. ---
-try {
-    if (Test-CorrectionLikePrompt -Prompt $prompt) {
-        [void](Add-LearnRuleCapture -Prompt $prompt -SessionId $sessionId -TranscriptPath ([string]$transcriptPath))
-    }
-} catch { Write-Log "0.C correction-capture (inline) failed: $($_.Exception.Message)" }
-
-# Only attempt decision capture if we have a transcript and a short decision-like prompt
-# (v0.18 MED-20: predicate extracted to user-prompt-lib.ps1 Test-DecisionLikePrompt)
-if ($transcriptPath -and [System.IO.File]::Exists($transcriptPath)) {
-    $isDecisionLike = $false
-    try { $isDecisionLike = Test-DecisionLikePrompt -Prompt $prompt } catch {
-        Write-Log "0.B: Test-DecisionLikePrompt unavailable: $($_.Exception.Message)"
-    }
-
-    if ($isDecisionLike) {
-        # Read last ~8 lines of transcript to find the last assistant turn
-        $lastLines = @()
-        try {
-            $lastLines = Get-Content -Path $transcriptPath -Tail 8 -Encoding UTF8 -ErrorAction Stop
-        } catch {
-            Write-Log "0.B: could not read transcript: $($_.Exception.Message)"
-        }
-
-        # Find the last assistant turn content before the user prompt
-        $numberedPattern = [regex]'\n\s*\*{0,2}\d+\.\s|\n\s*[ABCD]\.\s|\n\d+\.\s|\*\*\d+\.'
-
-        for ($i = $lastLines.Count - 1; $i -ge 0; $i--) {
-            $line = $lastLines[$i]
-            if (-not $line) { continue }
-
-            try {
-                $parsed = $script:Jss.DeserializeObject($line)
-            } catch { continue }
-
-            # Look for assistant message
-            $msgRole    = $null
-            $msgContent = $null
-
-            if ($parsed.type -eq 'assistant' -or ($parsed.message -and $parsed.message.role -eq 'assistant')) {
-                $msgRole = 'assistant'
-                # Extract text content
-                if ($parsed.message -and $parsed.message.content) {
-                    $content = $parsed.message.content
-                    if ($content -is [string]) {
-                        $msgContent = $content
-                    } elseif ($content -is [array]) {
-                        $texts = @()
-                        foreach ($c in $content) {
-                            if ($c.type -eq 'text' -and $c.text) { $texts += $c.text }
-                        }
-                        $msgContent = $texts -join "`n"
-                    }
-                } elseif ($parsed.content) {
-                    if ($parsed.content -is [string]) { $msgContent = $parsed.content }
-                }
-            }
-
-            if ($msgRole -eq 'assistant' -and $msgContent) {
-                # Check if it contains a numbered options pattern
-                if ($numberedPattern.IsMatch("`n" + $msgContent)) {
-                    $questionPreview = $msgContent.Substring(0, [Math]::Min(300, $msgContent.Length))
-                    break
-                }
-                # Also check multi-line format: multiple "1. " or "2. " occurrences
-                $occurrences = ([regex]'\b\d+\.\s').Matches($msgContent).Count
-                if ($occurrences -ge 2) {
-                    $questionPreview = $msgContent.Substring(0, [Math]::Min(300, $msgContent.Length))
-                    break
-                }
-            }
-        }
-    }
-}
-
-if ($questionPreview) {
-    # Build decision record
-    $decision = @{
-        ts               = [System.DateTime]::Now.ToString('o')
-        session_id       = $sessionId
-        question_preview = $questionPreview
-        answer           = $prompt.Substring(0, [Math]::Min(200, $prompt.Length))
-        kind             = 'user-decision'
-        transcript_path  = $transcriptPath
-    }
-
-    Write-Log "0.B decision detected: session=$sessionId answer='$($decision.answer)' q_preview='$($questionPreview.Substring(0,[Math]::Min(80,$questionPreview.Length)))...'"
-
-    # Append to ~/.mem0/recent-decisions.jsonl (WSL path via UNC)
-    $decisionPath = "\\wsl.localhost\$Mem0WslDistro\home\__WSL_USER__\.mem0\recent-decisions.jsonl"
-    try {
-        $line = $script:Jss.Serialize($decision)
-        [System.IO.File]::AppendAllText($decisionPath, $line + [System.Environment]::NewLine)
-        Write-Log "0.B: appended to recent-decisions.jsonl"
-    } catch {
-        Write-Log "0.B: WARN could not write recent-decisions.jsonl: $($_.Exception.Message)"
-    }
-
-    # POST to mem0 as tier=evidence user-decision
-    $sessionShort = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
-    $decisionMeta = @{
-        source           = 'user-decision'
-        kind             = 'decision'
-        tier             = 'evidence'   # POST /v1/memories only accepts evidence|temporal; promote to stable/canonical via CLI if durable
-        _stable_intent   = $true        # flag: this decision SHOULD be promoted to stable after review
-                                        # v0.19 L3: renamed from 'stable_intent' to the underscore =
-                                        # server-internal convention (mem0-mcp-shim's _canonical_intent /
-                                        # _insight_intent); server strips BOTH spellings (_INTENT_KEYS)
-                                        # so pre-v0.19 records need no migration
-        question_preview = $decision.question_preview.Substring(0, [Math]::Min(200, $decision.question_preview.Length))
-        session_id       = $sessionId
-    }
-    # C3: the write carries the session's routed brand and nothing else. An unrouted session
-    # stays brand-neutral; it used to be stamped with a hard-coded brand here.
-    if ($brand) { $decisionMeta['brand'] = $brand }
-    $memBody = $script:Jss.Serialize(@{
-        messages = "User decision (session $sessionShort at $($decision.ts.Substring(0,16))): Q: $($decision.question_preview.Substring(0,[Math]::Min(200,$decision.question_preview.Length))) | A: $($decision.answer)"
-        user_id  = '__WSL_USER__'
-        infer    = $false
-        metadata = $decisionMeta
-    })
-
-    if ($sw.ElapsedMilliseconds -le $BudgetMs) {
-        try {
-            $null = Invoke-Mem0Post -Uri "$BaseUrl/v1/memories" -Body $memBody -ApiKey $apiKey -TimeoutMs 1000
-            Write-Log "0.B: mem0 write OK"
-        } catch {
-            Write-Log "0.B: WARN mem0 write failed: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Log "H9: budget exceeded before 0.B mem0 write ($($sw.ElapsedMilliseconds)ms); skipping"
-    }
-}
 
 exit 0
