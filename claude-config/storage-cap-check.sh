@@ -416,6 +416,19 @@ if [ "$MEM0_UP" = 0 ]; then
     echo "[AMS] authority unreachable"
   fi
 fi
+# 1.38.0: the ranked-bundle precis (B1 below) was the slowest step of this synchronous hook (0.6 s of
+# 1.4 s measured, one HTTP round trip to the authority). Its inputs are known here, so it starts now in
+# the background and the later block only collects its output, in the same place in the banner.
+B1_OUT=""
+B1_PID=""
+if [ "${MEM0_UP:-0}" = 1 ] && [ -n "$KEY" ]; then
+  SDIR_B1="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  B1_OUT="$(mktemp 2>/dev/null)"
+  if [ -n "$B1_OUT" ]; then
+    python3 "$SDIR_B1/sessionstart_bundle.py" --brand "$BRAND" --initiative "$INITIATIVE" >"$B1_OUT" 2>/dev/null &
+    B1_PID=$!
+  fi
+fi
 # WP-2 (register: alert-no-session-start-reader): the client half of /health/maintenance. ONE bounded
 # read (1.5 s) behind the MEM0_UP probe, any role; silent when the brain is OK, loud when it is not.
 # The endpoint is public (no key). A malformed or missing body prints nothing: this line must never
@@ -612,11 +625,12 @@ fi
 # (tier=frontier, K<=2); otherwise a RECENCY pseudo-query (most-recent episode goal; precision-first
 # tier=small, K<=1) + distilled. Silent on abstention. Helper is fail-silent with its own HTTP
 # timeout + checkpoint=False (no synthetic episode in the resume banner).
-if [ "${MEM0_UP:-0}" = 1 ] && [ -n "$KEY" ]; then
-  SDIR_B1="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-  recall=$(python3 "$SDIR_B1/sessionstart_bundle.py" --brand "$BRAND" --initiative "$INITIATIVE" 2>/dev/null)
+if [ -n "$B1_PID" ]; then
+  wait "$B1_PID" 2>/dev/null
+  recall="$(cat "$B1_OUT" 2>/dev/null)"
   [ -n "$recall" ] && echo "$recall"
 fi
+[ -n "$B1_OUT" ] && rm -f "$B1_OUT"   # started in the background after the health probe (1.38.0)
 
 # v0.13 SessionStart hydration: emit a one-line pointer to the stack repo's
 # session_summary.md if present. v1.0 Phase 7B: resolve the repo from the operator
