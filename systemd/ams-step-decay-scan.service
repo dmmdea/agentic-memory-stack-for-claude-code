@@ -6,6 +6,7 @@ After=mem0.service ams-step-goal-recurrence-promote.service
 [Service]
 Type=oneshot
 LoadCredentialEncrypted=ams-api-key:__SECRETS_DIR__/ams-api-key.cred
+LoadCredentialEncrypted=ams-service-key:__SECRETS_DIR__/ams-service-key.cred
 Environment=MEM0_API_KEY_FILE=%d/ams-api-key
 Environment=MEM0_HOST_KIND=native
 Environment=MEM0_CODEX_TRANSPORT=native

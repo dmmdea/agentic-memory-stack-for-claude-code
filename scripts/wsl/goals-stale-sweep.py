@@ -10,7 +10,13 @@ Run weekly via systemd-user timer Sun 04:00 (after stack-backup 03:30).
 
 The goal lifecycle pressure Codex's audit flagged in MED 3.6: 'goals have no
 lifecycle pressure — abandoned exists but nothing in the system triggers
-abandonment or review'."""
+abandonment or review'.
+
+1.37.0 (audit GQ-03, operator decision 2026-10-18): the open-question registry gets the same
+pressure. It was write-only (4,954 open, median age 53 d, about 2 % ever resolved). With
+--auto-abandon, an open question untouched for --oq-abandon-days (default 30) is set to
+'abandoned', one open-question-status-change ledger event each; the goal tools and the
+open_question_resolve door still work on it."""
 from __future__ import annotations
 
 import argparse
@@ -21,6 +27,7 @@ import sys
 from pathlib import Path
 
 DEFAULT_STALE_DAYS = 30
+DEFAULT_OQ_ABANDON_DAYS = 30
 EPISODIC_DB = Path.home() / ".mem0" / "episodic.db"
 LEDGER_DIR = Path.home() / ".mem0"
 SWEEP_LOG = Path.home() / ".mem0" / "goals-stale-sweep.jsonl"
@@ -110,6 +117,25 @@ def abandon_goal(conn, goal_id: int, reason: str, commit: bool = True) -> bool:
     return True
 
 
+def abandon_stale_open_questions(conn, days: int) -> int:
+    """Open questions whose updated_at is older than `days`: abandoned, one ledger event each."""
+    rows = conn.execute(
+        "SELECT id FROM open_questions WHERE status = 'open' "
+        "AND datetime(updated_at) < datetime('now', ?)", (f"-{int(days)} days",)).fetchall()
+    now = _iso_now()
+    n = 0
+    for (oq_id,) in rows:
+        cur = conn.execute("UPDATE open_questions SET status = 'abandoned', updated_at = ? "
+                           "WHERE id = ? AND status = 'open'", (now, oq_id))
+        if cur.rowcount:
+            n += 1
+            _ledger({"event": "open-question-status-change", "open_question_id": oq_id,
+                     "new_status": "abandoned", "actor": "goals-stale-sweep",
+                     "reason": f"open question untouched for {days}d (oq sweep, 1.37.0)"})
+    conn.commit()
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v0.17 Phase E: stale-goal sweeper")
     parser.add_argument("--stale-days", type=int, default=DEFAULT_STALE_DAYS,
@@ -119,6 +145,9 @@ def main() -> int:
     parser.add_argument("--abandon-days", type=int, default=90,
                         help="auto-abandon acts only on goals inactive at least this long "
                              "(operator-set 2026-08-09: 90; reporting still uses --stale-days)")
+    parser.add_argument("--oq-abandon-days", type=int, default=DEFAULT_OQ_ABANDON_DAYS,
+                        help="with --auto-abandon, abandon open questions untouched this long "
+                             f"(default {DEFAULT_OQ_ABANDON_DAYS}; 0 turns the open-question pass off)")
     args = parser.parse_args()
 
     if not EPISODIC_DB.exists():
@@ -182,6 +211,12 @@ def main() -> int:
                       flush=True)
             else:
                 print(f"[{ts}] (report-only; pass --auto-abandon to flip status)", flush=True)
+
+        if args.auto_abandon and args.oq_abandon_days > 0:
+            oq_n = abandon_stale_open_questions(conn, args.oq_abandon_days)
+            sweep_record["oq_abandoned_count"] = oq_n
+            sweep_record["oq_abandon_days"] = args.oq_abandon_days
+            print(f"[{ts}] open questions: abandoned {oq_n} untouched for {args.oq_abandon_days}d", flush=True)
 
         # Always log the sweep run
         with SWEEP_LOG.open("a", encoding="utf-8") as f:

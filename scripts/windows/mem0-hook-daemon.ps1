@@ -209,18 +209,14 @@ function Invoke-DaemonRawBundle {
     # mismatch forces inline fallback, so this verdict can never be stale). The
     # client reads needs_0b instead of re-implementing Test-DecisionLikePrompt
     # in C# (the duplicate gate is deleted) — no silent drift.
-    $resp.needs_0b   = [bool](Test-DecisionLikePrompt -Prompt ([string]$prompt))
+    # 1.37.0 (audit CP-07, operator decision 2026-10-18): Phase 0.B decision capture is retired. It stored
+    # 71 mostly bare answers ("ok", "1", "done"), leaked machine turns and once a one-time code. needs_0b
+    # stays in the response so an older client exe reads a plain false and never spawns the 0.B pass.
+    $resp.needs_0b   = $false
 
-    # Step 1 (2026-06-30): real-time correction-capture. When the prompt looks like
-    # the operator correcting the agent, append it to the durable learn-rules queue
-    # (~/.mem0/learn-rules.jsonl). Rides this already-firing daemon path -> no new
-    # hook, no Windows parallel-hook-spawn race (anthropics/claude-code#37988).
-    # STRICTLY fail-open: never affects the bundle or needs_0b.
-    try {
-        if (Test-CorrectionLikePrompt -Prompt ([string]$prompt)) {
-            [void](Add-LearnRuleCapture -Prompt ([string]$prompt) -SessionId $sessionId -TranscriptPath ([string]$transcriptPath) -Brand ([string]$brand) -Initiative ([string]$initiative))
-        }
-    } catch {}
+    # 1.37.0 (audit CP-01/CP-02, operator decision 2026-10-18): real-time correction capture (learn-rules)
+    # is retired: recall <= 4 % on hand-labelled corrections, and half of what it stored was pasted
+    # handoffs. learn-rules-drain.ps1 still empties any queue an older client left behind.
 
     # --- mirror §4: triviality gate (same constants as the inline path)
     $isTrivial = $true

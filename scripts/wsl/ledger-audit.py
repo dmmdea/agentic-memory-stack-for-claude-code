@@ -177,7 +177,17 @@ SCHEMA: dict[str, dict] = {
         "required": ["ts", "event", "open_question_id", "new_status", "actor"],
         "optional": ["reason", "schema_version"],
     },
+    # 1.37.0: decay expiry soft-retire (retrievable=false) of one flagged record
+    "decay-retire": {
+        "required": ["ts", "event", "memory_id", "actor", "reason"],
+        "optional": ["schema_version"],
+    },
     # Scan events (no memory_id)
+    "decay-scan-summary": {
+        "required": ["ts", "event", "actor", "mode"],
+        "optional": ["deleted_temporal", "flagged", "retired", "would_retire", "retrieval_log_days",
+                     "never_retrieved_used", "schema_version"],
+    },
     "decay-scan-skip": {
         "required": ["ts", "event", "actor", "reason"],
         "optional": ["schema_version"],

@@ -461,16 +461,6 @@ Describe 'Daemon raw pipeline (Invoke-DaemonRawBundle via -DefineOnly, mocked HT
         Should -Invoke Get-BrandMap -Exactly 3 -Because 'one brands.json read per prompt, not one per resolver call'
     }
 
-    It 'decision-like prompt -> needs_0b TRUE (M4: 0.B verdict computed daemon-side)' {
-        Mock Get-Mem0ApiKeyCached { 'k' }
-        Mock Invoke-Mem0Post { '{"ok":true,"episode_id":3,"action":"updated"}' }
-        # "1 and 2" is trivial (word-count gate -> checkpoint-only) yet decision-like
-        $raw = '{"hook_event_name":"UserPromptSubmit","prompt":"1 and 2","transcript_path":"C:\\x\\agentic-memory-stack\\' + $script:sid + '.jsonl"}'
-        $r = Invoke-DaemonRawBundle -RawStdin $raw -StateDir $script:stateDir -FixtureDir $script:fixDir
-        $r.served | Should -BeTrue
-        $r.needs_0b | Should -BeTrue
-    }
-
     It 'immediate second substantive prompt: rate-limited -> checkpoint-only POST' {
         Mock Get-Mem0ApiKeyCached { 'k' }
         Mock Invoke-Mem0Post { '{"ok":true,"checkpoint":{"episode_id":9,"action":"updated"},"memories":[],"goals":[],"open_questions":[],"episode_id":9,"action":"updated"}' }

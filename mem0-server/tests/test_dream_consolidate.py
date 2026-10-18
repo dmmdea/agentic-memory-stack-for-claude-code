@@ -284,6 +284,7 @@ def test_failed_phases_exit_5_and_skips_exit_0(home, monkeypatch):
     # so silently because this suite is not in CI - which this change also fixes.
     m = _mod()
     monkeypatch.setattr(m, "_run_deployed", lambda script, env=None: (2, "boom"))
+    monkeypatch.setattr(m, "INSIGHT_INTERVAL_S", 0)  # three back-to-back nights each reach the insight phases
     with pytest.raises(SystemExit) as e:
         m.main([], mem0=FakeMem0(EV), judge=_judge(SIG, '{"insights":[]}', "[]"), qdrant_http=None, eval_runner=lambda c: (0, ""), now=NOW)
     assert e.value.code == 5, "an index build failure must receipt ok:false"
