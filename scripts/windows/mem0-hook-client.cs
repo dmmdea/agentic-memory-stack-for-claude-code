@@ -402,6 +402,10 @@ static class HookClient
             psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + daemon + "\"";
             psi.UseShellExecute = true;
             psi.WindowStyle = ProcessWindowStyle.Hidden;
+            // 1.38.2: the resident daemon starts in the user profile, never in the cwd of the
+            // session whose prompt respawned it (it pinned that folder: a worktree there could
+            // not be removed while the daemon lived).
+            psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             Process p = Process.Start(psi);
             if (p != null) p.Dispose();
         }

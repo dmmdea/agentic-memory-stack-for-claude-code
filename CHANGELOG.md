@@ -4,6 +4,15 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.38.2 — the compiled hook client's daemon respawn gets the same fix (2026-10-18)
+
+### Fixed
+- **The resident hook daemon respawned by the compiled UserPromptSubmit client
+  (`mem0-hook-client.cs`) now starts in the user profile.** 1.38.1 fixed the PowerShell spawners,
+  but the client's own respawn path still handed the daemon the prompt's session cwd: a daemon
+  started after the 1.38.1 deploy was read back sitting in that session's folder. The installer
+  rebuilds the client.
+
 ## 1.38.1 — detached children no longer pin the launching session's folder (2026-10-18)
 
 ### Fixed
