@@ -10,7 +10,7 @@
       "name": "agentic-memory-stack",
       "source": "./",
       "description": "Installs the agentic memory stack: the install-agentic-memory-stack skill + the 4-phase operator-agnostic installer.",
-      "version": "1.38.0",
+      "version": "1.38.1",
       "skills": ["./skill/install-agentic-memory-stack/"]
     }
   ]
