@@ -2100,6 +2100,10 @@ function Start-HookDaemonDetached {
     try {
         if (-not $DaemonPath -or -not [System.IO.File]::Exists($DaemonPath)) { return $false }
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        # 1.38.1: a detached child starts in the user profile, never in the cwd it would inherit from
+        # the session whose hook launched it (a resident child pinned that folder, so a worktree there
+        # could not be removed).
+        $psi.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
         $psi.FileName = $env:SystemRoot + '\System32\WindowsPowerShell\v1.0\powershell.exe'
         $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $DaemonPath + '"'
         $psi.UseShellExecute = $true

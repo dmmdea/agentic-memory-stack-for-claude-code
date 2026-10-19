@@ -86,6 +86,10 @@ function Find-GitBash {
 function Start-DetachedProcess {
     param([string]$FilePath, [string]$ArgumentList, [hashtable]$Environment)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
+    # 1.38.1: a detached child starts in the user profile, never in the cwd it would inherit from
+    # the session whose hook launched it (a resident child pinned that folder, so a worktree there
+    # could not be removed).
+    $psi.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
     $psi.FileName = $FilePath
     $psi.Arguments = $ArgumentList
     $psi.UseShellExecute = $false
