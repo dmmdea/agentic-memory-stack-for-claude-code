@@ -4,6 +4,19 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.38.1 — detached children no longer pin the launching session's folder (2026-10-18)
+
+### Fixed
+- **Every detached child the hooks start now runs in the user profile folder.** The spawners built
+  their process without a working directory, so a child inherited the cwd of whichever session's hook
+  launched it. The resident `ams-store sync --watch` kept that folder open for as long as it ran,
+  and `git worktree remove` on it failed ("Permission denied", "Device or resource busy") until the
+  watcher exited. Fixed in every spawner: `memory-maintenance-spawn.ps1` (watcher, lint, catch-ups),
+  `mem0-hook-daemon-spawn.ps1` and the daemon starter in `user-prompt-lib.ps1`, `codex-shim-spawn.ps1`,
+  `wiki-index-catchup.ps1`, the L1a extractor spawns in `stop-extract.ps1` and
+  `sessionstart-capture.ps1` (and its embedder pre-warm), and the installer's watcher restart. No child
+  reads its cwd: every path it gets is absolute.
+
 ## 1.38.0 — faster hooks, and writes that name their expiry and evidence (2026-10-18)
 
 ### Changed

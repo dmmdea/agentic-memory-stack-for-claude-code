@@ -56,17 +56,17 @@ if ($prewarmUrl) {
     $prewarmCmd = "try { Invoke-RestMethod '" + $prewarmUrl.TrimEnd('/') + "/health/embedder?warm=rerank' -TimeoutSec 45 | Out-Null } catch {}"
     try {
         if ($IsUnixHost) {
-            Start-Process -FilePath 'pwsh' `
+            Start-Process -FilePath 'pwsh' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
                 -ArgumentList '-NoProfile','-Command',$prewarmCmd `
                 -ErrorAction Stop | Out-Null
         } else {
-            Start-Process -FilePath 'pwsh.exe' `
+            Start-Process -FilePath 'pwsh.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
                 -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command',"`"$prewarmCmd`"" `
                 -WindowStyle Hidden -ErrorAction Stop | Out-Null
         }
     } catch {
         try {
-            Start-Process -FilePath 'powershell.exe' `
+            Start-Process -FilePath 'powershell.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
                 -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command',"`"$prewarmCmd`"" `
                 -WindowStyle Hidden -ErrorAction Stop | Out-Null
         } catch {
@@ -182,18 +182,18 @@ try {
 $spawned = $false
 try {
     if ($IsUnixHost) {
-        Start-Process -FilePath 'pwsh' `
+        Start-Process -FilePath 'pwsh' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
             -ArgumentList '-NoProfile','-File',$Worker,'-TranscriptPath',$prior.FullName,'-EventName','SessionStart' `
             -ErrorAction Stop | Out-Null
     } else {
-        Start-Process -FilePath 'pwsh.exe' `
+        Start-Process -FilePath 'pwsh.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
             -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$($prior.FullName)`"",'-EventName','SessionStart' `
             -WindowStyle Hidden -ErrorAction Stop | Out-Null
     }
     $spawned = $true
 } catch {
     try {
-        Start-Process -FilePath 'powershell.exe' `
+        Start-Process -FilePath 'powershell.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
             -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$($prior.FullName)`"",'-EventName','SessionStart' `
             -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
         $spawned = $true

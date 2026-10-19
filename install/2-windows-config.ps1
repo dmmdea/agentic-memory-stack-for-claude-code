@@ -989,6 +989,10 @@ if ($script:amsStoppedWatcher) {
     if ($amsSyncReady) {
         try {
             $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            # 1.38.1: a detached child starts in the user profile, never in the cwd it would inherit from
+            # the session whose hook launched it (a resident child pinned that folder, so a worktree there
+            # could not be removed).
+            $psi.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
             $psi.FileName = $amsStoreExe
             $psi.Arguments = 'sync --watch --hub-host ' + $HubHost
             $psi.UseShellExecute = $true

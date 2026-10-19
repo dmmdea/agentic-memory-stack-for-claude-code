@@ -65,6 +65,10 @@ if ((Test-Path $exe) -and $hub) {
 foreach ($child in $children) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        # 1.38.1: a detached child starts in the user profile, never in the cwd it would inherit from
+        # the session whose hook launched it (a resident child pinned that folder, so a worktree there
+        # could not be removed).
+        $psi.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
         $psi.FileName = $child.Exe
         $psi.Arguments = $child.Args
         $psi.UseShellExecute = $true

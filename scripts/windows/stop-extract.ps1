@@ -120,20 +120,20 @@ if ($originTrans) {
 # characters to the worker, so the argument list differs by platform.
 if ($IsUnixHost) {
     try {
-        Start-Process -FilePath 'pwsh' `
+        Start-Process -FilePath 'pwsh' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
             -ArgumentList (@('-NoProfile','-File',$Worker,'-TranscriptPath',$trans,'-EventName',$evt) + $sidArgs + $originArgsUnix) `
             -ErrorAction SilentlyContinue | Out-Null
     } catch { }
 } else {
     try {
-        Start-Process -FilePath 'pwsh.exe' `
+        Start-Process -FilePath 'pwsh.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
             -ArgumentList (@('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt) + $sidArgs + $originArgsWin) `
             -WindowStyle Hidden `
             -ErrorAction SilentlyContinue | Out-Null
     } catch {
         # If pwsh.exe missing, fall back to powershell.exe (Windows PS 5.1)
         try {
-            Start-Process -FilePath 'powershell.exe' `
+            Start-Process -FilePath 'powershell.exe' -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
                 -ArgumentList (@('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$Worker,'-TranscriptPath',"`"$trans`"",'-EventName',$evt) + $sidArgs + $originArgsWin) `
                 -WindowStyle Hidden `
                 -ErrorAction SilentlyContinue | Out-Null
