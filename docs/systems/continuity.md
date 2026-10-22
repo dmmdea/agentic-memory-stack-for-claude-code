@@ -308,7 +308,7 @@ Search and goals each have a 2s `TimeoutSec`. The overall hook latency stays wel
 
 ## Phase 0.E — SessionStart Brand Context Auto-Load
 
-**Added:** v0.17 Phase 0.E (2026-06-11).
+**Added:** v0.17 Phase 0.E (2026-06-11). **Off by default since 1.39.0:** the block prints only in `full` context mode (`~/.mem0/sessionstart-context`); the default `pointer` mode prints one line that names `memory_recall` instead, after a measurement found the lists cost skill activation ([sessionstart-banner](./sessionstart-banner.md#context-mode-1390)).
 
 **Goal:** Every new session starts with the relevant brand's top canonical facts and open goals already in Claude's context — before the first user message.
 

@@ -4,6 +4,24 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.39.0 — the SessionStart banner points at memory instead of printing it (2026-10-22)
+
+### Changed
+- **The banner's memory lists are off by default.** `claude-config/storage-cap-check.sh` printed, at every
+  session start, the last five sessions, the brand's locked canonical facts, its open goals and a ranked-recall
+  precis. A sandboxed, pre-registered three-arm A/B over 46 tasks measured that block against an empty hook
+  and against plain prose of the same length: the plain prose cost a small amount of skill activation, and the
+  block cost far more than its length (activation 35/46 with nothing printed, 27/46 with the prose, 10/46
+  with the block; every comparison BLOCK at the measurement gate). The banner now prints one line in their
+  place, `[agentic-memory-stack] memory online (brand <brand>): recent sessions, locked facts and open goals are
+  one mcp__mem0__memory_recall(query, brand) call away.`, and the per-prompt injection and `memory_recall` keep
+  serving the same facts on demand. **This changes the default for every box on upgrade.** Write `full` to
+  `~/.mem0/sessionstart-context` (beside `role`, inside WSL on a Windows box) to restore the lists; absent or
+  anything else is `pointer`. Warnings, queue lines, cap lines and the `[AMS]` health line print in both modes.
+- **Post-compaction restore is unchanged.** In pointer mode `sessionstart_bundle.py` still runs when a fresh
+  PreCompact marker exists, so the resumed session gets its `[recall]` precis and the marker is consumed as
+  before ([compaction-capture-restore](docs/flows/compaction-capture-restore.md)).
+- Plugin manifests to 1.39.0.
 ## 1.38.3 — the L1a extractor waits out a blip instead of dropping the run (2026-10-21)
 
 ### Fixed
