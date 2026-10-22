@@ -349,6 +349,20 @@ function Test-Mem0Health {
     } catch { return $false }
 }
 
+function Wait-Mem0Health {
+    # 1.38.3: the patient probe for a DETACHED caller (the L1a worker), where nobody waits on the
+    # result. One 5 s probe dropped 15 of 156 extractions on 2026-10-19..21: a blip on the path to
+    # the authority, or a few busy seconds there, aborted the whole run. Probes again after each
+    # delay (about 3.5 min in all by default) and returns $true as soon as one probe answers.
+    param([int[]]$DelaysSec = @(5, 20, 60, 120))
+    if (Test-Mem0Health) { return $true }
+    foreach ($d in $DelaysSec) {
+        Start-Sleep -Seconds $d
+        if (Test-Mem0Health) { return $true }
+    }
+    return $false
+}
+
 function Get-Mem0Evidence {
     param([int]$Limit = 100)
     $key = Get-Mem0Key

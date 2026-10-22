@@ -67,7 +67,7 @@ l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks C
   │
   ├─ Test-Throttle('l1a', 600s) → skip if < 10 min since last successful run
   ├─ Drain-Mem0DeadLetter        → retry any previously-failed POSTs first
-  ├─ Test-Mem0Health             → skip if mem0 unreachable (writes to DLQ instead)
+  ├─ Wait-Mem0Health             → probe up to 5 times over ~3.5 min; skip if mem0 is still unreachable
   ├─ Get-RecentTranscriptTurns   → last 24 turns, capped at 12KB
   ├─ Acquire-CodexLock('l1a')   → skip if the nightly consolidator or another L1a holds the shared mutex
   │
@@ -208,7 +208,8 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 
 | Condition | Behavior |
 |---|---|
-| mem0 unreachable on L1a start | Skip extraction; drain the legacy DLQ on next run |
+| mem0 unreachable on L1a start | Probe again after 5, 20, 60 and 120 s (the worker is detached, so the wait costs nothing). If still unreachable, skip this extraction; the cursor is not advanced, so the session's next run re-reads the turns |
+| Episode POST slow (cold embedder on the authority) | Waits up to 30 s; a failure is logged as non-fatal (facts were already posted or queued to the Outbox) |
 | Codex unauthenticated / exits non-zero | Log error with the last three lines of Codex's output (where the error is); release lock; exit 0 (best-effort) |
 | Lock held by other component | Wait up to 20 s (polling every 2 s); if still held, log "codex lock held by another worker; skipping this extraction (waited Ns)"; exit 0 |
 | JSON parse fails on Codex output | Log preview of raw output; exit 0 (no partial write) |

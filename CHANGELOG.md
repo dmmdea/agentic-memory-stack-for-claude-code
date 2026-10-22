@@ -4,6 +4,20 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.38.3 — the L1a extractor waits out a blip instead of dropping the run (2026-10-21)
+
+### Fixed
+- **A brief blip on the path to the authority no longer drops an extraction.** The detached L1a
+  worker probed `/health` once with a 5 s timeout and aborted the whole run on a miss; 15 of 156 runs
+  were dropped that way on 2026-10-19..21, 14 of them on one day. It now probes up to 5 times over
+  about 3.5 minutes (`Wait-Mem0Health` in `memory-common.ps1`), which costs nothing in a worker
+  nobody waits on. A run that still finds no authority aborts as before, without advancing the
+  cursor, so the session's next run re-reads its turns.
+- **The episode POST waits 30 s instead of 5.** The authority embeds an episode before it answers; on
+  a cold embedder that took about 6 s, so the worker logged "episode post failed" while the server
+  went on to store the episode (8 such false failures in the same three days; the episodes checked
+  were present).
+
 ## 1.38.2 — the compiled hook client's daemon respawn gets the same fix (2026-10-18)
 
 ### Fixed
