@@ -57,8 +57,9 @@ try {
         Write-MemoryLog -Component 'l1a' -Message "  DLQ: drained $($dlq.drained), remaining $($dlq.remaining)"
     }
 
-    if (-not (Test-Mem0Health)) {
-        Write-MemoryLog -Component 'l1a' -Message '  mem0 unreachable, aborting'
+    if (-not (Wait-Mem0Health)) {
+        # The cursor is not advanced, so the session's next run re-reads these turns.
+        Write-MemoryLog -Component 'l1a' -Message '  mem0 unreachable after 5 probes over ~3.5 min, aborting (cursor not advanced)'
         exit 0
     }
 
@@ -370,12 +371,16 @@ $turns
             # goal/summary carries non-ASCII (Spanish sessions, em-dashes) reached
             # FastAPI as invalid UTF-8 -> 400 and the episode was silently lost
             # (the catch below logs it as "non-fatal"). Send UTF-8 BYTES.
+            # 1.38.3: 30 s, not 5. This worker is detached, and the authority embeds the episode
+            # before it answers: on a cold embedder that took about 6 s, so the client gave up while
+            # the server went on to store the episode (8 false "episode post failed" lines,
+            # 2026-10-19..21).
             Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/episodes" `
                 -Method Post `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($episodePayload)) `
                 -ContentType 'application/json' `
                 -Headers @{'X-API-Key' = $apiKey} `
-                -TimeoutSec 5 | Out-Null
+                -TimeoutSec 30 | Out-Null
             Write-MemoryLog -Component 'l1a' -Message "  posted episode for session $episodeSessionId (goal: $($parsed.episode.goal.Substring(0, [Math]::Min(80, $parsed.episode.goal.Length))))"
         } catch {
             # Best-effort: POST /v1/episodes is live (v0.20 Phase B). A failure here is
