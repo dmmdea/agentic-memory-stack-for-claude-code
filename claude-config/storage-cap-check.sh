@@ -17,7 +17,18 @@ warnings=""
 # l10 flags, the contradiction queue/sweep log, the local episodic.db, the morning-summary counter) is
 # written by the BRAIN's chain and freezes on a replica at the authority cutover, so a replica prints
 # none of them and reads the authority instead (recent sessions + one health line, below).
-_ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
+_ROLE=""; [ -r "$HOME/.mem0/role" ] && _ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
+
+# 1.39.0: how much memory context the banner prints. ~/.mem0/sessionstart-context (a file beside role) holds
+# `full` or `pointer`; absent or anything else is `pointer`. The default follows a measurement: the lists this
+# banner printed at every session start (recent sessions, locked facts, open goals, the ranked precis) stopped a
+# self-activating skill from loading in a sandboxed, pre-registered A/B (46 tasks, three arms). Plain text of the
+# same length cost some activation; these lists cost far more than their length. In `pointer` mode the same
+# content is one recall call away and the banner says so in one line (printed after the health line below);
+# `full` restores the lists. Warnings, queues, cap lines and the health line print in both modes.
+# (A `< file` redirect that fails prints to the shell's stderr before `2>/dev/null` applies, so an absent file is
+# tested first; the role line above gets the same guard.)
+_CTX=""; [ -r "$HOME/.mem0/sessionstart-context" ] && _CTX=$(tr -d '[:space:]' < "$HOME/.mem0/sessionstart-context" 2>/dev/null); [ "$_CTX" = full ] || _CTX=pointer
 
 # v0.17 Phase 0.E brand inference; v1.0 Phase 7B: operator-agnostic — rules from
 # the deployed brands.json beside this script (no private brand names hardcoded;
@@ -279,7 +290,7 @@ fi
 # cutover, so it presented weeks-old sessions as current; a replica reads the authority instead (the
 # block after the MEM0_UP probe below).
 EPDB="$HOME/.mem0/episodic.db"
-if [ "$_ROLE" = brain ] && [ -f "$EPDB" ]; then
+if [ "$_CTX" = full ] && [ "$_ROLE" = brain ] && [ -f "$EPDB" ]; then
   ep=$(python3 - "$EPDB" <<'PY' 2>/dev/null
 import sys, sqlite3
 try:
@@ -421,7 +432,9 @@ fi
 # the background and the later block only collects its output, in the same place in the banner.
 B1_OUT=""
 B1_PID=""
-if [ "${MEM0_UP:-0}" = 1 ] && [ -n "$KEY" ]; then
+# 1.39.0: in pointer mode the precis runs only for a post-compaction restore, i.e. when a PreCompact marker
+# is present (the helper consumes the marker either way, so it never lingers into a later session).
+if [ "${MEM0_UP:-0}" = 1 ] && [ -n "$KEY" ] && { [ "$_CTX" = full ] || [ -f "$HOME/.mem0/precompact-query.json" ]; }; then
   SDIR_B1="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   B1_OUT="$(mktemp 2>/dev/null)"
   if [ -n "$B1_OUT" ]; then
@@ -488,7 +501,7 @@ fi
 # cutover). GET /v1/episodes?recent=60&state=complete (1.5 s; unfinished sessions have no goal and the
 # newest ended_at, so without the filter they can fill the window), keep the 5 newest sessions that have a goal,
 # label the source. Authority reachable but the read fails -> one "unavailable" line, never silent.
-if [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
+if [ "$_CTX" = full ] && [ "$_ROLE" != brain ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
   _eps=$(curl -fsS --max-time 1.5 -H "X-API-Key: $KEY" "$AMS_URL/v1/episodes?recent=60&state=complete" 2>/dev/null)
   _epout=$(printf '%s' "$_eps" | AMS_BRAND="$BRAND" AMS_BRANDS_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/brands.json" python3 -c "
 import os, sys, json, datetime as dt
@@ -551,7 +564,7 @@ if out:
     echo "$_epout"
   fi
 fi
-if [ "$MEM0_UP" = 1 ] && [ -n "$BRAND" ] && [ -n "$KEY" ]; then
+if [ "$_CTX" = full ] && [ "$MEM0_UP" = 1 ] && [ -n "$BRAND" ] && [ -n "$KEY" ]; then
   echo "[agentic-memory-stack] brand context ($BRAND):"
   # Canonical memories for this brand (highest trust). v0.30 FIX (2026-06-19): fetch via
   # the canonical SEARCH path, NOT the list endpoint. GET /v1/memories is a plain
@@ -631,6 +644,15 @@ if [ -n "$B1_PID" ]; then
   [ -n "$recall" ] && echo "$recall"
 fi
 [ -n "$B1_OUT" ] && rm -f "$B1_OUT"   # started in the background after the health probe (1.38.0)
+# 1.39.0 pointer mode: one line in place of the lists above. Only when the authority answered the probe (an
+# unreachable authority already printed its own line) and the box holds a key to recall with.
+if [ "$_CTX" = pointer ] && [ "$MEM0_UP" = 1 ] && [ -n "$KEY" ]; then
+  if [ -n "$BRAND" ]; then
+    echo "[agentic-memory-stack] memory online (brand $BRAND): recent sessions, locked facts and open goals are one mcp__mem0__memory_recall(query, brand) call away."
+  else
+    echo "[agentic-memory-stack] memory online: recent sessions, locked facts and open goals are one mcp__mem0__memory_recall(query) call away."
+  fi
+fi
 
 # v0.13 SessionStart hydration: emit a one-line pointer to the stack repo's
 # session_summary.md if present. v1.0 Phase 7B: resolve the repo from the operator

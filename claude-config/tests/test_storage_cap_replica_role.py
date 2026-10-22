@@ -84,6 +84,8 @@ class Box:
         (self.home / ".mem0" / "authority-url").write_text("http://authority.invalid:1\n")
         if role is not None:
             (self.home / ".mem0" / "role").write_text(role + "\n")
+        # 1.39.0: the lists these tests pin print only in `full` context mode (the default is `pointer`).
+        (self.home / ".mem0" / "sessionstart-context").write_text("full\n")
 
     def authority(self, *, up: bool = True, maintenance=None, episodes=None, raw_maintenance: str | None = None):
         (self.fake / "up").unlink(missing_ok=True)

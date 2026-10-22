@@ -66,7 +66,7 @@ Then compaction proceeds. PreCompact cannot inject anything into the session (ho
 
 ### 4 — SessionStart restore consumes the marker
 
-When the post-compaction session opens, the WSL SessionStart hook `storage-cap-check.sh` runs and calls `sessionstart_bundle.py --brand <brand> --initiative <initiative>`. The helper:
+When the post-compaction session opens, the WSL SessionStart hook `storage-cap-check.sh` runs and calls `sessionstart_bundle.py --brand <brand> --initiative <initiative>` (since 1.39.0, in the default `pointer` context mode it does so only when the marker file exists; in `full` mode at every start). The helper:
 
 1. **Reads and consumes the marker** (`load_and_consume_marker`): it opens `~/.mem0/precompact-query.json`, then **always deletes it** — fresh, stale, or corrupt — so a marker can never linger into a later session (**consume-once**). The marker's query is *used* only if it is **fresh: less than 300 s old** (`MARKER_MAX_AGE = 300`), since the post-compact SessionStart fires seconds later.
 2. **Chooses the query and bundle shape** (`choose_query_and_params`):
