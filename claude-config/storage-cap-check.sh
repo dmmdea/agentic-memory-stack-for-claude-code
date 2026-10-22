@@ -17,7 +17,7 @@ warnings=""
 # l10 flags, the contradiction queue/sweep log, the local episodic.db, the morning-summary counter) is
 # written by the BRAIN's chain and freezes on a replica at the authority cutover, so a replica prints
 # none of them and reads the authority instead (recent sessions + one health line, below).
-_ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
+_ROLE=""; [ -r "$HOME/.mem0/role" ] && _ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || _ROLE=brain
 
 # 1.39.0: how much memory context the banner prints. ~/.mem0/sessionstart-context (a file beside role) holds
 # `full` or `pointer`; absent or anything else is `pointer`. The default follows a measurement: the lists this
@@ -26,7 +26,9 @@ _ROLE=$(tr -d '[:space:]' < "$HOME/.mem0/role" 2>/dev/null); [ -n "$_ROLE" ] || 
 # same length cost some activation; these lists cost far more than their length. In `pointer` mode the same
 # content is one recall call away and the banner says so in one line (printed after the health line below);
 # `full` restores the lists. Warnings, queues, cap lines and the health line print in both modes.
-_CTX=$(tr -d '[:space:]' < "$HOME/.mem0/sessionstart-context" 2>/dev/null); [ "$_CTX" = full ] || _CTX=pointer
+# (A `< file` redirect that fails prints to the shell's stderr before `2>/dev/null` applies, so an absent file is
+# tested first; the role line above gets the same guard.)
+_CTX=""; [ -r "$HOME/.mem0/sessionstart-context" ] && _CTX=$(tr -d '[:space:]' < "$HOME/.mem0/sessionstart-context" 2>/dev/null); [ "$_CTX" = full ] || _CTX=pointer
 
 # v0.17 Phase 0.E brand inference; v1.0 Phase 7B: operator-agnostic — rules from
 # the deployed brands.json beside this script (no private brand names hardcoded;
