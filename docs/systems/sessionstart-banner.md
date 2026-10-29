@@ -1,6 +1,6 @@
 # The SessionStart Banner — What It Reads, and From Whom
 
-`claude-config/storage-cap-check.sh` runs synchronously at every SessionStart and prints the orientation a new session starts from: cap warnings, review queues, one health line and, depending on the [context mode](#context-mode-1390), either one pointer line or the memory lists (recent sessions, brand context, open goals, the ranked precis). It always exits 0 and is silent when nothing needs saying.
+`claude-config/storage-cap-check.sh` runs synchronously at SessionStart on `startup`, `clear` and `compact` (the hook's matcher is `startup|clear|compact`; it does not run on `resume`, which already has the orientation) and prints the orientation a new session starts from: cap warnings, review queues, one health line and, depending on the [context mode](#context-mode-1390), either one pointer line or the memory lists (recent sessions, brand context, open goals, the ranked precis). It always exits 0 and is silent when nothing needs saying.
 
 The design rule this page records: **the banner reads the box's role first, and a replica reads the authority, never its own frozen files.** Under the One-Brain Rule the nightly chain and the episodic writes live on the brain; a replica's `~/.mem0` copy of every brain artifact stopped changing at the authority cutover. Before this rule the banner showed those frozen files as current (weeks-old "recent sessions", a permanent "MEMORY.md stale" warning that blamed a script which skips by design on a replica, a "job-queue mirror STALE" alarm).
 

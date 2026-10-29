@@ -110,8 +110,12 @@ files, and scripts that live in this repo. Keys (`api-key`, `canonical-key.dpapi
 
 ## Off-box copies
 
-**Cloud mirror (`ams-pcloud-copy.sh`).** Mirrors the newest set to the synced cloud folder. It
-copies files as they are: the mirror is **not client-side encrypted**, so treat the cloud account as
+**Cloud mirror (`ams-pcloud-copy.sh`).** Optional. Mirrors the newest set to a folder that a
+cloud-sync client keeps in sync (any provider; the script's default path is `~/pCloudDrive/memory-backups/<hostname>`, and `--pcloud-dir` / `MEM0_PCLOUD_DIR` point it elsewhere).
+`install/linux-authority.sh` leaves the step out of the nightly chain when `--pcloud-dir` is empty,
+`~/pCloudDrive` does not exist and the unit is not already installed, so an install without a
+mirror has no failing step. Once the step is installed, a destination that is missing is a failed
+step, not a quiet skip. It copies files as they are: the mirror is **not client-side encrypted**, so treat the cloud account as
 holding the raw corpus (encrypting it is an operator decision, not something the script does). The
 copy refuses, with exit 5 and the outcome `failed:stale-set` (or `failed:stack-backup-not-ok`), when
 the newest local manifest is older than 26 h or the latest `stack-backup` receipt is not ok, so a
@@ -125,11 +129,12 @@ newest 7 **complete** sets (a set is complete when its manifest exists), deletes
 dead partials, and never deletes the newest complete set. `AMS_PCLOUD_MAX_AGE_H` and
 `AMS_PCLOUD_KEEP_SETS` override the two limits.
 
-**ZFS replica (recovery point).** The replication step is an operator-side script on the brain
-(it is not in this repo). It sends with `--no-sync-snap`, so it ships only snapshots that already
+**ZFS replica (recovery point).** Optional. The replication step is an operator-side script on the
+authority (it is not in this repo); the `syncoid` chain step skips itself while
+`~/.mem0/scripts/syncoid.sh` does not exist. It sends with `--no-sync-snap`, so it ships only snapshots that already
 exist, and the newest one at chain time is the hourly snapshot taken before that night's
 `stack-backup` wrote its set. The replica therefore lags one backup set: after a total loss of the
-brain, the replica holds the previous night's set and the live store as of that earlier snapshot
+authority, the replica holds the previous night's set and the live store as of that earlier snapshot
 (RPO about 24 h), while the cloud mirror holds the latest set. Operator-side remedy: drop
 `--no-sync-snap` so syncoid takes its own snapshot after the backup step, or take a named snapshot
 at the end of the chain and send that. The replica target may also be a single disk; two copies on

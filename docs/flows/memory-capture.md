@@ -93,7 +93,7 @@ The compiled `UserPromptSubmit` client (exec-form hook entry — a Windows concu
 
 ### The dream — nightly consolidation
 
-`dream-consolidate.ps1`, 3:00 am via Task Scheduler (`-WakeToRun`), 24 h-throttled, holding the shared Codex lock (extractor / dream / judgment shim never run Codex concurrently — one ChatGPT subscription). Four phases, each leaving an audit artifact:
+`dream-consolidate.ps1`, 3:00 am via Task Scheduler (`-WakeToRun`), 23 h-throttled, holding the shared Codex lock (extractor / dream / judgment shim never run Codex concurrently — one ChatGPT subscription). Four phases, each leaving an audit artifact:
 
 1. **Orient** — load state, decide whether there is anything worth consolidating.
 2. **Gather (surprise-weighted)** — read the last 36 h of transcripts (≤ 10 files) and weight signals by information gain: corrections, decisions, surprises, contradictions rank far above routine progress.

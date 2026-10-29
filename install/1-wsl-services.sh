@@ -684,7 +684,7 @@ echo "  maintenance scripts deployed to $SCRIPTS_DIR (timers exec these, not the
 # DEPLOYED but the timer is NOT auto-enabled — it prunes the PREVIOUS embedding space's collections
 # after a migration (scripts/wsl/embedder-migrate.py), once the operator has armed it for a date; a
 # fresh install starts directly in its profile's space with no old rollback anchor to prune.
-for unit in mem0.service qdrant.service l10-audit.service l10-audit.timer decay-scan.service decay-scan.timer stack-backup.service stack-backup.timer goals-stale-sweep.service goals-stale-sweep.timer contradiction-sweep.service contradiction-sweep.timer episodic-reconcile.service episodic-reconcile.timer egemma-rollback-prune.service egemma-rollback-prune.timer; do
+for unit in mem0.service qdrant.service l10-audit.service l10-audit.timer decay-scan.service decay-scan.timer stack-backup.service stack-backup.timer goals-stale-sweep.service goals-stale-sweep.timer contradiction-sweep.service contradiction-sweep.timer retrieval-pairs.service retrieval-pairs.timer episodic-reconcile.service episodic-reconcile.timer goal-recurrence-promote.service goal-recurrence-promote.timer egemma-rollback-prune.service egemma-rollback-prune.timer; do
     SRC="$REPO_ROOT/systemd/$unit"
     DST="$SYSTEMD_USER_DIR/$unit"
     if [ ! -f "$SRC" ]; then echo "  WARN: $SRC not found, skipping"; continue; fi
@@ -751,10 +751,9 @@ enable_brain_unit stack-backup.timer
 # v0.22 Phase G: auto-enable the weekly hygiene sweep timers (previously a
 # manual step). enable --now is idempotent (safe to re-run). Fail-soft: if
 # systemd-user is unavailable the warning is printed but the install does not
-# abort. Only the TIMERS are enabled — they run the sweeps in their SAFE
-# defaults: goals-stale-sweep stays REPORT-ONLY (its ExecStart passes no
-# --auto-abandon, so no destructive goal-status flips on the unattended
-# schedule); contradiction-sweep runs its normal judge-stamp mode.
+# abort. Only the TIMERS are enabled. goals-stale-sweep passes --auto-abandon,
+# which the script scopes itself (never manual goals, only past its --abandon-days
+# window of inactivity); contradiction-sweep runs its normal judge-stamp mode.
 enable_brain_unit goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer \
     || echo "  WARN: could not enable sweep timers (systemd-user unavailable?) — enable manually: systemctl --user enable --now goals-stale-sweep.timer contradiction-sweep.timer retrieval-pairs.timer episodic-reconcile.timer goal-recurrence-promote.timer"
 

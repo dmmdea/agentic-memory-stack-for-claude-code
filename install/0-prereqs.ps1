@@ -63,14 +63,15 @@ Check "claude (Claude Code CLI)" {
     (Test-Path "$env:USERPROFILE\.local\bin\claude.exe") -or
     [bool](Get-Command claude -ErrorAction SilentlyContinue)
 } "Install Claude Code: npm i -g @anthropic-ai/claude-code (or the native installer)"
-Check "codex.cmd (Codex CLI)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" } "Install Codex: npm i -g @openai/codex"
+# The stack's Codex calls (scripts\windows\memory-common.ps1, 3-verify.ps1) run the npm global shim at this exact path.
+Check "codex.cmd (Codex CLI, npm global: $env:USERPROFILE\AppData\Roaming\npm\codex.cmd)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" } "Install Codex with npm so the shim lands at $env:USERPROFILE\AppData\Roaming\npm\codex.cmd: npm i -g @openai/codex (a Codex installed another way, e.g. pnpm or scoop, is not found by the stack)"
 Check "Codex authenticated (ChatGPT subscription)" {
     if (-not (Test-Path "$env:USERPROFILE\.codex\auth.json")) { return $false }
     $auth = Get-Content "$env:USERPROFILE\.codex\auth.json" -Raw | ConvertFrom-Json
     $auth.auth_mode -eq 'chatgpt' -and $auth.tokens -and $auth.tokens.access_token
-} "Run: codex login   (pick 'Sign in with ChatGPT')"
+} "Run: codex login   (pick 'Sign in with ChatGPT'; the stack's extraction jobs need a ChatGPT-subscription login, an API-key login is not accepted)"
 
-# P4-1a (2026-09-16): the store binary merges with `git merge-tree --write-tree`, which needs
+# The store binary merges with `git merge-tree --write-tree`, which needs
 # git >= 2.38 (ams-store/internal/gitx pins the same floor at runtime). Parse the version; a git
 # that is merely present is not enough.
 function Test-GitVersionAtLeast {
@@ -87,7 +88,7 @@ Check "git >= 2.38 (ams-store merge-tree --write-tree)" {
 Write-Host ""
 Write-Host "Checking WSL-side prerequisites..."
 
-Check "Python 3.12+ in WSL" { (wsl.exe -d $Distro -e python3 --version 2>&1) -match 'Python 3\.(1[2-9]|[2-9])' } "wsl -d $Distro -e sudo apt install -y python3 python3-pip python3-venv"
+Check "Python 3.12+ in WSL" { (wsl.exe -d $Distro -e python3 --version 2>&1) -match 'Python 3\.(1[2-9]|[2-9]\d)(\D|$)' } "python3 in WSL must be 3.12 or newer (it is: $((wsl.exe -d $Distro -e python3 --version 2>&1 | Out-String).Trim())). Ubuntu 24.04 ships 3.12: wsl --install -d Ubuntu-24.04, then re-run with -Distro Ubuntu-24.04. On a distro that has it: sudo apt install -y python3 python3-pip python3-venv"
 Check "curl in WSL" { wsl.exe -d $Distro -e which curl 2>&1 | Out-Null; $LASTEXITCODE -eq 0 } "wsl: sudo apt install -y curl"
 # jq parses the Qdrant snapshot name in scripts/wsl/stack-backup.sh. Without it the
 # nightly backup silently shipped no vector snapshot for weeks (the parse came back
@@ -153,7 +154,11 @@ Check "Node 22+ in WSL" {
 
 Check "systemd in WSL" { (wsl.exe -d $Distro -e ps -p 1 -o comm= 2>&1) -match 'systemd' } "Add to /etc/wsl.conf inside WSL:`n  [boot]`n  systemd=true`nThen: wsl --shutdown"
 
-Check "Claude /login (Max OAuth)" { Test-Path "$env:USERPROFILE\.claude\.credentials.json" } "Run: claude /login   (in any directory)"
+# Informational only: nothing in the stack reads this file. It exists after a `claude /login` with a subscription;
+# a box that signs in with an API key or a cloud provider has none and is fine.
+Write-Host -NoNewline "  Claude login (subscription: $env:USERPROFILE\.claude\.credentials.json) ... "
+if (Test-Path "$env:USERPROFILE\.claude\.credentials.json") { Write-Host "OK" -ForegroundColor Green }
+else { Write-Host "not found (not required; run claude /login unless you use an API key or a cloud provider)" -ForegroundColor Yellow }
 
 Write-Host ""
 if ($fails.Count -gt 0) {

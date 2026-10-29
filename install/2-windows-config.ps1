@@ -48,20 +48,19 @@ param(
     # mem0-canonize.sh forwards there, replay-ops.py executes queued canonizations there.
     # Empty inherits the existing line (same rule as -AuthorityUrl: a re-run never blanks it).
     [string]$AuthoritySsh = '',
-    # P4-1a (2026-09-16, register P4-1): the MagicDNS name of the store hub - the fleet's one git
-    # remote for the per-workspace auto-memory stores (blueprint §5.4 pins the user@MagicDNS URL
-    # form to it). Inherits the previous receipt's value when omitted. Empty on a box with no hub:
-    # the store gate still runs (local commits) but no sync hook and no watcher are registered,
-    # and the legacy nightly compactor task is kept.
+    # The MagicDNS name of the store hub - the fleet's one git remote for the per-workspace
+    # auto-memory stores (the remote is a user@MagicDNS URL). Inherits the previous receipt's value
+    # when omitted. Empty on a box with no hub: the store gate still runs (local commits) but no
+    # sync hook and no watcher are registered, and the legacy nightly compactor task is kept.
     [string]$HubHost = '',
-    # P4-1a: an OFFLINE DROP of the store binary. By default the installer downloads the release
+    # An OFFLINE DROP of the store binary. By default the installer downloads the release
     # asset of the tag named in VERSION and verifies it against the release's SHA256SUMS; on a box
     # that cannot reach GitHub pass a local ams-store.exe here, plus -BinarySums (the SHA256SUMS
     # file it shipped with) so the drop is verified the same way. A drop without sums installs
     # UNVERIFIED and says so.
     [string]$BinaryPath = '',
     [string]$BinarySums = '',
-    # P4-1a: the GitHub repository whose releases carry the binary (the canonical public repo).
+    # The GitHub repository whose releases carry the binary (the canonical public repo; a fork's).
     [string]$ReleaseRepo = 'dmmdea/agentic-memory-stack-for-claude-code'
 )
 

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# install/linux-authority.sh — the native Linux AUTHORITY install (spec §4; no WSL anywhere).
+# install/linux-authority.sh — the native Linux AUTHORITY install (no WSL anywhere).
 #
 # What it does, in order:
 #   [0] prerequisites: not root; tools; the two operator systemd-creds files (the service key is made here when missing); bind address is a real
-#       non-wildcard IPv4 (the tailscale0 address); the Phase 0 symlink set resolves off the
-#       root disk; the local embedder answers on :11436
+#       non-wildcard IPv4 (the tailscale0 address); ~/apps/mem0-server, ~/apps/mem0-scripts,
+#       ~/qdrant-server and ~/.mem0 are symlinks into a data volume (a plain directory is
+#       accepted with a WARN: its data lives on the root disk); the local embedder answers on
+#       :11436; the codex CLI and its login are checked (WARN only)
 #   [1] ~/.mem0/role=brain, stack.env (MEM0_HOST_KIND=native, MEM0_BIND, MEM0_ROLE=brain,
 #       MEM0_SECRETS_DIR), authority-url
-#   [2] Python 3.12 via uv (the system Python is untested with the pinned wheel set)
-#   [3] Qdrant (loopback 6333; ZFS is an accepted storage filesystem — the Phase 1 restore
-#       drill is its proof)
+#   [2] Python 3.12 via uv (the system Python is untested with the pinned wheel set); when uv is
+#       absent the installer fetches it with `curl -LsSf https://astral.sh/uv/install.sh | sh`
+#       into ~/.local/bin. Install uv yourself first to skip that download.
+#   [3] Qdrant (loopback 6333; ZFS is an accepted storage filesystem)
 #   [4] mem0 server venv + modules + VERSION stamp (same lists as the WSL installer)
 #   [4b] the store binary (/usr/local/bin/ams-store, from the release asset of the tag in
 #       VERSION, checksum-verified) and the HUB CHECKOUT this box judges: <checkout>/projects
@@ -17,7 +20,10 @@
 #       for the hub user, a seeded known_hosts and one remote named hub. Both are skipped when
 #       --ams-checkout/--ams-hub are not configured, and so is the store-judge chain step.
 #   [5] units: mem0/qdrant/l10-audit + the ams-nightly chain + the native drop-in;
-#       NO per-job timers (one chain, spec §4); scripts deployed to ~/apps/mem0-scripts
+#       NO per-job timers (one chain); scripts deployed to ~/apps/mem0-scripts. The
+#       rtcwake step is rendered only on a box with an RTC wake alarm and passwordless
+#       `sudo rtcwake`, the pcloud-copy step only with --pcloud-dir (or an existing
+#       ~/pCloudDrive); the syncoid step skips itself while ~/.mem0/scripts/syncoid.sh is absent
 #   [6] enable qdrant, mem0, l10-audit.timer, ams-nightly.timer; health probes on the bind ip
 #
 # Usage:
@@ -27,8 +33,10 @@
 #   --zfs-dataset: the dataset /health/maintenance reads pool usage from (omit on a non-ZFS box).
 #   --eval-root:   checkout holding eval/retrieval-drift/retrieval_drift.py (the dream's drift
 #                  canary); written to stack.env as MEM0_EVAL_ROOT. Omit -> the canary no-ops.
-#   --pcloud-dir:  where the chain's pcloud-copy step mirrors the newest backup set
-#                  (stack.env MEM0_PCLOUD_DIR; default ~/pCloudDrive/memory-backups/<hostname>).
+#   --pcloud-dir:  where the chain's pcloud-copy step mirrors the newest backup set, a cloud-sync
+#                  or network folder (stack.env MEM0_PCLOUD_DIR). Omit it and the step is dropped
+#                  from the rendered set unless ~/pCloudDrive exists (then the step mirrors to
+#                  ~/pCloudDrive/memory-backups/<hostname>, as before).
 #   --embed-profile: the embedding space the store lives in (mem0-server/embedder_profile.py:
 #                  egemma-300m or egemma2). A space is a model AND a prompt template; two spaces never
 #                  share a collection, and a query embedded in the wrong one scores noise with no error.
@@ -85,7 +93,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # collection or model alias of its own, it asks the module.
 . "$REPO_ROOT/scripts/wsl/embed-profile.sh"
 BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET=""; EVAL_ROOT=""; PCLOUD_DIR=""; EMBED_MODEL=""; EMBED_PROFILE=""
-# P4-1b: the store hub's own checkout and the binary that judges it.
+# The store hub's own checkout and the binary that judges it.
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
 WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
 PROMOTION_GATE_MODE=""; SET_PROMOTION_GATE_MODE=0
@@ -96,7 +104,7 @@ QDRANT_DIR="$HOME/qdrant-server"; SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 WSL_INSTALLER="$REPO_ROOT/install/1-wsl-services.sh"
 UV="${UV:-$HOME/.local/bin/uv}"
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --bind-ip) BIND_IP="${2:-}"; shift 2 ;;
@@ -127,11 +135,16 @@ plan() { if [ "$DRY_RUN" = 1 ]; then echo "    [dry-run] $*"; return 0; fi; retu
 # ---------------------------------------------------------------- 0. prerequisites
 say "[0] prerequisites"
 [ "$(id -u)" != 0 ] || fail "run as the service user, not root"
-[ -n "$BIND_IP" ] || fail "--bind-ip <tailscale0 ipv4> is required (never 0.0.0.0; spec §4 bind rule)"
+[ -n "$BIND_IP" ] || fail "--bind-ip <tailscale0 ipv4> is required (never 0.0.0.0). Get the address with: tailscale ip -4"
 [[ "$BIND_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail "--bind-ip must be a plain IPv4 (the tailscale0 address), got '$BIND_IP' — a wildcard, loopback or name is not a bind"
 case "$BIND_IP" in 0.0.0.0|127.*) fail "--bind-ip '$BIND_IP' is a wildcard/loopback bind; the authority binds the tailscale0 address only" ;; esac
-[ -n "$SECRETS_DIR" ] || fail "--secrets-dir <dir> is required (holds ams-api-key.cred and ams-canonical-key.cred from systemd-creds)"
-for c in ams-api-key.cred ams-canonical-key.cred; do [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c (Phase 0 P0-3: systemd-creds --user encrypt --with-key=host+tpm2)"; done
+[ -n "$SECRETS_DIR" ] || fail "--secrets-dir <dir> is required: a private directory (mkdir -m 700 <dir>) that holds ams-api-key.cred and ams-canonical-key.cred, encrypted with systemd-creds"
+for c in ams-api-key.cred ams-canonical-key.cred; do
+    [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c. Make the key, keep a plaintext copy off this box (the canonical key cannot be regenerated; every replica and client needs the API key), then encrypt it (needs systemd >= 256 and a TPM2):
+    (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ${c%.cred}.txt)
+    systemd-creds --user encrypt --with-key=host+tpm2 --name=${c%.cred} ${c%.cred}.txt $SECRETS_DIR/$c
+    shred -u ${c%.cred}.txt   # only after the off-box copy exists"
+done
 # v1.23.1: the tenant INHERITS on a re-run (same rule as the Windows installer's AuthorityUrl /
 # EvalRootWsl): an omitted --user-id takes the tenant already in ~/.mem0/stack.env, and only a
 # first install with no receipt falls back to the login name. The 2026-09-14 cutover re-ran this
@@ -227,7 +240,7 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 [ -z "$PCLOUD_DIR" ] || STACK_ENV_ARGS+=(MEM0_PCLOUD_DIR="$PCLOUD_DIR")
 # v1.23.2: recorded so a re-run can inherit it (the drop-in alone is not a receipt)
 [ -z "$ZFS_DATASET" ] || STACK_ENV_ARGS+=(MEM0_ZFS_DATASET="$ZFS_DATASET")
-# P4-1b: same inherit rule for the store hub's checkout and remote.
+# Same inherit rule for the store hub's checkout and remote.
 [ -z "$AMS_CHECKOUT" ] || STACK_ENV_ARGS+=(MEM0_AMS_CHECKOUT="$AMS_CHECKOUT")
 [ -z "$AMS_HUB" ] || STACK_ENV_ARGS+=(MEM0_AMS_HUB="$AMS_HUB")
 # The producer (the dream's store-judge phase) reads BOTH from here: its own unit carries
@@ -269,7 +282,7 @@ PIP_SPECS="$(grep -E "pip install --quiet 'mem0ai" "$WSL_INSTALLER" | head -1 | 
 STACK_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 UNITS="mem0.service qdrant.service l10-audit.service l10-audit.timer"
 for u in "$REPO_ROOT"/systemd/ams-*; do [ -f "$u" ] && UNITS="$UNITS $(basename "$u")"; done
-# P4-1b: the store-judge step exists only on the box that HOLDS the hub checkout. Rendering it
+# The store-judge step exists only on the box that HOLDS the hub checkout. Rendering it
 # elsewhere would leave __AMS_CHECKOUT__ unresolved (which render_units refuses) and enable a
 # nightly step with nothing to judge, so it is dropped from the set instead.
 AMS_STORE_JUDGE_UNIT="ams-step-store-judge.service"
@@ -288,10 +301,31 @@ fi
 # dir, where it sat disabled and could never load a firewall table.
 NFT_UNIT="ams-nft.service"
 UNITS="$(printf '%s\n' $UNITS | grep -vx "$NFT_UNIT" | tr '\n' ' ')"
+# The wake-from-sleep and cloud-mirror steps exist only where they can work. Rendered anywhere else they
+# would fail every night and turn the health stamp red. A box that already has the unit keeps it. A real
+# or dry run decides; --render-only (the test harness) renders the full set.
+drop_unit() { UNITS="$(printf '%s\n' $UNITS | grep -vx "$1" | tr '\n' ' ')"; }
+if [ -z "$RENDER_ONLY" ]; then
+    if [ -z "$PCLOUD_DIR" ] && [ ! -d "$HOME/pCloudDrive" ] && [ ! -f "$SYSTEMD_USER_DIR/ams-step-pcloud-copy.service" ]; then
+        drop_unit ams-step-pcloud-copy.service
+        echo "    --pcloud-dir not configured and no ~/pCloudDrive: no pcloud-copy step (the backup set is not mirrored off-box; pass --pcloud-dir <dir> to add it)"
+    fi
+    if [ ! -f "$SYSTEMD_USER_DIR/ams-step-rtcwake.service" ] \
+       && ! { [ -e /sys/class/rtc/rtc0/wakealarm ] && command -v rtcwake >/dev/null 2>&1 && sudo -n -l rtcwake >/dev/null 2>&1; }; then
+        drop_unit ams-step-rtcwake.service
+        echo "    no RTC wake alarm, or no passwordless 'sudo rtcwake': no rtcwake step (the box is not woken before the nightly chain)"
+    fi
+    # The units that judge through the Codex CLI run with CODEX_HOME=<secrets-dir>/codex.
+    if ! command -v codex >/dev/null 2>&1; then
+        echo "    WARN: the codex CLI is not on PATH: the dream, the weekly contradiction sweep and the weekly retrieval-pairs sweep cannot run their Codex judge, so those steps fail or degrade. Install Node 22+ and run: npm i -g @openai/codex; then sign in: mkdir -p $SECRETS_DIR/codex && CODEX_HOME=$SECRETS_DIR/codex codex login"
+    elif [ ! -s "$SECRETS_DIR/codex/auth.json" ]; then
+        echo "    WARN: no Codex login under $SECRETS_DIR/codex (the CODEX_HOME of the nightly units): the dream, the weekly contradiction sweep and the weekly retrieval-pairs sweep cannot run their Codex judge, so those steps fail or degrade. Sign in once: mkdir -p $SECRETS_DIR/codex && CODEX_HOME=$SECRETS_DIR/codex codex login"
+    fi
+fi
 echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID"
 echo "    units: $UNITS"
 
-# P4-1b helpers -----------------------------------------------------------------------------
+# Store hub helpers -----------------------------------------------------------------------------
 # The hub remote is given as user@host:repo.git, the one form the remote policy accepts besides
 # ssh://. The host is parsed out of it rather than taken as its own flag, so the ssh Match block,
 # the sync's --hub-host and the git remote can never name three different machines.
@@ -337,14 +371,22 @@ if [ -n "$RENDER_ONLY" ]; then
 fi
 
 if [ "$DRY_RUN" = 0 ]; then
-    for t in python3 curl jq systemctl ip systemd-creds; do command -v "$t" >/dev/null || fail "$t is required"; done
+    for t in python3 curl jq systemctl ip systemd-creds; do command -v "$t" >/dev/null || fail "$t is required (Debian/Ubuntu: sudo apt install -y python3 curl jq iproute2 systemd)"; done
+    # A symlink into a data volume passes silently. A plain directory, or none yet, is allowed: the install
+    # creates what it needs, and the data then lives on the root disk.
     for p in "$HOME/apps/mem0-server" "$HOME/apps/mem0-scripts" "$HOME/qdrant-server" "$HOME/.mem0"; do
-        [ -L "$p" ] || fail "$p is not a symlink into the AMS dataset (Phase 0 P0-2 symlink set; spec §4: nothing on the root disk)"
+        [ -L "$p" ] && continue
+        if [ -e "$p" ] && [ ! -d "$p" ]; then fail "$p exists and is not a directory; move it away and re-run"; fi
+        if [ ! -e "$p" ]; then
+            echo "    WARN: $p does not exist; the install creates it as a plain directory, so its data lives on the root disk. To use a separate volume, make the symlink first: ln -s <volume>/$(basename "$p") $p"
+            continue
+        fi
+        echo "    WARN: $p is a plain directory, not a symlink into a data volume: its data lives on the root disk. To keep it on a separate volume, move the directory there and symlink it back (mv $p <volume>/$(basename "$p"); ln -s <volume>/$(basename "$p") $p), then re-run."
     done
-    ip -4 -o addr show | grep -q " inet ${BIND_IP}/" || fail "$BIND_IP is not present on any interface (is tailscaled up?)"
+    ip -4 -o addr show | grep -q " inet ${BIND_IP}/" || fail "$BIND_IP is not present on any interface. Start tailscale (sudo tailscale up) and take the address from: tailscale ip -4"
     # the body first, then the match: `curl | grep -q` under pipefail can read a served alias as missing
     models_json="$(curl -sf -m 5 http://127.0.0.1:11436/v1/models || true)"
-    printf '%s' "$models_json" | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model). EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture) and the entries install/1-wsl-services.sh prints"
+    printf '%s' "$models_json" | grep -q "\"$EMBED_MODEL\"" || fail "llama-swap on :11436 does not list the embed model '$EMBED_MODEL' (profile $EMBED_PROFILE; --embed-model). Set llama-swap up per install/llama-swap-setup.md; check with: curl -s http://127.0.0.1:11436/v1/models. EmbeddingGemma-2 needs llama.cpp b11452 or later (the gemma-embedding2 architecture) and the entries install/1-wsl-services.sh prints"
     # Rebinding an existing store to another space: mem0 CREATES an absent collection empty and then
     # writes into it, so the new space must already hold the store (scripts/wsl/embedder-migrate.py).
     PREV_PROFILE="$RECORDED_PROFILE"
@@ -403,7 +445,7 @@ elif plan "generate $SERVICE_CRED (32 random bytes -> systemd-creds --user encry
     ( umask 077
       python3 -c 'import secrets; print(secrets.token_hex(32))' \
         | systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-service-key - "$SERVICE_CRED.tmp" ) \
-        || { rm -f "$SERVICE_CRED.tmp"; fail "could not create $SERVICE_CRED: systemd-creds --user encrypt --with-key=host+tpm2 failed (it needs systemd >= 256 and TPM2 access for this user); the existing file, if any, is untouched"; }
+        || { rm -f "$SERVICE_CRED.tmp"; fail "could not create $SERVICE_CRED: systemd-creds --user encrypt --with-key=host+tpm2 failed; the existing file, if any, is untouched. It needs systemd >= 256 (check: systemctl --version), a TPM2 (check: systemd-creds has-tpm2) and access to it for this user (check: ls -l /dev/tpmrm0; if it is group-owned, add yourself: sudo usermod -aG tss \$USER, then log in again). Fix that and re-run"; }
     svc_cred_decrypts "$SERVICE_CRED.tmp" || { rm -f "$SERVICE_CRED.tmp"; fail "systemd-creds wrote $SERVICE_CRED.tmp but it does not decrypt; the existing file, if any, is untouched"; }
     if [ -e "$SERVICE_CRED" ]; then
         aside="$SERVICE_CRED.undecryptable-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -598,12 +640,12 @@ if plan "render $UNITS + mem0.service.d/native.conf into $SYSTEMD_USER_DIR; depl
     # from here and the tree has no .git, so its git_sha reads this stamp (it was "unknown").
     deploy_stamp_write "$REPO_ROOT" "$MEM0_APP" "$SCRIPTS_DIR"
     systemctl --user daemon-reload
-    # One chain (spec §4): any per-job timer a previous install enabled is turned off, never deleted.
+    # One chain: any per-job timer a previous install enabled is turned off, never deleted.
     for t in decay-scan stack-backup goals-stale-sweep contradiction-sweep retrieval-pairs episodic-reconcile goal-recurrence-promote egemma-rollback-prune offline-watcher; do
         systemctl --user disable --now "$t.timer" >/dev/null 2>&1 || true
     done
     echo "    units rendered; per-job timers off"
-    # Bind belt persistence (P0-5 design note): a ROOT oneshot loading the AMS table from its own
+    # Bind belt persistence: a ROOT oneshot loading the AMS table from its own
     # file. Never nftables.service (its conf flushes the iptables-nft tables tailscale/docker own).
     if [ -s /etc/nftables.d/ams.nft ] && sudo -n true 2>/dev/null; then
         sudo -n install -m 0644 "$REPO_ROOT/systemd/ams-nft.service" /etc/systemd/system/ams-nft.service \

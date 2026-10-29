@@ -116,7 +116,7 @@ A fresh install *creates* the machine-local set from the tracked source; a re-in
 - **Operator-neutral at rest.** The shipped source carries Sentinels, not real values; operator identity materializes only in machine-local Receipts and deployed copies resolved at install. The docs/CI PII gate enforces this neutrality.
 - **Keys are provisioned with least exposure and never transported.** The API key is mode `600`; the canonical key is never regenerated over an existing DPAPI blob. On cutover the canonical key is generated *fresh* on the new machine — the DPAPI blob is bound to the old Windows user and cannot decrypt elsewhere.
 - **The role gate is a safety control.** It stops a read-replica from running destructive nightly mutations against the one shared brain.
-- **Loopback binds by default.** Qdrant (`6333`) and mem0 (`18791`) bind `127.0.0.1`; a wider bind is a deliberate `MEM0_BIND` choice, not an accident. Scheduled tasks run non-elevated as the interactive user.
+- **Loopback binds by default.** Qdrant (`6333`) and mem0 (`18791`) bind `127.0.0.1`; a wider bind is a deliberate `MEM0_BIND` choice, not an accident, and the value is the box's tailnet address, never `0.0.0.0`. Scheduled tasks run non-elevated as the interactive user.
 
 ## Observability and debugging
 

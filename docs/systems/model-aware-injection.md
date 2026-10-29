@@ -2,7 +2,7 @@
 
 Memory injection is **available, not shoved**: the auto-surfaced `[MEMORY CONTEXT]` block
 is scaled to the *consuming model's* tier — full for frontier Opus/Fable, lighter for
-small Haiku-class models, and **nothing at all** for the local offload harness. The
+small Haiku-class models, and **nothing at all** for an offload tool (a cheap local model reached over MCP). The
 guiding principle is that memory leverage should live with the capable agent that can
 actually use it, and the cheaper a model is, the less context it should have to wade
 through.
@@ -35,15 +35,15 @@ banner still lists them):
 |---|---|---|---|---|---|---|---|---|
 | **frontier** | `opus`, `fable`, `sonnet` | 2 | 0 | 0 | 0.70 | full | no | yes — full `[tier\|brand] text` bullets |
 | **small** | `haiku` | 1 | 0 | 0 | 0.70 | flat | yes | yes — flat, highest-tier-first, 1-line legend, `[brand]` tag dropped when brand known |
-| **offload** | Gemma cascade (`mcp__local-offload__*`) | — | — | — | — | — | — | **none — by construction** (see below) |
+| **offload** | a local-model MCP tool (`mcp__<server>__*`) | — | — | — | — | — | — | **none — by construction** (see below) |
 
 Notes:
 
 - **Thresholds** are read from `model-tiers.json`, not hardcoded. They were lowered from
   0.4 (nomic era) to 0.30/0.33 in v0.22 (0.70 now, the active profile's calibrated gate) when mem0's embedder migrated from English-only
   `nomic-embed-text` to multilingual **EmbeddingGemma-300m** (768-d, via llama-swap
-  on `:11436`); the reranker is **bge-reranker-v2-m3** (GPU since 2026-08-13; CPU before —
-  score scale is device-independent, so threshold calibration was unaffected). Ollama was
+  on `:11436`); the reranker is **bge-reranker-v2-m3** (it runs on the GPU; the score scale is
+  device-independent, so threshold calibration does not depend on the device). Ollama was
   decommissioned in the same migration.
 - **Caps** are applied server-side in `context_bundle` (per `ContextBundleIn.tier`). The
   client `Select-AdmittedMemoryResults` independently hard-caps surfaced memories at
@@ -75,44 +75,44 @@ block. A tier-resolution slip can never *degrade* injection, only fail to lighte
 
 ## The offload-no-block principle
 
-The local offload harness (`mcp__local-offload__offload_classify | offload_extract |
-offload_summarize | offload_triage`, a free Gemma-4 cascade on `:11436`) gets **no memory
+An offload tool is an MCP server that fronts a cheap local model (classify, extract,
+summarize). The stack does not ship one; if you register one, it gets **no memory
 block at all — and this is true by construction, not by a runtime tier check.** Three
-independent facts make it impossible for the harness to receive the `[MEMORY CONTEXT]`
+independent facts make it impossible for the tool to receive the `[MEMORY CONTEXT]`
 block:
 
 1. **`UserPromptSubmit` is never raised for a tool call.** It fires for human prompts and
    also for background task notifications, which get no block since C10 (see
    [`../flows/memory-retrieval.md`](../flows/memory-retrieval.md), Channel 1). It is *never*
    raised for a tool call or an MCP invocation, and it does not fire inside subagents. The
-   offload harness is reached only via `mcp__local-offload__*` tool calls from the
+   offload tool is reached only via `mcp__<server>__*` tool calls from the
    orchestrating agent. Those calls do not raise `UserPromptSubmit`, so the only producer of
    the block is never invoked for them.
 2. **The block producer is bound only to the human-prompt client.** `UserPromptSubmit` is
    registered to a single command — the compiled `mem0-hook-client.exe` (PowerShell fallback
    `user-prompt-extract.ps1`) and the daemon it spawns. There is no matcher and no `mcp__`
    anything on that registration.
-3. **`PreToolUse` gates strictly on the editing/exec tools and excludes MCP.** The stack's
-   `PreToolUse` hook matcher is `Bash|Edit|MultiEdit|Write`; no `PreToolUse` matcher names
-   `mcp__`. So no hook of any kind fires for an `mcp__local-offload__*` call, and that hook
-   path does not render the block anyway.
+3. **The stack registers no `PreToolUse` hook.** Its only matcher-bearing hooks are
+   `PostToolUse` (`Write|Edit`) and `SessionStart` (`startup|clear|compact`); none names
+   `mcp__`. So no stack hook fires for an `mcp__<server>__*` call. The invariant below
+   guards against a third-party `PreToolUse` matcher that would fire for one.
 
-Therefore the offload model receives **only** what the orchestrating agent passes it as
+Therefore the offload tool receives **only** what the orchestrating agent passes it as
 tool arguments — never the memory block, never CLAUDE.md, never the tier protocol (it runs
 in a separate MCP process that does not load any of those).
 
 ### Verification (CI-style gate)
 
 `Test-MemoryStack.ps1` asserts this invariant every run, so a future misconfiguration
-that would expose the harness is caught:
+that would expose the offload tool is caught:
 
 - **R-offload** (INVARIANTS I13): parses the deployed `~/.claude/settings.json` hooks and
   asserts (a) `UserPromptSubmit` binds only to the human-prompt client with no `mcp__`
-  matcher/command, and (b) no `PreToolUse` hook that fires for an offload call can route the
-  memory block to it.
+  matcher/command, and (b) no `PreToolUse` hook (a third-party one, since the stack registers none) that
+  fires for an offload call can route the memory block to it.
 
   (b) is evaluated the way Claude Code evaluates it: each matcher is run as a **regex** against
-  a real offload tool name, not substring-searched for `mcp__local-offload` — `mcp__.*`, `mcp__`
+  a real offload tool name, not substring-searched for the server name — `mcp__.*`, `mcp__`
   and `.*` all fire at runtime while containing no such substring, so a substring test would
   miss precisely the holes that matter. A firing matcher is an **exposure** only when the
   command behind it is a memory-context **producer** (the stack's own hook client, daemon or
@@ -141,7 +141,7 @@ that would expose the harness is caught:
 
 ## The "orchestrating agent inlines one fact" pattern
 
-Because the offload harness gets no memory, the **memory leverage stays with the capable
+Because the offload tool gets no memory, the **memory leverage stays with the capable
 orchestrating agent** (Opus/Fable). When an offload task genuinely needs a stored fact,
 the orchestrator retrieves it (via `mcp__mem0__memory_search` or from the already-surfaced
 block) and **inlines that one fact into the tool arguments** — it does not try to give the
@@ -149,7 +149,7 @@ small model the whole context.
 
 Concretely, the offload model gets: **task + input + (optionally) one fact-as-argument.**
 For example, if a classification depends on a brand-specific label set, the orchestrator
-passes the label set in the `labels` argument rather than expecting the Gemma model to
+passes the label set in the `labels` argument rather than expecting the small model to
 recall it. This keeps the offload path fast, free, and stateless, and keeps the
 high-judgment "which fact matters" decision where the judgment is — on the frontier model.
 

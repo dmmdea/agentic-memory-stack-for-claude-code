@@ -30,7 +30,7 @@ Liveness + version probe. No auth.
 
 **Response 200:**
 ```json
-{"ok": true, "version": "2.0.4-v012", "stack": "<stack release>", "store": "qdrant", "embedder": "embeddinggemma-300m"}
+{"ok": true, "version": "2.0.4-v012", "stack": "<stack release>", "store": "qdrant", "embedder": "embeddinggemma-2", "embed_profile": "egemma2"}
 ```
 
 `version` is the historical mem0-lib+phase tag (kept stable — dashboards may pattern-match it). `stack` is the actual stack release (the repo `VERSION` file) — the field the operations runbook tells you to read.
@@ -81,11 +81,15 @@ Three more keyless probes, all answered by the authority. `/health/maintenance` 
 
 **Response 200:** `{"results":[{"id":..., "memory":..., "metadata":..., "user_id":..., "created_at":..., "updated_at":..., "hash":...}, ...]}`
 
-> **Known quirk (mem0 v2.0.4):** `Memory.get_all`'s size param is named `top_k` (default 20) — `app.py` passes `top_k` explicitly, so `limit` is honored up to the 500 cap. Beyond that, use the Qdrant scroll API directly (`POST :6333/collections/<collection>/points/scroll`) against the collection mem0 is bound to — the `collection_name` in `mem0-server/config.py` (`mem0_egemma_768` as shipped; `/health/deep` reports the live binding as `collection`).
+> **Known quirk (mem0 v2.0.4):** `Memory.get_all`'s size param is named `top_k` (default 20) — `app.py` passes `top_k` explicitly, so `limit` is honored up to the 500 cap. Beyond that, use the Qdrant scroll API directly (`POST :6333/collections/<collection>/points/scroll`) against the collection mem0 is bound to — the `collection_name` in `mem0-server/config.py` (`mem0_eg2_768` on the default EmbeddingGemma-2 profile, `mem0_egemma_768` on the legacy 300m profile; `/health/deep` reports the live binding as `collection`).
 
 ### `GET /v1/memories/{mid}` — exact read
 
 Returns one record by id: text, metadata (incl. tier), timestamps. Use before update/delete/promote — search and list are not substitutes for an exact read. 404 when the id does not exist.
+
+### `GET /v1/memories/{mid}/media/{n}` — media file of a media memory
+
+Returns the n-th media file (0-based, in the order of the payload's `media`) of a media memory, with its stored type and file name. 404 for an unknown memory (the id is a full UUID, not a prefix), an index past the list, or a file missing from the media directory. Full description: [mem0-api.md](./systems/mem0-api.md).
 
 ### `POST /v1/memories/search` — semantic search
 
@@ -219,6 +223,7 @@ The MCP tool `memory_supersede` wraps this route (below).
 |---|---|
 | `POST /v1/goals` | create a goal (title, priority 1–5, brand, optional parent_goal_id) |
 | `GET /v1/goals` | list goals; `status`/`brand`/`limit` filters |
+| `GET /v1/goals/count` | `{total, by_status}`: the true unfiltered count (a `GET /v1/goals` page is capped by `limit`) |
 | `GET /v1/goals/tree` | recursive goal hierarchy (optional `root_id`) |
 | `GET /v1/goals/{goal_id}` | full goal detail incl. linked-episode count |
 | `PATCH /v1/goals/{goal_id}/status` | set goal status |
@@ -229,6 +234,7 @@ The MCP tool `memory_supersede` wraps this route (below).
 | `POST /v1/goals/{source_goal_id}/merge` | merge a duplicate goal into a target: `{ok, source_goal_id, target_goal_id, relinked_episodes, dropped_duplicates}` (a source link the target already has is dropped, not moved) |
 | `POST /v1/open_questions` | record a frontier question |
 | `GET /v1/open_questions` | list open questions (`status`/`brand`/`limit`) |
+| `GET /v1/open_questions/count` | `{total, by_status}`: the true unfiltered count |
 | `POST /v1/open_questions/search` | FTS5 search across questions |
 | `GET /v1/open_questions/{oq_id}` | question detail incl. related goal |
 | `PATCH /v1/open_questions/{oq_id}/resolve` | resolve with resolution text + session id |
@@ -321,8 +327,8 @@ Wraps `DELETE /v1/memories/{id}`. Queues to the offline outbox when the authorit
 
 ## Things this contract does NOT cover
 
-- Qdrant's HTTP API on `:6333`. We use a stable subset (`/collections/mem0_egemma_768/points/{search,scroll}`, `/collections/mem0_egemma_768`). Upstream Qdrant guarantees its own API stability per their semver.
-- llama-swap's OpenAI-compatible API on `:11436` (serves EmbeddingGemma-300m embeddings + the bge reranker). We use `/v1/embeddings`. **(v0.22: replaced Ollama/`:11434` + nomic-embed-text.)**
+- Qdrant's HTTP API on `:6333`. We use a stable subset (`/collections/<collection>/points/{search,scroll}`, `/collections/<collection>`, with `<collection>` the live binding `/health/deep` reports). Upstream Qdrant guarantees its own API stability per their semver.
+- llama-swap's OpenAI-compatible API on `:11436` (serves the active profile's embedder, EmbeddingGemma-2 by default, + the bge reranker). We use `/v1/embeddings`.
 
 > **Note (v0.13):** agentmemory's MCP surface (50+ `mcp__agentmemory__*` tools) has been **REMOVED** from the stack. Those tools no longer appear in Claude Code sessions. Episodic memory is a deliberate v0.14 gap.
 

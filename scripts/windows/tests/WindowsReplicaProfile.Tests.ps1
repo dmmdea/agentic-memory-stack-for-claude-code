@@ -64,7 +64,7 @@ Describe 'install.ps1 -EmbedProfile' {
 
     It 'leaves the existing parameters alone' {
         $names = @($script:ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-        $names | Should -Be @('NonInteractive', 'LogFile', 'Distro', 'Role', 'AuthorityUrl', 'AuthoritySsh', 'EmbedProfile', 'MediaEmbedder')
+        $names | Should -Be @('NonInteractive', 'LogFile', 'Distro', 'Role', 'AuthorityUrl', 'AuthoritySsh', 'EmbedProfile', 'MediaEmbedder', 'ApiKeyFile', 'HubHost', 'BinaryPath', 'BinarySums', 'ReleaseRepo')
         $role = $script:ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Role' }
         $role.Extent.Text | Should -Match "ValidateSet\('brain','replica'\)"
     }

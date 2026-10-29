@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This system is the set of Claude Code lifecycle hooks (registered in `settings.json`) that drive memory **capture** and **retrieval injection** on Windows. On session close / compaction, a Codex-backed extractor writes the session's durable facts to mem0; on every prompt, a resident daemon + a compiled thin client inject the `[MEMORY CONTEXT]` block; SessionStart spawns the accelerators. Every hook is best-effort and fail-open — it can slow nothing and block nothing.
+This system is the set of Claude Code lifecycle hooks (registered in `settings.json`) that drive memory **capture** and **retrieval injection** on Windows. On session close / compaction, a Codex-backed extractor writes the session's durable facts to mem0; on every prompt, a resident daemon + a compiled thin client inject the `[MEMORY CONTEXT]` block; SessionStart spawns the accelerators and the maintenance children, and syncs the store when a hub is configured. Every hook is best-effort and fail-open — it can slow nothing and block nothing.
 
 ## Questions this doc answers
 
@@ -14,7 +14,7 @@ This system is the set of Claude Code lifecycle hooks (registered in `settings.j
 
 ## Scope
 
-The `settings.json` hook registrations and their Windows-side handlers: the L1a Stop/PreCompact extractor, the UserPromptSubmit daemon + compiled client, the SessionStart spawns, and PreToolUse — plus the shared Codex mutex, the dead-letter queue, and the fail-open contracts that make all of it safe.
+The `settings.json` hook registrations and their Windows-side handlers: the L1a Stop/PreCompact extractor, the UserPromptSubmit daemon + compiled client, the SessionStart spawns, the PostToolUse write gate and the store sync hooks — plus the shared Codex mutex, the dead-letter queue, and the fail-open contracts that make all of it safe.
 
 ## Non-scope
 
@@ -44,13 +44,21 @@ Codex CLI authenticates via **ChatGPT subscription OAuth** (separate auth surfac
 
 `install/2-windows-config.ps1` patches these entries into the live `~/.claude/settings.json` (see `claude-config/settings.example.json` for the scrubbed reference):
 
-| Event | Handler | Role |
-|---|---|---|
-| `Stop` | `stop-extract.ps1` | Dispatch the L1a extractor at session close. |
-| `PreCompact` | `stop-extract.ps1` | Snapshot the transcript before compaction mutates it, then extract. |
-| `SessionStart` | `storage-cap-check.sh` (WSL), `mem0-hook-daemon-spawn.ps1` (async), `codex-shim-spawn.ps1` (async), `sessionstart-capture.ps1` (async) | Storage guard + spawn the bundle daemon, the Codex HTTP shim (`:18792`), and the session précis. |
-| `UserPromptSubmit` | `mem0-hook-client.exe` | Inject the `[MEMORY CONTEXT]` block for the prompt. |
-| `PreToolUse` | *(none — stack-owned entry retired)* | The 0.F contradiction check (`pre-tool-check.ps1`) was retired 2026-08-09 by operator decision (AMS-16, near-100% FP warn corpus); the installer strips it on re-run. |
+| Event | Matcher | Handler | Async / timeout | Role |
+|---|---|---|---|---|
+| `Stop` | none | `stop-extract.ps1` | async, 15 s | Dispatch the L1a extractor at session close. |
+| `PreCompact` | none | `stop-extract.ps1` | sync | Snapshot the transcript before compaction mutates it, then extract. |
+| `PreCompact` | none | `precompact_capture.py` (WSL, `\|\| true`) | sync | Stash a redacted query marker for the post-compact SessionStart top-up. Fail-open: a missing script cannot block compaction. |
+| `SessionStart` | `startup\|clear\|compact` | `storage-cap-check.sh` (WSL) | sync | Storage guard and session-open banner. Not run on `resume`. |
+| `SessionStart` | none | `mem0-hook-daemon-spawn.ps1` | async, 10 s | Pre-warm the bundle daemon. |
+| `SessionStart` | none | `codex-shim-spawn.ps1` | async, 10 s | Start the Codex HTTP shim (`:18792`); a no-op until its flag file exists. |
+| `SessionStart` | none | `sessionstart-capture.ps1` | async, 15 s | Capture the prior session's transcript (the backstop for a session that ended without a Stop). |
+| `SessionStart` | none | `memory-maintenance-spawn.ps1` | async, 10 s | Spawn the detached maintenance children (dream catch-up, index refresh, store lint, store watcher). |
+| `SessionStart` | none | `ams-store.exe sync --once` | async, 90 s | Store sync with the hub. Registered only when the installer proved a hub path. |
+| `SessionEnd` | none | `ams-store.exe sync --once` | sync, 60 s | Push the closing session's local commits to the hub. Registered only with a proven hub path. |
+| `UserPromptSubmit` | none | `mem0-hook-client.exe` | sync, 5 s | Inject the `[MEMORY CONTEXT]` block for the prompt. |
+| `PostToolUse` | `Write\|Edit` | `ams-store.exe gate` | sync, 10 s | Advisory index write gate; always exits 0. |
+| `PreToolUse` | n/a | *(none)* | n/a | The stack registers no PreToolUse hook. The installer strips an older `pre-tool-check.ps1` entry on re-run. |
 
 ## Important flows
 
@@ -71,7 +79,7 @@ l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks C
   ├─ Get-RecentTranscriptTurns   → last 24 turns, capped at 12KB
   ├─ Acquire-CodexLock('l1a')   → skip if the nightly consolidator or another L1a holds the shared mutex
   │
-  ▼ Invoke-CodexSubagent (codex.cmd, ChatGPT OAuth, reasoning=low, timeout=60s)
+  ▼ Invoke-CodexSubagent (codex.cmd, ChatGPT OAuth, reasoning=low, timeout=90s)
 Codex / per-job model
   │ prompt: extract ≤5 durable facts as {"facts":[...]} (plus an episode checkpoint)
   │ ~15-30s per call
@@ -133,10 +141,14 @@ The entry points are the `settings.json` hook registrations in the table above. 
 ## Dependencies
 
 - **Codex CLI** (`codex.cmd`, ChatGPT-subscription OAuth); the model is pinned per job, see *Model routing* below.
+- **mem0 REST** on `:18791` (all reads/writes).
+- **PowerShell 7 (pwsh)** preferred for the PS hooks; the daemon runs under Windows PowerShell 5.1 (its `JavaScriptSerializer` + `NamedPipeServerStream` PipeSecurity are .NET Framework).
+- **The compiled-client toolchain:** `build-hook-client.ps1` (framework `csc`) compiles `mem0-hook-client.cs`.
+- **llama-swap** on `:11436` indirectly, via the bundle's embedder.
 
-## Model routing (2026-09-07)
+## Model routing
 
-Every Codex call used to inherit whatever `~/.codex/config.toml` named. On 2026-09-07 a config edit moved the entire stack onto `gpt-6-astra` and **no receipt recorded it** — the audit trail could not say which model had judged a memory. Model choice is now a property of the JOB, passed explicitly with `-Model` (`codex exec -m`), and config.toml is only the fallback for a call site that names none.
+Model choice is a property of the JOB, passed explicitly with `-Model` (`codex exec -m`), so a receipt records which model judged a memory. `~/.codex/config.toml` is only the fallback for a call site that names none.
 
 | job | model | effort | timeout | why |
 |---|---|---|---|---|
@@ -149,7 +161,7 @@ Every Codex call used to inherit whatever `~/.codex/config.toml` named. On 2026-
 | shim `/judge` default | `gpt-5.6-terra` | low | ≤180s | bounded classification for every WSL-side judge |
 | contradiction + supersession | `gpt-5.6-terra` | low | 60s | binary NLI; 103 real calls in one weekly sweep |
 
-**Effort is the cost lever, not the model name.** Measured on this box, the same judge prompt cost 263 tokens at `low` and 3,335 at `medium` — about 13x. Astra runs at **medium** by operator directive (2026-09-07); the doctrine is to escalate only on a *measured* failure at the lower setting.
+**Effort is the cost lever, not the model name.** Measured on this box, the same judge prompt cost 263 tokens at `low` and 3,335 at `medium` — about 13x. Astra runs at **medium**; the doctrine is to escalate only on a *measured* failure at the lower setting.
 
 **Provenance.** `Parse-CodexHeader` reads the model and effort Codex prints in its own stdout header, so every usage row carries `model_requested`/`model_resolved` and `effort_requested`/`effort_resolved`. A mismatch is the detectable form of silent drift — which matters because `model_reasoning_effort` is *not* validated at config load, so a typo passes silently. `outcome` is a closed enum (`ok`, `empty`, `timeout`, `exit_nonzero`, `parse_fail`, `lock_unavailable`, `skipped_no_candidates`).
 
@@ -185,10 +197,6 @@ This exists because the **NLI write-gate is pinned but deliberately OFF**: it wo
 ### Who judged a promotion
 
 The tier ledger records `judge_model` on both the write-ahead intent row and the completion row (`schema_version` v18, additive — pre-v18 rows stay valid). `actor` is a role label and never said what did the judging. The field is deliberately **outside the signed material**: the canonical HMAC covers `<ts>|<nonce>|promote|<mid>|<reason>`, so `judge_model` is an audit convenience, never an authorisation input. `mem0-canonize.sh` passes it via the `JUDGE_MODEL` environment variable.
-- **mem0 REST** on `:18791` (all reads/writes).
-- **PowerShell 7 (pwsh)** preferred for the PS hooks; the daemon runs under Windows PowerShell 5.1 (its `JavaScriptSerializer` + `NamedPipeServerStream` PipeSecurity are .NET Framework).
-- **The compiled-client toolchain:** `build-hook-client.ps1` (framework `csc`) compiles `mem0-hook-client.cs`.
-- **llama-swap** on `:11436` indirectly, via the bundle's embedder.
 
 ## Downstream effects
 
@@ -226,7 +234,7 @@ The daemon's named pipe is ACL'd to the current user only (inherited ACEs droppe
 ## Observability and debugging
 
 - **Logs:** `l1a.log` (extraction), `hook-daemon.log` (daemon ops), `codex-usage.jsonl` (Codex spend).
-- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew). The counters are per server process (since the last restart). The SessionStart enrichment call (`20.0`) and the dream's canonical search (`17.0`) stamp the version too, but `missing` is still polluted: the retrieval-drift guard's snapshot searches (about 28 a night, run from a private evaluation repo) do not stamp yet, so a nonzero `missing` is not by itself a hook regression. Open follow-up: once that repo sends the same `hook_contract_version` field, a nonzero `missing` becomes a real regression signal; until then read it as a floor, not an alarm.
+- **Drift counters:** `GET /health/deep` → `checks.hook_contract` reports `missing`/`unknown` version counts (hook↔server skew). The counters are per server process (since the last restart). The SessionStart enrichment call (`20.0`) and the dream's canonical search (`17.0`) stamp the version too, but `missing` is still polluted: the retrieval-drift guard's snapshot searches (about 28 a night, run from an external evaluation harness) do not stamp yet, so a nonzero `missing` is not by itself a hook regression. Read it as a floor, not an alarm, until that harness sends the same `hook_contract_version` field.
 - **Staleness:** the `lib_hash` handshake makes a stale-daemon-after-deploy self-correct on the next prompt.
 - **`Test-MemoryStack.ps1`** (R9) hashes `mem0-hook-client.cs` and checks the exe is fresh against it.
 

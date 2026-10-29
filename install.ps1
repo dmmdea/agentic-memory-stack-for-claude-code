@@ -10,6 +10,9 @@
 #
 # Switch this box's embedding profile (a replica restoring sets made in another space; see docs/MIGRATION.md):
 #   .\install.ps1 -Role replica -EmbedProfile egemma2
+#
+# A replica's first install needs the authority's URL and its API key (a file holding the key alone):
+#   .\install.ps1 -Role replica -AuthorityUrl http://<authority-host>:18791 -ApiKeyFile <path to the key file>
 
 param(
     [switch]$NonInteractive,
@@ -45,7 +48,22 @@ param(
     # Recorded in ~/.mem0/stack.env as MEM0_MEDIA_EMBEDDER (MEM0_SET_MEDIA_EMBEDDER in the WSL phase); omitted,
     # the recorded value is kept. Case-sensitive like -EmbedProfile: ValidateSet ignores case and does not
     # normalise, so 'ON' would reach the WSL phase, which accepts on|off only.
-    [ValidateSet('', 'on', 'off', IgnoreCase = $false)][string]$MediaEmbedder = ''
+    [ValidateSet('', 'on', 'off', IgnoreCase = $false)][string]$MediaEmbedder = '',
+    # A replica authenticates to the authority with the authority's API key. Without this, phase 1 generates a
+    # random local key that the authority rejects (HTTP 401 on every call). A file holding the key alone, e.g. the
+    # output of `systemd-creds --user decrypt --name=ams-api-key <secrets-dir>/ams-api-key.cred -` on a native
+    # authority, or the authority's ~/.mem0/api-key. It is copied to ~/.mem0/api-key in the WSL distro (mode 600)
+    # before phase 1, replacing the key there. Replica role only; omitted, the key on the box is kept.
+    [string]$ApiKeyFile = '',
+    # Forwarded to install/2-windows-config.ps1 only when given (omitted, the box keeps what it recorded).
+    # -HubHost: the MagicDNS name of the store hub; without one the store's sync hooks are not registered.
+    # -BinaryPath / -BinarySums: an offline drop of ams-store.exe and the SHA256SUMS it shipped with, for a box that
+    # cannot reach GitHub (phase 2 otherwise downloads the release asset of the tag in VERSION and verifies it).
+    # -ReleaseRepo: the GitHub <owner>/<repo> whose releases carry that binary (a fork's).
+    [string]$HubHost = '',
+    [string]$BinaryPath = '',
+    [string]$BinarySums = '',
+    [string]$ReleaseRepo = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +72,14 @@ $ErrorActionPreference = 'Stop'
 # tracking, yielding five cryptic parse errors). Fail loud here instead, where 5.1 parses.
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "This installer requires PowerShell 7+ (pwsh). You are on $($PSVersionTable.PSVersion). Run: pwsh -File install.ps1"
+}
+# File parameters are resolved against the caller's directory, before this script moves to the repo root.
+foreach ($fp in 'ApiKeyFile', 'BinaryPath', 'BinarySums') {
+    $fv = Get-Variable -Name $fp -ValueOnly
+    if ($fv) {
+        if (-not (Test-Path -LiteralPath $fv -PathType Leaf)) { throw "-$fp '$fv' is not a file." }
+        Set-Variable -Name $fp -Value (Resolve-Path -LiteralPath $fv).Path
+    }
 }
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
@@ -66,6 +92,9 @@ Set-Location $RepoRoot
 . (Join-Path $RepoRoot 'install\role-lib.ps1')
 $RoleChoice = Resolve-InstallRole -Explicit ($PSBoundParameters.ContainsKey('Role')) -Requested $Role -ProfileDir $env:USERPROFILE
 $Role = $RoleChoice.Role
+if ($ApiKeyFile -and $Role -ne 'replica') {
+    throw "-ApiKeyFile is for a replica, which uses the authority's key. This box is a $Role and keeps the key phase 1 generates; pass -Role replica, or drop -ApiKeyFile."
+}
 
 # v1.0 Phase 7A: resolve the WSL distro (never hardcode 'Ubuntu'). `wsl -l -q`
 # emits UTF-16 — read it with the right console encoding or names arrive
@@ -105,6 +134,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Prerequisites check failed - resolve issues above and re-run." }
 
     Write-Phase "[1/4] WSL services (mem0, Qdrant, l10-audit, llama-swap)"
+    if ($ApiKeyFile) {
+        # Written before the WSL phase, which keeps an api-key file that already exists.
+        $apiKey = (Get-Content -LiteralPath $ApiKeyFile -Raw).Trim()
+        if (-not $apiKey -or $apiKey -match '\s') { throw "-ApiKeyFile '$ApiKeyFile' must hold the API key alone, on one line." }
+        $apiKey | wsl.exe -d $Distro -e bash -c 'umask 077; mkdir -p ~/.mem0 && tr -d "\r" > ~/.mem0/api-key.new && chmod 600 ~/.mem0/api-key.new && mv -f ~/.mem0/api-key.new ~/.mem0/api-key'
+        if ($LASTEXITCODE -ne 0) { throw "Could not write ~/.mem0/api-key in WSL distro $Distro." }
+        $keyLen = [string](wsl.exe -d $Distro -e bash -c 'tr -d "\n" < ~/.mem0/api-key | wc -c')
+        if ($keyLen.Trim() -ne [string]$apiKey.Length) { throw "~/.mem0/api-key in WSL does not match -ApiKeyFile after writing it." }
+        $apiKey = $null
+        Write-Host "Authority API key installed to ~/.mem0/api-key in $Distro (mode 600)."
+    }
     # wslpath needs forward slashes (backslashes are stripped by the wsl.exe arg pass);
     # fall back to manual /mnt/<drive>/... computation.
     $rrFwd = $RepoRoot -replace '\\', '/'
@@ -141,13 +181,21 @@ try {
     }
 
     Write-Phase "[2/4] Windows config (hooks, Task Scheduler, MCP registrations, CLAUDE.md patch)"
-    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro -Role $Role -AuthorityUrl $AuthorityUrl -AuthoritySsh $AuthoritySsh
+    # These four reach phase 2 only when given; omitted, phase 2 inherits what the box recorded.
+    $phase2Extra = @{}
+    foreach ($fwd in 'HubHost', 'BinaryPath', 'BinarySums', 'ReleaseRepo') {
+        if ($PSBoundParameters.ContainsKey($fwd)) { $phase2Extra[$fwd] = Get-Variable -Name $fwd -ValueOnly }
+    }
+    & "$RepoRoot\install\2-windows-config.ps1" -WslUser $wslUser -Distro $Distro -Role $Role -AuthorityUrl $AuthorityUrl -AuthoritySsh $AuthoritySsh @phase2Extra
     if ($LASTEXITCODE -ne 0) { throw "Windows config failed." }
 
     Write-Phase "[3/4] Verify (end-to-end smoke test)"
     & "$RepoRoot\install\3-verify.ps1" -WslUser $wslUser -Distro $Distro
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "Verify reported issues - check output above. Stack may still be partially functional." -ForegroundColor Yellow
+        Write-Phase "INSTALL INCOMPLETE"
+        Write-Host "The install ran, but verify failed. The failed checks are listed under 'VERIFY FAILED' above, each with its fix." -ForegroundColor Red
+        Write-Host "Fix them and re-run .\install.ps1: finished steps are skipped and the recorded role and flags are kept." -ForegroundColor Red
+        exit 1
     }
 
     Write-Phase "DONE"

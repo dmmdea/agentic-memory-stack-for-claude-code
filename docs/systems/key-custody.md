@@ -33,7 +33,7 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 | mem0 API key | `~/.mem0/api-key`; native authority: `<secrets-dir>/ams-api-key.cred` (systemd credential), exposed to a unit as the file named by `MEM0_API_KEY_FILE` | re-issuable, but everything is wired to it |
 | **service key** (`ams-service-key`, 1.32.5) | native authority: `<secrets-dir>/ams-service-key.cred` (systemd credential); WSL authority: `~/.mem0/service-key` (mode 600) | **regenerable, authority-only** — never on a replica or a PC; restore = regenerate |
 | authority URL | `~/.mem0/authority-url` | config, trivially rebuilt |
-| NVIDIA API key | `~/.claude.json` (`local-offload` env, plaintext) | re-issuable from the vendor |
+| optional vendor API key (`NVIDIA_API_KEY`) | `~/.claude.json` (an MCP server's `env`, plaintext); `key-backup.sh` extracts it when present | re-issuable from the vendor |
 | GitHub tokens | OS keyring | re-issuable — `gh auth login` |
 | Codex / ChatGPT OAuth | `~/.codex/auth.json` | re-issuable — re-authenticate |
 
@@ -110,7 +110,7 @@ Treating the blob as the second copy is the trap this doc exists to prevent.
 
 Collects the irreplaceable and awkward-to-replace material, writes a `sha256` manifest, and
 publishes to **two destinations** — a local volume off the source disk, and an offsite
-(Drive-synced) folder that survives the machine entirely. It then **re-reads both copies and
+(cloud-synced or remote) folder that survives the machine entirely. It then **re-reads both copies and
 verifies them against the manifest**, and **fails with a non-zero exit if fewer than two
 destinations verify**. One copy is not durability, so the script refuses to call it success.
 
@@ -120,7 +120,7 @@ second one: a copy anywhere but the authority defeats what the key is for.
 
 ```bash
 # from the Windows-side shell, which is the only runtime that sees both destinations
-MEM0_DIR="//wsl.localhost/<distro>/home/<user>/.mem0" bash scripts/wsl/key-backup.sh
+MEM0_DIR="//wsl.localhost/<distro>/home/<user>/.mem0" KEY_BACKUP_LOCAL=<dir> KEY_BACKUP_OFFSITE=<dir> bash scripts/wsl/key-backup.sh
 ```
 
 Two environment traps are handled in code, because both were hit while building it: the
@@ -131,8 +131,9 @@ its interpreter by executing it rather than trusting `command -v`.
 | env var | purpose |
 |---|---|
 | `MEM0_DIR` | source key directory (use the WSL share when running from Windows) |
-| `KEY_BACKUP_LOCAL` | local destination, default `/v/mem0-backups/keys` |
-| `KEY_BACKUP_OFFSITE` | offsite destination, default the Drive keys folder |
+| `KEY_BACKUP_LOCAL` | local destination on a different disk from `~/.mem0`; required, no default (the script exits 64 naming both variables when either is unset) |
+| `KEY_BACKUP_OFFSITE` | offsite destination that survives the machine (a synced cloud folder, a mounted remote share); required, no default |
+| `OFFSITE_WIN_DEST` | optional: the Windows-side path of the offsite folder, for a volume that is not mounted inside WSL; no default |
 
 ## Restore
 

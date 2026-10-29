@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The mem0-server is a FastAPI wrapper (`mem0-server/app.py`) around mem0 2.0.4, running on `127.0.0.1:18791` (loopback-only, never `0.0.0.0`). It owns all memory reads and writes. The MCP shim (`scripts/wsl/mem0-mcp-shim.py`) translates stdio MCP calls to HTTP against this server; Claude Code sees only the MCP tools and never calls the REST API directly.
+The mem0-server is a FastAPI wrapper (`mem0-server/app.py`) around mem0 2.0.4, running on `:18791`: the authority binds its tailnet address, a dormant replica's copy binds loopback (`127.0.0.1`), and neither ever binds `0.0.0.0`. It owns all memory reads and writes. The MCP shim (`scripts/wsl/mem0-mcp-shim.py`) translates stdio MCP calls to HTTP against this server; Claude Code sees only the MCP tools and never calls the REST API directly.
 
 ## Questions this doc answers
 
@@ -65,7 +65,7 @@ The end-to-end capture and retrieval paths that drive this API are documented as
 
 ## Data and state
 
-- **Vector store:** Qdrant collection `mem0_egemma_768` (768-dim EmbeddingGemma vectors) on `:6333`; tier and metadata live in each point's payload.
+- **Vector store:** Qdrant collection of the active embedding profile (`mem0_eg2_768` by default; `mem0_egemma_768` on the legacy 300m profile; `/health/deep` reports it as `collection`), 768-dim EmbeddingGemma vectors on `:6333`; tier and metadata live in each point's payload.
 - **History:** mem0's `~/.mem0/history.db` (SQLite).
 - **Tier ledger:** append-only `~/.mem0/tier-ledger-YYYY-MM.jsonl` (monthly segments; the legacy `tier-ledger.jsonl` is a frozen archive) — every tier change, metadata merge, and decay-delete lands here.
 - **API key:** `~/.mem0/api-key` (mode 600). **Canonical HMAC key:** resolved via the DPAPI provider (see [`dpapi-canonical-key.md`](./dpapi-canonical-key.md)). **Service key** (1.32.5): the systemd credential `ams-service-key` on the native authority, `~/.mem0/service-key` (mode 600) on a WSL authority, absent everywhere else; it is read by the same provider class as the canonical key (`service_key_provider()`), under its own file names, so neither key can fall back to the other's file. Nothing to back up: the installer regenerates it.
@@ -77,7 +77,7 @@ The end-to-end capture and retrieval paths that drive this API are documented as
 Shallow liveness probe. Returns within ~50ms.
 
 ```
-Response 200: {"ok": true, "version": "2.0.4-v012", "stack": "<stack semver>", "store": "qdrant", "embedder": "embeddinggemma-300m"}
+Response 200: {"ok": true, "version": "2.0.4-v012", "stack": "<stack semver>", "store": "qdrant", "embedder": "embeddinggemma-2", "embed_profile": "egemma2"}
 # NOTE: "version" is deliberately PINNED to the historical "2.0.4-v012" (dashboards pattern-match it);
 # the release version of the stack is the separate "stack" key.
 ```
@@ -321,8 +321,8 @@ The shim (`scripts/wsl/mem0-mcp-shim.py`) exposes these tools to Claude Code:
 
 ## Dependencies
 
-- **Qdrant** on `:6333` (collection `mem0_egemma_768`, loopback).
-- **llama-swap** on `:11436` — the EmbeddingGemma-300m embedder and the bge-reranker-v2-m3 cross-encoder.
+- **Qdrant** on `:6333` (the active profile's collection, loopback).
+- **llama-swap** on `:11436` — the active profile's embedder (EmbeddingGemma-2 by default) and the bge-reranker-v2-m3 cross-encoder.
 - **mem0** (`mem0ai[nlp]`, floor 2.0.4; see `mem0-server/requirements.txt`) library.
 - **The Codex HTTP shim** on `:18792` — used by the optional NLI write-gate (`codex_shim_client.py`) to judge contradictions against canonical.
 
@@ -332,7 +332,7 @@ Every route change ripples to the MCP shim (`mem0-mcp-shim.py`), the Windows hoo
 
 ## Invariants and assumptions
 
-- The server binds loopback-only (`127.0.0.1`); it is never exposed on `0.0.0.0`.
+- The server binds one address, set by its service unit: the authority's tailnet address, or loopback on a dormant replica. It is never bound to `0.0.0.0`. To serve replicas over a network, bind the `tailscale0` address (`MEM0_BIND` in `~/.mem0/stack.env`), not a wildcard.
 - The tier gates are server-side; a caller cannot self-elevate to `canonical`/`insight` regardless of the metadata it sends.
 - An `actor` or `metadata.source` label is never a credential: the labels of the server's own jobs count only on a request that carries `X-AMS-Service-Key`, and a server without the key (every replica and PC) refuses all of them.
 - A record leaves `canonical` or `insight` only through the operator's signed `demote` token; no job label, and no key the stack's jobs hold, exempts it.

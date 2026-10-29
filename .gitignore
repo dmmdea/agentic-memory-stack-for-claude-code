@@ -60,3 +60,21 @@ claude-config/brands.json
 
 # operator-specific PII leak-guard patterns (see scripts/windows/tests/pii-patterns.local.txt.example)
 scripts/windows/tests/pii-patterns.local.txt
+
+# Keys and install receipts (the stack keeps these under ~/.mem0, outside the repo; this is a safety net)
+canonical-key
+canonical-key.*
+service-key
+stack.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cred
+
+# Build output: release binaries are built by CI from ams-store/, never committed
+dist/
+ams-store/ams-store
+ams-store/ams-store.exe
+*.exe
