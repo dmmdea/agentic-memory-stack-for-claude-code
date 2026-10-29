@@ -1087,9 +1087,8 @@ function Get-UnixEpoch {
 
 function Test-Throttle {
     # Check whether enough time has elapsed since last successful run.
-    # Pure check - does NOT write the state file (audit finding 2026-06-08: the old
-    # combined Test-ThrottleAndMark wrote BEFORE doing any work, so a transient
-    # failure burned the throttle window and silenced the next 10 minutes).
+    # Pure check - does NOT write the state file: a combined check-and-mark would write
+    # BEFORE doing any work, so a transient failure would burn the throttle window.
     # Caller must explicitly Mark-Throttle on success.
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -1112,15 +1111,6 @@ function Mark-Throttle {
     $stateFile = Join-Path $script:StateDir "last-$Name"
     $now = Get-UnixEpoch
     Set-Content -Path $stateFile -Value $now -Encoding UTF8 -NoNewline
-}
-
-function Test-ThrottleAndMark {
-    # DEPRECATED - kept for backward-compat with any out-of-tree callers.
-    # Prefer Test-Throttle + Mark-Throttle so partial failures don't burn the window.
-    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$MinIntervalSeconds)
-    if (-not (Test-Throttle -Name $Name -MinIntervalSeconds $MinIntervalSeconds)) { return $false }
-    Mark-Throttle -Name $Name
-    return $true
 }
 
 function Acquire-CodexLock {

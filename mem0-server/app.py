@@ -1,5 +1,6 @@
-"""mem0 v2.0.4 WSL-native FastAPI wrapper — v0.12 stack
-Loopback only on 127.0.0.1:18791. X-API-Key auth.
+"""FastAPI wrapper around mem0 (the memory server).
+Listens on port 18791: 127.0.0.1 by default; the authority binds its tailnet address via MEM0_BIND.
+X-API-Key auth (the health probes are keyless).
 Exposes same REST surface as official mem0 server (POST/GET/PUT/DELETE /v1/memories, POST /v1/memories/search).
 """
 import os
@@ -1201,7 +1202,9 @@ def health_embedder(warm: Optional[str] = Query(None)) -> dict:
                 continue
             loaded = _embedder_503.listing_loaded(entry)  # flat state OR v256 status.value
             break
-    except Exception:
+    except Exception as e:  # informational probe: an unreadable listing reads as loaded=None
+        log.debug("health_embedder: could not read the llama-swap model listing (%s: %s)",
+                  type(e).__name__, e)
         loaded = None
     t0 = _time.perf_counter()
     r = _httpx.post(f"{_embed_base()}/embeddings",
@@ -1233,7 +1236,9 @@ def health_deep() -> dict:
     # stack. Read from the live Memory instance — fail-soft (None) if unavailable.
     try:
         out["collection"] = mem.vector_store.collection_name
-    except Exception:
+    except Exception as e:
+        log.debug("health_deep: could not read the vector store collection name (%s: %s)",
+                  type(e).__name__, e)
         out["collection"] = None
     # The embedding space this server is bound to: profile, model alias, template version and the
     # collections that space owns. A reader compares it with the store's embed-identity record.
@@ -1875,7 +1880,9 @@ def _search_core(b: SearchIn, _route: str = "search"):
                     r["operational_recency_score"] = base_score * decay
                     r["freshness_weight"] = round(decay, 6)  # R5 observability (retrieval log)
                 except (ValueError, TypeError):
-                    pass
+                    # A created_at that does not parse gets no freshness weight and keeps its score.
+                    log.debug("operational recency: unusable created_at %r on %s; no freshness weight",
+                              created, r.get("id"))
             # Re-sort by operational_recency_score descending (records without it sort last)
             if any("operational_recency_score" in r for r in results["results"]):
                 results["results"].sort(
@@ -2261,7 +2268,8 @@ def diagnose_memory(b: DiagnoseIn, x_api_key: Optional[str] = Header(None)):
                                      age_days, float(_deta if _deta > 0 else 365),
                                      _dk), 6)}
             except (ValueError, TypeError):
-                pass
+                log.debug("explain: unusable created_at %r on %s; no freshness probe",
+                          created, b.target_id)
         # -- verdict: first eating stage, in live pipeline order --
         if dense_rank is None:
             verdict = "dense_retrieval:below_500_horizon"
@@ -4128,8 +4136,11 @@ def delete(
                     )
                     if _lp:
                         _linked_payload = _lp[0].payload if hasattr(_lp[0], "payload") else _lp[0].get("payload")
-                except Exception:
-                    pass
+                except Exception as e:
+                    # _linked_payload stays None: cascade_protected(None) skips the member below, so a
+                    # failed read never deletes it.
+                    log.warning("cascade: could not read chain member %s before the cascade delete (%s: %s)",
+                                _linked_id, type(e).__name__, e)
                 # 1.32.4: any API-key holder can create a superseded_by link (the supersede door), so
                 # the cascade never deletes a protected member through one, nor one it cannot read:
                 # the root's authorisation does not extend to a canonical or insight record.

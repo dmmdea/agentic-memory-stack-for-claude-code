@@ -675,9 +675,9 @@ if ($key -and -not $TmsIsReplica) {
             if ($canonKey) {
                 $ts = [DateTime]::UtcNow.ToString('o') -replace '\+00:00', 'Z'
                 $reason = 'healthcheck-probe'
-                # v0.19 Phase G: promotion signs format-2 (<ts>|<nonce>|promote|<mid>|<reason>)
-                # + X-User-Direct-Nonce — mirrors the I3 DELETE cleanup block below. The
-                # nonce-less format-1 payload is deprecated (server WARNs per use; v0.20 rejects).
+                # Promotion signs format 2 (<ts>|<nonce>|promote|<mid>|<reason>) plus
+                # X-User-Direct-Nonce, like the DELETE cleanup block below. The nonce-less
+                # format 1 was removed in v0.20: the server answers 403 to it.
                 $promoteNonce = [guid]::NewGuid().ToString()
                 $msg = "$ts|$promoteNonce|promote|$probeMid|$reason"
                 $hmacBytes = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($canonKey)).ComputeHash([System.Text.Encoding]::UTF8.GetBytes($msg))

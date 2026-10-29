@@ -35,9 +35,8 @@
 #   Tier promotion (no --action flag) signs action="promote" (v0.19 Phase G).
 #   Server validates via security_invariants.validate_hmac_user_direct().
 #
-# Format 1 (tier promotion, v0.14–v0.18: <ts>|<memory_id>|<reason>, no nonce)
-# is DEPRECATED: the server still accepts it through v0.19 (logging a WARN per
-# use) and rejects it in v0.20. This CLI no longer produces it.
+# Format 1 (the old nonce-less tier promotion: <ts>|<memory_id>|<reason>) was
+# removed in v0.20: the server answers 403 to it. This CLI never produces it.
 #
 # IMPORTANT: the action word is inside the signed payload, so a promote token
 # cannot be replayed as a put/delete/patch_metadata token (and vice versa) —
@@ -242,8 +241,7 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ─── Nonce (v0.17 Phase F.1; v0.19 Phase G: ALL operations) ──────────────────
 # A uuid4 nonce is generated for every operation, including tier promotion
-# (v0.19 Phase G switched promotion to format-2 — the nonce-less format-1
-# payload is deprecated and v0.20 rejects it).
+# (the nonce-less format-1 payload no longer exists; the server rejects it).
 # uuidgen is available in WSL Ubuntu (uuid-runtime package). Fallback: python3 uuid.
 NONCE="$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")"
 

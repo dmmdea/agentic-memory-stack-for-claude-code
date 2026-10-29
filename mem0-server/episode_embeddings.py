@@ -204,17 +204,16 @@ def run_deferred_embed(embedder, upsert, gate: DeferredEmbedGate, episode_id: in
 
 def ensure_episode_collection(client, dims: int = EPISODE_DIMS, collection: str = EPISODE_COLLECTION) -> bool:
     """Idempotently ensure the Cosine-distance episode collection exists.
-    Returns True if it was created, False if it already existed."""
+    Returns True if it was created, False if it already existed. A Qdrant connection or auth
+    error propagates; it is not read as "missing"."""
     from qdrant_client.models import Distance, VectorParams
-    try:
-        client.get_collection(collection)
+    if client.collection_exists(collection):
         return False
-    except Exception:
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=dims, distance=Distance.COSINE),
-        )
-        return True
+    client.create_collection(
+        collection_name=collection,
+        vectors_config=VectorParams(size=dims, distance=Distance.COSINE),
+    )
+    return True
 
 
 def upsert_episode_embedding(client, ep_id: int, vector: list, payload: dict,

@@ -20,11 +20,9 @@ The policy matrix (current_tier × action):
                                            HMAC check, so an actor string must never be enough to hide a
                                            canonical; it leaves default retrieval only through the signed path.
 
-Two signed-payload formats (INTENTIONALLY DISTINCT for backward compat):
-  1. Tier-promotion legacy (v0.14, PATCH /tier path — DEPRECATED in v0.19,
-     removed in v0.20; each accepted use logs a deprecation WARN):
-       <ts>|<memory_id>|<reason>
-     Produced by: pre-v0.19 mem0-canonize.sh <mid> "<reason>"
+One signed-payload format is accepted: format 2 below. Format 1 (v0.14, a nonce-less tier promotion,
+<ts>|<memory_id>|<reason>) was removed in v0.20; the server answers a promotion without
+X-User-Direct-Nonce with 403. The numbering is kept so the names in this file stay stable.
 
   2. Mutation actions (v0.17 Phase A + F.1; nonce REQUIRED since v0.18 MED-7):
        <ts>|<nonce>|<action>|<memory_id>|<reason>
@@ -610,9 +608,8 @@ def validate_hmac_user_direct(
             "(replay detected). Generate a new request with a fresh nonce.",
         )
 
-# v0.20 Phase G: warn_deprecated_format1_tier_promotion (v0.19 Phase G) retired
-# with the format-1 path itself — the 403 body now carries the migration
-# instruction to the caller, and uvicorn access logs record the rejected hits.
+# There is no deprecation WARN for the removed format-1 promotion: the 403 body carries the
+# migration instruction to the caller, and uvicorn access logs record the rejected hits.
 
 
 # ---------- Insight-tier validator ----------
