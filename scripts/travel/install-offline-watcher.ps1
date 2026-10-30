@@ -33,25 +33,40 @@ if (-not $_role -and -not $_auth) {
 # Registers a task, or keeps an equivalent one this user cannot overwrite. A task first registered from
 # an elevated session gives a non-elevated user read access only, so a later re-run's
 # Register-ScheduledTask -Force fails with E_ACCESSDENIED while the task is installed and running. It is
-# kept, with a WARN naming the one elevated step that lets re-runs refresh it, only when it runs exactly
-# this action (and, for the watcher, repeats at this interval) and is not disabled. Anything else still
-# fails loudly.
+# kept, with a WARN naming the one elevated step that lets re-runs refresh it, only when it would behave
+# as the one this script registers: enabled, in the root folder, run as this user at RunLevel Limited,
+# allowed on battery, with exactly this action and (for the watcher) one enabled 2-minute trigger that
+# still has a next run. Anything else still fails loudly. Returns 'registered' or 'kept'.
 function Register-ReplicaTask {
     param([string]$Name, [scriptblock]$Register, $Action, [string]$Interval = '')
     try {
         & $Register
-        return
+        return 'registered'
     } catch {
         $err = $_
     }
-    $t = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    $t = @(Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)
     $denied = "$($err.FullyQualifiedErrorId)" -like 'HRESULT 0x80070005*'
-    $same = $t -and $t.State -ne 'Disabled' -and @($t.Actions).Count -eq 1 -and
-        $t.Actions[0].Execute -eq $Action.Execute -and $t.Actions[0].Arguments -eq $Action.Arguments -and
-        (-not $Interval -or (@($t.Triggers).Count -eq 1 -and $t.Triggers[0].Repetition.Interval -eq $Interval))
-    if ($denied -and $same) {
-        Write-Host "WARN: '$Name' could not be refreshed (access denied: it was registered from an elevated session), but it is installed with this exact action and enabled, so it is kept. To let re-runs refresh it, run once in an elevated PowerShell: Unregister-ScheduledTask -TaskName '$Name' -Confirm:`$false; then re-run the installer without elevation." -ForegroundColor Yellow
-        return
+    $same = $false
+    if ($denied -and $t.Count -eq 1 -and $t[0].TaskPath -eq '\') {
+        $t = $t[0]
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $uid = [string]$t.Principal.UserId
+        $same = $t.State -ne 'Disabled' -and
+            ($uid -ieq $me -or $uid -ieq $env:USERNAME -or $me -ilike "*\$uid") -and
+            "$($t.Principal.RunLevel)" -eq 'Limited' -and
+            -not $t.Settings.DisallowStartIfOnBatteries -and -not $t.Settings.StopIfGoingOnBatteries -and
+            @($t.Actions).Count -eq 1 -and $t.Actions[0].Execute -eq $Action.Execute -and $t.Actions[0].Arguments -eq $Action.Arguments
+        if ($same -and $Interval) {
+            $info = Get-ScheduledTaskInfo -InputObject $t -ErrorAction SilentlyContinue
+            $same = @($t.Triggers).Count -eq 1 -and $t.Triggers[0].Enabled -ne $false -and
+                $t.Triggers[0].Repetition.Interval -eq $Interval -and $info -and $info.NextRunTime
+        }
+    }
+    if ($same) {
+        Write-Host "WARN: '$Name' could not be refreshed (access denied; usually it was first registered from an elevated session), so the installed task is kept: it runs this exact action as $uid at RunLevel Limited, enabled$(if ($Interval) { ', every 2 minutes, next run ' + $info.NextRunTime })." -ForegroundColor Yellow
+        Write-Host "      To let re-runs refresh it, run once in an elevated PowerShell: Unregister-ScheduledTask -TaskName '$Name' -Confirm:`$false; then re-run the installer without elevation." -ForegroundColor Yellow
+        return 'kept'
     }
     throw "Failed to register '$Name': $($err.Exception.Message)"
 }
@@ -78,12 +93,14 @@ $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoin
 # Registration must FAIL LOUDLY. It previously ran with the default non-terminating error
 # behaviour and then unconditionally printed a success line, so a rejected task XML looked
 # exactly like a successful install — which is how the box ended up with a hand-made task.
-Register-ReplicaTask -Name 'mem0-offline-watcher' -Action $action -Interval 'PT2M' -Register {
+$outcome = Register-ReplicaTask -Name 'mem0-offline-watcher' -Action $action -Interval 'PT2M' -Register {
     Register-ScheduledTask -TaskName 'mem0-offline-watcher' -Action $action -Trigger $trigger -Settings $set -Force -RunLevel Limited -ErrorAction Stop | Out-Null
 }
-$check = Get-ScheduledTask -TaskName 'mem0-offline-watcher' -ErrorAction SilentlyContinue
-if (-not $check) { throw "Register-ScheduledTask reported success but 'mem0-offline-watcher' does not exist." }
-Write-Host "Scheduled task 'mem0-offline-watcher' in place (every 2 min, windowless)."
+if ($outcome -eq 'registered') {
+    $check = Get-ScheduledTask -TaskName 'mem0-offline-watcher' -ErrorAction SilentlyContinue
+    if (-not $check) { throw "Register-ScheduledTask reported success but 'mem0-offline-watcher' does not exist." }
+    Write-Host "Registered scheduled task 'mem0-offline-watcher' (every 2 min, windowless)."
+}
 
 # 1.35.2: the snapshot-cache refresh, started by the watcher when one is due (travel-mode.ps1 refresh).
 # No trigger of its own: the watcher decides when (Test-CacheRefreshDue) and starts it with
@@ -92,11 +109,13 @@ Write-Host "Scheduled task 'mem0-offline-watcher' in place (every 2 min, windowl
 $tm = Join-Path $PSScriptRoot 'travel-mode.ps1'
 $rAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "//nologo `"$hiddenVbs`" pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$tm`" refresh"
 $rSet    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-Register-ReplicaTask -Name 'mem0-replica-cache-refresh' -Action $rAction -Register {
+$outcome = Register-ReplicaTask -Name 'mem0-replica-cache-refresh' -Action $rAction -Register {
     Register-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -Action $rAction -Settings $rSet -Force -RunLevel Limited `
         -Description 'Copies the authority''s newest nightly memory snapshot from pCloud into the local takeover cache. Started by mem0-offline-watcher when a refresh is due.' -ErrorAction Stop | Out-Null
 }
-if (-not (Get-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction SilentlyContinue)) {
-    throw "Register-ScheduledTask reported success but 'mem0-replica-cache-refresh' does not exist."
+if ($outcome -eq 'registered') {
+    if (-not (Get-ScheduledTask -TaskName 'mem0-replica-cache-refresh' -ErrorAction SilentlyContinue)) {
+        throw "Register-ScheduledTask reported success but 'mem0-replica-cache-refresh' does not exist."
+    }
+    Write-Host "Registered scheduled task 'mem0-replica-cache-refresh' (on demand, started by the watcher when a refresh is due)."
 }
-Write-Host "Scheduled task 'mem0-replica-cache-refresh' in place (on demand, started by the watcher when a refresh is due)."

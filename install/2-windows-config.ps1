@@ -1471,7 +1471,12 @@ if ($Role -ne 'brain') {
     # A box promoted from replica to brain keeps the tasks it had, so remove them.
     foreach ($t in @('mem0-offline-watcher', 'mem0-replica-cache-refresh')) {
         if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $t -Confirm:$false
+            try {
+                Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction Stop
+            } catch {
+                # Registered from an elevated session, it is read-only to this user (access denied).
+                throw "could not remove the replica-only task '$t' from this brain ($($_.Exception.Message)). Run once in an elevated PowerShell: Unregister-ScheduledTask -TaskName '$t' -Confirm:`$false; then re-run the installer."
+            }
             Write-Host "    removed replica-only task from the brain: $t" -ForegroundColor Yellow
         }
     }
