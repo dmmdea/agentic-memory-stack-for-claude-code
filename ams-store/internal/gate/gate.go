@@ -125,11 +125,12 @@ func Run(ctx context.Context, opt Options, stdin io.Reader) (code int) {
 		_ = recover()
 		code = 0
 	}()
-	run(ctx, opt, stdin)
+	evaluate(ctx, opt, stdin)
 	return 0
 }
 
-func run(ctx context.Context, opt Options, stdin io.Reader) {
+// evaluate holds the gate logic; Run wraps it so no failure can change the exit code.
+func evaluate(ctx context.Context, opt Options, stdin io.Reader) {
 	out := opt.Stdout
 	if out == nil {
 		out = io.Discard

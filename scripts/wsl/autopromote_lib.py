@@ -93,15 +93,13 @@ def is_imperative_or_task(text: str) -> bool:
     # Leading verb-imperative (heuristic, case-sensitive, sentence start)
     if _RE_LEADING_VERB.search(text):
         return True
-    # WG-01: PATCH /tier refuses canonical text the server's promote-canary reads as a standing order (HTTP 422):
+    # PATCH /tier refuses (HTTP 422) canonical text the server's promote-canary reads as a standing order:
     # per sentence, case-insensitive, `Do not` / `Always` / `Never` / `Shall` / `RULE:` at ANY sentence start,
     # `you must` anywhere. The three heuristics above look only at the start of the whole text and are
-    # case-sensitive, so a nominee with ". Do not audit them" in its second sentence cleared this filter, spent a
-    # Codex gate call and was refused by the server (2026-10-07). Applying the same predicate here
-    # keeps a text the server will refuse from ever being nominated, gated or retried.
-    if _canary.is_imperative_canonical(text):
-        return True
-    return False
+    # case-sensitive, so a nominee with ". Do not audit them" in its second sentence would pass them, spend a
+    # Codex gate call and be refused by the server. Applying the same predicate here keeps a text the server
+    # will refuse from ever being nominated, gated or retried.
+    return _canary.is_imperative_canonical(text)
 
 
 # ── 4C promotion gate: contradiction + source-weighted corroboration ──────────

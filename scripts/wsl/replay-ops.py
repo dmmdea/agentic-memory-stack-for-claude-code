@@ -292,9 +292,12 @@ def replay(outbox: Path, authority: str, key: str) -> dict:
         tmp.unlink()
     done_keys = set()
     if ledger.exists():
+        bad = 0
         for ln in ledger.read_text(encoding="utf-8").splitlines():
             try: done_keys.add(json.loads(ln)["key"])
-            except Exception: pass
+            except (ValueError, KeyError, TypeError): bad += 1   # torn or foreign line: not a done key
+        if bad:
+            print(f"replay-ops: skipped {bad} unreadable ledger line(s) in {ledger}", file=sys.stderr)
     recs = []
     for ln in replaying.read_text(encoding="utf-8").splitlines():
         if ln.strip():

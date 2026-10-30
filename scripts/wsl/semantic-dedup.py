@@ -193,12 +193,13 @@ def _acquire_dedup_lock() -> int | None:
         return None
 
 def _release_dedup_lock(fd: int):
+    """Best-effort release: an OSError is reported on stderr, never raised (the run is over)."""
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-        try: DEDUP_LOCK.unlink(missing_ok=True)
-        except: pass
-    except: pass
+        DEDUP_LOCK.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"semantic-dedup: lock release failed ({DEDUP_LOCK}): {e}", file=sys.stderr)
 
 def scroll_all_with_vectors():
     """Every point with its payload and DENSE vector as a float32 array.

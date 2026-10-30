@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -58,7 +59,7 @@ func (d deriveLock) TryAcquire(reason string) (func(), bool, error) {
 }
 
 func isHeld(err error) bool {
-	return err == lock.ErrHeld || strings.Contains(err.Error(), lock.ErrHeld.Error())
+	return errors.Is(err, lock.ErrHeld)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +372,8 @@ func reportToResult(rep *merge.Report) amsync.MergeResult {
 	for _, e := range rep.Deferred {
 		// The op is carried, never assumed. A withheld deletion reported as a
 		// "replace" is the one line in the receipt an operator would misread.
+		// The merge engine writes QueuedAt itself as RFC3339; a stamp that does not parse
+		// leaves the zero time in the receipt rather than failing the merge result.
 		queuedAt, _ := time.Parse(time.RFC3339, e.QueuedAt)
 		out.Deferred = append(out.Deferred, amsync.DeferredEntry{
 			Path: e.Path, Op: string(e.Op), Blob: e.Blob, QueuedAt: queuedAt,

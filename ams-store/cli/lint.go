@@ -147,7 +147,8 @@ func markThrottle(path string, now time.Time) {
 	}
 	// The CONTENT is the stamp a human reads; the mtime is the stamp the check reads.
 	// Writing both means a stamp whose mtime was clobbered by a backup restore is still
-	// explicable.
+	// explicable. Both writes are best-effort: a throttle stamp that cannot be written
+	// only means the next scan runs again.
 	_ = os.WriteFile(path, []byte(now.UTC().Format(time.RFC3339)+"\n"), 0o644)
 	_ = os.Chtimes(path, now, now)
 }

@@ -92,9 +92,7 @@ def abandon_exempt(row: dict) -> bool:
     everything extraction-minted always carried a session id)."""
     if (row.get("created_by") or "") == "manual":
         return True
-    if row.get("first_seen_session_id") is None and row.get("created_by") is None:
-        return True
-    return False
+    return row.get("first_seen_session_id") is None and row.get("created_by") is None
 
 
 def abandon_goal(conn, goal_id: int, reason: str, commit: bool = True) -> bool:

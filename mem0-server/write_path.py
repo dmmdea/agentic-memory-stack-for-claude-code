@@ -289,9 +289,10 @@ async def _record_response(request: Any, response: Any) -> None:
                 reason = await _reason_of(response)
             except Exception:
                 _log_failure("could not read the failure reason; recording it as upstream")
-        _note(status, reason)
-    except Exception:
+    except Exception:            # the status or the neutral flag was unreadable: record nothing
         _log_failure("could not record a write outcome")
+        return
+    _note(status, reason)        # guards itself: the tracker never raises into the request
 
 
 async def middleware(request: Any, call_next: Any) -> Any:

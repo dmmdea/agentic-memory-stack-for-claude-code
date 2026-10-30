@@ -231,6 +231,14 @@ def _connect() -> sqlite3.Connection:
     return _connect_to(EPISODIC_DB_PATH)
 
 
+def _lastrowid(cur: sqlite3.Cursor) -> int:
+    """The row id of the INSERT *cur* just ran. sqlite3 types it ``int | None``; it is None only for a
+    cursor that never inserted, which is a bug in the caller."""
+    if cur.lastrowid is None:
+        raise RuntimeError("INSERT produced no lastrowid")
+    return cur.lastrowid
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -447,7 +455,7 @@ def add_episode(
     )
     if commit:
         conn.commit()
-    return cur.lastrowid  # type: ignore[return-value]
+    return _lastrowid(cur)
 
 
 def add_link(
@@ -472,7 +480,7 @@ def add_link(
     )
     if commit:
         conn.commit()
-    return cur.lastrowid  # type: ignore[return-value]
+    return _lastrowid(cur)
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +642,7 @@ def upsert_in_progress_episode(
             """,
             (session_id, now, now, summary),
         )
-        episode_id = cur.lastrowid
+        episode_id = _lastrowid(cur)
         # Track first prompt on session
         conn.execute(
             "UPDATE sessions SET message_count = COALESCE(message_count, 0) + 1 WHERE session_id = ?",
@@ -644,7 +652,7 @@ def upsert_in_progress_episode(
 
     if commit:
         conn.commit()
-    return episode_id, action  # type: ignore[return-value]
+    return episode_id, action
 
 
 def finalize_episode(
@@ -744,7 +752,7 @@ def finalize_episode(
                 """,
                 (session_id, ended_at, ended_at, goal_text, summary_text),
             )
-            episode_id = cur.lastrowid
+            episode_id = _lastrowid(cur)
             if message_count:
                 conn.execute(
                     "UPDATE sessions SET message_count = ? WHERE session_id = ?",
@@ -753,7 +761,7 @@ def finalize_episode(
 
     if commit:
         conn.commit()
-    return episode_id  # type: ignore[return-value]
+    return episode_id
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +872,7 @@ def create_goal(
     )
     if commit:
         conn.commit()
-    return cur.lastrowid  # type: ignore[return-value]
+    return _lastrowid(cur)
 
 
 def get_goal(
@@ -1146,10 +1154,10 @@ def link_episode_to_goal(
             (episode_id, link_type, str(goal_id)),
         ).fetchone()[0]
     else:
-        link_id = cur.lastrowid
+        link_id = _lastrowid(cur)
     if commit:
         conn.commit()
-    return link_id  # type: ignore[return-value]
+    return link_id
 
 
 def retarget_goal_links(conn: sqlite3.Connection, source_goal_id: int, target_goal_id: int) -> tuple[int, int]:
@@ -1390,7 +1398,7 @@ def create_open_question(
     )
     if commit:
         conn.commit()
-    return cur.lastrowid  # type: ignore[return-value]
+    return _lastrowid(cur)
 
 
 def get_open_question(
