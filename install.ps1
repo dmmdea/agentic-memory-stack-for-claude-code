@@ -138,12 +138,19 @@ try {
         # Written before the WSL phase, which keeps an api-key file that already exists.
         $apiKey = (Get-Content -LiteralPath $ApiKeyFile -Raw).Trim()
         if (-not $apiKey -or $apiKey -match '\s') { throw "-ApiKeyFile '$ApiKeyFile' must hold the API key alone, on one line." }
-        $apiKey | wsl.exe -d $Distro -e bash -c 'umask 077; mkdir -p ~/.mem0 && tr -d "\r" > ~/.mem0/api-key.new && chmod 600 ~/.mem0/api-key.new && mv -f ~/.mem0/api-key.new ~/.mem0/api-key'
-        if ($LASTEXITCODE -ne 0) { throw "Could not write ~/.mem0/api-key in WSL distro $Distro." }
-        $keyLen = [string](wsl.exe -d $Distro -e bash -c 'tr -d "\n" < ~/.mem0/api-key | wc -c')
-        if ($keyLen.Trim() -ne [string]$apiKey.Length) { throw "~/.mem0/api-key in WSL does not match -ApiKeyFile after writing it." }
+        # Staged as api-key.new and checked there; the key in place is kept as api-key.prev-<epoch> and replaced
+        # only once the staged copy matches, so a bad file never costs the working key.
+        $apiKey | wsl.exe -d $Distro -e bash -c 'umask 077; mkdir -p ~/.mem0 && tr -d "\r" > ~/.mem0/api-key.new && chmod 600 ~/.mem0/api-key.new'
+        if ($LASTEXITCODE -ne 0) { throw "Could not write ~/.mem0/api-key.new in WSL distro $Distro." }
+        $keyLen = [string](wsl.exe -d $Distro -e bash -c 'tr -d "\n" < ~/.mem0/api-key.new | wc -c')
+        if ($keyLen.Trim() -ne [string]$apiKey.Length) {
+            wsl.exe -d $Distro -e bash -c 'rm -f ~/.mem0/api-key.new' | Out-Null
+            throw "The key staged in WSL does not match -ApiKeyFile; ~/.mem0/api-key is unchanged."
+        }
+        wsl.exe -d $Distro -e bash -c 'if [ -f ~/.mem0/api-key ] && ! cmp -s ~/.mem0/api-key ~/.mem0/api-key.new; then cp -p ~/.mem0/api-key ~/.mem0/api-key.prev-$(date +%s); fi; mv -f ~/.mem0/api-key.new ~/.mem0/api-key'
+        if ($LASTEXITCODE -ne 0) { throw "Could not move the staged key into ~/.mem0/api-key in WSL distro $Distro." }
         $apiKey = $null
-        Write-Host "Authority API key installed to ~/.mem0/api-key in $Distro (mode 600)."
+        Write-Host "Authority API key installed to ~/.mem0/api-key in $Distro (mode 600; a different previous key is kept as api-key.prev-<epoch>)."
     }
     # wslpath needs forward slashes (backslashes are stripped by the wsl.exe arg pass);
     # fall back to manual /mnt/<drive>/... computation.

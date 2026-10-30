@@ -140,10 +140,11 @@ say "[0] prerequisites"
 case "$BIND_IP" in 0.0.0.0|127.*) fail "--bind-ip '$BIND_IP' is a wildcard/loopback bind; the authority binds the tailscale0 address only" ;; esac
 [ -n "$SECRETS_DIR" ] || fail "--secrets-dir <dir> is required: a private directory (mkdir -m 700 <dir>) that holds ams-api-key.cred and ams-canonical-key.cred, encrypted with systemd-creds"
 for c in ams-api-key.cred ams-canonical-key.cred; do
-    [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c. Make the key, keep a plaintext copy off this box (the canonical key cannot be regenerated; every replica and client needs the API key), then encrypt it (needs systemd >= 256 and a TPM2):
-    (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ${c%.cred}.txt)
-    systemd-creds --user encrypt --with-key=host+tpm2 --name=${c%.cred} ${c%.cred}.txt $SECRETS_DIR/$c
-    shred -u ${c%.cred}.txt   # only after the off-box copy exists"
+    [ -s "$SECRETS_DIR/$c" ] || fail "missing $SECRETS_DIR/$c. Make the key in memory-backed scratch (never in this checkout), keep a plaintext copy off this box (the canonical key cannot be regenerated; every replica and client needs the API key), then encrypt it (needs systemd >= 256 and a TPM2):
+    d=\$(mktemp -d -p \"\${XDG_RUNTIME_DIR:-/dev/shm}\")
+    (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > \$d/${c%.cred}.txt)
+    systemd-creds --user encrypt --with-key=host+tpm2 --name=${c%.cred} \$d/${c%.cred}.txt $SECRETS_DIR/$c
+    rm -r \$d   # only after the off-box copy exists"
 done
 # v1.23.1: the tenant INHERITS on a re-run (same rule as the Windows installer's AuthorityUrl /
 # EvalRootWsl): an omitted --user-id takes the tenant already in ~/.mem0/stack.env, and only a
@@ -373,9 +374,12 @@ fi
 if [ "$DRY_RUN" = 0 ]; then
     for t in python3 curl jq systemctl ip systemd-creds; do command -v "$t" >/dev/null || fail "$t is required (Debian/Ubuntu: sudo apt install -y python3 curl jq iproute2 systemd)"; done
     # A symlink into a data volume passes silently. A plain directory, or none yet, is allowed: the install
-    # creates what it needs, and the data then lives on the root disk.
+    # creates what it needs, and the data then lives on the root disk. Not with a ZFS dataset configured:
+    # there a missing symlink means the volume is not mounted, and going on would start an empty store on
+    # the root disk that diverges from the real one.
     for p in "$HOME/apps/mem0-server" "$HOME/apps/mem0-scripts" "$HOME/qdrant-server" "$HOME/.mem0"; do
         [ -L "$p" ] && continue
+        [ -z "$ZFS_DATASET" ] || fail "$p is not a symlink into the data volume, but --zfs-dataset $ZFS_DATASET is configured: is the volume mounted? Restore the symlink (ln -s <volume>/$(basename "$p") $p) and re-run"
         if [ -e "$p" ] && [ ! -d "$p" ]; then fail "$p exists and is not a directory; move it away and re-run"; fi
         if [ ! -e "$p" ]; then
             echo "    WARN: $p does not exist; the install creates it as a plain directory, so its data lives on the root disk. To use a separate volume, make the symlink first: ln -s <volume>/$(basename "$p") $p"

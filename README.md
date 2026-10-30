@@ -104,7 +104,7 @@ No flags: the first install takes the role `brain` (this PC is its own authority
 **1. On the authority**, once, as the service user. Make the two key credentials. Write the plaintext to a scratch directory, encrypt, and keep the plaintext of both keys somewhere safe **off this box** (every PC needs the API key; the canonical key cannot be regenerated, because canonical records are signed with it):
 
 ```bash
-mkdir -m 700 -p <secrets-dir> && cd "$(mktemp -d)"
+mkdir -m 700 -p <secrets-dir> && cd "$(mktemp -d -p "${XDG_RUNTIME_DIR:-/dev/shm}")"   # memory-backed scratch: never write the keys into the checkout
 umask 077
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ams-api-key.txt
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ams-canonical-key.txt

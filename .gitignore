@@ -72,6 +72,7 @@ stack.env
 *.pem
 *.key
 *.cred
+ams-*-key.txt
 
 # Build output: release binaries are built by CI from ams-store/, never committed
 dist/
