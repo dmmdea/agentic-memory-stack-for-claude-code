@@ -27,7 +27,7 @@ Retrieval fires through four channels, each with its own trigger:
 
 ### Embedding: the prefix shim
 
-EmbeddingGemma-300m (llama-swap, GPU, 768-d) is **asymmetric**: queries and documents must be embedded with different task prefixes (`task: search result | query: …` vs `title: none | text: …`). Neither llama.cpp nor stock mem0 applies them — `egemma_embedder.py` is the shim, installed onto the mem0 embedding model at server start. This detail is load-bearing: an earlier EmbeddingGemma trial was *wrongly rejected* as worse-on-domain because the test predated the shim; with correct prefixes it beats the English-only predecessor decisively on the EN+ES corpus (ES recall@1 0.33 → 0.93; English at parity).
+The embedder (EmbeddingGemma-2 by default, EmbeddingGemma-300m on the legacy profile; llama-swap, GPU, 768-d) is **asymmetric**: queries and documents must be embedded with different task prefixes (`task: search result | query: …` vs `title: none | text: …`). Neither llama.cpp nor stock mem0 applies them — `egemma_embedder.py` is the shim, installed onto the mem0 embedding model at server start. This detail is load-bearing: an earlier EmbeddingGemma trial was *wrongly rejected* as worse-on-domain because the test predated the shim; with correct prefixes it beats the English-only predecessor decisively on the EN+ES corpus (ES recall@1 0.33 → 0.93; English at parity).
 
 ### Hybrid scoring — and the trap every maintainer must know
 
@@ -41,7 +41,7 @@ The subtlety that has caused real miscalibration:
 
 Calibrate thresholds against the *semantic* scale (binary-search the highest threshold at which a query still returns, or read `cosine`), never against the returned score. A first calibration pass measured the returned score, chose 0.50, and the live bundle abstained on *everything* — a relevant prompt whose combined score was 0.71 had semantic ≈ 0.42.
 
-**The calibration record** (eval harness, private repo): on EmbeddingGemma's compressed cosine scale, off-domain prompts top out ≈ 0.12; genuinely relevant ones run 0.25–0.57 (median ≈ 0.33). The production gate is **0.30**: it rejects everything clearly-irrelevant with margin, while 0.35 was measured to crater recall to ≈ 0.47 and 0.50 to zero. That is why the gate must not be "tightened" as a precision lever — precision comes from admission, tiers, and abstention downstream.
+**The calibration record** (measured with an external eval harness on the legacy EmbeddingGemma-300m): on its compressed cosine scale, off-domain prompts top out ≈ 0.12; genuinely relevant ones run 0.25–0.57 (median ≈ 0.33). The gate is the active profile's calibration: **0.70** on the default EmbeddingGemma-2, **0.30** on the legacy 300m profile. On the 300m scale the 0.30 gate rejects everything clearly-irrelevant with margin, while 0.35 was measured to crater recall to ≈ 0.47 and 0.50 to zero. That is why the gate must not be "tightened" as a precision lever — precision comes from admission, tiers, and abstention downstream.
 
 **Reranking** (bge cross-encoder, `reranker.py`) re-orders candidates at a measured 2–7 s (a cold load after the five-minute unload adds to that; one budget-bounded retry (12 s at the shipped values) absorbs it before search falls back to dense order, see [`reranker.md`](../systems/reranker.md)) — worth it only where latency doesn't matter: auto-on for deliberate `memory_search` at `limit ≥ 5`, overridable per call, **never** on the per-prompt bundle. Measured: it changes the top-2 on ~92 % of rerankable probes and improves blind-judged relevance — the win is real, just not affordable on the hot path.
 
@@ -91,7 +91,7 @@ sequenceDiagram
     H->>M: POST /v1/context/bundle (one round-trip)
     M->>E: embed query (task-prefixed)
     M->>Q: dense + BM25 + entity candidates
-    M->>M: semantic gate 0.30 → admission gate → K cap → insight filter
+    M->>M: semantic gate (profile: 0.70) → admission gate → K cap → insight filter
     M-->>H: memories only, goal and OQ caps are 0 (or empty)
     H->>H: client admission (tier/brand/cap/truncate) → R6 placement
     H-->>U: [MEMORY CONTEXT] block above the prompt — or nothing (abstain)
@@ -121,7 +121,7 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 
 ## External dependencies
 
-- **llama-swap on `:11436`** — EmbeddingGemma-300m (embeddings) and bge-reranker-v2-m3 (deliberate-path rerank).
+- **llama-swap on `:11436`** — the profile's embedder (EmbeddingGemma-2 by default) and bge-reranker-v2-m3 (deliberate-path rerank).
 - **mem0 server on `:18791`** — the bundle / recall / search endpoints and all gating.
 - **Qdrant** — the dense / keyword / entity candidate store the search legs query.
 - **fastembed** (in the server venv) — the BM25 sparse encoder; explicit in the installer with a loadability post-condition, and watched by the GATING `sparse_leg` health check (mem0 silently degrades to dense-only without it).
@@ -130,7 +130,7 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 
 - **Calibrate on the semantic scale, never the returned `score`** — the trap above; the gate applies to the raw semantic cosine (a result's `cosine`), and `score` is the rank-fusion score.
 - **Abstention-first** — no memory clears the gate → no block renders; goals/questions alone never inject.
-- **The 0.30 gate is an admission floor, not a precision lever** — precision comes from admission, tiers, and abstention, not from tightening the gate.
+- **The relevance gate is an admission floor, not a precision lever** — precision comes from admission, tiers, and abstention, not from tightening the gate.
 - **Rerank never runs on the hot path** — only on deliberate `memory_search` at `limit ≥ 5`.
 - **Brand is fail-closed** at server *and* client — an unknown-brand session sees only brand-neutral rows.
 - **Only `stable` + `evidence` echo through the per-prompt path** — `canonical` and `insight` never do (insight is filtered server-side; canonical arrives only via `memory_recall`).
@@ -184,6 +184,6 @@ The hook never blocks the prompt: the daemon path has an 8 s internal budget and
 - [`./memory-capture.md`](./memory-capture.md) — the write side that produced what is retrieved here.
 - [`../glossary.md`](../glossary.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
 
-## W5 (AMS-56): the keyword-recall union leg
+## The keyword-recall union leg
 
 mem0's internal hybrid re-scores ONLY candidates from the dense window, so an exact-token target (a port, id, or slug) whose dense rank sits past the window is structurally unreachable no matter how strong its BM25 score. On the DELIBERATE path only (`rerank: true` — the per-prompt bundle and the NLI gate hardcode `rerank: false` and are structurally excluded), the server unions `keyword_search` hits absent from the dense pool into the candidate list BEFORE the retired/intent filters, rerank, and admission, hydrated to the standard result shape with `lexical_only: true` and NO score or cosine key (a BM25 magnitude in either would poison the ordering and the brand-coherence floor, which reads `cosine` and fails open without one). The rerank is FORCED when lexical candidates are present, and the fail-closed rule is binding: a `lexical_only` item either carries a real `rerank_score` or is dropped. The leg stands down at `limit > 50` (latency guardrail) and never breaks dense search (whole-leg try/except). Receipts: `lexical_candidates` / `lexical_added` / `lexical_kept` in the retrieval log, plus the `route` field discriminating search/bundle/nli callers.

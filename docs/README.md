@@ -97,10 +97,10 @@ These live at the `docs/` root because they describe the repository and its runn
 | [`templates/adr.md`](./templates/adr.md) | Starting a new architecture decision record |
 | [`STYLE.md`](./STYLE.md) | The writing rules and the operator-neutral vocabulary every doc must use |
 
-## Development history and the maintainer archive
+## Development history
 
-This repository is the primary source of truth for the product and is edited directly, through pull requests. [`../CHANGELOG.md`](../CHANGELOG.md) is the product's version authority (as of v1.16.2); earlier, pre-inversion history is summarized in its first entries.
+This repository is the primary source of truth for the product and is edited directly, through pull requests. [`../CHANGELOG.md`](../CHANGELOG.md) is the product's version authority; its first entries summarize the history from before this repository became primary.
 
-A separate maintainer archive holds working material that is not part of the shipped product and is not mirrored here: research fit-analyses behind each design, per-release build plans, audit records, the faithfulness and retrieval eval harnesses, dependency-version and upgrade notes, and historical runbooks. Nothing in this index depends on that archive — the docs above are the maintained current-state set.
+Some working material is not part of the shipped product and is not in this repository: research notes behind each design, per-release build plans, audit records, the faithfulness and retrieval eval harnesses, and historical runbooks. Nothing in this index depends on it. The docs above are the maintained current-state set.
 
 > **Docs and code must agree.** Every change that alters behavior, responsibilities, flows, invariants, interfaces, or assumptions updates the affected docs in the same change. If a doc and the code disagree, fix one or flag the mismatch — do not leave it.

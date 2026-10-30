@@ -1,6 +1,6 @@
 [Unit]
 Description=Weekly judged retrieval-pairs sweep (co-retrieval supersession candidates -> human review queue)
-# 2026-08-24 review R2: ORDERING, not a clock offset, is what prevents the two
+# ORDERING, not a clock offset, is what prevents the two
 # Codex-judged units from queueing on the single-threaded shim after a boot
 # catch-up compresses both Persistent timers into one instant. After= makes this
 # unit wait for the discovery sweep whenever both are queued in one transaction.
@@ -8,7 +8,7 @@ After=network-online.target contradiction-sweep.service
 
 [Service]
 Type=oneshot
-# AMS-36 / operator decision 3.5 (2026-08-09): the judged retrieval-pairs mode.
+# The judged retrieval-pairs mode.
 # Judges the SUPERSESSION question (the HIDE decision, evidence-sweep
 # semantics) over pairs that actually co-land in one result set — a candidate
 # source the storage sweeps cannot reach. Verdicts are Codex-judged (same
@@ -17,9 +17,9 @@ Type=oneshot
 # stamped or hidden, and superseded_by is written solely by the operator's
 # --resolve-supersede step. --pairs-max-judged bounds the weekly Codex spend;
 # the pair cache makes repeat pairs free.
-# 2026-08-24 judge-resilience: same ExecStartPre pair as contradiction-sweep.service
-# (AMS-07) — this unit judged via Codex but never spawned the shim, so a Sunday with
-# no recent Claude session found :18792 dark and burned the week. Bounded, fail-soft
+# Same ExecStartPre pair as contradiction-sweep.service: the unit judges via Codex,
+# so it spawns the shim first, or a Sunday with no recent Claude session would find
+# :18792 dark and lose the week. Bounded, fail-soft
 # (the leading '-' keeps a failed spawn from blocking the run; the sweep's own
 # ensure-shim backstop then gets a second chance in-process).
 ExecStartPre=-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\__WIN_USER__\\.claude\\scripts\\codex-shim-spawn.ps1

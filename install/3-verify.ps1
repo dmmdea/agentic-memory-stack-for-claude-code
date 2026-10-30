@@ -414,7 +414,13 @@ Check "mem0 add+search round-trip ($stackRole -> $authorityUrl)" {
             }
         }
         $found -and $deleted
-    } catch { $false }
+    } catch {
+        # A 401 on a replica is the usual cause: ~/.mem0/api-key in WSL is the random key phase 1 generated, not the authority's.
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 401) { Write-Host "(HTTP 401: ~/.mem0/api-key in WSL is not the key the authority accepts; re-run install.ps1 -Role replica -ApiKeyFile <file holding the authority's key>) " -NoNewline -ForegroundColor Yellow }
+        $false
+    }
 } "Round-trip against $authorityUrl failed, or the smoke point it wrote could not be deleted again (a point with user_id verify-test / source install-verify is left in the authority - remove it by id). On the brain: wsl -d $Distro -e bash -c 'journalctl --user -u mem0.service -n 30'. On a replica: is the brain reachable (tailscale status), and does ~/.mem0/authority-url point at it?"
 
 Write-Host ""

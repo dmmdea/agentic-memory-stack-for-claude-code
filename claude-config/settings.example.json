@@ -1,24 +1,82 @@
 {
-  "_comment": "EXAMPLE of the hook + env block install/2-windows-config.ps1 registers into your real ~/.claude/settings.json. NOT deployed verbatim — the installer patches your live file programmatically, merging these entries with any existing hooks. Shown here as a scrubbed reference for manual recovery. Replace <WIN_USER> with your Windows username and <DISTRO> with your WSL distro. NOTE (2026-06-25): the installer resolves and prefers PowerShell 7 (pwsh) as the runner for these PowerShell hooks AND the nightly dream Task Scheduler entry (falling back to powershell.exe only if pwsh is absent) — Windows PowerShell 5.1 silently broke the dream under Task Scheduler (empty $LASTEXITCODE, lost codex token counts, autopromote dying mid-loop). The literal 'powershell.exe' below is illustrative.",
+  "_comment": "Scrubbed reference of the hook + env block install/2-windows-config.ps1 registers into your real ~/.claude/settings.json. NOT deployed verbatim: the installer patches your live file in place and merges these entries with any hooks you already have. Use it to check or rebuild a registration by hand. Replace <WIN_USER> with your Windows user name. Hook commands run through Git Bash, so every path uses forward slashes and is double-quoted; a backslash path is stripped by bash and the hook dies silently. The installer emits `wsl.exe -e bash ...` with no `-d` when your WSL distro is the WSL default; add `-d <DISTRO>` after `wsl.exe` only if it is not. The two ams-store.exe `sync --once` entries (the last SessionStart entry and the whole SessionEnd event) are written only when the installer proved a store hub path; <HUB_HOST> is that hub's host name. Drop them if you run without a store hub. The installer prefers the bare `powershell.exe` launcher for these hooks and pwsh 7 for the nightly dream task.",
   "env": {
     "ENABLE_TOOL_SEARCH": "true"
   },
   "hooks": {
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\stop-extract.ps1" } ] }
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/stop-extract.ps1\"", "type": "command", "timeout": 15, "async": true }
+        ]
+      }
     ],
     "PreCompact": [
-      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\stop-extract.ps1" } ] }
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/stop-extract.ps1\"", "type": "command" }
+        ]
+      },
+      {
+        "hooks": [
+          { "command": "wsl.exe -e bash -lc \"python3 /mnt/c/Users/<WIN_USER>/.claude/scripts/precompact_capture.py || true\"", "type": "command" }
+        ]
+      }
     ],
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "wsl.exe -d <DISTRO> -e bash -lc \"bash /mnt/c/Users/<WIN_USER>/.claude/scripts/storage-cap-check.sh\"" } ] },
-      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\mem0-hook-daemon-spawn.ps1", "async": true, "timeout": 10 } ] },
-      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\codex-shim-spawn.ps1", "async": true, "timeout": 10 } ] },
-      { "hooks": [ { "type": "command", "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\<WIN_USER>\\.claude\\scripts\\sessionstart-capture.ps1", "async": true, "timeout": 15 } ] }
+      {
+        "hooks": [
+          { "command": "wsl.exe -e bash -lc \"bash /mnt/c/Users/<WIN_USER>/.claude/scripts/storage-cap-check.sh\"", "type": "command" }
+        ],
+        "matcher": "startup|clear|compact"
+      },
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/mem0-hook-daemon-spawn.ps1\"", "type": "command", "timeout": 10, "async": true }
+        ]
+      },
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/codex-shim-spawn.ps1\"", "type": "command", "timeout": 10, "async": true }
+        ]
+      },
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/sessionstart-capture.ps1\"", "type": "command", "timeout": 15, "async": true }
+        ]
+      },
+      {
+        "hooks": [
+          { "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/<WIN_USER>/.claude/scripts/memory-maintenance-spawn.ps1\"", "type": "command", "timeout": 10, "async": true }
+        ]
+      },
+      {
+        "hooks": [
+          { "command": "\"C:/Users/<WIN_USER>/.claude/scripts/ams-store.exe\" sync --once --hub-host <HUB_HOST>", "type": "command", "timeout": 90, "async": true }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "command": "\"C:/Users/<WIN_USER>/.claude/scripts/ams-store.exe\" sync --once --hub-host <HUB_HOST>", "type": "command", "timeout": 60 }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "C:\\Users\\<WIN_USER>\\.claude\\scripts\\mem0-hook-client.exe", "timeout": 5 } ] }
+      {
+        "hooks": [
+          { "command": "\"C:/Users/<WIN_USER>/.claude/scripts/mem0-hook-client.exe\"", "type": "command", "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "command": "\"C:/Users/<WIN_USER>/.claude/scripts/ams-store.exe\" gate", "type": "command", "timeout": 10 }
+        ],
+        "matcher": "Write|Edit"
+      }
     ]
-  },
-  "_ams16_note": "The 0.F PreToolUse contradiction check (pre-tool-check.ps1) was RETIRED 2026-08-09 by operator decision — its whole-history warn corpus was ~45 warnings at near-100% false-positive. The installer strips the hook from live settings on re-run; no PreToolUse entry is stack-owned anymore."
+  }
 }

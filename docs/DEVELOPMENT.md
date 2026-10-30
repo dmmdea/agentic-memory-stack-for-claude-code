@@ -1,6 +1,6 @@
 # Development guide — working on the stack itself
 
-How to change this system safely: the repo tour, the test suites, the deploy path, and the conventions that have kept ~90 releases regression-light. Development happens **here**: this repository is the primary source of truth for the product, edited directly through pull requests, and the test suites live here and run in CI. The eval harnesses and the per-release research and build material are not part of the shipped product and live in a separate maintainer archive.
+How to change this system safely: the repo tour, the test suites, the deploy path, and the conventions that have kept ~90 releases regression-light. Development happens **here**: this repository is the primary source of truth for the product, edited directly through pull requests, and the test suites live here and run in CI. The eval harnesses and the per-release research and build material are not part of the shipped product and are not in this repository.
 
 ## Repo tour (where a change goes)
 
@@ -21,9 +21,9 @@ Two invariants to respect when placing code: **all LLM judgment goes to Codex** 
 ## Running the tests
 
 ```bash
-# WSL, from the repo root — the Python suite (server + maintenance scripts; ~580 tests).
-# It runs against the
-# LIVE stack (mem0 + Qdrant + llama-swap must be up) and needs the API env, exactly as
+# WSL, from the repo root — the full Python suite (server + maintenance scripts; thousands of tests).
+# Its live-server files run against the
+# LIVE stack (mem0 + Qdrant + llama-swap must be up) and need the API env, exactly as
 # deploy.sh's own gate invokes it:
 cd mem0-server && MEM0_KEY=$(cat ~/.mem0/api-key) MEM0_URL=http://127.0.0.1:18791 \
   ~/apps/mem0-server/.venv/bin/python -m pytest -q
@@ -54,7 +54,7 @@ The Python suites follow the same rule with a platform trap of their own: `HOME`
 
 ## Deploying a change to the live runtime
 
-**One path** (v1.12, MEM-7 — born from a P0 where a hand-copied module never reached the installer):
+**One path** (a hand-copied module once never reached the installer, so there is a single deploy command):
 
 ```bash
 bash scripts/wsl/deploy.sh [--dry-run]   # from the repo root, on a WSL brain or replica
@@ -76,21 +76,21 @@ bash install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRET
 
 Both values are in `stack.env` (`MEM0_BIND`, `MEM0_SECRETS_DIR`); every other flag is inherited from it on a re-run ([installer-and-deploy.md](./systems/installer-and-deploy.md), *Linux authority, native*). The authority is deployed from a **release tree**: extract the release archive of the tag (or check the tag out) and run the installer from it. The store binary is fetched for the tag `VERSION` names, and a tree without a `.git` stamps `DEPLOYED_SHA` from the stamp it carries, else `unknown` (never an empty file). The installer restarts `mem0.service` on every run and probes `/health` and `/health/deep` itself; `--dry-run` previews first.
 
-## The eval harnesses (private repo)
+## The eval harnesses (not in this repository)
 
-`eval/` holds the measurement layer — run the relevant one before/after touching what it measures:
+The measurement layer is a set of `eval/` harnesses that ship separately from the product. If you have them, run the relevant one before/after touching what it measures:
 
 | Harness | Measures | Cost |
 |---|---|---|
 | `eval/faithfulness/` | does injected memory actually change behavior (causal-intervention, CMI loop) | Codex-judged (spend) |
 | `eval/injection-gating/` | relevance-gate calibration + paraphrase robustness | free |
-| `eval/findability/` | multi-hop + temporal retrieval guard (consumer-exact, deterministic; floors + exit 2 since W5) | free |
+| `eval/findability/` | multi-hop + temporal retrieval guard (consumer-exact, deterministic; floors + exit 2) | free |
 | `eval/promotion-gate/` | 4C gate calibration | Codex-judged |
 | `eval/replay/` | real-query export/replay/compare (Jaccard@10 + top-1 stability; replay-vs-replay primary; needs the MEM0_LOG_FULL_QUERY operator opt-in for data) | free |
 
 (Plus three narrower harnesses: `extractor-specificity/`, `intensification/`, `retrieval-drift/`.)
 
-The free ones are regression guards — re-run them on any retrieval-path change; they exist precisely because "retrieval feels fine" has been wrong before. **Since W5 the honor system has a floor:** `deploy.sh` runs the PUBLIC retrieval-families suite (`mem0-server/tests/test_retrieval_families.py` — paraphrase, dilution, temporal supersession, cross-brand hard-negative with positive control, ES exact-token, keyword-only-tail union rescue) post-restart and ABORTS with a rollback hint on a family breach (`MEM0_SKIP_RETRIEVAL_GATE=1` is the recorded escape hatch). On any reranker/embedder/mem0 bump, additionally run `eval/replay/` export-before/replay-after.
+The free ones are regression guards — re-run them on any retrieval-path change; they exist precisely because "retrieval feels fine" has been wrong before. **The honor system has a floor:** `deploy.sh` runs the PUBLIC retrieval-families suite (`mem0-server/tests/test_retrieval_families.py` — paraphrase, dilution, temporal supersession, cross-brand hard-negative with positive control, ES exact-token, keyword-only-tail union rescue) post-restart and ABORTS with a rollback hint on a family breach (`MEM0_SKIP_RETRIEVAL_GATE=1` is the recorded escape hatch). On any reranker/embedder/mem0 bump, additionally run `eval/replay/` export-before/replay-after.
 
 ## Conventions (the process that ships releases)
 
@@ -99,8 +99,7 @@ The free ones are regression guards — re-run them on any retrieval-path change
 3. **Release ritual:** work happens on a feature branch and lands on `dev` by pull request with CI green; a release then promotes `dev` → `main` by pull request and tags `v<VERSION>`. CI is the set of jobs in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml): the installer import-closure check, the Python and Pester product suites, and the ruff / shellcheck / PSScriptAnalyzer linters. Bump the root `VERSION`, add the matching `CHANGELOG.md` entry, and bring the `.claude-plugin/*.json` manifest versions to the same release together in that change — keeping the three in step is a manual discipline today, not an enforced gate (no CI job checks VERSION / CHANGELOG / manifest parity).
 4. **Docs and code are edited here directly — nothing is generated from an upstream mirror.** Every PR must keep the docs and the code in agreement. The docs gate ([`../scripts/ci/check-docs.py`](../scripts/ci/check-docs.py)) enforces the structural floor: every relative Markdown link must resolve and the prose must stay operator-neutral (placeholder values only — no operator handles, machine names, or local paths).
 5. **Keep the ledgers honest.** New tier mutations/deletions must append to the monthly tier-ledger; new background jobs need a health/summary line (`~/.mem0/*.jsonl`) and should fail *visible* (nonzero exit under systemd), while anything on the prompt hot path fails *open*.
-6. **Update the docs with the change.** `mem0-server/requirements.txt` (floors, held in step with the installer's pip lines by `scripts/tests/test_dependency_floors.py`) is the dependency source of truth; `docs/systems/` deep-dives, `docs/flows/` pipeline walkthroughs, and `ARCHITECTURE.md` describe verified behavior — if your change makes a doc claim false, the same PR fixes the doc. Stale docs here have caused real operator damage (a runbook once instructed starting a decommissioned service).
-7. **Check the private maintainer archive on every release.** The private archive repo tracks this repo as the code home; it holds only the non-shipped material (eval harnesses, research, audit records, build plans, private glue) and no live copy of the product code. On every promotion to `main`, confirm the archive needs no parity update — the product `VERSION`/`CHANGELOG` authority lives here (the archive's are frozen at the inversion point) and the old scrub/mirror pipeline is retired — and if a release changed something the archive references, update it in the same pass. This is a manual discipline; there is no cross-repo gate.
+6. **Update the docs with the change.** `mem0-server/requirements.txt` (floors, held in step with the installer's pip lines by `scripts/tests/test_dependency_floors.py`) is the dependency source of truth; `docs/systems/` deep-dives, `docs/flows/` pipeline walkthroughs, and `ARCHITECTURE.md` describe verified behavior — if your change makes a doc claim false, the same PR fixes the doc. Stale docs here have caused real operator damage (a runbook once instructed starting a decommissioned service).7. **The privacy gate guards the tree.** [`../scripts/ci/privacy-gate.py`](../scripts/ci/privacy-gate.py) fails a PR whose files, file names or commit messages carry a personal or machine-specific identifier. Write placeholders (`<user>`, `<authority-host>`, `192.0.2.10`) in docs, comments and commit messages.
 
 ## Debugging entry points
 

@@ -1,6 +1,6 @@
 # Migrating the stack to a new machine — with your memory intact
 
-The runbook for moving an **existing, populated** stack to a new Windows + WSL2 machine and *continuing* there — as opposed to a fresh install (empty store) or an in-place upgrade (`UPGRADE.md`, private repo). Follow the phases in order; each ends with a verification you should not skip.
+The runbook for moving an **existing, populated** stack to a new Windows + WSL2 machine and *continuing* there — as opposed to a fresh install (empty store) or an in-place upgrade (pull and re-run the installers: the README, "Upgrade"). Follow the phases in order; each ends with a verification you should not skip.
 
 **The mental model:** the *code* is reinstalled fresh (the installer is idempotent and operator-agnostic), the *data* is restored from a backup snapshot, and the *credentials* are re-provisioned — never transported. Three different treatments for three different things.
 
@@ -31,7 +31,7 @@ Transport the backup directory to the new machine by any private means (LAN copy
 
 ## Phase 1 — on the NEW machine: prerequisites + fresh install
 
-1. Satisfy the prerequisites (top-level `README.md` table): WSL2 distro with systemd + `mirrored` networking, Python 3.12+, Node 22+, and **llama-swap with both GGUFs** — the one prerequisite the installer can't auto-satisfy; follow [`install/llama-swap-setup.md`](../install/llama-swap-setup.md).
+1. Satisfy the prerequisites (top-level `README.md` table): WSL2 distro with systemd + `mirrored` networking, Python 3.12+, Node 22+, and **llama-swap serving the embedder of the box's embedding profile (`embeddinggemma2` on a fresh install) and the reranker** — the one prerequisite the installer can't auto-satisfy; follow [`install/llama-swap-setup.md`](../install/llama-swap-setup.md).
 2. Clone the repo and run the 4-phase installer from Windows PowerShell:
    ```powershell
    git clone <your-repo-url> $HOME\agentic-memory-stack
@@ -56,21 +56,28 @@ bash ~/apps/mem0-scripts/stack-restore.sh                     # lists snapshots
 bash ~/apps/mem0-scripts/stack-restore.sh --snapshot <TS> --dry-run
 # NOTE: --dry-run validates the snapshot but does NOT run the existing-collection
 # check below — a clean dry-run does not guarantee the live run proceeds.
+# It prints the set's embed_profile and collection. They must be the ones this box
+# is bound to (next command); it WARNs when the profiles differ.
+
+# The memories collection of THIS box's embedding profile, read while mem0 is still up.
+# A default install is on egemma2: mem0_eg2_768. A box on the legacy 300m profile
+# reports mem0_egemma_768.
+COLL=$(curl -s http://127.0.0.1:18791/health/deep | jq -r .collection); echo "$COLL"
 
 systemctl --user stop mem0.service
 
-# The fresh install's server start already CREATED mem0_egemma_768 (empty), and the
+# The fresh install's server start already CREATED $COLL (empty), and the
 # restore script refuses to write into an EXISTING collection (it checks existence,
 # not emptiness). Confirm it is truly empty, then delete it so the snapshot restore
 # can recreate it:
-curl -s http://127.0.0.1:6333/collections/mem0_egemma_768 | grep -o '"points_count":[0-9]*'
+curl -s "http://127.0.0.1:6333/collections/$COLL" | grep -o '"points_count":[0-9]*'
 #   -> must print "points_count":0 on a fresh box. If it is NON-zero, STOP — you are
 #      not on a fresh install; restore to the alternate targets instead and reconcile.
-curl -X DELETE http://127.0.0.1:6333/collections/mem0_egemma_768
+curl -X DELETE "http://127.0.0.1:6333/collections/$COLL"
 
 # Now restore DIRECTLY into the production targets:
 bash ~/apps/mem0-scripts/stack-restore.sh --snapshot <TS> \
-     --target-collection mem0_egemma_768 \
+     --target-collection "$COLL" \
      --target-episodic ~/.mem0/episodic.db
 ```
 
@@ -91,7 +98,7 @@ Copy the queue/ledger files from Phase 0 back into `~/.mem0/`. Then **verify the
 
 ```bash
 # 1. Point count matches the Phase-0 manifest
-curl -s http://127.0.0.1:6333/collections/mem0_egemma_768 | grep -o '"points_count":[0-9]*'
+curl -s "http://127.0.0.1:6333/collections/$COLL" | grep -o '"points_count":[0-9]*'
 # 2. Deep health is green (store + embedder + collection binding)
 curl -s http://127.0.0.1:18791/health/deep
 # 3. THE test: an old memory retrieves on the new machine
@@ -100,7 +107,7 @@ curl -s http://127.0.0.1:18791/health/deep
 ls ~/.mem0/history.db ~/.mem0/MEMORY.md ~/.mem0/audit-flags.baseline ~/.mem0/tier-ledger-pre-migration.jsonl
 ```
 
-> **Vector compatibility:** the restored memory vectors were embedded with EmbeddingGemma-300m and stay valid as long as the new machine serves the same embedder (which `llama-swap-setup.md` installs) — no re-embedding needed. **Exception — episode embeddings:** `stack-restore` restores only the memory collection. The nightly set also carries a snapshot of the episodes collection (`qcol-episodes-<TS>.snapshot`), but it is not restored automatically, so the `episodes_egemma_768` collection (semantic episode search / the raw-trace fallback) starts empty on the new box and old episodes fall back to keyword (FTS) search until you rebuild it: `~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/episode-embed-backfill.py` (one-time, local, free).
+> **Vector compatibility:** the restored memory vectors stay valid only in the embedding space they were made in. A set made on the default profile (EmbeddingGemma-2, collection `mem0_eg2_768`) restores onto a default install as written above. A set from before 1.35.0 was made with EmbeddingGemma-300m (collection `mem0_egemma_768`): restore it into its own collection (`--target-collection mem0_egemma_768`) and move it to the box's profile with the migration under "Moving to another embedding space" below, or serve the 300m model and keep that profile. The dry run names the set's profile. **Exception — episode embeddings:** `stack-restore` restores only the memory collection. The nightly set also carries a snapshot of the episodes collection (`qcol-episodes-<TS>.snapshot`), but it is not restored automatically, so the box's episodes collection (`episodes_egemma_768` on the legacy profile; semantic episode search / the raw-trace fallback) starts empty on the new box and old episodes fall back to keyword (FTS) search until you rebuild it: `~/apps/mem0-server/.venv/bin/python ~/apps/mem0-scripts/episode-embed-backfill.py` (one-time, local, free).
 
 ## Phase 4 — full-stack verification
 
@@ -135,7 +142,7 @@ Keep the old `~/.mem0/backups` for a few weeks as the rollback anchor, then reti
 | Symptom on the new machine | Cause → fix |
 |---|---|
 | `3-verify.ps1` fails on `:11436` | llama-swap not built/running — [`install/llama-swap-setup.md`](../install/llama-swap-setup.md) |
-| Restore refuses with `target collection ... already exists` | the fresh install's server start created the empty collection — verify `points_count:0`, delete it, rerun (exact sequence in Phase 3) |
+| Restore refuses with `target collection ... already exists` | the fresh install's server start created the empty collection — verify `points_count:0`, delete it, rerun (exact sequence in Phase 3, with `$COLL` read from `/health/deep`) |
 | Restore lands in `-restore` targets | you omitted the explicit `--target-*` flags (the safe default protects populated stores) — rerun as in Phase 3 |
 | `mem0.service` up but canonical promotion 503s | the key chain isn't provisioned — Phase 2 step 1; check the tmpfs key per the DPAPI doc's Recovery section |
 | Old memories don't retrieve but health is green | you restored into the alternate collection — check `curl :6333/collections` for `*-restore` names and redo with `--target-collection <the set's memories collection: mem0_eg2_768, or mem0_egemma_768 for a set from before 1.35.0>` |
@@ -151,11 +158,10 @@ re-embeds every point into new collections and re-calibrates every cosine thresh
 collections are named by model and the thresholds are calibrated per profile. The old collections are
 never written, so they stay the rollback anchor.
 
-**Measure first.** A newer model is not automatically better here: on 2026-10-08 EmbeddingGemma-2 lost
-about a quarter of the per-prompt path's MRR on this store under mem0's additive fusion, and still about
-0.02 under rank fusion. Run the house evals (`eval/embedder-ab/` in the operator repo) against a shadow
-server before moving the memories. The 1.35.0 move to EmbeddingGemma-2 was an operator decision taken
-with that cost measured, for media memories (runbook below).
+**Measure first.** A newer model is not automatically better on your store: in one measured comparison
+EmbeddingGemma-2 lost about a quarter of the per-prompt path's MRR under mem0's additive fusion, and still
+about 0.02 under rank fusion. Compare the two embedders on your own queries against a shadow server before
+moving the memories. The 1.35.0 default moved to EmbeddingGemma-2 for media memories (runbook below).
 
 ## The wiki (a rebuild)
 
@@ -223,7 +229,7 @@ deploying 1.35.2, re-run the Windows phase on each PC replica from its release t
 ```
 
 It registers `mem0-offline-watcher` and `mem0-replica-cache-refresh`. Within two minutes the watcher starts the
-first cache refresh (a ~700 MB copy from pCloud); `Test-MemoryStack.ps1` then shows the `offline watcher
+first cache refresh (a ~700 MB copy from the authority's cloud-mirror folder); `Test-MemoryStack.ps1` then shows the `offline watcher
 (takeover)` and `replica snapshot cache` rows green. `scripts\travel\install-offline-watcher.ps1` alone registers
 the same two tasks. See [`systems/offline-travel.md`](systems/offline-travel.md).
 
@@ -288,10 +294,10 @@ On top of the steps above:
         media memories are made and searched on the authority.
      3. **Put a set made in the new space into the offline cache, while online.** After the brain has written a
         backup set in the new space (its nightly backup, or `stack-backup.sh` by hand), run
-        `scripts\travel\travel-mode.ps1 on -DryRun`. It seeds the local snapshot cache from pCloud and touches
+        `scripts\travel\travel-mode.ps1 on -DryRun`. It seeds the local snapshot cache from the cloud-mirror folder and touches
         nothing else; check that the `snapshot:` stamp it prints is newer than the brain's switch. This step is
         not optional: the go-offline restore runs when the brain is unreachable, and `travel-mode.ps1` fetches
-        from pCloud only while it answers, so that restore can only use what the cache already holds. With only
+        from the cloud-mirror folder only while it answers, so that restore can only use what the cache already holds. With only
         old-space sets there, it refuses (the set's profile is not the box's) and the watcher brings nothing up.
      4. **Restore.** The watcher does it at the next go-offline. To prove it now, `scripts\travel\travel-mode.ps1 on`
         restores the set and puts this PC in travel mode (memory reads served by the replica, writes queued)

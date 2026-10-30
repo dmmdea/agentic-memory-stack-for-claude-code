@@ -255,54 +255,25 @@ Items 1, 2, 4 and 5 describe the Phase 0.B decision capture, retired in 1.37.0; 
 
 ## Phase 0.D — UserPromptSubmit Proactive Memory Search (READ side)
 
-**Added:** v0.17 Phase 0.D (2026-06-11), closes the operator's diagnosis: "proactive memory fetching is weak, you always forget to look, forget to use tools, forget where stuff is, and start trashing before looking at memory."
-
 **The gap:** Phase 0.A–C fixes the WRITE side (decisions survive interruptions). But agentic Claude still has to remember to call `memory_search` before responding. It often doesn't. The READ side closes this by surfacing memory proactively — **before Claude responds** — so the data is in Claude's context without requiring any action from Claude.
 
-**Script section:** `scripts/windows/user-prompt-extract.ps1` section 6 (Phase 0.D block, runs after 0.B decision capture, unconditionally for non-trivial prompts).
+**Current shape.** The original design ran a separate memory search, a goals fetch and an open-questions fetch on every prompt. That is gone. A substantive prompt now makes **one** `POST /v1/context/bundle` call (checkpoint + admission-gated memories), made by the compiled client through the resident daemon, with the inline `scripts/windows/user-prompt-extract.ps1` as the fallback. The contract is in [`../flows/memory-retrieval.md`](../flows/memory-retrieval.md) (Channel 1) and [`model-aware-injection.md`](./model-aware-injection.md):
 
-**Trivial-prompt filter:** Skip if word count < 3 or prompt is in the trivial list: `continue, yes, no, ok, okay, sure, go, next, stop, 1, 2, 3, a, b, c, thanks, thx`.
+- **Gate and caps:** the active embedder profile's relevance gate (0.70 on the default EmbeddingGemma-2) and the tier caps in `claude-config/model-tiers.json` (memories K=2 on the frontier tier; goals and open questions 0 since 1.37.0, so the block holds memories only). The session-start banner still lists goals and open questions.
+- **Trivial-prompt filter:** a prompt under 3 words, or one of `continue, yes, no, ok, okay, sure, go, next, stop, 1, 2, 3, a, b, c, thanks, thx`, posts only the episode checkpoint.
+- **Timeout:** 3 s for the bundle call. The registered hook timeout is 5 s.
+- **Output:** the block is written to stdout, which Claude Code injects as context before it processes the prompt. The header reads `[MEMORY CONTEXT - auto-surfaced by user-prompt-extract.ps1 v0.17 Phase 0.D ...]`.
 
-**What it fetches (in order):**
-
-1. **mem0 semantic search** — `POST /v1/memories/search` with `{query: prompt[:500], filters:{user_id:'youruser', brand?}, limit:5, threshold:0.4, rerank:true}`. Top 3 hits rendered with tier and brand tags.
-2. **Open goals** — `GET /v1/goals?status=open&limit=5&brand=<inferred>`. Rendered with priority. (Since 1.37.0 the per-prompt bundle serves neither goals nor open questions: `goal_cap` and `oq_cap` are 0.)
-3. **Open questions** — `GET /v1/open_questions?status=open&limit=3&brand=<inferred>` (404-safe; silently skipped pre-Phase-D since that endpoint ships later in v0.17).
-
-**Output format (emitted to stdout → Claude Code injects into LLM context):**
 ```
-[MEMORY CONTEXT — auto-surfaced by user-prompt-extract.ps1 v0.17 Phase 0.D]
-
-Top 3 relevant memories:
-  - [canonical|ai-ecosystem] mem0-server runs on :18791; episodic.db at ~/.mem0/episodic.db
-  - [stable|brand-a] the operator chose SQLite+FTS5 sidecar over recency-weighted mem0 (v0.15 decision)
-  - [evidence|ai-ecosystem] bge-reranker upgraded base (ctx=512, RERANK_DOC_MAX_CHARS=380) → v2-m3 (ctx=8192)
-
-Open goals (3 shown):
-  - [P2 OPEN] Ship v0.17 Phase 0.D + 0.E proactive fetch
-  - [P3 OPEN] Restore drill for v0.17 Phase B
+[MEMORY CONTEXT - auto-surfaced by user-prompt-extract.ps1 v0.17 Phase 0.D]
+  - [canonical|brand-a] mem0-server runs on :18791
+  - [stable|brand-a] SQLite + FTS5 sidecar chosen over recency-weighted mem0
 ```
-
-**Hook stdout injection:** Claude Code's UserPromptSubmit hook contract emits hook stdout as a system message injected into the LLM context **before** Claude processes the user's prompt. This is confirmed by the existing SessionStart mechanism (storage-cap-check.sh output appears as context at session start). If Anthropic changes this contract, the fallback is to write to `~/.mem0/last-surfaced-context.txt` and update CLAUDE.md to instruct Claude to read it.
-
-**Performance budget:** Total hook ≤ 500ms.
-
-| Operation | Typical latency |
-|---|---|
-| Phase 0.A checkpoint POST | ~50ms |
-| Phase 0.B decision detection | ~5ms |
-| Phase 0.D mem0 search + rerank | ~100–250ms |
-| Phase 0.D goals fetch | ~5ms |
-| Phase 0.D open_questions (404) | ~2ms |
-| **Total** | **~165–315ms** |
-
-Search and goals each have a 2s `TimeoutSec`. The overall hook latency stays well under 500ms in the normal case.
 
 **Failure modes:**
-- mem0 down/ECONNREFUSED: search block absent; logged; prompt not blocked.
-- Timeout (> 2s): block absent; logged; prompt not blocked.
-- Any exception in 0.D block: logged to `~/.claude/logs/user-prompt-extract.log`; hook exits 0.
-- open_questions 404 (pre-Phase-D): silently skipped (catch block has no log entry to avoid noise).
+- mem0 down or unreachable: the block is absent; logged; the prompt is never blocked.
+- Timeout: the block is absent; logged; the prompt is never blocked.
+- Any exception on this path: logged to `~/.claude/logs/user-prompt-extract.log`; the hook exits 0.
 
 ---
 
@@ -351,12 +322,11 @@ The hook uses `${CLAUDE_CWD:-$PWD}`. If Claude Code sets `CLAUDE_CWD` at hook in
 
 ---
 
-## Pre-Tool Contradiction Check (Phase 0.F — RETIRED 2026-08-09)
+## Pre-Tool Contradiction Check (Phase 0.F — RETIRED)
 
-**Status: RETIRED by operator decision (AMS-16).** The stub's own success
-criterion below was finally adjudicated against its whole-history warn corpus:
-~45 warnings ever, near-100% false-positive (after AMS-29 decontaminated the
-mis-scaled entries), zero real contradictions caught. That is the "low signal /
+**Status: RETIRED.** The stub's own success
+criterion below was adjudicated against its whole-history warn corpus:
+~45 warnings ever, near-100% false-positive, zero real contradictions caught. That is the "low signal /
 high noise" branch, and the measured answer was "disable the hook" — the
 installer now strips the PreToolUse registration from live settings and deletes
 the deployed script on re-run. The warn corpus (`~/.mem0/pre-tool-warnings.jsonl`)
@@ -364,7 +334,7 @@ is kept as the historical record. Everything below is preserved as the design
 history of why it shipped logging-only.
 
 Shipped in v0.17. Was deployed to `C:\Users\youruser\.claude\scripts\pre-tool-check.ps1`,
-registered as PreToolUse hook in `settings.json` scoped to `Bash|Edit|Write|MultiEdit`.
+registered as a PreToolUse hook in `settings.json` scoped to `Bash|Edit|Write|MultiEdit`.
 
 **Intent:** Before Claude runs Edit / Write / Bash on a file or command, check if a canonical
 memory contradicts the intended action. Surface "wait — you locked decision X about this" warnings
@@ -424,10 +394,10 @@ After 1 week (target: 2026-06-18), review `~/.mem0/pre-tool-warnings.jsonl`:
 
 | Phase | File | Effect |
 |---|---|---|
-| 0.D | `scripts/windows/user-prompt-extract.ps1` | Every non-trivial user prompt now automatically searches mem0 + lists open goals, injecting results into Claude's context before Claude responds |
+| 0.D | `scripts/windows/user-prompt-extract.ps1` | Every non-trivial user prompt now gets one gated context-bundle call; the admitted memories are injected into Claude's context before Claude responds |
 | 0.E | `claude-config/storage-cap-check.sh` | Every new session auto-loads canonical facts + open goals for the inferred brand from cwd |
 | Docs | `docs/systems/continuity.md` | This document — design rationale, format, performance budgets, failure modes |
 
 **Self-assessment — would Claude's next user-prompt now have relevant canonical memories in front of it without Claude needing to call memory_search?**
 
-Yes, for non-trivial prompts: Phase 0.D injects a `[MEMORY CONTEXT ...]` block into the LLM context via UserPromptSubmit hook stdout before Claude responds. The hook runs in ~165–315ms, well under the 500ms budget. For session starts, Phase 0.E surfaces brand-relevant canonical memories at SessionStart so even the very first message of a session has context. Claude doesn't need to call memory_search for the common case — the data arrives automatically.
+Yes, for non-trivial prompts: Phase 0.D injects a `[MEMORY CONTEXT ...]` block into the LLM context via UserPromptSubmit hook stdout before Claude responds. The bundle call is bounded at 3 s and the hook at 5 s. For session starts, Phase 0.E surfaces brand-relevant canonical memories at SessionStart so even the very first message of a session has context. Claude doesn't need to call memory_search for the common case — the data arrives automatically.

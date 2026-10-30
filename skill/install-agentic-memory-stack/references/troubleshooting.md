@@ -4,18 +4,17 @@ Read on demand from `SKILL.md`. All paths use `$HOME` / `<distro>` / `<wsl-user>
 
 ## llama-swap model entries (the one manual step)
 
-The installer fetches `~/models/embeddinggemma-300M-Q8_0.gguf` and verifies the embed endpoint, but does not rewrite your llama-swap config. Add both models to a non-exclusive, non-swapping `support` group, each with `ttl: 300`, bound to loopback:
+The installer stages the EmbeddingGemma GGUFs under `~/models/` and verifies the embed endpoint, but does not rewrite your llama-swap config. The full guide (build, download with checksums, config, service) is [`install/llama-swap-setup.md`](../../../install/llama-swap-setup.md). In short: both models go in a non-exclusive, non-swapping `support` group, each with `ttl: 300`, bound to loopback. A fresh install's embedder is `embeddinggemma2` (llama.cpp b11452 or later); a legacy-profile box serves `embeddinggemma` (b6384 or later).
 
 ```yaml
 models:
-  embeddinggemma:
-    cmd: <llama.cpp>/build/bin/llama-server --model $HOME/models/embeddinggemma-300M-Q8_0.gguf
-         --embeddings --pooling mean --n-gpu-layers 999
-         --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
-         --port ${PORT} --host 127.0.0.1
+  embeddinggemma2:
+    cmd: <llama.cpp>/build/bin/llama-server --model $HOME/models/embeddinggemma-2-Q8_0.gguf
+         --mmproj $HOME/models/mmproj-embeddinggemma-2-Q8_0.gguf
+         --embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 2048
+         -ngl 99 --flash-attn on --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
     ttl: 300    # unload after 5 idle minutes
-    aliases: ["embeddinggemma", "egemma", "embeddinggemma-300m"]
   bge-reranker-v2-m3:
     cmd: <llama.cpp>/build/bin/llama-server --model /path/to/bge-reranker-v2-m3.Q4_K_M.gguf
          --reranking --pooling rank --n-gpu-layers 999 --host 127.0.0.1 --port ${PORT}
@@ -25,16 +24,16 @@ groups:
   support:
     swap: false
     exclusive: false
-    members: ["embeddinggemma", "bge-reranker-v2-m3"]
+    members: ["embeddinggemma2", "bge-reranker-v2-m3"]
 ```
 
-> `--n-gpu-layers 999` puts every layer on the GPU (both models are a few hundred MB); host RAM is overflow only, so if a model does not fit the card let llama.cpp spill just the remainder instead of forcing zero GPU layers.
+> `-ngl 99` / `--n-gpu-layers 999` puts every layer on the GPU; host RAM is overflow only, so if a model does not fit the card let llama.cpp spill just the remainder.
 >
-> Do NOT raise `--ctx-size` above 2048 (the model's trained limit; the shim `mem0-server/egemma_embedder.py` truncates input to stay within it). llama-swap must bind `127.0.0.1:11436` (Test-MemoryStack WARNs if LAN-exposed). Verify:
+> Keep `--ctx-size` at 4096 for `embeddinggemma2` (2048 for the 300m model, its trained limit; the shim `mem0-server/egemma_embedder.py` truncates input to stay within it). llama-swap must bind `127.0.0.1:11436` (Test-MemoryStack WARNs if LAN-exposed). Verify:
 
 ```powershell
-# 768-dim embedder:
-$b = @{model='embeddinggemma'; input='title: none | text: ping'} | ConvertTo-Json
+# 768-dim embedder (use model 'embeddinggemma' on the legacy profile):
+$b = @{model='embeddinggemma2'; input='title: none | text: ping'} | ConvertTo-Json
 (Invoke-RestMethod -Uri 'http://127.0.0.1:11436/v1/embeddings' -Method Post -Body $b -ContentType 'application/json' -TimeoutSec 30).data[0].embedding.Count   # -> 768
 # reranker:
 $body = @{model='bge-reranker-v2-m3';query='test';documents=@('a','b');top_n=2} | ConvertTo-Json
@@ -75,17 +74,23 @@ ls -lh ~/.mem0/backups/
 | `Prereq: WSL mirrored networking MISSING` | Add `[wsl2]\nnetworkingMode = mirrored` to `%USERPROFILE%\.wslconfig`, then `wsl --shutdown` and re-run |
 | `Prereq: systemd in WSL MISSING` | Add `[boot]\nsystemd=true` to `/etc/wsl.conf` (inside WSL), then `wsl --shutdown` and re-run |
 | `No WSL distro found` | `wsl --install -d Ubuntu` (or any distro), or pass `-Distro <name>` (see `wsl -l -q`) |
-| `Prereq: Codex authenticated MISSING` | `codex login` → "Sign in with ChatGPT" |
+| `Prereq: Codex authenticated MISSING` | `codex login` → "Sign in with ChatGPT" (an API-key login is not accepted) |
+| `Prereq: codex.cmd MISSING` | `npm i -g @openai/codex` so the shim lands at `%USERPROFILE%\AppData\Roaming\npm\codex.cmd`; a Codex installed another way (pnpm, scoop) is not found |
+| `Prereq: Python 3.12+ in WSL MISSING` | Use a distro whose `python3` is 3.12+ (`wsl --install -d Ubuntu-24.04`, then `-Distro Ubuntu-24.04`); `apt install python3` on Ubuntu 22.04 gives 3.10 |
+| `Prereq: llama-swap :11436 reachable in WSL MISSING` | Start llama-swap: [`install/llama-swap-setup.md`](../../../install/llama-swap-setup.md) |
+| Replica: `mem0 add+search` fails with HTTP 401 | `~/.mem0/api-key` in WSL is not the authority's key. Re-run `install.ps1 -Role replica -AuthorityUrl <url> -ApiKeyFile <file holding the key>` |
+| Search finds nothing the authority holds, no error | The tenant differs: the authority's `--user-id` must equal this PC's WSL user name (`wsl -e whoami`) |
 | `Service mem0 not active` | `wsl -d <distro> -e bash -c "journalctl --user -u mem0.service -n 50"` |
 | `mem0.service` crash-loops on `ModuleNotFoundError` | A module is missing from the deploy — re-run `install.ps1` (refreshes all `MEM0_MODULES` incl. `egemma_embedder.py`) |
 | `Codex headless call MISSING` | `npm i -g @openai/codex@latest` (frequent model-compat updates) |
-| `mem0 add+search MISSING` | Confirm llama-swap serves `embeddinggemma` on :11436 (returns a 768-dim vector), then `systemctl --user restart mem0.service` |
+| `mem0 add+search MISSING` | Confirm llama-swap serves the profile's embedder alias on :11436 (`embeddinggemma2` on a fresh install, `embeddinggemma` on the legacy profile; it returns a 768-dim vector), then `systemctl --user restart mem0.service` |
 | `canonical key (server)` FAIL / 503 on canonical promote | DPAPI blob present: `systemctl --user restart mem0` (re-runs `dpapi-fetch-key`); no blob: `bash scripts/wsl/generate-canonical-key.sh`. Never generate a fresh key next to an existing blob |
 | `build-hook-client.ps1 failed` | Confirm `Microsoft.NET\Framework64\v4.0.30319\csc.exe` exists; the build smoke-gates so a bad exe is discarded and `settings.json` stays untouched. Re-run |
 | UserPromptSubmit slow / no `[MEMORY CONTEXT]` | Check the resident daemon (a hidden `powershell` running `mem0-hook-daemon.ps1`) + that `mem0-hook-client.exe` exists; rebuild via `build-hook-client.ps1`. The exe fails open to inline `user-prompt-extract.ps1` (which dot-sources `user-prompt-lib.ps1` — both must be deployed) |
 | `deployed hooks freshness` WARN | A deployed script drifted from the repo or the exe is stale vs its `.cs`. Re-run `build-hook-client.ps1` and/or `install/2-windows-config.ps1` |
 | `ConvertFrom-Json` error during MCP registration | Your `~/.claude.json` has case-colliding keys — the installer falls back to `-AsHashtable` (PS7) or warns + skips (PS5.1, config unchanged); add the `mem0` server manually if it warns (see below) |
-| Timers not found | `systemctl --user enable --now decay-scan.timer stack-backup.timer goals-stale-sweep.timer contradiction-sweep.timer episodic-reconcile.timer l10-audit.timer` |
+| Timers not found | `systemctl --user enable --now decay-scan.timer stack-backup.timer goals-stale-sweep.timer contradiction-sweep.timer episodic-reconcile.timer retrieval-pairs.timer goal-recurrence-promote.timer l10-audit.timer` |
+| Install ends `INSTALL INCOMPLETE` | The failed checks are listed under `VERIFY FAILED` with a fix each; fix them and re-run `install.ps1` (finished steps are skipped) |
 
 **Manual mem0 MCP registration** (if the installer warns it couldn't update `~/.claude.json`): add under `mcpServers.mem0`: `command=wsl.exe`, `args=["-d","<distro>","-e","/home/<wsl-user>/apps/mem0-server/.venv/bin/python","/mnt/c/Users/<win-user>/.claude/scripts/mem0-mcp-shim.py"]`.
 

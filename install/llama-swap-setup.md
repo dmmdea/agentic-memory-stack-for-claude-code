@@ -1,49 +1,71 @@
 # llama-swap setup — the one prerequisite the installer can't do for you
 
 The memory stack needs a local inference endpoint on `127.0.0.1:11436` serving two
-small models: an **EmbeddingGemma** embedder (768-dim, multilingual; EmbeddingGemma-300m, or
-EmbeddingGemma-2 on a box whose embedding profile is `egemma2`, section 4b) and
-**bge-reranker-v2-m3** (the reranker). Both are served by
+small models: the **EmbeddingGemma-2** embedder (768-dim, multilingual, multimodal; the `egemma2`
+embedding profile, the default of a fresh install) and **bge-reranker-v2-m3** (the reranker). Both are served by
 [llama-swap](https://github.com/mostlygeek/llama-swap), a tiny proxy that starts and
 swaps [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` processes on
-demand. `install/0-prereqs.ps1` checks this endpoint and fails until it's up.
+demand. `install/0-prereqs.ps1` (and `install/linux-authority.sh`) check this endpoint and fail until it's up.
 
-Everything below happens **inside WSL** (Ubuntu assumed; adjust paths for your distro).
-Total footprint: ~600 MB of models. Run them on a GPU (every layer, `--n-gpu-layers 999`); see the note after the config.
+Do this **before** the installer. It works the same on a Windows PC's WSL distro (Ubuntu assumed; adjust
+paths for yours) and on a native Linux authority; the differences are called out. The authority needs the same
+entries and the same aliases as its embedding profile: a replica that restores the authority's backups needs them too.
 
-## 1. Build llama.cpp (needs release b6384 or newer for the gemma-embedding arch; b11452 or newer for EmbeddingGemma-2)
+**Hardware.** The stack is sized for a GPU: every layer on the card (`-ngl 99` / `--n-gpu-layers 999`), unloading after
+300 s idle. Rough VRAM: about 1.5 GiB at peak for EmbeddingGemma-2 with its projector (about 0.5 GiB text-only,
+section 4), plus a few hundred MiB for the reranker. If a model does not fit, llama.cpp keeps the layers that fit
+on the GPU and spills the rest to RAM. Total model files: about 1.3 GB.
 
-The b6384 floor is EmbeddingGemma-300m's. EmbeddingGemma-2 uses the newer `gemma-embedding2`
-architecture, which llama.cpp has from b11452: a box that serves it builds to that floor.
+- **WSL:** install the NVIDIA driver on **Windows** only; it exposes the GPU to WSL. Do not install a Linux display driver inside the distro. Check with `nvidia-smi` in WSL.
+- **Native Linux:** the vendor driver, then the same `nvidia-smi` check.
+
+## 1. Build llama.cpp (release b11452 or newer)
+
+EmbeddingGemma-2 uses the `gemma-embedding2` architecture, which llama.cpp has from release **b11452**. An older
+build fails the embeddings call with a model-arch error. (A box that stays on the legacy EmbeddingGemma-300m
+profile, section 7, needs only b6384.)
 
 ```bash
 sudo apt install -y build-essential cmake git
 git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
-cmake -S ~/llama.cpp -B ~/llama.cpp/build -DCMAKE_BUILD_TYPE=Release
+git -C ~/llama.cpp describe --tags          # must be b11452 or later
+# NVIDIA: install the CUDA toolkit first (in WSL: the "WSL-Ubuntu" toolkit package from NVIDIA), then:
+cmake -S ~/llama.cpp -B ~/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+# other GPUs: -DGGML_VULKAN=ON instead of -DGGML_CUDA=ON
 cmake --build ~/llama.cpp/build --target llama-server -j
 ```
 
+Without a backend flag the build is CPU-only and the stack's GPU settings do nothing.
+
 ## 2. Install llama-swap
 
-Download the latest linux binary from the
-[llama-swap releases page](https://github.com/mostlygeek/llama-swap/releases) and put
-it at `~/.local/bin/llama-swap` (`chmod +x` it).
+Download the Linux build from the
+[llama-swap releases page](https://github.com/mostlygeek/llama-swap/releases): the archive whose name ends in
+`linux_amd64.tar.gz` (`linux_arm64.tar.gz` on arm64). Extract it and put the `llama-swap` binary at
+`~/.local/bin/llama-swap` (`chmod +x` it). Compare the archive's checksum with the one the release lists, if it lists one.
 
-## 3. Download the two models
+## 3. Download the models
 
 ```bash
 mkdir -p ~/models
-# EmbeddingGemma-300m (Q8_0, ~330 MB) — the installer also stages this if missing
-curl -L -o ~/models/embeddinggemma-300M-Q8_0.gguf \
-  https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
-# bge-reranker-v2-m3 (Q4_K_M, ~270 MB)
-curl -L -o ~/models/bge-reranker-v2-m3-Q4_K_M.gguf \
+# EmbeddingGemma-2 (Q8_0, text model) and its projector — Apache-2.0
+curl -fL -o ~/models/embeddinggemma-2-Q8_0.gguf \
+  https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf
+curl -fL -o ~/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+  https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/mmproj-embeddinggemma-2-Q8_0.gguf
+# bge-reranker-v2-m3 (Q4_K_M, ~440 MB)
+curl -fL -o ~/models/bge-reranker-v2-m3-Q4_K_M.gguf \
   https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q4_K_M.gguf
+# the two EmbeddingGemma-2 files must match these checksums (the installer checks them too)
+echo "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135  $HOME/models/embeddinggemma-2-Q8_0.gguf
+c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f  $HOME/models/mmproj-embeddinggemma-2-Q8_0.gguf" | sha256sum -c -
 ```
 
-## 4. Config — `~/llama-swap/config.yaml`
+The installer's WSL phase stages the same two EmbeddingGemma-2 files when they are missing, and also fetches
+the legacy EmbeddingGemma-300m file; fetching them yourself first is what lets llama-swap be configured before any
+installer phase runs. No checksum is published for the reranker file here: take it from the model page you download it from.
 
-(A box on the `egemma2` profile adds the entry in section 4b to this file; it does not replace the ones below.)
+## 4. Config — `~/llama-swap/config.yaml`
 
 ```yaml
 healthCheckTimeout: 300
@@ -59,18 +81,19 @@ groups:
   support:
     swap: false
     exclusive: false
-    members: ["embeddinggemma", "bge-reranker-v2-m3"]
+    members: ["embeddinggemma2", "bge-reranker-v2-m3"]
 
 models:
-  embeddinggemma:
+  embeddinggemma2:
     cmd: ~/llama.cpp/build/bin/llama-server
-      --model ~/models/embeddinggemma-300M-Q8_0.gguf
-      --embeddings --pooling mean --n-gpu-layers 999
-      --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
+      --model ~/models/embeddinggemma-2-Q8_0.gguf
+      --mmproj ~/models/mmproj-embeddinggemma-2-Q8_0.gguf
+      --embeddings --pooling mean
+      --ctx-size 4096 --batch-size 4096 --ubatch-size 2048
+      -ngl 99 --flash-attn on
       --port ${PORT} --host 127.0.0.1
     checkEndpoint: /v1/models
     ttl: 300
-    aliases: ["embeddinggemma-300m"]
 
   bge-reranker-v2-m3:
     cmd: ~/llama.cpp/build/bin/llama-server
@@ -84,55 +107,6 @@ models:
 
 (If you expand `~` manually, use your real home path — llama-swap does not expand `~`
 inside `cmd` on every platform.)
-
-`ttl: 300` on both. A model with no idle timeout holds its weights for the rest of the day on
-a box you may also want for something else; 300 s is long enough that a working session
-rarely pays a reload and short enough that an idle box gives the memory back.
-The `support` group above keeps the models from fighting a chat seat for the slot — they
-co-reside, so a reload is a cold start, not a queue behind someone else's model.
-
-The 300 s is not free, though: the first embed or rerank after an idle spell pays that cold
-start. The memory server absorbs it (an embedder that cannot answer yet gets a `503` +
-`Retry-After` so writes queue and retry; a reranker that times out is retried once with a
-longer allowance, then search falls back to dense order), and the SessionStart hook pre-warms
-both through `GET /health/embedder?warm=rerank`. See
-[`docs/systems/reranker.md`](../docs/systems/reranker.md).
-
-`--n-gpu-layers 999` puts every layer on the GPU: both models are a few hundred MB, so one
-card holds them next to a chat seat, and a GPU cold start after the 300 s idle unload is
-much faster than a CPU one. Host RAM is overflow, not the plan. If a model ever does not fit
-the card, let llama.cpp keep the layers that fit on the GPU and spill only the rest, rather
-than forcing zero GPU layers.
-
-## 4b. EmbeddingGemma-2 (the `egemma2` embedding profile)
-
-A fresh install records `egemma2` (1.35.0), and a replica switches to it with `install.ps1 -EmbedProfile egemma2`
-(docs/MIGRATION.md, "Replicas and PCs"). It needs its own llama-swap entry, because its vectors are a different
-space from EmbeddingGemma-300m's, and it needs llama.cpp b11452 or newer. `install/1-wsl-services.sh` stages the
-two files (the Q8_0 text model and its projector, sha256-checked) when the profile is `egemma2`, or with
-`MEM0_STAGE_EG2=1` ahead of a move, and prints the entry below.
-
-**Where the files come from.** Nothing else downloads those two files (section 3 fetches the 300m and reranker
-files only), and the entry needs them. On a box that is not on `egemma2` yet, either stage them first
-(`MEM0_STAGE_EG2=1 bash install/1-wsl-services.sh <wsluser> <winuser> <distro>`, inside WSL) or switch the profile
-first (`install.ps1 -EmbedProfile egemma2` stages them on the same run, harmlessly on a dormant replica), and then
-add the entry. Fetching `embeddinggemma-2-Q8_0.gguf` and `mmproj-embeddinggemma-2-Q8_0.gguf` from
-`ggml-org/embeddinggemma-2-GGUF` into `~/models/` by hand also works; check them against the installer's
-checksums (`EG2_SHA256`, `EG2_MMPROJ_SHA256` in `install/1-wsl-services.sh`).
-
-```yaml
-models:
-  embeddinggemma2:
-    cmd: ~/llama.cpp/build/bin/llama-server
-      --model ~/models/embeddinggemma-2-Q8_0.gguf
-      --mmproj ~/models/mmproj-embeddinggemma-2-Q8_0.gguf
-      --embeddings --pooling mean
-      --ctx-size 4096 --batch-size 4096 --ubatch-size 2048
-      -ngl 99 --flash-attn on
-      --port ${PORT} --host 127.0.0.1
-    checkEndpoint: /v1/models
-    ttl: 300
-```
 
 - `--mmproj` is the projector: images, audio and video embed into the same space as text. Text vectors are
   identical with and without it.
@@ -150,16 +124,28 @@ models:
   searched on the authority; this box then answers a media add or a media search with a 400 instead of sending
   image parts to a server that cannot read them, and `/health/deep` reports `checks.media.enabled: false`.
 
-**It joins the group; it does not replace it.** The `support` group in section 4 already lists what the box
-serves. Add `embeddinggemma2` to that `members:` list (for example `members: ["embeddinggemma",
-"embeddinggemma2", "bge-reranker-v2-m3"]`). The installer prints a one-member `support: {..., members:
-[embeddinggemma2]}` line as the *shape* of the group, and pasting it over an existing group drops the
-reranker and the other embedder out of it: they fall back into llama-swap's implicit swapping group and
-evict each other, which reads as `/health/deep: embedder timed out`. A config generated from a llama-swap
-`matrix` instead of `groups` follows the same rule: put the alias in the set the memory models already share
-(the `residents` set, in a config that names it so) and keep its other members. Every model still unloads after
-`ttl: 300`. Keep `embeddinggemma` served while any store or backup set is still in the old space; a box
-retires it only after its last set in that space is gone.
+`ttl: 300` on both. A model with no idle timeout holds its weights for the rest of the day on
+a box you may also want for something else; 300 s is long enough that a working session
+rarely pays a reload and short enough that an idle box gives the memory back.
+The `support` group above keeps the models from fighting a chat seat for the slot — they
+co-reside, so a reload is a cold start, not a queue behind someone else's model.
+
+The 300 s is not free, though: the first embed or rerank after an idle spell pays that cold
+start. The memory server absorbs it (an embedder that cannot answer yet gets a `503` +
+`Retry-After` so writes queue and retry; a reranker that times out is retried once with a
+longer allowance, then search falls back to dense order), and the SessionStart hook pre-warms
+both through `GET /health/embedder?warm=rerank`. See
+[`docs/systems/reranker.md`](../docs/systems/reranker.md).
+
+`--n-gpu-layers 999` puts every layer on the GPU: both models are small, so one
+card holds them next to a chat seat, and a GPU cold start after the 300 s idle unload is
+much faster than a CPU one. Host RAM is overflow, not the plan.
+
+**Already running llama-swap for other models?** Add the two entries to your existing `models:` and add their names
+to the `members:` of the `support` group you already have. Pasting a one-member group over it drops the other
+members out of the group: they fall back into llama-swap's implicit swapping group and evict each other, which reads as
+`/health/deep: embedder timed out`. A config generated from a llama-swap `matrix` instead of `groups` follows the same
+rule: put the alias in the set the memory models already share and keep its other members.
 
 ## 5. Run it as a service (systemd user unit)
 
@@ -183,23 +169,43 @@ systemctl --user daemon-reload
 systemctl --user enable --now llama-swap.service
 ```
 
-## 6. Verify (this is exactly what 0-prereqs.ps1 checks)
+## 6. Verify (this is what the installers check)
 
 ```bash
 curl -sf http://127.0.0.1:11436/v1/models            # lists both models
 curl -sf http://127.0.0.1:11436/v1/embeddings \
   -H 'Content-Type: application/json' \
-  -d '{"model":"embeddinggemma","input":"hello"}' | head -c 200   # returns a 768-dim vector
-```
-
-Both return 200 → re-run `install.ps1`. If the embeddings call fails with a model-arch
-error, your llama.cpp build is older than b6384 — rebuild from current master.
-
-On a box that serves EmbeddingGemma-2 (section 4b), check its alias the same way. A model-arch error here
-means the build is older than b11452:
-
-```bash
-curl -sf http://127.0.0.1:11436/v1/embeddings \
-  -H 'Content-Type: application/json' \
   -d '{"model":"embeddinggemma2","input":"title: none | text: hello"}' | head -c 200   # a 768-dim vector
 ```
+
+Both return 200 → run the installer (`install.ps1`, or `install/linux-authority.sh`). If the embeddings call fails
+with a model-arch error, your llama.cpp build is older than b11452 — rebuild from current master.
+
+## 7. The legacy profile (EmbeddingGemma-300m)
+
+A box that already holds a store from before 1.35.0 stays on the `egemma-300m` profile, whose vectors are a
+different space from EmbeddingGemma-2's. Keep serving its alias while any store or backup set is still in that
+space, and move to the new space with the migration in [`docs/MIGRATION.md`](../docs/MIGRATION.md). The 300m
+model is under the Gemma Terms of Use (see `THIRD-PARTY-NOTICES.md`). It needs llama.cpp b6384 or newer, and its
+entry joins the same `support` group (`members: ["embeddinggemma", "embeddinggemma2", "bge-reranker-v2-m3"]`):
+
+```bash
+curl -fL -o ~/models/embeddinggemma-300M-Q8_0.gguf \
+  https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf   # ~330 MB
+```
+
+```yaml
+models:
+  embeddinggemma:
+    cmd: ~/llama.cpp/build/bin/llama-server
+      --model ~/models/embeddinggemma-300M-Q8_0.gguf
+      --embeddings --pooling mean --n-gpu-layers 999
+      --ctx-size 2048 --batch-size 2048 --ubatch-size 2048
+      --port ${PORT} --host 127.0.0.1
+    checkEndpoint: /v1/models
+    ttl: 300
+    aliases: ["embeddinggemma-300m"]
+```
+
+Do not raise `--ctx-size` above 2048 for this model (its trained limit). Check it with
+`-d '{"model":"embeddinggemma","input":"hello"}'` against `/v1/embeddings`.

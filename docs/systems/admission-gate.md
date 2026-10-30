@@ -389,20 +389,14 @@ records (same `user_id`; same brand or null-brand) via direct Qdrant
 instruct LLM via llama-swap (`:11436/v1/chat/completions`) whether the
 candidate contradicts the canonical statement.
 
-- **Judge model:** `offload-e4b` by default (v0.21.1). This is the
-  local-offload harness's model — a STABLE ALIAS, so improvements made to it on
-  the harness side transparently upgrade this judge with no change here. It
-  fits the 8 GB RTX 3070 (~4–4.5 GB, ~6.7/8.2 GB with the model loaded) and runs
-  CONCURRENTLY with the persistent `bge-reranker-v2-m3`. **Why not `ministral-14b`
-  (the v0.19→v0.21 default):** the v0.19 bake-off picked the 14B on an 8–9-pair
-  verdict-quality sample alone, ignoring the binding hardware constraint — the
-  14B GGUF is 8.24 GB on an 8.19 GB card and with `--n-gpu-layers 999` it
-  overflowed the free VRAM after the persistent group, spilled to RAM, and
-  thrashed the reranker off the GPU on every weekly run. A binary contradiction
-  YES/NO is short-context classification — exactly what the small offload model
-  is for. The discarded alternative `llama-3.2-3b` answered YES 9/9 (uncalibrated
-  prompt). Override: `--model`. Re-validate on a labelled set if the harness
-  model regresses.
+- **Judge:** Codex by default, through the shared judge bridge (`judge_contradiction`, the
+  Codex HTTP shim on a Windows-hosted brain, `codex exec` natively on the authority); the
+  model is pinned per job (see [`codex-hooks.md`](./codex-hooks.md), *Model routing*).
+  `--judge local` keeps a cheap, offline pass on a local instruct model served by
+  llama-swap (`--model` names it; `curl :11436/v1/models` lists what is available). Local
+  flags are advisory only (the admission gate hides them, self-heal re-judges) and never
+  authoritative. A local judge must fit in VRAM beside the persistent reranker; a model that
+  does not will spill to RAM and push the reranker off the GPU on every weekly run.
 - **Verdict prompt (injection-resistant since v0.20 Phase C, M5):** strict
   YES/NO-first-word with one-line justification, biased conservative ("if
   uncertain, answer NO"); parsed by YES/NO prefix, anything else → pair

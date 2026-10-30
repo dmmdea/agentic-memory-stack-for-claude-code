@@ -2,21 +2,25 @@
 
 Domain terms used across this repository's documentation and code. See [STYLE.md](STYLE.md) for the naming rule.
 
+## Authority
+
+The one always-on machine that runs the server side (Qdrant + the mem0 server on `:18791`) and is the sole write authority for the store. Everything else (replicas, clients) reads and writes through it. A native Linux box is the intended host (`MEM0_HOST_KIND=native`); a Windows + WSL2 box can host it too. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+
 ## Brain
 
-The **brain box**: the single machine that hosts the memory authority (Qdrant + the mem0 server on `:18791`) and is the sole write authority for the store. The `brain`/`replica` role is chosen at install time by the installer's role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+The **role name** the installers record (`~/.mem0/role` = `brain`) for the authority, as opposed to `replica` and `client`. It names a role, not a machine: "the brain box" is whichever machine holds that role, and "a Windows-hosted brain" is an authority running in WSL2. Prose says "authority"; `brain` survives in role values, flags, file names and older docs. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Replica
 
-A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the Brain. Installed with `-Role replica` (Windows + WSL) or `install/linux-replica.sh` (native Linux), it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+A **replica box**: a machine that mirrors or consumes the memory read-only. A replica can never absorb a write, so it can never diverge from the authority. Installed with `-Role replica` (Windows + WSL) or `install/linux-replica.sh` (native Linux), it never registers the nightly canonical-mutation tasks. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Client
 
-A **thin client**: a native-Linux box that uses a Brain over the network and keeps no store of its own — only the MCP shim, the Outbox replay driver and the per-host authority/role/key files. Installed with `install/linux-client.sh`; its `~/.mem0/role` is `client`. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+A **thin client**: a native-Linux box that uses the authority over the network and keeps no store of its own — only the MCP shim, the Outbox replay driver and the per-host authority/role/key files. Installed with `install/linux-client.sh`; its `~/.mem0/role` is `client`. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## One-Brain Rule
 
-The invariant that exactly one machine — the Brain — holds write authority while replicas stay read-only; mutations made while the authority is unreachable queue to the Outbox and replay on reconnect, so divergence is impossible by construction. Enforced at install by a `brain`/`replica` role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).
+The invariant that exactly one machine — the authority (role `brain`) — holds write authority while replicas stay read-only; mutations made while the authority is unreachable queue to the Outbox and replay on reconnect, so divergence is impossible by construction. Enforced at install by a `brain`/`replica` role gate. See [installer-and-deploy.md](systems/installer-and-deploy.md).
 
 ## Tier
 
@@ -64,7 +68,7 @@ The `Test-MemoryStack.ps1` check (code **R9**) that SHA256-compares repository s
 
 ## Dream
 
-The nightly consolidator (Windows Task Scheduler, 3am, 24h-throttled): a four-phase orient → gather → consolidate → prune cycle that synthesizes 1–3 lineage-tracked Insights (on the native authority the gather and consolidate phases run once a week since 1.37.0) and may autonomously promote at most 3 facts/night to Canonical through the 4C Promotion Gate. See [dream-skill.md](systems/dream-skill.md).
+The nightly consolidator (Windows Task Scheduler, 3am, 23h-throttled): a four-phase orient → gather → consolidate → prune cycle that synthesizes 1–3 lineage-tracked Insights (on the native authority the gather and consolidate phases run once a week since 1.37.0) and may autonomously promote at most 3 facts/night to Canonical through the 4C Promotion Gate. See [dream-skill.md](systems/dream-skill.md).
 
 ## Drift Canary
 
@@ -72,7 +76,7 @@ The retrieval-drift canary run in the Dream's prune phase — a zero-Codex befor
 
 ## Outbox
 
-The operation-outbox (`~/.mem0/outbox.jsonl`) that queues mutations made while the Brain authority is unreachable; entries are op-typed and uuid4-keyed for idempotent replay to the authority on reconnect. See [offline-travel.md](systems/offline-travel.md).
+The operation-outbox (`~/.mem0/outbox.jsonl`) that queues mutations made while the authority is unreachable; entries are op-typed and uuid4-keyed for idempotent replay to the authority on reconnect. See [offline-travel.md](systems/offline-travel.md).
 
 ## Travel Mode
 

@@ -30,22 +30,29 @@
 #   (re-issuable by re-authenticating). Backing up re-issuable credentials widens the
 #   blast radius for no recovery benefit.
 #
-# DESTINATIONS (both, always - one disk is not durability)
-#   1. V:/mem0-backups/keys   off the source disk, same machine, fast local recovery
-#   2. the Drive keys folder  offsite, survives the machine entirely
+# DESTINATIONS (both, always - one disk is not durability; no default, you name them)
+#   KEY_BACKUP_LOCAL    a directory on a different disk from ~/.mem0, same machine, fast
+#                       local recovery
+#   KEY_BACKUP_OFFSITE  a directory that survives the machine entirely (a synced cloud
+#                       folder, a mounted remote share)
+#   OFFSITE_WIN_DEST    optional: the Windows-side path of the offsite folder, used when
+#                       that volume is not mounted inside WSL
 #
-# Usage:  key-backup.sh [--verify-only]
+# Usage:  KEY_BACKUP_LOCAL=<dir> KEY_BACKUP_OFFSITE=<dir> key-backup.sh
 set -euo pipefail
 
-# MEM0_DIR lets this run from the Windows-side shell, which is the only runtime that
-# sees BOTH destinations (WSL has no /mnt/g on this estate). Point it at the WSL
-# share: //wsl.localhost/<distro>/home/<user>/.mem0
+# MEM0_DIR lets this run from the Windows-side shell, which can see Windows drives that WSL
+# may not mount. Point it at the WSL share: //wsl.localhost/<distro>/home/<user>/.mem0
 MEM0="${MEM0_DIR:-$HOME/.mem0}"
 STAMP="$(date +%Y-%m-%d-%H%M)"
-LOCAL_DEST="${KEY_BACKUP_LOCAL:-/v/mem0-backups/keys}"
-OFFSITE_DEST="${KEY_BACKUP_OFFSITE:-/g/My Drive/AI Ecosystem/Ecosystem/Keys/ams}"
-# Windows-side equivalents, used only when the offsite volume is not mounted in WSL.
-OFFSITE_WIN_DEST="${OFFSITE_WIN_DEST:-G:\My Drive\AI Ecosystem\Ecosystem\Keys\ams}"
+LOCAL_DEST="${KEY_BACKUP_LOCAL:-}"
+OFFSITE_DEST="${KEY_BACKUP_OFFSITE:-}"
+# Windows-side equivalent of the offsite folder, used only when that volume is not mounted in WSL.
+OFFSITE_WIN_DEST="${OFFSITE_WIN_DEST:-}"
+if [ -z "$LOCAL_DEST" ] || [ -z "$OFFSITE_DEST" ]; then
+    echo "ERROR: set KEY_BACKUP_LOCAL (a directory on another disk of this machine) and KEY_BACKUP_OFFSITE (a directory that survives the machine) before running; the backup has no default destinations." >&2
+    exit 64
+fi
 OFFSITE_WIN_VERIFY="${OFFSITE_WIN_VERIFY:-}"
 WIN_CLAUDE_JSON="${WIN_CLAUDE_JSON:-/c/Users/$(. "$MEM0/stack.env" 2>/dev/null; echo "${MEM0_WIN_USER:-$USER}")/.claude.json}"
 
@@ -111,10 +118,9 @@ chmod 700 "$bundle"; chmod 600 "$bundle"/*
 
 # --- publish to both destinations ---------------------------------------------
 rc=0
-# The offsite volume is typically a Windows drive (Drive/OneDrive). Those are often NOT
-# mounted inside WSL - G: and P: are not, on this estate - so a naive `cp` silently loses
-# the offsite half and leaves exactly one copy. Fall back to a Windows-side copy instead
-# of accepting the gap.
+# The offsite volume may be a Windows drive (a synced cloud folder). Those are often NOT
+# mounted inside WSL, so a naive `cp` silently loses the offsite half and leaves exactly one
+# copy. With OFFSITE_WIN_DEST set, fall back to a Windows-side copy instead of accepting the gap.
 win_copy() {   # win_copy <linux-src-dir> <win-dest-dir>
     local src_win dst_win
     src_win="$(wslpath -w "$1" 2>/dev/null)" || return 1

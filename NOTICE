@@ -3,11 +3,17 @@ Copyright 2026 dmmdea
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This software INSTALLS or FETCHES third-party components at install time; it does
-not redistribute them. See THIRD-PARTY-NOTICES.md for the full list and licenses,
-including the EmbeddingGemma-300m model, which is governed by the Gemma Terms of Use
-(https://ai.google.dev/gemma/terms), and the optional EmbeddingGemma-2 model (Apache
-License 2.0); both are downloaded by the operator.
+The release binaries of ams-store (ams-store-windows-amd64.exe, ams-store-linux-amd64,
+ams-store-linux-arm64) redistribute third-party code: the Go standard library and runtime,
+github.com/fsnotify/fsnotify and golang.org/x/sys, all under the BSD 3-Clause License. Their
+copyright notices and license texts are in THIRD-PARTY-NOTICES.md, which applies to those
+binaries.
+
+The installers also INSTALL or FETCH other third-party components onto the operator's
+machine; those are not redistributed by this repository. See THIRD-PARTY-NOTICES.md for the
+list and the licenses, including the EmbeddingGemma-300m model, which is governed by the
+Gemma Terms of Use (https://ai.google.dev/gemma/terms), and the EmbeddingGemma-2 model (Apache
+License 2.0). Each is downloaded by the installer or the operator from its own project.
 
 Attribution: scripts/windows/dream-consolidate.ps1 is a port of
 grandamenium/dream-skill (MIT).
