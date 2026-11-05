@@ -59,7 +59,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `dedup-job` | daily semantic dedup sweep | job_liveness.dedup_summary_age_h + dedup_last_* (the job's own summary: degraded on compared_pairs==0 with scanned>1000, a degraded/no-op outcome, or no summary within 36h) | brain | F17 |
 | `memory-index` | dream gather step (memory index refresh) | job_liveness.gather_age_h (gather.json receipt age) | brain | F17 |
 | `sweep-job` | dream prune step (consolidation-completed receipt) | job_liveness.prune_age_h (prune.json receipt age) | brain | F17 |
-| `codex-auth` | Codex CLI auth serving dream judgment | derived: a fresh dream ran, therefore its judge authenticated | brain | F17 |
+| `codex-auth` | LLM judge credentials serving dream judgment (the Codex login, or the Claude API key) | Codex: derived, a fresh dream ran, therefore its judge authenticated; Claude API: the key file and the SDK are present | brain | F17 |
 | `reranker` | cross-encoder rerank leg on search | checks.reranker (PASSIVE counters bumped by real search reranks; no active probe here by F11 — active 3-doc probe is Test-MemoryStack L5) | optional | F17 |
 | `l1a-extraction` | hook-fired L1a memory extractor | job_liveness.l1a_attempt_age_h vs l1a_success_age_h (two-signal, F12: convicts only attempt-fresh + success-stale >96h; capped at degraded) | brain | F17 |
 | `sessionstart-banner` | SessionStart resume/context banner | job_liveness.sessionstart_banner_age_h (unconditional stamp at the top of storage-cap-check.sh) cross-checked against l1a_attempt_age_h | both | F17 |
@@ -94,8 +94,11 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
 - **`drift-guard`**: `state_present: false` → `unknown` (the guard may simply not be deployed);
   ≥ 2 consecutive snapshot failures or a > 96h-stale compare → `dead`; a standing alarm or
   compat-fallback → `degraded`.
-- **`codex-auth`**: derived only — a fresh dream proves its judge authenticated (`alive`);
-  anything else is `unknown`, because a stale dream proves nothing about the token either way.
+- **`codex-auth`**: on the Codex provider it is derived only — a fresh dream proves its judge
+  authenticated (`alive`); anything else is `unknown`, because a stale dream proves nothing about the
+  token either way. On the Claude API provider the credential is a key file the server can see:
+  `alive` when the key and the SDK are present, `dead` when either is missing. The id keeps its name
+  for both providers.
 - **`put-carryover`**: unknown-on-idle is the DESIGNED F9 semantics, not a gap — a day with no PUTs
   proves nothing. The named exerciser is `Test-MemoryStack`'s **I13 PUT-survival canary**: run the
   verifier and the counters move, then the row reports `alive`.

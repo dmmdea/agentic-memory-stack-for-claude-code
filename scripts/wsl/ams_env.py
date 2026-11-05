@@ -18,6 +18,8 @@ import os
 import time
 from pathlib import Path
 
+# The Codex pins per job class. A job asks judge_model() below, which answers for the provider this
+# install selected; these are what it returns on the Codex provider.
 MODEL_SYNTHESIS = "gpt-6-astra"      # open-ended synthesis + consequential judgment
 MODEL_CLASSIFY = "gpt-5.6-terra"     # bounded extraction / classification / routing
 EFFORT_SYNTHESIS = "medium"          # operator directive 2026-09-07: medium, not high
@@ -110,6 +112,25 @@ def mem0_headers(key: str | None = None) -> dict[str, str]:
     if sk:
         h[SERVICE_KEY_HEADER] = sk
     return h
+
+
+def judge_provider() -> str:
+    """'anthropic' or 'codex': the provider this install's judge runs on. The server package owns
+    the answer; a script that runs without it (a dry run) is on the Codex default."""
+    try:
+        import anthropic_judge
+        return anthropic_judge.provider()
+    except Exception:  # noqa: BLE001
+        return "codex"
+
+
+def judge_model(job_class: str) -> str:
+    """The model a job class ('synthesis' | 'classify') runs on under the configured provider."""
+    try:
+        import codex_shim_client
+        return codex_shim_client.model_for(job_class)
+    except Exception:  # noqa: BLE001
+        return MODEL_SYNTHESIS if job_class == "synthesis" else MODEL_CLASSIFY
 
 
 def codex_home() -> str:

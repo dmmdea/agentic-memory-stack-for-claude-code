@@ -422,7 +422,7 @@ def _post_json(http, url: str, body: dict) -> dict:
 def _call_judge(judge, prompt: str):
     """One judge call; None on any failure (the PS try/catch around Invoke-CodexSubagent)."""
     try:
-        res = judge(prompt, effort=ams_env.EFFORT_SYNTHESIS, timeout_s=180, model=ams_env.MODEL_SYNTHESIS)
+        res = judge(prompt, effort=ams_env.EFFORT_SYNTHESIS, timeout_s=180, model=ams_env.judge_model("synthesis"))
     except Exception:  # noqa: BLE001 — never raise out of the gate
         return None
     return res if isinstance(res, dict) else None
@@ -556,7 +556,7 @@ def promotion_gate_verdict(memory_id: str, candidate_text: str, evidence_record,
             # end-of-run aggregate); every verdict now writes its own dream-gate ledger row.
             try:
                 ams_env.write_usage("dream-gate", tokens_used=codex_tokens, duration_ms=codex_ms,
-                                    model_requested=ams_env.MODEL_SYNTHESIS, effort_requested=ams_env.EFFORT_SYNTHESIS,
+                                    model_requested=ams_env.judge_model("synthesis"), effort_requested=ams_env.EFFORT_SYNTHESIS,
                                     # resolved model/effort: the native transport does not parse the codex header
                                     # (Parse-CodexHeader has no Python twin yet), so the fields stay empty rather
                                     # than claim a value; codex-usage-report counts them as unparsed, never as drift.

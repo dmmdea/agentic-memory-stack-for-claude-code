@@ -75,12 +75,22 @@ stack_env_list() {  # $1 = a list separated by commas and/or whitespace -> "a,b,
 #     alias text-only (no --mmproj projector; a replica on a small card). Read, after the process
 #     environment, by mem0-server/embedder_profile.py (media_enabled), per call: media adds and media
 #     searches then answer 400 here and /health/deep reports checks.media.enabled false.
-# The installer flags that set a key here: linux-authority.sh --promotion-gate-mode, and on a WSL box
+#   MEM0_JUDGE_PROVIDER (codex|anthropic; absent means codex): who does the stack's LLM work, the Codex
+#     CLI or the Claude API (docs/systems/judge-provider.md). MEM0_ANTHROPIC_WORKSPACE_ID: the workspace
+#     header a Claude API key that is not scoped to one workspace needs. MEM0_JUDGE_MODEL_SYNTHESIS and
+#     MEM0_JUDGE_MODEL_CLASSIFY: the Claude models of the two job classes. MEM0_JUDGE_MONTHLY_BUDGET_USD:
+#     this box's monthly spend cap on that API (0 turns it off). All five are read, after the process
+#     environment, by mem0-server/anthropic_judge.py on every call, so by the server and by every job
+#     that judges; none of them matters while the provider is codex. A rewrite that dropped the
+#     provider line would put the box back on Codex, and one that dropped the cap would restore the
+#     default cap. The API key itself is never in this file (docs/systems/key-custody.md).
+# The installer flags that set a key here: linux-authority.sh --promotion-gate-mode, --judge-provider and
+# --anthropic-workspace-id, and on a WSL box
 # install.ps1 -MediaEmbedder (MEM0_SET_MEDIA_EMBEDDER in install/1-wsl-services.sh). A writer that
 # sets a key passes its name as a skip argument to stack_env_carry (or replaces the carried line) so
 # the line is written exactly once.
 # A new hand-set key goes here.
-STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK MEM0_WIKI_EMBED_PROFILE MEM0_QDRANT_COLLECTION MEM0_COLLECTION MEM0_EPISODES_COLLECTION MEM0_WIKI_COLLECTION MEM0_RELEVANCE_THRESHOLD MEM0_RAW_FALLBACK_COSINE_FLOOR MEM0_NLI_GATE_COSINE_FLOOR MEM0_MEDIA_EMBEDDER AMS_DECAY_RETIRE"
+STACK_ENV_OPERATOR_KEYS="MEM0_BRAIN_SSH MEM0_PROMOTION_GATE_MODE MEM0_SHARED_BRANDS MEM0_BRAND_MAP MEM0_NLI_GATE_ENABLED MEM0_POOL_HEALTH_ACK MEM0_WIKI_EMBED_PROFILE MEM0_QDRANT_COLLECTION MEM0_COLLECTION MEM0_EPISODES_COLLECTION MEM0_WIKI_COLLECTION MEM0_RELEVANCE_THRESHOLD MEM0_RAW_FALLBACK_COSINE_FLOOR MEM0_NLI_GATE_COSINE_FLOOR MEM0_MEDIA_EMBEDDER AMS_DECAY_RETIRE MEM0_JUDGE_PROVIDER MEM0_ANTHROPIC_WORKSPACE_ID MEM0_JUDGE_MODEL_SYNTHESIS MEM0_JUDGE_MODEL_CLASSIFY MEM0_JUDGE_MONTHLY_BUDGET_USD"
 # The embedding-space keys (mem0-server/embedder_profile.py reads them from this file when the process
 # environment has none) are carried by PATTERN, not by name, so a profile added later is covered:
 # MEM0_EMBED_PROFILE, the alias overrides MEM0_EMBED_MODEL (EmbeddingGemma-300m only) and

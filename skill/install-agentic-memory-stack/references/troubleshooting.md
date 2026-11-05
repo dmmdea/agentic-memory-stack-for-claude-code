@@ -74,7 +74,7 @@ ls -lh ~/.mem0/backups/
 | `Prereq: WSL mirrored networking MISSING` | Add `[wsl2]\nnetworkingMode = mirrored` to `%USERPROFILE%\.wslconfig`, then `wsl --shutdown` and re-run |
 | `Prereq: systemd in WSL MISSING` | Add `[boot]\nsystemd=true` to `/etc/wsl.conf` (inside WSL), then `wsl --shutdown` and re-run |
 | `No WSL distro found` | `wsl --install -d Ubuntu` (or any distro), or pass `-Distro <name>` (see `wsl -l -q`) |
-| `Prereq: Codex authenticated MISSING` | `codex login` → "Sign in with ChatGPT" (an API-key login is not accepted) |
+| `Prereq: Codex authenticated MISSING` | On the Codex provider (the default): `codex login` → "Sign in with ChatGPT" (an API-key login is not accepted). On the Claude API provider the prerequisite asks for the key file instead (`~/.mem0/anthropic-key` in the WSL distro) |
 | `Prereq: codex.cmd MISSING` | `npm i -g @openai/codex` so the shim lands at `%USERPROFILE%\AppData\Roaming\npm\codex.cmd`; a Codex installed another way (pnpm, scoop) is not found |
 | `Prereq: Python 3.12+ in WSL MISSING` | Use a distro whose `python3` is 3.12+ (`wsl --install -d Ubuntu-24.04`, then `-Distro Ubuntu-24.04`); `apt install python3` on Ubuntu 22.04 gives 3.10 |
 | `Prereq: llama-swap :11436 reachable in WSL MISSING` | Start llama-swap: [`install/llama-swap-setup.md`](../../../install/llama-swap-setup.md) |

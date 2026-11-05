@@ -4,7 +4,7 @@
 
 The dream consolidator is the nightly job that turns the day's raw `evidence` into durable knowledge: it synthesizes cross-cutting `insight`-tier memories, autonomously promotes a tightly-gated few evidence facts to `canonical`, and rebuilds the lean `MEMORY.md` index. It is the live script `scripts/windows/dream-consolidate.ps1`, run by the Windows Task Scheduler entry `ClaudeCode-DreamConsolidator-3am`. It superseded the earlier single-pass `c1-consolidate.ps1` (a lone evidence→insight pass).
 
-The 4-phase consolidation pattern (orient → gather → consolidate → prune) and the "dream" framing are ported from [`grandamenium/dream-skill`](https://github.com/grandamenium/dream-skill) (MIT License). This stack adapts the concept to its own architecture — a Windows Task Scheduler trigger, a PowerShell orchestrator, a Codex CLI subagent, and a mem0 REST backend — but the conceptual model is MIT-licensed upstream work.
+The 4-phase consolidation pattern (orient → gather → consolidate → prune) and the "dream" framing are ported from [`grandamenium/dream-skill`](https://github.com/grandamenium/dream-skill) (MIT License). This stack adapts the concept to its own architecture — a Windows Task Scheduler trigger, a PowerShell orchestrator, an LLM judge subagent (the Codex CLI by default, or the Claude API; see [judge provider](./judge-provider.md)), and a mem0 REST backend — but the conceptual model is MIT-licensed upstream work.
 
 ## Questions this doc answers
 
@@ -16,7 +16,7 @@ The 4-phase consolidation pattern (orient → gather → consolidate → prune) 
 
 ## Scope
 
-The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insight synthesis, autonomous canonical promotion, `MEMORY.md` rebuild, and the retrieval-drift canary — plus the trigger, the nightly (23h) throttle, the shared Codex mutex, and the missed-run catch-up.
+The nightly cycle: orientation, evidence/transcript gathering, judge-driven insight synthesis, autonomous canonical promotion, `MEMORY.md` rebuild, and the retrieval-drift canary — plus the trigger, the nightly (23h) throttle, the shared Codex mutex, and the missed-run catch-up.
 
 ## Non-scope
 
@@ -36,7 +36,7 @@ The nightly cycle: orientation, evidence/transcript gathering, Codex-driven insi
 
 ## How the system works
 
-The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the nightly throttle and exits immediately if the last successful run was < 23h ago. It then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every Codex call goes through the ChatGPT-subscription Codex CLI, never Claude — see [`codex-hooks.md`](./codex-hooks.md) for why.
+The consolidator fires nightly at 03:00 (Task Scheduler, `-WakeToRun`). It first checks the nightly throttle and exits immediately if the last successful run was < 23h ago. On the Codex provider it then acquires the shared Codex mutex (blocking L1a extractions for its duration) and runs the phases in order, marking the throttle only after a phase completes successfully. Every judge call goes through the configured judge provider, the ChatGPT-subscription Codex CLI by default or a Claude API key, never the interactive Claude login — see [`codex-hooks.md`](./codex-hooks.md) for why.
 
 If the machine is off/asleep at 03:00 the scheduled run is simply missed. `dream-catchup.ps1` — spawned detached from a SessionStart hook — covers that: it does cheap in-process debt checks (a queued promotion, or a last run > 48h ago; pending learn-rules are drained by `learn-rules-drain.ps1`, not by the dream) and nudges `dream-consolidate.ps1` only when there is real work, fail-open throughout. The dream's own nightly throttle + Codex lock prevent a double-run.
 
@@ -110,10 +110,10 @@ The native (Python) dream also stamps `brand` when more than half of the cited m
 
 ### Phase 3.5 — Autonomous canonical promotion
 
-After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second Codex call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task text, leading imperatives and any text the server's imperative canary would refuse) → sort by confidence → **cap at 3** → dedup against the existing canonical set.
+After consolidation, the dream may autonomously promote a few `evidence` facts to `canonical` under a strict, precision-first bar. A second judge call nominates canonical-worthy evidence (evergreen, declarative, ground-truth, cross-session, high-confidence); `Invoke-AutopromoteDecision` (in `autopromote-lib.ps1`) then runs the pure pipeline: parse → structural filter (rejects task text, leading imperatives and any text the server's imperative canary would refuse) → sort by confidence → **cap at 3** → dedup against the existing canonical set.
 
 Each surviving nominee passes through the **4C promotion gate** (`Invoke-PromotionGate`):
-1. **Contradiction gate (all sources):** any contradiction against an existing canonical fact — judged by an *independent, adversarial* Codex pass, never the proposing pass — → BLOCK.
+1. **Contradiction gate (all sources):** any contradiction against an existing canonical fact — judged by an *independent, adversarial* judge pass, never the proposing pass — → BLOCK.
 2. **Source-weighted corroboration:** a `trusted` source (operator-asserted) fast-tracks on the contradiction gate alone; every other source class needs `≥ MinCorroboration` (default **2**) independent observations. Fail-safe: anything not on the trusted allowlist is treated as untrusted.
 
 The gate is **shadow-first**: `MEM0_PROMOTION_GATE_MODE` ∈ `{off, shadow, enforce}` (default `shadow`; also settable persistently via the receipt's `PromotionGateMode`). `shadow` computes and logs the verdict but does not change the promotion decision (calibration); `enforce` makes a BLOCK verdict — or a gate *error* (fail-safe) — skip the promotion; `off` is the kill switch. The single decision point is the unit-tested `Resolve-GateBlocked`.
@@ -163,13 +163,14 @@ promotions, the drift canary before/after, the morning summary and the usage led
 (`dream-gather`, `dream-consolidate`, `dream-promote`, `dream-gate`, `dream`). What differs:
 
 - **Insights run weekly (1.37.0).** Phases 2 and 3 run only when 6.5 days have passed since `last-dream-insights` (`AMS_DREAM_INSIGHT_INTERVAL_S`, `0` = every night; see "Weekly insight cadence" above), so on six nights in seven the gather and consolidate usage rows (`dream-gather`, `dream-consolidate`) are absent and the receipt posts no insight. Everything else runs nightly.
-- **Judge transport.** Every Codex call is `codex_shim_client.judge` on the native transport; its
+- **Judge transport.** Every judge call is `codex_shim_client.judge` (on the Codex provider, the native transport); its
   file lock is the single-flight mutex, and the whole cycle additionally holds
   `~/.mem0/maintenance/dream.lock` so a chain re-entry is a receipted skip.
-- **Quota gate (spec §4).** Before the first judge call the newest plan-window probe
+- **Quota gate (spec §4).** On the Codex provider, before the first judge call the newest plan-window probe
   (`codex-usage-report.py --probe`, run by the unit's `ExecStartPre`) is read; below the 25 %
   reserve the night is skipped with usage outcome `skipped_quota` and the throttle is not marked. An
-  unknown window allows: the rule protects a reserve it can see.
+  unknown window allows: the rule protects a reserve it can see. On the Claude API the dream checks
+  the monthly spend cap at the same point.
 - **Gather input is the store.** Workstation transcripts never reach the authority (the
   transcript-ingest endpoint was cut in review): the corpus is the last 36 h of evidence, each line
   tagged with its `source`, plus the recent episodes; transcripts that exist locally under
@@ -191,7 +192,8 @@ promotions, the drift canary before/after, the morning summary and the usage led
 - **State lives under the dataset.** Receipts (`orient/gather/consolidate/promote/prune.json`), the
   drift snapshots and the morning summary sit under `~/.mem0/maintenance/` (never `/tmp`); the
   throttle stamps are `~/.mem0/maintenance/last-dream` and, since 1.37.0, `last-dream-insights`, written by Python only.
-- **Secrets.** The step unit loads three credentials (`LoadCredentialEncrypted=` lines): the API key
+- **Secrets.** The step unit loads three credentials (`LoadCredentialEncrypted=` lines), plus the Claude
+  API key's when the judge provider is the Claude API ([judge provider](./judge-provider.md)): the API key
   (`ams-api-key`, reached through `MEM0_API_KEY_FILE`), the canonical key (`ams-canonical-key`) and, since
   1.32.5, the service key (`ams-service-key`), all under `$CREDENTIALS_DIRECTORY`. The service key is what
   proves the `dream-consolidator` label on the insight adds and the `touched_by_dream` stamps; it is a
@@ -223,7 +225,7 @@ promotions, the drift canary before/after, the morning summary and the usage led
 
 ## Dependencies
 
-- **Codex CLI** (`gpt-6-astra` at medium effort, ChatGPT-subscription OAuth) for the consolidation and autopromote-nomination calls; gather runs on `gpt-5.6-terra`.
+- **The LLM judge.** On the Codex provider (the default), the Codex CLI (`gpt-6-astra` at medium effort, ChatGPT-subscription OAuth) for the consolidation and autopromote-nomination calls; gather runs on `gpt-5.6-terra`. On the Claude API, `claude-opus-5-5` for consolidation and nomination and `claude-haiku-5-5` for gather ([judge provider](./judge-provider.md)).
 - **The shared Codex mutex** (`memory-common.ps1`) — see [`codex-hooks.md`](./codex-hooks.md).
 - **mem0 REST** on `:18791` and **`mem0-canonize.sh`** for the HMAC-signed promotion.
 - **The service key** (`ams-service-key`, 1.32.5) on the brain: without it the server refuses the dream's insight adds and `touched_by_dream` stamps with `403 service-credential-required`, and on a native authority `mem0.service` itself will not start once its unit names a `.cred` that is missing or does not decrypt (re-run `install/linux-authority.sh`, which regenerates it).

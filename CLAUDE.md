@@ -19,7 +19,8 @@ Linux **authority** runs the server side and Windows + WSL2 or Linux PCs use it 
 3. **llama-swap** — local inference on `127.0.0.1:11436`: the profile's embedder, EmbeddingGemma-2 by default
    (asymmetric task prefixes applied by `mem0-server/egemma_embedder.py`)
    + bge-reranker-v2-m3, both on the GPU with a 300 s idle unload. Setup guide: `install/llama-swap-setup.md`.
-4. **Codex CLI** — optional; runs the unattended extraction/consolidation jobs.
+4. **LLM judge** — optional; runs the unattended extraction/consolidation jobs: the Codex CLI by default,
+   or the Claude API (`docs/systems/judge-provider.md`).
 5. **canonical key** (`~/.mem0/canonical-key`, mode 600; a systemd credential on the native
    authority) — HMAC signing key for
    `tier=canonical` promotions via `scripts/wsl/mem0-canonize.sh` (user-direct CLI

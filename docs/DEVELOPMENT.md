@@ -16,7 +16,7 @@ How to change this system safely: the repo tour, the test suites, the deploy pat
 
 `deploy.sh` in the table means a **WSL** brain or replica. On a **native Linux authority** (`~/.mem0/stack.env` `MEM0_HOST_KIND=native`) every `deploy.sh` step above is instead a re-run `install/linux-authority.sh --bind-ip <MEM0_BIND> --secrets-dir <MEM0_SECRETS_DIR>` from the checkout; `deploy.sh` refuses that host (see below).
 
-Two invariants to respect when placing code: **all LLM judgment goes to Codex** (local models embed/rerank only), and **anything that mutates tiers or deletes must write the ledger**.
+Two invariants to respect when placing code: **all LLM judgment goes to the judge provider**, the Codex CLI by default or the Claude API ([judge provider](./systems/judge-provider.md); local models embed/rerank only), and **anything that mutates tiers or deletes must write the ledger**.
 
 ## Running the tests
 

@@ -10,12 +10,12 @@ Deep-dive on layer 5 of [`ARCHITECTURE.md`](../../ARCHITECTURE.md): the machiner
 | Evidence-vs-evidence supersession sweep | "should the OLDER of two near-duplicates be hidden as stale?" | most-recent non-canonical facts | on-demand (`--evidence-sweep`) |
 | NLI write-gate (opt-in, async) | "does this brand-new record contradict canonical truth?" | each incoming write | at write time, post-response |
 
-All three route judgment to **Codex through the Windows HTTP shim (:18792)** — clean JSON over loopback TCP, API-key-authed, prompts treating memory text as untrusted data inside delimiter blocks with closing-tag neutralization. On the native transport the `codex exec` child is started without `CREDENTIALS_DIRECTORY` and the API-key pointers (`MEM0_API_KEY_FILE`, `MEM0_KEY`, `MEM0_API_KEY`), because a judge reads memory text any key holder can write (1.32.5); that removes the pointer, not the files, so the sandbox stays the real boundary.
+All three route judgment to **the judge provider** (the Codex CLI by default, or the Claude API; see [judge provider](./judge-provider.md)). On the Codex provider on a WSL-hosted brain the route is the **Windows HTTP shim (:18792)**: clean JSON over loopback TCP, API-key-authed. On every provider the prompts treat memory text as untrusted data inside delimiter blocks with closing-tag neutralization. On the native Codex transport the `codex exec` child is started without `CREDENTIALS_DIRECTORY` and the API-key pointers (`MEM0_API_KEY_FILE`, `MEM0_KEY`, `MEM0_API_KEY`), because a judge reads memory text any key holder can write (1.32.5); that removes the pointer, not the files, so the sandbox stays the real boundary.
 
 ### Why local models never judge (measured, twice)
 
 - An early local 3-B judge answered YES on **9/9** pairs spuriously; the later re-judge measured **78 % false positives** on local verdicts.
-- The weekly systemd unit therefore judges with Codex — never local. Two distinct refusal mechanisms guard this: `--rejudge-stamped` **refuses outright** with a non-Codex judge (`refused:non-codex-judge` — a local verdict must never resolve flags), and any Codex-judged pass **no-ops when the shim is down** (`no-op:codex-shim-unreachable`) rather than silently falling back to a local judge. A deliberately local main-sweep pass still runs, but writes only advisory *pending* flags the gate ignores.
+- The weekly systemd unit therefore judges with the configured judge provider (`--judge codex`, whichever provider that is) — never local. Two distinct refusal mechanisms guard this: `--rejudge-stamped` **refuses outright** with a local judge (`refused:non-codex-judge` — a local verdict must never resolve flags), and any pass judged through the Codex shim **no-ops when the shim is down** (`no-op:codex-shim-unreachable`) rather than silently falling back to a local judge. A deliberately local main-sweep pass still runs, but writes only advisory *pending* flags the gate ignores.
 
 ### Why there are two different judge questions (measured)
 
@@ -51,7 +51,7 @@ The load-bearing asymmetry: **clearing a flag is safe and automated; hiding is d
 - *Direction.* A YES whose candidate is **newer than the canonical** may be the correction, with the canonical the stale one. It is routed to the review queue as `kind: canonical-possibly-stale` (with `stale_canonical_id`, deliberately not `canonical_id`, so `--promote` cannot act on it) and the candidate gets only the `contradiction_checked_at` marker; nothing is hidden. The operator resolves it by refreshing or demoting the canonical, then `--dismiss <memory_id>` (which drops every queue line for that memory); the weekly sweep also drops the line by itself once its `stale_canonical_id` is no longer a live canonical (`stale_review_pruned` in the summary), and the queue's idempotency is per `(memory_id, kind, stale canonical)`, so a candidate already queued for `--promote` still gets its stale record. `--promote` leaves the stale line in place. A YES on an *older* candidate is stamped as before.
 - *Stamps are re-judged on the brain.* The Sunday unit runs `--then-rejudge-stamped` (the sweep, then `--rejudge-stamped` with the same `--judge codex --apply`, under one chain step and one receipt). The re-judge clears NO-verdict stamps, dangling stamps, and stamps whose target was **demoted or retired** (no judge call: nothing is left to contradict), as `cleared_ids[].reason` `dangling-canonical` / `target-demoted:<tier>` / `target-retired`.
 
-So the honest statement is: *new evidence-vs-evidence hides and pending-flag promotions are always human-gated; the weekly canonical-anchored sweep auto-enforces authoritative Codex verdicts.* Recovery is uniform regardless of path: `--unstamp <id>` un-hides in one command (on the authority, through `ams-service-run.sh`, see below; `--unsupersede <id>` for a supersession), the forensic `history` class always sees hidden records, and the next re-judge auto-clears anything Codex no longer stands behind. The SessionStart banner surfaces the queue depth.
+So the honest statement is: *new evidence-vs-evidence hides and pending-flag promotions are always human-gated; the weekly canonical-anchored sweep auto-enforces authoritative judge verdicts.* Recovery is uniform regardless of path: `--unstamp <id>` un-hides in one command (on the authority, through `ams-service-run.sh`, see below; `--unsupersede <id>` for a supersession), the forensic `history` class always sees hidden records, and the next re-judge auto-clears anything the judge no longer stands behind. The SessionStart banner surfaces the queue depth.
 
 **The incident behind the queue:** an early auto-enforce pass over *pending* flags hid **3 out of 4 perfectly consistent facts** on single Codex YES verdicts (2026-06-30). The queue has gated that path — and all evidence-vs-evidence hides — since. Note the historical wrinkle: the weekly unit judged locally (advisory-only) until the C5 hardening switched it to Codex for verdict quality, which made the Sunday pass enforcement-capable again; if a Sunday stamp ever looks wrong, `--unstamp` + the re-judge are the designed recovery.
 
@@ -66,7 +66,7 @@ flowchart LR
     B -->|"operator: judged false"| U["--unstamp / drop from queue"]
     B -->|"supersede line: --resolve-supersede id --winner w"| SU["superseded_by recorded through the supersede endpoint<br/>line dequeued"]
     SU -->|"wrong call later"| U3["--unsupersede"]
-    W["weekly canonical sweep, Codex YES"] -->|"auto-enforced (no queue)"| E
+    W["weekly canonical sweep, judge YES"] -->|"auto-enforced (no queue)"| E
     E -->|"wrong call later"| U2["--unstamp — one command, ledgered"]
     E --> H["always visible in query_class=history"]
 ```
@@ -109,7 +109,7 @@ It scrolls every non-canonical record and parses each marker with the parser the
 
 ## The NLI write-gate (poisoning defense at the door)
 
-Env-gated (`MEM0_NLI_GATE_ENABLED`, default off) and **async** — it runs as a background task after the write's HTTP response, so the hot path never waits. Fast pre-filter first: a canonical-tier search at cosine ≥ 0.5, top-3; Codex is invoked only when a genuinely high-similarity canonical neighbor exists. **Fails open** on every uncertainty (empty text, no neighbor, search error, shim down, unparseable, NO) — only a confident contradiction flags. Combined with the extractor's redaction and the L10 injection-shaped heuristics, this is the anti-poisoning stack; the unforgeable canonical tier bounds the blast radius of anything that slips through.
+Env-gated (`MEM0_NLI_GATE_ENABLED`, default off) and **async** — it runs as a background task after the write's HTTP response, so the hot path never waits. Fast pre-filter first: a canonical-tier search at cosine ≥ 0.5, top-3; the judge is invoked only when a genuinely high-similarity canonical neighbor exists. **Fails open** on every uncertainty (empty text, no neighbor, search error, shim down, unparseable, NO) — only a confident contradiction flags. Combined with the extractor's redaction and the L10 injection-shaped heuristics, this is the anti-poisoning stack; the unforgeable canonical tier bounds the blast radius of anything that slips through.
 
 ## Operating it
 
@@ -117,8 +117,8 @@ Day-2 commands, banners, and the shim's availability model are in [`operations.m
 
 ## Design principles of the layer (summary)
 
-1. **Authoritative judgment only** — Codex or refuse to run; advisory flags are never enforced.
-2. **Asymmetric automation** — un-hiding is always automated; hiding requires a human on the re-judge and evidence-sweep paths (the weekly canonical sweep auto-enforces Codex verdicts — recoverable via `--unstamp` + forensic visibility).
+1. **Authoritative judgment only** — the configured judge or refuse to run; advisory flags are never enforced.
+2. **Asymmetric automation** — un-hiding is always automated; hiding requires a human on the re-judge and evidence-sweep paths (the weekly canonical sweep auto-enforces judge verdicts — recoverable via `--unstamp` + forensic visibility).
 3. **Different questions, different judges** — contradiction ≠ staleness; each has its own calibrated prompt.
 4. **Nothing is unrecoverable** — forensic class, `--unstamp`, `--unsupersede`, append-only ledger.
 5. **Every policy here is scar tissue** — the 78 % local-FP rate, the 9/9 spurious YES, the 3/4 auto-hide incident, and the ⅔ ship-log over-flagging are all *measured* failures the current design encodes.

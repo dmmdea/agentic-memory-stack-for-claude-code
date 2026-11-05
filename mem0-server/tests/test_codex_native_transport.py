@@ -229,3 +229,57 @@ def test_the_judge_child_inherits_no_credential_pointer(monkeypatch):
     for k in ("CREDENTIALS_DIRECTORY", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY"):
         assert k not in env, k
     assert env.get("CODEX_HOME") == "/secrets/codex", "codex still finds its own login"
+
+
+def test_the_claude_api_transport_keeps_its_money_and_key_contract(monkeypatch, tmp_path):
+    """What an operator relies on when the judge provider is the Claude API. The key goes from its
+    file to the client and nowhere else: no file means no call (no other provider is tried), and the
+    environment never holds it. Every call that reached the provider is in the month's ledger, and
+    once the ledger has reached the cap the next call is refused before it is made."""
+    import types
+
+    import anthropic_judge as aj
+
+    for k in ("CREDENTIALS_DIRECTORY", "MEM0_ANTHROPIC_KEY_FILE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEM0_JUDGE_PROVIDER", "anthropic")
+    monkeypatch.setenv("MEM0_JUDGE_MONTHLY_BUDGET_USD", "1")
+    seen = {"keys": [], "requests": []}
+
+    class _Messages:
+        def create(self, **kw):
+            seen["requests"].append(kw)
+            return types.SimpleNamespace(
+                model=kw["model"], stop_reason="end_turn",
+                usage=types.SimpleNamespace(input_tokens=200_000, output_tokens=20_000),
+                content=[types.SimpleNamespace(type="thinking", thinking="..."),
+                         types.SimpleNamespace(type="text", text=" ok ")])
+
+    def factory(key, timeout_s):
+        seen["keys"].append(key)
+        messages = _Messages()
+        return types.SimpleNamespace(messages=messages, beta=types.SimpleNamespace(messages=messages))
+
+    out = csc.judge("p", effort="low", timeout_s=30, model="claude-opus-5-5")
+    assert out["ok"] is False and out["error_type"] == "no_key", out
+    assert out["transport"] == "anthropic", "a missing key must not send the call to another provider"
+
+    key = "sk-ant-test-" + "k" * 40
+    keyfile = tmp_path / ".mem0" / "anthropic-key"
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
+    keyfile.write_text(key + "\n", encoding="utf-8")
+    out = aj.judge_once("p", "low", 30, "claude-opus-5-5", _client_factory=factory)
+    assert out["ok"] is True and out["response"] == "ok", out
+    assert seen["keys"] == [key] and key not in os.environ.values()
+    assert seen["requests"][0]["fallbacks"] == "default"
+    # 200K in at $4/M + 20K out at $20/M = $1.20, written to the ledger by the transport itself
+    assert out["cost_usd"] == pytest.approx(1.2) and aj.month_spend_usd() == pytest.approx(1.2)
+
+    refused = aj.judge_once("p", "low", 30, "claude-opus-5-5", _client_factory=factory)
+    assert refused["ok"] is False and refused["error_type"] == "budget_exceeded", refused
+    assert len(seen["requests"]) == 1, "a call over the cap must not reach the provider"
+
+    monkeypatch.setenv("MEM0_JUDGE_MONTHLY_BUDGET_USD", "twenty")   # a typo never removes the cap
+    assert aj.budget_usd() == aj.DEFAULT_MONTHLY_BUDGET_USD
+    monkeypatch.setenv("MEM0_JUDGE_MONTHLY_BUDGET_USD", "0")        # 0 is the documented off switch
+    assert aj.judge_once("p", "low", 30, "claude-haiku-5-5", _client_factory=factory)["ok"] is True

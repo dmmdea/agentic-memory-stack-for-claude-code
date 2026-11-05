@@ -68,7 +68,13 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     window = None
-    if args.probe:
+    if args.probe and ams_env.judge_provider() == "anthropic":
+        # The plan window belongs to the Codex login. On the Claude API the allowance is the
+        # monthly spend cap, which the judge reads from its own ledger; there is nothing to probe.
+        if not (args.gate or args.json):
+            print("codex-window: not probed (the judge provider is the Claude API)", flush=True)
+            return 0
+    elif args.probe:
         window = cu.probe_window(ams_env.codex_home())
         if not (args.gate or args.json):
             # a bare --probe (the dream step's ExecStartPre) prints one line, not the whole table

@@ -23,6 +23,18 @@ PORT="${MEM0_CODEX_SHIM_PORT:-18792}"
 POLL_SECONDS="${1:-90}"
 PSEXE="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
+# On the Claude API provider the judge calls the API directly and no caller needs the shim, so
+# there is nothing to bring up (docs/systems/judge-provider.md). The environment wins over
+# stack.env, as it does for the judge itself.
+JUDGE_PROVIDER="${MEM0_JUDGE_PROVIDER:-}"
+if [ -z "$JUDGE_PROVIDER" ] && [ -f "$HOME/.mem0/stack.env" ]; then
+    JUDGE_PROVIDER="$(sed -n 's/^MEM0_JUDGE_PROVIDER=//p' "$HOME/.mem0/stack.env" | tail -n 1 | tr -d '\r')"
+fi
+if [ "$JUDGE_PROVIDER" = anthropic ]; then
+    echo "judge provider is the Claude API: no codex-shim needed"
+    exit 0
+fi
+
 # Already up? (cheap, no interop needed)
 if curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     echo "codex-shim already listening on :${PORT}"

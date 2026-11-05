@@ -1,5 +1,5 @@
 [Unit]
-Description=AMS chain step: contradiction sweep, Codex judge (weekly)
+Description=AMS chain step: contradiction sweep, LLM judge (weekly)
 PartOf=ams-nightly.target
 After=mem0.service ams-step-goals-stale-sweep.service
 

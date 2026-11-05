@@ -121,7 +121,7 @@ echo "  Qdrant config refreshed (loopback bind enforced)"
 MEM0_DIR="$USER_HOME/apps/mem0-server"
 # Every module app.py imports must be deployed (fix-pass: the old app.py+config.py
 # pair crash-looped fresh installs on ModuleNotFoundError for the newer modules).
-MEM0_MODULES="app.py config.py embedder_profile.py fusion.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py nli_write_gate.py episode_embeddings.py egemma_embedder.py media.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
+MEM0_MODULES="app.py config.py embedder_profile.py fusion.py reranker.py admission_gate.py episodic.py canonical_key_provider.py hook_contract.py security_invariants.py freshness.py codex_shim_client.py anthropic_judge.py nli_write_gate.py episode_embeddings.py egemma_embedder.py media.py imperative_canary.py redact.py payload_carryover.py sparse_health.py mojibake_check.py capabilities.py job_liveness.py drift_state.py pair_cache.py maintenance_health.py embedder_503.py write_path.py supersession.py"
 if [ ! -d "$MEM0_DIR/.venv" ]; then
     echo "==> Setting up mem0 server at $MEM0_DIR"
     mkdir -p "$MEM0_DIR"
@@ -165,7 +165,7 @@ if [ ! -d "$MEM0_DIR/.venv" ]; then
     # — is the defense against a future breaking fastembed release.
     # numpy: scripts/wsl/semantic-dedup.py scores duplicate pairs with blocked matrix products
     # (it arrives transitively with fastembed today; the dedup must not depend on that).
-    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' pip-audit
+    ./.venv/bin/pip install --quiet 'mem0ai[nlp]>=2.0.4' fastembed numpy 'fastmcp>=3' fastapi uvicorn[standard] httpx pydantic 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' 'anthropic>=2' pip-audit
     echo "  mem0 venv ready"
 else
     echo "==> mem0 venv exists at $MEM0_DIR/.venv (refreshing source files)"
@@ -188,7 +188,7 @@ else
     # a live box actually takes on re-run. Adding it only to the fresh-install
     # line would never heal an existing venv (that is exactly how the leg died:
     # a venv rebuild dropped it and nothing re-installed it).
-    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' pip-audit || \
+    "$MEM0_DIR/.venv/bin/pip" install --quiet 'starlette>=1.3.1' 'cryptography>=50.0.1' 'pyjwt>=2.15.0' 'mem0ai[nlp]>=2.0.4' fastembed 'fastmcp>=3' 'anthropic>=2' pip-audit || \
         echo "  WARN: pip could not reach an index (offline?) — verifying existing versions…"
 fi
 
@@ -437,6 +437,48 @@ if [ -n "${MEM0_SET_MEDIA_EMBEDDER:-}" ]; then
     done
     STACK_ENV_CARRY=(${ME_KEEP[@]+"${ME_KEEP[@]}"} "MEM0_MEDIA_EMBEDDER=$MEM0_SET_MEDIA_EMBEDDER")
     echo "  media embedder recorded: $MEM0_SET_MEDIA_EMBEDDER"
+fi
+# 1.40.0: MEM0_SET_JUDGE_PROVIDER=codex|anthropic records who does this box's LLM work (install.ps1
+# -JudgeProvider): the Codex CLI on its ChatGPT login, or the Claude API on the key in ~/.mem0/anthropic-key.
+# MEM0_SET_ANTHROPIC_WORKSPACE_ID records the workspace header a key that is not scoped to one workspace
+# needs (install.ps1 -AnthropicWorkspaceId). Both are carried like any operator key; the models and the
+# monthly spend cap are operator keys with no switch (docs/systems/judge-provider.md).
+if [ -n "${MEM0_SET_JUDGE_PROVIDER:-}" ]; then
+    case "$MEM0_SET_JUDGE_PROVIDER" in
+        codex|anthropic) ;;
+        *) echo "FATAL: MEM0_SET_JUDGE_PROVIDER='$MEM0_SET_JUDGE_PROVIDER' must be codex or anthropic; stack.env was not touched" >&2; exit 1 ;;
+    esac
+fi
+if [ -n "${MEM0_SET_ANTHROPIC_WORKSPACE_ID:-}" ]; then
+    case "$MEM0_SET_ANTHROPIC_WORKSPACE_ID" in
+        *[!A-Za-z0-9_-]*) echo "FATAL: MEM0_SET_ANTHROPIC_WORKSPACE_ID holds a character outside A-Z a-z 0-9 _ -; stack.env was not touched" >&2; exit 1 ;;
+    esac
+fi
+for jp_pair in "MEM0_JUDGE_PROVIDER=${MEM0_SET_JUDGE_PROVIDER:-}" "MEM0_ANTHROPIC_WORKSPACE_ID=${MEM0_SET_ANTHROPIC_WORKSPACE_ID:-}"; do
+    jp_key="${jp_pair%%=*}"
+    [ -n "${jp_pair#*=}" ] || continue
+    JP_KEEP=()
+    for kv in ${STACK_ENV_CARRY[@]+"${STACK_ENV_CARRY[@]}"}; do
+        [ "${kv%%=*}" = "$jp_key" ] || JP_KEEP+=("$kv")
+    done
+    STACK_ENV_CARRY=(${JP_KEEP[@]+"${JP_KEEP[@]}"} "$jp_pair")
+    echo "  judge setting recorded: $jp_key"
+done
+# The provider in force after this run: the switch, else what the carry holds, else codex.
+JP_ACTIVE=codex
+for kv in ${STACK_ENV_CARRY[@]+"${STACK_ENV_CARRY[@]}"}; do
+    [ "$kv" = "MEM0_JUDGE_PROVIDER=anthropic" ] && JP_ACTIVE=anthropic
+done
+if [ "$JP_ACTIVE" = anthropic ]; then
+    JP_KEY="$USER_HOME/.mem0/anthropic-key"
+    if [ ! -s "$JP_KEY" ]; then
+        echo "  WARN: the judge provider is the Claude API but $JP_KEY is missing or empty. Every LLM job on this box fails until it exists: (umask 077; cat > $JP_KEY), paste the key, press Enter, then Ctrl-D" >&2
+    else
+        case "$(stat -c %a "$JP_KEY" 2>/dev/null)" in
+            600|400) echo "  judge provider: the Claude API (key file $JP_KEY, owner-only)" ;;
+            *) chmod 600 "$JP_KEY" && echo "  judge provider: the Claude API (key file $JP_KEY; its mode was open to other users and is now 600)" ;;
+        esac
+    fi
 fi
 # A Windows user name or repo path with a space would make every `. stack.env` run its second
 # word as a command (the 1.31.1 wiki-sources outage class), so such a value is refused here.

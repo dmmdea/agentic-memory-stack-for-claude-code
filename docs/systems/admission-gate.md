@@ -389,9 +389,10 @@ records (same `user_id`; same brand or null-brand) via direct Qdrant
 instruct LLM via llama-swap (`:11436/v1/chat/completions`) whether the
 candidate contradicts the canonical statement.
 
-- **Judge:** Codex by default, through the shared judge bridge (`judge_contradiction`, the
-  Codex HTTP shim on a Windows-hosted brain, `codex exec` natively on the authority); the
-  model is pinned per job (see [`codex-hooks.md`](./codex-hooks.md), *Model routing*).
+- **Judge:** the configured judge provider (the Codex CLI by default, or the Claude API; see
+  [`judge-provider.md`](./judge-provider.md)), through the shared judge bridge (`judge_contradiction`;
+  on the Codex provider, the Codex HTTP shim on a Windows-hosted brain, `codex exec` natively on the
+  authority); the model is pinned per job (see [`codex-hooks.md`](./codex-hooks.md), *Model routing*).
   `--judge local` keeps a cheap, offline pass on a local instruct model served by
   llama-swap (`--model` names it; `curl :11436/v1/models` lists what is available). Local
   flags are advisory only (the admission gate hides them, self-heal re-judges) and never

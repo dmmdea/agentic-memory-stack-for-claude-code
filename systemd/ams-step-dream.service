@@ -1,5 +1,5 @@
 [Unit]
-Description=AMS chain step: dream consolidator (Python port; native Codex judge; quota gate)
+Description=AMS chain step: dream consolidator (Python port; native LLM judge; allowance gate)
 PartOf=ams-nightly.target
 After=mem0.service
 

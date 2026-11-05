@@ -179,7 +179,7 @@ TRUSTED_PATCH_ACTORS: dict[str, frozenset[str]] = {
     # (scripts/wsl/contradiction-sweep.py): YES verdicts stamp both keys,
     # NO verdicts stamp only contradiction_checked_at (idempotency marker).
     # v0.29.4: contradicts_canonical_pending is the LOCAL (advisory) judge's stamp —
-    # the admission gate IGNORES it (never hides a record); only an authoritative Codex
+    # the admission gate IGNORES it (never hides a record); only an authoritative judge
     # re-judge promotes it to contradicts_canonical (enforced). Same trusted actor.
     "contradiction-sweep-v019": frozenset({"contradicts_canonical", "contradiction_checked_at",
                                            "contradicts_canonical_pending"}),

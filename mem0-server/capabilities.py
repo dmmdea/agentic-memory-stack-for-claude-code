@@ -165,8 +165,9 @@ CAPABILITIES = [
      "probe": "job_liveness.prune_age_h (prune.json receipt age)",
      "required": "brain", "escalation_documented": True},
     {"id": "codex-auth",
-     "what": "Codex CLI auth serving dream judgment",
-     "probe": "derived: a fresh dream ran, therefore its judge authenticated",
+     "what": "LLM judge credentials serving dream judgment (the Codex login, or the Claude API key)",
+     "probe": "Codex: derived, a fresh dream ran, therefore its judge authenticated; "
+              "Claude API: the key file and the SDK are present",
      "required": "brain", "escalation_documented": True},
     # ---- W4: the eight formerly-blind rows, now probe-backed ----
     {"id": "reranker",
@@ -450,6 +451,15 @@ def _drift_guard_state(check):
 
 
 def _codex_auth_state(jl):
+    # On the Claude API the credential is a key file this process can see, so its presence is
+    # read directly. A key the provider rejects still shows up as a failed dream step.
+    try:
+        import anthropic_judge
+        if anthropic_judge.provider() == "anthropic":
+            h = anthropic_judge.health()
+            return "alive" if (h.get("key_present") and h.get("sdk")) else "dead"
+    except Exception:  # noqa: BLE001 (a health row must never raise)
+        pass
     # V1 keeps this honest and simple: a fresh dream ran end-to-end, therefore
     # its Codex judge authenticated. Anything else is 'unknown' — a stale or
     # absent dream proves nothing about the auth token either way.

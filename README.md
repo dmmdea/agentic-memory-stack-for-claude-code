@@ -4,7 +4,7 @@
 
 A persistent, multi-tier, **measurably faithful** memory backend for [Claude Code](https://docs.claude.com/en/docs/claude-code): one always-on **authority** holds the memory, and any number of Windows + WSL2 or Linux PCs use it. It captures durable facts from your sessions, consolidates them into higher-order insights, surfaces the right one before each prompt, and governs against drift — with a causal-intervention eval proving the memory actually changes behavior.
 
-> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (Codex CLI), one 18-step nightly chain on the native-Linux authority (consolidation, dedup, backups, health), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a canonical-key credential kept out of the store (a systemd credential on the native authority, a DPAPI blob on a Windows-hosted authority).
+> **What it is:** semantic memory (mem0 + Qdrant + EmbeddingGemma), background extraction (an LLM judge: the Codex CLI by default, or the Claude API; see [judge provider](docs/systems/judge-provider.md)), one 18-step nightly chain on the native-Linux authority (consolidation, dedup, backups, health), tiered trust (evidence → insight → canonical), an episodic/goals/open-questions sidecar, and a canonical-key credential kept out of the store (a systemd credential on the native authority, a DPAPI blob on a Windows-hosted authority).
 >
 > **What it is NOT:** a Claude Code feature. It's external infrastructure: one authority (a Linux box, or a Windows PC with WSL2 that is its own authority) plus a PC install on each machine you code on.
 
@@ -13,7 +13,7 @@ A persistent, multi-tier, **measurably faithful** memory backend for [Claude Cod
 - **Zero-effort capture** — facts are extracted from your sessions automatically (session end, compaction, nightly consolidation), behind an inferability gate that keeps generic noise out and a redaction chokepoint that keeps credentials out.
 - **Right memory, right moment** — the top 1–2 relevant memories are injected above each prompt (or *nothing*, if nothing clears the calibrated relevance gate); `memory_recall` / `memory_search` MCP tools for deeper, deliberate pulls on top of that injection; a resume précis at session start.
 - **Trust, not just recall** — five tiers from auto-captured `evidence` up to HMAC-locked `canonical` ground truth; an admission gate hides superseded, contradicted, or wrong-workspace records at read time; time-sensitive tiers age out on a Weibull curve.
-- **A memory that polices itself** — weekly Codex-judged contradiction sweeps, an on-demand supersession sweep, an optional write-time NLI gate, and a queue-gated resolution policy: false flags auto-clear, evidence-vs-evidence hides are human-confirmed, and every hide is one-command reversible and forensically visible.
+- **A memory that polices itself** — weekly LLM-judged contradiction sweeps, an on-demand supersession sweep, an optional write-time NLI gate, and a queue-gated resolution policy: false flags auto-clear, evidence-vs-evidence hides are human-confirmed, and every hide is one-command reversible and forensically visible.
 - **Boring-by-design operations** — nightly/weekly hygiene run as one receipted chain (dedup, decay, backups ×8 with integrity checks; the L10 audit runs on its own 6-hour timer), an append-only audit ledger, a private-network-only bind + API-key security, and a full MCP tool family (memory, episodic, goals, open questions).
 
 ```mermaid
@@ -21,7 +21,7 @@ flowchart LR
     A["Claude Code sessions"] -->|"hooks: extract + capture"| B["mem0 server :18791<br/>tiers + admission gate"]
     B --> C["Qdrant :6333<br/>768-d vectors"]
     B -->|"embed / rerank"| D["llama-swap :11436<br/>EmbeddingGemma + bge (GPU)"]
-    E["Codex CLI (per-job model)"] -->|"extraction / consolidation / judgment"| B
+    E["LLM judge (Codex CLI or Claude API)"] -->|"extraction / consolidation / judgment"| B
     B -->|"top K=1-2 past the relevance gate, or abstain"| A
 ```
 
@@ -52,7 +52,7 @@ The installer you run decides the topology. In every one, mem0 + Qdrant + llama-
 Topology (c) is a thin client, not a stand-alone stack. What it installs, from `install/linux-client.sh`:
 
 - the `mem0` MCP server (the shim) and the outbox: while the authority is unreachable, reads return an offline result and writes queue to `~/.mem0/outbox.jsonl` and replay later;
-- capture hooks (Stop, PreCompact, SessionStart), but only when `pwsh` 7 and a logged-in `codex` are present; without them the step is skipped with a message;
+- capture hooks (Stop, PreCompact, SessionStart), but only when `pwsh` 7 and a logged-in `codex` are present; without them the step is skipped with a message (this installer has no judge-provider switch yet, so a native Linux client captures through the Codex CLI);
 - the fleet-store hooks, only with `--ams-hub`.
 
 It does **not** install the per-prompt `[MEMORY CONTEXT]` injection (no `UserPromptSubmit` hook is registered on Linux), the nightly dream, or a local store. `install/linux-replica.sh` adds a dormant read-only copy for offline use on top of it. The authority install (`linux-authority.sh`) sets up the server only: it registers no hooks and no MCP server on its own box. To use the memory from the authority box itself, run the client installer there too ([docs/operations.md](./docs/operations.md), "a local client on the native Linux authority").
@@ -69,7 +69,7 @@ Terms: a **tenant** is the `user_id` the memory is stored under; the **authority
 | **WSL2** with a Linux distro, `mirrored` networking, systemd enabled | mem0/Qdrant (or the replica's dormant copy) run here. `%USERPROFILE%\.wslconfig`: `[wsl2]` `networkingMode=mirrored`; `/etc/wsl.conf`: `[boot]` `systemd=true`; then `wsl --shutdown` |
 | **Python 3.12+** in WSL (`python3`), `curl`, `jq`, Node.js 22+ | Ubuntu 24.04 ships 3.12 (`wsl --install -d Ubuntu-24.04`); Ubuntu 22.04's `python3` is 3.10 and fails the check |
 | [Claude Code](https://docs.claude.com/en/docs/claude-code) | The host you are augmenting |
-| [Codex CLI](https://github.com/openai/codex) from npm (`npm i -g @openai/codex`), logged in with **Sign in with ChatGPT** | Background extraction and consolidation. The installer wants the npm shim at `%USERPROFILE%\AppData\Roaming\npm\codex.cmd` and a ChatGPT-subscription login; an API-key login is not accepted |
+| [Codex CLI](https://github.com/openai/codex) from npm (`npm i -g @openai/codex`), logged in with **Sign in with ChatGPT** | Background extraction and consolidation on the Codex provider (the default). The installer wants the npm shim at `%USERPROFILE%\AppData\Roaming\npm\codex.cmd` and a ChatGPT-subscription login; an API-key login is not accepted. Not needed on the Claude API provider, which asks for a key file instead: [judge provider](docs/systems/judge-provider.md) |
 | `git` 2.38+ for Windows | The store binary merges with `git merge-tree` |
 | **llama-swap** serving the embedder and the reranker on `127.0.0.1:11436`, on a GPU | Set it up **before** the installer: [install/llama-swap-setup.md](./install/llama-swap-setup.md). The default embedding profile is `egemma2` (EmbeddingGemma-2, needs llama.cpp **b11452 or later**) plus bge-reranker-v2-m3. A replica (b) needs it too, for its dormant copy |
 
@@ -77,7 +77,7 @@ A Claude subscription login (`~\.claude\.credentials.json`) is reported but not 
 
 **Topology (b) adds:** Tailscale (or another private network) on the authority and on each PC, so the PC can open `http://<authority-host>:18791`. With WSL `mirrored` networking, WSL uses the Windows host's network, so Tailscale runs on the Windows side only. Without Tailscale, bind the authority to a private LAN address and pass that address as `--bind-ip`; the traffic is plain HTTP plus an API key, so keep it on a network you trust.
 
-**A native Linux authority also needs:** an x86_64 Linux box with systemd **256 or later** and a **TPM2** (the installer encrypts the key credentials with `systemd-creds --with-key=host+tpm2`; without a TPM the installer cannot create them), a non-root service user (`sudo loginctl enable-linger <user>` once; the installer tries it), `python3 curl jq iproute2`, `tailscaled` up, llama-swap as above, and, for the nightly dream, Node plus the Codex CLI logged in (the installer warns when either is missing). Python 3.12 comes from `uv`: if `uv` is absent the installer fetches it with `curl -LsSf https://astral.sh/uv/install.sh | sh` into `~/.local/bin`; install `uv` first to skip that download. Optional steps (cloud mirror, RTC wake, store hub, wiki index) are left out of the nightly chain unless configured, and the ZFS replication step skips itself until you provide its script.
+**A native Linux authority also needs:** an x86_64 Linux box with systemd **256 or later** and a **TPM2** (the installer encrypts the key credentials with `systemd-creds --with-key=host+tpm2`; without a TPM the installer cannot create them), a non-root service user (`sudo loginctl enable-linger <user>` once; the installer tries it), `python3 curl jq iproute2`, `tailscaled` up, llama-swap as above, and, for the nightly dream on the Codex provider (the default), Node plus the Codex CLI logged in (the installer warns when either is missing); on the Claude API provider, the key credential instead ([judge provider](docs/systems/judge-provider.md)). Python 3.12 comes from `uv`: if `uv` is absent the installer fetches it with `curl -LsSf https://astral.sh/uv/install.sh | sh` into `~/.local/bin`; install `uv` first to skip that download. Optional steps (cloud mirror, RTC wake, store hub, wiki index) are left out of the nightly chain unless configured, and the ZFS replication step skips itself until you provide its script.
 
 ## 3. Install
 
@@ -116,7 +116,7 @@ shred -u ams-api-key.txt ams-canonical-key.txt
 
 Keep `--name=`: without it decryption under the credential's id fails. The installer creates the third credential, the service key, itself. Details: [docs/systems/key-custody.md](./docs/systems/key-custody.md).
 
-Log the authority's Codex in (the nightly dream and the contradiction sweep use it; the installer warns if it is missing):
+On the Codex provider (the default), log the authority's Codex in (the nightly dream and the contradiction sweep use it; the installer warns if it is missing). Skip this on the Claude API provider:
 
 ```bash
 npm i -g @openai/codex
@@ -225,13 +225,13 @@ sudo systemctl disable --now ams-nft.service; sudo rm -f /etc/systemd/system/ams
 
 **What is kept.** None of the above touches your memory or your keys. The data lives in `~/.mem0` (receipts, ledgers, `episodic.db`, backups, `stack.env`), `~/qdrant-server` (the Qdrant binary and every vector), `~/apps/mem0-server`, `~/apps/mem0-scripts` and, on the authority, `<secrets-dir>` (the `.cred` files). Deleting these destroys the memory; take a backup first ([docs/data-backup.md](./docs/data-backup.md)). The installers also leave `~/models`, llama-swap, llama.cpp, `uv`, `/usr/local/bin/ams-store` (hub installs) and the systemd linger setting in place.
 
-## Why Codex (and not Claude) as the subagent?
+## Why background LLM work does not use the interactive Claude login
 
-Claude Max OAuth enforces a single concurrent session — headless `claude --print` from hooks fails intermittently when an interactive session holds the slot (by design; headless agentic workloads are Anthropic's paid-API territory). Codex CLI authenticates via your **ChatGPT subscription** (separate OAuth, no concurrency block) and runs reliably headless from any Windows shell at zero marginal cost; quality matches for structured extraction. **All LLM judgment routes to Codex; local llama-swap models do embedding/reranking only.**
+Claude Max OAuth enforces a single concurrent session — headless `claude --print` from hooks fails intermittently when an interactive session holds the slot (by design; headless agentic workloads are Anthropic's paid-API territory). Background work therefore uses a credential that is independent of the interactive login: the Codex CLI's **ChatGPT subscription** login (the default; separate OAuth, no concurrency block, runs reliably headless from any Windows shell at zero marginal cost, quality matches for structured extraction), or a Claude API key you supply. **All LLM judgment routes to the judge provider; local llama-swap models do embedding/reranking only.**
 
 ## Architecture
 
-See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full data-flow diagram and **[skill/.../references/architecture.md](./skill/install-agentic-memory-stack/references/architecture.md)** for the summary. Live runtime processes on the authority: `mem0-server` (:18791, the private-network address) + Qdrant (:6333, loopback) + llama-swap (:11436, EmbeddingGemma + bge-reranker on the GPU) + the Codex CLI on demand; on every PC, the Claude Code hooks and the MCP shim. Trust tiers: evidence → insight → canonical (HMAC-gated, CLI-only promotion).
+See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full data-flow diagram and **[skill/.../references/architecture.md](./skill/install-agentic-memory-stack/references/architecture.md)** for the summary. Live runtime processes on the authority: `mem0-server` (:18791, the private-network address) + Qdrant (:6333, loopback) + llama-swap (:11436, EmbeddingGemma + bge-reranker on the GPU) + the LLM judge on demand (the Codex CLI by default, or the Claude API); on every PC, the Claude Code hooks and the MCP shim. Trust tiers: evidence → insight → canonical (HMAC-gated, CLI-only promotion).
 
 ### Faithfulness (R1–R6)
 

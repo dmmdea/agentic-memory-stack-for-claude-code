@@ -313,7 +313,7 @@ fi
 # ---------------------------------------------------------------- 5c. L1a capture
 # The capture path is what makes a box contribute to the corpus rather than only read from it:
 # a Stop / PreCompact / SessionStart hook spawns a worker that reads the just-finished transcript,
-# asks the Codex CLI to extract durable facts, and posts them to the authority. It is written in
+# asks the LLM judge (the Codex CLI by default) to extract durable facts, and posts them to the authority. It is written in
 # PowerShell and shared byte-for-byte with the Windows install, so a native Linux box needs pwsh 7
 # and the codex CLI; without either, the block is skipped LOUDLY rather than silently, because a
 # client that captures nothing looks identical to one that captures everything.

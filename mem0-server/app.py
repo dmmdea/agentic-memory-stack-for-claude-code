@@ -43,6 +43,7 @@ from redact import redact_secrets  # server-side secret scrub for stored prompt_
 from redact import count_redactions  # W5 T6.1: count-only entrance telemetry
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
+import anthropic_judge    # the Claude API transport behind the same judge (MEM0_JUDGE_PROVIDER)
 import nli_write_gate     # v0.27.2 R5: NLI write-gate decision (pure; deps injected below)
 from payload_carryover import compute_carryover  # AMS-01: PUT payload carry-over (P0)
 from sparse_health import sparse_leg_health      # AMS-09: BM25 leg liveness (gating)
@@ -565,7 +566,7 @@ CANONICAL_AUTOPROMOTE_ALLOWED = {"dream-autopromote"}
 MAX_MEMORY_CHARS = int(os.environ.get("MEM0_MAX_MEMORY_CHARS", "4000"))  # storage cap (env-overridable)
 # v0.22: raised 1500 -> 4000. The old 1500 was a policy guess ("realistic for atomic facts",
 # audit 2026-06-08); its "prompt-budget honest" half is now MOOT — the v0.22 model-aware
-# injection truncates each memory to ~200 chars in the rendered [MEMORY CONTEXT] block, so a
+# injection cuts a memory over 320 chars at a sentence end in the rendered [MEMORY CONTEXT] block, so a
 # longer STORED memory never bloats the prompt. 1500 was rejecting legitimate milestone/
 # checkpoint summaries (~1.5-2.5K chars) with a 413 every session. 4000 fits them with headroom
 # and stays well within EmbeddingGemma's 2048-token (~8K char) context. Atomic facts (<=25 words)
@@ -579,7 +580,7 @@ from imperative_canary import is_imperative_canonical
 
 # v0.27.2 R5: NLI write-gate config (env). DEFAULT OFF — the write path is HOT (every L1a
 # Stop-hook extraction writes), so this never engages unless explicitly enabled. When on, a
-# fast canonical-tier pre-filter (a high SEMANTIC threshold) means Codex is invoked ONLY when
+# fast canonical-tier pre-filter (a high SEMANTIC threshold) means the LLM judge is invoked ONLY when
 # a genuinely high-cosine canonical neighbor exists; any shim failure FAILS OPEN (admits).
 def _env_flag(name):
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
@@ -1120,7 +1121,11 @@ def health_maintenance() -> dict:
     now = _dt.datetime.now(_dt.timezone.utc)
     out = _mh.build(maint / "receipts.jsonl", now, pool,
                      _mh.journal_boots_reader(), codex_shim_client.judge_transport,
-                     usage_reader=_mh.usage_window_reader(maint / "codex-usage.jsonl"),
+                     # The judge's allowance: the Codex plan window, or on the Claude API this
+                     # month's estimated spend against the box's cap.
+                     usage_reader=(anthropic_judge.usage_summary
+                                   if codex_shim_client.judge_transport() == "anthropic"
+                                   else _mh.usage_window_reader(maint / "codex-usage.jsonl")),
                      # Pool HEALTH (not capacity) needs a pool to ask: only a ZFS box names one.
                      pool_health_reader=_mh.zpool_health_reader(ds) if ds else None,
                      # The operator's dated pool-health ack (env, else stack.env), read on every call.
@@ -1316,6 +1321,11 @@ def health_deep() -> dict:
     # authority, the Windows HTTP shim on WSL boxes, none when neither is available.
     # Informational — never flips ok.
     out["checks"]["judge_transport"] = codex_shim_client.judge_transport()
+    # On the Claude API, the provider's local readiness too: the key the unit loaded, the SDK, the
+    # models and the month's spend against the cap. Local state only, no network call, so a probe
+    # never spends. Informational: a missing key shows as the capability row, not as ok=false here.
+    if out["checks"]["judge_transport"] == "anthropic":
+        out["checks"]["judge"] = codex_shim_client.health()
     # AMS-09 (2026-08-07): BM25 sparse-leg liveness — GATING. The lexical leg
     # died silently for 33 days behind mem0's fastembed ImportError fail-soft
     # while this endpoint stayed green (the exact 'shallow health green-lighting

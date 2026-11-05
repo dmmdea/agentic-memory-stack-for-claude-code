@@ -106,9 +106,13 @@ The mode in which memory is asked for — `durable` (default), `operational`, `c
 
 Retiring a stale Memory behind a newer one. It has one writer, `POST /v1/memories/{id}/supersede` (the MCP tool `memory_supersede`, the operator's `contradiction-sweep.py --resolve-supersede` and `--supersede-markers`), which enforces the refusal rules on every call and ledgers it. A **full** supersession sets `superseded_by`, and the Admission Gate then withholds the record outside the `history` Query Class; a **partial** one annotates a single stale claim (`partially_superseded_by`) and never hides. It is reversible (`memory_unsupersede`, `--unsupersede`). Appending "SUPERSEDED ..." to a record's text is not a supersession: the gate never reads text. See [reconciliation.md](systems/reconciliation.md).
 
+## Judge Provider
+
+Who answers the stack's language-model calls on one box: `codex` (the Codex CLI on a ChatGPT login; the default, no key and no API spend) or `anthropic` (the Claude API on a key the operator supplies). Set per box with `MEM0_JUDGE_PROVIDER`; a function or flag that still says `codex` means "the configured LLM judge". Local models never judge, on either provider. See [judge-provider.md](systems/judge-provider.md).
+
 ## L1a Extractor
 
-The session fact extractor (`scripts/windows/l1a-extract.ps1`): on a Stop/PreCompact hook a Codex subagent reads the last ~24 turns under an inferability-gate + ephemera-gate prompt, keeping only genuinely project-specific facts that outlive the session (max 5/run, one success per 10 min) and posting each to mem0 as `tier=evidence`. See [memory-capture.md](flows/memory-capture.md).
+The session fact extractor (`scripts/windows/l1a-extract.ps1`): on a Stop/PreCompact hook the LLM judge (see [Judge Provider](#judge-provider)) reads the last ~24 turns under an inferability-gate + ephemera-gate prompt, keeping only genuinely project-specific facts that outlive the session (max 5/run, one success per 10 min) and posting each to mem0 as `tier=evidence`. See [memory-capture.md](flows/memory-capture.md).
 
 ## Ship-Log
 

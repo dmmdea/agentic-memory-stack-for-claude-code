@@ -9,12 +9,12 @@ Read on demand from `SKILL.md`. The canonical, in-repo deep dive is `ARCHITECTUR
 | `mem0-server` (`:18791`) | WSL systemd-user | FastAPI wrapper over mem0 2.0.4; also hosts the episodic/goals/open-questions SQLite sidecar + the admission gate + the canonical-key HMAC enforcement. |
 | Qdrant (`:6333`) | WSL systemd-user | Vector store. Collections are named by the embedding profile: `mem0_eg2_768` (memories) + the profile's episodes collection on the default `egemma2`; `mem0_egemma_768` and `episodes_egemma_768` on the legacy 300m profile (`/health/deep` reports the live `collection`). Loopback-bound. |
 | llama-swap (`:11436`) | WSL | Single local inference stack: **EmbeddingGemma-2** by default (mem0's embedder, 768-dim, multilingual; EmbeddingGemma-300m on the legacy profile) + **bge-reranker-v2-m3**. Loopback-bound. No Ollama. |
-| Codex CLI | Windows | The subagent LLM for ALL LLM judgment — L1a extraction, nightly consolidation, the contradiction-sweep judge, the NLI write-gate. ChatGPT-subscription auth. Reached from WSL python via the loopback `codex-shim.ps1` HTTP shim (`:18792`). |
+| LLM judge: Codex CLI (default) or Claude API | Windows (Codex CLI); either side (Claude API) | The subagent LLM for ALL LLM judgment — L1a extraction, nightly consolidation, the contradiction-sweep judge, the NLI write-gate. Per-box setting, see [judge provider](../../../docs/systems/judge-provider.md). The Codex CLI uses ChatGPT-subscription auth and is reached from WSL python via the loopback `codex-shim.ps1` HTTP shim (`:18792`) on a WSL-hosted brain; the Claude API uses a key you supply and needs no shim. |
 | Claude Code hooks | Windows | Stop/PreCompact (extract), SessionStart (warm + caps), UserPromptSubmit (`[MEMORY CONTEXT]` injection via the resident named-pipe daemon). The stack registers no PreToolUse hook. |
 
 ## Conceptual layer map
 
-`POLICY` (tier protocol in CLAUDE.md + storage caps) → `INGEST` (Codex L1a extractor, hook-fired) → `STORES` (mem0 + Qdrant + episodic.db) → `RETRIEVAL` (EmbeddingGemma embedder + bge-reranker) → `REFINEMENT` (nightly dream-consolidate + promote/demote + heuristic audit).
+`POLICY` (tier protocol in CLAUDE.md + storage caps) → `INGEST` (LLM-judge L1a extractor, hook-fired) → `STORES` (mem0 + Qdrant + episodic.db) → `RETRIEVAL` (EmbeddingGemma embedder + bge-reranker) → `REFINEMENT` (nightly dream-consolidate + promote/demote + heuristic audit).
 
 ## Trust tiers
 
@@ -25,7 +25,7 @@ Read on demand from `SKILL.md`. The canonical, in-repo deep dive is `ARCHITECTUR
 The v1.0 milestone turned the stack from "store + inject and hope" into "measurably faithful memory." Each was research-grounded and adversarially audited:
 
 - **R1 — causal-intervention faithfulness eval** (the harness is not part of this repository): CMI do-intervention (no/with/corrupted memory) measuring Behavior-Change Rate, Counterfactual Sensitivity, Adoption. Agent-under-test = Codex; deterministic substring scoring.
-- **R3 — extractor specificity** (the #1 lever): the Codex extractor keeps specific/executable, drops inferable facts ("could Claude already know this? → drop"); typed Title/Description/Content schema. Measured lift: adoption 1.0 vs 0.5, counterfactual-sensitivity 0.667 vs 0.5 on a non-saturated probe set.
+- **R3 — extractor specificity** (the #1 lever): the LLM-judge extractor keeps specific/executable, drops inferable facts ("could Claude already know this? → drop"); typed Title/Description/Content schema. Measured lift: adoption 1.0 vs 0.5, counterfactual-sensitivity 0.667 vs 0.5 on a non-saturated probe set.
 - **R2 — abstention-first, entity-side gated injection**: inject only when project-specific entities are present + relevance clears the semantic floor; cap K at 1–2; NOOP (inject nothing) as the default.
 - **R5 — governance**: NLI write-gate (Codex-judged, opt-in) + Weibull freshness read-gate (evidence/temporal tiers; atemporal tiers never decay) + weekly contradiction-sweep (Codex-authoritative; local sweep stamps a `_pending` key the admission gate ignores) + episodic-ledger reconciliation.
 - **R6 — placement / attention hygiene**: the single most-relevant memory is rendered LAST in the `[MEMORY CONTEXT]` block (adjacent to the prompt = the recency peak).
@@ -35,6 +35,6 @@ The v1.0 milestone turned the stack from "store + inject and hope" into "measura
 
 The installer works for any operator. The four operator-specific dimensions (WSL user, Windows user, WSL distro, repo path) are resolved at install time into an **install receipt** (`~/.claude/scripts/mem0-stack.config.psd1` + `~/.mem0/stack.env`). Receipt-driven scripts (`Test-MemoryStack.ps1`, `dream-consolidate.ps1`) read it at runtime; other deployed scripts carry bounded sentinels (`__WSL_USER__`/`__WIN_USER__`/`__WSL_DISTRO__`/`__REPO_ROOT_WSL__`) substituted at deploy and reversed by the "deployed hooks freshness" SHA-parity normalizer. No developer path or handle ships in the deployable surface.
 
-## Why Codex (not Claude) as the subagent
+## Why background LLM work does not use the interactive Claude login
 
-Claude Max OAuth enforces a single concurrent session — headless `claude --print` from hooks fails intermittently when an interactive session holds the slot (by design; headless is Anthropic's paid-API territory). Codex CLI authenticates via a separate ChatGPT-subscription OAuth (no concurrency block) and runs reliably headless from any Windows shell, at zero marginal cost. Quality matches for structured extraction. **All LLM judgment routes to Codex; local llama-swap models are embedding/reranking only.**
+Claude Max OAuth enforces a single concurrent session — headless `claude --print` from hooks fails intermittently when an interactive session holds the slot (by design; headless is Anthropic's paid-API territory). Background work therefore uses a credential that is independent of the interactive login: the Codex CLI's separate ChatGPT-subscription OAuth (the default; no concurrency block, runs reliably headless from any Windows shell, zero marginal cost, quality matches for structured extraction), or a Claude API key you supply. **All LLM judgment routes to the judge provider; local llama-swap models are embedding/reranking only.**

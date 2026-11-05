@@ -356,14 +356,35 @@ if ($stackRole -eq 'brain') {
     } "A replica must not run the brain's timers: in WSL systemctl --user disable --now decay-scan.timer stack-backup.timer (or re-run install/1-wsl-services.sh with MEM0_ROLE=replica)"
 }
 
+# 1.40.0: the smoke test follows the judge provider this box recorded in ~/.mem0/stack.env. On the
+# Claude API it is one real call through the DEPLOYED transport, in a child of the PowerShell 7 this
+# script runs under (the same launcher the extraction worker gets), so it proves the key file, the
+# workspace header and the spend cap together. It costs a fraction of a cent and writes one row to
+# the spend ledger.
+$judgeProvider = 'codex'
+try {
+    $recordedProvider = (wsl.exe -d $Distro -e bash -lc 'grep -E ^MEM0_JUDGE_PROVIDER= ~/.mem0/stack.env 2>/dev/null | tail -n 1 | cut -d= -f2' 2>$null | Select-Object -First 1)
+    if ("$recordedProvider".Trim() -eq 'anthropic') { $judgeProvider = 'anthropic' }
+} catch {}
 Write-Host ""
-Write-Host "Codex CLI (subagent LLM) smoke test:"
-Check "Codex headless call works" {
-    try {
-        $out = "Reply with exactly: ok" | & "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" exec --skip-git-repo-check -c model_reasoning_effort='"low"' - 2>&1
-        ($out -join "`n") -match '(?ms)codex\s+ok'
-    } catch { $false }
-} "Run: codex login   (pick 'Sign in with ChatGPT'). Upgrade if needed: npm i -g @openai/codex@latest"
+if ($judgeProvider -eq 'anthropic') {
+    Write-Host "Claude API (subagent LLM) smoke test:"
+    Check "Claude API call works through the deployed transport" {
+        $lib = (Join-Path $env:USERPROFILE '.claude\scripts\memory-common.ps1').Replace("'", "''")
+        $cmd = ". '$lib'; try { `$r = Invoke-CodexSubagent -Prompt 'Reply with exactly: ok' -ReasoningEffort low -TimeoutSeconds 60 -Model `$script:AmCodexModelClassify; 'ANSWER:' + (Get-CodexResponseText -RawOutput `$r) } catch { 'ERROR:' + `$_.Exception.Message }"
+        $out = (& (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String).Trim()
+        if ($out -match '(?m)^ANSWER:\s*ok\b') { $true }
+        else { Write-Host ""; Write-Host "    $out" -ForegroundColor Yellow; $false }
+    } "The line above says why. No key file: in the WSL distro, (umask 077; cat > ~/.mem0/anthropic-key), paste the key, Enter, Ctrl-D. HTTP 401 or 403: the key, or MEM0_ANTHROPIC_WORKSPACE_ID in ~/.mem0/stack.env (install.ps1 -AnthropicWorkspaceId). Spend cap reached: MEM0_JUDGE_MONTHLY_BUDGET_USD. See docs/systems/judge-provider.md"
+} else {
+    Write-Host "Codex CLI (subagent LLM) smoke test:"
+    Check "Codex headless call works" {
+        try {
+            $out = "Reply with exactly: ok" | & "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" exec --skip-git-repo-check -c model_reasoning_effort='"low"' - 2>&1
+            ($out -join "`n") -match '(?ms)codex\s+ok'
+        } catch { $false }
+    } "Run: codex login   (pick 'Sign in with ChatGPT'). Upgrade if needed: npm i -g @openai/codex@latest"
+}
 
 Write-Host ""
 Write-Host "mem0 end-to-end (add -> search):"
