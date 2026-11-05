@@ -43,6 +43,13 @@ try {
     # 2026-06-08: prior code marked the throttle before doing anything, so a
     # transient health/parse/POST failure silenced the next 10 min)
     if (-not (Test-Throttle -Name 'l1a' -MinIntervalSeconds 600)) {
+        # 1.40.1: say so. This exit left no line, so a session whose every Stop fell inside another
+        # session's 10 minutes looked the same in the log as a session whose hook never fired.
+        # The session is named as the episode names it (the hook's id wins; a PreCompact snapshot's
+        # file name is not a session).
+        $throttledSession = 'unknown'
+        try { if ($SessionId -or $TranscriptPath) { $throttledSession = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $TranscriptPath } } catch { }
+        Write-MemoryLog -Component 'l1a' -Message "throttled: event=$EventName session=$throttledSession - a successful extraction ran on this box under 10 min ago, so this run is skipped"
         exit 0
     }
 

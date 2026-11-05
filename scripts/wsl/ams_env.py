@@ -116,12 +116,15 @@ def mem0_headers(key: str | None = None) -> dict[str, str]:
 
 def judge_provider() -> str:
     """'anthropic' or 'codex': the provider this install's judge runs on. The server package owns
-    the answer; a script that runs without it (a dry run) is on the Codex default."""
+    the answer. A script deployed without that package on its path (codex-usage-report.py, which
+    the dream unit runs first) reads the same setting itself, the environment first and then
+    stack.env: answering 'codex' there made a Claude API box probe the Codex plan window."""
     try:
         import anthropic_judge
         return anthropic_judge.provider()
     except Exception:  # noqa: BLE001
-        return "codex"
+        value = (os.environ.get("MEM0_JUDGE_PROVIDER") or "").strip() or stack_env().get("MEM0_JUDGE_PROVIDER", "")
+        return "anthropic" if value.strip().lower() == "anthropic" else "codex"
 
 
 def judge_model(job_class: str) -> str:

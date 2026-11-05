@@ -95,3 +95,20 @@ def test_cli_gate_exit_codes(tmp_path, used, code, verb):
     # the fresh row was used as-is: no probe row was appended to the ledger
     rows = (home / ".mem0" / "maintenance" / "codex-usage.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
+
+
+def test_cli_probe_on_the_claude_api_never_probes_codex(tmp_path):
+    """The dream unit runs `codex-usage-report.py --probe` first, with only the scripts directory on
+    its path. On a box whose stack.env names the Claude API it must not probe the Codex plan window.
+    1.40.0 did: the provider lookup needed the server package there and answered codex."""
+    import subprocess
+    home = tmp_path / "home"; (home / ".mem0" / "maintenance").mkdir(parents=True)
+    (home / ".mem0" / "stack.env").write_text("MEM0_JUDGE_PROVIDER=anthropic\n", encoding="utf-8")
+    env = dict(home_env(home), CODEX_HOME=str(tmp_path / "no-codex"))
+    for v in ("MEM0_URL", "MEM0_API_KEY_FILE", "MEM0_KEY", "MEM0_API_KEY", "MEM0_JUDGE_PROVIDER", "PYTHONPATH"):
+        env.pop(v, None)
+    r = subprocess.run([sys.executable, str(SCRIPTS / "codex-usage-report.py"), "--probe"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "not probed" in r.stdout and "used_percent" not in r.stdout
+    assert not (home / ".mem0" / "maintenance" / "codex-usage.jsonl").exists(), "no codex-window row is written"
