@@ -47,7 +47,8 @@ Notes:
   decommissioned in the same migration.
 - **Caps** are applied server-side in `context_bundle` (per `ContextBundleIn.tier`). The
   client `Select-AdmittedMemoryResults` independently hard-caps surfaced memories at
-  **top-3** (defense in depth, every tier) and truncates each memory to 200 chars.
+  **top-3** (defense in depth, every tier) and cuts each memory over 320 chars at a sentence end, marked
+  `... [cut; full text: memory_get_by_id <id>]`.
 - **Frontier format**: full `[tier|brand] text` bullets, no legend. At v0.22 it matched v0.21 output
   byte for byte; its caps have moved since (K = 2, and goals and open questions off in 1.37.0).
 - **Small format**: prepends a one-line trust legend, orders memories highest-tier-first

@@ -218,14 +218,15 @@ function Invoke-DaemonRawBundle {
     # is retired: recall <= 4 % on hand-labelled corrections, and half of what it stored was pasted
     # handoffs. learn-rules-drain.ps1 still empties any queue an older client left behind.
 
-    # --- mirror §4: triviality gate (same constants as the inline path)
+    # --- mirror section 4: triviality gate (the one lib rule, Test-TrivialPrompt, same as the inline path)
     $isTrivial = $true
     $promptForSearch = $null
     if ($prompt -and $prompt.Length -gt 5) {
         $promptForSearch = if ($prompt.Length -gt 500) { $prompt.Substring(0, 500) } else { $prompt }
-        $trivial = @('continue', 'yes', 'no', 'ok', 'okay', 'sure', 'go', 'next', 'stop', '1', '2', '3', 'a', 'b', 'c', 'thanks', 'thx')
-        $wordCount = ($promptForSearch -split '\s+').Count
-        $isTrivial = $wordCount -lt 3 -or $trivial -contains $promptForSearch.ToLower().Trim()
+        try { $isTrivial = [bool](Test-TrivialPrompt -Prompt ([string]$prompt)) } catch {
+            $isTrivial = $false
+            Write-DaemonLog "0.D triviality classifier failed ($($_.Exception.Message)); treating the prompt as substantive"
+        }
     }
 
     # --- mirror §4: C10 machine-turn gate (same lib predicate as the inline path). A background

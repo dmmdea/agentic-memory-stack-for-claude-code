@@ -306,6 +306,53 @@ function Test-MachineTurnPrompt {
     return $trimmed.StartsWith('<task-notification>', [System.StringComparison]::Ordinal)
 }
 
+function Test-TrivialPrompt {
+    <#
+    .SYNOPSIS
+    Is this UserPromptSubmit prompt too content-free to search memory for? A trivial prompt makes
+    the checkpoint-only POST and gets no [MEMORY CONTEXT] block.
+    .DESCRIPTION
+    The one triviality rule, shared by the per-prompt hook (user-prompt-extract.ps1) and the
+    resident daemon (mem0-hook-daemon.ps1). Trivial when any of these holds:
+      1. Short reply: length <= 5, fewer than 3 words (judged on the first 500 characters), or
+         exactly one of a short list of replies (continue, yes, no, ok, thanks, ...).
+      2. Continuation: after an optional short acknowledgement or apology clause (it opens with
+         sorry, ok, yes, done, thanks, back, rebooted or the like and ends in a comma or period),
+         the prompt opens with continue / resume / proceed / keep going / go on / carry on
+         (optionally after please and/or now), and the whole prompt is <= 120 characters. Any other
+         leading clause names a subject, so the prompt is searched as usual.
+      3. Probe: a "reply with one fixed token" instruction of <= 60 characters.
+      4. Image-only turn: nothing but [Image: source: ...] markers and whitespace.
+    A prompt that names a subject is never trivial by rules 2 and 3. Neither the compiled client
+    nor the server decides triviality, so there is no mirror of this rule. PS 5.1-safe, .NET
+    string methods and -match/-cmatch only, never throws (a failure reads as not trivial).
+    #>
+    param([string]$Prompt)
+    try {
+        if ([string]::IsNullOrEmpty($Prompt) -or $Prompt.Length -le 5) { return $true }
+
+        $head = $Prompt
+        if ($head.Length -gt 500) { $head = $head.Substring(0, 500) }
+        $replies = @('continue', 'yes', 'no', 'ok', 'okay', 'sure', 'go', 'next', 'stop', '1', '2', '3', 'a', 'b', 'c', 'thanks', 'thx')
+        $wordCount = [regex]::Split($head, '\s+').Count
+        if ($wordCount -lt 3 -or ($replies -contains $head.ToLower().Trim())) { return $true }
+
+        $t = $Prompt.Trim()
+        if ($t.Length -le 120) {
+            if ($t -match '^(?:(?:sorry|ok|okay|yes|yeah|yep|done|thanks|thank\s+you|great|perfect|alright|good|hi|hello|hey|back|rebooted|restarted)\b[^,.\r\n]{0,50}[,.]\s*)?(?:(?:please|now)[\s,]+){0,2}(?:continue|resume|proceed|keep\s+going|go\s+on|carry\s+on)\b') { return $true }
+        }
+        if ($t.Length -le 60) {
+            if ($t -match '^reply(?:\s+with)?(?:[\s:]+(?:only|exactly|just))?(?:[\s:]+the)?(?:[\s:]+(?:single|one))?(?:[\s:]+(?:word|token|string))?[\s:]+["''\x60]?[A-Za-z0-9_-]{1,24}["''\x60]?[.!]?$') { return $true }
+        }
+        if ($t.StartsWith('[Image: source:', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($t -match '^(?:\[Image: source: [^\]\r\n]*\]\s*)+$') { return $true }
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Redact-Secrets {
     # Byte-identical (comment-stripped) copy of Redact-Secrets in memory-common.ps1, pinned by
     # AuthorityResolution.Tests.ps1 and run against tests/fixtures/redaction-cases.jsonl by
@@ -1496,7 +1543,9 @@ function Select-AdmittedMemoryResults {
     brand, only memories matching it (or brand-neutral null-brand ones) surface.
     With NO inferred brand (unknown-brand session), ONLY brand-neutral memories
     surface — brand-tagged memories never leak into an unrecognized session.
-    Layer 3 — top-3 + 200-char per-memory cap.
+    Layer 3 - top-3 + per-memory cap: a memory over 320 chars is cut at the last sentence end
+    after char 120 (else the last whitespace, else char 320) and ends with
+    " ... [cut; full text: memory_get_by_id <id>]" (" ... [cut]" when it has no id).
 
     Rejected candidates are appended to admission-rejected.jsonl (one JSONL line
     per result not in the final surfaced set). Audit failure never breaks the hook.
@@ -1540,13 +1589,35 @@ function Select-AdmittedMemoryResults {
         })
     }
 
-    # Layer 3 — top-3 + 200-char per-memory cap
+    # Layer 3 - top-3 + 320-char per-memory cap, cut at a sentence end
     # (array slice, not Select-Object -First: Select-Object is the Utility
-    # module and would cost ~75ms module load on the hook hot path — v0.20 A.3)
+    # module and would cost ~75ms module load on the hook hot path - v0.20 A.3)
     if ($filteredResults.Count -gt 3) { $filteredResults = @($filteredResults[0..2]) }
     foreach ($fr in $filteredResults) {
-        if ($fr.memory -and $fr.memory.Length -gt 200) {
-            $fr.memory = $fr.memory.Substring(0, 200) + '... [truncated by v0.18 admission policy]'
+        if ($fr.memory -and $fr.memory.Length -gt 320) {
+            $mem = [string]$fr.memory
+            $cutLen = -1
+            # last sentence end (". ", "! ", "? ", "; " or a newline) inside the first 320 chars and after char 120
+            for ($i = 319; $i -ge 120; $i--) {
+                $ch = $mem[$i]
+                if ($ch -eq [char]10 -or $ch -eq [char]13) { $cutLen = $i; break }
+                if (($ch -eq [char]46 -or $ch -eq [char]33 -or $ch -eq [char]63 -or $ch -eq [char]59) -and $mem[$i + 1] -eq [char]32) { $cutLen = $i + 1; break }
+            }
+            # else the last whitespace inside the first 320 chars
+            if ($cutLen -lt 1) {
+                for ($i = 319; $i -ge 1; $i--) {
+                    if ([char]::IsWhiteSpace($mem[$i])) { $cutLen = $i; break }
+                }
+            }
+            if ($cutLen -lt 1) { $cutLen = 320 }
+            $body = $mem.Substring(0, $cutLen).TrimEnd()
+            if ($body.Length -eq 0) { $body = $mem.Substring(0, 320) }
+            $memId = [string]$fr.id
+            if ([string]::IsNullOrEmpty($memId)) {
+                $fr.memory = $body + ' ... [cut]'
+            } else {
+                $fr.memory = $body + ' ... [cut; full text: memory_get_by_id ' + $memId + ']'
+            }
         }
     }
 
@@ -2526,8 +2597,8 @@ function Measure-MemoryContextBudget {
     The char-proxy ceiling is derived from the tier's own caps in model-tiers.json
     (so it stays honest if caps change) plus the fixed per-item truncation limits
     enforced by Format-MemoryContextBlock / Select-AdmittedMemoryResults:
-      - memories: client admission hard-caps at top-3, each truncated to 200 chars
-                  (+ the truncation suffix) -> per-item ceiling ~260 incl. tag.
+      - memories: client admission hard-caps at top-3, each cut to <= 320 chars
+                  (+ the cut marker with the memory id) -> per-item ceiling ~420 incl. tag.
       - goals:    title truncated to 100 chars -> per-item ceiling ~120.
       - oq:       text truncated to 120 chars -> per-item ceiling ~140.
     Plus header (~90), optional small-tier legend (~200), and section labels (~90).
@@ -2572,7 +2643,7 @@ function Measure-MemoryContextBudget {
         $memN = [Math]::Max(1, [int]$caps.memory_cap)
         $goalN = [Math]::Max(0, [int]$caps.goal_cap)
         $oqN = [Math]::Max(0, [int]$caps.oq_cap)
-        $memText = ('x' * 240)   # > 200 so truncation fires
+        $memText = ('x' * 400)   # > 320 so the cut fires
         $goalText = ('g' * 130)  # > 100
         $oqText = ('q' * 150)    # > 120
         # W5 T2.3 (review Finding 5): worst-case memories carry a STALE
@@ -2602,7 +2673,7 @@ function Measure-MemoryContextBudget {
 
         # Ceiling from caps + fixed per-item truncation limits.
         $effMem = [Math]::Min(3, $memN)         # client admission hard-caps memories at 3
-        $perMem = 200 + 60                        # 200-char cap + truncation suffix + tag
+        $perMem = 320 + 100                       # 320-char cap + cut marker (with id) + tag
         $perGoal = 100 + 20
         $perOq = 120 + 20
         $headerOverhead = 90
