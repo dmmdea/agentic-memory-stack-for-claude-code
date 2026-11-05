@@ -4,6 +4,25 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.40.1 — the dream's first step no longer probes Codex on a Claude API box (2026-11-05)
+
+### Fixed
+- **On the Claude API the dream's first step no longer probes the Codex plan window.** `ams-step-dream.service`
+  runs `codex-usage-report.py --probe` before the dream. That script has only the scripts directory on its
+  path, and `ams_env.judge_provider()` asked the server package for the provider, so the lookup failed there
+  and answered `codex`: the first dream on a Claude API box printed a Codex window and wrote a `codex-window`
+  row. Nothing depended on the row (on that provider the dream gates on the spend cap), but the box kept
+  calling the Codex usage endpoint every night and would have logged a failed probe once the Codex login was
+  gone. The lookup now reads the same setting itself when the server package cannot be imported, the
+  environment first and then `stack.env`.
+
+### Changed
+- **A throttled extraction says so.** The session extractor skips a run that starts within 10 minutes of the
+  last successful one on the box, whichever session that was, and that exit wrote nothing. It now logs one
+  line (`throttled: event=... session=...`), so the share of session ends that were skipped can be counted
+  from `l1a.log`. The throttle itself is unchanged.
+- Plugin manifests to 1.40.1.
+
 ## 1.40.0 — the judge provider is selectable: the Codex CLI or the Claude API (2026-11-05)
 
 ### Added

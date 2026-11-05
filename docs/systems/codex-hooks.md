@@ -98,7 +98,7 @@ mem0 :18791
 - Extractor: `C:\Users\<WIN_USER>\.claude\scripts\l1a-extract.ps1` (repo: `scripts/windows/l1a-extract.ps1`)
 - Shared helpers: `memory-common.ps1` (repo: `scripts/windows/memory-common.ps1`)
 
-**Throttle:** 10 minutes (600s) between successful extractions. The throttle is marked AFTER a successful Codex call + POST, not before. Prior design marked it before doing any work, which silenced extraction for 10 min on any transient failure.
+**Throttle:** 10 minutes (600s) between successful extractions. The throttle is marked AFTER a successful Codex call + POST, not before. Prior design marked it before doing any work, which silenced extraction for 10 min on any transient failure. It is one throttle per box, not per session: a session whose turn ends inside another session's 10 minutes is skipped, and its turns wait for that session's next run. A skipped run writes one line to `l1a.log` (`throttled: event=... session=...`), so the share of skipped session ends can be counted.
 
 **Log:** `~/.claude/logs/l1a.log`, rotated at 1MB (keeps 5 archives).
 **Usage log:** `~/.claude/logs/codex-usage.jsonl` — per-call token/duration/status records.
