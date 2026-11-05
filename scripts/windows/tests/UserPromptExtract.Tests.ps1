@@ -255,12 +255,38 @@ Describe 'Phase 0.D proactive-injection admission (Select-AdmittedMemoryResults)
         @($entries | Where-Object reason -eq 'truncated_by_topN').Count | Should -Be 3
     }
 
-    It 'truncates memories longer than 200 chars' {
-        $longHit = [pscustomobject]@{ id = 'm-long'; memory = ('x' * 400)
+    It 'cuts memories longer than 320 chars at a sentence end and names the id for the full text' {
+        $sentence = 'This is one sentence of the stored memory text. '
+        $longHit = [pscustomobject]@{ id = 'm-long'; memory = ($sentence * 10)
                                       metadata = [pscustomobject]@{ tier = 'evidence'; brand = $null } }
         $admitted = @(Select-AdmittedMemoryResults -Hits @($longHit) -Brand 'ai-ecosystem' -AuditPath $script:auditPath)
-        $admitted[0].memory.Length | Should -BeLessOrEqual (200 + '... [truncated by v0.18 admission policy]'.Length)
-        $admitted[0].memory | Should -BeLike '*`[truncated by v0.18 admission policy`]'
+        $admitted[0].memory | Should -BeLike '*text. ... `[cut; full text: memory_get_by_id m-long`]'
+        $admitted[0].memory.Length | Should -BeLessOrEqual (320 + ' ... [cut; full text: memory_get_by_id m-long]'.Length)
+        # no sentence end, no whitespace: cut at 320; no id: bare marker
+        $blob = [pscustomobject]@{ id = ''; memory = ('x' * 400)
+                                   metadata = [pscustomobject]@{ tier = 'evidence'; brand = $null } }
+        $admitted = @(Select-AdmittedMemoryResults -Hits @($blob) -Brand 'ai-ecosystem' -AuditPath $script:auditPath)
+        $admitted[0].memory | Should -Be (('x' * 320) + ' ... [cut]')
+    }
+
+    It 'treats content-free prompts as trivial and keeps subject prompts (Test-TrivialPrompt)' {
+        $trivial = @(
+            'ok', 'yes', 'go on', 'fix it',
+            'please continue and resume stale work', 'please continue working and resume stale work',
+            'sorry i restarted the pc, please continue and resume stale work', 'Continue from where you left off.',
+            'Please continue and resume stale work, explore as much as you need to re-align yourself',
+            'Reply with the single word: ok', 'Reply with exactly: ok', 'Reply with only ok', 'reply ok', 'Reply with the single word OK.',
+            '[Image: source: C:\tmp\a.png]', "[Image: source: a.png]`n[Image: source: b.png] "
+        )
+        foreach ($p in $trivial) { Test-TrivialPrompt -Prompt $p | Should -BeTrue -Because $p }
+        $substantive = @(
+            'how is the main box doing?', 'open the review board again', 'what is the 90 minute stability soak?',
+            'yes fix the login bug in the store',
+            'the build is green, can you continue the release notes and also add the new endpoint for refunds to the changelog, then open the pull request and tell me when the checks are done',
+            'Reply with a summary of what changed in the installer and why it matters for replicas',
+            '[Image: source: a.png] what is wrong with this chart?'
+        )
+        foreach ($p in $substantive) { Test-TrivialPrompt -Prompt $p | Should -BeFalse -Because $p }
     }
 
     It 'admits only brand-neutral memories when no brand is inferred (v0.19 fail-closed)' {

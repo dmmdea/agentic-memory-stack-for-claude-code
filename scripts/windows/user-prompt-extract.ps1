@@ -402,15 +402,16 @@ if (-not $script:DaemonServedBundle) {
 # identical logic — we are only here for Phase 0.B.
 if (-not $script:DaemonServedBundle) {
 
-# Triviality gate (was inline in Phase 0.D): <3 words or common short replies
-# never trigger proactive surfacing.
+# Triviality gate: the one lib rule (Test-TrivialPrompt: <3 words, common short replies,
+# continuation / probe / image-only prompts) never triggers proactive surfacing. With no lib
+# function there is no renderer either, so the prompt stays trivial (checkpoint-only POST).
 $isTrivial = $true
 $promptForSearch = $null
 if ($prompt -and $prompt.Length -gt 5) {
     $promptForSearch = if ($prompt.Length -gt 500) { $prompt.Substring(0, 500) } else { $prompt }
-    $trivial = @('continue', 'yes', 'no', 'ok', 'okay', 'sure', 'go', 'next', 'stop', '1', '2', '3', 'a', 'b', 'c', 'thanks', 'thx')
-    $wordCount = ($promptForSearch -split '\s+').Count
-    $isTrivial = $wordCount -lt 3 -or $trivial -contains $promptForSearch.ToLower().Trim()
+    if (Test-FunctionAvailable 'Test-TrivialPrompt') {
+        try { $isTrivial = [bool](Test-TrivialPrompt -Prompt $prompt) } catch { $isTrivial = $false; Write-Log "0.D triviality classifier failed ($($_.Exception.Message)); treating the prompt as substantive" }
+    }
 }
 
 # C10 (2026-09-22): a background task notification is a machine turn. It keeps the 0.A checkpoint
