@@ -23,6 +23,7 @@ and keep existing ADRs aligned with code, but they do not make the decisions.
 | [Harness auto-memory and the memory corpus are harmonized, not merged](auto-memory-system-a-vs-b.md) | Accepted |
 | [Fleet store sync and a native-Linux authority](fleet-store-sync-and-linux-authority.md) | Accepted |
 | [Embedder profiles: one definition per embedding space, the wiki in its own](embedder-profiles.md) | Proposed |
+| [The judge provider is selectable per box: the Codex CLI or the Claude API](selectable-judge-provider.md) | Accepted |
 
 ## When to write one
 

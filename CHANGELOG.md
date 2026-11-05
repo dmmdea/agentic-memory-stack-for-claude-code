@@ -4,6 +4,76 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.40.0 — the judge provider is selectable: the Codex CLI or the Claude API (2026-11-05)
+
+### Added
+- **A box can run its LLM work on the Claude API.** Session extraction, memory compaction, the dream's
+  consolidation and promotion, the contradiction and supersession judges and the write gate all went to the
+  Codex CLI on a ChatGPT login. The provider is now a per-box setting, `MEM0_JUDGE_PROVIDER`: `codex` (the
+  default, unchanged: no key, no API spend) or `anthropic` (the Claude API on a key the operator supplies).
+  It is a dispatch inside the two functions every LLM call already passed through, `codex_shim_client.judge()`
+  and `Invoke-CodexSubagent`, so no job changed. Set it with `install/linux-authority.sh --judge-provider
+  anthropic [--anthropic-workspace-id <id>]` on a native authority and `install.ps1 -JudgeProvider anthropic
+  [-AnthropicWorkspaceId <id>]` on a PC; a re-run without the flag keeps what is recorded
+  ([judge provider](docs/systems/judge-provider.md), [ADR](docs/architecture/decisions/selectable-judge-provider.md)).
+- **Models per job class.** A job names a class, not a model. On the Claude API `synthesis` (the dream's
+  consolidation, the promotion nominations and their gate) is `claude-opus-5-5` and `classify` (extraction, the
+  dream's gather step, the store judge, the yes/no judges, compaction) is `claude-haiku-5-5`;
+  `MEM0_JUDGE_MODEL_SYNTHESIS` and `MEM0_JUDGE_MODEL_CLASSIFY` override them.
+- **A monthly spend cap per box.** Each transport writes one row per call to
+  `~/.mem0/maintenance/llm-spend-YYYY-MM.jsonl` and refuses the next call once the month's estimate has reached
+  `MEM0_JUDGE_MONTHLY_BUDGET_USD` (default 20; `0` turns the cap off; a value that does not parse keeps the
+  default). The dream checks the cap where it checks the Codex quota on the other provider. The figure is an
+  estimate from a price table; the provider's console is the bill. Writers on a PC take a named mutex for the
+  append: the WSL share lets two writers take the same file offset, and 8 concurrent writers lost 74 of 320
+  rows without it and none with it. A call that times out on this side gets an estimated row (`"est": true`,
+  the prompt at one token per three characters), because the provider may still bill it and no usage came
+  back; a spend limit on the workspace in the provider's console is the hard stop and this cap the early
+  warning.
+- **One host, one bounded retry.** Both transports send the key and the prompts to `api.anthropic.com` only:
+  the Python transport names the address itself, so an `ANTHROPIC_BASE_URL` a job inherits from a coding
+  agent's session is ignored. A call is retried once on a rate limit, a server error or a connection failure,
+  inside the caller's time bound, and never on a timeout.
+- **The key is a file or a systemd credential, never an environment variable.** A native authority loads
+  `<secrets-dir>/ams-anthropic-key.cred` only into the units that judge (`mem0.service`, the dream and the two
+  weekly sweeps), through a `judge-anthropic.conf` drop-in per unit; a PC keeps `~/.mem0/anthropic-key`
+  (owner-only) inside its WSL distro. A missing key is an error: the stack never falls back to the other
+  provider on its own. The authority installer refuses the provider while the credential is missing or does
+  not decrypt on that host, and fails after the restart unless `/health/deep` reports `checks.judge` with the
+  key and the SDK present ([key custody](docs/systems/key-custody.md)).
+- **Health on the Claude API.** `/health/deep` adds `checks.judge`; `/health/maintenance` reports `usage` from
+  the spend ledger; the `codex-auth` capability row reads the key and the SDK. None of them makes a network
+  call. On a PC the prerequisite check asks for the key file instead of the Codex CLI and its login, and the
+  verify step makes one real call through the deployed transport.
+
+### Changed
+- **The per-prompt memory block skips prompts that carry no subject.** `Test-TrivialPrompt`, one rule shared by
+  the inline hook and the daemon, treats a short continuation (`please continue and resume stale work`), a
+  short reply-with-a-token probe and an image-only prompt as trivial: they post the checkpoint and skip the
+  bundle. On 1,032 real typed prompts the old rule skipped 106 and the new one 207; all 101 newly skipped were
+  continuation or probe prompts.
+- **An injected memory is cut at a sentence end.** A memory over 320 characters is cut at the last sentence end
+  (else the last whitespace) and ends with `... [cut; full text: memory_get_by_id <id>]`. The old rule cut at
+  200 characters wherever that fell, which 3 in 10 injected memories hit.
+- **The promotion curator asks whether anything depends on the fact.** The nomination prompt gains a sixth
+  test, consequential (a later decision or action depends on it), and names what never to nominate: the
+  momentary state of a service or machine, a one-off value from a single task, an account alias or an
+  inventory detail no decision depends on. True but inert facts were reaching the authority tier.
+- **A replica no longer starts the Codex shim.** Both of its consumers are brain jobs, so on a replica the
+  listener had no caller. `codex-shim-spawn.ps1` reads the role and exits. On the Claude API nothing calls the
+  shim; `ensure-codex-shim.sh` says so and returns at once, and the session-time re-judge no longer waits for it.
+- The `anthropic` package joins the server's requirements (imported only on the Claude API provider).
+- Plugin manifests to 1.40.0.
+
+### Fixed
+- **An LLM answer file is read as UTF-8 on Windows PowerShell 5.1.** The extraction worker runs under
+  PowerShell 7 when it is installed and falls back to 5.1 when it is not. There `Get-Content` decodes a file
+  with no BOM in the ANSI code page, so an accented character in an answer came back as two or three wrong
+  ones. `Get-CodexResponseText` now names the encoding.
+
+### Not covered yet
+- `install/linux-client.sh` has no provider switch: a native Linux client still captures through the Codex CLI.
+
 ## 1.39.0 — the SessionStart banner points at memory instead of printing it (2026-10-22)
 
 ### Changed

@@ -17,8 +17,8 @@ Type=oneshot
 # stamped or hidden, and superseded_by is written solely by the operator's
 # --resolve-supersede step. --pairs-max-judged bounds the weekly Codex spend;
 # the pair cache makes repeat pairs free.
-# Same ExecStartPre pair as contradiction-sweep.service: the unit judges via Codex,
-# so it spawns the shim first, or a Sunday with no recent Claude session would find
+# Same ExecStartPre pair as contradiction-sweep.service: the unit judges via the configured judge
+# (Codex by default), so on the Codex provider it spawns the shim first, or a Sunday with no recent Claude session would find
 # :18792 dark and lose the week. Bounded, fail-soft
 # (the leading '-' keeps a failed spawn from blocking the run; the sweep's own
 # ensure-shim backstop then gets a second chance in-process).

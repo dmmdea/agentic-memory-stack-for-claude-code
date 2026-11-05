@@ -1,8 +1,9 @@
 # Dream Consolidator - 4-phase pattern (orient -> gather -> consolidate -> prune)
 # Replaces c1-consolidate.ps1 in v0.13. Ported from grandamenium/dream-skill MIT.
 # Fires nightly 3am via Windows Task Scheduler. Throttled to 24h.
-# Codex executes each phase on a per-job model (gather: gpt-5.6-terra; consolidate and
-# promote-nominate: gpt-6-astra at medium effort). Fable designed the prompts.
+# The LLM judge executes each phase on a per-job model. On the Codex provider (the default)
+# that is gather: gpt-5.6-terra; consolidate and promote-nominate: gpt-6-astra at medium effort;
+# on the Claude API it is claude-haiku-5-5 for gather and claude-opus-5-5 for the other two. Fable designed the prompts.
 
 param([switch]$DryRun, [switch]$Force)
 
@@ -689,8 +690,9 @@ PROMOTE ONLY IF the memory is:
 3. GROUND-TRUTH — operator-stated or a verifiable environment fact (not speculation or inference)
 4. CROSS-SESSION — relevant beyond the current session or project
 5. HIGH-CONFIDENCE — you are certain it belongs in the authority tier
+6. CONSEQUENTIAL — a later decision or action depends on it (a true fact that nothing will ever turn on does not belong in the authority tier)
 
-NEVER nominate: tasks, ship logs, status updates, transient debugging notes, brand/voice content, speculation, anything imperative (rules/orders), anything already in the canonical set, or anything where you are unsure.
+NEVER nominate: tasks, ship logs, status updates, transient debugging notes, brand/voice content, speculation, the momentary state of a service or machine ("X is up", "X is running"), a one-off value from a single task, an account alias or an inventory detail that no decision depends on, anything imperative (rules/orders), anything already in the canonical set, or anything where you are unsure.
 
 PRECISION OVER RECALL: when in doubt, omit. A missed nomination is cheap (it will be re-reviewed tomorrow); a wrong authority-write is not.
 

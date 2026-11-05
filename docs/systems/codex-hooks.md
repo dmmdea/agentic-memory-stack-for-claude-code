@@ -2,12 +2,12 @@
 
 ## Purpose
 
-This system is the set of Claude Code lifecycle hooks (registered in `settings.json`) that drive memory **capture** and **retrieval injection** on Windows. On session close / compaction, a Codex-backed extractor writes the session's durable facts to mem0; on every prompt, a resident daemon + a compiled thin client inject the `[MEMORY CONTEXT]` block; SessionStart spawns the accelerators and the maintenance children, and syncs the store when a hub is configured. Every hook is best-effort and fail-open — it can slow nothing and block nothing.
+This system is the set of Claude Code lifecycle hooks (registered in `settings.json`) that drive memory **capture** and **retrieval injection** on Windows. On session close / compaction, an extractor backed by the box's LLM judge (the Codex CLI by default, or the Claude API; this doc describes the Codex provider, see [judge provider](./judge-provider.md) for the other) writes the session's durable facts to mem0; on every prompt, a resident daemon + a compiled thin client inject the `[MEMORY CONTEXT]` block; SessionStart spawns the accelerators and the maintenance children, and syncs the store when a hub is configured. Every hook is best-effort and fail-open — it can slow nothing and block nothing.
 
 ## Questions this doc answers
 
 - Which Claude Code events are hooked, and what runs on each?
-- Why does extraction use Codex instead of `claude --print`?
+- Why does extraction use the Codex CLI (or a Claude API key) instead of `claude --print`?
 - How does the L1a Stop/PreCompact extractor flow, and why is it fail-open?
 - What are the resident daemon and the compiled client, and how do they stay non-blocking?
 - How do the extractor and the nightly consolidator avoid colliding on Codex?
@@ -26,7 +26,7 @@ The `settings.json` hook registrations and their Windows-side handlers: the L1a 
 ## Key concepts
 
 - **Fail-open / best-effort:** a hook never blocks the Claude Code UI, session close, or compaction — it exits 0 and does its work detached.
-- **Codex (not Claude):** unattended extraction/consolidation run on the Codex CLI (ChatGPT-subscription OAuth) to dodge the Claude Max single-session concurrency block.
+- **Not the interactive Claude login:** unattended extraction/consolidation run on the Codex CLI (ChatGPT-subscription OAuth, the default) or on a Claude API key, to dodge the Claude Max single-session concurrency block.
 - **The resident daemon:** `mem0-hook-daemon.ps1` — an accelerator that keeps the bundle pipeline warm over a named pipe; it is *never a dependency*.
 - **The compiled client:** `mem0-hook-client.exe` (from `mem0-hook-client.cs`) — the registered UserPromptSubmit command; a thin exe that talks to the daemon and falls back to the inline PowerShell path on any failure.
 - **The shared Codex mutex:** one lock file that the extractor and the consolidator contend for, so Codex is never invoked concurrently.
@@ -34,11 +34,11 @@ The `settings.json` hook registrations and their Windows-side handlers: the L1a 
 
 ## How the system works
 
-### Why Codex (not Claude) for unattended cron
+### Why unattended cron does not use the interactive Claude login
 
 Anthropic's Claude Max OAuth enforces a single concurrent session per account. When Claude Code is open in VS Code, subprocess invocations of `claude --print` from hooks fail intermittently with "Not logged in" because the interactive session holds the slot. This was verified with multi-hour debugging: PowerShell-detached invocations, WSL-bridged invocations, explicit `WSLENV` forwarding — all unreliable while the interactive session is active.
 
-Codex CLI authenticates via **ChatGPT subscription OAuth** (separate auth surface, no concurrency block) and runs reliably headless from any Windows shell. The models it runs are pinned per job (see *Model routing* below), and their measured quality on the operator goldset is what drives that routing tasks. Both the L1a extraction and the nightly consolidation are covered by the existing ChatGPT subscription — zero marginal cost.
+Background work therefore uses a credential that is independent of the interactive login. On the default Codex provider that is the Codex CLI, which authenticates via **ChatGPT subscription OAuth** (separate auth surface, no concurrency block) and runs reliably headless from any Windows shell; the other choice is a Claude API key ([judge provider](./judge-provider.md)). The models it runs are pinned per job (see *Model routing* below), and their measured quality on the operator goldset is what drives that routing tasks. Both the L1a extraction and the nightly consolidation are covered by the existing ChatGPT subscription — zero marginal cost.
 
 ### The registered hooks
 
@@ -80,7 +80,7 @@ l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks C
   ├─ Acquire-CodexLock('l1a')   → skip if the nightly consolidator or another L1a holds the shared mutex
   │
   ▼ Invoke-CodexSubagent (codex.cmd, ChatGPT OAuth, reasoning=low, timeout=90s)
-Codex / per-job model
+LLM judge (Codex CLI by default, or Claude API; per-job model)
   │ prompt: extract ≤5 durable facts as {"facts":[...]} (plus an episode checkpoint)
   │ ~15-30s per call
   ▼

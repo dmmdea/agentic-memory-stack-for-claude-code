@@ -1,8 +1,8 @@
 """mem0 v2.0.4 config - v0.12 stack
 WSL-native, no Docker. Backends:
 - LLM (fallback extractor, fires only when infer=True): local llama-swap. NOT used in
-  the hot path - L1a Stop hook and C1 nightly consolidation both use Codex CLI
-  (per-job model, ChatGPT subscription OAuth) instead. See ARCHITECTURE.md for the
+  the hot path - L1a Stop hook and C1 nightly consolidation both use the LLM judge
+  (the Codex CLI by default, or the Claude API) instead. See ARCHITECTURE.md for the
   history of why this is NOT 'claude --print' (Anthropic Max OAuth concurrency
   block; verified failure documented in CHANGELOG.md).
 - Embedder: EmbeddingGemma-300m (multilingual EN/ES) via llama.cpp/llama-swap :11436

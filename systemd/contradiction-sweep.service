@@ -5,7 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 # C5 (2026-07-03, audit decision 2026-06-14): contradiction judging is JUDGMENT
-# work -> Codex via the Windows shim (:18792); local models are never the judge
+# work -> the judge provider (Codex via the Windows shim (:18792) by default); local models are never the judge
 # (an earlier 3B local judge YES'd 9/9 pairs spuriously, and the v0.27.3
 # re-judge measured 78% false positives on local verdicts). This REVERSES the
 # v0.27.3 `--judge local` trade: the script preflights the shim and NO-OPs

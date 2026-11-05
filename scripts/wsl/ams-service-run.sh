@@ -48,6 +48,13 @@ if [[ "$(env_val MEM0_HOST_KIND)" == "native" ]]; then
   for c in ams-api-key ams-service-key; do
     [[ -r "$sec/$c.cred" ]] || { echo "missing $sec/$c.cred (re-run install/linux-authority.sh, which makes the service key)" >&2; exit 2; }
   done
+  # On the Claude API a script that judges needs the API key too (the installed units get it from
+  # their judge-anthropic.conf drop-in; a transient unit has no drop-ins).
+  judge_cred=()
+  if [[ "$(env_val MEM0_JUDGE_PROVIDER)" == "anthropic" ]]; then
+    [[ -r "$sec/ams-anthropic-key.cred" ]] || { echo "missing $sec/ams-anthropic-key.cred (the Claude API key of the judge provider; install/linux-authority.sh --judge-provider anthropic says how to make it)" >&2; exit 2; }
+    judge_cred=(-p "LoadCredentialEncrypted=ams-anthropic-key:$sec/ams-anthropic-key.cred")
+  fi
   # a plain `ssh host 'cmd'` may reach a shell without the user runtime dir, and systemd-run --user needs it
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   unit="ams-service-run-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -55,6 +62,7 @@ if [[ "$(env_val MEM0_HOST_KIND)" == "native" ]]; then
   exec systemd-run --user --pipe --wait --collect --unit="$unit" \
     -p "LoadCredentialEncrypted=ams-api-key:$sec/ams-api-key.cred" \
     -p "LoadCredentialEncrypted=ams-service-key:$sec/ams-service-key.cred" \
+    ${judge_cred[@]+"${judge_cred[@]}"} \
     -p "Environment=MEM0_HOST_KIND=native" \
     -p "Environment=MEM0_CODEX_TRANSPORT=native" \
     -p "Environment=CODEX_HOME=$sec/codex" \

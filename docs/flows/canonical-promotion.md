@@ -21,7 +21,7 @@ Two distinct triggers, never a single one:
 - **Canonical-key custody** — the HMAC key resolved at call time from one of three sources (runtime tmpfs / plaintext / DPAPI blob); detail in [`../systems/dpapi-canonical-key.md`](../systems/dpapi-canonical-key.md).
 - **`dream-consolidate.ps1` (phase 3.5)** — the nightly orchestrator's autonomous-promotion phase; see [`../systems/dream-skill.md`](../systems/dream-skill.md).
 - **`autopromote-lib.ps1`** — the pure nomination pipeline (`Invoke-AutopromoteDecision`) and the **4C promotion gate** (`Invoke-PromotionGate` / `Get-PromotionGateVerdict` / `Resolve-GateBlocked`).
-- **Codex CLI** — path B uses it twice: once to *nominate* canonical-worthy evidence, and once (a separate, adversarial pass) as the contradiction judge. Never the proposing pass judging itself.
+- **The LLM judge** (the Codex CLI by default, or the Claude API; see [judge provider](../systems/judge-provider.md)) — path B uses it twice: once to *nominate* canonical-worthy evidence, and once (a separate, adversarial pass) as the contradiction judge. Never the proposing pass judging itself.
 - **The mem0 server** — `PATCH /v1/memories/{id}/tier` validates the actor, the reason, and the HMAC token via `security_invariants.validate_hmac_user_direct`, then writes the tier ledger. See [`../systems/mem0-api.md`](../systems/mem0-api.md).
 
 ## Step-by-step flow
@@ -41,10 +41,10 @@ The `reason` is a required positional argument (the CLI exits `2` without it) �
 
 After the nightly consolidation writes its insights, phase 3.5 may autonomously promote a *few* `evidence` facts. It is precision-first and structurally bounded:
 
-1. **Nominate.** A second Codex call proposes canonical-worthy evidence — evergreen, declarative, ground-truth, cross-session, high-confidence.
+1. **Nominate.** A second judge call proposes canonical-worthy evidence — evergreen, declarative, ground-truth, cross-session, high-confidence.
 2. **Decide the shortlist** (`Invoke-AutopromoteDecision`, a pure pipeline): parse the nominees → **structural filter** (`Test-ImperativeOrTask` rejects task text, leading imperatives and whatever the server's imperative canary would refuse with `422`: a sentence that opens with Must, Never, Always, Shall, Do not, Don't or `RULE:` in any case, or says "you must"; the Python dream applies the same rule through the server's own module, so a text the server would refuse is never gated or sent) → **sort by confidence descending** → **cap at 3** (the rest deferred to the next night) → **dedup** against the existing canonical set.
 3. **Gate each survivor** (`Get-PromotionGateVerdict` → `Invoke-PromotionGate`), the **4C** contradiction + source-weighted-corroboration judge:
-   - **Contradiction gate (all sources):** if a *second, independent, adversarial* Codex pass judges the nominee to contradict an existing canonical fact → **BLOCK**. The verdict fails safe: an errored canonical fetch or an unparseable judge reply is treated as a contradiction.
+   - **Contradiction gate (all sources):** if a *second, independent, adversarial* judge pass judges the nominee to contradict an existing canonical fact → **BLOCK**. The verdict fails safe: an errored canonical fetch or an unparseable judge reply is treated as a contradiction.
    - **Source-weighted corroboration:** a `trusted` source (operator-asserted — `operator-decision` / `user-decision`; the `source` label is caller-chosen, see the security notes) fast-tracks on the contradiction gate alone; **every other source class is treated as untrusted** and needs `≥ MinCorroboration` (default **2**) independent observations. Anything not on the trusted allowlist is untrusted by construction.
 4. **Promote the survivors** by calling `mem0-canonize.sh --actor dream-autopromote <id> "<reason>"` — the *same* HMAC door as path A, signed with the *same* key. The actor label only distinguishes the two in the ledger.
 
@@ -96,7 +96,7 @@ A promoted record now sits in `canonical`: it becomes part of the anchor set the
 ## External dependencies
 
 - **The canonical key** — resolved from tmpfs / plaintext / DPAPI blob; without it, both paths refuse (see [`../systems/dpapi-canonical-key.md`](../systems/dpapi-canonical-key.md)).
-- **Codex CLI** (ChatGPT-subscription) — path B's nomination pass and the independent adversarial contradiction judge; serialized by the shared Codex mutex.
+- **The LLM judge** (the Codex CLI on a ChatGPT login by default, or the Claude API) — path B's nomination pass and the independent adversarial contradiction judge; on the Codex provider, serialized by the shared Codex mutex.
 - **The mem0 REST server** on `:18791` — the PATCH /tier gate and the tier ledger.
 - **Qdrant + EmbeddingGemma** — path B's corroboration and nearest-canonical queries run against the live vector store.
 - **Windows Task Scheduler** — hosts the nightly dream that drives path B.
@@ -106,7 +106,7 @@ A promoted record now sits in `canonical`: it becomes part of the anchor set the
 1. **No plain write can create canonical.** Only the HMAC-signed CLI reaches the tier; the actor must be `user-direct` or `dream-autopromote`, and both go through the same signing surface.
 2. **Autonomy is HMAC-uniform.** The dream's promotion is signed with the same key as the operator's — the `dream-autopromote` label is auditing metadata, not a privilege bypass: it unlocks nothing the HMAC does not. The labels that do carry privilege (the job labels such as `dream-consolidator`) are credential-backed claims since 1.32.5, and none of them reaches canonical: the service key that proves them is a different secret from the canonical key.
 3. **The 4C gate is observed-by-default, enforced-by-choice.** Shadow computes and logs; only `enforce` blocks. Never assume "blocks by default."
-4. **The contradiction judge is independent and fail-safe.** A second adversarial Codex pass, never the proposer; any unverifiable verdict counts as a contradiction.
+4. **The contradiction judge is independent and fail-safe.** A second adversarial judge pass, never the proposer; any unverifiable verdict counts as a contradiction.
 5. **At most 3 autopromotions per night**, confidence-sorted and deduped against the existing canonical set.
 6. **Canonical promotion is online-only** — no offline/queued route exists.
 

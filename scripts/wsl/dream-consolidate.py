@@ -498,8 +498,9 @@ PROMOTE ONLY IF the memory is:
 3. GROUND-TRUTH — operator-stated or a verifiable environment fact (not speculation or inference)
 4. CROSS-SESSION — relevant beyond the current session or project
 5. HIGH-CONFIDENCE — you are certain it belongs in the authority tier
+6. CONSEQUENTIAL — a later decision or action depends on it (a true fact that nothing will ever turn on does not belong in the authority tier)
 
-NEVER nominate: tasks, ship logs, status updates, transient debugging notes, brand/voice content, speculation, anything imperative (rules/orders), anything already in the canonical set, or anything where you are unsure.
+NEVER nominate: tasks, ship logs, status updates, transient debugging notes, brand/voice content, speculation, the momentary state of a service or machine ("X is up", "X is running"), a one-off value from a single task, an account alias or an inventory detail that no decision depends on, anything imperative (rules/orders), anything already in the canonical set, or anything where you are unsure.
 
 PRECISION OVER RECALL: when in doubt, omit. A missed nomination is cheap (it will be re-reviewed tomorrow); a wrong authority-write is not.
 
@@ -1074,7 +1075,7 @@ class Dream:
                 continue
             called += 1
             r = self._judge_call("store-judge", store_judge_prompt(ws, shorten, migrate),
-                                 ams_env.MODEL_CLASSIFY, "medium", STORE_JUDGE_TIMEOUT_S)
+                                 ams_env.judge_model("classify"), "medium", STORE_JUDGE_TIMEOUT_S)
             if not r.get("ok"):
                 log(f"  store-judge {ws}: judge failed: {r.get('error_type')}")
                 stores.append({"workspace": ws, "outcome": "unavailable",
@@ -1148,8 +1149,18 @@ class Dream:
             log("skipping: nightly throttle (23h) not yet elapsed")
             return {"phase": "throttle", "posted": 0, "promoted": 0, "note": "skipping: nightly throttle (23h) not yet elapsed"}
 
-        # ---- quota gate (spec §4): read the newest window probe; never judge below the reserve
-        if not self.dry:
+        # ---- allowance gate. On the Claude API the allowance is the box's monthly spend cap, read
+        # from the transport's own ledger; on Codex it is the plan window (spec §4): read the newest
+        # window probe and never judge below the reserve. Either skip leaves the throttle unmarked.
+        if not self.dry and ams_env.judge_provider() == "anthropic":
+            import anthropic_judge
+            gate = anthropic_judge.budget_gate()
+            if not gate["allow"]:
+                log(f"skipping: judge budget gate — {gate['reason']}")
+                ams_env.write_usage(COMPONENT, status="ok", outcome="skipped_quota")
+                return {"phase": "quota", "posted": 0, "promoted": 0, "note": f"skipping: judge budget gate — {gate['reason']}"}
+            log(f"  budget gate: {gate['reason']}")
+        elif not self.dry:
             window = codex_usage.last_window()
             if window is None and self.probe is not None:
                 try:
@@ -1218,11 +1229,11 @@ class Dream:
                 return {"phase": "gather", "posted": 0, "promoted": 0, "note": "no recent evidence or transcripts, skipping gather"}
 
             g = self._judge_call("dream-gather", gather_prompt(memorymd, insights, ep_lines, open_goals, blocked, oqs, corpus),
-                                 ams_env.MODEL_CLASSIFY, "medium", GATHER_TIMEOUT_S)
+                                 ams_env.judge_model("classify"), "medium", GATHER_TIMEOUT_S)
             self.ms["gather"], self.tokens["gather"] = g["duration_ms"], int(g.get("tokens_used") or 0)
             if not g.get("ok"):
-                log(f"  gather codex failed: {g.get('error_type')} {g.get('error', '')}")
-                return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather codex failed: {g.get('error_type')}", "failed": True}
+                log(f"  gather judge failed: {g.get('error_type')} {g.get('error', '')}")
+                return {"phase": "gather", "posted": 0, "promoted": 0, "note": f"gather judge failed: {g.get('error_type')}", "failed": True}
             parsed = extract_json(g.get("response", ""), "signals")
             signals = list(parsed.get("signals") or []) if parsed else []
             self.n_signals = len(signals)
@@ -1256,16 +1267,16 @@ class Dream:
             evidence_bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 180)}" for e in evidence)
             evidence_ids = [str(e.get("id")) for e in evidence]
             c = self._judge_call("dream-consolidate", consolidate_prompt(signal_bullets, evidence_bullets),
-                                 ams_env.MODEL_SYNTHESIS, ams_env.EFFORT_SYNTHESIS, SYNTH_TIMEOUT_S)
+                                 ams_env.judge_model("synthesis"), ams_env.EFFORT_SYNTHESIS, SYNTH_TIMEOUT_S)
             self.ms["consolidate"], self.tokens["consolidate"] = c["duration_ms"], int(c.get("tokens_used") or 0)
             if not c.get("ok"):
-                log(f"  consolidate codex failed: {c.get('error_type')} {c.get('error', '')}")
-                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate codex failed: {c.get('error_type')}", "failed": True}
+                log(f"  consolidate judge failed: {c.get('error_type')} {c.get('error', '')}")
+                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": f"consolidate judge failed: {c.get('error_type')}", "failed": True}
             parsed = extract_json(c.get("response", ""), "insights")
             if parsed is None:
-                log("  consolidate: malformed JSON from codex; skipping throttle mark")
+                log("  consolidate: malformed JSON from the judge; skipping throttle mark")
                 log(f"  preview: {_clip(c.get('response', ''), 300)}")
-                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from codex; throttle NOT marked", "failed": True}
+                return {"phase": "consolidate", "posted": 0, "promoted": 0, "note": "consolidate: malformed JSON from the judge; throttle NOT marked", "failed": True}
             ins_list = list(parsed.get("insights") or [])
             self.save_phase("consolidate", {"insights": ins_list, "codex_ms": self.ms["consolidate"], "tokens": self.tokens["consolidate"]})
 
@@ -1355,18 +1366,18 @@ class Dream:
         bullets = _lines(f"- [{e.get('id')}] {_clip(_mem_text(e), 160)}" for e in candidates[:50])
         codex_json, codex_failed, promote_ms = None, False, None
         if not candidates:
-            log("  autopromote: no evidence candidates, skipping Codex")
+            log("  autopromote: no evidence candidates, skipping the judge")
             ams_env.write_usage("dream-promote", status="ok", outcome="skipped_no_candidates",
-                                model_requested=ams_env.MODEL_SYNTHESIS, effort_requested=ams_env.EFFORT_SYNTHESIS)
+                                model_requested=ams_env.judge_model("synthesis"), effort_requested=ams_env.EFFORT_SYNTHESIS)
         else:
-            p = self._judge_call("dream-promote", promote_prompt(bullets, canonical_facts), ams_env.MODEL_SYNTHESIS,
+            p = self._judge_call("dream-promote", promote_prompt(bullets, canonical_facts), ams_env.judge_model("synthesis"),
                                  ams_env.EFFORT_SYNTHESIS, SYNTH_TIMEOUT_S)
             promote_ms = p["duration_ms"]
             if p.get("ok") and str(p.get("response", "")).strip():
                 codex_json = p.get("response")
             else:
                 codex_failed = True
-                log(f"  autopromote: Codex call failed (non-fatal): {p.get('error_type', 'empty')}")
+                log(f"  autopromote: judge call failed (non-fatal): {p.get('error_type', 'empty')}")
         decision = ap.autopromote_decision(codex_json, codex_failed, candidates, canonical_norm, dry_run=self.dry)
         for line in decision["logs"]:
             log(f"  {line}")

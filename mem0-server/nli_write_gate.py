@@ -2,13 +2,14 @@
 
 A self-writing memory store with no write-gate is a drift/poisoning surface (SSGM
 2603.11768; AgentPoison). This gate rejects/flags an added fact that CONTRADICTS an
-existing canonical/core fact — judged by **Codex** (the model-routing rule: all LLM
-judgment uses Codex, never a local model), reached via the Windows Codex HTTP shim.
+existing canonical/core fact — judged by the configured LLM judge (the model-routing rule: all LLM
+judgment goes to the judge provider, never a local model): Codex by default, reached on a
+WSL-hosted brain via the Windows Codex HTTP shim, or the Claude API.
 
 DESIGN (never block the hot write path):
   - Env-gated OFF by default (the caller only invokes this when MEM0_NLI_GATE_ENABLED).
   - FAST PRE-FILTER first: a canonical-tier search with a high SEMANTIC threshold floor.
-    Codex is invoked ONLY when a genuinely high-cosine canonical neighbor exists; every
+    The judge is invoked ONLY when a genuinely high-cosine canonical neighbor exists; every
     other write admits immediately (no LLM call on the common path).
   - FAIL OPEN: empty text, no neighbor, a search error, the shim being down/timing out,
     an unparseable verdict, or a NO verdict all ADMIT. The gate only acts on a CONFIDENT

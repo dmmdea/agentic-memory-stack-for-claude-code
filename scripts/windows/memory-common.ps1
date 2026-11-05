@@ -669,6 +669,359 @@ function Get-CodexAuthMode {
     return 'unknown'
 }
 
+# ---------------------------------------------------------------- judge provider (Claude API)
+# Who does this box's LLM work: the Codex CLI (the default) or the Claude API. The setting, the
+# models, the monthly spend cap, the key file and the spend ledger are the ones
+# mem0-server/anthropic_judge.py uses (docs/systems/judge-provider.md), so a box has one provider
+# setting, one key and one ledger whichever language makes the call. This side speaks raw HTTP:
+# there is no official SDK for PowerShell.
+# USD per million tokens (input, output), most specific prefix first. KEEP IN SYNC with _PRICES in
+# mem0-server/anthropic_judge.py. A model no row matches is priced at the highest rate here, so it
+# can trip the cap early, never late.
+$script:AmJudgePrices = @(
+    @('claude-haiku-5-5', 0.10, 0.50),
+    @('claude-sonnet-5', 2.00, 10.00),
+    @('claude-opus-5-5', 4.00, 20.00),
+    @('claude-opus-', 5.00, 25.00),
+    @('claude-fable-', 10.00, 50.00),
+    @('claude-haiku-', 1.00, 5.00),
+    @('claude-sonnet-', 3.00, 15.00)
+)
+$script:AmJudgeUnknownPrice = @(10.00, 50.00)
+$script:AmJudgeDefaultModelSynthesis = 'claude-opus-5-5'
+$script:AmJudgeDefaultModelClassify = 'claude-haiku-5-5'
+$script:AmJudgeDefaultBudgetUsd = 20.0
+# Thinking counts toward max_tokens, so a cap sized for a short answer can be used up before the
+# answer starts. This is a ceiling, not a spend.
+$script:AmJudgeMaxTokens = 16000
+# A declined request is re-served by the model the provider recommends, inside the same call. Only
+# these families accept the parameter; on the others a refusal is final.
+$script:AmJudgeFallbackBeta = 'server-side-fallback-2026-07-01'
+$script:AmJudgeFallbackFamilies = @('claude-opus-5', 'claude-sonnet-5-5', 'claude-fable-5')
+$script:AmJudgeApiUrl = 'https://api.anthropic.com/v1/messages'
+$script:AmJudgeApiVersion = '2026-10-21'
+
+function Get-AmsMem0Dir {
+    # The directory that holds this box's mem0 API key also holds stack.env, the Claude API key and
+    # the spend ledger: ~/.mem0 on Unix, the same directory inside WSL (over the UNC share) on Windows.
+    return (Split-Path -Parent $script:Mem0KeyPath)
+}
+
+function Get-AmsJudgeSettings {
+    # Provider, models, workspace id and monthly cap, read per call: the environment first, then
+    # stack.env, the same keys in the same order as anthropic_judge._setting. A stack.env that cannot
+    # be read gives the defaults, which means the Codex provider. A box with no stack.env is the
+    # ordinary case of that. A stack.env that should be there and cannot be reached (on a PC it is
+    # read over the WSL share) is not, so that one is logged.
+    $stack = @{}
+    $stackError = ''
+    try {
+        $f = Join-Path (Get-AmsMem0Dir) 'stack.env'
+        foreach ($line in @([System.IO.File]::ReadAllLines($f))) {
+            $t = "$line".Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            $i = $t.IndexOf('=')
+            if ($i -lt 1) { continue }
+            $stack[$t.Substring(0, $i).Trim()] = $t.Substring($i + 1).Trim()
+        }
+    } catch [System.IO.FileNotFoundException] {
+    } catch { $stackError = [string]$_.Exception.Message }
+    if ($stackError -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEM0_JUDGE_PROVIDER'))) {
+        try {
+            Write-MemoryLog -Component 'codex' -Message ('judge: stack.env could not be read (' + $stackError + '), so the provider reads as its default, codex')
+        } catch { }
+    }
+    $read = {
+        param([string]$Key, [string]$Default = '')
+        $v = [Environment]::GetEnvironmentVariable($Key)
+        if (-not [string]::IsNullOrWhiteSpace($v)) { return "$v".Trim() }
+        if ($stack.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace([string]$stack[$Key])) { return [string]$stack[$Key] }
+        return $Default
+    }
+    # 0 turns the cap off. A value that does not parse keeps the default: a typo never removes the cap.
+    $budget = [double]$script:AmJudgeDefaultBudgetUsd
+    $rawBudget = [string](& $read 'MEM0_JUDGE_MONTHLY_BUDGET_USD')
+    if ($rawBudget) {
+        $b = [double]0
+        if ([double]::TryParse($rawBudget, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$b) -and $b -ge 0) { $budget = $b }
+    }
+    $provider = if (([string](& $read 'MEM0_JUDGE_PROVIDER')).ToLowerInvariant() -eq 'anthropic') { 'anthropic' } else { 'codex' }
+    return [pscustomobject]@{
+        Provider       = $provider
+        ModelSynthesis = [string](& $read 'MEM0_JUDGE_MODEL_SYNTHESIS' $script:AmJudgeDefaultModelSynthesis)
+        ModelClassify  = [string](& $read 'MEM0_JUDGE_MODEL_CLASSIFY' $script:AmJudgeDefaultModelClassify)
+        WorkspaceId    = [string](& $read 'MEM0_ANTHROPIC_WORKSPACE_ID')
+        BudgetUsd      = $budget
+    }
+}
+
+function Get-AmsAnthropicKeyPath {
+    # The first non-empty key file, or '': the credential a systemd unit loaded, the file the operator
+    # named, then <mem0 dir>/anthropic-key (owner-only). The same order as anthropic_judge.key_path.
+    $cands = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:CREDENTIALS_DIRECTORY)) { $cands += (Join-Path "$($env:CREDENTIALS_DIRECTORY)".Trim() 'ams-anthropic-key') }
+    if (-not [string]::IsNullOrWhiteSpace($env:MEM0_ANTHROPIC_KEY_FILE)) { $cands += "$($env:MEM0_ANTHROPIC_KEY_FILE)".Trim() }
+    $cands += (Join-Path (Get-AmsMem0Dir) 'anthropic-key')
+    foreach ($c in $cands) {
+        try {
+            if ([System.IO.File]::Exists($c) -and ((New-Object System.IO.FileInfo($c)).Length -gt 0)) { return $c }
+        } catch { }
+    }
+    return ''
+}
+
+function Get-AmsJudgeSpendPath {
+    # One ledger per month (UTC), shared with the Python transport: <mem0 dir>/maintenance/llm-spend-YYYY-MM.jsonl
+    param([datetime]$NowUtc = [datetime]::UtcNow)
+    $month = $NowUtc.ToString('yyyy-MM', [Globalization.CultureInfo]::InvariantCulture)
+    return (Join-Path (Join-Path (Get-AmsMem0Dir) 'maintenance') ('llm-spend-' + $month + '.jsonl'))
+}
+
+function Get-AmsJudgeCostUsd {
+    # Estimated cost of one call. The provider's console is the bill; this feeds the cap and the ledger.
+    param([string]$Model, [long]$InputTokens = 0, [long]$OutputTokens = 0)
+    $rateIn = [double]$script:AmJudgeUnknownPrice[0]; $rateOut = [double]$script:AmJudgeUnknownPrice[1]
+    foreach ($row in $script:AmJudgePrices) {
+        if ("$Model".StartsWith([string]$row[0], [StringComparison]::Ordinal)) { $rateIn = [double]$row[1]; $rateOut = [double]$row[2]; break }
+    }
+    # Above 100K prompt tokens the small model bills at five times its short-prompt rate.
+    if ("$Model".StartsWith('claude-haiku-5-5', [StringComparison]::Ordinal) -and $InputTokens -gt 100000) { $rateIn *= 5.0; $rateOut *= 5.0 }
+    return (($InputTokens * $rateIn + $OutputTokens * $rateOut) / 1000000.0)
+}
+
+function Get-AmsJudgeMonthSpend {
+    # This month's estimated spend on this box, summed from the ledger. No ledger yet reads as 0. A
+    # ledger that exists and cannot be read also reads as 0, and the log says so, because the cap is
+    # then not enforced. The rows come from two writers (this file and anthropic_judge.py), so the
+    # figure is read by pattern: a number may carry an exponent (1e-05).
+    $f = ''
+    try { $f = Get-AmsJudgeSpendPath } catch { return [double]0 }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    for ($attemptNo = 1; $attemptNo -le 3; $attemptNo++) {
+        try {
+            if (-not [System.IO.File]::Exists($f)) { return [double]0 }
+            # Opened shared for writing: another worker may be appending its own row right now.
+            $text = ''
+            $fs = New-Object System.IO.FileStream($f, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+                $text = $sr.ReadToEnd()
+            } finally { $fs.Dispose() }
+            $total = [double]0
+            foreach ($m in [regex]::Matches($text, '"cost_usd"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)')) {
+                $c = [double]0
+                if ([double]::TryParse($m.Groups[1].Value, [Globalization.NumberStyles]::Float, $inv, [ref]$c)) { $total += $c }
+            }
+            return $total
+        } catch {
+            if ($attemptNo -lt 3) { Start-Sleep -Milliseconds 50; continue }
+            try {
+                Write-MemoryLog -Component 'codex' -Message ('judge: spend ledger unreadable, so the monthly cap is not enforced for this call: ' + $_.Exception.Message)
+            } catch { }
+        }
+    }
+    return [double]0
+}
+
+function Add-AmsJudgeSpend {
+    # One row per API call in the month's ledger; returns the estimated cost. A ledger that cannot be
+    # written never fails the call that was already paid for: the row goes to the log instead, so the
+    # spend is still on record. Numbers are written culture-invariant: a decimal comma would make the
+    # row unreadable to both readers.
+    # -Estimated marks a row whose token counts did not come from the provider (a call that timed
+    # out on this side): "est": true.
+    param([string]$Model, [long]$InputTokens = 0, [long]$OutputTokens = 0, [switch]$Estimated)
+    $cost = Get-AmsJudgeCostUsd -Model $Model -InputTokens $InputTokens -OutputTokens $OutputTokens
+    $row = ''
+    try {
+        $now = [datetime]::UtcNow
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $f = Get-AmsJudgeSpendPath -NowUtc $now
+        $dir = Split-Path -Parent $f
+        $row = '{"ts": "' + $now.ToString('yyyy-MM-ddTHH:mm:ss.ffffff', $inv) + '+00:00", "provider": "anthropic", "model": "' +
+            ("$Model" -replace '[^A-Za-z0-9._:@/-]', '') + '", "input_tokens": ' + $InputTokens.ToString($inv) +
+            ', "output_tokens": ' + $OutputTokens.ToString($inv) + ', "cost_usd": ' + [Math]::Round($cost, 6).ToString('0.######', $inv) + $(if ($Estimated) { ', "est": true' } else { '' }) + '}'
+        # Several hook workers can finish a call in the same instant. On the WSL share an append is a
+        # seek to the end followed by a write at that offset, and nothing there stops two writers
+        # taking the same offset: measured, 8 writers lost 74 of 320 rows with no error. So the
+        # writers on this box take a named mutex for the append. A mutex that cannot be had (5 s, or
+        # no right to create one) does not stop the write: the row is appended anyway.
+        $mutex = $null; $held = $false
+        try {
+            try {
+                $mutex = New-Object System.Threading.Mutex($false, 'Global\AmsJudgeSpendLedger')
+                try { $held = $mutex.WaitOne(5000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
+            } catch { $mutex = $null }
+            for ($attemptNo = 1; $attemptNo -le 3; $attemptNo++) {
+                try {
+                    if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+                    [System.IO.File]::AppendAllText($f, $row + "`n", (New-Object System.Text.UTF8Encoding($false)))
+                    break
+                } catch {
+                    if ($attemptNo -lt 3) { Start-Sleep -Milliseconds 50; continue }
+                    throw
+                }
+            }
+        } finally {
+            if ($held) { try { $mutex.ReleaseMutex() } catch { } }
+            if ($null -ne $mutex) { try { $mutex.Dispose() } catch { } }
+        }
+    } catch {
+        try {
+            Write-MemoryLog -Component 'codex' -Message ('judge: spend ledger row not written (' + $_.Exception.Message + '): ' + $row)
+        } catch { }
+    }
+    return $cost
+}
+
+function Invoke-AnthropicJudge {
+    # One Messages API call, returned in the shape of a Codex CLI transcript, so the parsers below
+    # (Parse-CodexHeader, Parse-CodexTokenUsage, Get-CodexResponseText) and every caller of
+    # Invoke-CodexSubagent work unchanged. It throws on failure, like the Codex path; a timeout
+    # message contains 'timed out', which is what the callers test for.
+    # The key is read from its file here and travels only in the request header. It is never put in
+    # an environment variable (a coding agent that inherits ANTHROPIC_API_KEY stops using its own
+    # login), a log line or an error message.
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [string]$ReasoningEffort = 'low',
+        [int]$TimeoutSeconds = 120,
+        [string]$Model = '',
+        [string]$LastMessagePath = '',
+        $Settings = $null
+    )
+    if ($null -eq $Settings) { $Settings = Get-AmsJudgeSettings }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $keyPath = Get-AmsAnthropicKeyPath
+    if (-not $keyPath) {
+        throw ("the judge provider is the Claude API but no key file was found (expected " + (Join-Path (Get-AmsMem0Dir) 'anthropic-key') + "; docs/systems/judge-provider.md)")
+    }
+    $spent = Get-AmsJudgeMonthSpend
+    if ($Settings.BudgetUsd -gt 0 -and $spent -ge $Settings.BudgetUsd) {
+        throw ([string]::Format($inv, 'Claude API monthly spend cap reached: estimated {0:0.00} USD of {1:0.00} USD this month (MEM0_JUDGE_MONTHLY_BUDGET_USD in stack.env)', $spent, $Settings.BudgetUsd))
+    }
+    # The callers name a Codex model per job class. A claude-* id is used as given; the synthesis pin
+    # maps to the synthesis model; everything else is bounded work and gets the classify model.
+    $apiModel = [string]$Settings.ModelClassify
+    if ("$Model".StartsWith('claude-', [StringComparison]::Ordinal)) { $apiModel = $Model }
+    elseif ($Model -and ($Model -eq $script:AmCodexModelSynthesis)) { $apiModel = [string]$Settings.ModelSynthesis }
+    $effort = if (@('low', 'medium', 'high', 'xhigh', 'max') -contains $ReasoningEffort) { $ReasoningEffort } else { 'medium' }
+
+    $useFallback = $false
+    foreach ($fam in $script:AmJudgeFallbackFamilies) {
+        if ($apiModel.StartsWith([string]$fam, [StringComparison]::Ordinal)) { $useFallback = $true; break }
+    }
+    $body = [ordered]@{
+        model         = $apiModel
+        max_tokens    = $script:AmJudgeMaxTokens
+        output_config = @{ effort = $effort }
+        messages      = @(@{ role = 'user'; content = $Prompt })
+    }
+    if ($useFallback) { $body['fallbacks'] = 'default' }
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 6 -Compress))
+
+    $key = ([System.IO.File]::ReadAllText($keyPath)).Trim()
+    if (-not $key) { throw "the Claude API key file is empty ($keyPath)" }
+    try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
+    # Only a process pinned to a protocol list without TLS 1.2 is touched (old .NET Framework
+    # defaults); the system default (0) already negotiates it.
+    try {
+        $sp = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$sp -ne 0 -and (([int]$sp -band 3072) -eq 0)) { [Net.ServicePointManager]::SecurityProtocol = $sp -bor [Net.SecurityProtocolType]::Tls12 }
+    } catch { }
+
+    # One retry, on a rate limit, a server error or a connection failure only, and only inside the
+    # caller's time bound. A timeout is never retried: the bound is the caller's, not a suggestion.
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    $respText = ''
+    while ($true) {
+        $attempt++
+        $remaining = ($deadline - [datetime]::UtcNow).TotalSeconds
+        if ($remaining -lt 1) { throw "Invoke-CodexSubagent timed out after ${TimeoutSeconds}s (Claude API)" }
+        $status = 0; $netError = ''; $timedOut = $false; $respText = ''
+        $client = [System.Net.Http.HttpClient]::new()
+        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $script:AmJudgeApiUrl)
+        try {
+            $client.Timeout = [TimeSpan]::FromSeconds($remaining)
+            [void]$req.Headers.TryAddWithoutValidation('x-api-key', $key)
+            [void]$req.Headers.TryAddWithoutValidation('anthropic-version', $script:AmJudgeApiVersion)
+            if ($Settings.WorkspaceId) { [void]$req.Headers.TryAddWithoutValidation('anthropic-workspace-id', [string]$Settings.WorkspaceId) }
+            if ($useFallback) { [void]$req.Headers.TryAddWithoutValidation('anthropic-beta', $script:AmJudgeFallbackBeta) }
+            $req.Content = [System.Net.Http.ByteArrayContent]::new($bodyBytes)
+            $req.Content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/json')
+            $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+            $status = [int]$resp.StatusCode
+            # Decoded as UTF-8 here, by hand: a JSON body names no charset, and the stock cmdlets
+            # then decode it as Latin-1 on Windows PowerShell 5.1.
+            $respText = [System.Text.Encoding]::UTF8.GetString($resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult())
+        } catch {
+            $ex = $_.Exception
+            while ($null -ne $ex) {
+                if ($ex -is [System.OperationCanceledException]) { $timedOut = $true }
+                $netError = [string]$ex.Message
+                $ex = $ex.InnerException
+            }
+        } finally {
+            try { $req.Dispose() } catch { }
+            try { $client.Dispose() } catch { }
+        }
+        if ($timedOut) {
+            # The provider may still finish and bill a call this side gave up on, and no usage came
+            # back. The prompt is counted at one token per three characters (a high estimate) and the
+            # answer at nothing, so a run of timeouts cannot spend past the cap unseen.
+            [void](Add-AmsJudgeSpend -Model $apiModel -InputTokens ([long]([Math]::Floor($Prompt.Length / 3) + 1)) -OutputTokens 0 -Estimated)
+            throw "Invoke-CodexSubagent timed out after ${TimeoutSeconds}s (Claude API)"
+        }
+        if ($status -ge 200 -and $status -lt 300) { break }
+        $retryable = ($status -eq 0) -or ($status -eq 429) -or ($status -ge 500)
+        if ($retryable -and $attempt -lt 2 -and (($deadline - [datetime]::UtcNow).TotalSeconds -gt 10)) {
+            Start-Sleep -Seconds 2
+            continue
+        }
+        if ($status -eq 0) { throw ('Claude API unreachable: ' + (Redact-Secrets -Text $netError)) }
+        $errType = ''; $errMsg = ''
+        try { $ej = $respText | ConvertFrom-Json; $errType = [string]$ej.error.type; $errMsg = [string]$ej.error.message } catch { }
+        if (-not $errMsg) { $errMsg = $respText }
+        if ($errMsg.Length -gt 300) { $errMsg = $errMsg.Substring(0, 300) }
+        throw ("Claude API returned HTTP $status" + $(if ($errType) { " ($errType)" } else { '' }) + ': ' + (Redact-Secrets -Text $errMsg))
+    }
+    $key = $null
+
+    $obj = $null
+    try { $obj = $respText | ConvertFrom-Json } catch { $obj = $null }
+    if ($null -eq $obj) { throw 'Claude API returned a body that is not JSON' }
+    $tokIn = [long]0; $tokOut = [long]0; $served = $apiModel; $stop = ''
+    try { $tokIn = [long]$obj.usage.input_tokens } catch { }
+    try { $tokOut = [long]$obj.usage.output_tokens } catch { }
+    try { if ($obj.model) { $served = [string]$obj.model } } catch { }
+    try { $stop = [string]$obj.stop_reason } catch { }
+    # Recorded before the answer is judged: a refusal and an empty answer are billed too.
+    [void](Add-AmsJudgeSpend -Model $served -InputTokens $tokIn -OutputTokens $tokOut)
+    try {
+        Write-MemoryLog -Component 'codex' -Message ("judge: provider=anthropic model=$served effort=$effort tokens_in=$tokIn tokens_out=$tokOut stop=$stop")
+    } catch { }   # a log failure never costs the call
+    if ($stop -eq 'refusal') {
+        $category = ''
+        try { $category = [string]$obj.stop_details.category } catch { }
+        throw ('the Claude API declined the request (category: ' + $(if ($category) { $category } else { 'unspecified' }) + ')')
+    }
+    # Blocks are read by type: a response can open with thinking blocks.
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($block in @($obj.content)) {
+        try { if (([string]$block.type -eq 'text') -and $block.text) { [void]$sb.Append([string]$block.text) } } catch { }
+    }
+    $text = $sb.ToString().Trim()
+    if (-not $text) { throw "the Claude API returned no text (stop_reason: $stop)" }
+    if (-not [string]::IsNullOrWhiteSpace($LastMessagePath)) {
+        try { [System.IO.File]::WriteAllText($LastMessagePath, $text, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    }
+    $nl = "`n"
+    return ('Claude API' + $nl + '--------' + $nl + 'model: ' + $served + $nl + 'provider: anthropic' + $nl +
+        'reasoning effort: ' + $effort + $nl + '--------' + $nl + 'user' + $nl + '[prompt not echoed]' + $nl + $nl +
+        'codex' + $nl + $text + $nl + 'tokens used' + $nl + ($tokIn + $tokOut).ToString($inv))
+}
+
 function Invoke-CodexSubagent {
     param(
         [Parameter(Mandatory)][string]$Prompt,
@@ -685,6 +1038,14 @@ function Invoke-CodexSubagent {
         # the authoritative copy; stdout scraping stays as the fallback.
         [string]$LastMessagePath = ''
     )
+    # The judge provider. On the Claude API this function keeps its name, its parameters and the
+    # shape of what it returns, so every caller and parser is unchanged and needs no Codex CLI.
+    # A missing key is an error, not a reason to use the other provider: the operator chose this one.
+    $judge = Get-AmsJudgeSettings
+    if ($judge.Provider -eq 'anthropic') {
+        return (Invoke-AnthropicJudge -Prompt $Prompt -ReasoningEffort $ReasoningEffort -TimeoutSeconds $TimeoutSeconds `
+            -Model $Model -LastMessagePath $LastMessagePath -Settings $judge)
+    }
     if ($script:IsUnixHost) {
         if (-not (Get-Command $script:CodexCmd -ErrorAction SilentlyContinue)) {
             throw "codex not found on PATH (looked for '$($script:CodexCmd)')"
@@ -995,7 +1356,9 @@ function Get-CodexResponseText {
     if (-not [string]::IsNullOrWhiteSpace($LastMessagePath)) {
         try {
             if (Test-Path -LiteralPath $LastMessagePath) {
-                $fromFile = (Get-Content -LiteralPath $LastMessagePath -Raw -ErrorAction Stop)
+                # Read as UTF-8 by name: both providers write the file as UTF-8 without a BOM, and
+                # Get-Content on Windows PowerShell 5.1 decodes such a file with the ANSI code page.
+                $fromFile = [System.IO.File]::ReadAllText($LastMessagePath, [System.Text.Encoding]::UTF8)
                 if (-not [string]::IsNullOrWhiteSpace($fromFile)) { return $fromFile.Trim() }
             }
         } catch {

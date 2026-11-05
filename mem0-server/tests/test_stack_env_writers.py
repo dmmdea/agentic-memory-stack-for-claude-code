@@ -458,6 +458,15 @@ KEY_READERS = {   # key -> [(file, the text of its stack.env read)]
     "MEM0_RAW_FALLBACK_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"episode_floor": "MEM0_RAW_FALLBACK_COSINE_FLOOR"')],
     "MEM0_NLI_GATE_COSINE_FLOOR": [("mem0-server/embedder_profile.py", '"nli_floor": "MEM0_NLI_GATE_COSINE_FLOOR"')],
     "MEM0_MEDIA_EMBEDDER": [("mem0-server/embedder_profile.py", '_setting("MEM0_MEDIA_EMBEDDER")')],
+    "MEM0_JUDGE_PROVIDER": [("mem0-server/anthropic_judge.py", "_setting(PROVIDER_ENV)"),
+                            ("scripts/windows/memory-common.ps1", "& $read 'MEM0_JUDGE_PROVIDER'"),
+                            ("scripts/wsl/ensure-codex-shim.sh", "s/^MEM0_JUDGE_PROVIDER=//p")],
+    "MEM0_ANTHROPIC_WORKSPACE_ID": [("mem0-server/anthropic_judge.py", '_setting("MEM0_ANTHROPIC_WORKSPACE_ID")'),
+                                    ("scripts/windows/memory-common.ps1", "& $read 'MEM0_ANTHROPIC_WORKSPACE_ID'")],
+    "MEM0_JUDGE_MODEL_SYNTHESIS": [("mem0-server/anthropic_judge.py", '_setting("MEM0_JUDGE_MODEL_SYNTHESIS", DEFAULT_MODEL_SYNTHESIS)')],
+    "MEM0_JUDGE_MODEL_CLASSIFY": [("mem0-server/anthropic_judge.py", '_setting("MEM0_JUDGE_MODEL_CLASSIFY", DEFAULT_MODEL_CLASSIFY)')],
+    "MEM0_JUDGE_MONTHLY_BUDGET_USD": [("mem0-server/anthropic_judge.py", '_setting("MEM0_JUDGE_MONTHLY_BUDGET_USD")'),
+                                      ("scripts/windows/memory-common.ps1", "& $read 'MEM0_JUDGE_MONTHLY_BUDGET_USD'")],
 }
 
 

@@ -53,7 +53,7 @@ Goals are the persistent, multi-session objectives that episodic memory tracks a
 | "What open questions are blocking progress?" | No | Yes — `episodes.open_questions` JSON column |
 | FTS5 fuzzy-match on goal title | No | Yes — `goals_fts` virtual table |
 
-The design choice (locked v0.16): **SQLite adjacency-list hierarchy** over mem0 metadata tagging. Goals need tree traversal, brand isolation, status transitions, and FTS5 fuzzy-match for Codex extraction — all better served by a dedicated table than by Qdrant metadata.
+The design choice (locked v0.16): **SQLite adjacency-list hierarchy** over mem0 metadata tagging. Goals need tree traversal, brand isolation, status transitions, and FTS5 fuzzy-match for LLM-judge extraction (the Codex CLI by default, or the Claude API; see [judge provider](./judge-provider.md)) — all better served by a dedicated table than by Qdrant metadata.
 
 ---
 
@@ -107,7 +107,7 @@ Every session end (via the L1a Stop hook chain) can create or match goals automa
 ```
 Claude Code session ends
   → stop-extract.ps1 → l1a-extract.ps1
-      1. Codex extraction returns:
+      1. LLM-judge extraction returns:
            { facts: [...], episode: {
                goal, summary,
                advanced_goals: [{goal_title, delta_text}, ...],

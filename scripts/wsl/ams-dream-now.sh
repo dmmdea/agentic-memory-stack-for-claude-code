@@ -4,10 +4,10 @@
 # Runs ON the authority. From a replica PC: ssh <brain-alias> 'bash ~/apps/mem0-scripts/ams-dream-now.sh'
 # (a replica's own dream-consolidate.ps1 exits on its role, -Force included, so it never consolidates).
 #
-# The nightly dream is ams-step-dream.service, one step of the chain. Started from a shell it would
-# fail to authenticate: the unit supplies three systemd credentials and three Environment= lines. And
-# its `--guarded` turns it into a receipted no-op once tonight's chain has succeeded. So this starts
-# a transient user unit that carries the same LoadCredentialEncrypted= / Environment= / ExecStartPre=
+# The nightly dream is ams-step-dream.service, one step of the chain. Started from a shell it would fail to
+# authenticate: the unit supplies three systemd credentials (four on the Claude API) and three Environment=
+# lines. And its `--guarded` turns it into a receipted no-op once tonight's chain has succeeded. So this
+# starts a transient user unit that carries the same LoadCredentialEncrypted= / Environment= / ExecStartPre=
 # and runs the unit's own command without --guarded. It goes through ams-step.sh, so the run is
 # receipted like a chain step (step `dream` in ~/.mem0/maintenance/receipts.jsonl); it never stamps
 # last-chain-success (only the --guard step does), so it cannot void or complete a night.
@@ -15,8 +15,8 @@
 # --force is passed to the dream on purpose: dream-consolidate.py skips ("nightly throttle (23h) not
 # yet elapsed") when it ran less than 23 h ago, which after the nightly run is always. --force
 # bypasses that throttle ONLY: the judge lock (a run overlapping the nightly is a quiet, receipted
-# skip) and the Codex quota reserve still apply. It takes no arguments, because a --dry-run would
-# still be receipted as a `dream` step and refresh the dream's freshness in /health/maintenance.
+# skip) and the judge's allowance gate (Codex quota reserve, or Claude API monthly cap) still apply. No
+# arguments: a --dry-run would still be receipted as a `dream` step and refresh its /health/maintenance age.
 #
 # One thing differs from the unit file, because systemd-run is not the unit loader: `-p Environment=`
 # does not expand specifiers (measured on systemd 255: %d and %h reach the process literally), so
@@ -72,6 +72,13 @@ sec="$(env_val MEM0_SECRETS_DIR)"
 for c in ams-api-key ams-canonical-key ams-service-key; do
     [ -r "$sec/$c.cred" ] || fail "missing $sec/$c.cred (the credential ams-step-dream.service loads)"
 done
+# On the Claude API the installed unit loads one more credential through its judge-anthropic.conf
+# drop-in; this transient unit has no drop-ins, so the credential is named here.
+judge_cred=()
+if [ "$(env_val MEM0_JUDGE_PROVIDER)" = anthropic ]; then
+    [ -r "$sec/ams-anthropic-key.cred" ] || fail "missing $sec/ams-anthropic-key.cred (the Claude API key of the judge provider; install/linux-authority.sh --judge-provider anthropic says how to make it)"
+    judge_cred=(-p "LoadCredentialEncrypted=ams-anthropic-key:$sec/ams-anthropic-key.cred")
+fi
 PY="$HOME/apps/mem0-server/.venv/bin/python"
 SCRIPTS="$HOME/apps/mem0-scripts"
 [ -x "$PY" ] || fail "missing $PY (the authority's server venv)"
@@ -92,6 +99,7 @@ systemd-run --user --wait --collect --unit="$unit" \
     -p "LoadCredentialEncrypted=ams-api-key:$sec/ams-api-key.cred" \
     -p "LoadCredentialEncrypted=ams-canonical-key:$sec/ams-canonical-key.cred" \
     -p "LoadCredentialEncrypted=ams-service-key:$sec/ams-service-key.cred" \
+    ${judge_cred[@]+"${judge_cred[@]}"} \
     -p "Environment=MEM0_HOST_KIND=native" \
     -p "Environment=MEM0_CODEX_TRANSPORT=native" \
     -p "Environment=CODEX_HOME=$sec/codex" \

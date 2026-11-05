@@ -3,7 +3,12 @@
 
 # v1.0 Phase 7A: operator-agnostic. The WSL distro is resolved by the orchestrator
 # and passed in; if run standalone it auto-detects the default distro.
-param([string]$Distro = '')
+param(
+    [string]$Distro = '',
+    # 1.40.0: the judge provider this run applies (install.ps1 -JudgeProvider). Empty = what an earlier
+    # install recorded in ~/.mem0/stack.env; a first install with neither is the Codex provider.
+    [ValidateSet('', 'codex', 'anthropic')][string]$JudgeProvider = ''
+)
 
 $ErrorActionPreference = 'Continue'
 if (-not $Distro) {
@@ -63,13 +68,29 @@ Check "claude (Claude Code CLI)" {
     (Test-Path "$env:USERPROFILE\.local\bin\claude.exe") -or
     [bool](Get-Command claude -ErrorAction SilentlyContinue)
 } "Install Claude Code: npm i -g @anthropic-ai/claude-code (or the native installer)"
-# The stack's Codex calls (scripts\windows\memory-common.ps1, 3-verify.ps1) run the npm global shim at this exact path.
-Check "codex.cmd (Codex CLI, npm global: $env:USERPROFILE\AppData\Roaming\npm\codex.cmd)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" } "Install Codex with npm so the shim lands at $env:USERPROFILE\AppData\Roaming\npm\codex.cmd: npm i -g @openai/codex (a Codex installed another way, e.g. pnpm or scoop, is not found by the stack)"
-Check "Codex authenticated (ChatGPT subscription)" {
-    if (-not (Test-Path "$env:USERPROFILE\.codex\auth.json")) { return $false }
-    $auth = Get-Content "$env:USERPROFILE\.codex\auth.json" -Raw | ConvertFrom-Json
-    $auth.auth_mode -eq 'chatgpt' -and $auth.tokens -and $auth.tokens.access_token
-} "Run: codex login   (pick 'Sign in with ChatGPT'; the stack's extraction jobs need a ChatGPT-subscription login, an API-key login is not accepted)"
+# 1.40.0: the judge provider decides which LLM credential this box needs. On the Claude API the Codex
+# CLI and its login are not used at all, so they are not asked for.
+$judgeProvider = $JudgeProvider
+if (-not $judgeProvider) {
+    try {
+        $recorded = (wsl.exe -d $Distro -e bash -lc 'grep -E ^MEM0_JUDGE_PROVIDER= ~/.mem0/stack.env 2>/dev/null | tail -n 1 | cut -d= -f2' 2>$null | Select-Object -First 1)
+        if ("$recorded".Trim() -eq 'anthropic') { $judgeProvider = 'anthropic' }
+    } catch {}
+}
+if ($judgeProvider -eq 'anthropic') {
+    Check "Claude API key file (~/.mem0/anthropic-key in the WSL distro, owner-only, not empty)" {
+        $r = wsl.exe -d $Distro -e bash -lc 'f=~/.mem0/anthropic-key; [ -s $f ] && case $(stat -c %a $f) in 600|400) echo ok ;; esac'
+        ($r -as [string]).Trim() -eq 'ok'
+    } "In the WSL distro: mkdir -p ~/.mem0 && (umask 077; cat > ~/.mem0/anthropic-key)   then paste the key, press Enter, then Ctrl-D. A file that is there with another mode: chmod 600 ~/.mem0/anthropic-key (docs/systems/judge-provider.md)"
+} else {
+    # The stack's Codex calls (scripts\windows\memory-common.ps1, 3-verify.ps1) run the npm global shim at this exact path.
+    Check "codex.cmd (Codex CLI, npm global: $env:USERPROFILE\AppData\Roaming\npm\codex.cmd)" { Test-Path "$env:USERPROFILE\AppData\Roaming\npm\codex.cmd" } "Install Codex with npm so the shim lands at $env:USERPROFILE\AppData\Roaming\npm\codex.cmd: npm i -g @openai/codex (a Codex installed another way, e.g. pnpm or scoop, is not found by the stack). Or run the stack's LLM work on the Claude API: install.ps1 -JudgeProvider anthropic"
+    Check "Codex authenticated (ChatGPT subscription)" {
+        if (-not (Test-Path "$env:USERPROFILE\.codex\auth.json")) { return $false }
+        $auth = Get-Content "$env:USERPROFILE\.codex\auth.json" -Raw | ConvertFrom-Json
+        $auth.auth_mode -eq 'chatgpt' -and $auth.tokens -and $auth.tokens.access_token
+    } "Run: codex login   (pick 'Sign in with ChatGPT'; on the Codex provider the stack's extraction jobs need a ChatGPT-subscription login, an API-key login is not accepted)"
+}
 
 # The store binary merges with `git merge-tree --write-tree`, which needs
 # git >= 2.38 (ams-store/internal/gitx pins the same floor at runtime). Parse the version; a git

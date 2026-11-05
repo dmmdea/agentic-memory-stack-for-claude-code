@@ -19,6 +19,9 @@
 #
 #   ~/.claude/state/codex-shim.disabled   (present -> never spawn)
 #
+# 1.40.0: a replica never spawns it. Both consumers run on the brain only, so on a
+# replica the listener had no caller (the role check below).
+#
 # POSTURE NOTE (deliberate, recorded in the program ledger): the shim now
 # listens on loopback :18792 for up to its idle life (~4h) after each session
 # start, where before it never listened at all. It is loopback-only, its /judge
@@ -40,6 +43,21 @@ try { [void][Console]::In.ReadToEnd() } catch {}
 $dir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
 $optOut = [System.IO.Path]::Combine($env:USERPROFILE, '.claude', 'state', 'codex-shim.disabled')
 if ([System.IO.File]::Exists($optOut)) { exit 0 }
+
+# 1.40.0: both consumers of the shim (the session-time re-judge and the weekly sweep) are brain jobs,
+# so a replica started a listener that nothing ever called. The role is read as the shared lib reads
+# it (~\.mem0\role, then the install receipt beside this script). A role that cannot be read keeps
+# the old behaviour and spawns.
+$role = ''
+try {
+    $roleFile = [System.IO.Path]::Combine($env:USERPROFILE, '.mem0', 'role')
+    if ([System.IO.File]::Exists($roleFile)) { $role = ([System.IO.File]::ReadAllText($roleFile)).Trim().ToLowerInvariant() }
+    if (-not $role) {
+        $receipt = [System.IO.Path]::Combine($dir, 'mem0-stack.config.psd1')
+        if ([System.IO.File]::Exists($receipt)) { $role = ([string](Import-PowerShellDataFile $receipt).Role).Trim().ToLowerInvariant() }
+    }
+} catch { $role = '' }
+if ($role -and $role -ne 'brain') { exit 0 }
 
 # Resolve the port (env override, else the reserved default 18792).
 $port = 18792

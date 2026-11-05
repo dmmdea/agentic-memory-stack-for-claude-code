@@ -5,6 +5,11 @@ date: "2026-06-15"
 
 # Codex CLI as the extraction, consolidation, and judgment LLM
 
+> **Amended 2026-11-05 by [the selectable judge provider](selectable-judge-provider.md).** Codex is
+> the default provider and no longer the only one: a box may run the same jobs on the Claude API
+> with a key the operator supplies. The reasons below for not using the interactive Claude login,
+> and for keeping local models out of judgment, stand.
+
 ## Context
 
 Several unattended jobs need an LLM: the session fact extractor, the nightly consolidator, and the
@@ -40,6 +45,8 @@ invoke Codex concurrently.
 - **Local llama-swap models as the judge/extractor** — rejected on measured quality (78% false
   positives on contradiction judgment).
 - **A paid Anthropic API key** — out of scope by design (no paid APIs beyond existing subscriptions).
+  *Reversed in part on 2026-11-05: an API key is now an opt-in provider, never the default (see the
+  amendment at the top).*
 
 ## Related code
 

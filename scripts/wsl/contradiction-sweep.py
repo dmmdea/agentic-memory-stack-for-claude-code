@@ -93,8 +93,9 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # deployed flat: ~/apps/mem0-scripts
 import ams_env  # noqa: E402  (spec §4: URL from authority-url, key from the systemd credential)
 
-# v0.27.3: reuse the shared Codex bridge (judge_contradiction) so the sweep judges with Codex
-# via the Windows HTTP shim — the model-routing rule (all LLM judgment uses Codex, never a local
+# v0.27.3: reuse the shared judge bridge (judge_contradiction) so the sweep judges with the
+# configured LLM judge (Codex by default, through the Windows HTTP shim on a WSL-hosted brain;
+# or the Claude API) — the model-routing rule (all LLM judgment goes to the judge provider, never a local
 # model; the v0.21.1 offload-e4b judge was the audited misrouting). The bridge lives in
 # mem0-server/ (sibling of scripts/). Local-judge mode still runs if the bridge is absent.
 # LAYOUT-AWARE (2026-07-25): parents[2] alone is correct ONLY in the repo layout
@@ -185,8 +186,8 @@ LLAMA_SWAP = "http://127.0.0.1:11436"
 # for. Override with --model (see curl :11436/v1/models). Re-validate the judge
 # on a labelled set if the harness model regresses.
 DEFAULT_MODEL = "offload-e4b"
-# v0.27.3: the judge is Codex by default (model-routing rule: all LLM judgment uses Codex via the
-# shim, never local). `--judge local` keeps the old offload-e4b path for a cheap/offline pass; its
+# v0.27.3: the judge is the configured provider by default (`codex` names the configured LLM judge;
+# model-routing rule: all LLM judgment goes to the judge provider, never local). `--judge local` keeps the old offload-e4b path for a cheap/offline pass; its
 # flags are advisory (the admission gate hides them, self-heal re-judges) and NEVER authoritative.
 DEFAULT_JUDGE = "codex"
 # 2026-09-07: 45 -> 60s. Modest margin over the code's own stated 20-30s band now that the
@@ -196,6 +197,12 @@ CODEX_JUDGE_TIMEOUT_S = 60.0  # Codex low-effort NLI runs ~20-30s
 # Must move together with CODEX_JUDGE_IDENTITY in codex_shim_client, or cached verdicts from a
 # different model survive the change for the cache TTL.
 CODEX_JUDGE_MODEL = "gpt-5.6-terra"
+
+
+def _judge_model() -> str:
+    """The model both sweep judges run on: the classify model of the configured provider (the
+    Codex pin above on the Codex provider, or with a judge client that predates model_for)."""
+    return _codex.model_for("classify") if _codex is not None and hasattr(_codex, "model_for") else CODEX_JUDGE_MODEL
 ACTOR = "contradiction-sweep-v019"
 SWEEP_LOG = Path.home() / ".mem0" / "contradiction-sweep.jsonl"
 # 2026-06-30: the SAFE rejudge policy routes YES verdicts here (human review) instead of
@@ -299,6 +306,11 @@ def _ensure_shim_once() -> bool:
     if _ENSURE_SHIM["tried"]:
         return False
     _ENSURE_SHIM["tried"] = True
+    # Only the shim transport has a shim to start. The Claude API and the native CLI have nothing
+    # this script can bring up, and waiting on it would only delay the run's real verdict.
+    transport = getattr(_codex, "judge_transport", None)
+    if callable(transport) and transport() != "shim":
+        return False
     script = Path(__file__).resolve().parent / "ensure-codex-shim.sh"
     if not script.is_file():
         # deployed layout: this file runs from ~/apps/mem0-scripts/ where the
@@ -702,7 +714,7 @@ def judge_pair_codex(canonical_text: str, candidate_text: str,
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
     out = _codex_call(_codex.judge_contradiction, str(canonical_text), str(candidate_text),
-                      timeout_s=int(timeout_s), model=CODEX_JUDGE_MODEL)
+                      timeout_s=int(timeout_s), model=_judge_model())
     if not out.get("ok"):
         # Distinct prefix for budget-exhausted contention: the legs abort with
         # degraded:judge-lock-contended instead of miscounting a live co-tenant
@@ -745,7 +757,11 @@ def _judge_model_id(judge_mode: str, model: str) -> str:
     effort — args.model is the LOCAL llama-swap name and is irrelevant there);
     on the local path it is args.model."""
     if judge_mode == "codex":
-        return getattr(_codex, "CODEX_JUDGE_IDENTITY", "codex-unknown") if _codex else "codex-unknown"
+        if _codex is None:
+            return "codex-unknown"
+        # judge_identity() names the provider and model that answer; a client without it is Codex.
+        ident = getattr(_codex, "judge_identity", None)
+        return ident() if callable(ident) else getattr(_codex, "CODEX_JUDGE_IDENTITY", "codex-unknown")
     return str(model)
 
 
@@ -764,7 +780,7 @@ def judge_dispatch(judge_mode: str, http: httpx.Client, model: str, canonical_te
                    candidate_text: str, timeout_s: float,
                    use_cache: bool = True,
                    cache_stats: Optional[dict] = None) -> tuple[Optional[bool], str]:
-    """Route to the Codex bridge (default; model-routing rule) or the local llama-swap judge.
+    """Route to the judge bridge (default; model-routing rule) or the local llama-swap judge.
 
     W5 ADOPT-4: consults the per-pair verdict cache first (unordered key —
     contradiction is symmetric) and writes through boolean verdicts. The
@@ -881,7 +897,7 @@ def judge_supersession_codex(older_text: str, newer_text: str,
     if _codex is None:
         return None, "codex-bridge-unavailable: codex_shim_client import failed"
     out = _codex_call(_codex.judge_supersession, str(older_text), str(newer_text),
-                      timeout_s=int(timeout_s), model=CODEX_JUDGE_MODEL)
+                      timeout_s=int(timeout_s), model=_judge_model())
     if not out.get("ok"):
         if out.get("error_type") in _busy_types():
             consumed = LOCK_PATIENCE_BUDGET_S - _LOCK_BUDGET["remaining_s"]
@@ -941,7 +957,7 @@ def stamp_candidate(http: httpx.Client, candidate_id: str, checked_at: str,
     YES verdict (LOCAL/advisory): contradicts=<mid>, pending=True
         -> writes contradicts_canonical_pending=<mid> ONLY. v0.29.4: the admission
         gate IGNORES the *_pending key, so a weak local-model verdict NEVER hides a
-        live record — only an authoritative Codex re-judge promotes it. (The v0.27.3
+        live record — only an authoritative judge re-judge promotes it. (The v0.27.3
         re-judge found the local judge had 78% false positives; this stops those
         false positives from transiently hiding correct records.)
     NO verdict:  contradicts=None -> writes only contradiction_checked_at.
@@ -1402,7 +1418,7 @@ def _append_summary(record: dict) -> None:
 def scroll_stamped(http: httpx.Client) -> list[dict]:
     """Every record carrying a contradicts_canonical OR contradicts_canonical_pending
     stamp (the flagged set). v0.29.4: includes pending (local-judge advisory) records
-    so the authoritative Codex re-judge promotes or clears them — a pending record left
+    so the authoritative judge re-judge promotes or clears them — a pending record left
     un-rejudged would otherwise never be enforced or cleared."""
     flt = {"should": [
         {"must_not": [{"is_empty": {"key": "contradicts_canonical"}}]},
@@ -1510,7 +1526,7 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
             cand_text = pl.get("data") or pl.get("memory")
             # v0.29.4: a record may be flagged via contradicts_canonical (confirmed)
             # OR contradicts_canonical_pending (local-judge advisory) — re-judge both.
-            # The authoritative Codex verdict below either promotes pending->confirmed
+            # The authoritative judge verdict below either promotes pending->confirmed
             # (stamp_candidate pending=False) or clears it (clear=True).
             was_pending = bool(pl.get("contradicts_canonical_pending")) and not pl.get("contradicts_canonical")
             canonical_id = pl.get("contradicts_canonical") or pl.get("contradicts_canonical_pending")

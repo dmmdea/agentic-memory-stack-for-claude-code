@@ -23,7 +23,7 @@ There is no single trigger — capture happens at five distinct moments, each hu
 - **The per-prompt hook client + resident daemon** — the compiled `mem0-hook-client` (`mem0-hook-client.cs`) → `mem0-hook-daemon.ps1` → `user-prompt-lib.ps1` / `user-prompt-extract.ps1`.
 - **The dream consolidator** — `dream-consolidate.ps1`, run nightly by Windows Task Scheduler, with `dream-catchup.ps1` and `memory-index-refresh.ps1` as its resilience spawners.
 - **The PreCompact WSL sidecar** — `precompact_capture.py`.
-- **Codex CLI** (ChatGPT-subscription) — the LLM that performs extraction, consolidation, and nomination; one shared lock across all three.
+- **The LLM judge** (the Codex CLI on a ChatGPT login by default, or the Claude API; see [judge provider](../systems/judge-provider.md)) — the LLM that performs extraction, consolidation, and nomination; on the Codex provider, one shared lock across all three.
 - **The mem0 server** (`:18791`) — the REST authority every write targets; `redact.py` scrubs at its checkpoint chokepoint; `mem0-canonize.sh` is the HMAC door for canonical promotions.
 
 ## Step-by-step flow
@@ -75,7 +75,7 @@ The other shape rules (all enforced in-prompt, all consequential downstream):
 
 **Facts and the episode are independent.** The extraction prompt asks for the episode whenever the conversation has substantive turns, even when no fact passes the gates; only a truly trivial exchange may return `episode: null`. Each posted fact carries the brand its transcript path (or, in a content-rule workspace, its own text) routes to; an unrouted path posts none ([`brands.md`](../systems/brands.md)).
 
-**Beyond facts**, the same Codex call extracts the episode (goal: 1–2 sentences; summary: 2–4), **0–3 advanced goals** (with a one-sentence delta), **0–2 blocked goals** (with the blocker), and **0–5 open questions** — declarative uncertainties raised but unanswered, "NOT idle wondering". These feed the prospective-memory surfaces (session banners, the bundle).
+**Beyond facts**, the same judge call extracts the episode (goal: 1–2 sentences; summary: 2–4), **0–3 advanced goals** (with a one-sentence delta), **0–2 blocked goals** (with the blocker), and **0–5 open questions** — declarative uncertainties raised but unanswered, "NOT idle wondering". These feed the prospective-memory surfaces (session banners, the bundle).
 
 ### SessionStart — capturing the prior session
 
@@ -93,16 +93,16 @@ The compiled `UserPromptSubmit` client (exec-form hook entry — a Windows concu
 
 ### The dream — nightly consolidation
 
-`dream-consolidate.ps1`, 3:00 am via Task Scheduler (`-WakeToRun`), 23 h-throttled, holding the shared Codex lock (extractor / dream / judgment shim never run Codex concurrently — one ChatGPT subscription). Four phases, each leaving an audit artifact:
+`dream-consolidate.ps1`, 3:00 am via Task Scheduler (`-WakeToRun`), 23 h-throttled, holding, on the Codex provider, the shared Codex lock (extractor / dream / judgment shim never run Codex concurrently — one ChatGPT subscription). Four phases, each leaving an audit artifact:
 
 1. **Orient** — load state, decide whether there is anything worth consolidating.
 2. **Gather (surprise-weighted)** — read the last 36 h of transcripts (≤ 10 files) and weight signals by information gain: corrections, decisions, surprises, contradictions rank far above routine progress.
-3. **Consolidate** — Codex (medium effort) synthesizes **1–3 lineage-tracked insights** (`tier=insight`, source-evidence links kept). Zero insights is a normal outcome on an uneventful day — re-running on unchanged evidence would only produce near-duplicates.
+3. **Consolidate** — the judge (medium effort) synthesizes **1–3 lineage-tracked insights** (`tier=insight`, source-evidence links kept). Zero insights is a normal outcome on an uneventful day — re-running on unchanged evidence would only produce near-duplicates.
 4. **Prune + index** — rebuild the semantic index; run the **retrieval-drift canary** (a zero-Codex before/after snapshot of canary-fact retrievability; a benign consolidation must not change what's findable) and brand-scope audits.
 
 **Insight cadence (1.37.0).** In `dream-consolidate.py` (the native authority's chain step) phases 2 and 3, gather and consolidate (about 25k Codex tokens a night), run once a week: `INSIGHT_INTERVAL_S` is 6.5 days (561600 s, so the stamp that lands a minute after 03:00 never pushes the run to the eighth night), set with `AMS_DREAM_INSIGHT_INTERVAL_S` in the dream process's environment (`0` = every night, as before; `stack.env` is not read for it), and its throttle marker is `dream-insights` (`~/.mem0/maintenance/last-dream-insights`). Autonomous promotion (phase 3.5), the store judge (3.7) and prune + index (phase 4) still run every night, and the 23 h `dream` throttle is unchanged. The retrieval-drift canary brackets the night's write phases: inside phase 3 on an insight night, around promotion on the others (which also write the gather receipt, marked `skipped: weekly insight cadence`, so the capability rows stay fresh). A `--force` or `--dry-run` run always takes the insight phases, so a by-hand `ams-dream-now.sh` (which passes `--force`) does too. The Windows-hosted brain's `dream-consolidate.ps1` was not changed.
 
-**Autonomous canonical promotion** (phase 3.5): Codex nominates evidence that reads as evergreen, declarative, ground-truth-grade, cross-session, high-confidence — precision over recall. The pipeline then applies *structural* controls the LLM can't override: nominees are **sorted by confidence, capped at 3/night** (over-cap deferred to the next night), deduped against the existing canonical set, and pushed through the **4C contradiction/corroboration gate** (shadow-calibration by default; in enforce mode a blocked nominee stays evidence). The surviving few are promoted via the same HMAC door the operator uses (`mem0-canonize.sh --actor dream-autopromote`), so even autonomous promotion is cryptographically uniform and ledgered.
+**Autonomous canonical promotion** (phase 3.5): the judge nominates evidence that reads as evergreen, declarative, ground-truth-grade, cross-session, high-confidence — precision over recall. The pipeline then applies *structural* controls the LLM can't override: nominees are **sorted by confidence, capped at 3/night** (over-cap deferred to the next night), deduped against the existing canonical set, and pushed through the **4C contradiction/corroboration gate** (shadow-calibration by default; in enforce mode a blocked nominee stays evidence). The surviving few are promoted via the same HMAC door the operator uses (`mem0-canonize.sh --actor dream-autopromote`), so even autonomous promotion is cryptographically uniform and ledgered.
 
 ### PreCompact query capture
 
@@ -137,7 +137,7 @@ When the pipeline succeeds: only genuinely project-specific facts reach mem0 as 
 
 ## External dependencies
 
-- **Codex CLI** (per-job model, ChatGPT-subscription OAuth) — the extraction / consolidation / nomination LLM; one shared Codex lock serializes all three.
+- **The LLM judge** (the Codex CLI on a ChatGPT login by default, or the Claude API) — the extraction / consolidation / nomination LLM; on the Codex provider, one shared Codex lock serializes all three.
 - **mem0 REST server** on `:18791` — the write authority; `mem0-canonize.sh` for the HMAC-signed canonical promotion.
 - **Windows Task Scheduler** — hosts the nightly dream (`-WakeToRun`).
 - **WSL2** — hosts `precompact_capture.py`, the mem0 server, and the canonize CLI.

@@ -723,6 +723,12 @@ if [ "$_ROLE" = brain ] && [ -n "${MEM0_REPO_ROOT_WSL:-}" ]; then
     _SWEEP="$HOME/apps/mem0-scripts/contradiction-sweep.py"
     [ -f "$_SWEEP" ] || _SWEEP="$MEM0_REPO_ROOT_WSL/scripts/wsl/contradiction-sweep.py"
     (
+      # On the Claude API provider the sweep calls the API itself: there is no shim to wait for.
+      if [ "${MEM0_JUDGE_PROVIDER:-}" = anthropic ]; then
+        touch "$RESOLVE_MARKER"
+        nohup "$_PYB" "$_SWEEP" --rejudge-stamped --judge codex --apply >/dev/null 2>&1 &
+        exit 0
+      fi
       [ -f "$_ENSURE" ] && bash "$_ENSURE" 45 >/dev/null 2>&1
       if curl -sf --max-time 2 http://127.0.0.1:18792/health >/dev/null 2>&1; then
         # marker touched only when the rejudge actually fires — a failed ensure must

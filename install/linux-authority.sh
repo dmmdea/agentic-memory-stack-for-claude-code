@@ -6,7 +6,8 @@
 #       non-wildcard IPv4 (the tailscale0 address); ~/apps/mem0-server, ~/apps/mem0-scripts,
 #       ~/qdrant-server and ~/.mem0 are symlinks into a data volume (a plain directory is
 #       accepted with a WARN: its data lives on the root disk); the local embedder answers on
-#       :11436; the codex CLI and its login are checked (WARN only)
+#       :11436; the judge provider is checked: the codex CLI and its login (WARN only), or the
+#       Claude API key credential (refused when absent or undecryptable)
 #   [1] ~/.mem0/role=brain, stack.env (MEM0_HOST_KIND=native, MEM0_BIND, MEM0_ROLE=brain,
 #       MEM0_SECRETS_DIR), authority-url
 #   [2] Python 3.12 via uv (the system Python is untested with the pinned wheel set); when uv is
@@ -29,6 +30,7 @@
 # Usage:
 #   bash install/linux-authority.sh --bind-ip <tailscale0 ipv4> --secrets-dir <dir with *.cred> \
 #        [--zfs-dataset <pool/dataset>] [--user-id <tenant>] [--eval-root <dir>] [--pcloud-dir <dir>]
+#        [--judge-provider codex|anthropic] [--anthropic-workspace-id <id>]
 #        [--dry-run] [--render-only <dir>]
 #   --zfs-dataset: the dataset /health/maintenance reads pool usage from (omit on a non-ZFS box).
 #   --eval-root:   checkout holding eval/retrieval-drift/retrieval_drift.py (the dream's drift
@@ -75,10 +77,22 @@
 #                  a recorded value is carried over unchanged; nothing is invented on a first
 #                  install, because enforce makes a gate error fail safe and the operator
 #                  calibrates first. An explicit empty value drops the line (back to shadow).
+#   --judge-provider: codex | anthropic, written to stack.env as MEM0_JUDGE_PROVIDER: who does the
+#                  stack's LLM work (the dream, the sweeps, the write gate). codex (the default when
+#                  nothing is recorded) is the Codex CLI on a ChatGPT login under <secrets-dir>/codex.
+#                  anthropic is the Claude API on a key you supply as one more systemd credential,
+#                  <secrets-dir>/ams-anthropic-key.cred, loaded only by the units that judge (one
+#                  drop-in per unit). The installer refuses that provider while the file is absent or
+#                  does not decrypt on this host, and fails after the restart unless /health/deep shows
+#                  the server sees the key. The models and the monthly spend cap are stack.env settings
+#                  (docs/systems/judge-provider.md). An explicit empty value goes back to codex.
+#   --anthropic-workspace-id: sent as the anthropic-workspace-id header (stack.env
+#                  MEM0_ANTHROPIC_WORKSPACE_ID). A key that is not scoped to one workspace needs it.
 #   --render-only: write the resolved unit set (units + drop-in) into <dir> and exit; touches
 #                  nothing else (the test harness uses it).
 #   Re-runs INHERIT: every optional flag you omit (--user-id, --embed-profile, --embed-model,
-#                  --eval-root, --pcloud-dir, --zfs-dataset) keeps the value already in ~/.mem0/stack.env;
+#                  --eval-root, --pcloud-dir, --zfs-dataset, --judge-provider,
+#                  --anthropic-workspace-id) keeps the value already in ~/.mem0/stack.env;
 #                  only a first install with no stack.env applies the defaults above. An EXPLICIT
 #                  empty value (--eval-root "") clears the inherited value.
 set -euo pipefail
@@ -97,6 +111,8 @@ BIND_IP=""; SECRETS_DIR=""; USER_ID=""; DRY_RUN=0; RENDER_ONLY=""; ZFS_DATASET="
 AMS_CHECKOUT=""; AMS_HUB=""; AMS_BINARY=""; AMS_SUMS=""
 WIKI_SOURCES=""; WIKI_PULL_KEY=""; SET_WIKI_SOURCES=0; SET_WIKI_PULL_KEY=0
 PROMOTION_GATE_MODE=""; SET_PROMOTION_GATE_MODE=0
+# Who does the LLM work: the Codex CLI (default) or the Claude API (mem0-server/anthropic_judge.py).
+JUDGE_PROVIDER=""; SET_JUDGE_PROVIDER=0; ANTHROPIC_WORKSPACE_ID=""; SET_ANTHROPIC_WORKSPACE_ID=0
 AMS_RELEASE_REPO="${AMS_RELEASE_REPO:-dmmdea/agentic-memory-stack-for-claude-code}"
 SET_ZFS_DATASET=0; SET_EVAL_ROOT=0; SET_PCLOUD_DIR=0; SET_EMBED_MODEL=0; SET_EMBED_PROFILE=0
 MEM0_DIR="$HOME/.mem0"; MEM0_APP="$HOME/apps/mem0-server"; SCRIPTS_DIR="$HOME/apps/mem0-scripts"
@@ -122,6 +138,8 @@ while [ $# -gt 0 ]; do
         --wiki-sources) WIKI_SOURCES="${2:-}"; SET_WIKI_SOURCES=1; shift 2 ;;
         --wiki-pull-key) WIKI_PULL_KEY="${2:-}"; SET_WIKI_PULL_KEY=1; shift 2 ;;
         --promotion-gate-mode) PROMOTION_GATE_MODE="${2:-}"; SET_PROMOTION_GATE_MODE=1; shift 2 ;;
+        --judge-provider) JUDGE_PROVIDER="${2:-}"; SET_JUDGE_PROVIDER=1; shift 2 ;;
+        --anthropic-workspace-id) ANTHROPIC_WORKSPACE_ID="${2:-}"; SET_ANTHROPIC_WORKSPACE_ID=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --render-only) RENDER_ONLY="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -215,6 +233,12 @@ inherit_from_stack_env AMS_CHECKOUT MEM0_AMS_CHECKOUT --ams-checkout
 inherit_from_stack_env AMS_HUB      MEM0_AMS_HUB      --ams-hub
 inherit_from_stack_env WIKI_SOURCES  MEM0_WIKI_SOURCES  --wiki-sources
 inherit_from_stack_env WIKI_PULL_KEY MEM0_WIKI_PULL_KEY --wiki-pull-key
+inherit_from_stack_env JUDGE_PROVIDER MEM0_JUDGE_PROVIDER --judge-provider
+inherit_from_stack_env ANTHROPIC_WORKSPACE_ID MEM0_ANTHROPIC_WORKSPACE_ID --anthropic-workspace-id
+case "$JUDGE_PROVIDER" in
+    ""|codex|anthropic) ;;
+    *) fail "--judge-provider must be codex or anthropic, got '$JUDGE_PROVIDER'" ;;
+esac
 # a box installed before v1.23.2 carries the dataset only in the rendered drop-in
 if [ -z "$ZFS_DATASET" ] && [ "$SET_ZFS_DATASET" != 1 ] && [ -f "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" ]; then
     ZFS_DATASET="$(sed -n 's/^Environment=MEM0_ZFS_DATASET=//p' "$SYSTEMD_USER_DIR/mem0.service.d/native.conf" | head -n1)"
@@ -251,6 +275,10 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 # The wiki-index step reads both from here (docs/systems/wiki-index.md).
 [ -z "$WIKI_SOURCES" ] || STACK_ENV_ARGS+=(MEM0_WIKI_SOURCES="$WIKI_SOURCES")
 [ -z "$WIKI_PULL_KEY" ] || STACK_ENV_ARGS+=(MEM0_WIKI_PULL_KEY="$WIKI_PULL_KEY")
+# The judge reads both from here (mem0-server/anthropic_judge.py: environment first, then this file),
+# so no unit needs an Environment= line for them. Nothing recorded and no flag means Codex.
+[ -z "$JUDGE_PROVIDER" ] || STACK_ENV_ARGS+=(MEM0_JUDGE_PROVIDER="$JUDGE_PROVIDER")
+[ -z "$ANTHROPIC_WORKSPACE_ID" ] || STACK_ENV_ARGS+=(MEM0_ANTHROPIC_WORKSPACE_ID="$ANTHROPIC_WORKSPACE_ID")
 # 1.31.3: operator-owned keys (install/stack-env.sh STACK_ENV_OPERATOR_KEYS) have no flag, so
 # they are carried over from the existing receipt or a re-run deletes them. Nothing on the brain
 # reads MEM0_BRAIN_SSH today (wiki-index.sh is the replica's wrapper), but this re-run is the
@@ -260,7 +288,9 @@ STACK_ENV_ARGS=(MEM0_WSL_USER="$USER_ID" MEM0_WIN_USER= MEM0_DISTRO=native MEM0_
 # line), it replaces the recorded value, so the carry skips that key and it is written once.
 # The profile and the active alias are written from the values above; the carry keeps every OTHER
 # embedding-space key (the alias of the space this store is not in is what a rollback needs).
-CARRY_SKIP=(MEM0_EMBED_PROFILE "$EMBED_MODEL_KEY")
+# The judge provider and its workspace id are written above from the flag or the recorded value, so
+# the carry skips them too; the model and spend-cap keys have no flag and ride the carry.
+CARRY_SKIP=(MEM0_EMBED_PROFILE "$EMBED_MODEL_KEY" MEM0_JUDGE_PROVIDER MEM0_ANTHROPIC_WORKSPACE_ID)
 if [ "$SET_PROMOTION_GATE_MODE" = 1 ]; then
     CARRY_SKIP+=(MEM0_PROMOTION_GATE_MODE)
     case "$PROMOTION_GATE_MODE" in
@@ -317,13 +347,17 @@ if [ -z "$RENDER_ONLY" ]; then
         echo "    no RTC wake alarm, or no passwordless 'sudo rtcwake': no rtcwake step (the box is not woken before the nightly chain)"
     fi
     # The units that judge through the Codex CLI run with CODEX_HOME=<secrets-dir>/codex.
-    if ! command -v codex >/dev/null 2>&1; then
+    if [ "$JUDGE_PROVIDER" = anthropic ]; then
+        echo "    judge provider: the Claude API (no Codex login is needed)"
+    elif ! command -v codex >/dev/null 2>&1; then
         echo "    WARN: the codex CLI is not on PATH: the dream, the weekly contradiction sweep and the weekly retrieval-pairs sweep cannot run their Codex judge, so those steps fail or degrade. Install Node 22+ and run: npm i -g @openai/codex; then sign in: mkdir -p $SECRETS_DIR/codex && CODEX_HOME=$SECRETS_DIR/codex codex login"
     elif [ ! -s "$SECRETS_DIR/codex/auth.json" ]; then
         echo "    WARN: no Codex login under $SECRETS_DIR/codex (the CODEX_HOME of the nightly units): the dream, the weekly contradiction sweep and the weekly retrieval-pairs sweep cannot run their Codex judge, so those steps fail or degrade. Sign in once: mkdir -p $SECRETS_DIR/codex && CODEX_HOME=$SECRETS_DIR/codex codex login"
     fi
 fi
-echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID"
+# The units that call the LLM judge: the server (the write gate), the dream and the two weekly sweeps.
+JUDGE_UNITS="mem0.service ams-step-dream.service ams-step-contradiction-sweep.service ams-step-retrieval-pairs.service"
+echo "    stack $STACK_VERSION; bind $BIND_IP; secrets $SECRETS_DIR; tenant $USER_ID; judge provider ${JUDGE_PROVIDER:-codex}"
 echo "    units: $UNITS"
 
 # Store hub helpers -----------------------------------------------------------------------------
@@ -353,6 +387,20 @@ render_units() {  # $1 = destination dir
         "$REPO_ROOT/systemd/mem0-native.conf" > "$dst/mem0.service.d/native.conf"
     # no dataset given: the endpoint falls back to the disk usage of the home filesystem
     [ -n "$ZFS_DATASET" ] || sed -i '/^Environment=MEM0_ZFS_DATASET=$/d' "$dst/mem0.service.d/native.conf"
+    # The Claude API key reaches a unit as one more credential, in a drop-in of its own, so the unit
+    # files are the same for both providers. On the Codex provider no unit may name the credential: a
+    # LoadCredentialEncrypted= whose file is absent stops the unit from starting.
+    for unit in $JUDGE_UNITS; do
+        case " $UNITS " in *" $unit "*) ;; *) continue ;; esac
+        if [ "$JUDGE_PROVIDER" = anthropic ]; then
+            mkdir -p "$dst/$unit.d"
+            sed -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" "$REPO_ROOT/systemd/judge-anthropic.conf" > "$dst/$unit.d/judge-anthropic.conf"
+            grep -q "__[A-Z_]*__" "$dst/$unit.d/judge-anthropic.conf" && fail "unresolved sentinel in $unit.d/judge-anthropic.conf"
+        elif [ -e "${dst:?}/${unit:?}.d/judge-anthropic.conf" ]; then
+            rm -f "${dst:?}/${unit:?}.d/judge-anthropic.conf"
+            rmdir "${dst:?}/${unit:?}.d" 2>/dev/null || true
+        fi
+    done
     # l10-audit runs on its own timer outside the chain and needs the key credential itself.
     mkdir -p "$dst/l10-audit.service.d"
     sed -e "s|__SECRETS_DIR__|$SECRETS_DIR|g" "$REPO_ROOT/systemd/l10-audit-native.conf" > "$dst/l10-audit.service.d/native.conf"
@@ -458,6 +506,26 @@ elif plan "generate $SERVICE_CRED (32 random bytes -> systemd-creds --user encry
     fi
     mv -f "$SERVICE_CRED.tmp" "$SERVICE_CRED"
     echo "    service key: generated $SERVICE_CRED"
+fi
+
+# The Claude API key of the judge provider. Unlike the service key it cannot be made here: the
+# operator issues it. The test is a real decrypt, because every unit that judges loads the
+# credential and a unit whose credential does not decrypt on this host does not start. It runs
+# before anything is written, so a refusal leaves the box as it was.
+ANTHROPIC_CRED="$SECRETS_DIR/ams-anthropic-key.cred"
+if [ "$JUDGE_PROVIDER" = anthropic ]; then
+    anthropic_cred_help="Store the key with no plaintext copy on this box (paste the key, press Enter, then Ctrl-D):
+    systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-anthropic-key - $ANTHROPIC_CRED"
+    if [ ! -s "$ANTHROPIC_CRED" ]; then
+        fail "--judge-provider anthropic needs the Claude API key as a systemd credential, and $ANTHROPIC_CRED is missing. $anthropic_cred_help"
+    elif ! command -v systemd-creds >/dev/null; then
+        [ "$DRY_RUN" = 1 ] || fail "systemd-creds is required to check $ANTHROPIC_CRED"
+        echo "    [dry-run] Claude API key: $ANTHROPIC_CRED present; no systemd-creds here to probe it"
+    elif systemd-creds --user decrypt --name=ams-anthropic-key "$ANTHROPIC_CRED" - >/dev/null 2>&1; then
+        echo "    Claude API key: $ANTHROPIC_CRED present and decrypts on this host"
+    else
+        fail "$ANTHROPIC_CRED does not decrypt on this host (a file made on another box never does). Replace it. $anthropic_cred_help"
+    fi
 fi
 
 # ---------------------------------------------------------------- 1. role + receipts
@@ -704,5 +772,13 @@ echo "    embedding profile $EMBED_PROFILE bound (collection ${bound_collection:
 fusion_ok="$(printf '%s' "$deep_json" | jq -r '.checks.fusion.ok // false' 2>/dev/null || echo false)"
 [ "$fusion_ok" = true ] || fail "mem0's search is not bound to the rank fusion: $(printf '%s' "$deep_json" | jq -c '.checks.fusion' 2>/dev/null) (docs/systems/fusion.md; journalctl --user -u mem0)"
 echo "    search fusion: $(printf '%s' "$deep_json" | jq -r '.checks.fusion.mode // "?"' 2>/dev/null)"
+# The judge provider: a server that cannot see the API key answers every judge call with no_key, and
+# the dream then skips its judged phases every night while the chain stays green. The spend cap is
+# not part of this check: a month that has reached its cap must not fail a deploy.
+if [ "$JUDGE_PROVIDER" = anthropic ]; then
+    judge_ready="$(printf '%s' "$deep_json" | jq -r 'if (.checks.judge.key_present and .checks.judge.sdk) then "true" else "false" end' 2>/dev/null || echo false)"
+    [ "$judge_ready" = true ] || fail "mem0 cannot judge on the Claude API: $(printf '%s' "$deep_json" | jq -c '.checks.judge' 2>/dev/null). Is ~/.config/systemd/user/mem0.service.d/judge-anthropic.conf present, does $ANTHROPIC_CRED decrypt, and is the anthropic package in the server venv? (journalctl --user -u mem0)"
+    echo "    judge provider: the Claude API ($(printf '%s' "$deep_json" | jq -r '.checks.judge | "synthesis \(.model_synthesis), classify \(.model_classify), cap \(.budget.budget_usd) USD a month"' 2>/dev/null))"
+fi
 echo
 echo "Native authority installed. Bind $BIND_IP:18791; secrets via systemd-creds; timers: systemctl --user list-timers ams-nightly.timer l10-audit.timer"

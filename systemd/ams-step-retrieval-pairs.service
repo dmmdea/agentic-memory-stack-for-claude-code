@@ -1,5 +1,5 @@
 [Unit]
-Description=AMS chain step: retrieval pairs, Codex judge (weekly)
+Description=AMS chain step: retrieval pairs, LLM judge (weekly)
 PartOf=ams-nightly.target
 After=mem0.service ams-step-episodic-reconcile.service
 

@@ -103,14 +103,14 @@ Claude Code session ends
           1. Throttle check (10-min window)
           2. Test mem0 health
           3. Read last 24 transcript turns (12 000 chars max)
-          4. Codex extraction (`gpt-5.6-terra`, effort=low, timeout=90s)
+          4. LLM-judge extraction (Codex provider: `gpt-5.6-terra`, effort=low, timeout=90s)
              Prompt returns STRICT JSON: { facts: [...], episode: { goal, summary } | null }
           5. POST each fact to mem0 as evidence (existing path)
           6. [NEW v0.15] If episode.goal is non-null:
              POST /v1/episodes  →  episodic.db
 ```
 
-The Codex call is shared (one call returns both facts AND episode) so no extra cost vs v0.14.
+The judge call (the Codex CLI by default, or the Claude API; see [judge provider](./judge-provider.md)) is shared (one call returns both facts AND episode) so no extra cost vs v0.14.
 
 ### Per-prompt checkpoint (the unfinished episode)
 

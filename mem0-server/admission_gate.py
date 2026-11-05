@@ -200,11 +200,11 @@ class AdmissionPolicy:
             # canonical-tier memory with contradicts_canonical=<canonical_mid>. The
             # gate only reads the stamp — no LLM runs at retrieval time.
             # contradiction_checked_at alone (the sweep's NO verdict) never rejects.
-            # v0.29.4: ONLY contradicts_canonical (the AUTHORITATIVE Codex verdict) is
+            # v0.29.4: ONLY contradicts_canonical (the AUTHORITATIVE judge verdict) is
             # enforced here. contradicts_canonical_pending (a weak LOCAL-judge advisory
             # verdict) is DELIBERATELY NOT read — a local verdict must never hide a live
             # record (model-routing rule: no local judgment on the retrieval path). A
-            # Codex re-judge promotes pending -> contradicts_canonical before it enforces.
+            # authoritative re-judge promotes pending -> contradicts_canonical before it enforces.
             #
             # WP-4: the stamp is a bare id, so it is enforced only while its target is STILL
             # canonical. `stamp_tiers` is the resolved {target id: current tier} map from

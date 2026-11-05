@@ -13,6 +13,10 @@
 #
 # A replica's first install needs the authority's URL and its API key (a file holding the key alone):
 #   .\install.ps1 -Role replica -AuthorityUrl http://<authority-host>:18791 -ApiKeyFile <path to the key file>
+#
+# Run this box's LLM work on the Claude API instead of the Codex CLI (make the key file first;
+# docs/systems/judge-provider.md):
+#   .\install.ps1 -JudgeProvider anthropic -AnthropicWorkspaceId <workspace id>
 
 param(
     [switch]$NonInteractive,
@@ -63,7 +67,17 @@ param(
     [string]$HubHost = '',
     [string]$BinaryPath = '',
     [string]$BinarySums = '',
-    [string]$ReleaseRepo = ''
+    [string]$ReleaseRepo = '',
+    # 1.40.0: who does this box's LLM work (session extraction and memory compaction on every box; the dream
+    # and the judges on a brain). 'codex' = the Codex CLI on its ChatGPT login, the default of a first install.
+    # 'anthropic' = the Claude API on the key in ~/.mem0/anthropic-key inside the WSL distro (owner-only; make it
+    # before this run, docs/systems/judge-provider.md says how). Recorded in ~/.mem0/stack.env as
+    # MEM0_JUDGE_PROVIDER (MEM0_SET_JUDGE_PROVIDER in the WSL phase); omitted, the recorded provider is kept.
+    # Case-sensitive, like -MediaEmbedder.
+    [ValidateSet('', 'codex', 'anthropic', IgnoreCase = $false)][string]$JudgeProvider = '',
+    # 1.40.0: sent as the anthropic-workspace-id header (stack.env MEM0_ANTHROPIC_WORKSPACE_ID). A key that is not
+    # scoped to one workspace needs it. Omitted, the recorded value is kept.
+    [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$AnthropicWorkspaceId = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,7 +144,7 @@ try {
     Write-Host ""
 
     Write-Phase "[0/4] Prerequisites check"
-    & "$RepoRoot\install\0-prereqs.ps1" -Distro $Distro
+    & "$RepoRoot\install\0-prereqs.ps1" -Distro $Distro -JudgeProvider $JudgeProvider
     if ($LASTEXITCODE -ne 0) { throw "Prerequisites check failed - resolve issues above and re-run." }
 
     Write-Phase "[1/4] WSL services (mem0, Qdrant, l10-audit, llama-swap)"
@@ -164,6 +178,17 @@ try {
     # 1.35.1: -EmbedProfile rides the same bash line as MEM0_SET_EMBED_PROFILE, only when given (the parameter
     # admits [a-z0-9-] only, so the name is safe inside the single quotes). With no -Role the WSL side still
     # inherits its role, and the switch is the only thing added.
+    # 1.40.0: -JudgeProvider and -AnthropicWorkspaceId reach the WSL phase as MEM0_SET_JUDGE_PROVIDER and
+    # MEM0_SET_ANTHROPIC_WORKSPACE_ID through WSLENV, which hands the variables it names to the process
+    # wsl.exe starts. They ride every form of the call below, and only when given.
+    $wslEnvBefore = $env:WSLENV
+    $judgeEnvBefore = $env:MEM0_SET_JUDGE_PROVIDER
+    $workspaceEnvBefore = $env:MEM0_SET_ANTHROPIC_WORKSPACE_ID
+    if ($JudgeProvider) { $env:MEM0_SET_JUDGE_PROVIDER = $JudgeProvider }
+    if ($AnthropicWorkspaceId) { $env:MEM0_SET_ANTHROPIC_WORKSPACE_ID = $AnthropicWorkspaceId }
+    if ($JudgeProvider -or $AnthropicWorkspaceId) {
+        $env:WSLENV = (@($env:WSLENV, 'MEM0_SET_JUDGE_PROVIDER', 'MEM0_SET_ANTHROPIC_WORKSPACE_ID') | Where-Object { $_ }) -join ':'
+    }
     if ($PSBoundParameters.ContainsKey('Role')) {
         wsl.exe -d $Distro -e bash -c "MEM0_ROLE='$Role' $(if ($EmbedProfile) { "MEM0_SET_EMBED_PROFILE='$EmbedProfile' " })$(if ($MediaEmbedder) { "MEM0_SET_MEDIA_EMBEDDER='$MediaEmbedder' " })exec bash '$repoWsl/install/1-wsl-services.sh' '$wslUser' '$env:USERNAME' '$Distro'"
     } elseif ($EmbedProfile -or $MediaEmbedder) {
@@ -171,7 +196,12 @@ try {
     } else {
         wsl.exe -d $Distro -e bash "$repoWsl/install/1-wsl-services.sh" "$wslUser" "$env:USERNAME" "$Distro"
     }
-    if ($LASTEXITCODE -ne 0) { throw "WSL services install failed." }
+    $wslPhaseExit = $LASTEXITCODE
+    # Put the three variables back as they were (assigning $null removes one that was not set).
+    $env:WSLENV = $wslEnvBefore
+    $env:MEM0_SET_JUDGE_PROVIDER = $judgeEnvBefore
+    $env:MEM0_SET_ANTHROPIC_WORKSPACE_ID = $workspaceEnvBefore
+    if ($wslPhaseExit -ne 0) { throw "WSL services install failed." }
     # A switch the WSL phase made clears the offline watcher's replica-restored.txt marker (install/1-wsl-services.sh
     # does it, where it knows a switch happened, so the in-WSL form of the command clears it too). The restore that
     # forces runs at go_offline, when the brain is unreachable, and travel-mode.ps1 seeds its local snapshot cache

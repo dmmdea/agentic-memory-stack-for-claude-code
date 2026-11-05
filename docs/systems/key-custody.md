@@ -13,11 +13,13 @@ one deliberate exception is the regenerable service key, below: it is re-made, n
 - Why is the DPAPI blob *not* a backup?
 - If this machine died right now, what would it take to be running again?
 - What is the service key, who may hold it, and why is it the one secret with no backup?
+- Where does the Claude API key live (when the judge provider is the Claude API), and what happens if it is lost?
 
 ## Scope
 
 `scripts/wsl/key-backup.sh`, the key material it protects, and the restore procedure; and the
-authority-only service key (1.32.5), which `key-backup.sh` deliberately does not collect.
+authority-only service key (1.32.5), which `key-backup.sh` deliberately does not collect; and the
+Claude API key, which exists only on the Claude API judge provider.
 
 ## Non-scope
 
@@ -32,6 +34,7 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 | **canonical HMAC signing key** | `~/.mem0/canonical-key`, its DPAPI blob, tmpfs at runtime | **irreplaceable** |
 | mem0 API key | `~/.mem0/api-key`; native authority: `<secrets-dir>/ams-api-key.cred` (systemd credential), exposed to a unit as the file named by `MEM0_API_KEY_FILE` | re-issuable, but everything is wired to it |
 | **service key** (`ams-service-key`, 1.32.5) | native authority: `<secrets-dir>/ams-service-key.cred` (systemd credential); WSL authority: `~/.mem0/service-key` (mode 600) | **regenerable, authority-only** — never on a replica or a PC; restore = regenerate |
+| Claude API key (`ams-anthropic-key`; only when `MEM0_JUDGE_PROVIDER=anthropic`) | native authority: `<secrets-dir>/ams-anthropic-key.cred` (systemd credential); PC or WSL-hosted box: `~/.mem0/anthropic-key` (mode 600) | re-issuable at the provider; no backup set carries it |
 | authority URL | `~/.mem0/authority-url` | config, trivially rebuilt |
 | optional vendor API key (`NVIDIA_API_KEY`) | `~/.claude.json` (an MCP server's `env`, plaintext); `key-backup.sh` extracts it when present | re-issuable from the vendor |
 | GitHub tokens | OS keyring | re-issuable — `gh auth login` |
@@ -96,6 +99,38 @@ canonical key, so a job that holds it cannot mint canonical tokens. The Codex ju
 memory text any API-key holder can write, runs without the environment variables that carry or point at
 the credentials (the credential directory, the API key file, the API key); that removes the pointer, not
 the files, and the sandbox is the real boundary.
+
+## The Claude API key
+
+The key exists only when the box's judge provider is the Claude API (`MEM0_JUDGE_PROVIDER=anthropic`;
+see [`judge-provider.md`](./judge-provider.md)). On the default Codex provider there is no such key
+and no unit names one.
+
+| | |
+|---|---|
+| class | **re-issuable** |
+| native authority | systemd credential `ams-anthropic-key`, file `<secrets-dir>/ams-anthropic-key.cred` (`--with-key=host+tpm2`). Loaded only by the units that judge, `mem0.service`, `ams-step-dream.service`, `ams-step-contradiction-sweep.service` and `ams-step-retrieval-pairs.service`, each through a `<unit>.d/judge-anthropic.conf` drop-in; the hand-run wrappers `ams-dream-now.sh` and `ams-service-run.sh` load it the same way |
+| PC, WSL-hosted box | `~/.mem0/anthropic-key`, mode 600 (inside the WSL distro on Windows) |
+| backup | none; no backup set carries it |
+| restore | issue a new key at the provider |
+
+Nothing stored depends on its value, so a lost key costs no data. A leaked key is different: whoever
+holds it can spend on the account until the key is revoked at the provider, which is why the file is
+owner-only and the key never enters the environment. Until a new one is in place the judged jobs
+report `no_key` (or `auth` for a revoked key) and skip their work. To replace it, issue a new key at the provider and write it the same way
+as the first. On the native authority the file is made by hand (the installer refuses
+`--judge-provider anthropic` while it is missing or does not decrypt on this host):
+
+```bash
+# paste the key, press Enter, then Ctrl-D; nothing is written in plaintext
+systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-anthropic-key - <secrets-dir>/ams-anthropic-key.cred
+```
+
+A systemd credential is read when a unit starts, so restart `mem0.service` after replacing the file.
+
+**It is never an environment variable.** A coding agent that inherits `ANTHROPIC_API_KEY` stops using
+its own login, and every child process inherits the environment; both transports read the file at call
+time instead.
 
 ## Why the DPAPI blob is not a backup
 
@@ -170,4 +205,5 @@ is what that blob gets built *from*, which is the whole reason it must survive.
 ## Related
 
 - [`dpapi-canonical-key.md`](./dpapi-canonical-key.md) — at-rest protection and rotation
+- [`judge-provider.md`](./judge-provider.md) — the judge provider setting, the Claude API key's use, and the spend cap
 - [`../data-backup.md`](../data-backup.md) — the corpus half of the backup story
