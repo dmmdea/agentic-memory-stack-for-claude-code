@@ -758,3 +758,58 @@ Describe 'Get-TranscriptWindowSince walks a long gap forward, in order (L1a curs
         $w | Should -BeGreaterThan 3 -Because 'the gap holds several budgets of text'
     }
 }
+
+Describe 'A first extraction reads forward from the start of the transcript (L1a, no cursor yet)' {
+    # 2026-11-12: a 7.6 MB transcript with no cursor got the first-run tail read. Its last 24 records
+    # were tool calls, so 187 of some 84,000 characters reached the extractor and the cursor moved to
+    # the end of the file: everything before that tail was never extracted.
+    It 'starts at byte 0 when the run may take several windows, and keeps the tail read for one window' {
+        $f = Join-Path $TestDrive 'first-run.jsonl'
+        $lines = New-Object System.Collections.Generic.List[string]
+        for ($i = 1; $i -le 6; $i++) {
+            $lines.Add('{"message":{"role":"assistant","content":"EARLY-' + $i + ' ' + ('word ' * 200) + '"}}')
+        }
+        for ($i = 1; $i -le 40; $i++) {
+            $lines.Add('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"tool output ' + ('z' * 300) + '"}]}}')
+        }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes((($lines -join "`n") + "`n"))
+        [System.IO.File]::WriteAllBytes($f, [byte[]]$bytes)
+
+        Get-RecentTranscriptTurns -TranscriptPath $f -MaxTurns 24 -MaxChars 12000 | Should -BeNullOrEmpty -Because 'the tail of this transcript holds no text: the incident shape'
+        Get-L1aReadMode -Cursor 0 -Length $bytes.Length -MaxWindows 3 | Should -Be 'forward'
+        $r = Get-TranscriptWindowSince -TranscriptPath $f -SinceBytes 0 -MaxChars 12000
+        @([regex]::Matches($r.Text, 'EARLY-\d')).Count | Should -Be 6 -Because 'the early turns are read, not skipped'
+        $r.ConsumedTo | Should -Be $bytes.Length
+
+        Get-L1aReadMode -Cursor 0 -Length $bytes.Length -MaxWindows 1 | Should -Be 'tail' -Because 'one window per throttle period cannot catch up from zero'
+        Get-L1aReadMode -Cursor 500 -Length 400 -MaxWindows 3 | Should -Be 'tail' -Because 'a shrunk file resets through the tail read'
+        Get-L1aReadMode -Cursor 400 -Length 400 -MaxWindows 3 | Should -Be 'none'
+        Get-L1aReadMode -Cursor 400 -Length 900 -MaxWindows 1 | Should -Be 'forward'
+    }
+}
+
+Describe 'Only conversation turns reach the extractor (L1a transcript readers)' {
+    # 2026-11-12: Claude Code writes request payloads (type api-request-blob: the system prompt and copies
+    # of earlier turns) and injected text (isMeta) into the transcript with a message role. Both readers
+    # took them as turns: 65 to 80 percent of the text they passed in 45 of 46 recent transcripts.
+    It 'drops request payloads and injected records from the forward window and from the tail read' {
+        $f = Join-Path $TestDrive 'not-turns.jsonl'
+        $lines = @(
+            '{"type":"user","message":{"role":"user","content":"REAL-USER asks a question"}}'
+            '{"type":"api-request-blob","sessionId":"s","hash":"h","message":{"role":"system","content":[{"type":"text","text":"BLOB-SYSTEM prompt text"}]}}'
+            '{"type":"api-request-blob","sessionId":"s","hash":"h","message":{"role":"user","content":[{"type":"text","text":"BLOB-USER copy of a turn"}]}}'
+            '{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"META skill body"}]}}'
+            '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"REAL-ASSISTANT answers"}]}}'
+            '{"message":{"role":"user","content":"REAL-UNTYPED older record"}}'
+        )
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes((($lines -join "`n") + "`n"))
+        [System.IO.File]::WriteAllBytes($f, [byte[]]$bytes)
+        foreach ($text in @((Get-TranscriptWindowSince -TranscriptPath $f -SinceBytes 0 -MaxChars 12000).Text,
+                            (Get-RecentTranscriptTurns -TranscriptPath $f -MaxTurns 24 -MaxChars 12000))) {
+            $text | Should -Match 'REAL-USER'
+            $text | Should -Match 'REAL-ASSISTANT'
+            $text | Should -Match 'REAL-UNTYPED'
+            $text | Should -Not -Match 'BLOB-SYSTEM|BLOB-USER|META'
+        }
+    }
+}

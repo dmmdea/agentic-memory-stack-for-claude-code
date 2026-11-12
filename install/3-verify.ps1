@@ -450,7 +450,7 @@ if ($fails.Count -eq 0) {
     Write-Host ""
     Write-Host "Next steps:"
     Write-Host "  1. Restart VS Code / Claude Code so the new hooks + MCP servers load"
-    Write-Host "  2. Use Claude Code normally - L1a fires automatically on Stop/PreCompact hooks (10-min throttle)"
+    Write-Host "  2. Use Claude Code normally - L1a fires automatically on Stop/PreCompact hooks (throttled: 90 s per session on the Claude API, 10 min box-wide on Codex)"
     if ($stackRole -eq 'brain') {
         Write-Host "  3. First dream-consolidate nightly run fires at 3:00 AM tomorrow (Task Scheduler with WakeToRun)"
     } else {

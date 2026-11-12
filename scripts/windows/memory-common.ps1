@@ -1771,6 +1771,23 @@ function Redact-Secrets {
     return $Text
 }
 
+function Test-TranscriptTurnRecord {
+    # True when a parsed transcript record is a conversation turn. Claude Code also writes records that
+    # carry a message with a role and text but are not turns: request payloads kept for debugging (type
+    # api-request-blob: the system prompt and copies of earlier turns) and text the harness injects
+    # (isMeta: skill bodies, command caveats). Read as turns they were most of what the extractor saw
+    # (2026-11-12: 65 to 80 percent of the text in 45 of 46 recent transcripts), and each one cost a model
+    # call that could only return facts about the prompt itself. A record with no top-level type is a
+    # turn (older transcripts).
+    param($Record)
+    if ($null -eq $Record) { return $false }
+    $t = [string]$Record.type
+    if ($t -and $t -ne 'user' -and $t -ne 'assistant') { return $false }
+    if ($Record.isMeta -eq $true) { return $false }
+    $role = [string]$Record.message.role
+    return ($role -eq 'user' -or $role -eq 'assistant')
+}
+
 function Get-RecentTranscriptTurns {
     param(
         [Parameter(Mandatory)][string]$TranscriptPath,
@@ -1811,6 +1828,7 @@ function Get-RecentTranscriptTurns {
         if ($line.Length -gt $maxRecordChars) { continue }   # oversized/corrupt — never feed to ConvertFrom-Json
         try {
             $obj = $line | ConvertFrom-Json
+            if (-not (Test-TranscriptTurnRecord $obj)) { continue }
             $role = $obj.message.role
             $content = $obj.message.content
             if (-not $role -or -not $content) { continue }
@@ -1882,15 +1900,20 @@ function Set-L1aCursor {
 }
 
 function Get-TranscriptRecordText {
-    # One JSONL record -> '[role] text', or $null when it carries no text. The same role/text
-    # extraction Get-RecentTranscriptTurns uses. A record that cannot hold text is dropped before
+    # One JSONL record -> '[role] text', or $null when it is not a conversation turn
+    # (Test-TranscriptTurnRecord) or carries no text. The same role/text extraction
+    # Get-RecentTranscriptTurns uses. A record that cannot hold text is dropped before
     # ConvertFrom-Json, which is quadratic on a large line under Windows PowerShell 5.1: a tool result
     # (a string content inside a block array) is most of a transcript's bytes and never text.
     param([string]$Line)
     if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    # A logged request payload is not a turn (Test-TranscriptTurnRecord); it starts with its type, so it
+    # is dropped before the parse, which is the costly part on a large line.
+    if ($Line.StartsWith('{"type":"api-request', [System.StringComparison]::Ordinal)) { return $null }
     if ($Line -notmatch '"type"\s*:\s*"text"|"role"\s*:\s*"[A-Za-z_]+"\s*,\s*"content"\s*:\s*"') { return $null }
     try {
         $obj = $Line | ConvertFrom-Json
+        if (-not (Test-TranscriptTurnRecord $obj)) { return $null }
         $role = $obj.message.role
         $content = $obj.message.content
         if (-not $role -or -not $content) { return $null }
@@ -2051,6 +2074,30 @@ function Get-L1aThrottleSeconds {
     $n = 0
     if ([int]::TryParse(([string]$env:AMS_L1A_THROTTLE_SECONDS).Trim(), [ref]$n) -and $n -ge 10 -and $n -le 3600) { return $n }
     return 90
+}
+
+function Get-L1aReadMode {
+    # Where one extraction pass reads from, given the cursor, the transcript length seen and the windows
+    # the run may take.
+    #   'none'    - a cursor at the length seen: nothing new.
+    #   'forward' - the forward window from the cursor. A transcript with NO cursor yet is read forward
+    #               from its start when the run may take more than one window: the old first run took the
+    #               last 24 records and moved the cursor to the end, so a session whose first extraction
+    #               came late (a long first turn, a first compaction) lost everything before that tail
+    #               (2026-11-12: 187 of some 84,000 characters of a 7.6 MB transcript).
+    #   'tail'    - the last-24-turns read: a shrunk file (the cursor is past the end), an empty length,
+    #               and a first run limited to ONE window (the Codex provider, AMS_L1A_MAX_WINDOWS=1),
+    #               where a walk from zero at one window per throttle period could not catch up with a
+    #               live session.
+    param([long]$Cursor, [long]$Length, [int]$MaxWindows = 1)
+    if ($Length -le 0) { return 'tail' }
+    if ($Cursor -gt 0) {
+        if ($Length -eq $Cursor) { return 'none' }
+        if ($Length -gt $Cursor) { return 'forward' }
+        return 'tail'
+    }
+    if ($MaxWindows -gt 1) { return 'forward' }
+    return 'tail'
 }
 
 function Get-L1aMaxWindows {

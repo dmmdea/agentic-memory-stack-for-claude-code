@@ -35,7 +35,7 @@ Invoke-RestMethod http://127.0.0.1:18791/health/deep
 |---|---|---|
 | every prompt | memory injection + episode checkpoint | `~/.claude/logs/user-prompt-extract.log` |
 | session start | banners (storage cap, audit flags, review queue), resume précis, dream catch-up spawn | the banner itself; `~/.claude/logs/` |
-| session end / compaction | L1a fact extraction (10-min throttle) | `~/.claude/logs/l1a.log` |
+| session end / compaction | L1a fact extraction (throttled: 90 s per session on the Claude API provider, 10 min box-wide on Codex) | `~/.claude/logs/l1a.log` |
 | daily 3:00 (Task Scheduler, WakeToRun) | dream consolidation | `schtasks /Query /TN "ClaudeCode-DreamConsolidator-3am" /FO LIST /V`; `~/.claude/logs/dream.log` |
 | daily 3:30 | stack-backup (**last 8 daily snapshots kept ≈ an 8-day restore window**) | `systemctl --user list-timers` in WSL |
 | daily 4:30 (Task Scheduler) | semantic dedup | `~/.mem0/tier-ledger-YYYY-MM.jsonl` (deletes are logged; monthly segments) |

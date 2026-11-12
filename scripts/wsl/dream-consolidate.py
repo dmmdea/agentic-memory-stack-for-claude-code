@@ -344,9 +344,14 @@ def recent_transcript_turns(path: Path, max_turns: int = TRANSCRIPT_TURNS, max_c
             continue
         try:
             obj = json.loads(line)
+            # Only conversation turns: a logged request payload (type api-request-blob) and text the
+            # harness injects (isMeta) carry a role and text too, and are not what the session said.
+            rec_type = obj.get("type")
+            if (rec_type and rec_type not in ("user", "assistant")) or obj.get("isMeta") is True:
+                continue
             msg = obj.get("message") or {}
             role, content = msg.get("role"), msg.get("content")
-            if not role or not content:
+            if role not in ("user", "assistant") or not content:
                 continue
             text = content if isinstance(content, str) else "\n".join(
                 c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
