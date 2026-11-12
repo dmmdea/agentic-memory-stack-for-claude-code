@@ -6,6 +6,8 @@ Before=ams-step-stack-backup.service
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guarded wiki-index /bin/bash %h/apps/mem0-scripts/wiki-index-nightly.sh
 
 [Install]

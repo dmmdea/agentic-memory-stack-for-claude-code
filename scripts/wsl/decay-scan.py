@@ -169,6 +169,18 @@ def retire_ids(path: str, reason: str, live: bool) -> int:
     return 1 if refused else 0
 
 
+def _write_outcome(counts: dict) -> None:
+    """Step outcome (C1, scripts/wsl/ams-step.sh): one line `ok <json counts>` to $AMS_OUTCOME_FILE so the
+    receipt carries what the scan did. Best-effort: a failed write never changes the exit code."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(f"ok {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"decay-scan: outcome file write failed (non-fatal): {e}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="weekly decay scanner")
     ap.add_argument("--retire-ids", help="soft-retire the ids in this file (one per line or a JSON list)")
@@ -272,6 +284,7 @@ def main():
     print(f"decay-scan: deleted_temporal={deleted}, flagged_evidence_candidates={flagged}, "
           f"retire_mode={mode} retired={retired} would_retire={would_retire} (cap {RETIRE_CAP}; "
           f"never-retrieved rule {'on' if use_never_retrieved else 'off'}, log {int(log_days)}d), report={REPORT}")
+    _write_outcome({"deleted_temporal": deleted, "flagged": flagged, "retired": retired, "would_retire": would_retire})
 
 if __name__ == "__main__":
     sys.exit(main())

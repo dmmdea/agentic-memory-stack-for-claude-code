@@ -48,7 +48,14 @@ try:
 except (OSError, ValueError): lines.append("- health stamp unavailable")
 try:
     g = json.loads((d / "dream" / "gather.json").read_text(encoding="utf-8"))
-    lines.append(f"- dream: {len(g.get('signals') or [])} signal(s), {g.get('tokens', 0)} tokens" + (" (dry run)" if g.get("dry_run") else ""))
+    skipped = g.get("skipped")
+    if skipped:
+        # The insight pass runs about once a week; on the other nights its receipt says it was skipped.
+        # "0 signal(s), 0 tokens" would read as a dead dream, so name the cadence instead.
+        why = "by its weekly cadence" if skipped == "weekly insight cadence" else f"({str(skipped)[:60]})"
+        lines.append(f"- dream: insight pass skipped {why}" + (" (dry run)" if g.get("dry_run") else ""))
+    else:
+        lines.append(f"- dream: {len(g.get('signals') or [])} signal(s), {g.get('tokens', 0)} tokens" + (" (dry run)" if g.get("dry_run") else ""))
 except (OSError, ValueError): pass
 with open(d / "morning-summary.md", "a", encoding="utf-8") as fh:
     fh.write(f"\n## Chain -- {now.strftime('%Y-%m-%d %H:%M')}\n" + "\n".join(lines) + "\n")

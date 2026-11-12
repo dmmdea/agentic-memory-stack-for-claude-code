@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -134,6 +135,18 @@ def abandon_stale_open_questions(conn, days: int) -> int:
     return n
 
 
+def _write_outcome(counts: dict) -> None:
+    """Step outcome (C1, scripts/wsl/ams-step.sh): one line `ok <json counts>` to $AMS_OUTCOME_FILE so the
+    receipt carries what the sweep did. Best-effort: a failed write never changes the exit code."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(f"ok {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"goals-stale-sweep: outcome file write failed (non-fatal): {e}", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v0.17 Phase E: stale-goal sweeper")
     parser.add_argument("--stale-days", type=int, default=DEFAULT_STALE_DAYS,
@@ -220,6 +233,8 @@ def main() -> int:
         with SWEEP_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(sweep_record) + "\n")
 
+    _write_outcome({"stale": sweep_record["found_count"], "abandoned": sweep_record["abandoned_count"],
+                    "oq_abandoned": sweep_record.get("oq_abandoned_count", 0)})
     return 0
 
 

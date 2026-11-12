@@ -4,6 +4,8 @@ After=default.target
 
 [Service]
 Type=simple
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 WorkingDirectory=%h/apps/mem0-server
 # v0.29.3: R4 raw-trace fallback ON by default in production (its episodic
 # test-pollution gate was cleared + live-verified in v0.29.2). Surfaces ONE

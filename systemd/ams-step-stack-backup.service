@@ -5,6 +5,8 @@ After=mem0.service ams-step-retrieval-pairs.service
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh --guard stack-backup /bin/bash %h/apps/mem0-scripts/stack-backup.sh
 
 [Install]

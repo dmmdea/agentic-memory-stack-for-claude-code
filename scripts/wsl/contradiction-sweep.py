@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -641,7 +642,10 @@ def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
     if not path:
         return
     status = _c1_status(outcome)
-    counts = {(f"{_OUTCOME_SCOPE}_{k}" if _OUTCOME_SCOPE else k): v for k, v in (counts or {}).items()}
+    counts = dict(counts or {})
+    if _SUPPRESSED_DISMISSED:
+        counts["suppressed_dismissed"] = _SUPPRESSED_DISMISSED   # pairs the operator already dismissed
+    counts = {(f"{_OUTCOME_SCOPE}_{k}" if _OUTCOME_SCOPE else k): v for k, v in counts.items()}
     try:
         p = Path(path)
         prior_status, prior_counts = _read_outcome_line(p)
@@ -1060,14 +1064,100 @@ def _queued_keys(path) -> set:
     return keys
 
 
+# Durable dismiss. --dismiss used to only drop the queue line, so the weekly sweep judged the same pair
+# YES again and asked the operator the same question. The ledger remembers the decision beside the queue,
+# keyed by (memory_id, kind, other id) and bound to a hash of both records' text at dismiss time: an
+# edited text is a different question and re-opens the pair. Nothing is dismissed except by --dismiss.
+DISMISSED_LEDGER_NAME = "contradiction-dismissed.jsonl"
+_SUPPRESSED_DISMISSED = 0   # pairs this run did not re-queue because the operator already dismissed them
+
+
+def _dismissed_ledger_path(queue_path) -> Path:
+    return Path(queue_path).with_name(DISMISSED_LEDGER_NAME)
+
+
+def _other_id(rec: dict) -> str:
+    """The second record of a queue line: the canonical it was judged against, or the stale canonical."""
+    return str(rec.get("canonical_id") or rec.get("stale_canonical_id") or "")
+
+
+def _text_sha256(text) -> str:
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _current_text_hashes(ids) -> list:
+    """sha256 of each id's CURRENT stored text, fetched by id; None for an id that is empty, absent or
+    whose fetch failed (a null hash never suppresses, so a blip can only cost one repeated question)."""
+    out: list = []
+    try:
+        with httpx.Client() as http:
+            for pid in ids:
+                try:
+                    info = fetch_point_info(http, str(pid)) if pid else None
+                    out.append(None if info is None else _text_sha256(info["text"]))
+                except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                    out.append(None)
+    except Exception:  # noqa: BLE001 - advisory lookup, never fatal
+        out = [None] * len(list(ids))
+    return out
+
+
+def _is_dismissed(path, record: dict) -> bool:
+    """True when the operator already dismissed this exact pair and neither text has changed since."""
+    mid, other, kind = record.get("memory_id"), _other_id(record), record.get("kind") or ""
+    if not mid or not other:
+        return False
+    recorded: list = []
+    try:
+        with open(_dismissed_ledger_path(path), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(e, dict) and e.get("memory_id") == mid and (e.get("kind") or "") == kind
+                        and e.get("other_id") == other and e.get("memory_sha256") and e.get("other_sha256")):
+                    recorded.append((e["memory_sha256"], e["other_sha256"]))
+    except OSError:
+        return False
+    if not recorded:
+        return False
+    cur = _current_text_hashes([mid, other])
+    return None not in cur and tuple(cur) in recorded
+
+
+def record_dismissed(path, records: list) -> int:
+    """Append one ledger line per dismissed queue line: ts, memory_id, kind, other_id and the sha256 of
+    each record's current text (null when its fetch failed). Returns lines written; never raises."""
+    written = 0
+    try:
+        p = _dismissed_ledger_path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            for rec in records:
+                mid, other = rec.get("memory_id"), _other_id(rec)
+                mh, oh = _current_text_hashes([mid, other])
+                f.write(json.dumps({"ts": _iso_now(), "memory_id": mid, "kind": rec.get("kind") or "",
+                                    "other_id": other, "memory_sha256": mh, "other_sha256": oh}) + "\n")
+                written += 1
+    except OSError:
+        pass
+    return written
+
+
 def append_review_queue(path, record: dict) -> bool:
     """Append a candidate to the human-review queue (one JSON line), IDEMPOTENT by _queue_key so a
     re-flagged candidate isn't duplicated across weekly runs while a different kind of record for the
-    same memory still lands. Never raises: returns False on any write failure (the queue is advisory,
-    must not crash the sweep)."""
+    same memory still lands. A pair the operator already dismissed (see the ledger above) and whose
+    texts are unchanged is not queued again; that is counted as suppressed_dismissed. Never raises:
+    returns False on any write failure (the queue is advisory, must not crash the sweep)."""
+    global _SUPPRESSED_DISMISSED
     try:
         if record.get("memory_id") and _queue_key(record) in _queued_keys(path):
             return True  # already queued -> idempotent no-op
+        if _is_dismissed(path, record):
+            _SUPPRESSED_DISMISSED += 1
+            return True  # dismissed by the operator, texts unchanged -> do not ask again
         record.setdefault("ts", _iso_now())
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1078,9 +1168,10 @@ def append_review_queue(path, record: dict) -> bool:
         return False
 
 
-def _drop_queue_lines(path, should_drop) -> int:
-    """Rewrite the queue without the lines should_drop(record) accepts; returns lines removed.
-    Unparseable lines are kept verbatim. Never raises."""
+def _drop_queue_lines(path, should_drop, removed_out: Optional[list] = None) -> int:
+    """Rewrite the queue without the lines should_drop(record) accepts; returns lines removed (the
+    removed records are also appended to removed_out when given). Unparseable lines are kept verbatim.
+    Never raises."""
     try:
         p = Path(path)
         if not p.is_file():
@@ -1098,6 +1189,8 @@ def _drop_queue_lines(path, should_drop) -> int:
                     continue
                 if isinstance(rec, dict) and should_drop(rec):
                     removed += 1
+                    if removed_out is not None:
+                        removed_out.append(rec)
                 else:
                     kept.append(s)
         if removed:
@@ -1109,12 +1202,14 @@ def _drop_queue_lines(path, should_drop) -> int:
         return 0
 
 
-def remove_from_review_queue(path, memory_id, exclude_kinds: tuple = ()) -> int:
+def remove_from_review_queue(path, memory_id, exclude_kinds: tuple = (),
+                             removed_out: Optional[list] = None) -> int:
     """Drop the queue lines for memory_id (called after a human --promote or --dismiss, so the review
     count reflects only OUTSTANDING candidates), except lines whose kind is in exclude_kinds. Returns
     lines removed. Never raises."""
     return _drop_queue_lines(
-        path, lambda rec: rec.get("memory_id") == memory_id and (rec.get("kind") or "") not in exclude_kinds)
+        path, lambda rec: rec.get("memory_id") == memory_id and (rec.get("kind") or "") not in exclude_kinds,
+        removed_out)
 
 
 def prune_stale_review_entries(http: httpx.Client, path) -> int:
@@ -1256,13 +1351,19 @@ def run_promote(mem0_http: httpx.Client, memory_id: str) -> int:
 def run_dismiss(memory_id: str) -> int:
     """--dismiss <memory_id>: the operator's answer to a review-queue line that needs no stamp, chiefly
     canonical-possibly-stale (--promote refuses it: it has no canonical_id). Drops every queue line for
-    memory_id. Exit 0 when something was removed, 1 when nothing matched."""
-    removed = remove_from_review_queue(str(REVIEW_QUEUE), memory_id)
+    memory_id, and remembers each removed pair in the dismissed ledger beside the queue so the weekly sweep
+    does not queue the same pair again while both texts are unchanged. Exit 0 when something was removed,
+    1 when nothing matched. The texts are read from the vector store by id; when that is down the ledger
+    line carries null hashes and suppresses nothing (the sweep may ask once more)."""
+    gone: list = []
+    removed = remove_from_review_queue(str(REVIEW_QUEUE), memory_id, removed_out=gone)
     if not removed:
         print(f"contradiction-sweep: --dismiss {memory_id}: not found in review queue "
               f"({REVIEW_QUEUE}) - nothing to dismiss", flush=True)
         return 1
-    print(f"contradiction-sweep: --dismiss {memory_id}: removed {removed} review-queue line(s)", flush=True)
+    remembered = record_dismissed(str(REVIEW_QUEUE), gone)
+    print(f"contradiction-sweep: --dismiss {memory_id}: removed {removed} review-queue line(s), "
+          f"remembered {remembered} in {_dismissed_ledger_path(REVIEW_QUEUE).name}", flush=True)
     return 0
 
 
@@ -2574,7 +2675,8 @@ def main(argv=None) -> int:
     --judge/--apply) AFTER the sweep in the same process, so the weekly unit runs both under ONE chain
     step and one receipt (a second step would need its own name in the chain). The worse exit wins.
     A dry run does not chain: it would only print the same decisions twice."""
-    global _OUTCOME_SCOPE
+    global _OUTCOME_SCOPE, _SUPPRESSED_DISMISSED
+    _SUPPRESSED_DISMISSED = 0
     argv = list(sys.argv[1:] if argv is None else argv)
     chain = "--then-rejudge-stamped" in argv
     argv = [a for a in argv if a != "--then-rejudge-stamped"]
@@ -2582,6 +2684,7 @@ def main(argv=None) -> int:
     if chain and "--apply" in argv and "--rejudge-stamped" not in argv:
         # both passes report into ONE outcome line: the second never overwrites the first's reason or counts
         _OUTCOME_SCOPE = "rejudge"
+        _SUPPRESSED_DISMISSED = 0     # the re-judge's own skips, reported beside the sweep's
         try:
             rc = max(rc, _main(argv + ["--rejudge-stamped"]))
         finally:
@@ -2639,7 +2742,9 @@ def _main(argv=None) -> int:
     parser.add_argument("--dismiss", default=None, metavar="MEMORY_ID",
                         help="drop every review-queue line for MEMORY_ID, then exit. The way out for a "
                              "canonical-possibly-stale line, which --promote refuses (no canonical_id); "
-                             "the sweep also prunes such lines by itself once the canonical is demoted.")
+                             "the sweep also prunes such lines by itself once the canonical is demoted. "
+                             "Each pair is remembered in contradiction-dismissed.jsonl and not queued again "
+                             "until one of its texts changes.")
     parser.add_argument("--evidence-sweep", action="store_true",
                         help="evidence-vs-evidence mode: anchor on the most-recent NON-canonical facts, "
                              "find OLDER near-duplicate neighbors, judge contradiction (newer wins), and "
