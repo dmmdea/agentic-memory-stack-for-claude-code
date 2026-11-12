@@ -1666,7 +1666,8 @@ def add(b: AddIn, background_tasks: BackgroundTasks, request: Request, x_api_key
         raise _upstream_error(e)
 
 @app.get("/v1/memories")
-def list_all(user_id: str = Query(...), limit: int = Query(100), x_api_key: Optional[str] = Header(None)):
+def list_all(user_id: str = Query(...), limit: int = Query(100), mask: bool = Query(False),
+             x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
     # Hard-cap: silently clamp to 500 regardless of what the caller requests.
     limit = min(limit, 500)
@@ -1676,7 +1677,8 @@ def list_all(user_id: str = Query(...), limit: int = Query(100), x_api_key: Opti
         # default `top_k=20` wins, capping every list call at 20 regardless of caller intent.
         # This caused C1 consolidation and L10 audit to operate on 20/384 = 5% of data
         # (audit finding 2026-06-08). Pass `top_k` explicitly.
-        return mem.get_all(filters={"user_id": user_id}, top_k=limit)
+        res = mem.get_all(filters={"user_id": user_id}, top_k=limit)
+        return _mask_list_read(res) if mask else res
     except Exception as e:
         log.exception("list failed")
         raise _upstream_error(e)
@@ -2150,6 +2152,24 @@ def _mask_read_items(items, key="memory"):
     if n:
         _read_redact_bump(n)
     return masked
+
+
+# The text fields a masked read covers, per record type. Episode rows carry three JSON-text columns the
+# extractor fills (open questions, advanced and blocked goals with their delta and block reasons), and an
+# open question carries a free-text topic: a credential-shaped span can sit in any of them.
+_EPISODE_TEXT_KEYS = ("goal_text", "summary_text", "open_questions", "advanced_goals", "blocked_goals")
+_OQ_TEXT_KEYS = ("question_text", "resolution_text", "topic")
+_GOAL_TEXT_KEYS = ("title", "description")
+
+def _mask_list_read(res, key="memory"):
+    """Opt-in masking for a list read (?mask=true). The model-facing clients ask for it (the MCP shim's
+    list tools); maintenance jobs that compare or rewrite stored text do not, so a list read without the
+    flag is byte-for-byte what it was. Accepts the {"results": [...]} envelope or a bare list."""
+    if isinstance(res, dict) and isinstance(res.get("results"), list):
+        return {**res, "results": _mask_read_items(res["results"], key=key)}
+    if isinstance(res, list):
+        return _mask_read_items(res, key=key)
+    return res
 
 
 @app.post("/v1/memories/search")
@@ -3060,13 +3080,15 @@ def create_goal_endpoint(b: GoalIn, x_api_key: Optional[str] = Header(None)):
 
 
 @app.get("/v1/goals/tree")
-def goals_tree_endpoint(root_id: Optional[int] = None, x_api_key: Optional[str] = Header(None)):
+def goals_tree_endpoint(root_id: Optional[int] = None, mask: bool = False,
+                        x_api_key: Optional[str] = Header(None)):
     """Return goal hierarchy as a flat list with depth field.
     root_id=None returns all top-level trees."""
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_get_goal_tree(conn, root_goal_id=root_id)
+            rows = _episodic_get_goal_tree(conn, root_goal_id=root_id)
+        return _mask_list_read(rows, key=_GOAL_TEXT_KEYS) if mask else rows
     except Exception as e:
         log.exception("goals tree failed")
         raise _upstream_error(e)
@@ -3079,6 +3101,7 @@ def list_goals_endpoint(
     parent_id: Optional[int] = None,
     limit: int = 50,
     initiative: Optional[str] = None,
+    mask: bool = False,
     x_api_key: Optional[str] = Header(None),
 ):
     """List goals with optional filters: status, brand, parent_id, limit, initiative.
@@ -3090,7 +3113,8 @@ def list_goals_endpoint(
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_list_goals(conn, status=status, brand=brand, parent_goal_id=parent_id, limit=limit, initiative=initiative)
+            rows = _episodic_list_goals(conn, status=status, brand=brand, parent_goal_id=parent_id, limit=limit, initiative=initiative)
+        return _mask_list_read(rows, key=_GOAL_TEXT_KEYS) if mask else rows
     except Exception as e:
         log.exception("goals list failed")
         raise _upstream_error(e)
@@ -3481,6 +3505,7 @@ def create_open_question_endpoint(b: OpenQuestionIn, x_api_key: Optional[str] = 
 def list_open_questions_endpoint(
     status: str = "open", brand: Optional[str] = None, limit: int = 20,
     initiative: Optional[str] = None,
+    mask: bool = False,
     x_api_key: Optional[str] = Header(None),
 ):
     """List open questions with status + brand filters. Default status='open'.
@@ -3491,7 +3516,8 @@ def list_open_questions_endpoint(
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_list_open_questions(conn, status=status, brand=brand, limit=limit, initiative=initiative)
+            rows = _episodic_list_open_questions(conn, status=status, brand=brand, limit=limit, initiative=initiative)
+        return _mask_list_read(rows, key=_OQ_TEXT_KEYS) if mask else rows
     except Exception as e:
         log.exception("open_questions list failed")
         raise _upstream_error(e)
@@ -3505,7 +3531,7 @@ def search_open_questions_endpoint(b: OpenQuestionSearchIn, x_api_key: Optional[
         with _episodic_connect() as conn:
             return _mask_read_items(
                 _episodic_search_open_questions(conn, query=b.query, brand=b.brand, status=b.status, limit=b.limit),
-                key=("question_text", "resolution_text"))
+                key=_OQ_TEXT_KEYS)
     except Exception as e:
         log.exception("open_questions search failed")
         raise _upstream_error(e)
@@ -3882,8 +3908,8 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # negative or missing cap must not turn into an unbounded listing).
             out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("goal_cap", 0) > 0 else []
             out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("oq_cap", 0) > 0 else []
-            out["goals"] = _mask_read_items(out["goals"], key=("title", "description"))
-            out["open_questions"] = _mask_read_items(out["open_questions"], key=("question_text", "resolution_text"))
+            out["goals"] = _mask_read_items(out["goals"], key=_GOAL_TEXT_KEYS)
+            out["open_questions"] = _mask_read_items(out["open_questions"], key=_OQ_TEXT_KEYS)
     except Exception:
         log.exception("bundle: goals/open_questions failed (non-fatal)")
         out.setdefault("goals", [])
@@ -4065,7 +4091,7 @@ def search_episodes(b: EpisodeSearchIn, x_api_key: Optional[str] = Header(None))
     try:
         with _episodic_connect() as conn:
             results = _episodic_search_fts(conn, b.query, b.since, b.until, b.brand, b.limit)
-        results = _mask_read_items(results, key=("goal_text", "summary_text"))
+        results = _mask_read_items(results, key=_EPISODE_TEXT_KEYS)
         return {"results": results, "count": len(results)}
     except Exception as e:
         log.exception("episode search failed")
@@ -4093,6 +4119,7 @@ def list_episodes(
     recent: int = Query(10),
     brand: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
+    mask: bool = Query(False),
     x_api_key: Optional[str] = Header(None),
 ):
     """List last N episodes by ended_at desc. Default recent=10.
@@ -4104,7 +4131,8 @@ def list_episodes(
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_recent(conn, recent, brand, state)
+            rows = _episodic_recent(conn, recent, brand, state)
+        return _mask_list_read(rows, key=_EPISODE_TEXT_KEYS) if mask else rows
     except Exception as e:
         log.exception("episode list failed")
         raise _upstream_error(e)

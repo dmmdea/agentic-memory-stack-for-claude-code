@@ -4,6 +4,21 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.41.2 — the MCP list tools mask stored credentials too (2026-11-12)
+
+### Fixed
+
+- 1.41.0 masked credential-shaped text in the reads by query, but the MCP shim's list tools read through the
+  list endpoints, which stayed unmasked: memory_list, episodic_recent, the goals lists and tree, and
+  open_questions_open handed stored text to a model as it is stored. Those five endpoints (GET /v1/memories,
+  /v1/episodes, /v1/goals, /v1/goals/tree, /v1/open_questions) now accept ?mask=true, and the shim sends it
+  on every list tool. A changed item carries redacted: true and counts in checks.read_redactions_today.
+  Without the flag a list read is what it was, so the maintenance jobs that compare or rewrite stored text
+  are unaffected. The by-id reads stay unmasked on purpose: an edit starts from one.
+- The masked reads of episodes and open questions (search, list and the bundle) missed four text
+  fields: an episode row's open_questions, advanced_goals and blocked_goals columns, which hold text the
+  extractor wrote, and an open question's topic. They are masked now.
+
 ## 1.41.1 — only conversation turns reach the extractor, and a first extraction reads from the start (2026-11-12)
 
 ### Fixed

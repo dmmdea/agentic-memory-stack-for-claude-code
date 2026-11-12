@@ -599,10 +599,12 @@ def memory_recall(query: str, brand: str | None = None, initiative: str | None =
 def memory_list(user_id: str = "__WSL_USER__", limit: int = 50) -> dict:
     """List recent memories for user_id. Hard-capped server-side at 500.
     Prefer memory_search for content discovery; this is for inventory."""
+    # mask=true: a list read handed to a model carries credential-shaped spans masked, like search
+    # (the list tools below send it too). memory_get_by_id stays raw: it is the read an edit starts from.
     user_id = _resolve_tenant(user_id)
     if limit > 500:
         limit = 500
-    data, source = _request("GET", "/v1/memories", params={"user_id": user_id, "limit": limit})
+    data, source = _request("GET", "/v1/memories", params={"user_id": user_id, "limit": limit, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -818,7 +820,7 @@ def episodic_recent(limit: int = 7, brand: str | None = None) -> list:
     params: dict = {"recent": limit}
     if brand:
         params["brand"] = brand
-    data, source = _request("GET", "/v1/episodes", params=params)
+    data, source = _request("GET", "/v1/episodes", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -861,7 +863,7 @@ def goals_list(status: str | None = None, brand: str | None = None, limit: int =
         params["status"] = status
     if brand:
         params["brand"] = brand
-    data, source = _request("GET", "/v1/goals", params=params)
+    data, source = _request("GET", "/v1/goals", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -875,7 +877,7 @@ def goals_tree(root_id: int | None = None) -> list[dict]:
     params: dict = {}
     if root_id is not None:
         params["root_id"] = root_id
-    data, source = _request("GET", "/v1/goals/tree", params=params)
+    data, source = _request("GET", "/v1/goals/tree", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -888,7 +890,7 @@ def goals_open(brand: str | None = None, limit: int = 10) -> list[dict]:
     params: dict = {"status": "open", "limit": limit}
     if brand:
         params["brand"] = brand
-    data, source = _request("GET", "/v1/goals", params=params)
+    data, source = _request("GET", "/v1/goals", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -901,7 +903,7 @@ def goals_blocked(brand: str | None = None, limit: int = 10) -> list[dict]:
     params: dict = {"status": "blocked", "limit": limit}
     if brand:
         params["brand"] = brand
-    data, source = _request("GET", "/v1/goals", params=params)
+    data, source = _request("GET", "/v1/goals", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -1113,7 +1115,7 @@ def open_questions_open(brand: str | None = None, limit: int = 7) -> list[dict]:
     params: dict = {"status": "open", "limit": limit}
     if brand:
         params["brand"] = brand
-    data, source = _request("GET", "/v1/open_questions", params=params)
+    data, source = _request("GET", "/v1/open_questions", params={**params, "mask": "true"})
     if source == "local-replica" and isinstance(data, dict):
         data["source"] = "local-replica"
         data["stale_note"] = "served from local replica; authority unreachable"
@@ -1215,7 +1217,7 @@ def _drain_outbox_async() -> None:
 # (AMS-02). A stale copy carries a stale literal here, the server compares it to its own
 # STACK_VERSION, and the mcp-shim manifest row goes 'degraded'.
 # BUMPED WITH THE REPO VERSION — mem0-server/tests/test_capabilities.py pins the two.
-SHIM_STACK_VERSION = "1.41.1"
+SHIM_STACK_VERSION = "1.41.2"
 
 
 def _write_start_receipt() -> None:
