@@ -126,6 +126,20 @@ type Result struct {
 	IndexText string
 	// Candidates is the offer surface this run computed.
 	Candidates CandidateSet
+	// Planned lists, under --dry-run only, every SHORTEN and MIGRATE this run would carry
+	// out, the deterministic line floor's included (Floor true). It is empty on a real run:
+	// the receipt and the index are the record there.
+	Planned []PlannedDecision
+}
+
+// PlannedDecision is one change a dry run reports it would make.
+type PlannedDecision struct {
+	Slug string
+	Verb Verb
+	// Floor marks a MIGRATE the deterministic line floor added rather than the judge.
+	Floor bool
+	// NewHook is the replacement hook of a SHORTEN.
+	NewHook string
 }
 
 type pendingDelete struct {
@@ -369,6 +383,9 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 			rec.Dirty = true
 			newlySealed[d.Slug] = true
 			res.Shortened++
+			if opt.DryRun {
+				res.Planned = append(res.Planned, PlannedDecision{Slug: d.Slug, Verb: VerbShorten, NewHook: hook})
+			}
 			if m.FM != nil && m.FM.Present {
 				// The hook is authoritative in the FILE from v2 on; the index is derived
 				// from it. The write is deferred to after the invariants pass so an
@@ -399,6 +416,7 @@ func Apply(ctx context.Context, opt Options) (Result, error) {
 				migrationsDone++
 				removals++
 				res.Migrated++
+				res.Planned = append(res.Planned, PlannedDecision{Slug: d.Slug, Verb: VerbMigrate, Floor: isFloor})
 				if isFloor {
 					res.LineFloored++
 				}
@@ -721,8 +739,16 @@ const floorKey = "ams_line_floor"
 // Bytes converge through the convergence floor; LINES only fall through migration, and a
 // judge keeps by default - one store climbed to 174 lines against the 200-line injection
 // cutoff while every nightly migrated nothing. When the index is over its line trigger,
-// the OLDEST pullable facts the judge did not decide are migrated deterministically -
-// same write-then-verify path, same blast cap - until the store is back at its target.
+// the OLDEST pullable facts the judge did not migrate or shorten are migrated
+// deterministically - same write-then-verify path, same blast cap - until the store is
+// back at its target.
+//
+// Only a decision that removes or rewrites the fact (MIGRATE, SHORTEN) shields a slug from
+// the floor. A KEEP does not: the judge decides every slug it is offered and keeps by
+// default, so counting a KEEP as a decision left the pool empty on every night the store
+// stayed over its trigger, and the floor never fired. A KEEP still protects a slug that is
+// not migratable (doctrine, a feedback or user fact, an over-cap body) because the pool is
+// built from IsMigratable.
 //
 // It is appended AFTER the judge's decisions so the judge's own MIGRATEs count first,
 // and the debt is reduced by them: a judge migration that fails to land leaves the store
@@ -737,9 +763,12 @@ func lineFloorPlan(opt Options, st *State, decisions []Decision, keep []*index.R
 	decided := map[string]bool{}
 	judgeMigrates := 0
 	for _, d := range decisions {
-		decided[d.Slug] = true
-		if d.Verb == VerbMigrate {
+		switch d.Verb {
+		case VerbMigrate:
+			decided[d.Slug] = true
 			judgeMigrates++
+		case VerbShorten:
+			decided[d.Slug] = true
 		}
 	}
 	left := debt - min(judgeMigrates, opt.maxMigrations())

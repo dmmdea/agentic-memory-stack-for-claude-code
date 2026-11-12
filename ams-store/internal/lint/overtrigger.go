@@ -100,14 +100,18 @@ func RecordOverTrigger(projectsRoot, workspace string, overTrigger bool, now tim
 		// losing the clock costs one alarm, refusing to maintain costs the store.
 		s = emptyStamps()
 	}
-	prev, had := s.OverTriggerSince[workspace]
+	prev := s.OverTriggerSince[workspace]
 	live := s.IsLive(workspace)
 	switch {
 	case !overTrigger:
 		// The clear is a WRITE, not a deletion: the tombstone is what carries it to the
 		// other PCs, which still have the stamp and would otherwise hand it back.
-		if !had && s.clearedNotBefore(workspace, now) {
-			return s, nil // already cleared at or after this instant; nothing new to say
+		if _, tombstoned := s.ClearedAt[workspace]; !live && tombstoned {
+			// No live stamp and a clear already on record: a fresh tombstone would only
+			// move a timestamp, rewrite a tracked file and cost a commit on every
+			// maintenance pass for a store nobody touched. A real clear (a live stamp
+			// existed) falls through and writes its tombstone.
+			return s, nil
 		}
 		delete(s.OverTriggerSince, workspace)
 		if !s.clearedNotBefore(workspace, now) {

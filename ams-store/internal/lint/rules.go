@@ -113,6 +113,13 @@ type StoreRow struct {
 	SkipStreak       int      `json:"skip_streak"`
 	LastStatus       string   `json:"last_status,omitempty"`
 	OverTriggerHours *float64 `json:"over_trigger_hours"`
+	// LastStatusAt is when LastStatus was written, and LastDecisionAt when the store last
+	// reached a decision (applied, applied-unrecorded, no-op, protected-set-overflow).
+	// Whole-second Zulu; absent when there is no such receipt inside FindingWindow. The
+	// banner reads them to say what the judge last did instead of guessing the chain is
+	// broken.
+	LastStatusAt   string `json:"last_status_at,omitempty"`
+	LastDecisionAt string `json:"last_decision_at,omitempty"`
 }
 
 // MeasureStore reads a store and returns its stats.

@@ -49,6 +49,10 @@ The session's brand, campaign and initiative are inferred from its working direc
 | Weekly `--rejudge-stamped` spawn | yes | never (the brain runs its own Sunday sweep) |
 | Auto-memory lint summary, outbox and canonize lines, cap warnings for the local stores | yes | yes (valid on any box) |
 
+## The auto-memory over-trigger line
+
+The auto-memory lint summary (`lint-summary.json`, all roles) feeds one line per box. A store continuously over its compaction trigger for less than 24 h prints quietly as `auto-memory G7: over trigger <store> <h>h (alarm at 24h; ...)`. At 24 h or more it prints one `AUTO-MEMORY G7 ALARM` line for the worst store, built only from what the summary carries: the hours over the trigger, its lines against the 160-line trigger and its bytes against the 20,000 B trigger, the last run's status and age, and the age of the last decision. The hours are continuous time over the trigger, which a nightly decision does not reset, so the line names the judge or the nightly chain as the cause only when no decision was applied inside 36 h (or none is on record); when one was, it says the chain is deciding and the store is not shrinking below its trigger, and points at `compact-receipts.jsonl`. A summary written by a binary that predates the last-run fields prints the measurements without a last-judge clause and blames nothing. See [`ams-store.md`](./ams-store.md) for the clock and the line floor.
+
 ## Reading the authority
 
 Every authority read sits behind the one `MEM0_UP` probe (1 s), so a cold morning costs that probe and nothing more.

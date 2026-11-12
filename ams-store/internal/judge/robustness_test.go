@@ -392,3 +392,42 @@ func TestLineFloor_StopsAtTheBlastCap(t *testing.T) {
 		t.Errorf("after_lines = %d, want 162 - the store converges over several nights, not in one", res.AfterLines)
 	}
 }
+
+// A judge decides every slug it is offered and KEEP is its safe default, so a plan that
+// keeps everything must not shield those facts from the line floor: the store stayed over
+// its trigger for many nights with line_floored = 0 each night because a KEEP counted as
+// "decided". Only a decision that removes or rewrites the fact does.
+func TestLineFloor_AKeepDoesNotShieldAPullableFact(t *testing.T) {
+	lines := []string{"# Memory Index", ""}
+	facts := map[string]string{}
+	var keeps []Decision
+	for i := 1; i <= 169; i++ {
+		slug := "fact" + itoa(i) + ".md"
+		lines = append(lines, entryLine("Fact "+itoa(i), slug, "hook "+itoa(i)))
+		facts[slug] = factFile("fact"+itoa(i), "desc "+itoa(i), "reference", "body "+itoa(i))
+		keeps = append(keeps, Decision{Slug: slug, Verb: VerbKeep})
+	}
+	f := newFixture(t, "kept", lines, facts, testutil.Mem0OK)
+	for i := 1; i <= 40; i++ {
+		age(t, filepath.Join(f.dir, "fact"+itoa(i)+".md"), f.now.AddDate(0, 0, -100+i))
+	}
+
+	res := f.apply(keeps, nil)
+
+	if res.Status != StatusApplied {
+		t.Fatalf("status = %q, want %q (note %s)", res.Status, StatusApplied, res.Note)
+	}
+	// 171 index lines against the 140-line target is a debt of 31, below the blast cap of
+	// floor(0.2*169) = 33: the floor takes the 31 oldest facts despite every one being KEPT.
+	if res.LineFloored != 31 {
+		t.Fatalf("line_floored = %d, want 31: a KEEP shielded pullable facts from the floor", res.LineFloored)
+	}
+	for i := 1; i <= 31; i++ {
+		if f.exists("fact" + itoa(i) + ".md") {
+			t.Errorf("fact%d.md is among the oldest and was KEPT; the floor should still have migrated it", i)
+		}
+	}
+	if !f.exists("fact32.md") {
+		t.Error("the floor migrated past its debt")
+	}
+}

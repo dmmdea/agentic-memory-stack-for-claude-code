@@ -249,11 +249,22 @@ else:
                 kinds[k] = kinds.get(k, 0) + 1
         detail = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
         parts.append(f"auto-memory lint: {n} actionable ({detail})")
-    # G7 (design section 9, register P4-1c): hours over trigger WITHOUT an applied decision, per
-    # store, from the store lint's over_trigger_hours (the over-trigger clock that rides in the
-    # synced tree; min across PCs). A skip cannot satisfy it; only a decision applied on the hub
-    # clears it. Quiet below 24 h, loud at or above - this line is the one observer that does
-    # not depend on the authority being up.
+    # G7 (design section 9, register P4-1c): hours CONTINUOUSLY over trigger, per store, from the
+    # store lint's over_trigger_hours (the over-trigger clock that rides in the synced tree; min
+    # across PCs). The clock only resets when the store falls back under the trigger, so a judge
+    # that applies a decision every night and still leaves the store over trigger keeps it running:
+    # the alarm line therefore states the measurements (lines and bytes against the triggers) and
+    # the last run and decision from the summary, and blames the judge or the chain only when the
+    # data shows no decision inside 36 h. Quiet below 24 h, loud at or above - this line is the
+    # one observer that does not depend on the authority being up.
+    LINE_TRIGGER, BYTE_TRIGGER = 160, 20000   # mirrors ams-store/internal/store/constants.go
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def _ago(ts):
+        try:
+            t = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        except Exception:
+            return None
+        return max(0.0, (now - t).total_seconds() / 3600.0)
     over = []
     for s in d.get("stores") or []:
         try:
@@ -261,13 +272,26 @@ else:
         except Exception:
             h = 0.0
         if h > 0:
-            over.append((str(s.get("workspace") or "?"), h))
+            over.append((str(s.get("workspace") or "?"), h, s))
     if over:
         over.sort(key=lambda x: -x[1])
         worst = over[0][1]
-        listing = ", ".join(f"{w} {h:g}h" for w, h in over)
+        listing = ", ".join(f"{w} {h:g}h" for w, h, _s in over)
         if worst >= 24:
-            parts.append(f"AUTO-MEMORY G7 ALARM: over trigger without an applied decision for {worst:g}h ({listing}) - the hub judge has not decided; check the nightly chain")
+            w0, _h0, s0 = over[0]
+            size = ""
+            if isinstance(s0.get("lines"), int) and isinstance(s0.get("bytes"), int):
+                size = f" ({s0['lines']} lines vs the {LINE_TRIGGER}-line trigger, {s0['bytes']} B vs the {BYTE_TRIGGER} B trigger)"
+            run_ago, dec_ago = _ago(s0.get("last_status_at")), _ago(s0.get("last_decision_at"))
+            last = ""
+            if run_ago is not None:
+                last = f"; last run {s0.get('last_status') or 'unknown'} {run_ago:.1f}h ago"
+            if dec_ago is not None and dec_ago <= 36:
+                last += f", last decision {dec_ago:.1f}h ago - the nightly chain is deciding but the store is not shrinking below its trigger (see compact-receipts.jsonl)"
+            elif dec_ago is not None or run_ago is not None:
+                last += ", no decision applied inside 36h - the hub judge has not decided; check the nightly chain"
+            others = f" (all: {listing})" if len(over) > 1 else ""
+            parts.append(f"AUTO-MEMORY G7 ALARM: {w0} has been over its trigger for {worst:g}h{size}{last}{others}")
         else:
             parts.append(f"auto-memory G7: over trigger {listing} (alarm at 24h; the hub judge decides nightly)")
 age = d.get("last_receipt_age_hours")

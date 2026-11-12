@@ -928,6 +928,36 @@ func TestLint_OverTriggerStampClearsWhenTheStoreFallsBack(t *testing.T) {
 	}
 }
 
+// A store that stays under its trigger must not rewrite the tombstone on every maintenance
+// pass: the file is tracked, so each rewrite costs a commit that is then pushed.
+func TestLint_UnderTriggerPassesLeaveTheStampFileUntouched(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	if _, err := lint.RecordOverTrigger(sb.ProjectsRoot, "ws", true, fixedNow.Add(-30*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// The real clear writes the tombstone.
+	if _, err := lint.RecordOverTrigger(sb.ProjectsRoot, "ws", false, fixedNow); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(lint.StampPath(sb.ProjectsRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two later passes, hours apart, still under the trigger: nothing new to say.
+	for _, later := range []time.Duration{3 * time.Hour, 27 * time.Hour} {
+		if _, err := lint.RecordOverTrigger(sb.ProjectsRoot, "ws", false, fixedNow.Add(later)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(lint.StampPath(sb.ProjectsRoot))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(first) {
+			t.Fatalf("an under-trigger pass rewrote the stamp file:\nbefore %s\nafter  %s", first, got)
+		}
+	}
+}
+
 func TestLint_MergeStampsTakesTheMin(t *testing.T) {
 	a := lint.Stamps{OverTriggerSince: map[string]time.Time{
 		"one": fixedNow, "only-a": fixedNow,
