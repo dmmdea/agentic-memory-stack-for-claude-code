@@ -50,7 +50,7 @@ That `|| true` is the **fail-open contract** — see *Invariants* for why it is 
 
 1. Reads `transcript_path` (a **Windows** path) and translates it to its WSL mount (`C:\…` → `/mnt/c/…`).
 2. **Tails only the last 256 KB** of the transcript (`_TAIL_BYTES`), never the whole file — bounding the pathological giant-transcript case.
-3. Parses the JSONL and keeps the **last 6** user/assistant turns (`DEFAULT_MAX_TURNS = 6`) as `[role] text`.
+3. Parses the JSONL and keeps the **last 6** user/assistant turns (`DEFAULT_MAX_TURNS = 6`) as `[role] text`. A turn is a record of type `user` or `assistant` that is not flagged `isMeta`; logged request payloads (`api-request-blob`) and injected text are skipped ([memory capture](./memory-capture.md), *What counts as a turn*).
 4. **Redacts** credential-shaped text (OpenAI `sk-` keys, `Authorization:` bearer/basic headers, `api_key|token|password|secret` assignments, PEM private-key blocks) so nothing secret lands in the marker, even transiently.
 5. Truncates the result to **800 chars** (`DEFAULT_MAX_CHARS`), keeping the most-recent tail.
 

@@ -190,8 +190,10 @@ function Invoke-L1aWindow {
     # Cursor-aware windowing (2026-07-14): only extract turns appended SINCE the last successful
     # extraction of THIS transcript, so overlapping recent-24-turn windows stop re-emitting the
     # same facts every Stop. $advanceTo is captured NOW (before the slow codex call) so appends
-    # during extraction are picked up next run, not skipped. No cursor, a shrink, or a read error ->
-    # the last-24-turns tail, with the cursor set to the length seen.
+    # during extraction are picked up next run, not skipped. Get-L1aReadMode decides where the pass reads:
+    # forward from the cursor (from the start of the file on a first run that may take several windows),
+    # or the last-24-turns tail with the cursor set to the length seen (a shrink, a read error, a first
+    # run limited to one window).
     $advanceTo = 0L
     try { $advanceTo = [long](Get-Item -LiteralPath $ReadPath).Length } catch { $advanceTo = 0L }
     $cursor = Get-L1aCursor -TranscriptPath $CursorPath
@@ -199,7 +201,8 @@ function Invoke-L1aWindow {
     $consumedTo = $advanceTo
     $windowTag = ''
     if ($MaxWindows -gt 1) { $windowTag = " $WindowNo/$MaxWindows" }
-    if ($cursor -gt 0 -and $advanceTo -gt 0 -and $advanceTo -eq $cursor) {
+    $readMode = Get-L1aReadMode -Cursor $cursor -Length $advanceTo -MaxWindows $MaxWindows
+    if ($readMode -eq 'none') {
         # transcript is byte-for-byte unchanged since the last successful extraction — nothing new.
         # (The DLQ drain above already retried any previously-failed posts, so this is safe.)
         # NOTE: -eq, NOT -le. A SHRINK ($advanceTo < $cursor: rotation/truncation/corruption) must
@@ -209,10 +212,12 @@ function Invoke-L1aWindow {
         return 'stop'
     }
     $usedWindow = $false
-    if ($cursor -gt 0 -and $advanceTo -gt $cursor) {
+    if ($readMode -eq 'forward') {
         # The forward window: the next 12,000 characters of text past the cursor, read in order. The
         # old read took the LAST 24 records of the gap and the cursor then jumped to the end of the file,
-        # so everything between the cursor and that tail was never extracted.
+        # so everything between the cursor and that tail was never extracted. With no cursor yet the
+        # window starts at byte 0.
+        if ($cursor -lt 0) { $cursor = 0L }
         $win = $null
         try { $win = Get-TranscriptWindowSince -TranscriptPath $ReadPath -SinceBytes $cursor -MaxChars 12000 } catch { $win = $null }
         if ($null -ne $win) {
@@ -235,7 +240,7 @@ function Invoke-L1aWindow {
         }
     }
     if (-not $usedWindow) {
-        # first extraction of this transcript, a rotation/shrink, or a read error above: the unchanged
+        # a first extraction limited to one window, a rotation/shrink, or a read error above: the
         # last-24-turns behaviour (never lose extraction), and the cursor goes to the length seen.
         $turns = Get-RecentTranscriptTurns -TranscriptPath $ReadPath -MaxTurns 24 -MaxChars 12000
         $consumedTo = $advanceTo

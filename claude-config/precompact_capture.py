@@ -115,6 +115,12 @@ def extract_turns_text(jsonl_text: str, max_turns: int = DEFAULT_MAX_TURNS) -> s
             obj = json.loads(line)
         except Exception:
             continue
+        # A turn has type user/assistant (or none, in older transcripts) and is not injected by the
+        # harness. Request payloads kept for debugging (type api-request-blob) carry a role and text
+        # too: the system prompt and copies of earlier turns.
+        rec_type = obj.get("type")
+        if (rec_type and rec_type not in ("user", "assistant")) or obj.get("isMeta") is True:
+            continue
         msg = obj.get("message") or {}
         role = msg.get("role")
         content = msg.get("content")

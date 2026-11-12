@@ -71,7 +71,7 @@ Claude Code Stop / PreCompact event
 stop-extract.ps1    (C:\Users\<WIN_USER>\.claude\scripts\, runs in < 2s)
   │ Start-Process -Hidden detached pwsh
   ▼
-l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks Claude Code)
+l1a-extract.ps1     (background, throttled, best-effort — never blocks Claude Code)
   │
   ├─ throttle gate → skip if too soon after the last successful run (Codex provider: box-wide, 600 s; Claude API provider: per session, 90 s)
   ├─ Drain-Mem0DeadLetter        → retry any previously-failed POSTs first

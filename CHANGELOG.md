@@ -4,6 +4,37 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.41.1 — only conversation turns reach the extractor, and a first extraction reads from the start (2026-11-12)
+
+### Fixed
+
+- The transcript readers took every record that carries a message role as a conversation turn. Claude Code
+  also writes request payloads kept for debugging (type api-request-blob: the system prompt and copies of
+  earlier turns) and text the harness injects (isMeta: skill bodies, command caveats). In 45 of 46 recent
+  transcripts those were 65 to 80 percent of the text the readers passed, so most extraction calls read
+  prompt text, and the forward reader of 1.41.0, which walks every record, multiplied them. A record is
+  now a turn only when its type is user or assistant (or absent), its role is user or assistant and it is
+  not isMeta. Fixed in the forward window, the tail read, the PreCompact capture and the dream's
+  transcript reader. On one real 7.6 MB transcript a read from the start went from 20 windows to 3.
+- A transcript the extractor had never read got the old first-run tail read: its last 24 records, then the
+  cursor moved to the end of the file. A session whose first extraction came late (a long first turn, a
+  first compaction) lost everything before that tail. Seen on the day 1.41.0 shipped: 187 of some 84,000
+  characters of a 7.6 MB transcript reached the extractor, because its last 24 records were tool calls. A
+  first run now reads forward from byte 0, window by window, like every later run, when the run may take
+  more than one window (the Claude API provider). A first run limited to one window (the Codex provider,
+  or AMS_L1A_MAX_WINDOWS=1) keeps the tail read: a walk from zero at one window per throttle period could
+  not catch up with a live session. A shrunk file still resets through the tail read.
+- The installer's closing hint, the operations table and the hooks diagram still said the extractor has a
+  10-minute throttle. They now give both: 90 s per session on the Claude API provider, 10 minutes box-wide
+  on Codex.
+
+### Changed
+
+- `Get-L1aReadMode` (memory-common.ps1) holds the choice between the forward window and the tail read, so
+  it can be tested without a model call, and `Test-TranscriptTurnRecord` holds the rule for what a turn is.
+  Two tests, one per incident: a transcript whose tail holds no text is read from byte 0, and request
+  payloads and injected records are not turns.
+
 ## 1.41.0 — capture reads forward from its cursor, search masks stored credentials, the verifier stops crying wolf (2026-11-12)
 
 ### Fixed
@@ -16,7 +47,8 @@ in the first entries below — full pre-inversion history lives in the maintaine
   file, so everything between the old cursor and that tail was never extracted. It now reads forward from the
   cursor, 12,000 characters of text per window, and the cursor moves to the end of what was read (always a
   record boundary, never past the length seen, never into a partial last line). Tool-only stretches are passed
-  without a model call. A transcript with no cursor still gets the old first-run tail read.
+  without a model call. A transcript with no cursor still got the old first-run tail read (changed in
+  1.41.1).
 - A PreCompact run keyed its cursor on the temp snapshot's file name, so the real transcript's cursor never
   moved (and every compaction left an orphan cursor file) and the next Stop re-extracted what PreCompact had
   just posted. The cursor is now keyed on the real transcript, and cursor files named for precompact-snap-*
