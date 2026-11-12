@@ -407,9 +407,27 @@ function Test-Endpoint([string]$url) {
     try { $r = Invoke-RestMethod "$url/health" -TimeoutSec 5; return [bool]$r.ok } catch { return $false }
 }
 
+function ConvertTo-WslInt([string]$Raw, [ref]$Value) {
+    # A wsl.exe capture that is used as a number: NUL characters stripped (UTF-16 output of an older
+    # wsl.exe), then TryParse. Anything else is not a count: wsl.exe's own status text ("An install,
+    # uninstall, or conversion is in progress ...") comes back on the same stream while the distro is busy.
+    $t = ("$Raw" -replace "`0", '').Trim()
+    return [int]::TryParse($t, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, $Value)
+}
+
 function Get-OutboxCount {
-    $n = Wsl 'test -f ~/.mem0/outbox.jsonl && wc -l < ~/.mem0/outbox.jsonl || echo 0'
-    return [int]("$($n | Select-Object -First 1)".Trim())
+    # The queued-memory count, or $null when WSL did not answer with a number (a handled failure that
+    # says what came back; callers decide what an unknown count means).
+    $prev = $env:WSL_UTF8
+    $env:WSL_UTF8 = '1'
+    try { $n = Wsl 'test -f ~/.mem0/outbox.jsonl && wc -l < ~/.mem0/outbox.jsonl || echo 0' }
+    catch { Write-Warning "outbox count unavailable: wsl.exe failed: $($_.Exception.Message)"; return $null }
+    finally { $env:WSL_UTF8 = $prev }
+    $raw = ("$(@($n) | Select-Object -First 1)" -replace "`0", '').Trim()
+    $count = 0
+    if (ConvertTo-WslInt $raw ([ref]$count)) { return $count }
+    Write-Warning "outbox count unavailable: expected a number from WSL, got '$raw'"
+    return $null
 }
 
 function Get-TravelState {
@@ -424,7 +442,8 @@ function Show-Status {
     Write-Host "  travel mode : $(if ($t) { "ON since $($t.since) (replica + outbox)" } else { 'OFF (live authority)' })"
     Write-Host "  authority   : $Authority  -> $(if (Test-Endpoint $Authority) { 'reachable' } else { 'UNREACHABLE' })"
     Write-Host "  replica     : $Replica  -> $(if (Test-Endpoint $Replica) { 'running' } else { 'stopped' })"
-    Write-Host "  outbox      : $(Get-OutboxCount) queued memories"
+    $oc = Get-OutboxCount
+    Write-Host "  outbox      : $(if ($null -eq $oc) { 'unknown (WSL did not answer)' } else { "$oc queued memories" })"
     Write-Host ""
 }
 
@@ -497,7 +516,10 @@ switch ($Mode) {
       }
 
       # 2. Drain the outbox FIRST if the authority is still reachable — never strand writes
-      if ((Get-OutboxCount) -gt 0 -and (Test-Endpoint $Authority)) {
+      # An unknown count (WSL busy) skips the drain: the outbox stays on disk and drains when this box
+      # goes back online, so the restore must not be blocked by it.
+      $queued = Get-OutboxCount
+      if ($null -ne $queued -and $queued -gt 0 -and (Test-Endpoint $Authority)) {
           Write-Host "    outbox has queued memories and the authority is still reachable — replaying before going offline"
           & "$PSScriptRoot\replay-outbox.ps1" -Authority $Authority -Distro $Distro
       }
@@ -600,7 +622,10 @@ EOF"
           Write-Host "    -Force: flipping without replay; the outbox stays queued" -ForegroundColor Yellow
       } else {
           $n = Get-OutboxCount
-          if ($n -gt 0) {
+          if ($null -eq $n -and -not $Force) { throw "Could not read the outbox size from WSL (see the warning above), so the queue may not be drained. Staying in travel mode. Retry, or use -Force to flip anyway and replay later." }
+          if ($null -eq $n) {
+              Write-Host "    -Force: outbox size unknown; flipping without replay, the outbox stays queued" -ForegroundColor Yellow
+          } elseif ($n -gt 0) {
               Write-Host "    replaying $n queued memories to the authority"
               & "$PSScriptRoot\replay-outbox.ps1" -Authority $Authority -Distro $Distro
           } else {

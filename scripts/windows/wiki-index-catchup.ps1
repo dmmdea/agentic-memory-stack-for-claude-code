@@ -99,6 +99,19 @@ function Start-DetachedProcess {
     if ($proc) { $proc.Dispose() }
 }
 
+function Get-WikiRefreshLogPath {
+    # Where the detached refresh writes its output and its exit status (next to the other logs). The
+    # directory is made and a log past 512 KB is set aside as <name>.old (one generation), so it stays bounded.
+    $p = Join-Path $script:LogDir 'wiki-index-refresh.log'
+    try {
+        New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null
+        if ((Test-Path -LiteralPath $p) -and (Get-Item -LiteralPath $p).Length -gt 512KB) {
+            Move-Item -LiteralPath $p -Destination "$p.old" -Force
+        }
+    } catch {}
+    return $p
+}
+
 function Start-WikiRefresh {
     # Launch the deployed refresh driver, hidden and detached. $true when it was started.
     param([Parameter(Mandatory)][string]$VaultDir, [Parameter(Mandatory)][string]$ScriptDir)
@@ -119,8 +132,19 @@ function Start-WikiRefresh {
     }
     $envBlock = @{ WIKI_VAULT = $VaultDir }
     if ($script:Mem0WslDistro) { $envBlock['WSL_DISTRO'] = $script:Mem0WslDistro }
+    # The child gets no console, so it has no usable stdout: a shell script whose inherited stdout is
+    # closed dies at its first echo, and nothing recorded how it ended. A wrapper shell binds stdin to
+    # /dev/null and stdout+stderr to the log BEFORE the driver runs, then appends the driver's exit
+    # status. The wrapper line holds no double quote or backslash, so it passes through the Windows
+    # command line unchanged; paths are single-quoted with any embedded quote escaped.
+    $logPath = Get-WikiRefreshLogPath
+    $sq = { param([string]$p) "'" + (($p -replace '\\', '/') -replace "'", "'\''") + "'" }
+    $wrapper = 'exec </dev/null >>' + (& $sq $logPath) + ' 2>&1; ' +
+        'echo START wiki-index-refresh.sh at $(date +%FT%T); ' +
+        'bash ' + (& $sq $driver) + '; rc=$?; ' +
+        'echo EXIT wiki-index-refresh.sh status=$rc at $(date +%FT%T); exit $rc'
     try {
-        Start-DetachedProcess -FilePath $bash -ArgumentList ('"' + ($driver -replace '\\', '/') + '"') -Environment $envBlock
+        Start-DetachedProcess -FilePath $bash -ArgumentList ('-c "' + $wrapper + '"') -Environment $envBlock
     } catch {
         Write-MemoryLog -Component 'wiki-index-catchup' -Message "refresh could not be started (non-fatal): $_"
         return $false
@@ -161,7 +185,7 @@ function Invoke-WikiCatchup {
         $stamp = Join-Path $script:StateDir 'last-wiki-refresh'
         $reason = Get-WikiRefreshReason -FreshAgeH $ageH -VaultDir $vault -StampPath $stamp
         if (-not $reason) { return }
-        Write-MemoryLog -Component 'wiki-index-catchup' -Message "refresh due ($reason); starting wiki-index-refresh.sh"
+        Write-MemoryLog -Component 'wiki-index-catchup' -Message "refresh due ($reason); starting wiki-index-refresh.sh (its output and exit status: $(Join-Path $script:LogDir 'wiki-index-refresh.log'))"
         if (Start-WikiRefresh -VaultDir $vault -ScriptDir $ScriptDir) {
             Mark-Throttle -Name 'wiki-catchup'
         }

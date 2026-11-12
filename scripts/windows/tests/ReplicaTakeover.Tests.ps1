@@ -199,6 +199,19 @@ Describe 'offline-watcher.ps1: the tick, run end to end' {
         $r.State.consecutive_down | Should -Be 1
         $r.State.mode | Should -Be 'online' -Because 'one miss is a blip, not a takeover'
     }
+    It 'with no resolvable authority it stops before the probe and leaves the state file untouched' {
+        # A busy wsl.exe made the watcher fall onto a placeholder host that resolves to nothing; three such
+        # ticks put the box offline while the authority was up. "Cannot tell" must change nothing.
+        $h = script:New-TickProfile
+        $state = Join-Path $h '.claude\state\offline-mode.json'
+        Set-Content -LiteralPath $state -Value '{"mode":"online","consecutive_down":2,"consecutive_up":0,"transition":"none"}'
+        $before = (Get-FileHash -LiteralPath $state).Hash
+        $probed = Join-Path $h 'probed.txt'
+        & pwsh -NoProfile -Command "`$env:USERPROFILE = '$h'; `$env:MEM0_URL = ''; `$env:MEM0_WSL_DISTRO = 'no-such-distro-for-tests'; function Invoke-RestMethod { Add-Content -LiteralPath '$probed' -Value 'probed' }; & '$($script:watcherPs1)' *>`$null" 2>&1 | Out-Null
+        Test-Path $probed | Should -BeFalse -Because 'no authority means no probe'
+        (Get-FileHash -LiteralPath $state).Hash | Should -Be $before
+        (Get-Content -Raw (Join-Path $h '.claude\state\offline-watcher.log')) | Should -Match 'authority unresolved'
+    }
 }
 
 Describe 'offline-watcher.ps1: the tick wires the decisions in' {
