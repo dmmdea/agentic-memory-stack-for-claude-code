@@ -15,6 +15,9 @@ in the first entries below — full pre-inversion history lives in the maintaine
   on every list tool. A changed item carries redacted: true and counts in checks.read_redactions_today.
   Without the flag a list read is what it was, so the maintenance jobs that compare or rewrite stored text
   are unaffected. The by-id reads stay unmasked on purpose: an edit starts from one.
+- The masked reads of episodes and open questions (search, list and the bundle) missed four text
+  fields: an episode row's open_questions, advanced_goals and blocked_goals columns, which hold text the
+  extractor wrote, and an open question's topic. They are masked now.
 
 ## 1.41.1 — only conversation turns reach the extractor, and a first extraction reads from the start (2026-11-12)
 
