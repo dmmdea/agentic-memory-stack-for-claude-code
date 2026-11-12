@@ -362,7 +362,7 @@ Describe 'W3 alarm-mouths guards stay wired (audit 2026-08-07: AMS-05/06/08)' {
         $m = [regex]::Match($script:dreamCode, '@\{ query = ''([^'']*)''; filters = @\{ tier = ''canonical''')
         $m.Success | Should -BeTrue -Because 'the canonical fetch body must exist'
         $m.Groups[1].Value.Trim() | Should -Not -BeNullOrEmpty -Because 'mem0 2.1.0 rejects an empty query'
-        $script:dreamCode | Should -Match 'user_id = \$DcWslUser \}; limit = 500; threshold = 0\.0 \}' -Because 'no canonical may be dropped by its cosine, and 500 is the server cap on one search'
+        $script:dreamCode | Should -Match 'user_id = \$DcWslUser \}; limit = 500; threshold = 0\.0; raw = \$true \}' -Because 'no canonical may be dropped by its cosine, 500 is the server cap on one search, and the dedup compares the stored text, not the masked one'
         $script:dreamCode | Should -Match 'canonicalFacts\.Count -ge 500' -Because 'a full page may hide canonicals and is logged'
     }
 
