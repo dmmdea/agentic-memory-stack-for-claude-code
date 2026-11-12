@@ -120,3 +120,21 @@ def test_find_credentials_reports_rule_key_and_value_without_the_label():
     assert redact.find_credentials("nothing secret here") == []
     assert redact.find_credentials(None) == [] and redact.find_credentials("") == []
     assert set(redact.count_redactions(text)) == {k for k, _ in found}
+
+
+def test_read_path_masking_flags_credential_items_and_leaves_clean_ones_untouched():
+    """Security contract: the memories search/bundle hand to a model come back masked and flagged when
+    they hold a credential-shaped span; an item without one is the same object, unflagged; the input is
+    never mutated (a by-id read followed by a PUT must still see the stored text)."""
+    secret = "sk-" + "ABCD1234567890efghIJ"
+    dirty = {"id": "a", "memory": "deploy key is " + secret + " ok", "score": 0.9}
+    clean = {"id": "b", "memory": "the brain box runs the memory service", "score": 0.5}
+    items = [dirty, clean]
+    out, n = redact.mask_memory_items(items)
+    assert n == 1
+    assert secret not in out[0]["memory"] and out[0]["redacted"] is True
+    assert out[0]["id"] == "a" and out[0]["score"] == 0.9
+    assert out[1] is clean and "redacted" not in out[1]
+    assert secret in dirty["memory"] and "redacted" not in dirty      # input untouched
+    snip, n2 = redact.mask_memory_items([{"snippet": "token: " + secret}], key="snippet")
+    assert n2 == 1 and secret not in snip[0]["snippet"]

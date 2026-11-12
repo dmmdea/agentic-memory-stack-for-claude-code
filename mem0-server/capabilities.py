@@ -178,7 +178,9 @@ CAPABILITIES = [
     {"id": "l1a-extraction",
      "what": "hook-fired L1a memory extractor",
      "probe": ("job_liveness.l1a_attempt_age_h vs l1a_success_age_h "
-               "(two-signal, F12: convicts only attempt-fresh + success-stale >96h; capped at degraded)"),
+               "(two-signal, F12: convicts only attempt-fresh + success-stale >96h; capped at degraded); "
+               "with neither PC-side stamp (a native authority) checks.capture, the episodic store's "
+               "capture state (ok -> alive, stalled -> degraded, else unknown)"),
      "required": "brain", "escalation_documented": True},
     {"id": "sessionstart-banner",
      "what": "SessionStart resume/context banner",
@@ -506,7 +508,19 @@ def _reranker_state(check, now_s=None):
     return "alive"
 
 
-def _l1a_state(jl):
+def _capture_verdict(capture):
+    """The server-side twin of the two-signal rule, for a box that holds no PC-side stamps (a native
+    authority): maintenance_health.capture_state read from the episodic store. ok -> alive, stalled ->
+    degraded (never dead: the F12 cap), quiet / unknown / anything unreadable -> unknown."""
+    state = capture.get("state") if isinstance(capture, dict) else None
+    if state == "ok":
+        return "alive"
+    if state == "stalled":
+        return "degraded"
+    return "unknown"
+
+
+def _l1a_state(jl, capture=None):
     """Two-signal extractor verdict (review F12, BLOCKER).
 
     ``last-l1a`` stamps ONLY on a successful extraction and ``last-sessionstart-
@@ -523,7 +537,9 @@ def _l1a_state(jl):
     attempt = jl.get("l1a_attempt_age_h")
     success = jl.get("l1a_success_age_h")
     if attempt is None and success is None:
-        return "unknown"                      # zero signal
+        # Zero PC-side signal: a native authority never holds the PC's stamps, so the verdict
+        # comes from the episodic store's capture block (checks.capture) when there is one.
+        return _capture_verdict(capture)
     if _fresh(success):
         return "alive"                        # a real extraction landed recently
     if success is None:
@@ -682,7 +698,7 @@ def _state_for(row, checks, stack_version=None, now_s=None):
     if cid == "reranker":
         return _reranker_state(checks.get("reranker"), now_s)
     if cid == "l1a-extraction":
-        return _l1a_state(jl)
+        return _l1a_state(jl, checks.get("capture"))
     if cid == "sessionstart-banner":
         return _sessionstart_banner_state(jl)
     if cid == "mcp-shim":

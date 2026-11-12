@@ -1,4 +1,4 @@
-"""Server-side secret redaction for STORED text.
+"""Server-side secret redaction for STORED text, and for memory text handed to a model on read.
 
 Strip credential-shaped substrings before they land in a persistent, queryable store. Applied at
 the checkpoint chokepoint (_checkpoint_core) so prompt_text from BOTH /v1/episodes/checkpoint and
@@ -161,6 +161,50 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def mask_memory_items(items, key="memory") -> tuple:
+    """Read-path masking: `(new_items, n_masked)`. `key` is one field name or a sequence of them; each
+    named text field of an item goes through `redact_secrets`. An item with a changed field comes back as
+    a COPY carrying the masked text and `"redacted": True`; an item without a credential-shaped span is
+    returned as the same object, untouched. The input list and its items are never mutated. For the HTTP
+    handlers that hand stored text to a model by query (memory search, the context bundle, episode and
+    open-question search); in-process callers, GET by id, list and every write response stay raw on
+    purpose (an update is a read by id followed by a PUT: masked text would overwrite the original)."""
+    keys = (key,) if isinstance(key, str) else tuple(key)
+    out: list = []
+    n = 0
+    for item in items or []:
+        if isinstance(item, dict):
+            changed = {}
+            for k in keys:
+                text = item.get(k)
+                if isinstance(text, str) and text:
+                    masked = redact_secrets(text)
+                    if masked != text:
+                        changed[k] = masked
+            if changed:
+                item = {**item, **changed, "redacted": True}
+                n += 1
+        out.append(item)
+    return out, n
+
+
+# The placeholders redact_secrets writes: [REDACTED] and [REDACTED_<KIND>].
+REDACTION_MARKER_RE = re.compile(r"\[REDACTED(?:_[A-Z0-9_]+)?\]")
+
+
+def introduces_redaction_marker(new_text: Optional[str], stored_text: Optional[str]) -> bool:
+    """True when applying `new_text` would replace a stored credential-shaped span with a redaction
+    placeholder: `new_text` carries a placeholder, and `stored_text` carries none but holds a span
+    `redact_secrets` would mask. That is the shape of an edit built from a masked search result. A
+    stored text with nothing to mask, one that already carries a placeholder, or a missing record is
+    never flagged, so a memory that only talks about redaction updates normally."""
+    if not isinstance(new_text, str) or not REDACTION_MARKER_RE.search(new_text):
+        return False
+    if not isinstance(stored_text, str) or REDACTION_MARKER_RE.search(stored_text):
+        return False
+    return redact_secrets(stored_text) != stored_text
 
 
 def count_redactions(text: Optional[str]) -> dict:

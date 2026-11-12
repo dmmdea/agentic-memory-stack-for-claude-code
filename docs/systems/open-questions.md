@@ -45,7 +45,7 @@ FTS5 virtual table `open_questions_fts` indexes `question_text` + `topic` using 
 Every `POST /v1/episodes` that includes a non-empty `open_questions` list triggers a promotion step:
 
 1. For each question string, `find_open_question_by_text_fuzzy()` runs an FTS5 match.
-2. If a match exists with `status='open'` (same brand): skip — already tracked.
+2. If a match exists with `status='open'` (same brand): skip — already tracked — but refresh that row's `updated_at` (`touch_open_question()`, status untouched), so the 30-day abandonment sweep below counts from the last sighting and a question that keeps coming back is not retired 30 days after its first one.
 3. If no match: `create_open_question()` inserts a new row with `commit=False` so it's part of the atomic episode POST transaction. On rollback, no orphan row is created.
 
 This means every session that Codex extracts open questions from automatically populates the global registry, with deduplication preventing accumulation.
