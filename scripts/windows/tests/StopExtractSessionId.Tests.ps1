@@ -116,7 +116,10 @@ Describe 'l1a-extract.ps1 keys the episode on the session the spawner passed' {
     }
     It 'posts the resolved session id, not one derived from the snapshot file name' {
         $script:l1a | Should -Match 'session_id\s*=\s*\$episodeSessionId'
-        $script:l1a | Should -Match 'Resolve-L1aSessionId\s+-SessionId\s+\$SessionId\s+-TranscriptPath\s+\$TranscriptPath'
+        # 1.41: the window function takes the hook's id as -EpisodeSessionHint (the primary run passes -SessionId, a
+        # catch-up passes none) and the path it reads as -ReadPath; the snapshot-name rule itself is unchanged.
+        $script:l1a | Should -Match 'Resolve-L1aSessionId\s+-SessionId\s+\$EpisodeSessionHint\s+-TranscriptPath\s+\$ReadPath'
+        $script:l1a | Should -Match '-EpisodeSessionHint\s+\$SessionId\b'
         $script:l1a | Should -Not -Match "GetFileNameWithoutExtension\(\`$TranscriptPath\)"
     }
     It 'reads brand and workspace from the original transcript when a snapshot was analysed' {

@@ -719,3 +719,42 @@ Describe 'Invoke-LogRotation rotates live logs only (never re-rotates its own ar
         Test-Path -LiteralPath (Join-Path $script:LogDir 'user-prompt-extract.log') | Should -BeTrue
     }
 }
+
+
+Describe 'Get-TranscriptWindowSince walks a long gap forward, in order (L1a cursor)' {
+    # The old reader took the LAST 24 records of the gap and the cursor then jumped to the end of the
+    # file, so everything before that tail was never extracted. Here the text past the cursor is more
+    # than three budgets: successive windows must return every turn once, in order, each window must
+    # end on a record boundary, and a trailing partial line must never be consumed.
+    It 'returns every turn exactly once across successive windows, ending on record boundaries' {
+        $f = Join-Path $TestDrive 'forward.jsonl'
+        $lines = New-Object System.Collections.Generic.List[string]
+        for ($i = 1; $i -le 30; $i++) {
+            $role = if ($i % 2) { 'user' } else { 'assistant' }
+            $lines.Add('{"message":{"role":"' + $role + '","content":"TURN-' + ('{0:D3}' -f $i) + ' ' + ('word ' * 300) + '"}}')
+            $lines.Add('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"tool output ' + ('z' * 500) + '"}]}}')
+        }
+        $complete = [System.Text.Encoding]::UTF8.GetBytes((($lines -join "`n") + "`n"))
+        $partial = [System.Text.Encoding]::UTF8.GetBytes('{"message":{"role":"user","content":"TURN-999 half a rec')
+        [System.IO.File]::WriteAllBytes($f, [byte[]]($complete + $partial))
+
+        $cursor = 0L
+        $seen = @()
+        for ($w = 0; $w -lt 40; $w++) {
+            $r = Get-TranscriptWindowSince -TranscriptPath $f -SinceBytes $cursor -MaxChars 4000
+            $r | Should -Not -BeNullOrEmpty
+            $r.ConsumedTo | Should -BeLessOrEqual $complete.Length -Because 'the partial last line is never consumed'
+            if ($r.ConsumedTo -le $cursor) { break }
+            $complete[[int]$r.ConsumedTo - 1] | Should -Be 10 -Because 'a window ends just past a newline'
+            if ($r.Text) {
+                $r.Text.Length | Should -BeLessOrEqual 4000
+                $seen += @([regex]::Matches($r.Text, 'TURN-\d{3}') | ForEach-Object { $_.Value })
+            }
+            $cursor = $r.ConsumedTo
+        }
+        $cursor | Should -Be $complete.Length
+        $seen.Count | Should -Be 30 -Because 'no turn is skipped and none repeats'
+        $seen | Should -Be @(1..30 | ForEach-Object { 'TURN-' + ('{0:D3}' -f $_) })
+        $w | Should -BeGreaterThan 3 -Because 'the gap holds several budgets of text'
+    }
+}

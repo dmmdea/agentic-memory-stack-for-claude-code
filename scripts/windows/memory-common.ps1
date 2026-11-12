@@ -1485,9 +1485,12 @@ function Acquire-CodexLock {
     # hold (the dream's worst case is ~29 min) was previously stealable mid-call.
     param(
         [Parameter(Mandatory)][string]$Owner,    # 'l1a' | 'c1' | 'dream'
-        [int]$MaxAgeMinutes = 30
+        [int]$MaxAgeMinutes = 30,
+        # The shared Codex mutex by default. The L1a extractor names a per-session lock file here on the
+        # Claude API provider, whose reason for the shared one (one subscription's quota) does not apply.
+        [string]$LockName = 'codex.lock'
     )
-    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' 'codex.lock'))
+    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' $LockName))
     $lockDir = Split-Path -Parent $lockFile
     if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Path $lockDir -Force | Out-Null }
     $contents = "$Owner $((Get-Date).ToString('o')) pid=$PID"
@@ -1552,21 +1555,23 @@ function Acquire-CodexLockWithWait {
         [Parameter(Mandatory)][string]$Owner,
         [int]$WaitSeconds = 20,
         [int]$PollSeconds = 2,
-        [scriptblock]$Sleep = { param($s) Start-Sleep -Seconds $s }
+        [scriptblock]$Sleep = { param($s) Start-Sleep -Seconds $s },
+        [string]$LockName = 'codex.lock'
     )
-    if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = 0 } }
+    if (Acquire-CodexLock -Owner $Owner -LockName $LockName) { return @{ acquired = $true; waited = 0 } }
     $waited = 0
     while ($waited -lt $WaitSeconds) {
         $step = [Math]::Min($PollSeconds, $WaitSeconds - $waited)
         & $Sleep $step
         $waited += $step
-        if (Acquire-CodexLock -Owner $Owner) { return @{ acquired = $true; waited = $waited } }
+        if (Acquire-CodexLock -Owner $Owner -LockName $LockName) { return @{ acquired = $true; waited = $waited } }
     }
     return @{ acquired = $false; waited = $waited }
 }
 
 function Release-CodexLock {
-    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' 'codex.lock'))
+    param([string]$LockName = 'codex.lock')
+    $lockFile = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' (Join-Path 'state' $LockName))
     if (-not (Test-Path -LiteralPath $lockFile)) { return }
     try {
         $contents = Get-Content -LiteralPath $lockFile -Raw -ErrorAction Stop
@@ -1837,6 +1842,10 @@ function Get-RecentTranscriptTurns {
 # call / POST re-processes the same window next time. ANY uncertainty (no cursor, shrink/
 # rotation, empty since-window, or an error) falls back to Get-RecentTranscriptTurns — the
 # unchanged behaviour — so this can never LOSE an extraction, only skip redundant ones.
+# The cursor moves FORWARD: a window (Get-TranscriptWindowSince) takes the next 12,000 characters of text
+# past the cursor and the cursor becomes the window's ConsumedTo, so a gap longer than one window is walked
+# in order across windows and runs. A PreCompact run reads a snapshot (a byte-for-byte copy of the
+# transcript taken by stop-extract.ps1) but keys the cursor on the REAL transcript's file name.
 function Get-L1aCursorPath {
     param([Parameter(Mandatory)][string]$TranscriptPath)
     $name = [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
@@ -1872,61 +1881,130 @@ function Set-L1aCursor {
     } catch { }   # best-effort: a cursor-write failure just means the next run re-extracts (safe)
 }
 
-function Get-TranscriptTurnsSince {
-    # Like Get-RecentTranscriptTurns, but returns ONLY the turns appended after $SinceBytes.
-    # Returns $null when nothing new (or on any read/parse trouble) so the caller falls back.
+function Get-TranscriptRecordText {
+    # One JSONL record -> '[role] text', or $null when it carries no text. The same role/text
+    # extraction Get-RecentTranscriptTurns uses. A record that cannot hold text is dropped before
+    # ConvertFrom-Json, which is quadratic on a large line under Windows PowerShell 5.1: a tool result
+    # (a string content inside a block array) is most of a transcript's bytes and never text.
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    if ($Line -notmatch '"type"\s*:\s*"text"|"role"\s*:\s*"[A-Za-z_]+"\s*,\s*"content"\s*:\s*"') { return $null }
+    try {
+        $obj = $Line | ConvertFrom-Json
+        $role = $obj.message.role
+        $content = $obj.message.content
+        if (-not $role -or -not $content) { return $null }
+        $text = if ($content -is [string]) {
+            $content
+        } else {
+            ($content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n"
+        }
+        if ($text) { return "[$role] $text" }
+    } catch { }
+    return $null
+}
+
+function Get-TranscriptWindowSince {
+    # The forward window: read record by record from $SinceBytes, collect text turns until the next one
+    # would push the joined text past $MaxChars, and report how far the scan got. The caller sets its
+    # cursor to ConsumedTo, so the next window starts exactly where this one stopped and a long gap is
+    # walked in order, window after window, instead of being sampled from its tail.
+    #   - ConsumedTo is always a record boundary (just past a newline) and never beyond the length seen
+    #     at open; a trailing partial line (a write in flight, or a snapshot cut mid-line) is never consumed.
+    #   - A record with no text costs nothing against the budget. A window that scans $MaxScanBytes
+    #     without finding text still returns its ConsumedTo, so a tool-only stretch is passed.
+    #   - A turn larger than the budget is included alone, truncated (its tail is kept, as the tail read
+    #     always did) and consumed, so a window can never stall on it. A record over 256 KB of text is
+    #     skipped unparsed (the pathological-giant-line guard); it is consumed too.
+    # Returns @{ Text; ConsumedTo; Length; Turns }; Text is $null when the window holds no text. Returns
+    # $null on a read error so the caller falls back to the tail read.
     param(
         [Parameter(Mandatory)][string]$TranscriptPath,
         [Parameter(Mandatory)][long]$SinceBytes,
-        [int]$MaxTurns = 24,
-        [int]$MaxChars = 12000
+        [int]$MaxChars = 12000,
+        [long]$MaxScanBytes = 16777216
     )
-    if (-not (Test-Path $TranscriptPath)) { return $null }
-    $tailBytes      = 524288    # same 512 KB bound as Get-RecentTranscriptTurns (pathological-line guard)
     $maxRecordChars = 262144
-    $raw = $null
-    $droppedPartial = $false
+    $maxRecordBytes = 1048576    # no record of <= 262144 chars is longer than this in UTF-8 (4 bytes a char at most)
+    $fs = $null
     try {
         $fs = [System.IO.File]::Open($TranscriptPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        try {
-            $len = $fs.Length
-            if ($SinceBytes -ge $len) { return $null }   # nothing appended since the cursor
-            $start = $SinceBytes
-            if (($len - $start) -gt $tailBytes) { $start = $len - $tailBytes; $droppedPartial = $true }  # huge gap: bound + drop first partial
-            [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
-            $count = [int]($len - $start)
-            $buf = New-Object byte[] $count
-            $read = $fs.Read($buf, 0, $count)
-            $raw = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
-        } finally { $fs.Dispose() }
     } catch { return $null }
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-    $records = $raw -split "`n"
-    # Only when we re-bounded past the cursor is the first fragment a partial mid-line record.
-    # At a clean cursor boundary (a prior file length) the first record is whole — keep it.
-    if ($droppedPartial -and $records.Count -gt 1) { $records = $records[1..($records.Count - 1)] }
-    $turns = @()
-    foreach ($line in ($records | Select-Object -Last $MaxTurns)) {
-        $line = $line.TrimEnd("`r")
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line.Length -gt $maxRecordChars) { continue }
-        try {
-            $obj = $line | ConvertFrom-Json
-            $role = $obj.message.role
-            $content = $obj.message.content
-            if (-not $role -or -not $content) { continue }
-            $text = if ($content -is [string]) {
-                $content
-            } else {
-                ($content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n"
+    try {
+        $len = [long]$fs.Length
+        if ($SinceBytes -lt 0) { $SinceBytes = 0 }
+        if ($SinceBytes -ge $len) {
+            return [pscustomobject]@{ Text = $null; ConsumedTo = [long][Math]::Min($SinceBytes, $len); Length = $len; Turns = 0 }
+        }
+        [void]$fs.Seek($SinceBytes, [System.IO.SeekOrigin]::Begin)
+        $limit = $SinceBytes + $MaxScanBytes
+        $utf8 = [System.Text.Encoding]::UTF8
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)   # one char per byte: a newline's index in the string is its index in the buffer
+        $buf = New-Object byte[] 1048576
+        $carry = New-Object System.IO.MemoryStream
+        $skipping = $false
+        $turns = New-Object System.Collections.Generic.List[string]
+        $joinedLen = 0
+        $consumed = [long]$SinceBytes
+        $filePos = [long]$SinceBytes
+        $done = $false
+        while (-not $done -and $filePos -lt $len) {
+            $want = [int][Math]::Min([long]$buf.Length, $len - $filePos)
+            $n = $fs.Read($buf, 0, $want)
+            if ($n -le 0) { break }
+            $chunkAbs = $filePos
+            $filePos += $n
+            $s = $latin1.GetString($buf, 0, $n)
+            $i = 0
+            while ($i -lt $n) {
+                $j = $s.IndexOf([char]10, $i)
+                if ($j -lt 0) {
+                    # No newline in the rest of this chunk: the record goes on, or it is a partial tail.
+                    if (-not $skipping) {
+                        if (($carry.Length + ($n - $i)) -gt $maxRecordBytes) { $skipping = $true; $carry.SetLength(0) }
+                        else { $carry.Write($buf, $i, $n - $i) }
+                    }
+                    break
+                }
+                $recEnd = $chunkAbs + $j + 1
+                $rec = $null
+                if (-not $skipping) {
+                    $lineLen = $j - $i
+                    if (($carry.Length + $lineLen) -le $maxRecordBytes) {
+                        $line = $null
+                        if ($carry.Length -gt 0) {
+                            $carry.Write($buf, $i, $lineLen)
+                            $line = $utf8.GetString($carry.GetBuffer(), 0, [int]$carry.Length)
+                        } else {
+                            $line = $utf8.GetString($buf, $i, $lineLen)
+                        }
+                        $line = $line.TrimEnd("`r")
+                        if ($line.Length -le $maxRecordChars) { $rec = Get-TranscriptRecordText -Line $line }
+                    }
+                }
+                $carry.SetLength(0)
+                $skipping = $false
+                if ($null -ne $rec) {
+                    $cost = $rec.Length
+                    if ($turns.Count -gt 0) { $cost += 2 }   # the "`n`n" between turns
+                    if ($turns.Count -gt 0 -and ($joinedLen + $cost) -gt $MaxChars) { $done = $true; break }   # this record opens the next window
+                    [void]$turns.Add($rec)
+                    $joinedLen += $cost
+                }
+                $consumed = $recEnd
+                $i = $j + 1
+                if ($recEnd -ge $limit) { $done = $true; break }
             }
-            if ($text) { $turns += "[$role] $text" }
-        } catch { }
-    }
-    if ($turns.Count -eq 0) { return $null }
-    $joined = Redact-Secrets ($turns -join "`n`n")
-    if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
-    return $joined
+        }
+        $text = $null
+        if ($turns.Count -gt 0) {
+            # Redact on the FULL joined text before truncating, as the tail read does.
+            $joined = Redact-Secrets ($turns -join "`n`n")
+            if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
+            $text = $joined
+        }
+        return [pscustomobject]@{ Text = $text; ConsumedTo = [long]$consumed; Length = $len; Turns = $turns.Count }
+    } catch { return $null } finally { $fs.Dispose() }
 }
 
 function Resolve-L1aSessionId {
@@ -1942,4 +2020,122 @@ function Resolve-L1aSessionId {
         if ($fname) { return $fname }
     }
     return [System.Guid]::NewGuid().ToString()
+}
+
+# ---------------------------------------------------------------------------
+# L1a capture scope. Who gates and serializes an extraction depends on who does the LLM work.
+# On the Codex provider one ChatGPT subscription's quota is shared by every job on the box, so the
+# gate is box-wide (one successful extraction per 10 min) and the lock is the shared Codex mutex.
+# On the Claude API there is no shared quota (about 0.0006 USD a call), so the gate is per session
+# (a stamp named for the session, 90 s) and the lock is per session: two sessions never wait on each
+# other, two events of one session never extract the same window twice. The box-wide last-l1a stamp is
+# still written on every success (the health rows read it) but no longer gates the Claude API provider.
+# AMS_L1A_THROTTLE_SCOPE=box forces the box-wide gate on any provider.
+function Get-L1aProvider {
+    # 'anthropic' or 'codex', the box's judge setting. Any trouble reading it reads as the default, codex.
+    try { return ([string](Get-AmsJudgeSettings).Provider) } catch { return 'codex' }
+}
+
+function Get-L1aThrottleScope {
+    param([string]$Provider)
+    if (([string]$env:AMS_L1A_THROTTLE_SCOPE).Trim().ToLowerInvariant() -eq 'box') { return 'box' }
+    if ($Provider -eq 'anthropic') { return 'session' }
+    return 'box'
+}
+
+function Get-L1aThrottleSeconds {
+    # Box scope is always the 10 minutes of the Codex quota. The per-session interval is 90 s;
+    # AMS_L1A_THROTTLE_SECONDS (10..3600) overrides it, and a value outside that range is ignored.
+    param([string]$Scope)
+    if ($Scope -ne 'session') { return 600 }
+    $n = 0
+    if ([int]::TryParse(([string]$env:AMS_L1A_THROTTLE_SECONDS).Trim(), [ref]$n) -and $n -ge 10 -and $n -le 3600) { return $n }
+    return 90
+}
+
+function Get-L1aMaxWindows {
+    # Windows one run may process: 3 on the Claude API, 1 on Codex (each window is a Codex call against the
+    # shared quota). AMS_L1A_MAX_WINDOWS (1..5) overrides either.
+    param([string]$Provider)
+    $n = 0
+    if ([int]::TryParse(([string]$env:AMS_L1A_MAX_WINDOWS).Trim(), [ref]$n) -and $n -ge 1 -and $n -le 5) { return $n }
+    if ($Provider -eq 'anthropic') { return 3 }
+    return 1
+}
+
+function Get-L1aSessionKey {
+    # A session id as a safe file-name component (the same rule the cursor file name uses).
+    param([string]$SessionId)
+    $safe = ([string]$SessionId -replace '[^0-9A-Za-z_\-]', '_')
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'unknown' }
+    if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 80) }
+    return $safe
+}
+
+function Test-L1aThrottle {
+    # $true when an extraction may run. Box scope reads the box-wide last-l1a stamp, session scope the
+    # session's own (last-l1a-session-<key>). Pure check, like Test-Throttle.
+    param([string]$Scope, [string]$SessionKey, [int]$Seconds)
+    if ($Scope -eq 'session') { return (Test-Throttle -Name ('l1a-session-' + $SessionKey) -MinIntervalSeconds $Seconds) }
+    return (Test-Throttle -Name 'l1a' -MinIntervalSeconds $Seconds)
+}
+
+function Mark-L1aThrottle {
+    # Stamp a successful extraction. The box-wide stamp is written whatever the scope (the health and
+    # verifier rows read it); a session scope also stamps the session.
+    param([string]$Scope, [string]$SessionKey)
+    Mark-Throttle -Name 'l1a'
+    if ($Scope -eq 'session') { Mark-Throttle -Name ('l1a-session-' + $SessionKey) }
+}
+
+function Remove-L1aOldState {
+    # One cheap pass per run: per-session stamps and lock files, and the cursor files an older release
+    # keyed on a PreCompact snapshot's file name (precompact-snap-<PID>, never read again), once they are
+    # older than $MaxAgeDays. Best-effort.
+    param([int]$MaxAgeDays = 7)
+    try {
+        if (-not (Test-Path -LiteralPath $script:StateDir)) { return }
+        $cut = (Get-Date).AddDays(-$MaxAgeDays)
+        foreach ($pat in @('last-l1a-session-*', 'l1a-session-*.lock', 'l1a-cursor-precompact-snap-*')) {
+            Get-ChildItem -LiteralPath $script:StateDir -Filter $pat -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cut } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Get-L1aCatchupCandidates {
+    # Up to $Max transcripts under $ProjectsRoot (two levels, no -Recurse) that the extractor has seen
+    # (they have a cursor), that have bytes past it, and that were last written between $MinAgeMinutes and
+    # $MaxAgeDays ago, most recent first. A session written to within $MinAgeMinutes may still be live.
+    # $ExcludeNames are transcript base names (the session ids) to leave out; a transcript listed twice
+    # through a directory alias counts once.
+    param(
+        [Parameter(Mandatory)][string]$ProjectsRoot,
+        [string[]]$ExcludeNames = @(),
+        [int]$Max = 2,
+        [int]$MinAgeMinutes = 15,
+        [int]$MaxAgeDays = 7
+    )
+    $found = @()
+    try {
+        if (-not (Test-Path -LiteralPath $ProjectsRoot)) { return @() }
+        $newest = (Get-Date).AddMinutes(-$MinAgeMinutes)
+        $oldest = (Get-Date).AddDays(-$MaxAgeDays)
+        $seen = @{}
+        foreach ($n in $ExcludeNames) { if ($n) { $seen[[string]$n] = $true } }
+        $files = @(Get-ChildItem -Path (Join-Path $ProjectsRoot (Join-Path '*' '*.jsonl')) -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -le $newest -and $_.LastWriteTime -ge $oldest } |
+            Sort-Object -Property @{ Expression = { $_.LastWriteTimeUtc.Ticks }; Descending = $true }, @{ Expression = { $_.FullName } })
+        foreach ($f in $files) {
+            if ($seen.ContainsKey($f.BaseName)) { continue }
+            $c = Get-L1aCursor -TranscriptPath $f.FullName
+            if ($c -gt 0 -and $f.Length -gt $c) {
+                $seen[$f.BaseName] = $true
+                $found += $f
+                if ($found.Count -ge $Max) { break }
+            }
+        }
+    } catch { }
+    return @($found)
 }
