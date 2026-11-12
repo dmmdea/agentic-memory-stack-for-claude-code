@@ -386,10 +386,14 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
     # TOP of storage-cap-check.sh, ahead of its cold-server gate, so the stamp
     # proves the HOOK FIRED even on a morning when the server was still starting
     # and every server-dependent section was skipped.
+    # The stamp is written by a PC-side hook, so on a native authority (no interactive sessions) it
+    # can never exist: the missing-stamp note is then not an error, same as the native-gated notes below.
+    host_kind = ((environ or os.environ).get("MEM0_HOST_KIND")
+                 or senv.get("MEM0_HOST_KIND") or "").strip().lower()
     try:
         out["sessionstart_banner_age_h"] = _epoch_stamp_age(
             mem0_dir / "last-sessionstart-banner", now_s)
-        if out["sessionstart_banner_age_h"] is None:
+        if out["sessionstart_banner_age_h"] is None and host_kind != "native":
             notes.append("sessionstart_banner: missing/unparseable")
     except OSError as e:
         notes.append(f"sessionstart_banner: {e.__class__.__name__}")
@@ -464,8 +468,7 @@ def job_liveness_health(mem0_dir=None, win_home=None, now_s=None,
     # markers live under ~/.mem0/maintenance (ams_env.state_dir()) and are read in the native
     # block below. Reporting "MEM0_WIN_USER unset" there was a false note, and the nulls it left
     # made capabilities call a chain that ran 16/16 the same night "unknown".
-    host_kind = ((environ or os.environ).get("MEM0_HOST_KIND")
-                 or senv.get("MEM0_HOST_KIND") or "").strip().lower()
+    # (host_kind is read above, ahead of the banner stamp.)
     if win_home is None and host_kind != "native":
         win_user = (environ or os.environ).get("MEM0_WIN_USER") or senv.get("MEM0_WIN_USER")
         if win_user:

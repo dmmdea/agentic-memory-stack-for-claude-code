@@ -34,7 +34,13 @@ def _run_with_fake_home(home: Path) -> str:
     return res.stdout
 
 
-def _write_summary(home: Path, stores, *, age_hours: float = 0.0, actionable: int = 0) -> None:
+def _zulu(hours_ago: float) -> str:
+    t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_summary(home: Path, stores, *, age_hours: float = 0.0, actionable: int = 0, extra=None) -> None:
+    """`extra` maps a workspace to fields merged into its row (lines, bytes, last_*_at)."""
     state = home / ".claude" / "state" / "automemory"
     state.mkdir(parents=True, exist_ok=True)
     gen = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=age_hours)
@@ -42,7 +48,7 @@ def _write_summary(home: Path, stores, *, age_hours: float = 0.0, actionable: in
         "generated_at": gen.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "stores": [{"workspace": w, "bytes": 1000, "lines": 10, "entries": 3, "files": 3,
                     "over_trigger": h is not None and h > 0, "skip_streak": 0, "last_status": "no-op",
-                    "over_trigger_hours": h} for w, h in stores],
+                    "over_trigger_hours": h, **((extra or {}).get(w) or {})} for w, h in stores],
         "findings": [],
         "counts": {"total": 0, "actionable": actionable},
         "last_receipt_age_hours": 0,
@@ -57,10 +63,25 @@ def test_quiet_line_below_24h(tmp_path):
     assert "ws-b" not in out and "ws-c" not in out, "stores at 0 or null are not listed"
 
 
-def test_alarm_line_at_or_above_24h_lists_worst_first(tmp_path):
-    _write_summary(tmp_path, [("ws-a", 4.7), ("ws-b", 31.5), ("ws-c", 24)])
+def test_alarm_line_states_the_measurements_and_the_last_decision(tmp_path):
+    """The clock is continuous time over the trigger; a judge that decided last night is not blamed."""
+    _write_summary(tmp_path, [("ws-a", 4.7), ("ws-b", 31.5), ("ws-c", 24)], extra={
+        "ws-b": {"lines": 183, "bytes": 17400, "last_status": "no-op",
+                 "last_status_at": _zulu(3.2), "last_decision_at": _zulu(3.2)}})
     out = _run_with_fake_home(tmp_path)
-    assert "AUTO-MEMORY G7 ALARM: over trigger without an applied decision for 31.5h (ws-b 31.5h, ws-c 24h, ws-a 4.7h)" in out
+    assert "AUTO-MEMORY G7 ALARM: ws-b has been over its trigger for 31.5h" in out
+    assert "(183 lines vs the 160-line trigger, 17400 B vs the 20000 B trigger)" in out
+    assert "last run no-op 3.2h ago, last decision 3.2h ago" in out
+    assert "(all: ws-b 31.5h, ws-c 24h, ws-a 4.7h)" in out
+    assert "has not decided" not in out, "a judge that decided inside 36h must not be blamed"
+
+
+def test_alarm_line_blames_the_chain_only_without_a_decision_in_36h(tmp_path):
+    _write_summary(tmp_path, [("ws-a", 50)], extra={
+        "ws-a": {"lines": 183, "bytes": 17400, "last_status": "skipped-live-session",
+                 "last_status_at": _zulu(2), "last_decision_at": _zulu(60)}})
+    out = _run_with_fake_home(tmp_path)
+    assert "no decision applied inside 36h - the hub judge has not decided; check the nightly chain" in out
 
 
 def test_silent_when_no_store_is_over_trigger(tmp_path):

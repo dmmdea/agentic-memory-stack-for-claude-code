@@ -33,7 +33,9 @@ and protected-set overflow. Hub-only.
                          A scratch or temp workspace (the store exclude rules) is not a
                          store: --candidates prints an empty offer set and an apply
                          reports excluded-scratch, exit 0, writing nothing
-  --dry-run              report what would be applied; write nothing, post nothing
+  --dry-run              report what would be applied, the line floor's moves included, and
+                         post nothing and change no store file; the receipt row is flagged
+                         dry_run (point --state-root at a scratch dir to keep it out of the real ledger)
   --max-migrations <n>   cap the migrations one plan may perform (default 5)
   --force                bypass the 20 h one-attempt-per-store window, and only that
   --hub                  assert the hub role before <state-root>/role is seeded
@@ -257,6 +259,9 @@ func runJudgeApply(env Env, args []string) int {
 			"mem0":         res.Mem0,
 			"mem0_orphan":  res.Mem0Orphan,
 		}
+		if f.dryRun {
+			out["planned"] = plannedJSON(res.Planned)
+		}
 		enc := json.NewEncoder(env.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(out); err != nil {
@@ -274,7 +279,33 @@ func runJudgeApply(env Env, args []string) int {
 	for _, o := range res.Mem0Orphan {
 		fmt.Fprintf(env.Stderr, "  orphan: %s\n", o)
 	}
+	if f.dryRun {
+		for _, p := range res.Planned {
+			switch {
+			case p.Verb == judge.VerbMigrate && p.Floor:
+				fmt.Fprintf(env.Stderr, "  would MIGRATE %s (line floor)\n", p.Slug)
+			case p.Verb == judge.VerbMigrate:
+				fmt.Fprintf(env.Stderr, "  would MIGRATE %s (judge)\n", p.Slug)
+			default:
+				fmt.Fprintf(env.Stderr, "  would %s %s -> %s\n", p.Verb, p.Slug, p.NewHook)
+			}
+		}
+	}
 	return ExitOK
+}
+
+// plannedJSON is the dry run's list of changes in machine form; never nil, so the key is
+// always an array.
+func plannedJSON(planned []judge.PlannedDecision) []map[string]any {
+	out := make([]map[string]any, 0, len(planned))
+	for _, p := range planned {
+		row := map[string]any{"slug": p.Slug, "verb": string(p.Verb), "line_floor": p.Floor}
+		if p.NewHook != "" {
+			row["new_hook"] = p.NewHook
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 // excludedWorkspace answers judge-apply for a scratch or temp workspace: nothing offered,
@@ -324,7 +355,13 @@ func runJudgeCandidates(env Env, roots store.Roots, dir, workspace string, asJSO
 	if asJSON {
 		enc := json.NewEncoder(env.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(map[string]any{"workspace": workspace, "shorten": cs.Shorten, "migrate": cs.Migrate}); err != nil {
+		// The store's own line count and the budget it is held to ride along so the judge's
+		// prompt can say how far over the line trigger the store is; the offer set alone
+		// cannot tell a store at 142 lines from one at 183.
+		if err := enc.Encode(map[string]any{
+			"workspace": workspace, "shorten": cs.Shorten, "migrate": cs.Migrate,
+			"lines": st.Index.LineCount(), "line_trigger": store.TriggerLines, "line_target": store.TargetLines,
+		}); err != nil {
 			fmt.Fprintf(env.Stderr, "ams-store judge-apply: %v\n", err)
 			return ExitUsage
 		}

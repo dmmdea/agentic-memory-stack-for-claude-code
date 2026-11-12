@@ -17,9 +17,10 @@
 #   an agent - can make them unrecoverable. Nothing here is ever the only copy.
 #
 # WHAT IT BACKS UP
-#   ~/.mem0/canonical-key   HMAC signing key for canonical promotion (irreplaceable:
-#                           losing it does not just block writes, it invalidates the
-#                           audit chain that existing canonical records were signed under)
+#   ~/.mem0/canonical-key   HMAC key that signs the short-lived user-direct tokens authorising
+#                           canonical/insight writes (no stored record is signed under it, so a
+#                           fresh key loses no data; but until one is in place those writes are
+#                           refused, and a backup saves minting and re-wiring a new one)
 #   ~/.mem0/api-key         mem0 server API key (re-issuable, but everything is wired to it)
 #   ~/.mem0/authority-url   which memory server this box talks to
 #   ~/.claude.json          NVIDIA_API_KEY lives here in plaintext (extracted, not the
@@ -38,8 +39,24 @@
 #   OFFSITE_WIN_DEST    optional: the Windows-side path of the offsite folder, used when
 #                       that volume is not mounted inside WSL
 #
-# Usage:  KEY_BACKUP_LOCAL=<dir> KEY_BACKUP_OFFSITE=<dir> key-backup.sh
+# REFUSES A BUNDLE WITHOUT THE KEYS
+#   The run fails (exit 4) and names what is missing when the canonical key or the API key was
+#   not collected: a bundle of only authority-url used to pass as "1 artifact, verified in 2
+#   destinations". --allow-partial backs up what exists anyway (the run says it is partial).
+#   On a native Linux authority (stack.env MEM0_HOST_KIND=native) the keys are systemd credentials,
+#   sealed to that host and not files, so this script cannot back them up at all: it says so and
+#   points to docs/systems/key-custody.md instead of reporting a green run holding no key.
+#
+# Usage:  KEY_BACKUP_LOCAL=<dir> KEY_BACKUP_OFFSITE=<dir> key-backup.sh [--allow-partial]
 set -euo pipefail
+
+ALLOW_PARTIAL=0
+for arg in "$@"; do
+    case "$arg" in
+        --allow-partial) ALLOW_PARTIAL=1 ;;
+        *) echo "ERROR: unknown argument '$arg' (only --allow-partial is accepted)" >&2; exit 64 ;;
+    esac
+done
 
 # MEM0_DIR lets this run from the Windows-side shell, which can see Windows drives that WSL
 # may not mount. Point it at the WSL share: //wsl.localhost/<distro>/home/<user>/.mem0
@@ -73,6 +90,27 @@ for f in canonical-key api-key authority-url; do
         log "  WARN: $MEM0/$f absent - not backed up"
     fi
 done
+
+# The two keys are what a bundle is for. Without --allow-partial a bundle missing either is a failure.
+missing=""
+[ -s "$bundle/canonical-key" ] || missing="canonical-key"
+[ -s "$bundle/api-key" ] || missing="${missing:+$missing, }api-key"
+PARTIAL_NOTE=""
+if [ -n "$missing" ]; then
+    host_kind="${MEM0_HOST_KIND:-}"
+    [ -n "$host_kind" ] || host_kind="$(sed -n 's/^MEM0_HOST_KIND=//p' "$MEM0/stack.env" 2>/dev/null | head -n1 | tr -d "\r\"' " || true)"
+    if [ "$host_kind" = "native" ]; then
+        log "ERROR: not collected: $missing. This box is a native Linux authority (MEM0_HOST_KIND=native): its keys are systemd credentials (<secrets-dir>/ams-*.cred), not files in $MEM0. A sealed credential is bound to the host that made it, so this script cannot back it up and a copy of the .cred file is useless on another machine. See 'Native authority' in docs/systems/key-custody.md for the procedure."
+    else
+        log "ERROR: not collected: $missing (absent or empty under $MEM0). A bundle without the keys is not a key backup. Fix the path (MEM0_DIR), or pass --allow-partial to back up what exists anyway."
+    fi
+    if [ "$ALLOW_PARTIAL" -ne 1 ]; then
+        log "FAIL: nothing was written to either destination."
+        exit 4
+    fi
+    PARTIAL_NOTE=" PARTIAL (--allow-partial): missing $missing."
+    log "  WARN:$PARTIAL_NOTE"
+fi
 
 # NVIDIA key out of the Claude registry (the file itself is 60KB of mostly non-secret).
 if [ -f "$WIN_CLAUDE_JSON" ]; then
@@ -157,5 +195,5 @@ if [ "$verified" -lt 2 ]; then
     log "FAIL: key material is durable only when it exists in BOTH destinations ($verified/2)."
     exit 3
 fi
-log "key-backup: $n artifact(s), verified in $verified destinations."
+log "key-backup: $n artifact(s), verified in $verified destinations.$PARTIAL_NOTE"
 exit $rc

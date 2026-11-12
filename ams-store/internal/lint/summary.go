@@ -122,6 +122,8 @@ func Run(ctx context.Context, opt Options) (Summary, error) {
 			SkipStreak:       h.SkipStreak,
 			LastStatus:       agedStatus(h, now),
 			OverTriggerHours: stamps.HoursOverTrigger(s.Workspace, now),
+			LastStatusAt:     agedStamp(h.LastReceiptUTC, now),
+			LastDecisionAt:   agedStamp(h.LastProductiveUTC, now),
 		}
 		rows = append(rows, row)
 		if stats.OverTrigger {
@@ -164,6 +166,15 @@ func agedStatus(h RunHistory, now time.Time) string {
 		return ""
 	}
 	return h.LastStatus
+}
+
+// agedStamp renders a receipt time for the summary, or "" when there is none or it is older
+// than FindingWindow.
+func agedStamp(t *time.Time, now time.Time) string {
+	if t == nil || now.UTC().Sub(*t) > FindingWindow {
+		return ""
+	}
+	return t.UTC().Format(SummaryTimeFormat)
 }
 
 // Write persists the summary through the atomic writer.

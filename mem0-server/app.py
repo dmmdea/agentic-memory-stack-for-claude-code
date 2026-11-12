@@ -41,6 +41,8 @@ from admission_gate import default_policy_for_class
 from admission_gate import admission_rejections_today as _admission_rejections_today
 from redact import redact_secrets  # server-side secret scrub for stored prompt_text
 from redact import count_redactions  # W5 T6.1: count-only entrance telemetry
+from redact import mask_memory_items as _mask_memory_items  # read-path masking (search, bundle)
+from redact import introduces_redaction_marker as _introduces_redaction_marker  # PUT write-back guard
 from freshness import freshness_weight as _freshness_weight  # v1.0 R5 Weibull read-gate
 import codex_shim_client  # v0.27.1 R5 keystone: Codex judgment via the Windows HTTP shim
 import anthropic_judge    # the Claude API transport behind the same judge (MEM0_JUDGE_PROVIDER)
@@ -95,6 +97,7 @@ from episodic import (
     list_open_questions as _episodic_list_open_questions,
     search_open_questions as _episodic_search_open_questions,
     find_open_question_by_text_fuzzy as _episodic_find_open_question_by_text_fuzzy,
+    touch_open_question as _episodic_touch_open_question,
 )
 # v0.29 R4 — semantic raw-trace gate (episode-summary embeddings in Qdrant)
 from episode_embeddings import (
@@ -324,7 +327,10 @@ import write_path as _write_path
 _write_path.install(app)
 
 def auth(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+    # Compare bytes: hmac.compare_digest raises TypeError on a non-ASCII str, which would answer an
+    # unauthenticated request with a 500 instead of a 401.
+    if not x_api_key or not hmac.compare_digest(x_api_key.encode("utf-8", "surrogatepass"),
+                                                API_KEY.encode("utf-8", "surrogatepass")):
         raise HTTPException(401, "missing or invalid X-API-Key")
 
 
@@ -395,6 +401,9 @@ class SearchIn(BaseModel):
     limit: int = 20
     threshold: float = 0.1
     rerank: bool = False
+    # Read-path masking is skipped for a caller that sets raw: a maintenance job that compares the
+    # stored text. The same key reads any record unmasked by id, so the flag opens nothing new.
+    raw: bool = False
     # v0.17 F.4.1: recency-class search policy
     # durable (default): no recency boost — tier-based ranking; preserves v0.13-v0.16 behaviour.
     # operational: post-rerank exponential-decay recency boost with 30-day half-life.
@@ -435,6 +444,9 @@ class DiagnoseIn(BaseModel):
 
 class UpdateIn(BaseModel):
     text: str
+    # A PUT whose text would replace a stored credential-shaped span with a redaction placeholder is
+    # refused (409) unless the caller sets this: the deliberate scrub of a stored credential.
+    allow_redaction_marker: bool = False
 
 class TierIn(BaseModel):
     tier: str  # "evidence" | "canonical" | "insight" | "temporal" | "stable"
@@ -715,6 +727,17 @@ def _redactions_bump(n=0):
         _redactions_today.update({"date": today, "total": 0})
     _redactions_today["total"] += n
 
+# Read-path masking (POST /v1/memories/search, POST /v1/context/bundle): memories returned with a
+# credential-shaped span masked, per day. Count only, zero I/O, informational on /health/deep.
+_read_redactions_today = {"date": None, "items": 0}
+
+def _read_redact_bump(n=0):
+    today = _dt.date.today().isoformat()
+    if _read_redactions_today["date"] != today:
+        _read_redactions_today.update({"date": today, "items": 0})
+    _read_redactions_today["items"] += n
+
+
 def _record_would_redact(counts: dict) -> None:
     """Daily counter + local per-rule JSONL. Never raises into add()."""
     try:
@@ -798,10 +821,21 @@ def _episode_raw_fallback(prompt, brand):
     snippet = (f"{goal} — {summ}" if goal and summ else (goal or summ)).strip()
     if not snippet:
         return None
+    # Mask BEFORE the cut: a rule that needs both ends of a span (a key block) would miss one the
+    # cut truncated.
+    _snip_redacted = False
+    if _read_redact_on():
+        _masked_snip = redact_secrets(snippet)
+        if _masked_snip != snippet:
+            snippet, _snip_redacted = _masked_snip, True
+            _read_redact_bump(1)
     # brand is included for the hook's defense-in-depth $brandGate backstop (the
     # server already fail-closes via only_brand_neutral; the client re-checks).
-    return {"episode_id": ep_id, "brand": payload.get("brand"),
-            "snippet": snippet[:RAW_FALLBACK_SNIPPET_CHARS].rstrip()}
+    _rf = {"episode_id": ep_id, "brand": payload.get("brand"),
+           "snippet": snippet[:RAW_FALLBACK_SNIPPET_CHARS].rstrip()}
+    if _snip_redacted:
+        _rf["redacted"] = True
+    return _rf
 
 def _nli_search_fn(query, filters, threshold, topk):
     """Canonical-tier neighbor lookup for the write-gate. mem0 hybrid search gates each
@@ -912,6 +946,13 @@ TIER_BUNDLE_POLICY: dict[str, dict[str, Any]] = {
 RELEVANCE_GATE = _embedder_profile.threshold("relevance_gate", EMBED_PROFILE)
 for _tier_policy in TIER_BUNDLE_POLICY.values():
     _tier_policy["relevance_threshold"] = RELEVANCE_GATE
+# Per-tier memory cap knob: MEM0_BUNDLE_MEMORY_CAP_FRONTIER / MEM0_BUNDLE_MEMORY_CAP_SMALL, an integer 0-3,
+# overrides TIER_BUNDLE_POLICY[tier]["memory_cap"] at import. Unset or invalid keeps the default above
+# (2 and 1), which stays in parity with claude-config/model-tiers.json: the cap is a setting, not a new default.
+for _cap_tier in TIER_BUNDLE_POLICY:
+    _cap_raw = os.environ.get(f"MEM0_BUNDLE_MEMORY_CAP_{_cap_tier.upper()}", "").strip()
+    if _cap_raw.isascii() and _cap_raw.isdigit() and 0 <= int(_cap_raw) <= 3:
+        TIER_BUNDLE_POLICY[_cap_tier]["memory_cap"] = int(_cap_raw)
 # A threshold knob is not scoped to a space: one fitted on another model's scores and left set is noise
 # here. Say so loudly where it matters most, on a space other than the legacy one (every knob set before
 # profiles existed was fitted on EmbeddingGemma-300m's scores).
@@ -1373,6 +1414,18 @@ def health_deep() -> dict:
     # W5 T6.1: OPAQUE total only (F6) — the per-rule split never leaves the box.
     _redactions_bump()
     out["checks"]["redactions_would_apply_today"] = dict(_redactions_today)
+    # Read-path masking: how many returned memories had a credential-shaped span masked today. A
+    # count only, informational, never flips ok.
+    _read_redact_bump()
+    out["checks"]["read_redactions_today"] = dict(_read_redactions_today)
+    # The episodic store's capture block (the same one /health/maintenance serves), so the
+    # l1a-extraction row has a verdict on an authority that holds no PC-side stamps. Indexed reads,
+    # no model load; informational, never flips ok; a reader failure reads as unknown.
+    try:
+        import maintenance_health as _mh_cap
+        out["checks"]["capture"] = _mh_cap._capture(_capture_signals, _dt.datetime.now(_dt.timezone.utc))
+    except Exception as e:
+        out["checks"]["capture"] = {"state": "unknown", "stalled": False, "note": str(e)[:120]}
     # W3 (2026-08-07): the alarm mouths — nightly-job receipt ages, the
     # retrieval-drift guard's state file, and the capability manifest folded
     # over everything above. ALL informational: the gating checks already
@@ -2034,6 +2087,11 @@ def _search_core(b: SearchIn, _route: str = "search"):
             # pins the old length (verified); mixed-era rows are handled by
             # both consumers.
             "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:10]] if isinstance(results, dict) else [],
+            # Numbers only, aligned index-for-index with returned_top_ids (null where an item carries
+            # none): the raw cosine the threshold gated on, and the score the list was ordered by. No
+            # text, no query; they let the quality of what the per-prompt path injects be measured.
+            "returned_cosines": _log_numbers(results, "cosine"),
+            "returned_scores": _log_numbers(results, "score"),
             "reranked": (results.get("reranked") if isinstance(results, dict) else None),
             # W5 T5.5: the union leg's receipt — candidates seen, unioned into
             # the pool, and surviving the final list. lexical_candidates==0 on
@@ -2065,6 +2123,35 @@ def _search_core(b: SearchIn, _route: str = "search"):
     return results
 
 
+def _log_numbers(results, key: str) -> list:
+    """The top-10 results' `key` as floats, aligned with returned_top_ids; null where absent or not a number."""
+    if not isinstance(results, dict):
+        return []
+    out = []
+    for r in (results.get("results") or [])[:10]:
+        v = r.get(key) if isinstance(r, dict) else None
+        out.append(round(float(v), 4) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+    return out
+
+
+def _read_redact_on() -> bool:
+    """MEM0_READ_REDACT=0 turns the read-path masking off; anything else leaves it on."""
+    return os.environ.get("MEM0_READ_REDACT", "1").strip() != "0"
+
+
+def _mask_read_items(items, key="memory"):
+    """Mask credential-shaped text in the memories a model is handed (search, bundle) and count the
+    masked items for /health/deep. Only the two HTTP handlers call it: _search_core's in-process
+    callers need the stored text, and GET by id / list / writes stay raw (an update is a read by id
+    followed by a PUT, so masked text would overwrite the original)."""
+    if not _read_redact_on():
+        return items
+    masked, n = _mask_memory_items(items, key=key)
+    if n:
+        _read_redact_bump(n)
+    return masked
+
+
 @app.post("/v1/memories/search")
 def search(b: SearchIn, x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
@@ -2072,7 +2159,10 @@ def search(b: SearchIn, x_api_key: Optional[str] = Header(None)):
     # in v0.18 but the hooks' search POSTs were not.
     _warn_hook_contract_version("/v1/memories/search", b.hook_contract_version)
     try:
-        return _search_core(b)
+        _res = _search_core(b)
+        if not b.raw and isinstance(_res, dict) and isinstance(_res.get("results"), list):
+            _res = {**_res, "results": _mask_read_items(_res["results"])}
+        return _res
     except HTTPException:
         raise                       # a caller error (a media search's 400s) stays a 400
     except Exception as e:
@@ -2399,6 +2489,17 @@ def update(
                 f"blind update would destroy custom metadata: {str(e)[:120]}",
             )
         _pre_payload = dict(_pre_pts[0].payload or {}) if _pre_pts else {}
+        # Search and bundle results carry credential-shaped spans masked. Text built from such a
+        # result and PUT back would overwrite the stored span with the mask, so it is refused unless
+        # the caller says the scrub is deliberate; a read by id is never masked. 409, not 503: the
+        # shim must not queue and retry it.
+        if not b.allow_redaction_marker and _introduces_redaction_marker(b.text, _pre_payload.get("data")):
+            raise HTTPException(
+                409,
+                "update: the new text would replace a stored credential-shaped span with a redaction "
+                "placeholder (the shape of an edit built from a masked search result). Read the memory by "
+                "id and send the edit again, or send allow_redaction_marker: true to scrub it on purpose",
+            )
         _carryover = compute_carryover(_pre_payload)
         try:
             # Pre-merge: mem0 deepcopies metadata= into the rebuilt payload and
@@ -3402,7 +3503,9 @@ def search_open_questions_endpoint(b: OpenQuestionSearchIn, x_api_key: Optional[
     auth(x_api_key)
     try:
         with _episodic_connect() as conn:
-            return _episodic_search_open_questions(conn, query=b.query, brand=b.brand, status=b.status, limit=b.limit)
+            return _mask_read_items(
+                _episodic_search_open_questions(conn, query=b.query, brand=b.brand, status=b.status, limit=b.limit),
+                key=("question_text", "resolution_text"))
     except Exception as e:
         log.exception("open_questions search failed")
         raise _upstream_error(e)
@@ -3725,8 +3828,9 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # paid, zero memories injected, dead churn in admission-rejected.jsonl). Filter
             # server-side so an insight hit can't burn a K-slot the client will throw away;
             # the +2 over-fetch above lets an admissible memory take that slot instead.
-            out["memories"] = [m for m in _mems
-                               if ((m.get("metadata") or {}).get("tier")) != "insight"][:_tp["memory_cap"]]
+            out["memories"] = _mask_read_items(
+                [m for m in _mems
+                 if ((m.get("metadata") or {}).get("tier")) != "insight"][:_tp["memory_cap"]])
         except Exception:
             log.exception("bundle: search failed (non-fatal)")
             out["memories"] = []
@@ -3778,6 +3882,8 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # negative or missing cap must not turn into an unbounded listing).
             out["goals"] = _episodic_list_goals(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["goal_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("goal_cap", 0) > 0 else []
             out["open_questions"] = _episodic_list_open_questions(conn, status="open", brand=_bb, only_brand_neutral=(not _bb), initiative=b.initiative, limit=_tp["oq_cap"], exclude_session_id=b.session_id, rank_by_recency=True) if _tp.get("oq_cap", 0) > 0 else []
+            out["goals"] = _mask_read_items(out["goals"], key=("title", "description"))
+            out["open_questions"] = _mask_read_items(out["open_questions"], key=("question_text", "resolution_text"))
     except Exception:
         log.exception("bundle: goals/open_questions failed (non-fatal)")
         out.setdefault("goals", [])
@@ -3881,7 +3987,9 @@ def create_episode(b: EpisodeIn, background_tasks: BackgroundTasks, x_api_key: O
                             conn, q_text, brand=b.brand, status="open", limit=1,
                         )
                         if candidates:
-                            continue  # already tracked
+                            # Already tracked: a new sighting, so the 30-day auto-abandon counts from it.
+                            _episodic_touch_open_question(conn, candidates[0]["id"], commit=False)
+                            continue
                         _episodic_create_open_question(
                             conn, question_text=q_text.strip(),
                             brand=b.brand,
@@ -3957,6 +4065,7 @@ def search_episodes(b: EpisodeSearchIn, x_api_key: Optional[str] = Header(None))
     try:
         with _episodic_connect() as conn:
             results = _episodic_search_fts(conn, b.query, b.since, b.until, b.brand, b.limit)
+        results = _mask_read_items(results, key=("goal_text", "summary_text"))
         return {"results": results, "count": len(results)}
     except Exception as e:
         log.exception("episode search failed")

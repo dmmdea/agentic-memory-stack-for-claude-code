@@ -1457,6 +1457,18 @@ def update_open_question_status(
     return cur.rowcount > 0
 
 
+def touch_open_question(conn: sqlite3.Connection, oq_id: int, commit: bool = True) -> bool:
+    """Refresh updated_at on an OPEN question that was raised again (deduplicated against this row), so
+    the 30-day auto-abandon counts from the last sighting, not from the first one. Status is untouched."""
+    cur = conn.execute(
+        "UPDATE open_questions SET updated_at = ? WHERE id = ? AND status = 'open'",
+        (_iso_now(), oq_id),
+    )
+    if commit:
+        conn.commit()
+    return cur.rowcount > 0
+
+
 def list_open_questions(
     conn: sqlite3.Connection,
     status: str | None = "open",

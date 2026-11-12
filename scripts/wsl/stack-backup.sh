@@ -218,6 +218,16 @@ if [ -f "$PRQ_SRC" ]; then
     || { rm -f "$PRQ_DST.tmp"; echo "WARN: contradiction-promote-review.jsonl backup failed" >&2; rc=1; }
 fi
 
+# 1i-2. Contradiction dismissed ledger — the operator's "this pair is not a contradiction" decisions
+# (one line per --dismiss). Losing it only re-asks the operator the same questions, but those answers
+# cost attention to give. Zero-byte is legitimate; the file is absent until the first dismiss.
+DSM_SRC="$HOME/.mem0/contradiction-dismissed.jsonl"
+DSM_DST="$BACKUP_DIR/contradiction-dismissed-$TS.jsonl"
+if [ -f "$DSM_SRC" ]; then
+  cp "$DSM_SRC" "$DSM_DST.tmp" && mv "$DSM_DST.tmp" "$DSM_DST" \
+    || { rm -f "$DSM_DST.tmp"; echo "WARN: contradiction-dismissed.jsonl backup failed" >&2; rc=1; }
+fi
+
 # 1j. Stale-paths hand-label worksheet — 135 operator-labelled rows; the one artifact
 # in the sidecar that cannot be regenerated (the labels killed a feature; the evidence
 # must survive the machine).
@@ -372,7 +382,7 @@ prune_kind() {  # <kind> <extension>
 }
 for spec in qdrant:snapshot history:db tier-ledger:jsonl MEMORY:md audit-flags:baseline episodic:db \
             claude-settings:json l10-flags:jsonl l10-state:json promote-review:jsonl \
-            stale-worksheet:jsonl media:tar; do
+            contradiction-dismissed:jsonl stale-worksheet:jsonl media:tar; do
   prune_kind "${spec%%:*}" "${spec#*:}"
 done
 # Secondary-collection snapshots: one retention window per collection, found by what is on disk

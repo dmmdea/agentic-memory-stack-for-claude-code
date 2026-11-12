@@ -590,7 +590,9 @@ def validate_hmac_user_direct(
         hmac.new(_get_canonical_key().encode("utf-8"), msg, hashlib.sha256).digest()
     ).decode("ascii").strip()
 
-    if not hmac.compare_digest(expected, x_user_direct_token.strip()):
+    # bytes, not str: compare_digest raises TypeError on a non-ASCII str (a 500 instead of this 403)
+    if not hmac.compare_digest(expected.encode("ascii"),
+                               x_user_direct_token.strip().encode("utf-8", "surrogatepass")):
         raise HTTPException(
             403,
             f"X-User-Direct-Token HMAC mismatch for action={action!r}. "

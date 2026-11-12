@@ -245,7 +245,8 @@ class Mem0Client:
         # by its cosine to the query (the request default is 0.1), and a fixed non-empty query because
         # mem0 2.1.0 rejects an empty one (HTTP 500, which this fetch would read as "no canonicals").
         body = {"query": CANONICAL_FETCH_QUERY, "filters": {"tier": "canonical", "user_id": self.user_id},
-                "limit": CANONICAL_FETCH_LIMIT, "threshold": 0.0, "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
+                "limit": CANONICAL_FETCH_LIMIT, "threshold": 0.0, "raw": True,
+                "hook_contract_version": SEARCH_HOOK_CONTRACT_VERSION}
         r = self.http.post(f"{self.url}/v1/memories/search", headers=self.h, json=body, timeout=10.0)
         r.raise_for_status()
         d = r.json()
@@ -520,13 +521,34 @@ Existing canonical facts (do NOT re-nominate anything that duplicates these):
 # ---------------------------------------------------------------------------------------------
 # collaborators with real side effects (injectable)
 # ---------------------------------------------------------------------------------------------
-def store_judge_prompt(workspace: str, shorten: list[dict], migrate: list[dict]) -> str:
+def store_judge_prompt(workspace: str, shorten: list[dict], migrate: list[dict],
+                       lines: int | None = None, line_trigger: int | None = None,
+                       line_target: int | None = None) -> str:
     """One store's offer set, as the prompt the nightly judge answers.
 
     The offer set comes from the binary (`judge-apply --candidates`), which already excludes
     doctrine and already-sealed lines, so the model is never shown a line it may not touch.
     Everything it returns is re-checked at apply time anyway.
+
+    `lines`, `line_trigger` and `line_target` are the store's index line count and the budget the
+    binary holds it to (also from `--candidates`). Over the trigger, the prompt says MIGRATE is
+    the preferred verdict for a pullable fact and that KEEP does not shield it from the apply-time
+    oldest-first line floor. A binary that predates those fields gives None and the budget
+    paragraph is left out, so the prompt reads as it did.
     """
+    budget = ""
+    if isinstance(lines, int) and isinstance(line_trigger, int) and isinstance(line_target, int):
+        if lines > line_trigger:
+            budget = (f"\nLine budget: this store's index is {lines} lines against a line trigger of "
+                      f"{line_trigger} and a target of {line_target}; lines past 200 are not injected at all. "
+                      f"The store is OVER its line trigger, so MIGRATE is the preferred verdict for a pullable "
+                      f"project or reference fact, and KEEP does not protect a pullable fact: whatever you KEEP, "
+                      f"the apply step still migrates the oldest pullable facts until the store is back at "
+                      f"{line_target} lines. Choose which ones go instead of leaving that to age alone.\n")
+        else:
+            budget = (f"\nLine budget: this store's index is {lines} lines against a line trigger of "
+                      f"{line_trigger} and a target of {line_target}. It is not over its line trigger, so "
+                      f"KEEP is a fine verdict for a pullable fact.\n")
     def _bullets(items: list[dict], kind: str) -> str:
         out = []
         for c in items:
@@ -546,14 +568,15 @@ Verbs:
   the specifics is REJECTED at apply time.
 - MIGRATE: the fact is reference material a session rarely needs in context. It moves to the
   searchable corpus and leaves the index. Prefer MIGRATE for narrow, self-contained facts.
-- KEEP: leave it exactly as it is. The safe default, and the right answer whenever unsure.
+- KEEP: leave it exactly as it is. The safe default, and the right answer whenever unsure
+  (unless the line budget below says the store is over its line trigger).
 
 Rules:
 - One decision per slug, at most one verb each. Slugs exactly as given.
 - SHORTEN carries new_hook and nothing else; MIGRATE and KEEP carry no new_hook.
 - Never invent a slug that is not listed.
 - Deciding nothing is valid: {{"decisions":[]}}.
-
+{budget}
 Over-cap lines (SHORTEN or KEEP):
 {_bullets(shorten, "over-cap")}
 
@@ -1074,7 +1097,9 @@ class Dream:
                                "note": "nothing over the cap and nothing pullable", "decisions": []})
                 continue
             called += 1
-            r = self._judge_call("store-judge", store_judge_prompt(ws, shorten, migrate),
+            r = self._judge_call("store-judge",
+                                 store_judge_prompt(ws, shorten, migrate, cs.get("lines"),
+                                                    cs.get("line_trigger"), cs.get("line_target")),
                                  ams_env.judge_model("classify"), "medium", STORE_JUDGE_TIMEOUT_S)
             if not r.get("ok"):
                 log(f"  store-judge {ws}: judge failed: {r.get('error_type')}")

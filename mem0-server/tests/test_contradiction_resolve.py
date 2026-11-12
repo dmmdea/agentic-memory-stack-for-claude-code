@@ -159,6 +159,27 @@ def test_dismiss_removes_every_queue_line_for_the_memory(tmp_path, monkeypatch):
     assert sweep.run_dismiss("m1") == 1          # nothing left to dismiss: not silent success
 
 
+def test_dismissed_pair_is_not_requeued_until_a_text_changes(tmp_path, monkeypatch):
+    """--dismiss used to only drop the queue line, so the weekly sweep judged the same pair YES again
+    and asked the operator the same question (half of the dismissed lines came back). The decision is
+    now remembered beside the queue, bound to the texts it was made on: an edited text re-opens it."""
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    texts = {"m1": "the port is 8080", "c1": "the port is 9090"}
+    monkeypatch.setattr(sweep, "_current_text_hashes",
+                        lambda ids: [sweep._text_sha256(texts[i]) if i in texts else None for i in ids])
+    monkeypatch.setattr(sweep, "_SUPPRESSED_DISMISSED", 0)
+    pair = {"memory_id": "m1", "canonical_id": "c1"}
+    sweep.append_review_queue(str(q), dict(pair))
+    assert sweep.run_dismiss("m1") == 0
+    assert _lines(q) == []
+    assert sweep.append_review_queue(str(q), dict(pair)) is True     # judged YES again: not re-queued
+    assert _lines(q) == [] and sweep._SUPPRESSED_DISMISSED == 1
+    texts["c1"] = "the port is 7070"                                  # one of the two texts was edited
+    sweep.append_review_queue(str(q), dict(pair))
+    assert [r["memory_id"] for r in _lines(q)] == ["m1"]
+
+
 def test_main_dismiss_needs_no_backend(tmp_path, monkeypatch):
     """--dismiss is queue-file only. It must run on a box where the Codex judge is unavailable
     (no bridge import, no install receipt), where the judge preflight would otherwise answer a

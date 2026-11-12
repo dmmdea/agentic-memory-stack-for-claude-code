@@ -47,6 +47,14 @@ newer cloud one.
   authority URL is equally vacuous on the brain (whose authority is loopback).
 - `off` refuses to flip while the authority is unreachable, so the outbox is never stranded (`-Force`
   overrides, leaving the queue intact for a later replay).
+- The outbox size is the one number read from `wsl.exe`. If WSL answers with anything but a number
+  (its own status text while the distro is busy), the script warns and quotes what came back: `on`
+  skips the pre-restore drain, `off` stays in travel mode unless `-Force`, `status` prints `unknown`.
+- The background watcher (`offline-watcher.ps1`) takes the authority from `-Authority`, then a
+  non-local `MEM0_URL`, then the Windows-side `~\.mem0\authority-url`, then the WSL copy of that file.
+  With none of them it logs "authority unresolved" and ends the tick with exit code 3, without probing or
+  changing its state: an unknown authority is never read as "offline", and the non-zero result makes the
+  verifier's watcher row warn.
 - Replay is idempotent: each entry carries a uuid4 key (stamped by the shim's `_queue_op`), and
   replayed keys are recorded in `~/.mem0/outbox.replayed.jsonl` — an interrupted replay can be
   re-run without duplicating.

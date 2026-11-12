@@ -443,9 +443,11 @@ repeat rows for one path count once, and a store with no receipt in 7 days repor
 `last_status`. The hub's own checkout is linted every night by the judge wrapper (see
 *judge-apply*), so it no longer freezes while the PCs are the only callers. `compactor-silent` is parameterised:
 on a PC the finding does not exist, because there is no local nightly to be silent;
-on the hub `--nightly-unit` names the systemd timer. The G7 clock - hours over
-trigger without an applied decision - comes from `.ams/over-trigger.json`, which
-rides in the synced tree outside every store. `derive` and `sync` write it; lint
+on the hub `--nightly-unit` names the systemd timer. The G7 clock - hours
+continuously over the trigger - comes from `.ams/over-trigger.json`, which
+rides in the synced tree outside every store. It resets only when the store falls
+back under the trigger, so a judge that applies a decision every night and still
+leaves the store over trigger keeps it running. `derive` and `sync` write it; lint
 only reads it. A store is over trigger on bytes **or** lines (`store.OverTrigger`:
 20,000 B or 160 lines); the clock once tested bytes only, so a store at 176 lines and
 19 KB had no clock at all.
@@ -464,6 +466,20 @@ unparseable time on either side leaves the stamp ALIVE, so a garbled tombstone
 cannot silence a starvation alarm. A file written before the tombstone existed
 reads correctly (a missing `cleared_at` is empty) and is rewritten into the new
 shape on the first stamp change or merge.
+
+**An idle store writes nothing.** The stamp file is tracked, so every write costs a
+commit that is then pushed. A store that is under its trigger, has no live stamp and
+already carries a tombstone therefore leaves the file untouched; only a real clear (a
+live stamp existed) writes a fresh tombstone, and only a crossing writes a stamp. The
+merge rule above is unchanged.
+
+**What the summary says about the judge.** Each store row of `lint-summary.json`
+carries `last_status` with `last_status_at` (the newest non-dry-run receipt) and
+`last_decision_at` (the newest receipt that reached a decision: `applied`,
+`applied-unrecorded`, `no-op` or `protected-set-overflow`), both whole-second Zulu and
+absent when there is no such receipt in the last 7 days. The session-start banner
+reads them to say what the judge last did, so it blames the chain only when no
+decision was applied in 36 h (see [`sessionstart-banner.md`](./sessionstart-banner.md)).
 
 **One renderer owns those bytes.** The producer wrote the file with indented JSON
 while the merge reducer rewrote the same tracked file compactly, so every stamp
@@ -625,6 +641,31 @@ wrapper runs `ams-store lint --summary-out` on the hub checkout and adds the
 night. The wrapper takes the brand map from `MEM0_BRAND_MAP` (or `stack.env`) and echoes
 each store's `--json` result to the journal.
 
+**The line floor.** Bytes converge through the convergence floor; lines fall only
+through migration, and a judge keeps by default. So when the index is over its line
+trigger (160 lines) after the judge's decisions, the apply migrates the **oldest**
+pullable facts (type `project` or `reference`, not doctrine, body within the server's
+storage cap) until the store is back at its line target (140 lines): same
+write-then-verify path, same blast cap, bounded by the line debt rather than by
+`--max-migrations`. Only a decision that removes or rewrites a fact (MIGRATE, SHORTEN)
+shields that fact from the floor. **A KEEP does not**: the judge decides every slug it
+is offered and keeps by default, so treating a KEEP as a decision left the floor with
+nothing to take on every night the store stayed over its trigger. The judge's own
+MIGRATEs count first and reduce the debt (up to the migration cap); the floor takes the
+rest, and a file whose age cannot be read sorts last. The `--candidates` output carries
+the store's `lines`, `line_trigger` and `line_target`, which the Python prompt turns
+into a line-budget paragraph: over the trigger, MIGRATE is the preferred verdict for a
+pullable fact and a KEEP does not protect it from the floor.
+
+**Rehearsing an apply.** `judge-apply --dry-run` runs the whole apply, the line floor
+included, and posts nothing and changes no store file; it lists each change it would
+make (`would MIGRATE <slug> (line floor)`, `would SHORTEN ...`; under `--json` a
+`planned` array with `slug`, `verb`, `line_floor` and `new_hook`). It still takes the
+per-PC lock and still appends a receipt row (flagged `dry_run`) and, for a judge that
+did not answer, a usage row, so point `--state-root` at a scratch directory when
+rehearsing against a copy of a real store. A dry run is subject to the 20 h
+one-attempt window of its state root; a fresh scratch state root has none.
+
 **The migration cap is per trigger (P5-6, decided 2026-09-29).** The default cap of 5
 migrations per store per night was measured against the largest store, whose inflow
 exceeded 5 a night: it reported "40 over-cap, 40 pullable offered" every night and never
@@ -760,9 +801,9 @@ contract and the SessionStart hook runs it asynchronously, so the metric line th
 design asks for at session start is the banner's, not the verb's: the spawner runs
 `ams-store lint --summary-out <state>/lint-summary.json --hub-host <hub>` (the
 PowerShell lint only while the binary is absent), and the banner prints the per-store
-`over_trigger_hours` that lint writes - the G7 clock, hours over trigger without an
-applied decision, taken from `over-trigger.json` with `min` across PCs - quiet below
-24 h and as an `AUTO-MEMORY G7 ALARM` line at or above. The PowerShell lint writes
+`over_trigger_hours` that lint writes - the G7 clock, hours continuously over trigger,
+taken from `over-trigger.json` with `min` across PCs - quiet below 24 h and as an
+`AUTO-MEMORY G7 ALARM` line at or above. The PowerShell lint writes
 `null` there, which is why the lint swap is part of the cutover and not a cleanup.
 
 ### The gates that check the tests

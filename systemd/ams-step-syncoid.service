@@ -6,6 +6,8 @@ ConditionPathExists=%h/.mem0/scripts/syncoid.sh
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh syncoid /bin/bash %h/.mem0/scripts/syncoid.sh
 
 [Install]

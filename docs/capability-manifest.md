@@ -61,7 +61,7 @@ The **escalation** column marks the F17 rows: their source check is *information
 | `sweep-job` | dream prune step (consolidation-completed receipt) | job_liveness.prune_age_h (prune.json receipt age) | brain | F17 |
 | `codex-auth` | LLM judge credentials serving dream judgment (the Codex login, or the Claude API key) | Codex: derived, a fresh dream ran, therefore its judge authenticated; Claude API: the key file and the SDK are present | brain | F17 |
 | `reranker` | cross-encoder rerank leg on search | checks.reranker (PASSIVE counters bumped by real search reranks; no active probe here by F11 — active 3-doc probe is Test-MemoryStack L5) | optional | F17 |
-| `l1a-extraction` | hook-fired L1a memory extractor | job_liveness.l1a_attempt_age_h vs l1a_success_age_h (two-signal, F12: convicts only attempt-fresh + success-stale >96h; capped at degraded) | brain | F17 |
+| `l1a-extraction` | hook-fired L1a memory extractor | job_liveness.l1a_attempt_age_h vs l1a_success_age_h (two-signal, F12: convicts only attempt-fresh + success-stale >96h; capped at degraded); with neither PC-side stamp (a native authority) checks.capture, the episodic store's capture state (ok -> alive, stalled -> degraded, else unknown) | brain | F17 |
 | `sessionstart-banner` | SessionStart resume/context banner | job_liveness.sessionstart_banner_age_h (unconditional stamp at the top of storage-cap-check.sh) cross-checked against l1a_attempt_age_h | both | F17 |
 | `mcp-shim` | MCP shim bridging the CLI to the memory API | job_liveness.mcp_shim_receipt_age_h + mcp_shim_host_match + mcp_shim_stack_version (host-keyed start receipt; version skew = stale launch path) | brain | F17 |
 | `admission-gate` | server-side retrieval admission gate | checks.admission_probe (in-process AdmissionPolicy.evaluate() self-probe, zero I/O) | both | F17 |
@@ -124,9 +124,13 @@ Verdict rules per probe family (all thresholds live in `capabilities.py`):
   (**never `dead`** — the cap is deliberate); anything else, including "never succeeded here" and
   "attempts stopped too", → `unknown`. An idle box can therefore never be convicted. The stamps are
   read from a Windows profile only, so on a native Linux authority (`MEM0_HOST_KIND=native`) neither
-  age is filled and the row reads `unknown`; the authority's own reading of the same question is the
-  `capture` block of `GET /health/maintenance`, taken from the episodic store
-  ([systems/mem0-api.md](systems/mem0-api.md#get-healthmaintenance)).
+  age is filled. The authority's own reading of the same question is the `capture` block of
+  `GET /health/maintenance`, taken from the episodic store
+  ([systems/mem0-api.md](systems/mem0-api.md#get-healthmaintenance)); `GET /health/deep` embeds the same
+  block as `checks.capture` (indexed reads, no model load), and when **neither** PC-side stamp is present
+  the row takes its verdict from it: `ok` → `alive`, `stalled` → `degraded` (the cap holds: never `dead`),
+  `quiet` or `unknown` → `unknown`. When either PC-side stamp is present (a brain hosted where the PC's
+  state directory is readable) the two-signal rule above stands and `checks.capture` is not consulted.
 - **`sessionstart-banner`** — same two-signal shape. `claude-config/storage-cap-check.sh` writes
   `~/.mem0/last-sessionstart-banner` on its **first line**, above the cold-server gate, so the
   stamp proves the hook fired even on a morning when every server-dependent section was skipped.

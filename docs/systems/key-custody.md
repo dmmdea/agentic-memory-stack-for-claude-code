@@ -9,7 +9,7 @@ one deliberate exception is the regenerable service key, below: it is re-made, n
 ## Questions this doc answers
 
 - Which secrets does the stack actually depend on?
-- Which are irreplaceable and which can just be re-issued?
+- Which secrets cost data if lost, and which only cost a re-issue?
 - Why is the DPAPI blob *not* a backup?
 - If this machine died right now, what would it take to be running again?
 - What is the service key, who may hold it, and why is it the one secret with no backup?
@@ -31,7 +31,7 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 
 | secret | where it lives | class |
 |---|---|---|
-| **canonical HMAC signing key** | `~/.mem0/canonical-key`, its DPAPI blob, tmpfs at runtime | **irreplaceable** |
+| **canonical HMAC key** | `~/.mem0/canonical-key`, its DPAPI blob, tmpfs at runtime; native authority: `<secrets-dir>/ams-canonical-key.cred` (systemd credential) | **replaceable, costs no data**; without a key no canonical or insight write can be authorised |
 | mem0 API key | `~/.mem0/api-key`; native authority: `<secrets-dir>/ams-api-key.cred` (systemd credential), exposed to a unit as the file named by `MEM0_API_KEY_FILE` | re-issuable, but everything is wired to it |
 | **service key** (`ams-service-key`, 1.32.5) | native authority: `<secrets-dir>/ams-service-key.cred` (systemd credential); WSL authority: `~/.mem0/service-key` (mode 600) | **regenerable, authority-only** — never on a replica or a PC; restore = regenerate |
 | Claude API key (`ams-anthropic-key`; only when `MEM0_JUDGE_PROVIDER=anthropic`) | native authority: `<secrets-dir>/ams-anthropic-key.cred` (systemd credential); PC or WSL-hosted box: `~/.mem0/anthropic-key` (mode 600) | re-issuable at the provider; no backup set carries it |
@@ -42,10 +42,19 @@ Corpus backup (collections + SQLite) is `memory-backup.sh`, documented in
 
 **Where a process finds the API key.** The shim (`mem0-mcp-shim.py`) and the replay script (`replay-ops.py`) read, in order, the file named by `MEM0_API_KEY_FILE` (when it reads non-empty) and then `~/.mem0/api-key`; neither has a plaintext environment fallback, and a native authority holds no `~/.mem0/api-key`. A process there that is not a unit must decrypt the credential itself and point `MEM0_API_KEY_FILE` at the file it wrote (see [operations](../operations.md#mcp-tools-not-appearing-in-claude-code)), and remove that file when it is done.
 
-**Only the first is irreplaceable**, and it deserves the emphasis. Losing it does not merely
-block future canonical promotions: existing canonical records were signed under that key, so
-the audit chain that makes the canonical tier trustworthy cannot be re-established. It cannot
-be regenerated, only restored.
+**What the canonical key signs.** Only the short-lived user-direct token a canonical or insight
+write must carry: HMAC-SHA256 over `<ts>|<nonce>|<action>|<memory_id>|<reason>`, accepted within a
+300 s skew window and once per nonce (`mem0-server/security_invariants.py`, `validate_hmac_user_direct`).
+No signature is stored on a record and no record, ledger line or replay entry is verified against the key
+later. So losing the key loses no data and breaks no audit chain, and a fresh key is a valid
+replacement: old tokens die with the old key (they expire in minutes anyway), the tier ledger is
+unaffected, and nothing already canonical changes. What a missing key does cost is every canonical,
+insight and demote write until a key is back: the server answers `503` (no key loaded) and the
+canonize scripts cannot mint a token. A backup of the key therefore saves minting and re-wiring a
+new one; it is not what keeps the canonical tier trustworthy. The same reading is in
+[`dpapi-canonical-key.md`](./dpapi-canonical-key.md) and [`MIGRATION.md`](../MIGRATION.md).
+On a box that still holds the DPAPI blob, restore the existing key rather than minting a new one, as
+the server's own `503` message directs; mint a new key only where no blob exists.
 
 ## The service key
 
@@ -143,11 +152,16 @@ Treating the blob as the second copy is the trap this doc exists to prevent.
 
 ## What `key-backup.sh` does
 
-Collects the irreplaceable and awkward-to-replace material, writes a `sha256` manifest, and
+Collects the key files that are awkward to replace, writes a `sha256` manifest, and
 publishes to **two destinations** — a local volume off the source disk, and an offsite
 (cloud-synced or remote) folder that survives the machine entirely. It then **re-reads both copies and
 verifies them against the manifest**, and **fails with a non-zero exit if fewer than two
 destinations verify**. One copy is not durability, so the script refuses to call it success.
+
+A bundle without keys is refused. If the canonical key or the API key was not collected, the run
+prints which one is missing, writes nothing to either destination and exits 4; `--allow-partial`
+backs up what exists anyway, and the final line then says the bundle is partial. (The script used
+to pass with a bundle holding only `authority-url`.)
 
 Re-issuable credentials (GitHub, Codex) are deliberately excluded: backing them up widens the
 blast radius for no recovery benefit. The service key is excluded for the same reason, and a
@@ -169,6 +183,26 @@ its interpreter by executing it rather than trusting `command -v`.
 | `KEY_BACKUP_LOCAL` | local destination on a different disk from `~/.mem0`; required, no default (the script exits 64 naming both variables when either is unset) |
 | `KEY_BACKUP_OFFSITE` | offsite destination that survives the machine (a synced cloud folder, a mounted remote share); required, no default |
 | `OFFSITE_WIN_DEST` | optional: the Windows-side path of the offsite folder, for a volume that is not mounted inside WSL; no default |
+
+The one command-line flag is `--allow-partial` (see above).
+
+### Native authority
+
+On a native Linux authority (`MEM0_HOST_KIND=native` in `~/.mem0/stack.env`) the canonical key and the
+API key are systemd credentials, `<secrets-dir>/ams-canonical-key.cred` and `ams-api-key.cred`,
+encrypted with `--with-key=host+tpm2`. There are no key files in `~/.mem0`, and a sealed credential is
+bound to the host that made it: copying the `.cred` file to a backup gives a file nothing can decrypt
+after a rebuild. So `key-backup.sh` cannot back these keys up. It says so and exits 4; it does not
+report a green run that holds no key. The procedure on that box:
+
+- **The API key.** Its plaintext is also held by every client and replica (`~/.mem0/api-key` on each).
+  Keep one of those copies, or a copy made when the key was created, off the box.
+- **The canonical key.** Losing it costs no data (see above). To replace it, make a new key in
+  memory-backed scratch, encrypt it as the installer's own error message prints for a missing `.cred`
+  (`systemd-creds --user encrypt --with-key=host+tpm2 --name=ams-canonical-key <plaintext>
+  <secrets-dir>/ams-canonical-key.cred`), remove the plaintext, and restart `mem0.service`. Keep a
+  plaintext copy off the box at creation time if you want to skip that step after a rebuild.
+- **The service key** is regenerated, never backed up ([The service key](#the-service-key)).
 
 ## Restore
 
@@ -195,6 +229,10 @@ is what that blob gets built *from*, which is the whole reason it must survive.
 
 - **Treating the DPAPI blob as the second copy.** It is machine-bound. See above.
 - **Backing up to one place and calling it durable.** The script exits non-zero on purpose.
+- **Passing `--allow-partial` by habit.** It exists for a box that really holds one of the two keys; the
+  bundle it writes cannot restore the other.
+- **Running it on a native authority and expecting keys.** It exits 4 there; see
+  [Native authority](#native-authority).
 - **Copying the service key to a replica, a PC or a backup bundle.** It exists to be held by the
   authority alone; a copy next to the API key removes the separation it provides. Regenerate it
   on the authority instead.

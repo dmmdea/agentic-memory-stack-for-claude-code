@@ -35,6 +35,53 @@ function Test-IsLocalUrl {
     return $false   # non-IP hostnames other than localhost are remote (your-machine, any operator's host)
 }
 
+function Test-IsPlaceholderUrl {
+    # $true for the documentation placeholder host (your-machine): it resolves to nothing, so it is never
+    # an authority to probe. Operator-neutral text in config templates must not become one.
+    param([string]$Url)
+    $uri = $null
+    if (-not [System.Uri]::TryCreate("$Url".Trim(), [System.UriKind]::Absolute, [ref]$uri)) { return $false }
+    return ($uri.Host -ieq 'your-machine')
+}
+
+function Get-FirstUrlLine {
+    # First non-blank, non-comment line of a ~/.mem0/authority-url style file's lines, trimmed, no trailing '/'.
+    param($Lines)
+    foreach ($l in @($Lines)) {
+        $t = "$l" -replace "`0", ''
+        $t = $t.Trim()
+        if ($t -and -not $t.StartsWith('#')) { return $t.TrimEnd('/') }
+    }
+    return ''
+}
+
+function Resolve-WatcherAuthority {
+    # The authority this box probes, or '' when none can be told. Order: $env:MEM0_URL when it is not
+    # local; the Windows-side ~\.mem0\authority-url (a plain file read: it works while wsl.exe is busy and
+    # travel-mode.ps1 never writes it, so it keeps naming the authority while the replica runs) when it is
+    # not local; the WSL copy of the same file. A local, unspecified, malformed or placeholder URL is never
+    # taken. There is no default host: an unresolved authority is "cannot tell".
+    param([string]$Distro)
+    $usable = { param($u) $u -and -not (Test-IsLocalUrl $u) -and -not (Test-IsPlaceholderUrl $u) }
+    $e = "$env:MEM0_URL".Trim().TrimEnd('/')
+    if (& $usable $e) { return $e }
+    try {
+        $f = Join-Path $env:USERPROFILE '.mem0\authority-url'
+        if (Test-Path -LiteralPath $f) {
+            $w = Get-FirstUrlLine ([System.IO.File]::ReadAllLines($f))
+            if (& $usable $w) { return $w }
+        }
+    } catch {}
+    if ($Distro) {
+        try {
+            $env:WSL_UTF8 = '1'
+            $w = Get-FirstUrlLine (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null)
+            if (& $usable $w) { return $w }
+        } catch {}
+    }
+    return ''
+}
+
 function Test-CacheRefreshDue {
     # 1.35.2: is it time to refresh the local snapshot cache (travel-mode.ps1 refresh, through the
     # mem0-replica-cache-refresh task)? $Record is replica-cache-refresh.json (or $null). Due when there is
@@ -126,9 +173,12 @@ function Write-WatcherLog {
 if ($DefineOnly) { return }
 # --- tick body added in Task 7 ---
 $ErrorActionPreference = 'Continue'
-# Authority resolution: explicit -Authority wins (always honored, even loopback — a
-# deliberate operator choice); else $env:MEM0_URL only when Test-IsLocalUrl rejects it as
-# neither local, unspecified, nor malformed; else the your-machine default. travel-mode.ps1 on sets
+# Authority resolution (Resolve-WatcherAuthority): explicit -Authority wins (always honored, even
+# loopback — a deliberate operator choice, but never the placeholder host); else $env:MEM0_URL only when
+# Test-IsLocalUrl rejects it as neither local, unspecified, nor malformed; else the Windows-side
+# ~\.mem0\authority-url; else the WSL copy of that file; else the tick stops ("cannot tell", no probe,
+# no state change). A busy wsl.exe used to drop the watcher onto the placeholder host, which resolves to
+# nothing, and three such ticks put the box offline while the authority was up. An older travel-mode.ps1 on set
 # the user-scope MEM0_URL to the LOCAL replica — each scheduled-task tick is a fresh process
 # that would otherwise inherit the replica as its "authority", probe it as healthy, and
 # go_online would replay the outbox INTO the disposable local store (one-brain violation).
@@ -137,27 +187,19 @@ $ErrorActionPreference = 'Continue'
 $Distro    = if ($env:MEM0_WSL_DISTRO) { $env:MEM0_WSL_DISTRO } else {
     # wsl.exe emits UTF-16LE by default -> NUL-interleaved capture; WSL_UTF8=1 fixes the
     # encoding at the source, NUL-strip is belt-and-braces for older wsl.exe builds.
+    # A busy or absent wsl.exe leaves the name empty (the WSL read below is then skipped).
     $env:WSL_UTF8 = '1'
-    ((wsl.exe -l -q) -replace "`0", '' | Where-Object { $_.Trim() } | Select-Object -First 1).Trim() }
+    try { "$(((wsl.exe -l -q 2>$null) -replace "`0", '' | Where-Object { "$_".Trim() } | Select-Object -First 1))".Trim() } catch { '' } }
+if ($Authority -and (Test-IsPlaceholderUrl $Authority)) { $Authority = '' }
+if (-not $Authority) { $Authority = Resolve-WatcherAuthority -Distro $Distro }
 if (-not $Authority) {
-    if ($env:MEM0_URL -and -not (Test-IsLocalUrl $env:MEM0_URL)) { $Authority = $env:MEM0_URL }
-    else {
-        # 2026-07-20: fall back to the per-host authority file, NOT straight to the placeholder.
-        # This tick is a scheduled-task process, so $env:MEM0_URL is whatever the user-scope
-        # variable happened to be — and travel-mode.ps1 rewrites that variable as part of its
-        # normal operation. Without this, a cleared or clobbered variable drops the watcher onto
-        # the placeholder host below, which resolves to nothing: every probe fails, the box
-        # decides it is offline, and it wedges itself into travel mode while the brain is up.
-        # The file is the same source the shim and replay-ops read.
-        $fromFile = $null
-        try {
-            $fromFile = (wsl.exe -d $Distro -e bash -lc 'cat ~/.mem0/authority-url 2>/dev/null' 2>$null |
-                         Where-Object { "$_".Trim() -and -not "$_".Trim().StartsWith('#') } | Select-Object -First 1)
-        } catch {}
-        $fromFile = "$fromFile".Trim().TrimEnd('/')
-        if ($fromFile -and -not (Test-IsLocalUrl $fromFile)) { $Authority = $fromFile }
-        else { $Authority = 'http://your-machine:18791' }
-    }
+    # "Cannot tell" is not "offline": with no authority to probe the tick changes nothing, reads and
+    # writes no state, and never probes the placeholder host (a reachable authority would otherwise
+    # look down three ticks running and push this box into travel mode).
+    Write-WatcherLog 'authority unresolved (no -Authority, no non-local MEM0_URL, no non-local ~\.mem0\authority-url, WSL file unreadable or local); skipping this tick without probing'
+    # Non-zero on purpose: the task's last result is what the verifier's offline-watcher row reads, so a
+    # watcher that cannot see its authority shows there instead of staying quiet through a real outage.
+    exit 3
 }
 $StateFile = Join-Path $env:USERPROFILE '.claude\state\offline-mode.json'
 function Wsl([string]$c) { wsl.exe -d $Distro -e bash -lc $c }

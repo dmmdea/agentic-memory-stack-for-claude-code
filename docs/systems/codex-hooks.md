@@ -73,7 +73,7 @@ stop-extract.ps1    (C:\Users\<WIN_USER>\.claude\scripts\, runs in < 2s)
   ▼
 l1a-extract.ps1     (background, 10-min throttle, best-effort — never blocks Claude Code)
   │
-  ├─ Test-Throttle('l1a', 600s) → skip if < 10 min since last successful run
+  ├─ throttle gate → skip if too soon after the last successful run (Codex provider: box-wide, 600 s; Claude API provider: per session, 90 s)
   ├─ Drain-Mem0DeadLetter        → retry any previously-failed POSTs first
   ├─ Wait-Mem0Health             → probe up to 5 times over ~3.5 min; skip if mem0 is still unreachable
   ├─ Get-RecentTranscriptTurns   → last 24 turns, capped at 12KB
@@ -98,7 +98,7 @@ mem0 :18791
 - Extractor: `C:\Users\<WIN_USER>\.claude\scripts\l1a-extract.ps1` (repo: `scripts/windows/l1a-extract.ps1`)
 - Shared helpers: `memory-common.ps1` (repo: `scripts/windows/memory-common.ps1`)
 
-**Throttle:** 10 minutes (600s) between successful extractions. The throttle is marked AFTER a successful Codex call + POST, not before. Prior design marked it before doing any work, which silenced extraction for 10 min on any transient failure. It is one throttle per box, not per session: a session whose turn ends inside another session's 10 minutes is skipped, and its turns wait for that session's next run. A skipped run writes one line to `l1a.log` (`throttled: event=... session=...`), so the share of skipped session ends can be counted.
+**Throttle:** on the Codex provider, 10 minutes (600s) between successful extractions on the box; on the Claude API provider, 90 s per session ([memory capture](../flows/memory-capture.md)). The throttle is marked AFTER a successful Codex call + POST, not before. Prior design marked it before doing any work, which silenced extraction for 10 min on any transient failure. It is one throttle per box, not per session: a session whose turn ends inside another session's 10 minutes is skipped, and its turns wait for that session's next run. A skipped run writes one line to `l1a.log` (`throttled: event=... session=...`), so the share of skipped session ends can be counted.
 
 **Log:** `~/.claude/logs/l1a.log`, rotated at 1MB (keeps 5 archives).
 **Usage log:** `~/.claude/logs/codex-usage.jsonl` — per-call token/duration/status records.
@@ -207,10 +207,10 @@ Extracted facts land in mem0 as `tier=evidence` and become the raw material the 
 - **The daemon is an accelerator, never a dependency** — every failure falls back to a behavior byte-identical to the no-daemon path.
 - **Hooks never block:** stop-extract and the extractor exit 0 always; the client maps a blocking child exit `2` to `0`.
 - **PreCompact snapshots before compaction** — the pre-compaction transcript is preserved for extraction.
-- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator. A run that finds it held waits (polling every 2 s, 20 s by default; `AMS_L1A_LOCK_WAIT_SECONDS` overrides) before it skips. A run that waited re-checks the 10-minute throttle and the transcript cursor once it holds the lock, and releases it without calling Codex when another run on the same transcript finished meanwhile (its window is stale).
+- **One Codex at a time** — the shared mutex serializes the extractor and the consolidator (on the Claude API provider the extractor takes a per-session lock instead: the mutex exists for one subscription's quota). A run that finds it held waits (polling every 2 s, 20 s by default; `AMS_L1A_LOCK_WAIT_SECONDS` overrides) before it skips. A run that waited re-checks the 10-minute throttle and the transcript cursor once it holds the lock, and releases it without calling Codex when another run on the same transcript finished meanwhile (its window is stale).
 - **The ChatGPT login is what Codex authenticates with** — `Invoke-CodexSubagent` clears `OPENAI_API_KEY` and `CODEX_API_KEY` from the child's environment (an API-key credential would preempt the login) and logs the auth mode to `codex.log`, never a credential.
 - **One SessionStart start per session per second** — an atomic per-session marker in `~/.claude/state/` lets exactly one of several same-second SessionStart hooks spawn the extractor.
-- **The throttle is marked only after success** — a transient failure never silences the next 10 minutes.
+- **The throttle is marked only after success** — a transient failure never silences the next window.
 
 ## Error handling
 

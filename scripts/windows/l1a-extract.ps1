@@ -38,18 +38,42 @@ $env:L1A_REENTRANT = '1'
 # Initialize-MemoryEnv above creates it.)
 try { Set-Content -Path (Join-Path $script:StateDir 'last-l1a-attempt') -Value (Get-UnixEpoch) -Encoding UTF8 -NoNewline } catch { }
 
-try {
-    # Throttle: 10 minutes between SUCCESSFUL extractions (not mere fires - audit
+# A held lock is WAITED on (polling every 2 s, 20 s by default) before a run gives up. Skipping at
+# once cost 24% of extractions (114 of 481 runs in one week), and a session whose last Stop skipped
+# was never extracted. AMS_L1A_LOCK_WAIT_SECONDS overrides the bound; it applies to the shared Codex
+# mutex and to the per-session lock alike.
+$lockWaitSeconds = 20
+if ($env:AMS_L1A_LOCK_WAIT_SECONDS -match '^\d{1,3}$') { $lockWaitSeconds = [int]$env:AMS_L1A_LOCK_WAIT_SECONDS }
+
+# The run, as a function so the file reads top to bottom: Invoke-L1aMain (gate, health, which
+# transcripts) -> Invoke-L1aTranscript (the per-session lock, up to N windows) -> Invoke-L1aWindow
+# (one complete pass: window, model call, facts, usage row, cursor, episode). The last line of the file
+# calls Invoke-L1aMain.
+function Invoke-L1aMain {
+    # Who does the LLM work decides the scope: the Codex CLI is one subscription's quota shared by every
+    # job on the box (box-wide gate, shared lock, one window); the Claude API has no shared quota
+    # (per-session gate and lock, several windows). See Get-L1aThrottleScope in memory-common.ps1.
+    $provider = Get-L1aProvider
+    $scope = Get-L1aThrottleScope -Provider $provider
+    $throttleSeconds = Get-L1aThrottleSeconds -Scope $scope
+
+    # The session is named as the episode names it (the hook's id wins; a PreCompact snapshot's file
+    # name is not a session, so the real transcript's name is used when there is one).
+    $primarySource = if ($OriginTranscriptPath) { $OriginTranscriptPath } else { $TranscriptPath }
+    $sessionName = 'unknown'
+    try { if ($SessionId -or $primarySource) { $sessionName = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $primarySource } } catch { }
+    $sessionKey = Get-L1aSessionKey -SessionId $sessionName
+
+    # Throttle: spacing between SUCCESSFUL extractions (not mere fires - audit
     # 2026-06-08: prior code marked the throttle before doing anything, so a
-    # transient health/parse/POST failure silenced the next 10 min)
-    if (-not (Test-Throttle -Name 'l1a' -MinIntervalSeconds 600)) {
+    # transient health/parse/POST failure silenced the next window).
+    # 1.41: on the Claude API the gate is per session (90 s); box-wide 10 min is the Codex quota's.
+    # The skipped turns are not lost: the cursor only moves forward, so the next run picks them up.
+    if (-not (Test-L1aThrottle -Scope $scope -SessionKey $sessionKey -Seconds $throttleSeconds)) {
         # 1.40.1: say so. This exit left no line, so a session whose every Stop fell inside another
-        # session's 10 minutes looked the same in the log as a session whose hook never fired.
-        # The session is named as the episode names it (the hook's id wins; a PreCompact snapshot's
-        # file name is not a session).
-        $throttledSession = 'unknown'
-        try { if ($SessionId -or $TranscriptPath) { $throttledSession = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $TranscriptPath } } catch { }
-        Write-MemoryLog -Component 'l1a' -Message "throttled: event=$EventName session=$throttledSession - a successful extraction ran on this box under 10 min ago, so this run is skipped"
+        # session's window looked the same in the log as a session whose hook never fired.
+        $gateWhy = if ($scope -eq 'session') { "this session was extracted under $throttleSeconds s ago" } else { "a successful extraction ran on this box under $([int]($throttleSeconds / 60)) min ago" }
+        Write-MemoryLog -Component 'l1a' -Message "throttled: event=$EventName session=$sessionName scope=$scope - $gateWhy, so this run is skipped"
         exit 0
     }
 
@@ -75,14 +99,106 @@ try {
         exit 0
     }
 
+    # Housekeeping, one cheap pass per run: per-session stamps and locks, and the cursor files an older
+    # release keyed on a PreCompact snapshot's name, once they are a week old.
+    Remove-L1aOldState
+
+    # The cursor is keyed on the session's REAL transcript. A PreCompact run reads a snapshot (a
+    # byte-for-byte copy taken by stop-extract.ps1, named precompact-snap-<PID>.jsonl); keyed on that
+    # name the real transcript's cursor never moved, so the next Stop re-extracted what PreCompact had
+    # just posted. The reader never reports an offset past the snapshot's length.
+    $cursorPath = $primarySource
+    $useSessionLock = ($provider -eq 'anthropic')
+    $maxWindows = Get-L1aMaxWindows -Provider $provider
+    Invoke-L1aTranscript -ReadPath $TranscriptPath -CursorPath $cursorPath -SourceTranscript $primarySource `
+        -EpisodeSessionHint $SessionId -Scope $scope -SessionKey $sessionKey -Seconds $throttleSeconds `
+        -Provider $provider -MaxWindows $maxWindows -UseSessionLock $useSessionLock | Out-Null
+
+    # SessionStart catch-up (Claude API only): sessions that ended without an extraction that reached their
+    # last turns. A Stop skipped by the 90 s gate, a crash and a closed laptop all leave bytes past the
+    # cursor, and nothing else would come back for them. At most 2 other transcripts that have a cursor and
+    # bytes past it and were last written 15 minutes to 7 days ago (a younger one may be live), most recent
+    # first, one window each, under their own session ids, behind the same gate and lock. No scheduler, no
+    # marker file. AMS_L1A_CATCHUP=0 turns it off.
+    if ($EventName -eq 'SessionStart' -and $provider -eq 'anthropic' -and ([string]$env:AMS_L1A_CATCHUP).Trim() -ne '0') {
+        $projectsRoot = Join-Path (Get-AmsHomeDir) (Join-Path '.claude' 'projects')
+        $mine = @([System.IO.Path]::GetFileNameWithoutExtension($primarySource), $sessionName)
+        foreach ($cand in @(Get-L1aCatchupCandidates -ProjectsRoot $projectsRoot -ExcludeNames $mine -Max 2)) {
+            $candKey = Get-L1aSessionKey -SessionId $cand.BaseName
+            if (-not (Test-L1aThrottle -Scope $scope -SessionKey $candKey -Seconds $throttleSeconds)) {
+                Write-MemoryLog -Component 'l1a' -Message "throttled: event=$EventName session=$($cand.BaseName) scope=$scope - catch-up skipped, this session was extracted under $throttleSeconds s ago"
+                continue
+            }
+            Write-MemoryLog -Component 'l1a' -Message "=== catch-up: session=$($cand.BaseName) transcript=$($cand.FullName) ==="
+            Invoke-L1aTranscript -ReadPath $cand.FullName -CursorPath $cand.FullName -SourceTranscript $cand.FullName `
+                -EpisodeSessionHint '' -Scope $scope -SessionKey $candKey -Seconds $throttleSeconds `
+                -Provider $provider -MaxWindows 1 -UseSessionLock $true | Out-Null
+        }
+    }
+}
+
+function Invoke-L1aTranscript {
+    # One transcript: take the session lock (Claude API) and run up to $MaxWindows windows, each a complete
+    # pass of the pipeline, stopping early when a window has nothing to give or leaves nothing behind.
+    # The session lock is held across the windows, so two events of one session (Stop and PreCompact,
+    # parallel Stops) cannot extract the same window twice; the Codex provider keeps its shared mutex,
+    # taken around each model call inside the window.
+    param(
+        [string]$ReadPath, [string]$CursorPath, [string]$SourceTranscript, [string]$EpisodeSessionHint,
+        [string]$Scope, [string]$SessionKey, [int]$Seconds, [string]$Provider, [int]$MaxWindows, [bool]$UseSessionLock
+    )
+    $lockName = ''
+    if ($UseSessionLock) {
+        $lockName = 'l1a-session-' + $SessionKey + '.lock'
+        $lockResult = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds $lockWaitSeconds -LockName $lockName
+        if (-not $lockResult.acquired) {
+            Write-MemoryLog -Component 'l1a' -Message "  session lock held by another run of this session; skipping this extraction (waited $($lockResult.waited)s)"
+            return
+        }
+        if ($lockResult.waited -gt 0) {
+            Write-MemoryLog -Component 'l1a' -Message "  session lock acquired after $($lockResult.waited)s wait"
+            # The gate was evaluated BEFORE the wait. The run that held the lock has marked it and advanced
+            # the cursor; this run would only post paraphrased near-duplicates of what it just posted.
+            if (-not (Test-L1aThrottle -Scope $Scope -SessionKey $SessionKey -Seconds $Seconds)) {
+                Write-MemoryLog -Component 'l1a' -Message '  another run finished while this one waited for the lock; skipping this extraction'
+                Release-CodexLock -LockName $lockName
+                return
+            }
+        }
+    }
+    try {
+        for ($windowNo = 1; $windowNo -le $MaxWindows; $windowNo++) {
+            $res = @(Invoke-L1aWindow -ReadPath $ReadPath -CursorPath $CursorPath -SourceTranscript $SourceTranscript `
+                -EpisodeSessionHint $EpisodeSessionHint -Scope $Scope -SessionKey $SessionKey -Seconds $Seconds `
+                -WindowNo $windowNo -MaxWindows $MaxWindows -UseSessionLock $UseSessionLock)
+            if ($res.Count -eq 0 -or [string]$res[$res.Count - 1] -ne 'continue') { break }
+        }
+    } finally {
+        if ($lockName) { Release-CodexLock -LockName $lockName }
+    }
+}
+
+function Invoke-L1aWindow {
+    # One complete pass: the next window of text past the cursor, the model call, the facts, the usage
+    # row, the throttle stamp, the cursor, the episode. Returns 'continue' when the cursor stopped short of
+    # the length seen at the start (more to read), else 'stop'. Every early exit is a 'stop' that leaves
+    # the cursor where it was, so the next run re-reads the same window.
+    param(
+        [string]$ReadPath, [string]$CursorPath, [string]$SourceTranscript, [string]$EpisodeSessionHint,
+        [string]$Scope, [string]$SessionKey, [int]$Seconds, [int]$WindowNo, [int]$MaxWindows, [bool]$UseSessionLock
+    )
     # Cursor-aware windowing (2026-07-14): only extract turns appended SINCE the last successful
     # extraction of THIS transcript, so overlapping recent-24-turn windows stop re-emitting the
     # same facts every Stop. $advanceTo is captured NOW (before the slow codex call) so appends
-    # during extraction are picked up next run, not skipped. ANY uncertainty -> full recent window.
+    # during extraction are picked up next run, not skipped. No cursor, a shrink, or a read error ->
+    # the last-24-turns tail, with the cursor set to the length seen.
     $advanceTo = 0L
-    try { $advanceTo = [long](Get-Item -LiteralPath $TranscriptPath).Length } catch { $advanceTo = 0L }
-    $cursor = Get-L1aCursor -TranscriptPath $TranscriptPath
+    try { $advanceTo = [long](Get-Item -LiteralPath $ReadPath).Length } catch { $advanceTo = 0L }
+    $cursor = Get-L1aCursor -TranscriptPath $CursorPath
     $turns = $null
+    $consumedTo = $advanceTo
+    $windowTag = ''
+    if ($MaxWindows -gt 1) { $windowTag = " $WindowNo/$MaxWindows" }
     if ($cursor -gt 0 -and $advanceTo -gt 0 -and $advanceTo -eq $cursor) {
         # transcript is byte-for-byte unchanged since the last successful extraction — nothing new.
         # (The DLQ drain above already retried any previously-failed posts, so this is safe.)
@@ -90,20 +206,45 @@ try {
         # NOT skip — a stale cursor above the file length would silently stop extraction forever.
         # It falls through to the fallback (full window) below, which re-extracts and resets the cursor.
         Write-MemoryLog -Component 'l1a' -Message '  no new transcript content since last extraction; skipping'
-        exit 0
+        return 'stop'
     }
+    $usedWindow = $false
     if ($cursor -gt 0 -and $advanceTo -gt $cursor) {
-        try { $turns = Get-TranscriptTurnsSince -TranscriptPath $TranscriptPath -SinceBytes $cursor -MaxTurns 24 -MaxChars 12000 } catch { $turns = $null }
+        # The forward window: the next 12,000 characters of text past the cursor, read in order. The
+        # old read took the LAST 24 records of the gap and the cursor then jumped to the end of the file,
+        # so everything between the cursor and that tail was never extracted.
+        $win = $null
+        try { $win = Get-TranscriptWindowSince -TranscriptPath $ReadPath -SinceBytes $cursor -MaxChars 12000 } catch { $win = $null }
+        if ($null -ne $win) {
+            $usedWindow = $true
+            if ([string]::IsNullOrWhiteSpace($win.Text)) {
+                # Nothing to extract in what the scan passed: tool results and the like. Move the cursor
+                # past it (those bytes are not re-read) and go on if the scan stopped at its byte bound
+                # rather than at the end. A window that consumed nothing (a partial last line) waits.
+                if ($win.ConsumedTo -gt $cursor) {
+                    Set-L1aCursor -TranscriptPath $CursorPath -Bytes $win.ConsumedTo
+                    Write-MemoryLog -Component 'l1a' -Message "  no text turns in $($win.ConsumedTo - $cursor) bytes past the cursor (window$windowTag); cursor moved on without a model call"
+                    if ($win.ConsumedTo -lt $advanceTo) { return 'continue' }
+                } else {
+                    Write-MemoryLog -Component 'l1a' -Message '  no complete new record past the cursor; skipping'
+                }
+                return 'stop'
+            }
+            $turns = $win.Text
+            $consumedTo = [long]$win.ConsumedTo
+        }
     }
-    if ([string]::IsNullOrWhiteSpace($turns)) {
-        # first extraction of this transcript, a rotation/shrink, an empty since-window, or any
-        # error above: fall back to the unchanged last-24-turns behaviour (never lose extraction).
-        $turns = Get-RecentTranscriptTurns -TranscriptPath $TranscriptPath -MaxTurns 24 -MaxChars 12000
+    if (-not $usedWindow) {
+        # first extraction of this transcript, a rotation/shrink, or a read error above: the unchanged
+        # last-24-turns behaviour (never lose extraction), and the cursor goes to the length seen.
+        $turns = Get-RecentTranscriptTurns -TranscriptPath $ReadPath -MaxTurns 24 -MaxChars 12000
+        $consumedTo = $advanceTo
     }
     if ([string]::IsNullOrWhiteSpace($turns)) {
         Write-MemoryLog -Component 'l1a' -Message '  empty turns, aborting'
-        exit 0
+        return 'stop'
     }
+    Write-MemoryLog -Component 'l1a' -Message "  window${windowTag}: cursor=$cursor consumed_to=$consumedTo length=$advanceTo chars=$($turns.Length)"
 
     # EPHEMERA GATE (gate verdict 2026-08-19, memory-frontier hand-label): of the 60
     # memories the mechanical audit accused, only 5 were genuinely stale while 20
@@ -159,27 +300,33 @@ $turns
     # 2026-09: a run that finds the lock held now WAITS (polling every 2 s, 20 s by default) before it
     # gives up. Skipping at once cost 24% of extractions (114 of 481 runs in one week), and a session
     # whose last Stop skipped was never extracted. AMS_L1A_LOCK_WAIT_SECONDS overrides the bound.
-    $lockWaitSeconds = 20
-    if ($env:AMS_L1A_LOCK_WAIT_SECONDS -match '^\d{1,3}$') { $lockWaitSeconds = [int]$env:AMS_L1A_LOCK_WAIT_SECONDS }
-    $lockResult = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds $lockWaitSeconds
-    if (-not $lockResult.acquired) {
-        Write-MemoryLog -Component 'l1a' -Message "  codex lock held by another worker; skipping this extraction (waited $($lockResult.waited)s)"
-        exit 0
-    }
-    if ($lockResult.waited -gt 0) {
-        Write-MemoryLog -Component 'l1a' -Message "  codex lock acquired after $($lockResult.waited)s wait"
-        # The throttle and the turn window above were evaluated BEFORE the wait. A run on the same
-        # transcript (Stop + PreCompact, parallel Stops) may have finished meanwhile: it marked the
-        # throttle and advanced the cursor, so this window is stale, and running codex on it would
-        # spend quota and post paraphrased near-duplicates that the server's byte-identical hash
-        # cannot catch. Re-check both, and give the lock back if the work is already done.
-        $cursorNow = Get-L1aCursor -TranscriptPath $TranscriptPath
-        $throttleBlocks = -not (Test-Throttle -Name 'l1a' -MinIntervalSeconds 600)
-        $cursorReached = ($cursorNow -ne $cursor) -and ($advanceTo -gt 0) -and ($cursorNow -ge $advanceTo)
-        if ($throttleBlocks -or $cursorReached) {
-            Write-MemoryLog -Component 'l1a' -Message '  another run finished while this one waited for the lock; skipping this extraction'
-            Release-CodexLock
-            exit 0
+    # The wait bound is read at the top of the file. On the Claude API this mutex is not taken at all:
+    # its reason (one subscription's quota) does not apply there, and the per-session lock taken in
+    # Invoke-L1aTranscript is held across the whole window instead.
+    $codexLockTaken = $false
+    if (-not $UseSessionLock) {
+        $lockResult = Acquire-CodexLockWithWait -Owner 'l1a' -WaitSeconds $lockWaitSeconds
+        if (-not $lockResult.acquired) {
+            Write-MemoryLog -Component 'l1a' -Message "  codex lock held by another worker; skipping this extraction (waited $($lockResult.waited)s)"
+            return 'stop'
+        }
+        $codexLockTaken = $true
+        if ($lockResult.waited -gt 0) {
+            Write-MemoryLog -Component 'l1a' -Message "  codex lock acquired after $($lockResult.waited)s wait"
+            # The throttle and the turn window above were evaluated BEFORE the wait. A run on the same
+            # transcript (Stop + PreCompact, parallel Stops) may have finished meanwhile: it marked the
+            # throttle and advanced the cursor, so this window is stale, and running codex on it would
+            # spend quota and post paraphrased near-duplicates that the server's byte-identical hash
+            # cannot catch. Re-check both, and give the lock back if the work is already done.
+            $cursorNow = Get-L1aCursor -TranscriptPath $CursorPath
+            # (From window 2 on the stamp is this run's own, so only the cursor says whether another run got there.)
+            $throttleBlocks = ($WindowNo -eq 1) -and -not (Test-L1aThrottle -Scope $Scope -SessionKey $SessionKey -Seconds $Seconds)
+            $cursorReached = ($cursorNow -ne $cursor) -and ($advanceTo -gt 0) -and ($cursorNow -ge $advanceTo)
+            if ($throttleBlocks -or $cursorReached) {
+                Write-MemoryLog -Component 'l1a' -Message '  another run finished while this one waited for the lock; skipping this extraction'
+                Release-CodexLock
+                return 'stop'
+            }
         }
     }
 
@@ -201,10 +348,10 @@ $turns
         Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs ([int]((Get-Date) - $codexStart).TotalMilliseconds) `
             -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor -Outcome $failOutcome
         Remove-CodexLastMessagePath -Path $lastMsgPath   # every exit path clears its own -o file
-        Release-CodexLock
-        exit 0
+        if ($codexLockTaken) { Release-CodexLock }
+        return 'stop'
     }
-    Release-CodexLock
+    if ($codexLockTaken) { Release-CodexLock }
     $codexDurationMs = [int]((Get-Date) - $codexStart).TotalMilliseconds
     $codexTokens = (Parse-CodexTokenUsage -RawOutput $raw)
 
@@ -215,7 +362,7 @@ $turns
             -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor `
             -ModelResolved $codexHdr.Model -EffortResolved $codexHdr.Effort -Outcome 'empty'
         Remove-CodexLastMessagePath -Path $lastMsgPath
-        exit 0
+        return 'stop'
     }
 
     # Extract just the model response from Codex's verbose output, then parse JSON
@@ -231,7 +378,7 @@ $turns
         Write-CodexUsageLog -Component 'l1a' -Status 'error' -DurationMs $codexDurationMs -TokensUsed $codexTokens `
             -ModelRequested $script:AmCodexModelClassify -EffortRequested $script:CodexEffortExtractor `
             -ModelResolved $codexHdr.Model -EffortResolved $codexHdr.Effort -Outcome 'parse_fail'
-        exit 0
+        return 'stop'
     }
 
     $facts = @($parsed.facts)
@@ -257,7 +404,7 @@ $turns
     # The transcript the session actually lives in: it differs from -TranscriptPath only for a
     # PreCompact snapshot (a temp copy named precompact-snap-<PID>.jsonl, whose directory routes
     # to no brand). Workspace and brand are read from THIS path, for the facts and the episode alike.
-    $sourceTranscript = if ($OriginTranscriptPath) { $OriginTranscriptPath } else { $TranscriptPath }
+    $sourceTranscript = $SourceTranscript
 
     # C3: resolve the brand BEFORE the facts loop. The episode below used to be the only record
     # that carried a brand (the call sat after the loop), so every fact was brand-neutral and
@@ -310,8 +457,11 @@ $turns
     # which is what the old early-exit reported before the episode POST was reached.
     $usageStatus = if ($facts.Count -eq 0) { 'empty' } else { 'ok' }
     Write-CodexUsageLog -Component 'l1a' -TokensUsed ($codexTokens -as [int]) -DurationMs $codexDurationMs -Status $usageStatus -FactsPosted $posted
-    Mark-Throttle -Name 'l1a'
-    Set-L1aCursor -TranscriptPath $TranscriptPath -Bytes $advanceTo   # this window was processed; next run only scans NEW turns
+    # The box-wide last-l1a stamp is written whatever the scope (the health and verifier rows read it).
+    Mark-L1aThrottle -Scope $Scope -SessionKey $SessionKey
+    # This window was processed; the cursor goes to where the window stopped (the whole length seen,
+    # for the tail read), so the next window or run starts exactly there.
+    Set-L1aCursor -TranscriptPath $CursorPath -Bytes $consumedTo
 
     # Phase 3: if ship-logs exist but no episode is being posted they are dropped from
     # durable storage. Do NOT force-create an episode and do NOT write ship-logs to mem0.
@@ -333,7 +483,7 @@ $turns
             # transcript file name (format: <project-dir>/<uuid>.jsonl). A PreCompact snapshot is
             # named precompact-snap-<PID>, which is not a session.
             # (PowerShell variables are case-insensitive: the local must not shadow the -SessionId parameter.)
-            $episodeSessionId = Resolve-L1aSessionId -SessionId $SessionId -TranscriptPath $TranscriptPath
+            $episodeSessionId = Resolve-L1aSessionId -SessionId $EpisodeSessionHint -TranscriptPath $ReadPath
 
             # brand/workspace/project: $brandInfo was resolved above from $sourceTranscript (the real
             # transcript, not a PreCompact snapshot), before the facts loop.
@@ -397,6 +547,14 @@ $turns
         }
     }
 
+    # More to read past this window's cursor? (Never true on a tail read: that sets the cursor to the
+    # length seen.) Stopping on 'stop' is how a run ends early when a window has nothing to give.
+    if ($consumedTo -lt $advanceTo) { return 'continue' }
+    return 'stop'
+}
+
+try {
+    Invoke-L1aMain
 } catch {
     Write-MemoryLog -Component 'l1a' -Message "  unhandled error: $_"
 } finally {

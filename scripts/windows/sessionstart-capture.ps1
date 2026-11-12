@@ -16,7 +16,8 @@
 #
 # Fire-and-forget: spawns the worker DETACHED and exits 0 immediately so session start never blocks.
 # A per-transcript watermark (file name + mtime, not path) prevents re-capturing the same prior session
-# on repeated starts; the extractor's own 10-min throttle + mem0 dedup bound cost further.
+# on repeated starts; the extractor's own throttle + mem0 dedup bound cost further. On the Claude API provider the extractor
+# also runs the bounded catch-up for other transcripts (l1a-extract.ps1; AMS_L1A_CATCHUP=0 turns it off).
 #
 # Claude Code SessionStart payload (stdin JSON): { session_id, transcript_path, cwd, source,
 # hook_event_name }; source in {startup, resume, clear, compact}.

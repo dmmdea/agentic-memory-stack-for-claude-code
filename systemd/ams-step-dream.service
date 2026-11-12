@@ -5,6 +5,8 @@ After=mem0.service
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 LoadCredentialEncrypted=ams-api-key:__SECRETS_DIR__/ams-api-key.cred
 Environment=MEM0_API_KEY_FILE=%d/ams-api-key
 Environment=MEM0_HOST_KIND=native

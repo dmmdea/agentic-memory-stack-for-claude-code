@@ -16,6 +16,7 @@ raced through the throttle gap and both built); a lock older than 30 min is recl
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +57,19 @@ def _acquire_lock(lock: Path) -> bool:
             return False
 
 
+def _write_outcome(counts: dict) -> None:
+    """Step outcome (C1, scripts/wsl/ams-step.sh): one line `ok <json counts>` to $AMS_OUTCOME_FILE so the
+    receipt shows whether the index was built or the run was a throttle/lock skip. Best-effort: a failed
+    write never changes the exit code. A failed build writes nothing (its non-zero exit is the receipt)."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(f"ok {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        ams_env.log(COMPONENT, f"outcome file write failed (non-fatal): {e}")
+
+
 def main(argv=None, runner=_run_deployed) -> int:
     p = argparse.ArgumentParser(description="decoupled MEMORY.md index refresh")
     p.add_argument("--min-interval-s", type=int, default=DEFAULT_INTERVAL_S)
@@ -63,10 +77,12 @@ def main(argv=None, runner=_run_deployed) -> int:
     a = p.parse_args(argv)
     if not a.force and not ams_env.throttle_ok(COMPONENT, a.min_interval_s):
         ams_env.log(COMPONENT, "skip: throttle (index built within the interval)")
+        _write_outcome({"built": 0, "skipped_throttle": 1})
         return 0
     lock = ams_env.state_dir() / "locks" / "index-refresh.lock"
     if not _acquire_lock(lock):
         ams_env.log(COMPONENT, "skip: another refresh holds the lock")
+        _write_outcome({"built": 0, "skipped_locked": 1})
         return 0
     try:
         rc, out = runner("memory-index-build.py")
@@ -77,6 +93,7 @@ def main(argv=None, runner=_run_deployed) -> int:
             return rc
         ams_env.mark_throttle(COMPONENT)
         ams_env.log(COMPONENT, "MEMORY.md index refreshed (decoupled from dream)")
+        _write_outcome({"built": 1})
         return 0
     finally:
         try:

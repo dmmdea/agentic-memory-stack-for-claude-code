@@ -5,6 +5,8 @@ After=mem0.service ams-step-pcloud-copy.service
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh health-stamp /bin/bash %h/apps/mem0-scripts/ams-health-stamp.sh
 
 [Install]

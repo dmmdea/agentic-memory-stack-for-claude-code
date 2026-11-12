@@ -26,6 +26,11 @@
 param([switch]$Quiet)
 
 $ErrorActionPreference = 'Continue'
+# wsl.exe maps the caller's current directory into the distro and prints "wsl: Failed to translate '<path>'"
+# on stderr for a drive it cannot map (a cloud-synced or removable drive). Run from the user profile, which
+# it always maps, and put the caller's directory back before the script ends.
+$script:TmsStartLocation = (Get-Location).Path
+try { Set-Location -LiteralPath $env:USERPROFILE } catch { $script:TmsStartLocation = $null }
 
 # --------------------------------------------------------------------------
 # v1.0 Phase 7A: operator receipt — resolve the four operator-specific
@@ -364,9 +369,21 @@ if ($key) {
 }
 
 # L7: MEMORY.md exists and is fresh
+# Replica: the index is rebuilt on the brain; the copy under this box's WSL home is dormant (frozen at
+# the cutover to the authority), and memory-index-refresh.ps1 skips on a replica by design. Its age is
+# read from the authority's health (job_liveness.gather_age_h, the age of the gather receipt) instead.
 try {
     $memPath = "$TmsHomeUnc\.mem0\MEMORY.md"
-    if (Test-Path $memPath) {
+    if ($TmsIsReplica) {
+        $jlM = if ($hd -and $hd.checks) { $hd.checks.job_liveness } else { $null }
+        $gatherH = if ($jlM) { $jlM.gather_age_h } else { $null }
+        if ($null -ne $gatherH) {
+            if ($gatherH -lt 192) { Add-Check 'LIVENESS' 'MEMORY.md' 'OK'   "replica role: index is rebuilt on the brain; authority's last gather $([int]$gatherH)h ago (job_liveness.gather_age_h via /health/deep); the local copy is dormant and not read" }
+            else                  { Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' "replica role: authority's index gather is $([int]($gatherH / 24))d old (job_liveness.gather_age_h via /health/deep) - the brain's memory-index step is not completing" }
+        } else {
+            Add-Check 'LIVENESS' 'MEMORY.md' 'WARN' 'replica role: index is rebuilt on the brain; the authority did not report its gather age (/health/deep unavailable or no job_liveness.gather_age_h), so it was not read - the local copy is dormant and is not judged'
+        }
+    } elseif (Test-Path $memPath) {
         $age   = (Get-Date) - (Get-Item $memPath).LastWriteTime
         $lines = (Get-Content $memPath | Measure-Object -Line).Lines
         if ($age.TotalDays -lt 8) { Add-Check 'LIVENESS' 'MEMORY.md' 'OK'   "${lines} lines, $([int]$age.TotalHours)h old" }
@@ -503,7 +520,12 @@ try {
         } else {
             # W4: every row now has a probe. An 'unknown' here is an honest
             # zero-signal state (idle box, no traffic yet), NOT a missing probe.
-            Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities (role=$($cap.role)); $($unk.Count) unknown (zero-signal on this box - see docs/capability-manifest.md for each row's exerciser)"
+            # On a replica the manifest is the AUTHORITY's: its role and its unknowns describe the authority, not this box.
+            if ($TmsIsReplica) {
+                Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities on the authority (authority role=$($cap.role), via /health/deep); $($unk.Count) unknown there (zero-signal on the authority - see docs/capability-manifest.md for each row's exerciser)"
+            } else {
+                Add-Check 'LIVENESS' 'capability manifest' 'OK' "no dead required capabilities (role=$($cap.role)); $($unk.Count) unknown (zero-signal on this box - see docs/capability-manifest.md for each row's exerciser)"
+            }
         }
     }
 } catch { Add-Check 'LIVENESS' 'capability manifest' 'WARN' $_.Exception.Message }
@@ -1012,7 +1034,15 @@ try {
             Add-Check 'INVARIANTS' 'offload no-block (R-offload)' 'WARN' "settings.json hooks not found/parseable at $settingsPath (fail-open)"
         } else {
             $inv = Test-OffloadNoBlockInvariant -Hooks $hooksObj
-            Add-Check 'INVARIANTS' 'offload no-block (R-offload)' $inv.Status $inv.Detail
+            # The lib answers WARN both for "a foreign hook fires and no producer was found in the script
+            # it names" (the script was read; nothing to act on) and for "a script could not be read" (the
+            # check did not finish). Only the second is a WARN: it carries 'NOT VERIFIED'. The first is OK
+            # with its note, so a hook the operator knowingly runs does not keep the verdict DEGRADED.
+            if ($inv.Status -eq 'WARN' -and "$($inv.Detail)" -match '^a foreign PreToolUse hook fires' -and "$($inv.Detail)" -notmatch 'NOT VERIFIED') {
+                Add-Check 'INVARIANTS' 'offload no-block (R-offload)' 'OK' $inv.Detail
+            } else {
+                Add-Check 'INVARIANTS' 'offload no-block (R-offload)' $inv.Status $inv.Detail
+            }
         }
     }
 } catch { Add-Check 'INVARIANTS' 'offload no-block (R-offload)' 'WARN' "fail-open: $($_.Exception.Message)" }
@@ -2181,8 +2211,18 @@ if ($lastL1a) { Add-Info 'L1a last activity' 'OK' $lastL1a } else { Add-Info 'L1
 
 Add-Info 'memory authority' 'OK' "role=$(if ($TmsRole) { $TmsRole } else { 'unknown' }) -> $TmsAuthorityUrl"
 
-$lastDream = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\dream.log"
-if ($lastDream) { Add-Info 'Dream last activity' 'OK' $lastDream } else { Add-Info 'Dream last activity' 'WARN' 'no dream.log yet (fires nightly 3am)' }
+# Replica: the dream runs on the brain, so no dream.log can exist here; the authority's own health says
+# when it last ran (job_liveness.last_dream_age_h). Whether that age is acceptable is judged by the
+# capability manifest row, not here.
+if ($TmsIsReplica) {
+    $jlD = if ($hd -and $hd.checks) { $hd.checks.job_liveness } else { $null }
+    $dreamH = if ($jlD) { $jlD.last_dream_age_h } else { $null }
+    if ($null -ne $dreamH) { Add-Info 'Dream last activity' 'OK' "replica role: the dream runs on the brain; last ran $([int]$dreamH)h ago (authority job_liveness.last_dream_age_h)" }
+    else                   { Add-Info 'Dream last activity' 'OK' 'replica role: the dream runs on the brain; the authority did not report its last dream age (see the capability manifest row)' }
+} else {
+    $lastDream = Get-LastLogLine -Path "$env:USERPROFILE\.claude\logs\dream.log"
+    if ($lastDream) { Add-Info 'Dream last activity' 'OK' $lastDream } else { Add-Info 'Dream last activity' 'WARN' 'no dream.log yet (fires nightly 3am)' }
+}
 
 $dlq = "$env:USERPROFILE\.claude\state\mem0-post-failures.jsonl"
 if (Test-Path -LiteralPath $dlq) {
@@ -2190,12 +2230,18 @@ if (Test-Path -LiteralPath $dlq) {
     if ($n -gt 0) { Add-Info 'mem0 DLQ' 'WARN' "$n queued failures — will drain on next L1a/C1 run" }
 }
 
-try {
-    $flags = wsl.exe -d $TmsDistro -e bash -lc "wc -l < /home/$TmsWslUser/.mem0/audit-flags.jsonl 2>/dev/null"
-    $flagN = ($flags -as [string]).Trim()
-    if ($flagN -as [int] -gt 1000) { Add-Info 'L10 audit flags' 'WARN' "$flagN flags — large; review periodically" }
-    else                            { Add-Info 'L10 audit flags' 'OK'   "$flagN flags" }
-} catch {}
+if ($TmsIsReplica) {
+    # The ledger is the brain's; the local file is frozen at the cutover, so counting it reports a
+    # stale number. No health field carries the count, so say where it lives.
+    Add-Info 'L10 audit flags' 'OK' 'replica role: the flag ledger lives on the brain (not counted here; the local copy is frozen)'
+} else {
+    try {
+        $flags = wsl.exe -d $TmsDistro -e bash -lc "wc -l < /home/$TmsWslUser/.mem0/audit-flags.jsonl 2>/dev/null"
+        $flagN = ($flags -as [string]).Trim()
+        if ($flagN -as [int] -gt 1000) { Add-Info 'L10 audit flags' 'WARN' "$flagN flags — large; review periodically" }
+        else                            { Add-Info 'L10 audit flags' 'OK'   "$flagN flags" }
+    } catch {}
+}
 
 
 # ==========================================================================
@@ -2242,9 +2288,12 @@ Write-Host ''
 if ($failCount -eq 0 -and $warnCount -eq 0) {
     Write-Host "  Memory stack: HEALTHY (3/3 dimensions GREEN; $totalPass checks PASS)" -ForegroundColor Green
 } elseif ($failCount -eq 0) {
-    Write-Host "  Memory stack: DEGRADED ($dimSummary; $totalPass PASS, $totalWarn WARN)" -ForegroundColor Yellow
+    # Name the WARN rows on the top line: a bare count sends the reader to scan every table for them.
+    $warnNames = (@($allRows | Where-Object { $_.Status -eq 'WARN' } | ForEach-Object { $_.Component }) -join ', ')
+    Write-Host "  Memory stack: DEGRADED ($dimSummary; $totalPass PASS, $totalWarn WARN: $warnNames)" -ForegroundColor Yellow
 } else {
     Write-Host "  Memory stack: UNHEALTHY ($dimSummary; $totalPass PASS, $totalWarn WARN, $totalFail FAIL)" -ForegroundColor Red
 }
 
+try { if ($script:TmsStartLocation) { Set-Location -LiteralPath $script:TmsStartLocation } } catch {}
 if ($totalFail -gt 0) { exit 1 } else { exit 0 }

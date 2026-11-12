@@ -6,6 +6,8 @@ RequiresMountsFor=%h/pCloudDrive
 
 [Service]
 Type=oneshot
+# Files this unit creates are readable by their owner only (state holds full memory text).
+UMask=0077
 ExecStart=/bin/bash %h/apps/mem0-scripts/ams-step.sh pcloud-copy /bin/bash %h/apps/mem0-scripts/ams-pcloud-copy.sh
 
 [Install]

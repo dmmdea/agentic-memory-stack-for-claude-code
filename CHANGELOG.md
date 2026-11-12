@@ -4,6 +4,145 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.41.0 — capture reads forward from its cursor, search masks stored credentials, the verifier stops crying wolf (2026-11-12)
+
+### Fixed
+- The capture extractor's throttle was one box-wide stamp, so on the Claude API provider every session waited
+  behind every other session's last success and a throttled run queued nothing. The gate is now per session (a
+  stamp named for the session, 90 s; AMS_L1A_THROTTLE_SECONDS, 10..3600). The Codex provider keeps the box-wide
+  600 s gate, and AMS_L1A_THROTTLE_SCOPE=box forces it on any provider. The box-wide last-l1a stamp is still
+  written on every success. The 'throttled:' log line now names the scope.
+- The extractor took the last 24 records of the gap past its cursor and then moved the cursor to the end of the
+  file, so everything between the old cursor and that tail was never extracted. It now reads forward from the
+  cursor, 12,000 characters of text per window, and the cursor moves to the end of what was read (always a
+  record boundary, never past the length seen, never into a partial last line). Tool-only stretches are passed
+  without a model call. A transcript with no cursor still gets the old first-run tail read.
+- A PreCompact run keyed its cursor on the temp snapshot's file name, so the real transcript's cursor never
+  moved (and every compaction left an orphan cursor file) and the next Stop re-extracted what PreCompact had
+  just posted. The cursor is now keyed on the real transcript, and cursor files named for precompact-snap-*
+  older than 7 days are pruned.
+- On the Claude API provider the extractor no longer takes the shared Codex mutex (its reason is one
+  subscription's quota) and takes a per-session lock instead, so two events of the same session cannot extract
+  the same window twice; a run that waited for it re-checks the gate. Per-session stamps and locks older than 7
+  days are pruned.
+- The nightly line floor never fired. It treated every judge decision as shielding its slug, KEEP included, and
+  the judge decides every slug it is offered and keeps by default, so on a store that stayed over its line
+  trigger the floor's pool was always empty and the index kept growing toward the 200-line injection cutoff.
+  Only MIGRATE and SHORTEN now shield a slug; a KEEP on a pullable project or reference fact no longer does
+  when the store is over its line trigger. The debt arithmetic, oldest-first order, blast cap and
+  unreadable-sorts-last rule are unchanged.
+- The over-trigger stamp file was rewritten on every maintenance pass for a store under its trigger, costing a
+  tracked-file commit (and a push) each time for a store nobody touched. A store that is under its trigger with
+  no live stamp and a tombstone on record now writes nothing; a real clear still writes a fresh tombstone and
+  the merge rule is unchanged.
+- The session-start G7 alarm said 'over trigger without an applied decision ... the hub judge has not decided;
+  check the nightly chain' even when the judge had applied a decision every night, because the clock is
+  continuous time over the trigger. The alarm now states the hours, the store's lines against the 160-line
+  trigger and bytes against the 20,000 B trigger, and the last run and last decision with their ages, and names
+  the judge or the chain only when no decision was applied inside 36 hours.
+- A non-ASCII X-API-Key (or X-User-Direct-Token) made hmac.compare_digest raise TypeError on str arguments, so
+  an unauthenticated request got a 500. Both now compare bytes and answer 401 (403 for the direct token).
+- On a native authority the l1a-extraction capability row was always unknown, because it read stamps that exist
+  only on the PCs. /health/deep now embeds the episodic store's capture block as checks.capture, and with
+  neither PC-side stamp present the row takes its verdict from it (ok alive, stalled degraded and never dead,
+  quiet or unknown unknown). A WSL-hosted brain keeps the two-signal rule.
+- `job_liveness` reported 'sessionstart_banner: missing/unparseable' as an error on every read on a native
+  authority, where that stamp can never exist. The note is no longer emitted when MEM0_HOST_KIND=native.
+- An open question raised again and deduplicated against an existing open row left that row's updated_at alone,
+  so the 30-day auto-abandon retired a recurring question 30 days after its first sighting. The row is now
+  refreshed on each sighting.
+- `docs/flows/memory-retrieval.md` presented the relevance gate as a precision lever. On a replay of real prompts
+  it only separated off-domain prompts (which abstain), with useful and useless hits in the same cosine band;
+  the text says so.
+- The offline watcher no longer declares a reachable authority offline when wsl.exe is busy. It used to fall
+  onto a placeholder host that resolves to nothing, and three ticks later it took the box offline. It now
+  resolves the authority from -Authority, then a non-local MEM0_URL, then the Windows-side
+  ~\.mem0\authority-url, then the WSL copy. With none of them it logs one line and ends the tick with exit
+  code 3, without probing or touching its state file; the non-zero task result makes the verifier's watcher
+  row warn, so a watcher that cannot see its authority is not silent.
+- `travel-mode.ps1` no longer throws a type-conversion error when wsl.exe answers the outbox-size query with its
+  own status text. The count is read with WSL_UTF8 set and NULs stripped, and parsed with TryParse. A
+  non-number is a warning that quotes what came back. `on` skips the drain instead of aborting (the watcher
+  then no longer restores an older snapshot because of it), `off` stays in travel mode unless -Force, and
+  `status` prints 'unknown'.
+- On a replica, the verifier's MEMORY.md, 'Dream last activity' and 'L10 audit flags' rows read the authority's
+  health (job_liveness.gather_age_h and last_dream_age_h) or say the ledger lives on the brain, instead of
+  judging files frozen at the cutover to the authority. The capability-manifest row labels the role and the
+  unknowns as the authority's.
+- The verifier's 'offload no-block' row is OK, with its note, when a foreign hook's script was read and no
+  memory-context producer was found. It is WARN only when a script could not be read.
+- The verifier runs from the user profile and restores the caller's directory at the end, so wsl.exe no longer
+  prints "wsl: Failed to translate" when the current directory is on a drive WSL cannot map.
+- The PC-side wiki catch-up's detached refresh child had no stdout or stderr and nothing recorded how it ended.
+  Its output now goes to ~/.claude/logs/wiki-index-refresh.log (bounded at 512 KB), with a START line and an
+  'EXIT ... status=<code>' line from a wrapper shell, and the 'starting' line in wiki-index-catchup.log names
+  that log.
+- `contradiction-sweep.py --dismiss` only dropped the review-queue line, so the weekly sweep judged the same
+  pair YES again and re-asked the operator (half of the dismissed lines came back). It now records each
+  dismissed pair, with a hash of both texts, in `~/.mem0/contradiction-dismissed.jsonl`, and does not queue the
+  pair again until one of its texts changes; skips are counted as `suppressed_dismissed` in the step outcome
+  line.
+- `key-backup.sh` passed with 'verified in 2 destinations' while holding no key at all (on a native authority
+  the keys are systemd credentials, not files). It now exits 4 and names the missing canonical or API key,
+  writes nothing, and on a native authority says that a sealed credential cannot be backed up by this script
+  and points to the documented procedure; `--allow-partial` keeps the old lenient behaviour and labels the
+  bundle partial.
+- The morning summary printed `dream: 0 signal(s), 0 tokens` on the nights the dream's insight pass is skipped
+  by its weekly cadence, which read as a dead dream. It now says the insight pass was skipped by its weekly
+  cadence.
+- `decay-scan`, `goals-stale-sweep`, `goal-recurrence-promote` and `memory-index-refresh` receipted `work={}`,
+  so their effect never reached the receipt, the health endpoint or the morning summary. Each now writes `ok
+  {counts}` to the step outcome file (best-effort; a failed write never changes the exit code).
+- `mem0.service`, every `ams-step-*.service` and `l10-audit.service` ran with the default umask, leaving the
+  state directory's memory text readable by every local account. They now set `UMask=0077`, so files they
+  create are owner-only.
+- The docs called the canonical key irreplaceable in one place and replaceable in another. The key only signs
+  short-lived user-direct tokens, no stored record depends on it, so a lost key costs no data (canonical and
+  insight writes are refused until a key is back); key-custody.md, data-backup.md and key-backup.sh now say so.
+
+### Added
+- Bounded catch-up inside one run. When a processed window leaves the cursor short of the length seen at the
+  start, the next window runs (a full pass each), up to 3 windows per run on the Claude API provider and 1 on
+  Codex; AMS_L1A_MAX_WINDOWS (1..5) overrides.
+- SessionStart catch-up on the Claude API provider. After the prior session, the extractor runs one window each
+  for up to 2 other transcripts that have a cursor and bytes past it and were last written 15 minutes to 7 days
+  ago, most recent first, under their own session ids with the same gate and lock. AMS_L1A_CATCHUP=0 turns it
+  off.
+- Each store row of lint-summary.json carries `last_status_at` and `last_decision_at` (whole-second Zulu,
+  omitted when there is no receipt in 7 days), and `judge-apply --candidates --json` carries the store's
+  `lines`, `line_trigger` and `line_target`.
+- `judge-apply --dry-run` lists every change it would make, the line floor's included (`would MIGRATE <slug>
+  (line floor)`; a `planned` array under `--json`), and still posts nothing and changes no store file.
+- The reads that hand stored text to a model by query now mask credential-shaped text: POST
+  /v1/memories/search, POST /v1/context/bundle (memories, goals, open questions and the raw_fallback
+  snippet, masked before its length cut), POST /v1/episodes/search and POST /v1/open_questions/search. A
+  changed item carries the masked text and redacted: true. GET by id, list and every write response stay
+  unmasked on purpose. MEM0_READ_REDACT=0 turns it off. /health/deep reports
+  checks.read_redactions_today (informational).
+- Two guards keep the mask out of the store. "raw": true on the search body skips the masking for a job
+  that compares stored text (the nightly consolidation's canonical dedup sends it). PUT /v1/memories/{id}
+  answers 409 when the new text would replace a stored credential-shaped span with a redaction placeholder,
+  the shape of an edit built from a masked search result; "allow_redaction_marker": true applies it anyway
+  (a deliberate scrub).
+- The retrieval log row gains returned_cosines and returned_scores, aligned with returned_top_ids (null where
+  absent); numbers only, no text or query.
+- MEM0_BUNDLE_MEMORY_CAP_FRONTIER and MEM0_BUNDLE_MEMORY_CAP_SMALL (integer 0 to 3) override the per-tier
+  memory cap at start; unset or invalid keeps the defaults of 2 and 1, which do not change.
+- `stack-backup.sh` copies `contradiction-dismissed.jsonl` into each backup set
+  (`contradiction-dismissed-<TS>.jsonl`, eight kept).
+- `key-backup.sh --allow-partial`, and a 'Native authority' section in key-custody.md.
+
+### Changed
+- Acquire-CodexLock, Acquire-CodexLockWithWait and Release-CodexLock take an optional -LockName (default
+  codex.lock, so every existing caller is unchanged). Get-TranscriptTurnsSince is replaced by
+  Get-TranscriptWindowSince.
+- The store-judge prompt tells the judge the store's line count against the trigger and target. Over the
+  trigger it says MIGRATE is the preferred verdict for a pullable project or reference fact and that KEEP does
+  not protect it from the oldest-first line floor. The prompt's injection-defense structure is unchanged.
+- When the verdict is DEGRADED, the top line now names the WARN rows.
+
+- Plugin manifests to 1.41.0.
+
 ## 1.40.1 — the dream's first step no longer probes Codex on a Claude API box (2026-11-05)
 
 ### Fixed

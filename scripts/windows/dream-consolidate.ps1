@@ -663,7 +663,7 @@ try {
         $canonicalResp = Invoke-RestMethod -Uri "$($script:Mem0Url)/v1/memories/search" `
             -Method Post `
             -Headers @{'X-API-Key' = $ckeyForFetch; 'Content-Type' = 'application/json'} `
-            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = 'canonical facts'; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 500; threshold = 0.0 } | ConvertTo-Json -Depth 4 -Compress))) `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ query = 'canonical facts'; filters = @{ tier = 'canonical'; user_id = $DcWslUser }; limit = 500; threshold = 0.0; raw = $true } | ConvertTo-Json -Depth 4 -Compress))) `
             -TimeoutSec 10
         if ($canonicalResp -and $canonicalResp.results) {
             $canonicalFacts = @($canonicalResp.results | ForEach-Object { $_.memory })

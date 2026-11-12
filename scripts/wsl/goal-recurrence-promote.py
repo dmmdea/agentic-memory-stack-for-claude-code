@@ -81,6 +81,18 @@ def _append_receipt(outcome: str, **fields) -> None:
         print(f"goal-recurrence-promote: receipt append failed (non-fatal): {e}", flush=True)
 
 
+def _write_outcome(counts: dict) -> None:
+    """Step outcome (C1, scripts/wsl/ams-step.sh): one line `ok <json counts>` to $AMS_OUTCOME_FILE so the
+    step receipt carries what the run did. Best-effort: a failed write never changes the exit code."""
+    path = os.environ.get("AMS_OUTCOME_FILE")
+    if not path:
+        return
+    try:
+        Path(path).write_text(f"ok {json.dumps(counts, separators=(',', ':'))}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"goal-recurrence-promote: outcome file write failed (non-fatal): {e}", flush=True)
+
+
 def _iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -284,6 +296,8 @@ def _run(conn: sqlite3.Connection, args) -> int:
     _append_receipt("ok", dry_run=not args.apply, window_days=args.days,
                     unmatched_groups=len(groups), recurring=len(recurring),
                     created=created, linked=linked, abandoned=abandoned)
+    _write_outcome({"unmatched_groups": len(groups), "recurring": len(recurring),
+                    "created": created, "linked": linked, "abandoned": abandoned})
     return 0
 
 

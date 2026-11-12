@@ -73,6 +73,15 @@ per-box operator value (`WIKI_VAULT`, or one line in `~/.mem0/wiki-vault`; no in
 it). The drive letter of a cloud-synced folder moves, so a configured path that is gone is
 retried on the other letters.
 
+The refresh child has no console, so its stdout and stderr are bound to
+`~/.claude/logs/wiki-index-refresh.log` (appended; a log past 512 KB is set aside as
+`wiki-index-refresh.log.old`, one generation). A shell script whose inherited stdout is closed dies
+at its first `echo`, and with nothing bound there was no record of how a run ended. The child is a
+small wrapper shell: it points stdin at `/dev/null` and the output at the log before the driver
+starts, then appends `EXIT wiki-index-refresh.sh status=<code>` when the driver ends. The
+`wiki-index-catchup.log` "refresh due ... starting" line carries the log's path; a "starting" line
+with no `EXIT` line after it in the refresh log is a run that never finished.
+
 Both paths write the same points (ids are `uuid5("wiki:" + relative path)`), so they never
 duplicate and either can restore what the other left.
 

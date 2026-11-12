@@ -37,6 +37,8 @@ banner still lists them):
 | **small** | `haiku` | 1 | 0 | 0 | 0.70 | flat | yes | yes — flat, highest-tier-first, 1-line legend, `[brand]` tag dropped when brand known |
 | **offload** | a local-model MCP tool (`mcp__<server>__*`) | — | — | — | — | — | — | **none — by construction** (see below) |
 
+**Memory cap setting.** `MEM0_BUNDLE_MEMORY_CAP_FRONTIER` and `MEM0_BUNDLE_MEMORY_CAP_SMALL` (an integer 0 to 3) override the `mem cap` column for that tier when the server starts; unset or invalid keeps the default in the table (2 and 1). The defaults in `TIER_BUNDLE_POLICY` and in `claude-config/model-tiers.json` do not change, and a parity test pins them. The cap is a setting rather than a new default because the evidence is thin: on a replay of 20 real prompts the second injected memory was useful 16 to 32 percent of the time, against 35 to 70 percent for the first. One rater and 20 prompts are not enough to change the default. The retrieval log's `returned_cosines` and `returned_scores` (see [mem0-api.md](mem0-api.md)) make the next measurement cheaper.
+
 Notes:
 
 - **Thresholds** are read from `model-tiers.json`, not hardcoded. They were lowered from
