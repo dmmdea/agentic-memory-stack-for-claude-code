@@ -57,7 +57,7 @@ using System.Text.RegularExpressions;
 static class HookClient
 {
     const int ConnectTimeoutMs  = 100;   // same budget as the PS client
-    const int ResponseTimeoutMs = 8000;  // raised 2500->8000 (2026-06-30): the COLD daemon bundle_raw is ~3.3s; the old 2.5s budget made the exe abandon the daemon and fall to the flaky inline path (intermittent GetResponse timeouts -> no injection). Outer hook timeout is 30s, so there is headroom. Warm bundles still return in ~200ms.
+    const int ResponseTimeoutMs = 8000;  // raised 2500->8000 (2026-06-30): the COLD daemon bundle_raw is ~3.3s; the old 2.5s budget made the exe abandon the daemon and fall to the flaky inline path (intermittent GetResponse timeouts -> no injection). Outer hook timeout is 10s (5s before 1.42.0), so there is headroom. Warm bundles still return in ~200ms.
 
     static string ScriptDir;             // exe's own dir = deployed scripts dir
 

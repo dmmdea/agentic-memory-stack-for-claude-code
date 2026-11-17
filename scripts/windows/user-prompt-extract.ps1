@@ -68,6 +68,14 @@ $ErrorActionPreference = 'SilentlyContinue'
 # H9: budget enforcement — start the stopwatch immediately at hook entry.
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $BudgetMs = 1500
+# Per-prompt bundle budget (1.42.0), the inline twin of the daemon's constants. A bundle body that
+# carries cold_wait_ms lets the server wait (capped at 6 s on its side) for a cold embedder instead of
+# answering at once with no memories; the request timeout must outlast that wait. A server that does
+# not know the field ignores it. The checkpoint-only call keeps its own 1000 ms. The hook's own
+# timeout is 10 s, so a replica failover only gets what is left of $BundleInlineBudgetMs.
+$script:BundleColdWaitMs = 5500
+$script:BundleRequestTimeoutMs = 7000
+$script:BundleInlineBudgetMs = 9000
 
 # ---------------------------------------------------------------------------
 # 0. Setup: log file + JSON serializer + API key
@@ -475,21 +483,25 @@ if ((-not $isTrivial) -and (-not $rateLimited) -and (-not $isMachineTurn)) {
             tier                  = $tier          # v0.22 Pillar 2: consuming-model tier (server ignores until Phase D)
             transcript_path       = $transcriptPath
             hook_contract_version = $HookContractVersion
+            cold_wait_ms          = $script:BundleColdWaitMs   # 1.42.0: let the server wait for a cold embedder
         })
 
         try {
-            $bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            $bundleText = Invoke-Mem0Post -Uri "$BaseUrl/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs $script:BundleRequestTimeoutMs
         } catch {
             # v1.23 P2-7 (spec §8): on a REPLICA whose authority is silent, read the same bundle
             # from the dormant local store and say so in the header (source=local-replica).
             $fo = if (Test-FunctionAvailable 'Get-Mem0BundleFailoverUrl') { Get-Mem0BundleFailoverUrl -AuthorityUrl $BaseUrl } else { $null }
             if (-not $fo) { throw }
-            $bundleText = Invoke-Mem0Post -Uri "$fo/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            $foTimeoutMs = [int][Math]::Min($script:BundleRequestTimeoutMs, $script:BundleInlineBudgetMs - $sw.ElapsedMilliseconds)
+            if ($foTimeoutMs -lt 500) { throw }
+            $bundleText = Invoke-Mem0Post -Uri "$fo/v1/context/bundle" -Body $bundleBody -ApiKey $apiKey -TimeoutMs $foTimeoutMs
             $BundleSource = 'local-replica'
         }
         $bundleR = $script:Jss.DeserializeObject($bundleText)
 
-        Write-Log "0.A+0.D bundle: session=$sessionId episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count)"
+        $coldSuffix = if (Test-FunctionAvailable 'Get-BundleColdLogSuffix') { Get-BundleColdLogSuffix -Bundle $bundleR } else { '' }
+        Write-Log "0.A+0.D bundle: session=$sessionId episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count)$coldSuffix"
 
         # Render [MEMORY CONTEXT] — client-side admission Layers 1/2/3 applied
         # inside (Select-AdmittedMemoryResults); rejection audit unchanged.

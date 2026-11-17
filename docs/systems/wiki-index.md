@@ -73,6 +73,16 @@ per-box operator value (`WIKI_VAULT`, or one line in `~/.mem0/wiki-vault`; no in
 it). The drive letter of a cloud-synced folder moves, so a configured path that is gone is
 retried on the other letters.
 
+**Single flight.** Sessions that start in the same second would each read the throttle as open
+(it is stamped only after the launch) and each launch a refresh; the children then raced on one
+snapshot directory and most exited 2. The check-and-launch therefore runs under a create-new lock
+file (`~/.claude/state/wiki-catchup.lock`). A catch-up that finds it held logs one "catch-up already
+running" line and exits 0; the holder re-reads the throttle once it has the lock, so a launch that
+finished a moment earlier is not repeated. The lock covers only the check and the launch, not the
+refresh's own run (the throttle covers that), and one older than five minutes is taken over as
+left by a process that died holding it. A lock that cannot be created at all lets the catch-up run,
+as before: the hook fails open.
+
 The refresh child has no console, so its stdout and stderr are bound to
 `~/.claude/logs/wiki-index-refresh.log` (appended; a log past 512 KB is set aside as
 `wiki-index-refresh.log.old`, one generation). A shell script whose inherited stdout is closed dies

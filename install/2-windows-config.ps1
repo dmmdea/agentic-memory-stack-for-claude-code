@@ -1228,7 +1228,7 @@ $hookEntries = [ordered]@{
         @{ markers = @('memory-maintenance-spawn.ps1');                    command = $psMaintSpawn; async = $true; timeout = 10 }
     )
     # H12: Phase 0 hooks (v0.20 Final: exe registration + both-shape dedupe)
-    'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 5 })
+    'UserPromptSubmit'   = @(@{ markers = @('user-prompt-extract.ps1', 'mem0-hook-client'); command = $psUserPrompt; timeout = 10 })   # 1.42.0: 5 -> 10 s; the bundle call may now wait up to 5.5 s for a cold embedder
     # 2026-08-26: auto-memory index write-time byte lint. Matcher-scoped to Write|Edit; the
     # script itself exits immediately for any path that is not a workspace MEMORY.md, and
     # ALWAYS exits 0 (advisory only - a hook must never be able to block a memory write).

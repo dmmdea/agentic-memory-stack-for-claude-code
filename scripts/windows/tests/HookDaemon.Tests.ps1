@@ -623,6 +623,7 @@ Describe 'Daemon protocol dispatch (Invoke-DaemonRequest via -DefineOnly)' {
         $script:capturedBody = $null
         Mock Invoke-Mem0Post {
             $script:capturedBody = $Body
+            $script:capturedTimeoutMs = $TimeoutMs
             '{"ok":true,"checkpoint":{"ok":true,"episode_id":7,"action":"created"},"memories":[{"id":"m1","memory":"small tier parity memory","metadata":{"tier":"evidence","brand":null}}],"goals":[],"open_questions":[]}'
         }
         $req = [pscustomobject]@{ op = 'bundle'; session_id = 's1'; prompt = 'p'; brand = $null;
@@ -634,6 +635,10 @@ Describe 'Daemon protocol dispatch (Invoke-DaemonRequest via -DefineOnly)' {
         $r.context_block | Should -Match 'small tier parity memory'
         $script:capturedBody | Should -Match '"tier"\s*:\s*"small"'  # tier forwarded into the bundle request body
         $script:capturedBody | Should -Match 'agentic-memory-stack'  # initiative forwarded
+        # 1.42.0: the body asks the server to wait for a cold embedder, and the request outlasts that wait
+        $script:capturedBody | Should -Match ('"cold_wait_ms"\s*:\s*' + $script:BundleColdWaitMs + '\b')
+        $script:capturedTimeoutMs | Should -Be $script:BundleRequestTimeoutMs
+        $script:BundleRequestTimeoutMs | Should -BeGreaterThan $script:BundleColdWaitMs
     }
 
     It 'bundle with no API key available -> ok=false no_api_key (client falls back inline)' {

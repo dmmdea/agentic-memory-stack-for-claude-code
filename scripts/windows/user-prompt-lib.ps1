@@ -2253,6 +2253,28 @@ function Invoke-DaemonBundle {
 # over base64/hex/literal values (immune to key order and escaping).
 # ---------------------------------------------------------------------------
 
+function Get-BundleColdLogSuffix {
+    <#
+    .SYNOPSIS
+    1.42.0: the cold-embedder tail of the per-prompt "served" log line, so the rate can be read from
+    user-prompt-extract.log. The bundle body asks the server to wait for a cold embedder
+    (cold_wait_ms); the response then says how that went in `embedder`:
+      state 'warmed'  -> ' cold_wait_ms=<waited_ms>'   (the server waited, then searched)
+      state 'warming' -> ' cold=degraded'              (still loading; no memories this prompt)
+      anything else / absent (a server that predates the field, or a warm embedder) -> ''
+    Pure; never throws.
+    #>
+    param($Bundle)
+    try {
+        $e = $Bundle.embedder
+        if ($null -eq $e) { return '' }
+        $state = [string]$e.state
+        if ($state -eq 'warmed') { return ' cold_wait_ms=' + [string][int]$e.waited_ms }
+        if ($state -eq 'warming') { return ' cold=degraded' }
+    } catch {}
+    return ''
+}
+
 function ConvertFrom-DaemonRawResponse {
     <#
     .SYNOPSIS
