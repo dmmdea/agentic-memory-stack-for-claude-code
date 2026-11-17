@@ -1239,13 +1239,13 @@ def test_find_goal_fuzzy_single_token_exact_match(tmp_path):
     db_path = tmp_path / "test_v019_m3_exact.db"
     with _connect_to(db_path) as conn:
         init_schema(conn)
-        gid = create_goal(conn, title="Zerovial", brand="ai-ecosystem")
+        gid = create_goal(conn, title="Northwind", brand="ai-ecosystem")
         # Exact single-token title must match the existing goal
-        results = find_goal_by_title_fuzzy(conn, "Zerovial", brand="ai-ecosystem")
+        results = find_goal_by_title_fuzzy(conn, "Northwind", brand="ai-ecosystem")
         assert len(results) == 1, f"expected exact-title match, got {results}"
         assert results[0]["id"] == gid
         # Case-insensitive
-        results_ci = find_goal_by_title_fuzzy(conn, "zerovial", brand="ai-ecosystem")
+        results_ci = find_goal_by_title_fuzzy(conn, "northwind", brand="ai-ecosystem")
         assert len(results_ci) == 1 and results_ci[0]["id"] == gid, \
             f"expected case-insensitive exact match, got {results_ci}"
         # A 1-token query with NO exact-title goal still returns [] (v0.18
@@ -1253,7 +1253,7 @@ def test_find_goal_fuzzy_single_token_exact_match(tmp_path):
         create_goal(conn, title="Deploy the staging environment", brand="ai-ecosystem")
         assert find_goal_by_title_fuzzy(conn, "Deploy", brand="ai-ecosystem") == []
         # Brand filter stays NULL-safe: other brand must not match
-        assert find_goal_by_title_fuzzy(conn, "Zerovial", brand="other-brand") == []
+        assert find_goal_by_title_fuzzy(conn, "Northwind", brand="other-brand") == []
 
 
 def test_post_episode_one_word_goal_title_no_duplicate():
@@ -1294,15 +1294,15 @@ def test_find_goal_fuzzy_exact_match_skips_terminal_statuses(tmp_path):
     db_path = tmp_path / "test_v020_l2_status.db"
     with _connect_to(db_path) as conn:
         init_schema(conn)
-        gid = create_goal(conn, title="Zerovial", brand="ai-ecosystem")
-        assert [r["id"] for r in find_goal_by_title_fuzzy(conn, "Zerovial", brand="ai-ecosystem")] == [gid]
+        gid = create_goal(conn, title="Northwind", brand="ai-ecosystem")
+        assert [r["id"] for r in find_goal_by_title_fuzzy(conn, "Northwind", brand="ai-ecosystem")] == [gid]
         for terminal in ("completed", "abandoned", "duplicate"):
             update_goal_status(conn, gid, terminal)
-            assert find_goal_by_title_fuzzy(conn, "Zerovial", brand="ai-ecosystem") == [], \
+            assert find_goal_by_title_fuzzy(conn, "Northwind", brand="ai-ecosystem") == [], \
                 f"status={terminal} goal must not exact-title match"
         # back to a live status -> matches again (M3 dedup intact for live goals)
         update_goal_status(conn, gid, "blocked")
-        assert [r["id"] for r in find_goal_by_title_fuzzy(conn, "Zerovial", brand="ai-ecosystem")] == [gid]
+        assert [r["id"] for r in find_goal_by_title_fuzzy(conn, "Northwind", brand="ai-ecosystem")] == [gid]
 
 
 def test_post_episode_completed_goal_same_title_creates_new_goal():
@@ -1366,7 +1366,7 @@ def test_find_goal_fuzzy_fts_match_skips_terminal_statuses(tmp_path):
     with _connect_to(db_path) as conn:
         init_schema(conn)
         # Two tokens -> exercises the FTS branch (len(sanitized.split()) >= 2)
-        title = "Zerovial staging deploy"
+        title = "Northwind staging deploy"
         gid = create_goal(conn, title=title, brand="ai-ecosystem")
         assert [r["id"] for r in find_goal_by_title_fuzzy(conn, title, brand="ai-ecosystem")] == [gid], \
             "live multi-token goal must FTS-match before the status guard kicks in"
