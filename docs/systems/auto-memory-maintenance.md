@@ -79,7 +79,7 @@ summary file, but only the binary's lint fills the per-store `over_trigger_hours
 clock: hours continuously over the trigger, from the over-trigger stamp that rides in
 the synced tree) and the last run and last decision times, and the session-start banner
 (`claude-config/storage-cap-check.sh`) prints it - quiet below 24 h, an `AUTO-MEMORY G7 ALARM` line at
-or above that states the store's lines and bytes against the triggers and the last judge outcome. The lint enumerates every populated store (deduplicating alias directories by canonical path so one
+or above that states the store's lines and bytes against the triggers, when this PC last ran and last applied a pass, and that the judge's own decisions are recorded on the authority (the PC's own times are not the judge's, so the line never says the judge or the nightly chain failed). The lint enumerates every populated store (deduplicating alias directories by canonical path so one
 store is never processed twice), and recomputes findings from disk: orphan, dangling, duplicate
 slug, over-long line, oversized fact file, missing frontmatter, near or over a budget. It writes
 one summary file and **never writes inside a store**.

@@ -53,8 +53,8 @@ def test_yes_confirmed_keeps_regardless():
 def test_append_review_queue_writes_jsonl(tmp_path):
     q = tmp_path / "sub" / "promote-review.jsonl"
     rec = {"memory_id": "m1", "canonical_id": "c1", "justification": "YES they conflict"}
-    assert sweep.append_review_queue(str(q), rec) is True
-    assert sweep.append_review_queue(str(q), {"memory_id": "m2", "canonical_id": "c2"}) is True
+    assert sweep.append_review_queue(str(q), rec) == sweep.QueueResult.APPENDED
+    assert sweep.append_review_queue(str(q), {"memory_id": "m2", "canonical_id": "c2"}) == sweep.QueueResult.APPENDED
     lines = q.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
     assert json.loads(lines[0])["memory_id"] == "m1"
@@ -65,13 +65,13 @@ def test_append_review_queue_failure_is_nonfatal(tmp_path):
     # a directory path (not a file) makes the write fail -> returns False, never raises
     d = tmp_path / "adir"
     d.mkdir()
-    assert sweep.append_review_queue(str(d), {"memory_id": "x"}) is False
+    assert sweep.append_review_queue(str(d), {"memory_id": "x"}) == sweep.QueueResult.FAILED
 
 
 def test_append_review_queue_is_idempotent_by_memory_id(tmp_path):
     q = tmp_path / "promote-review.jsonl"
-    assert sweep.append_review_queue(str(q), {"memory_id": "dup", "canonical_id": "c1"}) is True
-    assert sweep.append_review_queue(str(q), {"memory_id": "dup", "canonical_id": "c1"}) is True
+    assert sweep.append_review_queue(str(q), {"memory_id": "dup", "canonical_id": "c1"}) == sweep.QueueResult.APPENDED
+    assert sweep.append_review_queue(str(q), {"memory_id": "dup", "canonical_id": "c1"}) == sweep.QueueResult.ALREADY_QUEUED
     lines = [ln for ln in q.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 1  # a re-flagged candidate is not duplicated across runs
 
@@ -120,10 +120,10 @@ def test_a_queued_promote_record_does_not_swallow_the_stale_record_for_the_same_
     """append_review_queue was idempotent by memory_id alone, so a candidate already queued for
     promote silently dropped the canonical-possibly-stale record the sweep then tried to add."""
     q = tmp_path / "q.jsonl"
-    assert sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"}) is True
-    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) is True
-    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) is True      # still idempotent
-    assert sweep.append_review_queue(str(q), _stale("m1", "c3")) is True      # another stale canonical
+    assert sweep.append_review_queue(str(q), {"memory_id": "m1", "canonical_id": "c1"}) == sweep.QueueResult.APPENDED
+    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) == sweep.QueueResult.APPENDED
+    assert sweep.append_review_queue(str(q), _stale("m1", "c2")) == sweep.QueueResult.ALREADY_QUEUED   # still idempotent
+    assert sweep.append_review_queue(str(q), _stale("m1", "c3")) == sweep.QueueResult.APPENDED      # another stale canonical
     assert [(r.get("kind"), r.get("stale_canonical_id")) for r in _lines(q)] == [
         (None, None), (STALE, "c2"), (STALE, "c3")]
 
@@ -173,11 +173,34 @@ def test_dismissed_pair_is_not_requeued_until_a_text_changes(tmp_path, monkeypat
     sweep.append_review_queue(str(q), dict(pair))
     assert sweep.run_dismiss("m1") == 0
     assert _lines(q) == []
-    assert sweep.append_review_queue(str(q), dict(pair)) is True     # judged YES again: not re-queued
+    assert sweep.append_review_queue(str(q), dict(pair)) == sweep.QueueResult.SUPPRESSED_DISMISSED  # judged YES again: not re-queued
     assert _lines(q) == [] and sweep._SUPPRESSED_DISMISSED == 1
     texts["c1"] = "the port is 7070"                                  # one of the two texts was edited
     sweep.append_review_queue(str(q), dict(pair))
     assert [r["memory_id"] for r in _lines(q)] == ["m1"]
+
+
+def test_only_a_real_append_counts_as_queued(tmp_path, monkeypatch):
+    """The queue used to answer True for a pair already in it and for a dismissed one, and the callers
+    counted every True as queued: three weekly runs reported queued=5, 6 and 9 for 4 new lines each.
+    Only an append is new work; the other two are tallied under their own keys."""
+    q = tmp_path / "q.jsonl"
+    monkeypatch.setattr(sweep, "REVIEW_QUEUE", q)
+    texts = {"m1": "the port is 8080", "c1": "the port is 9090"}
+    monkeypatch.setattr(sweep, "_current_text_hashes",
+                        lambda ids: [sweep._text_sha256(texts[i]) if i in texts else None for i in ids])
+    monkeypatch.setattr(sweep, "_SUPPRESSED_DISMISSED", 0)
+    monkeypatch.setattr(sweep, "_ALREADY_QUEUED", 0)
+    tally = sweep._new_tally()
+    new, dup = {"memory_id": "m2", "canonical_id": "c2"}, {"memory_id": "m1", "canonical_id": "c1"}
+    sweep.append_review_queue(str(q), dict(dup))
+    assert sweep.run_dismiss("m1") == 0                   # m1/c1 is now a dismissed pair
+    sweep.append_review_queue(str(q), dict(new))          # m2/c2 is already queued
+    for rec in (new, dup, {"memory_id": "m3", "canonical_id": "c3"}):
+        sweep._tally_queue(sweep.append_review_queue(str(q), dict(rec)), tally)
+    assert tally == {"queued": 1, "already_queued": 1, "suppressed_dismissed": 1}
+    assert [r["memory_id"] for r in _lines(q)] == ["m2", "m3"]
+    assert sweep._tally_queue(True, sweep._new_tally()) is True   # a stub that answers True reads as an append
 
 
 def test_main_dismiss_needs_no_backend(tmp_path, monkeypatch):
