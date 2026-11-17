@@ -100,6 +100,16 @@ if ($evt -eq 'PreCompact') {
 # (workspace/brand are read from it), travel beside the snapshot.
 $originTrans = $null
 if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
+    # 1.42.0: the worker deletes the snapshot it was given when it finishes; one a crashed or killed worker
+    # left behind (a copy of a whole transcript, up to hundreds of MB) is removed here once it is a day old.
+    # Only files named precompact-snap-*.jsonl directly in the temp directory, at most 50 a pass, silently.
+    try {
+        $staleBefore = (Get-Date).AddHours(-24)
+        Get-ChildItem -LiteralPath $TempDirPath -Filter 'precompact-snap-*.jsonl' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'precompact-snap-*.jsonl' -and $_.LastWriteTime -lt $staleBefore } |
+            Select-Object -First 50 |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    } catch { }
     $snap = Join-Path $TempDirPath "precompact-snap-$PID.jsonl"
     Copy-Item -Path $trans -Destination $snap -ErrorAction SilentlyContinue
     if (Test-Path $snap) { $originTrans = $trans; $trans = $snap }

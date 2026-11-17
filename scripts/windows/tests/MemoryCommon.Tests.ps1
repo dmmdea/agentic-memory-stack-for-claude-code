@@ -759,6 +759,54 @@ Describe 'Get-TranscriptWindowSince walks a long gap forward, in order (L1a curs
     }
 }
 
+Describe 'The forward window reports when its last record was written (L1a episode time)' {
+    # 1.42.0: an episode used to end "now": a catch-up run stamped a session it read days later as the
+    # newest, and the windows of one run, stamped within seconds, overwrote each other on the server.
+    It 'returns the timestamp of the last record it consumed, not of a trailing partial line' {
+        $f = Join-Path $TestDrive 'stamped.jsonl'
+        $lines = @(
+            '{"type":"user","message":{"role":"user","content":"first typed prompt"},"uuid":"u1","timestamp":"2026-11-01T10:00:00.000Z"}'
+            '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"an answer"}]},"uuid":"u2","timestamp":"2026-11-01T10:05:30.500Z"}'
+            '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"output"}]},"uuid":"u3","timestamp":"2026-11-01T10:07:00.000Z","toolUseResult":{"timestamp":"2026-01-01T00:00:00Z"}}'
+        )
+        $complete = [System.Text.Encoding]::UTF8.GetBytes((($lines -join "`n") + "`n"))
+        $partial = [System.Text.Encoding]::UTF8.GetBytes('{"type":"user","message":{"role":"user","content":"half"},"uuid":"u4","timestamp":"2026-11-02T00:00:00Z"')
+        [System.IO.File]::WriteAllBytes($f, [byte[]]($complete + $partial))
+        $r = Get-TranscriptWindowSince -TranscriptPath $f -SinceBytes 0 -MaxChars 12000
+        $r.ConsumedTo | Should -Be $complete.Length
+        $r.LastRecordAt | Should -BeOfType ([datetime])
+        $r.LastRecordAt.ToUniversalTime().ToString('o') | Should -Be '2026-11-01T10:07:00.0000000Z' -Because 'the last complete record counts, even one with no text, and a nested timestamp does not'
+    }
+}
+
+Describe 'A typed prompt beside a pasted image is read (L1a over-size records)' {
+    # 1.42.0: a user record with a pasted screenshot is megabytes long because of the base64 image block.
+    # Both readers dropped any record over 256K characters unparsed, so the typed text beside it never
+    # reached the extractor while the cursor moved past it.
+    It 'yields the typed text of a multi-megabyte image record and the cursor lands on a record boundary' {
+        $f = Join-Path $TestDrive 'pasted-image.jsonl'
+        $image = 'QUJD' * 1000000   # 4 MB of base64
+        $lines = @(
+            '{"type":"user","message":{"role":"user","content":"BEFORE typed prompt"},"uuid":"a1","timestamp":"2026-11-01T10:00:00.000Z"}'
+            '{"parentUuid":"a1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"' + $image + '"}},{"type":"text","text":"TYPED-BESIDE-IMAGE what is wrong here"}]},"uuid":"a2","timestamp":"2026-11-01T10:01:00.000Z"}'
+            '{"type":"api-request-blob","hash":"h","message":{"role":"user","content":[{"type":"text","text":"BLOB-COPY ' + ('x' * 300000) + '"}]}}'
+            '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"AFTER assistant answer"}]},"uuid":"a3","timestamp":"2026-11-01T10:02:00.000Z"}'
+        )
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes((($lines -join "`n") + "`n"))
+        [System.IO.File]::WriteAllBytes($f, [byte[]]$bytes)
+        $bytes.Length | Should -BeGreaterThan 4000000
+        $r = Get-TranscriptWindowSince -TranscriptPath $f -SinceBytes 0 -MaxChars 12000
+        $r.Text | Should -Match 'BEFORE typed prompt'
+        $r.Text | Should -Match 'TYPED-BESIDE-IMAGE what is wrong here'
+        $r.Text | Should -Match 'AFTER assistant answer'
+        $r.Text | Should -Not -Match 'BLOB-COPY' -Because 'an over-size record that is not a conversation turn stays skipped'
+        $r.Text | Should -Not -Match 'QUJDQUJD' -Because 'only the text blocks are kept, never the image'
+        $r.ConsumedTo | Should -Be $bytes.Length
+        $bytes[[int]$r.ConsumedTo - 1] | Should -Be 10 -Because 'a window ends just past a newline'
+        $r.LastRecordAt.ToUniversalTime().ToString('o') | Should -Be '2026-11-01T10:02:00.0000000Z'
+    }
+}
+
 Describe 'A first extraction reads forward from the start of the transcript (L1a, no cursor yet)' {
     # 2026-11-12: a 7.6 MB transcript with no cursor got the first-run tail read. Its last 24 records
     # were tool calls, so 187 of some 84,000 characters reached the extractor and the cursor moved to

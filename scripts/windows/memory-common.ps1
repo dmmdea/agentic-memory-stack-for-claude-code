@@ -407,8 +407,8 @@ function Add-Mem0Memory {
     $key = Get-Mem0Key
     $Metadata['source'] = $Source
     if (-not $Metadata.ContainsKey('tier')) { $Metadata['tier'] = 'evidence' }
-    # 1.32.5: what happened to this write, for Drain-Mem0DeadLetter ('ok' | 'poisoned' | 'queued' |
-    # 'dead-lettered' | 'retry'). Inside a drain ($script:Mem0InDeadLetterDrain) this function never
+    # 1.32.5: what happened to this write, for Drain-Mem0DeadLetter ('ok' | 'duplicate' | 'poisoned' |
+    # 'queued' | 'dead-lettered' | 'retry'; 'duplicate' is 1.42.0). Inside a drain ($script:Mem0InDeadLetterDrain) this function never
     # appends to the dead-letter file itself: the drain owns the re-queue, and a poisoned record leaves.
     $script:Mem0LastPostOutcome = $null
     $headers = @{'X-API-Key' = $key; 'Content-Type' = 'application/json'}
@@ -441,7 +441,15 @@ function Add-Mem0Memory {
         # record source-IDs (audit finding 2026-06-08: C1 insights had no lineage).
         $newId = $null
         if ($r -and $r.results -and $r.results.Count -gt 0) { $newId = $r.results[0].id }
-        $script:Mem0LastPostOutcome = 'ok'
+        # 1.42.0: the server answers a hash-identical fact with 200, event NOOP_DUPLICATE and
+        # deduplicated: true. That is stored already, not new, so it reads 'duplicate' (a success all the
+        # same: the return value below does not change). A caller that counts new writes reads this.
+        $isDup = $false
+        try {
+            if ($r -and $r.deduplicated -eq $true) { $isDup = $true }
+            elseif ($r -and $r.results -and $r.results.Count -gt 0 -and [string]$r.results[0].event -eq 'NOOP_DUPLICATE') { $isDup = $true }
+        } catch { $isDup = $false }
+        $script:Mem0LastPostOutcome = if ($isDup) { 'duplicate' } else { 'ok' }
         if ($newId) { return $newId } else { return $true }
     } catch {
         # v1.23 P2-7 (spec §7 defect 2): a failed write is never dropped and never dead-lettered.
@@ -1788,11 +1796,108 @@ function Test-TranscriptTurnRecord {
     return ($role -eq 'user' -or $role -eq 'assistant')
 }
 
+function Test-TranscriptWideRecordHead {
+    # 1.42.0: True when the first bytes of a transcript line (a few KB, as a string) show a conversation
+    # record: a top-level "type" of user or assistant, after nothing but plain scalar fields. The readers use
+    # it to decide whether an over-size line is worth parsing: a user record that carries a pasted image is
+    # that large because of the image, and the text typed beside it is the part worth keeping. A logged
+    # request payload (type api-request-*), a record with no top-level type, and every other record type fail
+    # it, so they stay skipped. (A record that writes its message before its type shows no type in its head
+    # and stays skipped too.)
+    param([string]$Head)
+    if ([string]::IsNullOrEmpty($Head)) { return $false }
+    $pair = '"[A-Za-z_]{1,40}"\s*:\s*(?:"(?:[^"\\]|\\.){0,300}"|null|true|false|-?[0-9]{1,15})\s*,\s*'
+    return [regex]::IsMatch($Head, ('^\{\s*(?:' + $pair + '){0,12}"type"\s*:\s*"(?:user|assistant)"'))
+}
+
+function Get-OversizeTranscriptRecordText {
+    # 1.42.0: one over-size JSONL line (more than 262,144 characters) -> '[role] text', or $null. Only a line
+    # whose head shows a conversation record (Test-TranscriptWideRecordHead) is read; its image and document
+    # payloads (a "data" value of base64) are blanked first, since they are most of its size and never text,
+    # and then it goes through Get-TranscriptRecordText like any record, so the same blocks count (text only)
+    # and Test-TranscriptTurnRecord still applies.
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+    $head = if ($Line.Length -gt 4096) { $Line.Substring(0, 4096) } else { $Line }
+    if (-not (Test-TranscriptWideRecordHead -Head $head)) { return $null }
+    $slim = [regex]::Replace($Line, '("data"\s*:\s*")[A-Za-z0-9+/=\\]{1024,}(")', '$1$2')
+    return (Get-TranscriptRecordText -Line $slim)
+}
+
+function Get-TranscriptRecordTimestamp {
+    # 1.42.0: the time a transcript record was written, as a UTC [datetime], or $null. Records carry a
+    # top-level ISO "timestamp" (written just after the record's uuid). It is read from the line with a
+    # pattern, not by parsing the line: this runs on every record a reader consumes, and a large line is
+    # costly to parse. A "timestamp" key inside a tool input or result can also match when the top-level one
+    # is absent; the caller treats the value as a bounded hint (never later than now), so that is harmless.
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+    $m = [regex]::Match($Line, '"uuid"\s*:\s*"[^"\\]{1,64}"\s*,\s*"timestamp"\s*:\s*"([0-9]{4}-[0-9]{2}-[0-9]{2}T[^"\\]{1,32})"')
+    if (-not $m.Success) { $m = [regex]::Match($Line, '"timestamp"\s*:\s*"([0-9]{4}-[0-9]{2}-[0-9]{2}T[^"\\]{1,32})"') }
+    if (-not $m.Success) { return $null }
+    $dt = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([datetime]::TryParse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) { return $dt }
+    return $null
+}
+
+function Resolve-L1aEpisodeEnd {
+    # 1.42.0: the ended_at of one window's episode, a UTC [datetime]. It is when the window's last record was
+    # written, not when the extractor ran: the extractor runs hours or days after a session in a catch-up, and
+    # one run posts up to three windows. Falls back to the transcript's last write time, then to now, when the
+    # record carried no usable time. Inside one run each later window ends at least 11 s after the previous
+    # one ($PreviousEnd): the server treats a complete episode of the same session within 10 s of the last
+    # one as a repeated Stop and overwrites it. Never later than now (that wins when both cannot hold).
+    param($LastRecordAt, [string]$FilePath = '', $PreviousEnd = $null)
+    $now = [DateTime]::UtcNow
+    $end = $null
+    if ($LastRecordAt -is [datetime]) { $end = $LastRecordAt.ToUniversalTime() }
+    if ($null -eq $end -and $FilePath) {
+        try { if (Test-Path -LiteralPath $FilePath) { $end = (Get-Item -LiteralPath $FilePath).LastWriteTimeUtc } } catch { $end = $null }
+    }
+    if ($null -eq $end) { $end = $now }
+    if ($PreviousEnd -is [datetime]) {
+        $floor = $PreviousEnd.ToUniversalTime().AddSeconds(11)
+        if ($end -lt $floor) { $end = $floor }
+    }
+    if ($end -gt $now) { $end = $now }
+    return $end
+}
+
+function Remove-L1aPrecompactSnapshot {
+    # 1.42.0: deletes the PreCompact snapshot a worker was given, once it is done, and nothing else. The
+    # spawner copies the whole transcript to <temp>\precompact-snap-<PID>.jsonl (up to hundreds of MB) and
+    # nothing used to delete it. Three things must all hold: the spawner named the real transcript
+    # ($OriginPath: only a PreCompact run does), the file is named precompact-snap-*.jsonl, and it sits
+    # directly in the temp directory the hook uses (the spawner's own rule: %TEMP% on Windows, /tmp on
+    # Unix). A real transcript fails the name and the directory test, and it is never the origin. Returns
+    # $true when a file was deleted; never throws.
+    param([string]$Path, [string]$OriginPath, [string]$TempDir = '')
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($OriginPath)) { return $false }
+        if (-not $TempDir) { $TempDir = if ($PSVersionTable.Platform -eq 'Unix') { '/tmp' } else { [string]$env:TEMP } }
+        if ([string]::IsNullOrWhiteSpace($TempDir)) { return $false }
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $originFull = [System.IO.Path]::GetFullPath($OriginPath)
+        if ($full -eq $originFull) { return $false }
+        if ([System.IO.Path]::GetFileName($full) -notlike 'precompact-snap-*.jsonl') { return $false }
+        $cmp = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparison]::Ordinal } else { [System.StringComparison]::OrdinalIgnoreCase }
+        $parent = [System.IO.Path]::GetDirectoryName($full).TrimEnd('\', '/')
+        $tempFull = [System.IO.Path]::GetFullPath($TempDir).TrimEnd('\', '/')
+        if (-not [string]::Equals($parent, $tempFull, $cmp)) { return $false }
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return $false }
+        Remove-Item -LiteralPath $full -Force -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
 function Get-RecentTranscriptTurns {
+    # $LastRecordAt (optional, a [ref]): receives the time of the last record in the tail it read (1.42.0).
     param(
         [Parameter(Mandatory)][string]$TranscriptPath,
         [int]$MaxTurns = 24,
-        [int]$MaxChars = 12000
+        [int]$MaxChars = 12000,
+        $LastRecordAt = $null
     )
     if (-not (Test-Path $TranscriptPath)) { return $null }
     # Pathological-transcript guard (v0.23). A corrupted/huge single-line transcript
@@ -1825,7 +1930,13 @@ function Get-RecentTranscriptTurns {
     foreach ($line in ($records | Select-Object -Last $MaxTurns)) {
         $line = $line.TrimEnd("`r")
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line.Length -gt $maxRecordChars) { continue }   # oversized/corrupt — never feed to ConvertFrom-Json
+        if ($line.Length -gt $maxRecordChars) {
+            # Oversized: skipped unparsed, unless its head shows a conversation record (a user turn with a
+            # pasted image is this large because of the image): then only its text blocks are kept (1.42.0).
+            $bigText = Get-OversizeTranscriptRecordText -Line $line
+            if ($bigText) { $turns += $bigText }
+            continue
+        }
         try {
             $obj = $line | ConvertFrom-Json
             if (-not (Test-TranscriptTurnRecord $obj)) { continue }
@@ -1839,6 +1950,16 @@ function Get-RecentTranscriptTurns {
             }
             if ($text) { $turns += "[$role] $text" }
         } catch { }
+    }
+    # 1.42.0: when the tail ends, for the caller's episode time: the newest record that carries one.
+    if ($null -ne $LastRecordAt) {
+        $looked = 0
+        for ($k = $records.Count - 1; $k -ge 0 -and $looked -lt 40; $k--) {
+            if ([string]::IsNullOrWhiteSpace($records[$k])) { continue }
+            $looked++
+            $ts = Get-TranscriptRecordTimestamp -Line $records[$k]
+            if ($null -ne $ts) { $LastRecordAt.Value = $ts; break }
+        }
     }
     if ($turns.Count -eq 0) { return $null }
     # Redact secrets on the FULL joined text (before truncation) so credentials never reach the
@@ -1938,9 +2059,15 @@ function Get-TranscriptWindowSince {
     #     without finding text still returns its ConsumedTo, so a tool-only stretch is passed.
     #   - A turn larger than the budget is included alone, truncated (its tail is kept, as the tail read
     #     always did) and consumed, so a window can never stall on it. A record over 256 KB of text is
-    #     skipped unparsed (the pathological-giant-line guard); it is consumed too.
-    # Returns @{ Text; ConsumedTo; Length; Turns }; Text is $null when the window holds no text. Returns
-    # $null on a read error so the caller falls back to the tail read.
+    #     skipped unparsed (the pathological-giant-line guard); it is consumed too. 1.42.0: unless its head
+    #     (the first few KB) shows a conversation record (type user or assistant): a typed prompt with a
+    #     pasted image is that large because of the base64 image, and the text beside it is kept (only the
+    #     text blocks, as for any record; Get-OversizeTranscriptRecordText), for a record up to the scan
+    #     bound. The cursor arithmetic is the same either way: the record is consumed whole.
+    #   - LastRecordAt (1.42.0): the time of the last record the window consumed (UTC [datetime]), $null when
+    #     none carried one. A window's episode is stamped with it, not with the time the extractor ran.
+    # Returns @{ Text; ConsumedTo; Length; Turns; LastRecordAt }; Text is $null when the window holds no
+    # text. Returns $null on a read error so the caller falls back to the tail read.
     param(
         [Parameter(Mandatory)][string]$TranscriptPath,
         [Parameter(Mandatory)][long]$SinceBytes,
@@ -1949,6 +2076,7 @@ function Get-TranscriptWindowSince {
     )
     $maxRecordChars = 262144
     $maxRecordBytes = 1048576    # no record of <= 262144 chars is longer than this in UTF-8 (4 bytes a char at most)
+    $wideRecordBytes = [Math]::Max([long]$maxRecordBytes, $MaxScanBytes)   # an over-size conversation record is buffered up to the scan bound
     $fs = $null
     try {
         $fs = [System.IO.File]::Open($TranscriptPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
@@ -1957,7 +2085,7 @@ function Get-TranscriptWindowSince {
         $len = [long]$fs.Length
         if ($SinceBytes -lt 0) { $SinceBytes = 0 }
         if ($SinceBytes -ge $len) {
-            return [pscustomobject]@{ Text = $null; ConsumedTo = [long][Math]::Min($SinceBytes, $len); Length = $len; Turns = 0 }
+            return [pscustomobject]@{ Text = $null; ConsumedTo = [long][Math]::Min($SinceBytes, $len); Length = $len; Turns = 0; LastRecordAt = $null }
         }
         [void]$fs.Seek($SinceBytes, [System.IO.SeekOrigin]::Begin)
         $limit = $SinceBytes + $MaxScanBytes
@@ -1971,6 +2099,14 @@ function Get-TranscriptWindowSince {
         $consumed = [long]$SinceBytes
         $filePos = [long]$SinceBytes
         $done = $false
+        $lastTs = $null
+        $recLimit = [long]$maxRecordBytes    # the byte limit of the record being read: wide once its head shows a conversation record
+        # The first few KB of the record being read, as text: from what is buffered of it, else from the current chunk.
+        $headOf = {
+            param([int]$At, [int]$Count)
+            if ($carry.Length -gt 0) { return $latin1.GetString($carry.GetBuffer(), 0, [int][Math]::Min(4096, $carry.Length)) }
+            return $latin1.GetString($buf, $At, [int][Math]::Min(4096, $Count - $At))
+        }
         while (-not $done -and $filePos -lt $len) {
             $want = [int][Math]::Min([long]$buf.Length, $len - $filePos)
             $n = $fs.Read($buf, 0, $want)
@@ -1984,16 +2120,23 @@ function Get-TranscriptWindowSince {
                 if ($j -lt 0) {
                     # No newline in the rest of this chunk: the record goes on, or it is a partial tail.
                     if (-not $skipping) {
-                        if (($carry.Length + ($n - $i)) -gt $maxRecordBytes) { $skipping = $true; $carry.SetLength(0) }
+                        if (($carry.Length + ($n - $i)) -gt $recLimit -and $recLimit -lt $wideRecordBytes) {
+                            if (Test-TranscriptWideRecordHead -Head (& $headOf $i $n)) { $recLimit = $wideRecordBytes }
+                        }
+                        if (($carry.Length + ($n - $i)) -gt $recLimit) { $skipping = $true; $carry.SetLength(0) }
                         else { $carry.Write($buf, $i, $n - $i) }
                     }
                     break
                 }
                 $recEnd = $chunkAbs + $j + 1
                 $rec = $null
+                $recTs = $null
                 if (-not $skipping) {
                     $lineLen = $j - $i
-                    if (($carry.Length + $lineLen) -le $maxRecordBytes) {
+                    if (($carry.Length + $lineLen) -gt $recLimit -and $recLimit -lt $wideRecordBytes) {
+                        if (Test-TranscriptWideRecordHead -Head (& $headOf $i $n)) { $recLimit = $wideRecordBytes }
+                    }
+                    if (($carry.Length + $lineLen) -le $recLimit) {
                         $line = $null
                         if ($carry.Length -gt 0) {
                             $carry.Write($buf, $i, $lineLen)
@@ -2003,10 +2146,13 @@ function Get-TranscriptWindowSince {
                         }
                         $line = $line.TrimEnd("`r")
                         if ($line.Length -le $maxRecordChars) { $rec = Get-TranscriptRecordText -Line $line }
+                        else { $rec = Get-OversizeTranscriptRecordText -Line $line }
+                        $recTs = Get-TranscriptRecordTimestamp -Line $line
                     }
                 }
                 $carry.SetLength(0)
                 $skipping = $false
+                $recLimit = [long]$maxRecordBytes
                 if ($null -ne $rec) {
                     $cost = $rec.Length
                     if ($turns.Count -gt 0) { $cost += 2 }   # the "`n`n" between turns
@@ -2015,6 +2161,7 @@ function Get-TranscriptWindowSince {
                     $joinedLen += $cost
                 }
                 $consumed = $recEnd
+                if ($null -ne $recTs) { $lastTs = $recTs }
                 $i = $j + 1
                 if ($recEnd -ge $limit) { $done = $true; break }
             }
@@ -2026,7 +2173,7 @@ function Get-TranscriptWindowSince {
             if ($joined.Length -gt $MaxChars) { $joined = $joined.Substring($joined.Length - $MaxChars) }
             $text = $joined
         }
-        return [pscustomobject]@{ Text = $text; ConsumedTo = [long]$consumed; Length = $len; Turns = $turns.Count }
+        return [pscustomobject]@{ Text = $text; ConsumedTo = [long]$consumed; Length = $len; Turns = $turns.Count; LastRecordAt = $lastTs }
     } catch { return $null } finally { $fs.Dispose() }
 }
 
