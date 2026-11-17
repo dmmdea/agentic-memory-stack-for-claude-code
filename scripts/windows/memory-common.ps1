@@ -1821,6 +1821,10 @@ function Get-OversizeTranscriptRecordText {
     $head = if ($Line.Length -gt 4096) { $Line.Substring(0, 4096) } else { $Line }
     if (-not (Test-TranscriptWideRecordHead -Head $head)) { return $null }
     $slim = [regex]::Replace($Line, '("data"\s*:\s*")[A-Za-z0-9+/=\\]{1024,}(")', '$1$2')
+    # The carve-out is for inline image data only. A record that is still over the ceiling once that is
+    # gone (a huge tool result, a huge paste) stays skipped: Windows PowerShell's ConvertFrom-Json is
+    # quadratic on large input, which is why the ceiling exists.
+    if ($slim.Length -gt 262144) { return $null }
     return (Get-TranscriptRecordText -Line $slim)
 }
 

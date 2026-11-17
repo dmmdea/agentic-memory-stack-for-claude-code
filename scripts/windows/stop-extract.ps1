@@ -106,7 +106,7 @@ if ($evt -eq 'PreCompact' -and $trans -and (Test-Path $trans)) {
     try {
         $staleBefore = (Get-Date).AddHours(-24)
         Get-ChildItem -LiteralPath $TempDirPath -Filter 'precompact-snap-*.jsonl' -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'precompact-snap-*.jsonl' -and $_.LastWriteTime -lt $staleBefore } |
+            Where-Object { $_.Name -like 'precompact-snap-*.jsonl' -and $_.CreationTime -lt $staleBefore } |
             Select-Object -First 50 |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
     } catch { }

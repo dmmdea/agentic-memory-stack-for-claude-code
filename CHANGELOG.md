@@ -31,9 +31,10 @@ retrieval log, receipts and journal.
   after their last record).
 - A typed prompt with a pasted image never reached the extractor. The readers skipped any transcript record
   over 262,144 characters without parsing it, and an inline image makes the whole record that large: 2 of 64
-  typed prompts in five days. An over-size record whose head shows a conversation record is now parsed, up to
-  the reader's 16 MB scan bound, with its image data dropped first; only its text blocks are kept, as for any
-  record. The cursor arithmetic is unchanged.
+  typed prompts in five days. An over-size record whose head shows a conversation record is now read with its
+  image data dropped; when what is left fits the same ceiling it is parsed and its text blocks are kept, as
+  for any record. A record that is still over the ceiling without its image data stays skipped. The cursor
+  arithmetic is unchanged.
 - PreCompact snapshots were never deleted. Each compaction copied the whole transcript into the temp
   directory (single copies up to 601 MB; 15 files and 2.4 GB on one PC). The extractor now deletes the
   snapshot it was given when it finishes, and the hook removes snapshots older than a day before it makes a
