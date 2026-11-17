@@ -4,6 +4,76 @@ This repo is the PRIMARY source for the agentic-memory-stack product; this file 
 product's version authority as of v1.17.0 (the earlier private-side history is summarized
 in the first entries below — full pre-inversion history lives in the maintainer archive).
 
+## 1.42.0 — a prompt after a pause gets its memory, and capture stops losing episodes and pasted-image prompts (2026-11-17)
+
+Found by reading five days of real use of 1.41.x: the hook and extractor logs on a PC, and the authority's
+retrieval log, receipts and journal.
+
+### Fixed
+
+- The first prompt after more than five idle minutes got no memory. The embedder unloads after five idle
+  minutes, and the per-prompt bundle answered a cold embedder at once with no memories while a background
+  load ran: 20 of 90 typed prompts in five days (22 percent), the same share as before the fast answer was
+  added in 1.36.0. The bundle now waits for the load when the client says how long it can wait
+  (`cold_wait_ms` in the request, capped by `MEM0_BUNDLE_COLD_WAIT_S`, default 6 s; 0 turns the wait off),
+  then searches as usual. The Windows hook asks for 5.5 s, its bundle request waits 7 s instead of 3 s and
+  the hook's own timeout is 10 s instead of 5 s; a cold load takes about 3.5 s. A client that does not send
+  the field gets the fast answer as before. Nothing keeps the embedder loaded: it still unloads after five
+  idle minutes. The hook log line carries `cold_wait_ms=<n>` for a prompt that waited and `cold=degraded`
+  for one that still got nothing, and a degraded bundle now writes a retrieval-log row (`degraded:
+  "cold-embedder"`), so the rate can be read from either log.
+- An extraction run that read two or three windows kept only the last window's episode. Each window posted an
+  episode stamped with the time of the post, a few seconds apart, and the server treats an episode within ten
+  seconds of the previous one for the same session as a repeated Stop and updates the row in place: 92 of 396
+  episode posts in five days. An episode is now stamped with the time of the last transcript record its
+  window read, and windows of one run are at least 11 s apart. The same change stops a catch-up run from
+  stamping a session that ended days ago as ending now (48 of 431 windows were extracted more than a day
+  after their last record).
+- A typed prompt with a pasted image never reached the extractor. The readers skipped any transcript record
+  over 262,144 characters without parsing it, and an inline image makes the whole record that large: 2 of 64
+  typed prompts in five days. An over-size record whose head shows a conversation record is now parsed, up to
+  the reader's 16 MB scan bound, with its image data dropped first; only its text blocks are kept, as for any
+  record. The cursor arithmetic is unchanged.
+- PreCompact snapshots were never deleted. Each compaction copied the whole transcript into the temp
+  directory (single copies up to 601 MB; 15 files and 2.4 GB on one PC). The extractor now deletes the
+  snapshot it was given when it finishes, and the hook removes snapshots older than a day before it makes a
+  new one. Only files named `precompact-snap-*.jsonl` directly in the temp directory are ever removed.
+- Masked reads of episodes missed a quoted secret inside the three JSON columns (`open_questions`,
+  `advanced_goals`, `blocked_goals`): the mask ran over the JSON text, where a quote is escaped, so
+  `password: "..."` was masked as plain text and not inside the column. The columns are now parsed and masked
+  string by string.
+- `GET /health/embedder` answered 500 with a traceback when the embedder returned 429 to the warm request
+  (several sessions starting in the same second). It now answers 503 with `Retry-After`, like any other
+  embedder outage.
+- The review-queue counts overstated new work. A pair already in the queue, and since 1.41.0 a pair the
+  operator had dismissed, were counted as queued: the weekly run reported 5, 6 and 9 queued on three Sundays
+  while the queue gained 4 rows each time. `queued` now counts rows appended; `already_queued` and
+  `suppressed_dismissed` are reported beside it in the receipt, the summary log and the console line.
+- The morning summary repeated steps. It printed every receipt of the last 24 hours, so a section re-listed
+  steps the previous section had shown, and after a long weekly run a step appeared twice in one section. A
+  section now holds the receipts written since the previous summary (the last 24 hours when there is none
+  within 48 hours).
+- The over-trigger alarm at session start said "the nightly chain is deciding but the store is not shrinking"
+  and, after 36 hours, "the hub judge has not decided; check the nightly chain". On a PC both times come
+  from the PC's own receipt rows, not from the judge on the authority. The line now says when this PC last
+  ran and last applied a pass, and where the judge's own decisions are recorded.
+- `install/3-verify.ps1` printed `wsl: Failed to translate` lines when started from a drive WSL cannot
+  translate. It now runs from the user profile and restores the caller's directory.
+- Sessions that started in the same second each launched the PC wiki catch-up refresh; the children raced on
+  one snapshot directory and most exited 2. The catch-up now takes a lock, and the others log "catch-up
+  already running" and exit 0.
+
+### Changed
+
+- The extractor's summary line says how many posted facts were new: `posted N to mem0 (X new, Y already
+  stored; ...)`. The server answers a fact it already holds with 200 and `NOOP_DUPLICATE`, and the old line
+  counted those as posted.
+- Retrieval-log rows carry `returned_order_scores`, the value the result list was sorted by (the freshness
+  or rerank score; `returned_scores` is the fusion score and was not sorted in about a fifth of rows), and a
+  bundle row carries `injected_ids`, the ids returned to the client after the insight filter and the cap.
+- `/health/deep` reports `bundle_cold_today.waited_ok`, the bundles that waited for a cold embedder and were
+  then served.
+
 ## 1.41.2 — the MCP list tools mask stored credentials too (2026-11-12)
 
 ### Fixed
