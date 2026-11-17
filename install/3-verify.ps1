@@ -13,6 +13,16 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# wsl.exe maps the caller's current directory into the distro and prints "wsl: Failed to translate '<path>'"
+# on stderr for a drive it cannot map (a cloud-synced or removable drive). Run from the user profile, which
+# it always maps, and put the caller's directory back on every way out (the two exits at the end, and a
+# terminating error anywhere in between).
+$script:VerifyStartLocation = (Get-Location).Path
+try { Set-Location -LiteralPath $env:USERPROFILE } catch { $script:VerifyStartLocation = $null }
+function Restore-VerifyLocation {
+    try { if ($script:VerifyStartLocation) { Set-Location -LiteralPath $script:VerifyStartLocation } } catch {}
+}
+trap { Restore-VerifyLocation; break }
 if (-not $Distro) {
     $prevEnc = [Console]::OutputEncoding
     try {
@@ -459,9 +469,11 @@ if ($fails.Count -eq 0) {
     }
     Write-Host "  4. Use the MCP tools: mcp__mem0__memory_search, memory_add, memory_promote, memory_demote, etc."
     Write-Host "  5. To promote a memory to tier=canonical, use: bash scripts/wsl/mem0-canonize.sh <id> '<reason>'"
+    Restore-VerifyLocation
     exit 0
 } else {
     Write-Host "VERIFY FAILED - $($fails.Count) issues:" -ForegroundColor Red
     foreach ($f in $fails) { Write-Host "  - $f" -ForegroundColor Yellow }
+    Restore-VerifyLocation
     exit 1
 }

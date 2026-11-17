@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import enum
 import hashlib
 import json
 import math
@@ -643,8 +644,12 @@ def _write_outcome(outcome: str, counts: Optional[dict] = None) -> None:
         return
     status = _c1_status(outcome)
     counts = dict(counts or {})
+    # Pairs the run met but did not add to the queue, from every append_review_queue call of the run
+    # (a leg that tallies its own passes the same keys; the run-wide totals only fill what it left out).
     if _SUPPRESSED_DISMISSED:
-        counts["suppressed_dismissed"] = _SUPPRESSED_DISMISSED   # pairs the operator already dismissed
+        counts.setdefault("suppressed_dismissed", _SUPPRESSED_DISMISSED)   # the operator already dismissed them
+    if _ALREADY_QUEUED:
+        counts.setdefault("already_queued", _ALREADY_QUEUED)               # already in the queue
     counts = {(f"{_OUTCOME_SCOPE}_{k}" if _OUTCOME_SCOPE else k): v for k, v in counts.items()}
     try:
         p = Path(path)
@@ -1145,27 +1150,59 @@ def record_dismissed(path, records: list) -> int:
     return written
 
 
-def append_review_queue(path, record: dict) -> bool:
+class QueueResult(enum.IntEnum):
+    """What append_review_queue did. Truthy for everything but FAILED, so a caller that only asks
+    "did the queue take it" keeps working; APPENDED == 1 == True, so a stub returning True reads as an
+    append. A caller that reports work counts compares against APPENDED: only a new line is new work."""
+    FAILED = 0
+    APPENDED = 1
+    ALREADY_QUEUED = 2
+    SUPPRESSED_DISMISSED = 3
+
+
+_ALREADY_QUEUED = 0   # pairs this run found already in the queue (not new review work)
+
+
+def append_review_queue(path, record: dict) -> QueueResult:
     """Append a candidate to the human-review queue (one JSON line), IDEMPOTENT by _queue_key so a
     re-flagged candidate isn't duplicated across weekly runs while a different kind of record for the
-    same memory still lands. A pair the operator already dismissed (see the ledger above) and whose
-    texts are unchanged is not queued again; that is counted as suppressed_dismissed. Never raises:
-    returns False on any write failure (the queue is advisory, must not crash the sweep)."""
-    global _SUPPRESSED_DISMISSED
+    same memory still lands. Returns what happened: APPENDED (a new line), ALREADY_QUEUED (the key is
+    in the queue; counted as already_queued), SUPPRESSED_DISMISSED (the operator already dismissed the
+    pair and neither text changed, see the ledger above; counted as suppressed_dismissed) or FAILED
+    (write failure; the queue is advisory, so this never raises). Only APPENDED is new review work."""
+    global _SUPPRESSED_DISMISSED, _ALREADY_QUEUED
     try:
         if record.get("memory_id") and _queue_key(record) in _queued_keys(path):
-            return True  # already queued -> idempotent no-op
+            _ALREADY_QUEUED += 1
+            return QueueResult.ALREADY_QUEUED  # idempotent no-op
         if _is_dismissed(path, record):
             _SUPPRESSED_DISMISSED += 1
-            return True  # dismissed by the operator, texts unchanged -> do not ask again
+            return QueueResult.SUPPRESSED_DISMISSED  # dismissed, texts unchanged -> do not ask again
         record.setdefault("ts", _iso_now())
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
-        return True
+        return QueueResult.APPENDED
     except OSError:
-        return False
+        return QueueResult.FAILED
+
+
+def _tally_queue(res, tally: dict) -> bool:
+    """Count one append_review_queue result into a caller's tally (keys queued, already_queued,
+    suppressed_dismissed); True only for a real append. A stub that returns True reads as an append."""
+    if res == QueueResult.APPENDED:
+        tally["queued"] += 1
+        return True
+    if res == QueueResult.ALREADY_QUEUED:
+        tally["already_queued"] += 1
+    elif res == QueueResult.SUPPRESSED_DISMISSED:
+        tally["suppressed_dismissed"] += 1
+    return False
+
+
+def _new_tally() -> dict:
+    return {"queued": 0, "already_queued": 0, "suppressed_dismissed": 0}
 
 
 def _drop_queue_lines(path, should_drop, removed_out: Optional[list] = None) -> int:
@@ -1612,7 +1649,8 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
     mem0_http = httpx.Client(headers=ams_env.mem0_headers(api_key))
-    checked = yes = no = cleared = skipped = queued = 0
+    checked = yes = no = cleared = skipped = 0
+    qt = _new_tally()   # queued / already_queued / suppressed_dismissed, from what the queue answered
     aborted = None
     consec_fail = 0  # 2026-08-24: rejudge previously counted NO judge failure at all —
     # a dead judge fast-skipped every stamped record and reported outcome=ok.
@@ -1707,13 +1745,12 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
                 cleared_ids.append({"memory_id": cid, "canonical_id": str(canonical_id), "detail": detail[:160]})
             elif decision == "queue-review":
                 yes += 1
-                queued += 1
                 print(f"  QUEUE-REVIEW {cid}: re-judged YES vs {canonical_id} — NOT auto-hidden "
                       f"(safe policy; logged for human review) ({detail})", flush=True)
-                if not dry_run:
-                    append_review_queue(str(REVIEW_QUEUE), {
+                if not dry_run:   # only a real append is queued; a duplicate or dismissed pair is not
+                    _tally_queue(append_review_queue(str(REVIEW_QUEUE), {
                         "memory_id": cid, "canonical_id": str(canonical_id),
-                        "candidate_text": str(cand_text)[:300], "justification": detail[:200]})
+                        "candidate_text": str(cand_text)[:300], "justification": detail[:200]}), qt)
                 kept_ids.append({"memory_id": cid, "canonical_id": str(canonical_id),
                                  "was_pending": was_pending, "queued_for_review": True, "detail": detail[:160]})
             else:  # promote (only under --allow-auto-promote) or keep (already-enforced)
@@ -1738,12 +1775,17 @@ def run_rejudge_stamped(args, dry_run: bool) -> int:
     _append_summary({"mode": "rejudge-stamped", "dry_run": dry_run, "judge": args.judge,
                      "allow_auto_promote": getattr(args, "allow_auto_promote", False),
                      "stamped_found": len(stamped),
-                     "checked": checked, "yes": yes, "no": no, "cleared": cleared, "queued_for_review": queued,
+                     "checked": checked, "yes": yes, "no": no, "cleared": cleared,
+                     "queued_for_review": qt["queued"], "already_queued": qt["already_queued"],
+                     "suppressed_dismissed": qt["suppressed_dismissed"],
                      "kept": len(kept_ids), "skipped": skipped,
                      "cleared_ids": cleared_ids, "kept_ids": kept_ids, "outcome": outcome})
     print(f"contradiction-sweep: rejudge-stamped done. checked={checked} yes={yes} no={no} "
-          f"cleared={cleared} queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return _finish(outcome, {"stamped_found": len(stamped), "checked": checked, "yes": yes, "no": no, "cleared": cleared})
+          f"cleared={cleared} queued_for_review={qt['queued']} already_queued={qt['already_queued']} "
+          f"suppressed_dismissed={qt['suppressed_dismissed']} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}",
+          flush=True)
+    return _finish(outcome, {"stamped_found": len(stamped), "checked": checked, "yes": yes, "no": no, "cleared": cleared,
+                             **qt})
 
 
 def scroll_noncanonical(http: httpx.Client, user_id: Optional[str] = None) -> list[dict]:
@@ -1802,7 +1844,8 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
         return _finish("no-op:lock-held")
     qdrant_http = httpx.Client()
     llm_http = httpx.Client()
-    anchors = pairs = queued = skipped = 0
+    anchors = pairs = skipped = 0
+    qt = _new_tally()   # queued / already_queued / suppressed_dismissed, from what the queue answered
     ev_skipped_no_vector = 0   # WP-4: counted, never a silent continue
     ev_cache_stats: dict = {}   # W5 ADOPT-4: hits/misses for the summary receipt
     consec_fail = 0  # fail fast if the judge dies mid-run (mirrors the canonical sweep)
@@ -1871,11 +1914,10 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
                 if verdict:
                     print(f"  SUPERSEDE-CANDIDATE older {nb.get('id')} <- newer {a_id} ({detail})", flush=True)
                     if not dry_run:
-                        append_review_queue(str(REVIEW_QUEUE), {
+                        _tally_queue(append_review_queue(str(REVIEW_QUEUE), {
                             "memory_id": str(nb.get("id")), "canonical_id": a_id, "kind": "supersede",
                             "candidate_text": str(nb_text)[:300],
-                            "justification": f"evidence-sweep: older fact judged STALE (superseded) — {detail[:160]}"})
-                        queued += 1
+                            "justification": f"evidence-sweep: older fact judged STALE (superseded) — {detail[:160]}"}), qt)
                     queued_ids.append({"loser": str(nb.get("id")), "winner": a_id, "detail": detail[:160]})
     except (httpx.HTTPError, OSError) as e:
         aborted = f"{type(e).__name__}: {str(e)[:120]}"
@@ -1888,14 +1930,17 @@ def run_evidence_sweep(args, dry_run: bool) -> int:
             pass
     outcome = _outcome_for_abort(aborted) if aborted else "ok"
     _append_summary({"mode": "evidence-sweep", "dry_run": dry_run, "judge": args.judge,
-                     "anchors": anchors, "pairs_judged": pairs, "queued_for_review": queued,
+                     "anchors": anchors, "pairs_judged": pairs, "queued_for_review": qt["queued"],
+                     "already_queued": qt["already_queued"], "suppressed_dismissed": qt["suppressed_dismissed"],
                      "skipped": skipped, "skipped_no_vector": ev_skipped_no_vector,
                      "queued_ids": queued_ids, "outcome": outcome,
                      "cache_hits": int(ev_cache_stats.get("cache_hits", 0)),
                      "cache_misses": int(ev_cache_stats.get("cache_misses", 0))})
     print(f"contradiction-sweep: evidence-sweep done. anchors={anchors} pairs_judged={pairs} "
-          f"queued_for_review={queued} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}", flush=True)
-    return _finish(outcome, {"anchors": anchors, "pairs": pairs, "queued": queued})
+          f"queued_for_review={qt['queued']} already_queued={qt['already_queued']} "
+          f"suppressed_dismissed={qt['suppressed_dismissed']} skipped={skipped} (dry_run={dry_run}) -> {SWEEP_LOG}",
+          flush=True)
+    return _finish(outcome, {"anchors": anchors, "pairs": pairs, **qt})
 
 
 PAIRS_LOCK = _lock_path("MEM0_PAIRS_LOCK", ".retrieval-pairs.lock")
@@ -2570,7 +2615,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         # stamped or hidden here. The pair cache makes re-runs cheap: a pair
         # judged last week is a cache hit this week.
         if judged:
-            judged_stats = {"judged": 0, "yes": 0, "queued": 0, "skipped": 0,
+            judged_stats = {"judged": 0, "yes": 0, "queued": 0, "already_queued": 0,
+                            "suppressed_dismissed": 0, "skipped": 0,
                             "unordered": 0, "cache_hits": 0, "cache_misses": 0}
             llm_http = httpx.Client()
             consec_fail = 0
@@ -2608,13 +2654,12 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
                         judged_stats["yes"] += 1
                         print(f"  SUPERSEDE-CANDIDATE older {older_id} <- newer {newer_id} "
                               f"({detail[:120]})", flush=True)
-                        if append_review_queue(str(REVIEW_QUEUE), {
-                                "memory_id": older_id, "canonical_id": newer_id,
-                                "kind": "supersede",
-                                "candidate_text": older_text[:300],
-                                "justification": ("retrieval-pairs: older co-retrieved fact "
-                                                  f"judged STALE (superseded) — {detail[:160]}")}):
-                            judged_stats["queued"] += 1
+                        _tally_queue(append_review_queue(str(REVIEW_QUEUE), {
+                            "memory_id": older_id, "canonical_id": newer_id,
+                            "kind": "supersede",
+                            "candidate_text": older_text[:300],
+                            "justification": ("retrieval-pairs: older co-retrieved fact "
+                                              f"judged STALE (superseded) — {detail[:160]}")}), judged_stats)
             finally:
                 llm_http.close()
 
@@ -2648,7 +2693,8 @@ def run_retrieval_pairs(args, judged: bool = False) -> int:
         tmp.write_text(json.dumps(receipt, indent=1), encoding="utf-8")
         os.replace(tmp, PAIRS_RECEIPT)
         _js = (f" judged={judged_stats['judged']} yes={judged_stats['yes']} "
-               f"queued={judged_stats['queued']} cache-hits={judged_stats['cache_hits']}"
+               f"queued={judged_stats['queued']} already-queued={judged_stats['already_queued']} "
+               f"suppressed-dismissed={judged_stats['suppressed_dismissed']} cache-hits={judged_stats['cache_hits']}"
                if judged_stats else "")
         print(f"contradiction-sweep: retrieval-pairs {'judged' if judged else 'dry-run'} done. "
               f"rows={len(rows)} pairs={len(pair_queries)} eligible={len(eligible)} "
@@ -2675,8 +2721,9 @@ def main(argv=None) -> int:
     --judge/--apply) AFTER the sweep in the same process, so the weekly unit runs both under ONE chain
     step and one receipt (a second step would need its own name in the chain). The worse exit wins.
     A dry run does not chain: it would only print the same decisions twice."""
-    global _OUTCOME_SCOPE, _SUPPRESSED_DISMISSED
+    global _OUTCOME_SCOPE, _SUPPRESSED_DISMISSED, _ALREADY_QUEUED
     _SUPPRESSED_DISMISSED = 0
+    _ALREADY_QUEUED = 0
     argv = list(sys.argv[1:] if argv is None else argv)
     chain = "--then-rejudge-stamped" in argv
     argv = [a for a in argv if a != "--then-rejudge-stamped"]
@@ -2685,6 +2732,7 @@ def main(argv=None) -> int:
         # both passes report into ONE outcome line: the second never overwrites the first's reason or counts
         _OUTCOME_SCOPE = "rejudge"
         _SUPPRESSED_DISMISSED = 0     # the re-judge's own skips, reported beside the sweep's
+        _ALREADY_QUEUED = 0
         try:
             rc = max(rc, _main(argv + ["--rejudge-stamped"]))
         finally:

@@ -205,6 +205,27 @@ no `cmd.exe`/`powershell.exe` anywhere in its units. `install/linux-authority.sh
 
 `--dry-run` prints what would change (including changed units) and writes nothing. The unit step never installs an `ams-*` unit; those belong to the native installer.
 
+### Per-prompt hook timeout
+
+The `UserPromptSubmit` entry the installer writes has `timeout: 10` (seconds; it was 5). The memory
+server's embedder unloads after five idle minutes and takes a few seconds to load, so the per-prompt
+bundle call now carries `cold_wait_ms` (5.5 s) and waits up to 7 s for the answer instead of getting an
+instant empty result for the first prompt after an idle spell. The compiled client waits at most 8 s on
+its pipe to the resident daemon, which keeps its own POST, cold-embedder sleep and retry inside that;
+the 10 s hook timeout is the outer bound, and a hook that times out fails open (the prompt proceeds
+without memory). A re-run of phase 2 updates the timeout of an existing entry: the merge drops the stack's
+own `UserPromptSubmit` entry (matched by its markers) and writes the current one, leaving other hooks
+alone. The rebuilt client (a comment-only change counts, the source hash is part of its freshness
+check) is deployed by the same re-run. See [`model-aware-injection.md`](model-aware-injection.md) for
+what the block contains.
+
+### Verify working directory
+
+`3-verify.ps1` runs from the user profile and restores the caller's directory on every exit. `wsl.exe`
+maps the current directory into the distro and prints `wsl: Failed to translate '<path>'` for a drive it
+cannot map (a cloud-synced or removable drive), once per call, so a verify started from such a drive was
+noisy. `Test-MemoryStack.ps1` does the same.
+
 ### Skew guard (verify time)
 
 `3-verify.ps1` extracts *every* `~/.claude/scripts/<file>` path referenced anywhere in `settings.json` and asserts each file exists on disk. This is deliberately broader than just hook commands — it catches the class where a shared/synced `settings.json` advances ahead of a machine's local deploy layer (a missing PreCompact capture script once deadlocked live sessions). Over-detection is the safe direction.

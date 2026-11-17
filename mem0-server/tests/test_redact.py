@@ -138,3 +138,29 @@ def test_read_path_masking_flags_credential_items_and_leaves_clean_ones_untouche
     assert secret in dirty["memory"] and "redacted" not in dirty      # input untouched
     snip, n2 = redact.mask_memory_items([{"snippet": "token: " + secret}], key="snippet")
     assert n2 == 1 and secret not in snip[0]["snippet"]
+
+
+def test_json_text_columns_of_an_episode_are_masked_leaf_by_leaf():
+    """A quote inside a JSON-text column is stored as backslash-quote, so redact_secrets over the JSON
+    text misses `password: "..."` there. The read path masks the string leaves instead and re-serializes.
+    app.py cannot be imported headless, so the helper is lifted from its source."""
+    import ast
+    src = (Path(_HERE).parent / "app.py").read_text(encoding="utf-8")
+    want = {"_JSON_TEXT_KEYS", "_mask_json_leaves", "_mask_json_text", "_mask_items_json_aware"}
+    nodes = [n for n in ast.parse(src).body
+             if (isinstance(n, ast.FunctionDef) and n.name in want)
+             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) in want)]
+    assert len(nodes) == len(want)
+    ns = {"json": json, "redact_secrets": redact.redact_secrets}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), ns)
+    secret = "Zq9" + "x7Lm2Qw8Rt5"
+    cell = json.dumps([{"goal_title": "g", "delta_text": 'rotate: password: "' + secret + '" today'}])
+    assert secret in cell and secret in json.dumps(cell)                      # shape of the stored column
+    assert redact.redact_secrets(cell) == cell                                # the old text-level mask missed it
+    row = {"id": 1, "advanced_goals": cell, "blocked_goals": "not json: token: " + secret,
+           "open_questions": json.dumps(["plain question"])}
+    out, n = ns["_mask_items_json_aware"]([row], ("advanced_goals", "blocked_goals", "open_questions"))
+    assert n == 1 and out[0]["redacted"] is True
+    assert secret not in out[0]["advanced_goals"] and secret not in out[0]["blocked_goals"]
+    assert json.loads(out[0]["advanced_goals"])[0]["goal_title"] == "g"      # still valid JSON, same shape
+    assert out[0]["open_questions"] == row["open_questions"]                   # an unchanged column is untouched

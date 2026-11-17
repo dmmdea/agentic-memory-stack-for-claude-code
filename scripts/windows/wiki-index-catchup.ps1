@@ -17,6 +17,9 @@
 # operator has told this box where the vault is: WIKI_VAULT, else the first line of
 # ~\.mem0\wiki-vault (a per-box operator value, like the brain alias). The drive letter of a
 # cloud-synced folder moves, so a configured path that is gone is retried on the other letters.
+# Single flight: sessions that start in the same second would each pass the throttle and launch a
+# refresh that races the others on one snapshot directory, so the check-and-launch runs under a
+# create-new lock file; a catch-up that finds it held logs "already running" and exits 0.
 # Fail-open everywhere: a failure here must never touch the session.
 param([switch]$DefineOnly)
 
@@ -31,6 +34,7 @@ try {
 
 $script:WikiFreshLimitH = 20
 $script:WikiThrottleSeconds = 21600
+$script:WikiLockStaleSeconds = 300   # a lock this old was left by a process that died holding it
 
 function Get-WikiVaultDir {
     # The vault directory on THIS box, or $null. WIKI_VAULT wins over the config file.
@@ -168,10 +172,55 @@ function Get-WikiRefreshReason {
     return $null
 }
 
+function Enter-WikiCatchupLock {
+    # Single flight (1.42.0). Several sessions that start in the same second each read the throttle
+    # as open (it is stamped only after the launch) and each launched a refresh; the children raced on
+    # one snapshot directory and most exited 2. One create-new lock file makes the check-and-launch
+    # atomic: $true when this process now holds it, $false when another catch-up does. A lock older than
+    # the stale limit belongs to a process that died without releasing it and is taken over. Fail-open:
+    # a lock that cannot be made at all lets the catch-up run, as before.
+    $path = Join-Path $script:StateDir 'wiki-catchup.lock'
+    foreach ($attempt in 1..2) {
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes([string]$PID)
+            $fs.Write($bytes, 0, $bytes.Length)
+            return $true
+        } catch [System.IO.IOException] {
+            if (-not (Test-Path -LiteralPath $path)) { return $true }   # not "exists": cannot lock, fail open
+            $age = $null
+            try { $age = ([datetime]::UtcNow - (Get-Item -LiteralPath $path).LastWriteTimeUtc).TotalSeconds } catch {}
+            if ($attempt -eq 1 -and $null -ne $age -and $age -gt $script:WikiLockStaleSeconds) {
+                try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch {}
+                continue
+            }
+            return $false
+        } catch {
+            return $true
+        } finally {
+            if ($fs) { try { $fs.Dispose() } catch {} }
+        }
+    }
+    return $false
+}
+
+function Exit-WikiCatchupLock {
+    try { Remove-Item -LiteralPath (Join-Path $script:StateDir 'wiki-catchup.lock') -Force -ErrorAction SilentlyContinue } catch {}
+}
+
 function Invoke-WikiCatchup {
     param([Parameter(Mandatory)][string]$ScriptDir)
+    $locked = $false
     try {
         if ((Get-Mem0Role) -eq 'brain') { return }
+        if (-not (Test-Throttle -Name 'wiki-catchup' -MinIntervalSeconds $script:WikiThrottleSeconds)) { return }
+        if (-not (Enter-WikiCatchupLock)) {
+            Write-MemoryLog -Component 'wiki-index-catchup' -Message 'catch-up already running (another session holds the lock); skipping'
+            return
+        }
+        $locked = $true
+        # The holder before us may have launched and stamped the throttle between our check and our lock.
         if (-not (Test-Throttle -Name 'wiki-catchup' -MinIntervalSeconds $script:WikiThrottleSeconds)) { return }
         $vault = Get-WikiVaultDir
         if (-not $vault) { return }
@@ -191,6 +240,10 @@ function Invoke-WikiCatchup {
         }
     } catch {
         try { Write-MemoryLog -Component 'wiki-index-catchup' -Message "catch-up aborted (non-fatal): $_" } catch {}
+    } finally {
+        # Held only across the check and the launch (the throttle is stamped before this), not for the
+        # refresh's own run: the detached driver outlives this process, and the throttle covers it.
+        if ($locked) { Exit-WikiCatchupLock }
     }
 }
 

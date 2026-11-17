@@ -63,25 +63,32 @@ def test_quiet_line_below_24h(tmp_path):
     assert "ws-b" not in out and "ws-c" not in out, "stores at 0 or null are not listed"
 
 
-def test_alarm_line_states_the_measurements_and_the_last_decision(tmp_path):
-    """The clock is continuous time over the trigger; a judge that decided last night is not blamed."""
+def test_alarm_line_states_the_measurements_and_what_this_pc_did(tmp_path):
+    """The clock is continuous time over the trigger. The run and decision times come from this PC's own
+    receipt rows, not from the judge on the authority, so the line states what the PC did and where the
+    judge's decisions are recorded, and accuses neither the judge nor the nightly chain."""
     _write_summary(tmp_path, [("ws-a", 4.7), ("ws-b", 31.5), ("ws-c", 24)], extra={
         "ws-b": {"lines": 183, "bytes": 17400, "last_status": "no-op",
                  "last_status_at": _zulu(3.2), "last_decision_at": _zulu(3.2)}})
     out = _run_with_fake_home(tmp_path)
     assert "AUTO-MEMORY G7 ALARM: ws-b has been over its trigger for 31.5h" in out
     assert "(183 lines vs the 160-line trigger, 17400 B vs the 20000 B trigger)" in out
-    assert "last run no-op 3.2h ago, last decision 3.2h ago" in out
+    assert "this PC's last run (no-op) was 3.2h ago, its last applied pass was 3.2h ago" in out
+    assert "the judge's own decisions are recorded on the authority (its compact-receipts.jsonl" in out
     assert "(all: ws-b 31.5h, ws-c 24h, ws-a 4.7h)" in out
-    assert "has not decided" not in out, "a judge that decided inside 36h must not be blamed"
+    for accusation in ("has not decided", "is deciding", "check the nightly chain", "last decision"):
+        assert accusation not in out, "the PC cannot know what the judge did"
 
 
-def test_alarm_line_blames_the_chain_only_without_a_decision_in_36h(tmp_path):
+def test_alarm_line_says_no_pass_inside_36h_without_blaming_the_chain(tmp_path):
     _write_summary(tmp_path, [("ws-a", 50)], extra={
         "ws-a": {"lines": 183, "bytes": 17400, "last_status": "skipped-live-session",
                  "last_status_at": _zulu(2), "last_decision_at": _zulu(60)}})
     out = _run_with_fake_home(tmp_path)
-    assert "no decision applied inside 36h - the hub judge has not decided; check the nightly chain" in out
+    assert "this PC has applied no pass inside 36h" in out
+    assert "the judge's own decisions are recorded on the authority" in out
+    for accusation in ("has not decided", "check the nightly chain", "is deciding"):
+        assert accusation not in out, "the PC cannot know what the judge did"
 
 
 def test_silent_when_no_store_is_over_trigger(tmp_path):

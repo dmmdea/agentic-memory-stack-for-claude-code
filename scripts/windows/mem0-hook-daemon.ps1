@@ -54,6 +54,19 @@ $script:DaemonLogPath = $env:USERPROFILE + '\.mem0\hook-daemon.log'
 # rollover, independent of the client's best-effort SendShutdown).
 $script:StaleExitRequested = $false
 
+# Per-prompt bundle budget (1.42.0). The server's embedder unloads after 5 idle minutes and takes
+# ~3.5 s to load; a bundle body that carries cold_wait_ms lets the server wait (capped at 6 s on its
+# side) for the load and then search, instead of answering at once with no memories. The request
+# timeout must outlast that wait. Both numbers live here for every bundle call site (op=bundle_raw,
+# op=bundle, the replica failover); the checkpoint-only call keeps its own 1000 ms. A server that does
+# not know the field ignores it.
+$script:BundleColdWaitMs = 5500
+$script:BundleRequestTimeoutMs = 7000
+# Everything one prompt may spend on bundle POSTs (first call + cold-embedder sleep + retry, or the
+# failover): the hook client's pipe deadline is 8000 ms (ResponseTimeoutMs in mem0-hook-client.cs), so
+# stay under it with a margin or the client abandons the daemon's answer.
+$script:BundleBudgetMs = 7500
+
 function Write-DaemonLog {
     # 1MB rotation (single .1 backup, same pattern as admission-rejected.jsonl).
     # PRIVACY: callers must never pass prompt/memory text.
@@ -280,11 +293,12 @@ function Invoke-DaemonRawBundle {
                 tier                  = $tier          # v0.22 Pillar 2: consuming-model tier (server ignores until Phase D)
                 transcript_path       = $transcriptPath
                 hook_contract_version = $script:HookContractVersion
+                cold_wait_ms          = $script:BundleColdWaitMs   # 1.42.0: let the server wait for a cold embedder
             }
             # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
             # retried ONCE; every other failure is the same fail-open as before.
             $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
-            $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+            $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs $script:BundleRequestTimeoutMs
             if (-not $post.ok) { $post = Invoke-BundleReplicaFailover -Body $bundleBody -ApiKey $apiKey -Failed $post }   # v1.23 P2-7
             if ($post.ok) {
                 $bundleR = ConvertFrom-HookJson $post.text
@@ -293,7 +307,7 @@ function Invoke-DaemonRawBundle {
                 # C10: session-deduped (memories + goals/OQ sections), same state file as the inline path.
                 $contextBlock = Format-SessionMemoryContextBlock -Bundle $bundleR -Brand $brand -Tier $tier -Source $script:BundleSource -SessionId $sessionId -StateDir $StateDir -Cache $script:InjectionStateCache -RequestStartTicks $reqStartTicks
                 $resp.context_b64 = ConvertTo-DaemonB64 $contextBlock
-                $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)"
+                $diagLine = "episode_id=$($bundleR.checkpoint.episode_id) action=$($bundleR.checkpoint.action) memories=$(@($bundleR.memories).Count) goals=$(@($bundleR.goals).Count) oq=$(@($bundleR.open_questions).Count) daemon_ms=$($swReq.ElapsedMilliseconds)$(Get-BundleColdLogSuffix -Bundle $bundleR)"
                 if ($post.diag_prefix) { $diagLine = $post.diag_prefix + ' ' + $diagLine }
                 $resp.diag_b64 = ConvertTo-DaemonB64 $diagLine
             } else {
@@ -400,11 +414,12 @@ function Invoke-DaemonRequest {
             tier                  = $reqTier
             transcript_path       = $Req.transcript_path
             hook_contract_version = $Req.hook_contract_version
+            cold_wait_ms          = $script:BundleColdWaitMs   # 1.42.0: let the server wait for a cold embedder
         }
         # P1-6: a 503 cold-embedder is named, waited on (min(Retry-After, 3) s) and
         # retried ONCE; every other failure is the same fail-open as before.
         $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
-        $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs 3000
+        $post = Invoke-BundlePostWithColdRetry -Uri ($script:BaseUrl + '/v1/context/bundle') -Body $bundleBody -ApiKey $apiKey -TimeoutMs $script:BundleRequestTimeoutMs
         if (-not $post.ok) { $post = Invoke-BundleReplicaFailover -Body $bundleBody -ApiKey $apiKey -Failed $post }   # v1.23 P2-7
         if (-not $post.ok) {
             # error = 'bundle_failed: <msg>' or 'cold-embedder retried=1 ok=False daemon_ms=N'
@@ -448,11 +463,18 @@ function Invoke-BundleReplicaFailover {
     # v1.23 P2-7 (spec §8): the authority did not answer. On a REPLICA retry the SAME bundle POST
     # against the dormant local store (offline-watcher / travel-mode start it) and stamp
     # source=local-replica; anywhere else hand the failure back unchanged.
-    param([string]$Body, [string]$ApiKey, $Failed, [int]$TimeoutMs = 3000)
+    param([string]$Body, [string]$ApiKey, $Failed, [int]$TimeoutMs = $script:BundleRequestTimeoutMs)
     $script:BundleSource = 'authority:' + ([uri]$script:BaseUrl).Authority
     $fo = Get-Mem0BundleFailoverUrl -AuthorityUrl $script:BaseUrl
     if (-not $fo) { return $Failed }
-    $local = Invoke-BundlePostWithColdRetry -Uri ($fo + '/v1/context/bundle') -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
+    # The failover shares the prompt's budget with the call that just failed: an authority that
+    # burned the whole request timeout leaves no time for a second full-length call, and the client
+    # would have given up on the pipe by then anyway.
+    $spent = 0
+    try { $spent = [int]$Failed.elapsed_ms } catch { $spent = 0 }
+    $left = $script:BundleBudgetMs - $spent
+    if ($left -lt 500) { return $Failed }
+    $local = Invoke-BundlePostWithColdRetry -Uri ($fo + '/v1/context/bundle') -Body $Body -ApiKey $ApiKey -TimeoutMs ([Math]::Min($TimeoutMs, $left)) -BudgetMs $left
     if ($local.ok) {
         $script:BundleSource = 'local-replica'
         $local.diag_prefix = 'failover=local-replica (' + $Failed.diag_prefix + ')'
@@ -478,34 +500,51 @@ function Invoke-BundlePostWithColdRetry {
       cold-embedder                      -> sleep min(retry_after, 3) s, retry the SAME POST once ->
                                             @{ ok=<bool>; retried=1; diag_prefix='cold-embedder retried=1 ok=<True|False> daemon_ms=<ms>' }
     daemon_ms spans both attempts and the wait. Never throws.
+
+    1.42.0: the body carries cold_wait_ms, so a current server waits for the load itself and the 503
+    only comes from a server that predates it (or one whose wait ran out). The whole call, sleep and
+    retry included, must end inside -BudgetMs (default $script:BundleBudgetMs, under the hook client's
+    8000 ms pipe deadline): the retry is skipped when the first POST left too little of it
+    (reported as retried=0), and the retry's own timeout is cut to what is left. Every result also
+    carries elapsed_ms so the replica failover can share the same budget.
     #>
-    param([string]$Uri, [string]$Body, [string]$ApiKey, [int]$TimeoutMs = 3000)
+    param([string]$Uri, [string]$Body, [string]$ApiKey, [int]$TimeoutMs = $script:BundleRequestTimeoutMs, [int]$BudgetMs = $script:BundleBudgetMs)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $out = @{ text = $null; retried = 0; ok = $false; diag_prefix = '' }
+    $out = @{ text = $null; retried = 0; ok = $false; diag_prefix = ''; elapsed_ms = 0 }
     $failure = $null
     try {
         $out.text = Invoke-Mem0Post -Uri $Uri -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
         $out.ok = $true
+        $out.elapsed_ms = [int]$sw.ElapsedMilliseconds
         return $out
     } catch {
         $firstMsg = [string]$_.Exception.Message
         $failure = ConvertFrom-Mem0PostError -Message $firstMsg
         if (-not (($failure.status -eq 503) -and ($failure.reason -eq 'cold-embedder'))) {
             $out.diag_prefix = 'bundle_failed: ' + $firstMsg
+            $out.elapsed_ms = [int]$sw.ElapsedMilliseconds
             return $out
         }
     }
-    # cold-embedder: the seat is loading. Wait at most 3 s (the hook's budget), then retry once.
+    # cold-embedder: the seat is loading. Wait at most 3 s, then retry once - but only when the sleep
+    # plus a worthwhile retry (>= 1 s) still fits the budget.
     $waitS = [Math]::Min([int]$failure.retry_after, 3)
+    if (($BudgetMs - $sw.ElapsedMilliseconds - ($waitS * 1000)) -lt 1000) {
+        $out.elapsed_ms = [int]$sw.ElapsedMilliseconds
+        $out.diag_prefix = 'cold-embedder retried=0 ok=False daemon_ms=' + [string]$sw.ElapsedMilliseconds
+        return $out
+    }
     if ($waitS -gt 0) { Start-Sleep -Seconds $waitS }
     $out.retried = 1
+    $retryTimeout = [int][Math]::Max(1000, [Math]::Min($TimeoutMs, $BudgetMs - $sw.ElapsedMilliseconds))
     try {
-        $out.text = Invoke-Mem0Post -Uri $Uri -Body $Body -ApiKey $ApiKey -TimeoutMs $TimeoutMs
+        $out.text = Invoke-Mem0Post -Uri $Uri -Body $Body -ApiKey $ApiKey -TimeoutMs $retryTimeout
         $out.ok = $true
     } catch {
         $out.ok = $false
         $out.text = $null
     }
+    $out.elapsed_ms = [int]$sw.ElapsedMilliseconds
     $out.diag_prefix = 'cold-embedder retried=1 ok=' + [string]$out.ok + ' daemon_ms=' + [string]$sw.ElapsedMilliseconds
     return $out
 }

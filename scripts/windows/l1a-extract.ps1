@@ -166,6 +166,9 @@ function Invoke-L1aTranscript {
             }
         }
     }
+    # 1.42.0: the previous window's episode end in this run (Resolve-L1aEpisodeEnd keeps the next one 11 s
+    # after it, past the server's 10 s repeated-Stop window).
+    $script:L1aPrevEpisodeEnd = $null
     try {
         for ($windowNo = 1; $windowNo -le $MaxWindows; $windowNo++) {
             $res = @(Invoke-L1aWindow -ReadPath $ReadPath -CursorPath $CursorPath -SourceTranscript $SourceTranscript `
@@ -199,6 +202,7 @@ function Invoke-L1aWindow {
     $cursor = Get-L1aCursor -TranscriptPath $CursorPath
     $turns = $null
     $consumedTo = $advanceTo
+    $lastRecordAt = $null   # the time of the last record this window read: its episode's ended_at (Resolve-L1aEpisodeEnd)
     $windowTag = ''
     if ($MaxWindows -gt 1) { $windowTag = " $WindowNo/$MaxWindows" }
     $readMode = Get-L1aReadMode -Cursor $cursor -Length $advanceTo -MaxWindows $MaxWindows
@@ -237,12 +241,15 @@ function Invoke-L1aWindow {
             }
             $turns = $win.Text
             $consumedTo = [long]$win.ConsumedTo
+            $lastRecordAt = $win.LastRecordAt
         }
     }
     if (-not $usedWindow) {
         # a first extraction limited to one window, a rotation/shrink, or a read error above: the
         # last-24-turns behaviour (never lose extraction), and the cursor goes to the length seen.
-        $turns = Get-RecentTranscriptTurns -TranscriptPath $ReadPath -MaxTurns 24 -MaxChars 12000
+        $tailRecordAt = $null
+        $turns = Get-RecentTranscriptTurns -TranscriptPath $ReadPath -MaxTurns 24 -MaxChars 12000 -LastRecordAt ([ref]$tailRecordAt)
+        $lastRecordAt = $tailRecordAt
         $consumedTo = $advanceTo
     }
     if ([string]::IsNullOrWhiteSpace($turns)) {
@@ -429,6 +436,8 @@ $turns
     }
 
     $posted = 0
+    $newlyStored = 0      # of $posted: facts the server stored now
+    $alreadyStored = 0    # of $posted: facts it already had (answered NOOP_DUPLICATE); counted, not new
     $postedMemoryIds = [System.Collections.Generic.List[string]]::new()
     # Only evergreen facts POST to mem0 and populate linked_memory_ids (durable-only).
     foreach ($rawFact in $split.Evergreen) {
@@ -451,12 +460,13 @@ $turns
             $memId = Add-Mem0Memory -Text $fact -Source 'l1a-extractor' -Metadata $factMeta
             if ($memId) {
                 $posted++
+                if ($script:Mem0LastPostOutcome -eq 'duplicate') { $alreadyStored++ } else { $newlyStored++ }
                 if ($memId -is [string]) { $postedMemoryIds.Add($memId) }
             }
         }
     }
     if ($facts.Count -gt 0) {
-        Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 (codex ${codexDurationMs}ms, $codexTokens tokens)"
+        Write-MemoryLog -Component 'l1a' -Message "  done - extracted $($split.Evergreen.Count + $split.ShipLogs.Count) durable+shiplog ($($split.Evergreen.Count) evergreen -> mem0, $($split.ShipLogs.Count) ship-logs -> episode), posted $posted to mem0 ($newlyStored new, $alreadyStored already stored; codex ${codexDurationMs}ms, $codexTokens tokens)"
     }
     # One usage record per run: 'empty' keeps the zero-fact case distinguishable in the ledger,
     # which is what the old early-exit reported before the episode POST was reached.
@@ -508,10 +518,18 @@ $turns
             $blockedGoals   = @($parsed.episode.blocked_goals   | Where-Object { $_ })
             $openQuestions  = @($parsed.episode.open_questions  | Where-Object { $_ })
 
+            # 1.42.0: the episode ends when the window's last record was written, not when this run is
+            # extracting it (a catch-up runs hours or days later), and each window of one run ends 11 s
+            # after the previous one: the server overwrites a complete episode of the same session that
+            # ends within 10 s of it (Resolve-L1aEpisodeEnd).
+            $endFile = if ($sourceTranscript -and (Test-Path -LiteralPath $sourceTranscript)) { $sourceTranscript } else { $ReadPath }
+            $episodeEnd = Resolve-L1aEpisodeEnd -LastRecordAt $lastRecordAt -FilePath $endFile -PreviousEnd $script:L1aPrevEpisodeEnd
+            $script:L1aPrevEpisodeEnd = $episodeEnd
+
             $episodePayload = @{
                 session_id     = $episodeSessionId
                 started_at     = $sessionStartedAt
-                ended_at       = (Get-Date).ToUniversalTime().ToString('o')
+                ended_at       = $episodeEnd.ToString('o')
                 transcript_path = $sourceTranscript
                 goal           = $parsed.episode.goal
                 summary        = $episodeSummary
@@ -563,6 +581,11 @@ try {
 } catch {
     Write-MemoryLog -Component 'l1a' -Message "  unhandled error: $_"
 } finally {
+    # 1.42.0: a PreCompact run is given a snapshot of the whole transcript in the temp directory; it is
+    # this run's own copy and nothing else deletes it. Remove-L1aPrecompactSnapshot deletes only a file
+    # named precompact-snap-*.jsonl that sits directly in the hook's temp directory and only when the spawner
+    # named the real transcript (-OriginTranscriptPath): a real transcript can never match.
+    try { Remove-L1aPrecompactSnapshot -Path $TranscriptPath -OriginPath $OriginTranscriptPath | Out-Null } catch { }
     Remove-Item env:L1A_REENTRANT -ErrorAction SilentlyContinue
 }
 

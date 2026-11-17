@@ -130,6 +130,20 @@ def test_a_spawn_failure_never_leaves_the_slot_held():
     assert e5.warm_state()["running"] is False
 
 
+def test_a_client_that_can_wait_gets_the_search_after_the_warm_and_others_abstain():
+    import time
+    cold = _listing({"id": MODEL, "status": {"value": "unloaded"}})
+
+    def _slow():
+        time.sleep(0.2)
+    got = e5.bundle_embed_gate(cold, _slow, MODEL, wait_s=3)
+    assert got["embed"] is True and got["state"] == "warmed" and got["warm_started"] is True
+    assert 150 <= got["waited_ms"] < 3000
+    # No wait budget: the abstain at once, key for key as before (no waited_ms).
+    assert e5.bundle_embed_gate(cold, lambda: None, MODEL, spawn=_run_now) == \
+        {"embed": False, "state": "warming", "warm_started": True}
+
+
 # ---------------------------------------------------------------------------
 # bundle_gate_for: the HTTP binding app._bundle_embed_gate delegates to (headless)
 # ---------------------------------------------------------------------------
@@ -200,14 +214,16 @@ def _bundle_handler_src() -> str:
 
 def test_only_the_hook_path_probes_the_embedder():
     body = _bundle_handler_src()
-    assert '_gate = _bundle_embed_gate() if b.checkpoint else {"embed": True, "state": "deliberate"}' in body
+    assert '_gate = _bundle_embed_gate(_wait_s) if b.checkpoint else {"embed": True, "state": "deliberate"}' in body
+    assert "_wait_s = _bundle_cold_wait_s(b.cold_wait_ms) if b.checkpoint else 0.0" in body
 
 
 def test_a_failing_probe_searches_and_a_cold_one_skips_search_and_raw_fallback():
     body = _bundle_handler_src()
-    probe = body[body.index("_gate = _bundle_embed_gate()"):]
+    probe = body[body.index("_gate = _bundle_embed_gate(_wait_s)"):]
     assert probe.index("except Exception:") < probe.index('_gate = {"embed": True, "state": "unknown"}')
-    assert "    if not _cold:\n        try:\n            filters" in body, "the dense search must sit behind _cold"
+    assert "    if not _cold:\n        _row_holder: dict[str, Any] = {}\n        try:" in body, \
+        "the dense search must sit behind _cold"
     fallback = [ln for ln in body.splitlines() if "RAW_FALLBACK_ENABLED and" in ln]
     assert fallback and all("not _cold" in ln for ln in fallback), fallback
 
@@ -217,7 +233,7 @@ def test_the_app_gate_delegates_to_the_tested_binding():
     src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
     fn = src[src.index("def _bundle_embed_gate("):]
     fn = fn[:fn.index("\ndef ")]
-    assert "_embedder_503.bundle_gate_for(_embed_base(), _embed_model())" in fn
+    assert "_embedder_503.bundle_gate_for(_embed_base(), _embed_model(), wait_s=wait_s)" in fn
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +258,7 @@ def wired_app(monkeypatch):
         calls["checkpoint"] += 1
         return {"ok": True, "episode_id": 7, "action": "updated", "state": "in_progress"}
 
-    def _search(si, _route="search"):
+    def _search(si, _route="search", **kw):
         calls["search"] += 1
         return {"results": [{"id": "m1", "memory": "alpha fact", "metadata": {"tier": "evidence"}}]}
 
@@ -272,7 +288,7 @@ def _body(app):
 def test_cold_bundle_abstains_but_keeps_checkpoint(wired_app, monkeypatch):
     app, calls = wired_app
     monkeypatch.setattr(app, "_bundle_embed_gate",
-                        lambda: {"embed": False, "state": "warming", "warm_started": True})
+                        lambda *a, **k: {"embed": False, "state": "warming", "warm_started": True})
     app._bundle_cold_bump()                      # roll the date first so the delta is today's
     before = app._bundle_cold_today["degraded"]
     out = app.context_bundle(_body(app), x_api_key="k")
@@ -284,7 +300,7 @@ def test_cold_bundle_abstains_but_keeps_checkpoint(wired_app, monkeypatch):
 
 def test_warm_bundle_searches_as_before(wired_app, monkeypatch):
     app, calls = wired_app
-    monkeypatch.setattr(app, "_bundle_embed_gate", lambda: {"embed": True, "state": "loaded"})
+    monkeypatch.setattr(app, "_bundle_embed_gate", lambda *a, **k: {"embed": True, "state": "loaded"})
     out = app.context_bundle(_body(app), x_api_key="k")
     assert [m["id"] for m in out["memories"]] == ["m1"]
     assert "embedder" not in out
@@ -294,7 +310,7 @@ def test_warm_bundle_searches_as_before(wired_app, monkeypatch):
 def test_a_failing_readiness_check_searches_as_before(wired_app, monkeypatch):
     app, calls = wired_app
 
-    def _broken():
+    def _broken(*a, **k):
         raise RuntimeError("boom")
     monkeypatch.setattr(app, "_bundle_embed_gate", _broken)
     out = app.context_bundle(_body(app), x_api_key="k")
@@ -307,7 +323,7 @@ def test_a_deliberate_recall_never_degrades_on_a_cold_embedder(wired_app, monkey
     app, calls = wired_app
     probes = []
 
-    def _cold_gate():
+    def _cold_gate(*a, **k):
         probes.append(1)
         return {"embed": False, "state": "warming", "warm_started": True}
     monkeypatch.setattr(app, "_bundle_embed_gate", _cold_gate)

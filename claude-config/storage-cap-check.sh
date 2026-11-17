@@ -253,9 +253,9 @@ else:
     # store lint's over_trigger_hours (the over-trigger clock that rides in the synced tree; min
     # across PCs). The clock only resets when the store falls back under the trigger, so a judge
     # that applies a decision every night and still leaves the store over trigger keeps it running:
-    # the alarm line therefore states the measurements (lines and bytes against the triggers) and
-    # the last run and decision from the summary, and blames the judge or the chain only when the
-    # data shows no decision inside 36 h. Quiet below 24 h, loud at or above - this line is the
+    # the alarm line therefore states the measurements (lines and bytes against the triggers), when this
+    # PC last ran and applied a pass, and where the judge's own decisions are read (they are recorded on
+    # the authority; the PC cannot see them). Quiet below 24 h, loud at or above - this line is the
     # one observer that does not depend on the authority being up.
     LINE_TRIGGER, BYTE_TRIGGER = 160, 20000   # mirrors ams-store/internal/store/constants.go
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -283,13 +283,20 @@ else:
             if isinstance(s0.get("lines"), int) and isinstance(s0.get("bytes"), int):
                 size = f" ({s0['lines']} lines vs the {LINE_TRIGGER}-line trigger, {s0['bytes']} B vs the {BYTE_TRIGGER} B trigger)"
             run_ago, dec_ago = _ago(s0.get("last_status_at")), _ago(s0.get("last_decision_at"))
-            last = ""
+            # These two times come from THIS PC's own receipt rows (its derive and sync passes), not from the
+            # judge, which runs on the authority: the line says what the PC did and where the judge's own
+            # decisions are recorded, and does not judge the judge or the nightly chain from PC-local data.
+            seen = []
             if run_ago is not None:
-                last = f"; last run {s0.get('last_status') or 'unknown'} {run_ago:.1f}h ago"
+                seen.append(f"this PC's last run ({s0.get('last_status') or 'unknown'}) was {run_ago:.1f}h ago")
             if dec_ago is not None and dec_ago <= 36:
-                last += f", last decision {dec_ago:.1f}h ago - the nightly chain is deciding but the store is not shrinking below its trigger (see compact-receipts.jsonl)"
+                seen.append(f"its last applied pass was {dec_ago:.1f}h ago")
             elif dec_ago is not None or run_ago is not None:
-                last += ", no decision applied inside 36h - the hub judge has not decided; check the nightly chain"
+                seen.append("this PC has applied no pass inside 36h")
+            last = ""
+            if seen:
+                last = ("; " + ", ".join(seen) + "; the judge's own decisions are recorded on the authority"
+                        " (its compact-receipts.jsonl and the store-judge line of its morning summary)")
             others = f" (all: {listing})" if len(over) > 1 else ""
             parts.append(f"AUTO-MEMORY G7 ALARM: {w0} has been over its trigger for {worst:g}h{size}{last}{others}")
         else:

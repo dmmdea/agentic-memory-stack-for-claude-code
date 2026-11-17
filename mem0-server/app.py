@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional, Any, List
 
 from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from mem0 import Memory
 
 from config import build_config, EMBEDDER_CONFIG, EMBED_PROFILE
@@ -690,17 +690,19 @@ def _raw_fallback_bump(fired=0, abstained=0, errors=0):
 
 
 # Per-prompt bundles served without the dense search because the embedder was unloaded
-# (_bundle_embed_gate): `degraded` counts them, `warms_started` the background warms they began.
+# (_bundle_embed_gate): `degraded` counts them, `warms_started` the background warms they began,
+# `waited_ok` the cold bundles that waited for the load and then searched (the client's cold_wait_ms).
 # Same zero-I/O daily-counter pattern; informational on /health/deep.
-_bundle_cold_today = {"date": None, "degraded": 0, "warms_started": 0}
+_bundle_cold_today = {"date": None, "degraded": 0, "warms_started": 0, "waited_ok": 0}
 
 
-def _bundle_cold_bump(degraded=0, warms_started=0):
+def _bundle_cold_bump(degraded=0, warms_started=0, waited_ok=0):
     today = _dt.date.today().isoformat()
     if _bundle_cold_today["date"] != today:
-        _bundle_cold_today.update({"date": today, "degraded": 0, "warms_started": 0})
+        _bundle_cold_today.update({"date": today, "degraded": 0, "warms_started": 0, "waited_ok": 0})
     _bundle_cold_today["degraded"] += degraded
     _bundle_cold_today["warms_started"] += warms_started
+    _bundle_cold_today["waited_ok"] += waited_ok
 
 
 def _put_carryover_bump(puts=0, restored=0, lost=0):
@@ -1206,12 +1208,37 @@ def _embed_base() -> str:
     return str(EMBEDDER_CONFIG.get("openai_base_url") or _embedder_profile.DEFAULT_BASE_URL).rstrip("/")
 
 
-def _bundle_embed_gate() -> dict:
+def _bundle_cold_wait_cap_s() -> float:
+    """MEM0_BUNDLE_COLD_WAIT_S: the most seconds a bundle may wait for a cold embedder, whatever the
+    client asks. Default 6.0; 0 turns waiting off; clamped to at most 20; unreadable reads as the default."""
+    try:
+        v = float(os.environ.get("MEM0_BUNDLE_COLD_WAIT_S", "6.0"))
+    except (TypeError, ValueError):
+        return 6.0
+    if v != v:  # NaN
+        return 6.0
+    return max(0.0, min(v, 20.0))
+
+
+def _bundle_cold_wait_s(cold_wait_ms) -> float:
+    """The wait this bundle gets: min(the client's cold_wait_ms, the server cap), in seconds. Absent,
+    zero, negative or non-numeric asks for no wait."""
+    try:
+        ms = float(cold_wait_ms)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (ms > 0):  # also NaN
+        return 0.0
+    return min(ms / 1000.0, _bundle_cold_wait_cap_s())
+
+
+def _bundle_embed_gate(wait_s: float = 0.0) -> dict:
     """embedder_503.bundle_embed_gate bound to this server's embedder: may the per-prompt bundle
-    run its dense search now, or is the embedder unloaded (then a background warm starts and the
-    bundle abstains instead of waiting out the load past the hook's budget)?
+    run its dense search now, or is the embedder unloaded? Then a background warm starts and the
+    bundle waits up to `wait_s` for it (a client that sent cold_wait_ms), else abstains at once
+    instead of waiting out the load past the hook's budget.
     MEM0_BUNDLE_COLD_DEGRADE=0 turns the check off (the search then waits for the load, as before)."""
-    return _embedder_503.bundle_gate_for(_embed_base(), _embed_model())
+    return _embedder_503.bundle_gate_for(_embed_base(), _embed_model(), wait_s=wait_s)
 
 
 def _qdrant_base() -> str:
@@ -1230,7 +1257,8 @@ def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     (informational: an unreadable listing reads as `loaded: None`, never as an error).
     The embed exceptions deliberately PROPAGATE — embedder_503.install maps a cold/down seat
     to 503 + Retry-After with reason cold-embedder, the same answer the bundle path gives,
-    which the hook client names and retries once.
+    which the hook client names and retries once. An HTTP 429 from the warm embed gets that same
+    503 answer (embedder_503.outage_response); other 4xx stay errors.
 
     `?warm=rerank` additionally issues a one-document rerank so the first deliberate search of
     the session does not pay the reranker's cold load (it unloads after 5 idle minutes too).
@@ -1256,6 +1284,10 @@ def health_embedder(warm: Optional[str] = Query(None)) -> dict:
     r = _httpx.post(f"{_embed_base()}/embeddings",
                     json={"model": _embed_model(), "input": "warm"},
                     timeout=10.0)
+    if r.status_code == 429:
+        # The seat is busy loading (several sessions warming in the same second): the same retryable
+        # outage as a refused connection, not a server error. Any other 4xx still raises below.
+        return _embedder_503.outage_response()
     r.raise_for_status()
     out: dict[str, Any] = {"ok": True, "loaded": loaded,
                            "warm_ms": int((_time.perf_counter() - t0) * 1000)}
@@ -1683,7 +1715,7 @@ def list_all(user_id: str = Query(...), limit: int = Query(100), mask: bool = Qu
         log.exception("list failed")
         raise _upstream_error(e)
 
-def _search_core(b: SearchIn, _route: str = "search"):
+def _search_core(b: SearchIn, _route: str = "search", _defer_log: Optional[dict] = None):
     """v0.20 A.3: search internals shared by POST /v1/memories/search and
     POST /v1/context/bundle. Contains the FULL retrieval-policy pipeline -
     retired/intent filtering, the W5 keyword-recall union leg, rerank,
@@ -1698,7 +1730,10 @@ def _search_core(b: SearchIn, _route: str = "search"):
     not; ADOPT-4 pair sampling and ADOPT-5 export both key on it.
     W5 T1.1: ``b.explain`` attaches a per-stage trace (counts + scalar
     details only — never result objects, so in-place stamp mutations cannot
-    make earlier stages lie) as results['_explain']. Zero cost when False."""
+    make earlier stages lie) as results['_explain']. Zero cost when False.
+    ``_defer_log``: a dict the caller owns. When given, the retrieval-log row is handed back in
+    ``_defer_log["record"]`` instead of being written, and the caller writes it (the bundle adds
+    injected_ids after its own filtering). Every other caller omits it and gets the row written here."""
     capped_limit = min(b.limit, 500)
     _explain_on = bool(getattr(b, "explain", False))
     _trace: list = []
@@ -2045,63 +2080,88 @@ def _search_core(b: SearchIn, _route: str = "search"):
                  if isinstance(results, dict) else 0)
     # v0.17 Phase F.2.3: retrieval observability — log every search to ~/.mem0/retrieval-log.jsonl
     try:
-        import hashlib as _hl
-        query_hash = _hl.sha256(b.query.encode("utf-8")).hexdigest()[:16]
-        log_full = os.environ.get("MEM0_LOG_FULL_QUERY") == "1"
-        # v0.18 LOW-3: opt-in filter-value hashing — with MEM0_LOG_HASH_FILTERS=1,
-        # brand/user_id values in the logged filter dict are replaced by
-        # sha256-hex truncated to 12 chars. Default (env unset): raw values, unchanged.
-        log_filters = b.filters
-        if os.environ.get("MEM0_LOG_HASH_FILTERS") == "1" and isinstance(b.filters, dict):
-            log_filters = dict(b.filters)
-            for _fk in ("brand", "user_id"):
-                if log_filters.get(_fk) is not None:
-                    log_filters[_fk] = _hl.sha256(
-                        str(log_filters[_fk]).encode("utf-8")
-                    ).hexdigest()[:12]
-        retrieval_record = {
-            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "actor": "rest-api",
-            # W5 T1.5: caller discriminator ('search'|'bundle'|'nli') — actor
-            # is constant, so pair-sampling/export could not tell hook-probe
-            # traffic from deliberate searches. Historical rows lack the key;
-            # readers must treat missing as unknown-legacy (review F7).
-            "route": _route,
-            "query_hash": query_hash,
-            "query_text": b.query[:200] if log_full else None,
-            "filters": log_filters,
-            "limit": b.limit,
-            "rerank": b.rerank,
-            # v0.20 Phase E (M4): query_class recorded on EVERY entry — the
-            # history class is an authz-by-design escape hatch (admission-gate.md)
-            # but was invisible here, so forensic reads of superseded/contradicted
-            # records left no trace. qclass is computed unconditionally above;
-            # the bundle endpoint shares _search_core, so both paths log it.
-            # (The effective admission class can diverge to 'canonical' via
-            # filters.tier — filters are logged above, so an auditor can
-            # reconstruct it; logging qclass makes every history request visible.)
-            "query_class": qclass,
-            "forensic": qclass == "history",
-            "threshold": b.threshold,
-            "returned_count": len(results.get("results", [])) if isinstance(results, dict) else 0,
-            # W5 T3.3 (ADOPT-4/5): top-10 (was top-3) — pair sampling and
-            # replay Jaccard@10 both need the fuller result set. No reader
-            # pins the old length (verified); mixed-era rows are handled by
-            # both consumers.
-            "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:10]] if isinstance(results, dict) else [],
-            # Numbers only, aligned index-for-index with returned_top_ids (null where an item carries
-            # none): the raw cosine the threshold gated on, and the score the list was ordered by. No
-            # text, no query; they let the quality of what the per-prompt path injects be measured.
-            "returned_cosines": _log_numbers(results, "cosine"),
-            "returned_scores": _log_numbers(results, "score"),
-            "reranked": (results.get("reranked") if isinstance(results, dict) else None),
-            # W5 T5.5: the union leg's receipt — candidates seen, unioned into
-            # the pool, and surviving the final list. lexical_candidates==0 on
-            # every rerank=False row is the M10 path-gating pin.
-            "lexical_candidates": _lex_candidates,
-            "lexical_added": _lex_added,
-            "lexical_kept": _lex_kept,
-        }
+        retrieval_record = _build_retrieval_record(b, results, qclass, _route,
+                                                   _lex_candidates, _lex_added, _lex_kept)
+        if _defer_log is not None:
+            # The bundle writes its row itself, after its own insight filter and K trim, so the row can
+            # carry the ids it actually returned (injected_ids).
+            _defer_log["record"] = retrieval_record
+        else:
+            _write_retrieval_row(retrieval_record)
+    except Exception:
+        log.exception("retrieval logging failed (non-fatal)")
+    return results
+
+
+def _build_retrieval_record(b, results, qclass, _route, _lex_candidates, _lex_added, _lex_kept) -> dict:
+    """The retrieval-log row of one search: hashes and numbers, never the query text (unless the
+    operator opted in with MEM0_LOG_FULL_QUERY=1)."""
+    import hashlib as _hl
+    query_hash = _hl.sha256(b.query.encode("utf-8")).hexdigest()[:16]
+    log_full = os.environ.get("MEM0_LOG_FULL_QUERY") == "1"
+    # v0.18 LOW-3: opt-in filter-value hashing — with MEM0_LOG_HASH_FILTERS=1,
+    # brand/user_id values in the logged filter dict are replaced by
+    # sha256-hex truncated to 12 chars. Default (env unset): raw values, unchanged.
+    log_filters = b.filters
+    if os.environ.get("MEM0_LOG_HASH_FILTERS") == "1" and isinstance(b.filters, dict):
+        log_filters = dict(b.filters)
+        for _fk in ("brand", "user_id"):
+            if log_filters.get(_fk) is not None:
+                log_filters[_fk] = _hl.sha256(
+                    str(log_filters[_fk]).encode("utf-8")
+                ).hexdigest()[:12]
+    retrieval_record = {
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "actor": "rest-api",
+        # W5 T1.5: caller discriminator ('search'|'bundle'|'nli') — actor
+        # is constant, so pair-sampling/export could not tell hook-probe
+        # traffic from deliberate searches. Historical rows lack the key;
+        # readers must treat missing as unknown-legacy (review F7).
+        "route": _route,
+        "query_hash": query_hash,
+        "query_text": b.query[:200] if log_full else None,
+        "filters": log_filters,
+        "limit": b.limit,
+        "rerank": b.rerank,
+        # v0.20 Phase E (M4): query_class recorded on EVERY entry — the
+        # history class is an authz-by-design escape hatch (admission-gate.md)
+        # but was invisible here, so forensic reads of superseded/contradicted
+        # records left no trace. qclass is computed unconditionally above;
+        # the bundle endpoint shares _search_core, so both paths log it.
+        # (The effective admission class can diverge to 'canonical' via
+        # filters.tier — filters are logged above, so an auditor can
+        # reconstruct it; logging qclass makes every history request visible.)
+        "query_class": qclass,
+        "forensic": qclass == "history",
+        "threshold": b.threshold,
+        "returned_count": len(results.get("results", [])) if isinstance(results, dict) else 0,
+        # W5 T3.3 (ADOPT-4/5): top-10 (was top-3) — pair sampling and
+        # replay Jaccard@10 both need the fuller result set. No reader
+        # pins the old length (verified); mixed-era rows are handled by
+        # both consumers.
+        "returned_top_ids": [r.get("id") for r in (results.get("results") or [])[:10]] if isinstance(results, dict) else [],
+        # Numbers only, aligned index-for-index with returned_top_ids (null where an item carries
+        # none): the raw cosine the threshold gated on, the fusion score, and the value the list was
+        # actually sorted by (the freshness-weighted score or the rerank score where one applied; the
+        # fusion score otherwise). No text, no query; they let the quality of what the per-prompt
+        # path injects be measured.
+        "returned_cosines": _log_numbers(results, "cosine"),
+        "returned_scores": _log_numbers(results, "score"),
+        "returned_order_scores": _log_order_numbers(results),
+        "reranked": (results.get("reranked") if isinstance(results, dict) else None),
+        # W5 T5.5: the union leg's receipt — candidates seen, unioned into
+        # the pool, and surviving the final list. lexical_candidates==0 on
+        # every rerank=False row is the M10 path-gating pin.
+        "lexical_candidates": _lex_candidates,
+        "lexical_added": _lex_added,
+        "lexical_kept": _lex_kept,
+    }
+    return retrieval_record
+
+
+def _write_retrieval_row(retrieval_record: dict) -> None:
+    """Append one row to ~/.mem0/retrieval-log.jsonl (rotating at 10 MB). Never raises."""
+    try:
         log_path = Path.home() / ".mem0" / "retrieval-log.jsonl"
         # Rotate at 10MB — move to .1 through .5, drop .5 if it exists.
         # v0.20 Phase E (L11): unlink the DST (.5) before renaming .4 into it —
@@ -2122,7 +2182,6 @@ def _search_core(b: SearchIn, _route: str = "search"):
             _lf.write(json.dumps(retrieval_record) + "\n")
     except Exception:
         log.exception("retrieval logging failed (non-fatal)")
-    return results
 
 
 def _log_numbers(results, key: str) -> list:
@@ -2134,6 +2193,42 @@ def _log_numbers(results, key: str) -> list:
         v = r.get(key) if isinstance(r, dict) else None
         out.append(round(float(v), 4) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
     return out
+
+
+# The per-result keys a list can be sorted by, most specific first: the operational and durable
+# freshness-weighted scores re-sort the list; a rerank score orders it when no freshness policy ran.
+_ORDER_SCORE_KEYS = ("operational_recency_score", "durable_freshness_score", "rerank_score", "score")
+
+
+def _log_order_numbers(results) -> list:
+    """The top-10 results' sort value as floats, aligned with returned_top_ids: the first of
+    _ORDER_SCORE_KEYS an item carries; null when it carries none."""
+    if not isinstance(results, dict):
+        return []
+    out = []
+    for r in (results.get("results") or [])[:10]:
+        v = None
+        if isinstance(r, dict):
+            for k in _ORDER_SCORE_KEYS:
+                cand = r.get(k)
+                if isinstance(cand, (int, float)) and not isinstance(cand, bool):
+                    v = cand
+                    break
+        out.append(round(float(v), 4) if v is not None else None)
+    return out
+
+
+def _log_cold_degraded(si) -> None:
+    """One retrieval-log row for a per-prompt bundle served without the dense search because the
+    embedder was cold: route "bundle", nothing returned, degraded "cold-embedder". The row is the
+    ordinary search row (query hash, filters, limits), so the rate of cold prompts can be measured."""
+    try:
+        rec = _build_retrieval_record(si, {"results": []}, (si.query_class or "durable").lower(),
+                                      "bundle", 0, 0, 0)
+        rec["degraded"] = "cold-embedder"
+        _write_retrieval_row(rec)
+    except Exception:
+        log.exception("retrieval logging of a cold bundle failed (non-fatal)")
 
 
 def _read_redact_on() -> bool:
@@ -2148,10 +2243,70 @@ def _mask_read_items(items, key="memory"):
     followed by a PUT, so masked text would overwrite the original)."""
     if not _read_redact_on():
         return items
-    masked, n = _mask_memory_items(items, key=key)
+    keys = (key,) if isinstance(key, str) else tuple(key)
+    if any(k in _JSON_TEXT_KEYS for k in keys):
+        masked, n = _mask_items_json_aware(items, keys)
+    else:
+        masked, n = _mask_memory_items(items, key=key)
     if n:
         _read_redact_bump(n)
     return masked
+
+
+# Episode columns that hold JSON text (a list of {goal_title, delta_text|block_reason} objects, a list of
+# question strings). redact_secrets over the JSON text misses a quoted assignment inside it: a quote is
+# stored as backslash-quote there, so `password: "..."` no longer has the shape the rules look for.
+_JSON_TEXT_KEYS = ("open_questions", "advanced_goals", "blocked_goals")
+
+
+def _mask_json_leaves(value):
+    """`value` with every string leaf of a parsed JSON structure run through redact_secrets."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_mask_json_leaves(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _mask_json_leaves(v) for k, v in value.items()}
+    return value
+
+
+def _mask_json_text(text):
+    """Masked copy of a JSON-text column. Text that parses as JSON is masked leaf by leaf and
+    re-serialized (ensure_ascii=False); when no leaf changed, or the text does not parse, it is masked
+    as plain text, which is what every column got before."""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return redact_secrets(text)
+    masked = _mask_json_leaves(parsed)
+    if masked != parsed:
+        return json.dumps(masked, ensure_ascii=False)
+    return redact_secrets(text)
+
+
+def _mask_items_json_aware(items, keys) -> tuple:
+    """redact.mask_memory_items with the JSON-text columns masked by `_mask_json_text`: `(new_items,
+    n_masked)`; a changed item is a copy carrying "redacted": True, an unchanged one is the same object."""
+    out: list = []
+    n = 0
+    for item in items or []:
+        if isinstance(item, dict):
+            changed = {}
+            for k in keys:
+                val = item.get(k)
+                if isinstance(val, str) and val:
+                    masked = _mask_json_text(val) if k in _JSON_TEXT_KEYS else redact_secrets(val)
+                elif isinstance(val, (list, dict)) and k in _JSON_TEXT_KEYS:
+                    masked = _mask_json_leaves(val)   # a column already parsed by the caller
+                else:
+                    continue
+                if masked != val:
+                    changed[k] = masked
+            if changed:
+                item = {**item, **changed, "redacted": True}
+                n += 1
+        out.append(item)
+    return out, n
 
 
 # The text fields a masked read covers, per record type. Episode rows carry three JSON-text columns the
@@ -3717,6 +3872,38 @@ class ContextBundleIn(BaseModel):
     # checkpoint=False. The hook path omits it (default True) and keeps the original
     # checkpoint-first contract unchanged.
     checkpoint: bool = True
+    # 1.42.0: how long, in milliseconds, this client can wait for a cold embedder. When the embedder is
+    # unloaded the per-prompt bundle (checkpoint=True) waits up to min(this, MEM0_BUNDLE_COLD_WAIT_S)
+    # for the load and then searches as normal. Absent or 0 keeps the fast abstain (older clients see
+    # no change); a negative or non-numeric value reads as 0 rather than failing the bundle.
+    cold_wait_ms: Optional[int] = None
+
+    @field_validator("cold_wait_ms", mode="before")
+    @classmethod
+    def _cold_wait_ms_lenient(cls, v):
+        if v is None or isinstance(v, bool):
+            return None if v is None else 0
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return n if n > 0 else 0
+
+
+def _bundle_search_in(b: "ContextBundleIn", tp: dict) -> "SearchIn":
+    """The search the per-prompt bundle runs (also what a cold-embedder degrade row is keyed on):
+    user_id + optional brand filters, K and threshold from the tier policy."""
+    filters: dict[str, Any] = {"user_id": DEFAULT_USER_ID}
+    if b.brand:
+        filters["brand"] = b.brand
+    return SearchIn(
+        query=(b.prompt or "")[:500],
+        filters=filters,
+        limit=tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped by the caller
+        threshold=tp["relevance_threshold"],  # the active space's calibrated gate, both tiers
+        rerank=False,
+        query_class="durable",
+    )
 
 
 @app.post("/v1/context/bundle")
@@ -3801,30 +3988,38 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
     # This is the embedding-similarity threshold only — NOT the reranker's
     # MEM0_RELEVANCE_FLOOR_OPERATIONAL.
     #
-    # Cold embedder: llama-swap holds a request for an unloaded model until it has loaded, which
-    # takes longer than the hook's whole budget, so the search is skipped while a background warm
-    # runs (embedder_503.bundle_embed_gate). The bundle then abstains on memories (and on the raw
-    # fallback, which embeds too); the checkpoint above has landed and goals/OQ are still served.
+    # Cold embedder: llama-swap holds a request for an unloaded model until it has loaded (about
+    # 3.5 s). The bundle starts a background warm (embedder_503.bundle_embed_gate). A client that
+    # sent cold_wait_ms says it can wait: the bundle waits up to min(cold_wait_ms, the server cap)
+    # for that warm and then searches as normal ("warmed"). Without a wait, or when the warm does not
+    # finish in time, the search is skipped: the bundle abstains on memories (and on the raw
+    # fallback, which embeds too), the checkpoint above has landed, goals/OQ are still served, and
+    # one retrieval-log row records the degrade.
     # Only the per-prompt hook (checkpoint=True) has a budget the load outlasts. The deliberate
     # callers (memory_recall, the session-start precis) send checkpoint=False and keep waiting for the
     # load: an empty answer there would read as "nothing relevant is stored".
+    _wait_s = _bundle_cold_wait_s(b.cold_wait_ms) if b.checkpoint else 0.0
     try:
-        _gate = _bundle_embed_gate() if b.checkpoint else {"embed": True, "state": "deliberate"}
+        _gate = _bundle_embed_gate(_wait_s) if b.checkpoint else {"embed": True, "state": "deliberate"}
     except Exception:
         log.exception("bundle: embedder readiness check failed (non-fatal; searching as before)")
         _gate = {"embed": True, "state": "unknown"}
     _cold = not _gate.get("embed", True)
+    if _gate.get("state") == "warmed":
+        out["embedder"] = {"state": "warmed", "waited_ms": int(_gate.get("waited_ms") or 0)}
+        _bundle_cold_bump(warms_started=int(bool(_gate.get("warm_started"))), waited_ok=1)
     if _cold:
         out["embedder"] = {"state": _gate.get("state"), "warm_started": bool(_gate.get("warm_started"))}
+        if "waited_ms" in _gate:
+            out["embedder"]["waited_ms"] = int(_gate.get("waited_ms") or 0)
         _bundle_cold_bump(degraded=1, warms_started=int(bool(_gate.get("warm_started"))))
+        _log_cold_degraded(_bundle_search_in(b, _tp))
         for _wk in ("rejected_brand_scoped", "rejected_superseded", "rejected_contradicted"):
             out[_wk] = 0
         out["memories"] = []
     if not _cold:
+        _row_holder: dict[str, Any] = {}
         try:
-            filters: dict[str, Any] = {"user_id": DEFAULT_USER_ID}
-            if b.brand:
-                filters["brand"] = b.brand
             # rerank=False is LOAD-BEARING (W5 T5): it structurally excludes the
             # keyword union leg and the cross-encoder call from the per-prompt
             # bundle hot path. Originally a CPU-cost decision; since the
@@ -3833,14 +4028,9 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
             # n=578 paired): bge reranking does not improve recall@1 over dense
             # order (p=0.43). Revisit only with a reranker that measurably does
             # (llama.cpp PR #24083 / nemotron-rerank was such a candidate).
-            sr = _search_core(SearchIn(
-                query=(b.prompt or "")[:500],
-                filters=filters,
-                limit=_tp["memory_cap"] + 2,        # v1.12 HK-6: +2 headroom — insight hits are dropped below
-                threshold=_tp["relevance_threshold"],  # the active space's calibrated gate, both tiers
-                rerank=False,
-                query_class="durable",
-            ), _route="bundle")
+            # _defer_log: the retrieval-log row is written below, after the insight filter and the K
+            # trim, so it can name the ids actually returned (injected_ids).
+            sr = _search_core(_bundle_search_in(b, _tp), _route="bundle", _defer_log=_row_holder)
             _mems = sr.get("results", []) if isinstance(sr, dict) else []
             # W5 T2.1 (ADOPT-3): forward the withheld counters onto the bundle
             # response — _search_core computes them but the bundle previously
@@ -3860,6 +4050,12 @@ def context_bundle(b: ContextBundleIn, x_api_key: Optional[str] = Header(None)):
         except Exception:
             log.exception("bundle: search failed (non-fatal)")
             out["memories"] = []
+        _row = _row_holder.get("record")
+        if _row is not None:
+            # returned_top_ids is what the search returned BEFORE the insight filter and the K trim;
+            # injected_ids is what the client was handed.
+            _row["injected_ids"] = [m.get("id") for m in out.get("memories") or [] if isinstance(m, dict)]
+            _write_retrieval_row(_row)
 
     # 2b) v0.29 R4 — raw-trace fallback. Only when the condensed semantic search
     # admitted NOTHING (low-confidence) do we attempt a SEMANTIC-cosine match

@@ -112,6 +112,8 @@ Claude Code session ends
 
 The judge call (the Codex CLI by default, or the Claude API; see [judge provider](./judge-provider.md)) is shared (one call returns both facts AND episode) so no extra cost vs v0.14.
 
+**What `ended_at` is on a finished episode (1.42.0).** The extractor stamps it with when the window's last record was written (the top-level `timestamp` of the last transcript record the window read), not with when the extractor ran. A catch-up run that extracts a session days after it ended therefore files it at the time it happened, and the windows of one run end at least 11 s apart, because the server treats a complete episode of the same session within 10 s of the previous one as a repeated Stop and overwrites it. The rule and its fallbacks are in [memory capture](../flows/memory-capture.md#l1a--the-cursor-the-windows-and-the-throttle-scope). The time health reads (`last_complete_ended_at`) is accordingly the time of the newest session activity that was extracted, not the time of the newest extraction.
+
 ### Per-prompt checkpoint (the unfinished episode)
 
 Before the session ends, every UserPromptSubmit upserts one `state='in_progress'` row for the session

@@ -130,11 +130,15 @@ def listing_loaded(entry: dict) -> Optional[bool]:
 # the embedder unloaded.
 #
 # So the bundle asks llama-swap's listing first (loopback, a few ms). A model listed as not loaded
-# is warmed in a background thread, at most one warm at a time, and that prompt's bundle is served
-# without the dense search: no memories, which is the abstain the hook already handles, instead of
-# a timeout. The prompts after it find the embedder warm. A listing that cannot be read, or that
-# does not report a state (an embedder that is not behind llama-swap), keeps the old behaviour.
-# The model still unloads after its idle TTL: the warm is work for the prompt in hand, not residency.
+# is warmed in a background thread, at most one warm at a time. A client that says how long it can
+# wait (`wait_s`, from the request's cold_wait_ms, capped by the server) has the bundle wait for
+# THAT warm to finish and then run its normal search ("warmed"); several bundles may wait on the
+# same warm. Without a wait budget, or when the warm does not finish inside it, that prompt's
+# bundle is served without the dense search: no memories, which is the abstain the hook already
+# handles, instead of a timeout. The prompts after it find the embedder warm. A listing that
+# cannot be read, or that does not report a state (an embedder that is not behind llama-swap),
+# keeps the old behaviour. The model still unloads after its idle TTL: the warm is work for the
+# prompt in hand, not residency.
 # ---------------------------------------------------------------------------
 
 log = logging.getLogger("mem0-server.embedder_503")
@@ -185,12 +189,28 @@ def _spawn_daemon(fn: Callable[[], None]) -> None:
     threading.Thread(target=fn, name="embedder-warm", daemon=True).start()
 
 
-def start_background_warm(warm: Callable[[], None],
-                          spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> bool:
-    """Run `warm` once in the background unless a warm is already running. True when one started."""
+class _Warm:
+    """One background warm: `done` is set when it ends, `error` is None only after `warm()` returned."""
+    __slots__ = ("done", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: Optional[str] = "unfinished"
+
+
+_warm_current: Optional[_Warm] = None   # the warm in flight (or the last one); guarded by _warm_lock
+
+
+def _begin_warm(warm: Callable[[], None],
+                spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> tuple:
+    """Start a warm unless one is running; `(started, handle)`. The handle is the warm a caller may
+    wait on: the one just started, or the one already running (None when there is none to join)."""
+    global _warm_current
     with _warm_lock:
         if _warm_state["running"]:
-            return False
+            return False, _warm_current
+        handle = _Warm()
+        _warm_current = handle
         _warm_state["running"] = True
         _warm_state["started_at"] = time.time()
         _warm_state["started"] += 1
@@ -200,46 +220,89 @@ def start_background_warm(warm: Callable[[], None],
             warm()
             _warm_state["last_ok_at"] = time.time()
             _warm_state["last_error"] = None
+            handle.error = None
         except Exception as exc:  # reported on /health/deep and in the log, never raised into a request
-            _warm_state["last_error"] = _error_text(exc)
+            handle.error = _error_text(exc)
+            _warm_state["last_error"] = handle.error
             log.warning("embedder background warm failed; hook bundles abstain on memories until "
-                        "it loads: %s", _warm_state["last_error"], exc_info=True)
+                        "it loads: %s", handle.error, exc_info=True)
         finally:
             with _warm_lock:
                 _warm_state["running"] = False
+            handle.done.set()   # wakes every bundle waiting on this warm
 
     try:
         spawn(_run)
     except Exception as exc:
         with _warm_lock:
             _warm_state["running"] = False
-        _warm_state["last_error"] = _error_text(exc)
+        handle.error = _error_text(exc)
+        _warm_state["last_error"] = handle.error
+        handle.done.set()
         log.warning("embedder background warm could not start: %s", _warm_state["last_error"])
-        return False
-    return True
+        return False, handle
+    return True, handle
+
+
+def start_background_warm(warm: Callable[[], None],
+                          spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> bool:
+    """Run `warm` once in the background unless a warm is already running. True when one started."""
+    return _begin_warm(warm, spawn)[0]
+
+
+_MAX_WAIT_S = 60.0   # a hard ceiling under the warm's own 60 s request timeout; callers clamp lower
+
+
+def _clean_wait(wait_s) -> float:
+    """`wait_s` as a finite number of seconds in [0, _MAX_WAIT_S]; anything unusable is 0 (no wait)."""
+    try:
+        w = float(wait_s)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (w > 0):   # also NaN
+        return 0.0
+    return min(w, _MAX_WAIT_S)
 
 
 def bundle_embed_gate(list_models: Callable[[], list], warm: Callable[[], None], model: str,
-                      spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> dict:
+                      spawn: Callable[[Callable[[], None]], None] = _spawn_daemon,
+                      wait_s: float = 0) -> dict:
     """Decide whether the per-prompt bundle may run its dense search now.
 
     {"embed": True, "state": "loaded"|"unknown"} -> search as before.
-    {"embed": False, "state": "warming", "warm_started": bool} -> skip the search; a warm is running."""
+    {"embed": True, "state": "warmed", "warm_started": bool, "waited_ms": int} -> the embedder was
+        cold, the bundle waited (at most `wait_s`) for the warm to finish and it did, without error.
+    {"embed": False, "state": "warming", "warm_started": bool} -> skip the search; a warm is running.
+        When `wait_s` > 0 the dict also carries "waited_ms" (the wait ran out or the warm failed).
+
+    `wait_s` 0 (the default) is the abstain-at-once behaviour, key for key."""
     ready = embedder_listed_ready(list_models, model)
     if ready is None:
         return {"embed": True, "state": "unknown"}
     if ready:
         return {"embed": True, "state": "loaded"}
-    return {"embed": False, "state": "warming", "warm_started": start_background_warm(warm, spawn)}
+    started, handle = _begin_warm(warm, spawn)
+    budget = _clean_wait(wait_s)
+    if budget <= 0:
+        return {"embed": False, "state": "warming", "warm_started": started}
+    t0 = time.monotonic()
+    if handle is not None:
+        handle.done.wait(timeout=budget)
+    waited_ms = int((time.monotonic() - t0) * 1000)
+    if handle is not None and handle.done.is_set() and handle.error is None:
+        return {"embed": True, "state": "warmed", "warm_started": started, "waited_ms": waited_ms}
+    return {"embed": False, "state": "warming", "warm_started": started, "waited_ms": waited_ms}
 
 
 def bundle_gate_for(base: str, model: str, environ=None, http=httpx,
-                    spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> dict:
+                    spawn: Callable[[Callable[[], None]], None] = _spawn_daemon,
+                    wait_s: float = 0) -> dict:
     """`bundle_embed_gate` bound to one OpenAI-compatible embedder at `base` (…/v1).
 
     The listing read gets 0.5 s, so a hung llama-swap costs the bundle half a second, not the hook's
-    budget; the warm gets 60 s, which covers a cold load. `MEM0_BUNDLE_COLD_DEGRADE=0` turns the
-    check off: the search then waits for the load, as before this gate existed."""
+    budget; the warm gets 60 s, which covers a cold load; `wait_s` is how long this bundle may wait
+    for it. `MEM0_BUNDLE_COLD_DEGRADE=0` turns the check off: the search then waits for the load, as
+    before this gate existed."""
     env = os.environ if environ is None else environ
     if str(env.get("MEM0_BUNDLE_COLD_DEGRADE", "1")).strip() == "0":
         return {"embed": True, "state": "disabled"}
@@ -253,7 +316,7 @@ def bundle_gate_for(base: str, model: str, environ=None, http=httpx,
         r = http.post(f"{base}/embeddings", json={"model": model, "input": "warm"}, timeout=60.0)
         r.raise_for_status()
 
-    return bundle_embed_gate(_list, _warm, model, spawn)
+    return bundle_embed_gate(_list, _warm, model, spawn, wait_s=wait_s)
 
 
 def warm_state() -> dict:
@@ -262,14 +325,20 @@ def warm_state() -> dict:
         return dict(_warm_state)
 
 
+def outage_response(wait: int = RETRY_AFTER_S) -> JSONResponse:
+    """The 503 + Retry-After answer for an embedder that cannot serve right now (one shape for the
+    exception handler below and for an endpoint that reads the embedder's HTTP status itself)."""
+    return JSONResponse(status_code=503, headers={"Retry-After": str(wait)},
+                        content={"detail": "embedder unavailable (cold start or down); retry",
+                                 "reason": REASON, "retry_after_s": wait})
+
+
 def install(app: FastAPI) -> None:
     """Register one handler for every outage-shaped exception type; non-outages re-raise."""
     async def _handler(request: Request, exc: Exception):
         wait = classify(exc)
         if wait is None:
             raise exc
-        return JSONResponse(status_code=503, headers={"Retry-After": str(wait)},
-                            content={"detail": "embedder unavailable (cold start or down); retry",
-                                     "reason": REASON, "retry_after_s": wait})
+        return outage_response(wait)
     for t in _HTTPX_OUTAGES + _openai_types():
         app.add_exception_handler(t, _handler)

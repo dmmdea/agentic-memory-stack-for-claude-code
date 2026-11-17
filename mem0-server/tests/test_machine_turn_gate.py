@@ -139,7 +139,7 @@ def wired_app(monkeypatch):
         calls["checkpoint"] += 1
         return {"ok": True, "episode_id": 7, "action": "updated", "state": "in_progress"}
 
-    def _search(si, _route="search"):
+    def _search(si, _route="search", **kw):
         calls["search"] += 1
         return {"results": [{"id": "m1", "memory": "alpha fact", "metadata": {"tier": "evidence"}}]}
 
@@ -163,7 +163,7 @@ def wired_app(monkeypatch):
     monkeypatch.setattr(app, "_episodic_list_open_questions", _oqs)
     monkeypatch.setattr(app, "_episode_raw_fallback", _raw)
     # A warm embedder, so the control case searches (test_bundle_cold_gate.py covers the cold one).
-    monkeypatch.setattr(app, "_bundle_embed_gate", lambda: {"embed": True, "state": "loaded"})
+    monkeypatch.setattr(app, "_bundle_embed_gate", lambda *a, **k: {"embed": True, "state": "loaded"})
     return app, calls
 
 
